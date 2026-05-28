@@ -503,11 +503,39 @@ ssh control-mac "paniolo netboot stop target-machine"
 4. Add optional config fields to `TargetConfig` in `_config.py`.
 5. Regenerate the skill and update this file.
 
+## Linux support
+
+Paniolo runs on Linux as well as macOS. Platform differences:
+
+- **OCR is macOS-only.** `paniolo video read` and the dashboard OCR button
+  require Apple Vision (`visionocr.swift`, compiled by `paniolo setup` on macOS).
+  On Linux they return an error; the rest of the video pipeline works.
+- **Netboot uses `sudo` internally on Linux.** DHCP (port 67) and TFTP (port 69)
+  require root on Linux; macOS 14+ allows them rootless. `paniolo netboot start`
+  auto-prepends `sudo env PYTHONUNBUFFERED=1 <python>` when spawning the two
+  server subprocesses on Linux. With passwordless sudoers this is transparent;
+  otherwise sudo prompts for a password. Interface config (`ip addr add`) also
+  uses sudo, same as macOS uses it for `ifconfig`.
+- **Interface management uses `ip` on Linux.** `_configure_interface()` runs
+  `ip addr add`/`ip link set up` (iproute2) instead of `networksetup`+`ifconfig`.
+  `_restore_interface()` flushes with `ip addr flush dev <iface>`.
+- **ARP pinning uses `ip neigh replace` on Linux.** `_dhcp._set_arp()` calls
+  `arp -s` on macOS and `ip neigh replace ... nud permanent` on Linux.
+- **BPF raw-frame sender is macOS-only.** `BpfSender` in `_tftp.py` uses
+  `/dev/bpf*` ioctls that don't exist on Linux. On Linux `available` is always
+  `False` and the server falls back to normal `sendto()` with retry.
+- **hdmicap build deps on Linux.** Building hdmicap requires system packages:
+  `build-essential pkg-config libclang-dev clang` (for V4L2 bindgen via
+  `v4l2-sys-mit`). `paniolo setup` prints a reminder.
+- **Interface listing uses sysfs on Linux.** `list_usb_ethernet_interfaces()`
+  reads `/sys/class/net/` (type, carrier) instead of `networksetup`.
+
 ## Known limitations / gotchas
 
-- **ifconfig requires root.** `_configure_interface()` needs NOPASSWD sudo.
+- **Interface configuration requires root.** `_configure_interface()` needs
+  NOPASSWD sudo (`ifconfig`/`networksetup` on macOS, `ip` on Linux).
 - **SSH PATH.** Non-interactive SSH shells often lack `/opt/homebrew/bin`.
-  `_find_bin()` probes `_BREW_PATHS` as a fallback.
+  `_find_bin()` probes `_BREW_PATHS` on macOS and `/usr/sbin`+`/sbin` on Linux.
 - **hdmicap device auto-detection.** With two non-built-in cameras (e.g. MS2109
   + Razer Kiyo), `guess_capture_device` returns None and the user is prompted.
   Pass `--device "USB Video"` (or whatever substring matches) to skip the prompt.

@@ -42,6 +42,9 @@ _BREW_PATHS = [
     "/usr/local/sbin",
 ]
 
+# Linux: dnsmasq and other netboot tools commonly live in /usr/sbin or /sbin.
+_LINUX_SBIN_PATHS = ["/usr/sbin", "/sbin"]
+
 _EXCLUDE_PORT_PREFIXES = (
     "Wi-Fi",
     "Thunderbolt",
@@ -52,12 +55,16 @@ _EXCLUDE_PORT_PREFIXES = (
 )
 _EXCLUDE_DEVICES = {"bridge0", "lo0"}
 
+# Linux interfaces to skip when listing candidates for netboot.
+_LINUX_SKIP_PREFIXES = ("lo", "docker", "veth", "br", "virbr", "vlan", "bond", "dummy")
+
 
 def _find_bin(name: str) -> str:
     found = shutil.which(name)
     if found:
         return found
-    for d in _BREW_PATHS:
+    extra = _LINUX_SBIN_PATHS if sys.platform != "darwin" else _BREW_PATHS
+    for d in extra:
         p = Path(d) / name
         if p.exists():
             return str(p)
@@ -71,21 +78,59 @@ def check_deps() -> list[str]:
 
 
 def _is_interface_active(device: str) -> bool:
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.check_output(
+                ["ifconfig", device], text=True, stderr=subprocess.DEVNULL
+            )
+            return "status: active" in out
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
+    else:
+        try:
+            carrier = Path(f"/sys/class/net/{device}/carrier").read_text().strip()
+            return carrier == "1"
+        except OSError:
+            return False
+
+
+def _list_linux_ethernet_interfaces() -> list[dict]:
+    """Return Ethernet interfaces on Linux using sysfs.
+
+    Each entry: {"port": str, "device": str, "active": bool}
+    Skips loopback, virtual bridges, Docker, and other non-physical interfaces.
+    """
+    net_dir = Path("/sys/class/net")
+    candidates: list[dict] = []
     try:
-        out = subprocess.check_output(
-            ["ifconfig", device], text=True, stderr=subprocess.DEVNULL
-        )
-        return "status: active" in out
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return False
+        entries = sorted(net_dir.iterdir())
+    except OSError:
+        return []
+    for iface_path in entries:
+        name = iface_path.name
+        if any(name.startswith(p) for p in _LINUX_SKIP_PREFIXES):
+            continue
+        # Type 1 = Ethernet (ARPHRD_ETHER).
+        try:
+            if (iface_path / "type").read_text().strip() != "1":
+                continue
+        except OSError:
+            continue
+        active = _is_interface_active(name)
+        candidates.append({"port": name, "device": name, "active": active})
+    return sorted(candidates, key=lambda x: (not x["active"], x["device"]))
 
 
 def list_usb_ethernet_interfaces() -> list[dict]:
     """Return external (non-built-in) Ethernet interfaces, active ones first.
 
     Each entry: {"port": str, "device": str, "active": bool}
-    Excludes Wi-Fi, Thunderbolt, Bluetooth, FireWire, and virtual bridges.
+    On macOS: queries networksetup and excludes Wi-Fi, Thunderbolt, Bluetooth, etc.
+    On Linux: reads sysfs and excludes loopback and virtual interfaces.
     """
+    if sys.platform != "darwin":
+        return _list_linux_ethernet_interfaces()
+
     try:
         out = subprocess.check_output(
             ["networksetup", "-listallhardwareports"],
@@ -134,8 +179,28 @@ def _spawn(cmd: list[str], log_path: Path, append: bool = False) -> subprocess.P
     )
 
 
+def _sudo_prefix() -> list[str]:
+    """Return a sudo prefix for privileged subprocesses on Linux.
+
+    On macOS, DHCP/TFTP bind to ports 67/69 without root; no prefix needed.
+    On Linux they require root (or CAP_NET_BIND_SERVICE). If we're already
+    running as root, no prefix needed either.
+
+    Uses 'sudo env PYTHONUNBUFFERED=1' so the env var reaches Python through
+    sudo's environment reset without requiring the SETENV sudoers option.
+    Each exec in the chain (sudo → env → python) keeps the same PID, so the
+    saved PID in the state file still refers to the Python process.
+    """
+    if sys.platform == "darwin" or os.getuid() == 0:
+        return []
+    return ["sudo", "env", "PYTHONUNBUFFERED=1"]
+
+
 def _find_network_service(interface: str) -> str | None:
-    """Return the networksetup service name for a given device (e.g. 'en11' → 'USB 10/100/1000 LAN')."""
+    """Return the networksetup service name for a given device (e.g. 'en11' → 'USB 10/100/1000 LAN').
+    macOS only; returns None on Linux."""
+    if sys.platform != "darwin":
+        return None
     try:
         out = subprocess.check_output(
             ["networksetup", "-listallhardwareports"],
@@ -155,44 +220,77 @@ def _find_network_service(interface: str) -> str | None:
 
 
 def _configure_interface(interface: str, host_ip: str) -> None:
-    service = _find_network_service(interface)
-    if service:
+    if sys.platform == "darwin":
+        service = _find_network_service(interface)
+        if service:
+            subprocess.run(
+                ["sudo", "networksetup", "-setmanual", service, host_ip, "255.255.255.0"],
+                check=False,
+            )
+        result = subprocess.run(
+            ["sudo", "ifconfig", interface, host_ip, "netmask", "255.255.255.0", "up"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"ifconfig {interface} failed: {result.stderr.strip()}\n"
+                "Ensure passwordless sudo is configured (NOPASSWD) for the control machine."
+            )
+    else:
+        # Remove any existing addresses on this interface, then assign ours.
         subprocess.run(
-            ["sudo", "networksetup", "-setmanual", service, host_ip, "255.255.255.0"],
+            ["sudo", "ip", "addr", "flush", "dev", interface],
+            capture_output=True,
+            text=True,
             check=False,
         )
-    result = subprocess.run(
-        ["sudo", "ifconfig", interface, host_ip, "netmask", "255.255.255.0", "up"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"ifconfig {interface} failed: {result.stderr.strip()}\n"
-            "Ensure passwordless sudo is configured (NOPASSWD) for the control machine."
+        result = subprocess.run(
+            ["sudo", "ip", "addr", "add", f"{host_ip}/24", "dev", interface],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0 and "already assigned" not in result.stderr:
+            raise RuntimeError(
+                f"ip addr add {host_ip}/24 dev {interface} failed: {result.stderr.strip()}\n"
+                "Ensure passwordless sudo is configured (NOPASSWD) for the control machine."
+            )
+        subprocess.run(
+            ["sudo", "ip", "link", "set", interface, "up"],
+            check=False,
         )
 
 
 def _restore_interface(interface: str) -> None:
-    """Return the interface to DHCP so macOS resumes normal network management."""
-    service = _find_network_service(interface)
-    if service:
+    """Release the static IP and return the interface to OS-managed networking."""
+    if sys.platform == "darwin":
+        service = _find_network_service(interface)
+        if service:
+            subprocess.run(
+                ["sudo", "networksetup", "-setdhcp", service],
+                check=False,
+            )
+    else:
+        # Flush our static address; leave link up. A DHCP client (NetworkManager,
+        # systemd-networkd, dhclient) will re-acquire an address if configured.
         subprocess.run(
-            ["sudo", "networksetup", "-setdhcp", service],
+            ["sudo", "ip", "addr", "flush", "dev", interface],
             check=False,
         )
 
 
 def _tune_arp_for_silent_client() -> None:
-    """Disable macOS neighbor-unreachability detection (NUD) for the netboot link.
+    """Tweak OS neighbor-unreachability detection (NUD) for the netboot link.
 
-    The Pi's bootloader sends us DHCP/TFTP but never answers ARP probes. Even
-    with a permanent static ARP entry, recent macOS (26.x) refuses to transmit
-    to such a neighbor — sendto() returns EHOSTUNREACH — because NUD marks it
-    unreachable. Zeroing arp_llreach_base makes arp_llreach_reachable() always
-    return true (NUD disabled), and host_down_time=0 removes the 20s host-down
-    penalty. These are global sysctls; harmless on a dedicated netboot host.
+    The Pi's bootloader sends us DHCP/TFTP but never answers ARP probes. Without
+    tuning, the OS may mark the neighbor unreachable and refuse to send packets.
+
+    macOS (26.x+): zeros arp_llreach_base and host_down_time so NUD never fires.
+    Linux: no tuning needed — ARP entries installed via _dhcp._set_arp persist
+    across link flaps and Linux's NUD does not block sends to permanent entries.
     """
+    if sys.platform != "darwin":
+        return
     for key, val in (
         ("net.link.ether.inet.arp_llreach_base", "0"),
         ("net.link.ether.inet.host_down_time", "0"),
@@ -240,19 +338,19 @@ def start(cfg: TargetConfig) -> None:
 
     ensure_target_dir(cfg.name)
     log_path = netboot_log_path(cfg.name)
+    sudo = _sudo_prefix()
 
     dhcp = _spawn(
-        [sys.executable, "-m", "paniolo._dhcp", cfg.host_ip, "--interface", cfg.interface],
+        sudo + [sys.executable, "-m", "paniolo._dhcp", cfg.host_ip, "--interface", cfg.interface],
         log_path,
     )
-    # Pure-Python TFTP server. It listens on the wildcard (rootless even on
-    # privileged port 69) but binds each reply socket to cfg.host_ip so macOS
-    # routes transfers out the correct secondary interface. See _tftp.py for
-    # the full rationale (off-the-shelf servers bound to 0.0.0.0 hit
-    # EHOSTUNREACH on the reply because egress selection picks the wrong NIC).
+    # Pure-Python TFTP server. Binds the listen socket on the wildcard so a
+    # non-root process can use port 69 on macOS; on Linux we prepend sudo
+    # (see _sudo_prefix). Each reply socket is bound to cfg.host_ip so the
+    # OS routes transfers out the correct secondary interface (see _tftp.py).
     tftp = _spawn(
-        [sys.executable, "-m", "paniolo._tftp", cfg.host_ip, str(tftp_root),
-         "--interface", cfg.interface],
+        sudo + [sys.executable, "-m", "paniolo._tftp", cfg.host_ip, str(tftp_root),
+                "--interface", cfg.interface],
         log_path,
         append=True,
     )
