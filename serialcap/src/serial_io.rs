@@ -293,7 +293,7 @@ async fn supervisor(
         };
 
         let (mut rd, mut wr) = tokio::io::split(port);
-        let mut buf = [0u8; 4096];
+        let mut buf = [0u8; 65536];
 
         enum InnerExit {
             Disconnect,
@@ -306,14 +306,17 @@ async fn supervisor(
         let exit = loop {
             tokio::select! {
                 read = rd.read(&mut buf) => match read {
-                    Ok(0) => { warn!("serial EOF"); break InnerExit::Disconnect; }
+                    Ok(0) => {}
                     Ok(n) => {
                         let chunk = Bytes::copy_from_slice(&buf[..n]);
                         push_ring(&ring, &chunk);
-                        let _ = line_tx.send(chunk.clone());
+                        if line_tx.send(chunk.clone()).is_err() {
+                            warn!("capture thread dead — bytes lost");
+                        }
                         // Err just means no subscribers; that's fine.
                         let _ = to_clients.send(chunk);
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) => { warn!("serial read error: {e}"); break InnerExit::Disconnect; }
                 },
                 Some(data) = write_rx.recv() => {
@@ -389,11 +392,14 @@ fn emit_marker(
 }
 
 fn push_ring(ring: &Arc<Mutex<VecDeque<u8>>>, chunk: &[u8]) {
-    let mut r = ring.lock().unwrap();
-    r.extend(chunk.iter().copied());
-    let overflow = r.len().saturating_sub(RING_BYTES);
-    if overflow > 0 {
-        r.drain(0..overflow);
+    // try_lock: if scrollback() holds the lock, skip rather than blocking
+    // the supervisor OS thread (which stalls the read loop and risks FIFO overflow).
+    if let Ok(mut r) = ring.try_lock() {
+        r.extend(chunk.iter().copied());
+        let overflow = r.len().saturating_sub(RING_BYTES);
+        if overflow > 0 {
+            r.drain(0..overflow);
+        }
     }
 }
 
