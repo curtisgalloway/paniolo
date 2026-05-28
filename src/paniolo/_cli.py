@@ -14,9 +14,12 @@
 
 from __future__ import annotations
 
+import grp
 import os
+import pwd
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Annotated, Optional
@@ -1037,37 +1040,99 @@ def hid_show() -> None:
 # ── setup ─────────────────────────────────────────────────────────────────────
 
 
+def _user_in_group(group_name: str) -> bool:
+    """Return True if the current user is a member of group_name."""
+    try:
+        gid = grp.getgrnam(group_name).gr_gid
+    except KeyError:
+        return True  # group doesn't exist on this system
+    return gid in os.getgroups() or gid == os.getgid()
+
+
+def _ensure_linux_groups() -> bool:
+    """Add the current user to dialout and video groups if needed.
+
+    Returns True if any group changes were made (meaning a re-login is needed
+    for them to take effect).
+    """
+    _REQUIRED_GROUPS = [
+        ("dialout", "serial port access (/dev/ttyUSB*, /dev/ttyACM*)"),
+        ("video",   "V4L2 capture device access (/dev/video*)"),
+    ]
+    username = pwd.getpwuid(os.getuid()).pw_name
+    changed = False
+    for group, reason in _REQUIRED_GROUPS:
+        try:
+            grp.getgrnam(group)
+        except KeyError:
+            continue  # group not present on this system, skip
+        if _user_in_group(group):
+            console.print(f"  [green]✓[/green] {group:12s} already a member")
+        else:
+            result = subprocess.run(
+                ["sudo", "usermod", "-aG", group, username],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                console.print(f"  [green]✓[/green] {group:12s} added ({reason})")
+                changed = True
+            else:
+                err.print(
+                    f"  [red]✗[/red] {group}: could not add user "
+                    f"({result.stderr.strip() or result.stdout.strip()})"
+                )
+    return changed
+
+
 @app.command()
 def setup() -> None:
-    """Install system tools (tftp-now) and build/install paniolo's binaries.
+    """Install system tools and build/install paniolo's binaries.
 
-    Builds hdmicap and serialcap (cargo install) and visionocr (swiftc) into
-    ~/.cargo/bin so the daemons resolve from a stable installed path, not the
-    in-repo build tree.
+    Builds hdmicap and serialcap (cargo install) into ~/.cargo/bin so the
+    daemons resolve from a stable installed path, not the in-repo build tree.
+    On macOS, also installs the visionocr OCR helper (swiftc) and tftp-now
+    (Homebrew).  On Linux, DHCP and TFTP are pure-Python; no extra tools needed.
     """
     repo = Path(__file__).parent.parent.parent
     cargo_bin = Path.home() / ".cargo" / "bin"
 
-    # 1. System tool: tftp-now via Homebrew.
-    if not shutil.which("brew"):
-        err.print("[red]Homebrew not found.[/red] Install it: https://brew.sh")
-        raise typer.Exit(1)
-    tftp = shutil.which("tftp-now") or next(
-        (str(p) for d in _netboot._BREW_PATHS if (p := Path(d) / "tftp-now").exists()),
-        None,
-    )
-    if tftp:
-        console.print(f"  [green]✓[/green] tftp-now     {tftp}")
-    else:
-        console.print("  [dim]…[/dim] installing tftp-now via brew")
-        try:
-            subprocess.run(["brew", "install", "tftp-now"], check=True)
-        except subprocess.CalledProcessError:
-            err.print(
-                "[yellow]tftp-now not in default tap.[/yellow] "
-                "Try: brew tap curl/curl && brew install tftp-now"
-            )
+    # 1. macOS system tool: tftp-now via Homebrew.
+    #    On Linux, DHCP and TFTP are built into paniolo as pure-Python servers;
+    #    no external TFTP binary is needed.
+    if sys.platform == "darwin":
+        if not shutil.which("brew"):
+            err.print("[red]Homebrew not found.[/red] Install it: https://brew.sh")
             raise typer.Exit(1)
+        tftp = shutil.which("tftp-now") or next(
+            (str(p) for d in _netboot._BREW_PATHS if (p := Path(d) / "tftp-now").exists()),
+            None,
+        )
+        if tftp:
+            console.print(f"  [green]✓[/green] tftp-now     {tftp}")
+        else:
+            console.print("  [dim]…[/dim] installing tftp-now via brew")
+            try:
+                subprocess.run(["brew", "install", "tftp-now"], check=True)
+            except subprocess.CalledProcessError:
+                err.print(
+                    "[yellow]tftp-now not in default tap.[/yellow] "
+                    "Try: brew tap curl/curl && brew install tftp-now"
+                )
+                raise typer.Exit(1)
+    else:
+        console.print(
+            "  [dim]ℹ[/dim]  Linux: DHCP+TFTP are built-in. "
+            "Before building, ensure system packages are installed:\n"
+            "    sudo apt-get install build-essential pkg-config libudev-dev libclang-dev"
+        )
+        console.print("\n[dim]Checking group membership…[/dim]")
+        needs_relogin = _ensure_linux_groups()
+        if needs_relogin:
+            console.print(
+                "\n[yellow]Note:[/yellow] Group changes take effect after you log out and back in "
+                "(or run [bold]newgrp dialout[/bold] in the current shell)."
+            )
 
     # 2. Rust daemons: cargo install into ~/.cargo/bin.
     cargo = shutil.which("cargo")
@@ -1090,7 +1155,7 @@ def setup() -> None:
                 err.print(f"  [red]✗[/red] {crate}: cargo install failed")
                 raise typer.Exit(1)
 
-    # 3. visionocr (Apple Vision OCR) via swiftc.
+    # 3. visionocr (Apple Vision OCR) via swiftc — macOS only.
     try:
         dest = cargo_bin / "visionocr"
         _ocr.build_visionocr(dest)

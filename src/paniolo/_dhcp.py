@@ -127,62 +127,109 @@ def _build_reply(
     return pkt
 
 
-def _set_arp(ip: str, mac: str) -> None:
+def _set_arp(ip: str, mac: str, interface: str | None = None) -> None:
     """Pin a static ARP entry mapping the client IP to the MAC we just saw in a
     DHCP packet.
 
     The Pi's netboot firmware sends us DHCP/TFTP but does NOT answer ARP
-    requests, so macOS cannot resolve its MAC dynamically and every unicast
-    reply fails with EHOSTUNREACH ("no route to host"). We already know the MAC
-    from the DHCP frame, so install it directly. `arp -s` replaces any existing
-    entry, so calling this on each DHCP exchange tracks the active MAC (the Pi
-    cycles through several across boot phases). Needs root, like the interface
-    IP assignment; both are unavoidable OS-level network config on macOS.
+    requests. We already know the MAC from the DHCP frame, so install it
+    directly. Calling this on each DHCP exchange tracks the active MAC (the Pi
+    cycles through several boot phases). Needs root.
+
+    macOS: uses `arp -s` (net-tools syntax).
+    Linux: uses `ip neigh replace` (iproute2, requires interface name).
     """
-    r = subprocess.run(
-        ["sudo", "arp", "-s", ip, mac], capture_output=True, text=True
-    )
-    if r.returncode != 0:
-        log.warning("arp -s %s %s failed: %s", ip, mac, r.stderr.strip() or r.stdout.strip())
+    if sys.platform == "darwin":
+        r = subprocess.run(
+            ["sudo", "arp", "-s", ip, mac], capture_output=True, text=True
+        )
+        if r.returncode != 0:
+            log.warning("arp -s %s %s failed: %s", ip, mac, r.stderr.strip() or r.stdout.strip())
+    else:
+        cmd = ["sudo", "ip", "neigh", "replace", ip, "lladdr", mac, "nud", "permanent"]
+        if interface:
+            cmd += ["dev", interface]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            log.warning(
+                "ip neigh replace %s lladdr %s failed: %s", ip, mac, r.stderr.strip()
+            )
     # Share with the co-process TFTP server so it can build BPF raw frames
-    # addressed to the Pi's real MAC (which the kernel may have overridden with a
-    # per-packet ephemeral MAC the bootloader only uses for sending, not receiving).
+    # (macOS) or just for diagnostics (Linux).
     try:
         _CLIENT_MAC_FILE.write_text(mac)
     except OSError as exc:
         log.debug("could not write client MAC file: %s", exc)
 
 
-def _monitor_interface(interface: str, host_ip: str) -> None:
-    """Continuously enforce the static IP on the interface.
-
-    macOS drops a manually-set IPv4 every time the USB-Ethernet link flaps —
-    and the netboot client flaps the link on every power-cycle and at several
-    points during its own boot. While the interface has no IP there is no route
-    to the client, so DHCP/TFTP replies fail with EHOSTUNREACH ("no route to
-    host"). We poll fast and re-apply the IP immediately so the window where
-    the client can't reach us is at most a couple hundred milliseconds — short
-    enough that the client's next retry lands.
-    """
-    had_ip = True
-    while True:
-        time.sleep(0.25)
+def _has_interface_ip(interface: str, host_ip: str) -> bool:
+    """Return True if `host_ip` is currently assigned to `interface`."""
+    if sys.platform == "darwin":
         try:
             out = subprocess.check_output(
                 ["ifconfig", interface], text=True, stderr=subprocess.DEVNULL
             )
-        except subprocess.CalledProcessError:
-            out = ""
-        has_ip = f"inet {host_ip} " in out
-        is_active = "status: active" in out
+            return f"inet {host_ip} " in out
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
+    else:
+        # Check sysfs; /sys/class/net/<iface>/address holds MAC but not IP.
+        # Use `ip addr show` instead.
+        try:
+            out = subprocess.check_output(
+                ["ip", "addr", "show", "dev", interface],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            return f"inet {host_ip}/" in out or f"inet {host_ip} " in out
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
+
+
+def _is_link_up(interface: str) -> bool:
+    """Return True if the interface link is currently up."""
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.check_output(
+                ["ifconfig", interface], text=True, stderr=subprocess.DEVNULL
+            )
+            return "status: active" in out
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
+    else:
+        try:
+            carrier = Path(f"/sys/class/net/{interface}/carrier").read_text().strip()
+            return carrier == "1"
+        except OSError:
+            return False
+
+
+def _monitor_interface(interface: str, host_ip: str) -> None:
+    """Continuously enforce the static IP on the interface.
+
+    The netboot client flaps the link on every power-cycle and at several
+    points during its own boot. macOS drops a manually-set IPv4 on link flap;
+    Linux is more stable but NetworkManager may reset the address. We poll fast
+    and re-apply immediately so the client's next retry always succeeds.
+    """
+    had_ip = True
+    while True:
+        time.sleep(0.25)
+        has_ip = _has_interface_ip(interface, host_ip)
+        is_active = _is_link_up(interface)
 
         if not has_ip and is_active:
-            # Re-apply every poll until it sticks (idempotent); a single attempt
-            # can lose a race with macOS still tearing the config down.
-            subprocess.run(
-                ["sudo", "ifconfig", interface, host_ip, "netmask", "255.255.255.0", "up"],
-                check=False,
-            )
+            if sys.platform == "darwin":
+                subprocess.run(
+                    ["sudo", "ifconfig", interface, host_ip, "netmask", "255.255.255.0", "up"],
+                    check=False,
+                )
+            else:
+                subprocess.run(
+                    ["sudo", "ip", "addr", "add", f"{host_ip}/24", "dev", interface],
+                    check=False,
+                    capture_output=True,
+                )
             if had_ip:
                 log.warning("interface %s lost IP %s — restoring", interface, host_ip)
         elif has_ip and not had_ip:
@@ -207,7 +254,15 @@ def serve(
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    sock.bind(("", 67))
+    try:
+        sock.bind(("", 67))
+    except PermissionError:
+        log.error(
+            "Cannot bind to port 67 (DHCP). On Linux, run paniolo as root or "
+            "grant CAP_NET_BIND_SERVICE: sudo setcap cap_net_bind_service=+ep "
+            "$(which python3)"
+        )
+        raise
     log.info(
         "DHCP listening on 0.0.0.0:67  host_ip=%s  bcast=%s  boot_file=%s",
         host_ip,
@@ -240,7 +295,7 @@ def serve(
 
         if msg_type_val == _DHCP_DISCOVER:
             log.info("DHCPDISCOVER from %s", mac)
-            _set_arp(_ASSIGNED_IP, mac)
+            _set_arp(_ASSIGNED_IP, mac, interface)
             reply = _build_reply(xid, chaddr, _DHCP_OFFER, host_ip, _ASSIGNED_IP, boot_file)
             sock.sendto(reply, (bcast, 68))
             log.info(
@@ -253,7 +308,7 @@ def serve(
 
         elif msg_type_val == _DHCP_REQUEST:
             log.info("DHCPREQUEST from %s", mac)
-            _set_arp(_ASSIGNED_IP, mac)
+            _set_arp(_ASSIGNED_IP, mac, interface)
             reply = _build_reply(xid, chaddr, _DHCP_ACK, host_ip, _ASSIGNED_IP, boot_file)
             sock.sendto(reply, (bcast, 68))
             log.info("DHCPACK → %s  ip=%s", mac, _ASSIGNED_IP)
