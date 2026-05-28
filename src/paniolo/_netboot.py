@@ -27,6 +27,7 @@ from ._state import (
     NetbootState,
     ensure_target_dir,
     is_netboot_running,
+    is_paniolo_child_alive,
     is_pid_alive,
     load_netboot_state,
     netboot_log_path,
@@ -204,8 +205,11 @@ def _cleanup_stale(target: str) -> None:
     state = load_netboot_state(target)
     if state is None:
         return
-    for pid in (state.dhcp_pid, state.tftp_pid):
-        if is_pid_alive(pid):
+    for pid, module in (
+        (state.dhcp_pid, "paniolo._dhcp"),
+        (state.tftp_pid, "paniolo._tftp"),
+    ):
+        if is_paniolo_child_alive(pid, module):
             try:
                 os.kill(pid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
