@@ -37,6 +37,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use tracing::error;
 
 /// Default number of lines retained across all rotated segments.
 pub const DEFAULT_BUFFER_LINES: u64 = 50_000;
@@ -196,13 +197,18 @@ impl LineLog {
             partial: false,
         };
         self.next_seq += 1;
-        if let Some(w) = self.writer.as_mut() {
-            if let Ok(mut s) = serde_json::to_string(&line) {
-                s.push('\n');
-                if w.write_all(s.as_bytes()).is_ok() {
-                    self.active_lines += 1;
+        match self.writer.as_mut() {
+            None => error!("capture writer is None; line seq={} lost", line.seq),
+            Some(w) => match serde_json::to_string(&line) {
+                Err(e) => error!("capture serialize seq={} failed: {e}", line.seq),
+                Ok(mut s) => {
+                    s.push('\n');
+                    match w.write_all(s.as_bytes()) {
+                        Ok(()) => self.active_lines += 1,
+                        Err(e) => error!("capture write seq={} failed: {e}", line.seq),
+                    }
                 }
-            }
+            },
         }
         if self.active_lines >= self.seg_lines {
             self.rotate();
