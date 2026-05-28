@@ -1,0 +1,32 @@
+[project]
+name = "paniolo"
+version = "0.1.0"
+description = "Agent-controlled target machine wrangler for low-level software development"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "typer>=0.12",
+]
+
+[project.scripts]
+paniolo = "paniolo._cli:app"
+
+[project.optional-dependencies]
+hid = [
+    "pyserial>=3.5",
+]
+
+[tool.uv]
+package = true
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

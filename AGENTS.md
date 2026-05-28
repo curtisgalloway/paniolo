@@ -1,0 +1,534 @@
+<!--
+Copyright 2026 Curtis Galloway
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
+# Paniolo — Agent Instructions
+
+## Skill
+
+A Repomix-generated reference skill lives at `.claude/skills/paniolo-reference/`.
+Load it at the start of any session to get a full structural map of the codebase.
+
+## Before opening a PR
+
+Run through this checklist before calling `gh pr create`:
+
+1. **Update docs that the PR affects.** For each changed subsystem, check:
+   - `docs/<subsystem>.md` — commands, config fields, workflows
+   - `README.md` — capabilities table, installation steps
+   - `AGENTS.md` — module layout, command descriptions, architecture notes
+   Include doc updates in the same PR, not a follow-up.
+
+2. **Regenerate the reference skill.** Use the Repomix CLI (`brew install repomix`,
+   or `npx -y repomix@latest`) from the repo root:
+
+   ```
+   repomix --skill-generate paniolo-reference \
+       --skill-output .claude/skills/paniolo-reference --force \
+       -i "captures/**,.git/**,.claude/skills/**"
+   ```
+
+   `target/` dirs and `ocr/visionocr` are gitignored, so Repomix skips them.
+   Excluding `.claude/skills/**` prevents the old skill from being packed into
+   the new one. Stage the updated skill files in the same commit.
+
+3. **Open the PR; do not merge it.** Push the branch and create the PR with
+   `gh pr create`, then stop. The merge decision belongs to the user.
+
+## Purpose
+
+Paniolo is a CLI tool that lets an AI agent fully control a target machine
+during low-level software development (bootloader, firmware, OS bring-up).
+"Paniolo" is the Hawaiian word for cowboy — the agent wrangles the target.
+
+Current capabilities:
+- DHCP + TFTP netboot over a direct USB-Ethernet link (`paniolo netboot`)
+- HDMI/USB capture via hdmicap warm-stream daemon (`paniolo video`)
+- Serial console — interactive (tio) or daemon-backed for the web dashboard (`paniolo serial`);
+  one daemon owns several named interfaces, each with a timestamped rolling capture
+  log queryable by line range (`paniolo serial log -i <name>`)
+- Combined video+serial web dashboard (hdmicap's `GET /`: video on top, xterm.js terminal below)
+- On-device OCR of the captured screen via Apple Vision (`paniolo video read`, dashboard OCR button)
+- USB HID input (keyboard/mouse injection) via the KB2040 rig (`paniolo hid`)
+- Power cycling via DTR (J2 wiring) or a configurable shell script (`paniolo serial dtr`, `paniolo power-cycle`)
+
+## Architecture
+
+**Option A (current):** one daemon per subsystem, controlled via SSH. No
+long-running parent process; state lives in JSON + PID files under
+`~/.local/share/paniolo/<target>/`. The `paniolo` binary is the only process
+that needs to persist in PATH; each subsystem daemon is a backgrounded
+subprocess.
+
+**Option B (future):** single long-running server with socket-based RPC,
+enabling inter-subsystem coordination (e.g., "stream serial output whenever
+a netboot attempt fires"). Will be implemented in Rust when the complexity
+of option A is no longer sufficient.
+
+## Module layout
+
+```
+src/paniolo/
+  _cli.py       typer CLI — subcommand groups: target, netboot, video, serial, hid
+                            top-level commands: console, power-cycle, power-state, setup
+  _config.py    TargetConfig CRUD (+ named SerialInterface list) (~/.config/paniolo/targets/<name>.toml)
+  _state.py     daemon state files (~/.local/share/paniolo/<target>/)
+  _netboot.py   dnsmasq + tftp-now subprocess management
+  _video.py     VideoConfig, hdmicap device discovery, daemon start/stop/URL helpers
+  _serial.py    serial helpers: tio (interactive) + serialcap daemon start/stop/URL
+  _ocr.py       visionocr tool discovery (builds it if needed) + read_text()
+  _hid.py       HID rig client: text commands over serial, scaling + sequencing
+  _power.py     DTR button-press helpers: dtr_button_press() (via serialcap daemon), dtr_direct_button_press() (pyserial fallback)
+
+tests/           pytest suite (host-side; no hardware) — currently test_hid.py
+
+hdmicap/         Rust crate: warm-stream HDMI capture daemon
+  src/
+    main.rs      CLI subcommands: daemon, devices, shot, watch, preview, stop
+    capture.rs   nokhwa-backed capture backend (avfoundation/v4l2)
+    capture_thread.rs  std::thread owning device, publishes into watch channel
+    frame.rs     FrameState, Signal enum, aHash, is_no_signal
+    server.rs    axum HTTP API: GET / (dashboard), /status, /snapshot, /preview,
+                 /ocr, /devices, and /xterm.* static assets
+    daemon.rs    advisory lock, discovery file, tokio runtime, graceful shutdown
+  assets/        index.html (combined dashboard) + vendored xterm.js/css/fit addon
+  vendor/
+    nokhwa-bindings-macos/  patched: removes frame-duration KVC calls that throw
+                            NSException on HDMI capture cards (e.g. MS2109)
+
+serialcap/       Rust crate: serial console daemon (parallels hdmicap)
+  src/
+    main.rs      CLI subcommands: daemon (--interface NAME=DEV[@BAUD], repeatable),
+                 log (-i NAME), devices, stop
+    serial_io.rs one supervisor per interface: tokio-serial port owner; reconnect
+                 loop; broadcast fan-out to WS clients; mpsc client->port; 64KB
+                 scrollback ring; tees every chunk to that interface's capture
+                 thread (off the live fan-out path). `Serials` holds the named set
+    capture.rs   line assembler: splits bytes into timestamped, sequence-numbered
+                 lines; appends them to a rotating on-disk JSONL log under
+                 capture/<name>/ (survives restarts; resumes the seq counter);
+                 mirrors the current unterminated line to a pending sidecar. Also
+                 the `log` reader (interface select; tail / range / since,
+                 ANSI-stripped by default) + UTC formatting
+    server.rs    axum: GET /stream (bidirectional WebSocket), /status, /interfaces,
+                 /devices. Per-interface endpoints take ?interface=NAME, defaulting
+                 to the first configured interface
+    daemon.rs    advisory lock, discovery file, tokio runtime, graceful shutdown;
+                 spawns one supervisor per interface
+
+ocr/             visionocr.swift: tiny Apple Vision OCR helper (compiled binary
+                 is gitignored; built on demand by _ocr.py via swiftc)
+
+hidrig/          CircuitPython firmware for the USB HID injection rig
+  target/code.py   I2C target -> USB HID (KB2040 plugged into the Pi)
+  control/code.py  USB serial -> I2C controller (text command parser; owns the
+                   wire protocol — source of truth, kept in sync with target)
+  control/boot.py  enables the usb_cdc data channel
+  host/hid_seize_reports.c  macOS IOKit tool: seizes the HID device exclusively
+                   and prints raw input reports — for pipeline testing without
+                   keystrokes reaching the focused app. Build with host/Makefile.
+  README.md        wiring, command + wire protocol; HANDOFF.md: remaining firmware work
+```
+
+## Combined dashboard (video + serial)
+
+hdmicap's `GET /` serves a two-pane page: the MJPEG video on top, an xterm.js
+terminal below. The terminal opens a WebSocket to **serialcap** (a separate
+daemon/port), so the two subsystems stay decoupled — hdmicap only references
+serialcap by URL. Defaults to `ws://<host>:8724/stream`; override with
+`?serial=<port>` or `?serialws=<url>`. serialcap sends serial bytes as binary
+frames and accepts keystrokes back over the same socket. xterm.js is vendored
+(not CDN) so the dashboard works on an isolated lab network. This is the first
+concrete instance of the "Option B" inter-subsystem coordination described above.
+
+**Multi-pane serial:** the page fetches `GET /interfaces` from serialcap on
+load and calls `buildPanes(names)`. With one interface a single terminal fills
+the panel and connection status appears in the top bar. With multiple interfaces
+each gets its own `.serial-pane` div (label + status bar + xterm.js terminal),
+laid out side by side in bottom mode or stacked in right-panel mode. All fits
+are tracked in `allFits[]` so resize and layout-toggle events re-fit every
+terminal. `?interface=<name>` bypasses the fetch and opens single-pane mode
+pinned to that interface.
+
+**Layout toggle:** a button in the status bar switches the serial panel between
+bottom (default, 40 vh) and right-panel (380 px fixed, video fills remaining
+width) layouts. The choice is persisted in `localStorage` under the key
+`paniolo-serial-layout`.
+
+## OCR (Apple Vision)
+
+`ocr/visionocr.swift` is a one-file helper using `VNRecognizeTextRequest`:
+on-device, no network, no model download. Reads a PNG on stdin (or a path),
+prints recognized text in reading order, or `--json` with bounding boxes.
+`paniolo setup` compiles it (`swiftc`) into `~/.cargo/bin`; `_ocr.visionocr_binary()`
+resolves it from PATH then `~/.cargo/bin` (never the build tree).
+
+Two entry points, both feeding it the same warm frame:
+- **`paniolo video read`** — fetches a snapshot (via `hdmicap shot`) and OCRs it.
+- **Dashboard button + hdmicap `GET /ocr`** — the daemon PNG-encodes the current
+  frame and pipes it to `visionocr` (`tokio::process`), returning the text. The
+  daemon finds the tool via `PANIOLO_VISIONOCR` (the installed path, set by
+  `paniolo video watch`), falling back to PATH; if absent, `/ocr` returns 501 and
+  the button shows an error.
+
+Tuning that matters for **small console text** (learned the hard way — see gotchas):
+- `recognitionLevel = .fast` is the default, not `.accurate`. `.accurate` is
+  tuned for natural document text and returns *nothing* on thin console fonts.
+- The tool 2×-upscales and black-pads the frame before recognition (fixes colon
+  misreads and first-character clipping at the frame edge).
+- `minimumTextHeight` is lowered (it's a fraction of image height; the default
+  1/32 skips ~16px console text).
+
+## _config.py
+
+`TargetConfig` is a `@dataclass` with fields: `name`, `interface`,
+`host_ip` (default `192.168.99.1`), `tftp_root` (optional),
+`power_cycle_cmd` (optional shell command/script for `paniolo power-cycle`),
+`power_serial_interface` (optional — default interface name for DTR commands),
+and `serial_interfaces` — a list of `SerialInterface(name, device, baud,
+power_sense_signal)`. A target can have several named serial consoles (e.g.
+`console`, `bmc`); helpers `serial_interface(name=None)` (resolves by name, or
+the sole one when omitted — raising on ambiguity), `upsert_serial_interface()`,
+and `remove_serial_interface()` manage them.
+
+Serialized as TOML using a hand-rolled writer (`_to_toml()` + `_toml_kv()`):
+scalar fields first, then one `[[serial]]` array-of-tables block per interface
+(Python 3.11 `tomllib` reads TOML but does not write it; avoids adding `tomli-w`).
+`_from_dict()` reads it back and **migrates** the legacy single-serial fields
+(`serial_device`/`serial_baud`) into one interface named `console`, and silently
+drops any `ha_power_entity` field from old configs, so older target files keep loading.
+
+Config files live at `~/.config/paniolo/targets/<name>.toml`.
+
+## _state.py
+
+Runtime state for each subsystem daemon. Currently only netboot.
+
+`NetbootState` is a `@dataclass`: `target`, `dnsmasq_pid`, `tftp_pid`,
+`started_at` (float epoch), `interface`, `tftp_root`. Stored as JSON at
+`~/.local/share/paniolo/<name>/netboot.json`.
+
+`is_pid_alive(pid)` uses `os.kill(pid, 0)`: returns `True` if the process
+exists; catches `ProcessLookupError` (dead) and `PermissionError` (exists but
+owned by another user — treat as alive).
+
+## _netboot.py
+
+Manages dnsmasq and tftp-now as backgrounded subprocesses.
+
+**`_find_bin(name)`** searches `PATH` via `shutil.which`, then falls back to
+`_BREW_PATHS = ["/opt/homebrew/bin", "/usr/local/bin"]`. This is needed
+because SSH non-interactive shells often lack Homebrew in PATH even when the
+user's interactive shell has it.
+
+**`_dnsmasq_conf(cfg, tftp_root)`** generates the dnsmasq config string.
+Key choices:
+- `bind-interfaces` is intentionally absent — dnsmasq binds `0.0.0.0:67`,
+  which works without root on macOS 10.14+.
+- `dhcp-boot=kernel_2712.img,,{host_ip}` sets `siaddr` (BOOTP next-server).
+- `dhcp-option=66,{host_ip}` sets DHCP option 66 (TFTP server name). The
+  RPi 5 EEPROM reads option 66 preferentially over `siaddr` — set both.
+- `log-facility=-` redirects dnsmasq syslog output to stderr → log file.
+- `port=0` disables DNS.
+
+**`start(cfg)`** flow: guard → check deps → validate tftp_root →
+configure interface (sudo ifconfig) → write dnsmasq config → spawn dnsmasq
+→ spawn tftp-now → save state.
+
+**`stop(target)`** sends SIGTERM to both PIDs, waits up to 3 s, removes state.
+
+## _video.py
+
+`VideoConfig` dataclass: `device` only. Saved to `~/.config/paniolo/video.toml`.
+
+`hdmicap_binary()` resolves the *installed* binary — PATH, then `~/.cargo/bin`.
+It never points at the in-repo `target/` build tree, so a running daemon can't
+reference an ephemeral build artifact that a checkout/cleanup deletes. `paniolo
+setup` installs it (`cargo install`).
+
+`list_devices()` runs `hdmicap devices` and parses its text output
+(`  <index>  <name>  [<misc>]`) into `[{index, name, misc}]` dicts.
+
+`guess_capture_device(devices)` returns the single non-built-in device (filters
+out FaceTime, iSight, iPhone, iPad), or None if ambiguous.
+
+`daemon_url()` reads hdmicap's discovery file (`$TMPDIR/hdmicap/daemon.json`),
+verifies the PID is alive, and returns `http://127.0.0.1:<port>` or None.
+
+`start_daemon(cfg, port)` spawns `hdmicap daemon --device <name> --port <port>`
+detached (`start_new_session=True`). Caller polls `daemon_url()` to confirm
+startup.
+
+## _serial.py
+
+Two paths share this module:
+
+- **Interactive (`paniolo serial connect`):** `tio_binary()` + `connect_cmd()`
+  build a `tio` invocation; `_cli.py` `os.execvp`s into it for a foreground
+  terminal. Unchanged, dependency-light path.
+- **Daemon (`paniolo serial watch`):** `serialcap_binary()` resolves the
+  installed binary (PATH then `~/.cargo/bin`, never the build tree, same as
+  `hdmicap_binary`), `start_daemon(interfaces, port, buffer_lines=None)` spawns
+  one daemon owning *all* the target's interfaces (`daemon_cmd()` builds the argv,
+  one repeated `--interface NAME=DEVICE@BAUD` per interface via `interface_arg()`),
+  `daemon_url()` reads `$TMPDIR/serialcap/daemon.json` and verifies the PID,
+  mirroring `_video.py`. Interfaces come from the target's
+  `TargetConfig.serial_interfaces`.
+
+`list_serial_devices()` globs `/dev/tty.usb*` (macOS) or `/dev/ttyUSB*` /
+`/dev/ttyACM*` (Linux). serialcap itself enumerates via the cross-platform
+`serialport` crate (`serialcap devices`), which gives richer USB VID/PID info.
+
+**Captured output (`paniolo serial log`):** `log_cmd()` builds the `serialcap
+log` argv; `_cli.py` resolves the binary and execs it as a passthrough. All the
+buffering, line assembly, timestamping, and range logic live in Rust
+(`serialcap/src/capture.rs`) — the daemon owns the port and is the only thing
+that sees every byte, so it persists timestamped lines to an on-disk JSONL log.
+`serialcap log` reads that log *directly* (no daemon round-trip), so it works
+whether or not the daemon is running. Flags: `--interface/-i NAME` (which
+interface; optional when only one was captured), `--tail N`, `--from/--to` (seq
+range), `--since` (poll for new lines), `--raw` (keep ANSI), `--json`,
+`--no-pending`. Lines carry a monotonic `seq` (stable across eviction, so a
+range/`--since` query stays valid) and a UTC `ts_ms`; output is ANSI-stripped by
+default. Each interface captures into its own `capture/<name>/` dir, so logs
+never conflate. The live WebSocket dashboard view is unchanged — capture is
+purely additive and runs on a separate thread so disk I/O can't stall the fan-out.
+
+## _hid.py
+
+Host client for the `hidrig/` USB HID injection rig. `paniolo hid` is a **thin
+text-command client**: it sends line commands (`type ...`, `key ENTER`, `move
+dx dy`, ...) to the control board's USB CDC *data* port; the board parses them
+and relays HID events. The board owns the wire protocol — `_hid.py` does not
+re-encode packets host-side.
+
+- `HidConfig(port)` saved to `~/.config/paniolo/hid.toml`; `list_serial_ports()`
+  / `guess_data_port()` find the control board's data CDC node (the
+  higher-numbered of the two it exposes).
+- `HidRig` opens the port (lazy `pyserial` import) and `cmd()`s lines, raising on
+  the board's `ERR` reply. Pass `transport=` to drive it without hardware (tests).
+- Host-side sequencing (the board stays dumb): `parse_sequence()` (command files
+  with `# comments` and `delay <ms>` / `sleep <s>` directives), `run_sequence()`,
+  `repeat_key()`, and `scale_to_logical()` (pixel -> 0..32767 for future abs mouse).
+
+`pyserial` is an **optional extra** (`pip install 'paniolo[hid]'` / `uv sync
+--extra hid`), imported lazily — the core install stays typer-only and the
+test suite needs neither pyserial nor hardware.
+
+## hidrig firmware
+
+The `hidrig/` directory contains CircuitPython 9.x firmware for two RP2040
+boards that together form a USB HID injection rig.
+
+### Architecture
+
+```
+[test computer]
+  |-- USB serial (data CDC) --> [control board: Trinkey QT2040 or KB2040]
+                                     |-- STEMMA QT (I2C, 100 kHz) -->
+                                                         [target board: KB2040]
+                                                              |-- USB HID -->
+                                                                     [Pi / DUT]
+```
+
+The control board (`control/code.py`) reads line-delimited text commands from
+the USB CDC **data** port, encodes them as compact binary I2C packets, and
+writes them to the target at address `0x41`. The target board (`target/code.py`)
+receives packets over I2C and replays them as USB HID keyboard/mouse events.
+
+### Wire protocol
+
+Each I2C write is `[opcode][payload...]`. Opcodes 0x01–0x04 are keyboard;
+0x10–0x13 are mouse. The `TYPE` opcode (0x04) carries UTF-8 text; the control
+board chunks it at 30 bytes so the packet never exceeds 31 bytes total.
+
+### I2C FIFO and drain loop
+
+The RP2040 I2C hardware RX FIFO is **16 bytes deep**. For packets larger than
+16 bytes, `req.read()` in CircuitPython returns only the bytes currently
+buffered — it does not wait for the STOP condition — so calling it once after a
+fixed sleep truncates large TYPE packets.
+
+The target uses a drain loop instead of a fixed sleep:
+
+```python
+data = bytearray()
+while True:
+    chunk = req.read(64)
+    if not chunk:
+        break
+    data.extend(chunk)
+    time.sleep(0.001)  # let next FIFO batch arrive
+handle(bytes(data))
+```
+
+The 1 ms inter-read sleep allows the next bytes to clock in (at 100 kHz, 11
+bytes arrive per ms). The loop terminates when `req.read()` returns empty bytes
+after the STOP condition is received. This approach is correct for any packet
+size and any I2C clock rate.
+
+### Handshake
+
+After each I2C write the control board polls a 1-byte I2C read from the target
+until the target responds `0x01`. The target sends `0x01` only after `handle()`
+returns (i.e., after the HID event has been submitted to the host). This
+back-pressure prevents the control board from sending the next packet while the
+target is still processing, which previously caused ENTER key flooding (release
+packet dropped → key held → auto-repeat) and `[Errno 5]` I/O errors on the I2C
+bus.
+
+### Host testing tool (`hidrig/host/`)
+
+`hid_seize_reports.c` is a macOS IOKit utility that opens the target board's
+HID interface with `kIOHIDOptionsTypeSeizeDevice`, preventing any keystroke from
+reaching the focused application. It registers an input report callback and
+prints hex dumps of every keyboard and mouse report. Use it to verify the full
+pipeline end-to-end without the Pi:
+
+```bash
+cd hidrig/host && make
+sudo ./hid_seize_reports   # grant Input Monitoring in System Settings first
+```
+
+Run `paniolo hid type/key/move/click/scroll` in a second terminal and read the
+reports. The tool prints the 156-byte report descriptor on first device match,
+so you can verify the HID descriptor matches expectations.
+
+VID/PID are 0x239A/0x8106 (KB2040 running CircuitPython). The built binary is
+gitignored; re-run `make` after cloning.
+
+### Negative number arguments (`move`, `scroll`)
+
+Click's tokenizer treats any token starting with `-` as a potential option flag.
+`paniolo hid move` and `paniolo hid scroll` use
+`context_settings={"ignore_unknown_options": True}` and accept `dx`/`dy`/`amount`
+as `str` arguments (cast to `int` internally) so that `paniolo hid move 50 -30`
+and `paniolo hid scroll -3` work without the `--` separator.
+
+## _power.py
+
+Two functions; no new dependencies beyond stdlib `urllib.request` and an optional
+lazy `pyserial` import:
+
+`dtr_button_press(daemon_url, interface_name, duration_ms)` — POSTs to the
+serialcap daemon's `/button?interface=<name>&ms=<N>` endpoint. Blocks until the
+press completes. Raises `RuntimeError` on HTTP error, `OSError` on network
+failure.
+
+`dtr_direct_button_press(device, duration_ms)` — pyserial fallback for when the
+daemon is not running. Opens the port, asserts DTR for the given duration, then
+releases. Raises `RuntimeError` if pyserial is not installed.
+
+## _cli.py
+
+Built with [Typer](https://typer.tiangolo.com/) (rich output included).
+
+**`_resolve(name)`** applies the default-target rule: if `name` is None and
+exactly one target is configured, use it; otherwise require an explicit name.
+
+Subcommand groups:
+- `target_app` (`paniolo target`) — `set`, `show`, `clear`
+- `netboot_app` (`paniolo netboot`) — `start`, `stop`, `status`, `tftp-root`, `logs`
+- `video_app` (`paniolo video`) — `setup`, `watch`, `preview`, `shot`, `read` (OCR), `devices`, `show`, `stop`
+- `serial_app` (`paniolo serial`) — `setup` (`--name`), `remove`, `connect` (tio, `-i`),
+  `watch`/`stop` (serialcap daemon, all interfaces), `log` (captured output, `-i`),
+  `devices`, `show`, `dtr` (`--ms`, `-i` — pulse DTR on any interface), `reset` (`--ms`, `-i`)
+- `hid_app` (`paniolo hid`) — `setup`, `type`, `key`, `releaseall`, `combo`, `down`, `up`, `click`, `mdown`, `mup`, `move`, `scroll`, `run <file>`, `show`
+
+Top-level commands:
+- `paniolo console [-i INTERFACE]` — open the combined video+serial dashboard; checks both
+  daemons are running, then opens the hdmicap URL (with optional `?interface=NAME`) in the browser
+- `paniolo power-cycle [TARGET]` — runs `cfg.power_cycle_cmd` via `subprocess.run(..., shell=True)`
+- `paniolo power-state [TARGET]` — reads power state from the serialcap daemon `/status` endpoint (requires sense signal wired)
+- `paniolo setup` — installs tftp-now (Homebrew) and builds/installs paniolo's
+  own binaries: hdmicap + serialcap (`cargo install`) and visionocr (`swiftc`),
+  all into `~/.cargo/bin`
+
+## Runtime paths
+
+| Purpose | Path |
+|---|---|
+| Target configs | `~/.config/paniolo/targets/<name>.toml` |
+| Video config | `~/.config/paniolo/video.toml` |
+| Netboot daemon state | `~/.local/share/paniolo/<name>/netboot.json` |
+| Generated dnsmasq config | `~/.local/share/paniolo/<name>/dnsmasq.conf` |
+| Combined netboot log | `~/.local/share/paniolo/<name>/netboot.log` |
+| hdmicap discovery file | `$TMPDIR/hdmicap/daemon.json` (`{pid, port}`) |
+| hdmicap advisory lock | `$TMPDIR/hdmicap/daemon.lock` |
+| serialcap discovery file | `$TMPDIR/serialcap/daemon.json` (`{pid, port, interfaces:[{name, device, baud}]}`) |
+| serialcap advisory lock | `$TMPDIR/serialcap/daemon.lock` |
+| serialcap capture log | `$TMPDIR/serialcap/capture/<name>/serial.jsonl(.1..)` (rotated JSONL, per interface) |
+| serialcap pending line | `$TMPDIR/serialcap/capture/<name>/pending.json` (current unterminated line) |
+
+## Source code constraints
+
+- **No hardcoded network addresses, URLs, or hostnames.** All site-specific
+  values go in config files under `~/.config/paniolo/` and are populated via
+  setup commands. Error messages must be generic.
+- **No new dependencies without discussion.** Core dep: `typer` only; stdlib for
+  everything else (`urllib.request`, `tomllib`, `subprocess`). `pyserial` is an
+  optional extra (`[hid]`), lazy-imported, used only by `paniolo hid`. Dev: `pytest`.
+
+## Remote control pattern
+
+```bash
+ssh control-mac "paniolo target set target-machine --interface en3 --tftp-root ~/pxe \
+  --power-cycle-cmd /Users/you/.config/paniolo/scripts/power-cycle-target-machine.sh"
+ssh control-mac "paniolo netboot start target-machine"
+TFTP_ROOT=$(ssh control-mac "paniolo netboot tftp-root target-machine")
+scp kernel.img control-mac:"${TFTP_ROOT}/kernel_2712.img"
+ssh control-mac "paniolo netboot logs -f target-machine"
+op run --env-file .env -- ssh control-mac "paniolo power-cycle target-machine"
+ssh control-mac "paniolo netboot stop target-machine"
+```
+
+## Adding a new subsystem
+
+1. Create `src/paniolo/_<subsystem>.py`.
+2. Add state dataclass + path helpers to `_state.py` if the subsystem is a
+   daemon with a PID.
+3. Add a `<subsystem>_app = typer.Typer(...)` group in `_cli.py`.
+4. Add optional config fields to `TargetConfig` in `_config.py`.
+5. Regenerate the skill and update this file.
+
+## Known limitations / gotchas
+
+- **ifconfig requires root.** `_configure_interface()` needs NOPASSWD sudo.
+- **SSH PATH.** Non-interactive SSH shells often lack `/opt/homebrew/bin`.
+  `_find_bin()` probes `_BREW_PATHS` as a fallback.
+- **hdmicap device auto-detection.** With two non-built-in cameras (e.g. MS2109
+  + Razer Kiyo), `guess_capture_device` returns None and the user is prompted.
+  Pass `--device "USB Video"` (or whatever substring matches) to skip the prompt.
+- **nokhwa MS2109 compatibility.** The MS2109 HDMI capture card doesn't expose
+  standard MJPEG/YUYV formats through nokhwa's filtered list and throws
+  NSException from AVFoundation frame-duration KVC calls. The vendor patch in
+  `hdmicap/vendor/nokhwa-bindings-macos/` fixes this.
+- **Daemon shutdown hard-exits.** Both hdmicap (`/preview` MJPEG) and serialcap
+  (`/stream` WebSocket) serve infinite responses, so a plain axum graceful
+  shutdown would block on them forever. On SIGTERM each daemon removes its
+  discovery file, gives a 300 ms grace, then `std::process::exit(0)`. The OS
+  releases the capture device / serial port on exit.
+- **Serial ports are exclusive.** Only one of `tio`/`screen`/serialcap can hold
+  a port at a time. `paniolo serial watch` and `paniolo serial connect` conflict
+  on the same device — use one or the other.
+- **macOS serialport can't open PTYs.** The `serialport` crate sets baud via the
+  `IOSSIOSPEED` ioctl, which returns ENOTTY ("Not a typewriter") on pseudo-
+  terminals. serialcap byte-flow can only be tested against a real serial device,
+  not a `pty.openpty()` pair.
+- **Vision `.accurate` misses small console text.** `VNRecognizeTextRequest`'s
+  `.accurate` level returns nothing on thin terminal fonts (it's tuned for
+  natural document text); `.fast` reads them. visionocr defaults to `.fast` and
+  2×-upscales + pads. Even so, small thin fonts produce character confusions
+  (`1`↔`l`↔`I`, `2`↔`Z`); accuracy improves markedly on larger boot-screen text.

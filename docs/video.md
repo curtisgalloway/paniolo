@@ -1,0 +1,91 @@
+# Video capture
+
+paniolo drives `hdmicap`, a Rust warm-stream daemon that keeps a USB HDMI
+capture device open continuously and serves the current frame over HTTP. This
+avoids the multi-second reopen latency you'd get by running ffmpeg per capture.
+
+---
+
+## Hardware
+
+Any USB HDMI capture card that presents as a UVC device (V4L2 / AVFoundation).
+Tested with the MS2109-based cards (e.g. generic "USB3.0 HDMI Capture" dongles).
+
+Connect the target's HDMI output to the capture card, then the card to the Mac.
+
+---
+
+## Setup
+
+```bash
+# Detect available capture devices
+paniolo video devices
+
+# Save which device to use
+paniolo video setup
+# or specify explicitly:
+paniolo video setup --device "USB Video"
+```
+
+The device name is saved to `~/.config/paniolo/video.toml` and used by
+subsequent commands. When only one non-built-in camera is present, `setup`
+auto-selects it.
+
+---
+
+## Starting and stopping the daemon
+
+```bash
+paniolo video watch [target-machine]   # start hdmicap daemon for a target
+paniolo video stop  [target-machine]   # stop it
+paniolo video show  [target-machine]   # show daemon URL and status
+```
+
+`watch` starts `hdmicap daemon` detached and polls for startup. The daemon URL
+is printed — open it in a browser for the live preview.
+
+---
+
+## Capturing frames
+
+```bash
+paniolo video shot [target-machine]           # save a screenshot to a temp file
+paniolo video shot [target-machine] -o out.png  # save to a specific path
+paniolo video preview [target-machine]        # open the live MJPEG stream in a browser
+```
+
+`shot` fetches a single PNG-encoded frame from the running daemon via
+`hdmicap shot`.
+
+---
+
+## OCR (Apple Vision)
+
+```bash
+paniolo video read [target-machine]
+```
+
+Fetches the current frame and runs Apple Vision's `VNRecognizeTextRequest` on
+it, printing the recognized text to stdout. On-device — no network, no model
+download required.
+
+`paniolo setup` compiles `ocr/visionocr.swift` into `~/.cargo/bin/visionocr`
+with `swiftc`. The OCR tool is also accessible from the [web dashboard](dashboard.md)
+via the OCR button.
+
+**OCR tuning notes:**
+- `.fast` recognition level is used (not `.accurate` — the latter misses small
+  console text entirely; it's tuned for natural document text).
+- The frame is 2×-upscaled and black-padded before recognition to improve
+  accuracy on thin console fonts.
+- `minimumTextHeight` is lowered from the default to catch small terminal text.
+
+---
+
+## Runtime paths
+
+| Purpose | Path |
+|---|---|
+| Video config | `~/.config/paniolo/video.toml` |
+| hdmicap discovery | `$TMPDIR/hdmicap/daemon.json` (`{pid, port}`) |
+| hdmicap advisory lock | `$TMPDIR/hdmicap/daemon.lock` |
