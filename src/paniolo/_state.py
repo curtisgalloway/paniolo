@@ -17,6 +17,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -70,15 +71,48 @@ def load_netboot_state(target: str) -> Optional[NetbootState]:
 
 
 def is_pid_alive(pid: int) -> bool:
+    """Return True if any process with this PID exists (signal-0 probe)."""
     try:
         os.kill(pid, 0)
         return True
-    except (ProcessLookupError, PermissionError):
+    except ProcessLookupError:
         return False
+    except PermissionError:
+        # PID exists but we cannot signal it -- still alive.
+        return True
+
+
+def _pid_cmdline(pid: int) -> str:
+    """Return the full command-line string for pid, or empty string on failure."""
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "args="],
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+    except Exception:  # pylint: disable=broad-except
+        return ""
+
+
+def is_paniolo_child_alive(pid: int, module: str) -> bool:
+    """Return True only if pid is alive AND its command line contains module.
+
+    Guards against stale PIDs reused by unrelated processes after a paniolo
+    child crashes.  module is the Python module name passed to -m, e.g.
+    'paniolo._tftp'.
+    """
+    if not is_pid_alive(pid):
+        return False
+    return module in _pid_cmdline(pid)
 
 
 def is_netboot_running(target: str) -> bool:
+    """Return True only if both child processes are alive and are our processes."""
     state = load_netboot_state(target)
     if state is None:
         return False
-    return is_pid_alive(state.dhcp_pid) and is_pid_alive(state.tftp_pid)
+    return (
+        is_paniolo_child_alive(state.dhcp_pid, "paniolo._dhcp")
+        and is_paniolo_child_alive(state.tftp_pid, "paniolo._tftp")
+    )
