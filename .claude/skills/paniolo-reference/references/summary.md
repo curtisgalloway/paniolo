@@ -38,30 +38,30 @@ This skill contains the following reference files:
 
 ## Statistics
 
-64 files | 13,485 lines
+64 files | 13,635 lines
 
 | Language | Files | Lines |
 |----------|------:|------:|
-| Python | 17 | 4,324 |
-| Markdown | 13 | 1,958 |
+| Python | 17 | 4,456 |
+| Markdown | 13 | 1,976 |
 | Rust | 13 | 5,703 |
 | No Extension | 9 | 396 |
 | TOML | 4 | 203 |
 | JavaScript | 2 | 4 |
-| HTML | 1 | 285 |
 | CSS | 1 | 209 |
 | JSON | 1 | 6 |
 | C | 1 | 156 |
-| Other | 2 | 241 |
+| Swift | 1 | 138 |
+| Other | 2 | 388 |
 
 **Largest files:**
 - `hdmicap/vendor/nokhwa-bindings-macos/src/lib.rs` (2,463 lines)
-- `src/paniolo/_cli.py` (1,350 lines)
+- `src/paniolo/_cli.py` (1,388 lines)
 - `serialcap/src/capture.rs` (683 lines)
-- `AGENTS.md` (594 lines)
-- `src/paniolo/_tftp.py` (552 lines)
+- `AGENTS.md` (603 lines)
+- `src/paniolo/_tftp.py` (558 lines)
 - `serialcap/src/serial_io.rs` (435 lines)
-- `src/paniolo/_netboot.py` (411 lines)
+- `src/paniolo/_netboot.py` (415 lines)
 - `hdmicap/src/server.rs` (395 lines)
 - `hdmicap/src/capture.rs` (359 lines)
-- `src/paniolo/_dhcp.py` (332 lines)
+- `src/paniolo/_dhcp.py` (334 lines)

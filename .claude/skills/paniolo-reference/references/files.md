@@ -1,96 +1,5 @@
 # Files
 
-## File: ocr/linuxocr
-````
-#!/usr/bin/env python3
-# Copyright 2026 Curtis Galloway
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Linux OCR helper using Tesseract. Mirrors the visionocr interface.
-
-Reads a PNG from stdin (pass '-') or a file path, applies 2x upscale and
-black padding (same preprocessing as visionocr for small console fonts),
-then pipes to tesseract and prints the recognized text.
-
-Requires: tesseract-ocr  (sudo apt-get install tesseract-ocr)
-Optional: Pillow         (pip install Pillow) — used for preprocessing;
-          without it, the raw PNG is passed directly to tesseract.
-"""
-
-import argparse
-import io
-import os
-import subprocess
-import sys
-import tempfile
-
-
-def _preprocess(png: bytes) -> bytes:
-    """2x upscale + black pad. Falls back to identity if Pillow is absent."""
-    try:
-        from PIL import Image  # type: ignore
-
-        img = Image.open(io.BytesIO(png)).convert("RGB")
-        w, h = img.size
-        img = img.resize((w * 2, h * 2), Image.LANCZOS)
-        padded = Image.new("RGB", (w * 2 + 20, h * 2 + 20), (0, 0, 0))
-        padded.paste(img, (10, 10))
-        buf = io.BytesIO()
-        padded.save(buf, "PNG")
-        return buf.getvalue()
-    except ImportError:
-        return png
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser(
-        description="OCR a PNG image using Tesseract (Linux visionocr replacement)."
-    )
-    ap.add_argument("input", nargs="?", default="-", help="PNG file path, or - for stdin")
-    ap.add_argument("--json", action="store_true", help="Ignored (reserved for future use)")
-    args = ap.parse_args()
-
-    if args.input == "-":
-        png = sys.stdin.buffer.read()
-    else:
-        with open(args.input, "rb") as f:
-            png = f.read()
-
-    png = _preprocess(png)
-
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
-        tf.write(png)
-        tmp = tf.name
-
-    try:
-        result = subprocess.run(
-            ["tesseract", tmp, "stdout", "--psm", "6", "--oem", "1"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            sys.stderr.write(result.stderr)
-            sys.exit(1)
-        sys.stdout.write(result.stdout)
-    finally:
-        os.unlink(tmp)
-
-
-if __name__ == "__main__":
-    main()
-````
-
 ## File: docs/dashboard.md
 ````markdown
 # Combined dashboard
@@ -811,295 +720,6 @@ via the OCR button.
 | Video config | `~/.config/paniolo/video.toml` |
 | hdmicap discovery | `$TMPDIR/hdmicap/daemon.json` (`{pid, port}`) |
 | hdmicap advisory lock | `$TMPDIR/hdmicap/daemon.lock` |
-````
-
-## File: hdmicap/assets/index.html
-````html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>paniolo · video + serial</title>
-  <link rel="stylesheet" href="/xterm.css">
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    html, body { height: 100%; }
-    body { background: #000; display: flex; flex-direction: column;
-           font: 12px ui-monospace, Menlo, monospace; color: #ddd; }
-    #video { flex: 1 1 auto; min-height: 0; position: relative;
-             display: flex; align-items: center; justify-content: center; }
-    #video img { max-width: 100%; max-height: 100%; object-fit: contain; }
-    #vstatus { position: absolute; top: 8px; right: 12px; color: #0f0;
-               background: rgba(0,0,0,.6); padding: 4px 8px; border-radius: 4px; }
-    #sidebar { flex: 0 0 auto; display: flex; flex-direction: column; min-height: 0; }
-    #bar { flex: 0 0 24px; background: #111; display: flex; align-items: center;
-           gap: 14px; padding: 0 12px; border-top: 1px solid #333; }
-    #bar .label { color: #888; }
-    #sstatus { color: #fa0; flex: 1 1 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    #layoutbtn { margin-left: auto; cursor: pointer; background: none; border: 1px solid #444;
-                 border-radius: 3px; color: #888; font: 11px ui-monospace, monospace;
-                 padding: 1px 6px; }
-    #layoutbtn:hover { color: #cdf; border-color: #46c; }
-    #serial { flex: 0 0 40vh; background: #000; min-height: 0; display: flex; }
-    .serial-pane { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; }
-    .serial-pane + .serial-pane { border-left: 1px solid #333; }
-    .pane-bar { flex: 0 0 20px; background: #111; border-bottom: 1px solid #222;
-                display: flex; align-items: center; padding: 0 8px; gap: 8px; font-size: 11px; }
-    .pane-name { color: #888; }
-    .pane-status { color: #fa0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .pane-term { flex: 1 1 0; min-height: 0; padding: 4px 6px; }
-    #videobtns { position: absolute; top: 8px; left: 12px; z-index: 3;
-                 display: flex; gap: 6px; }
-    #ocrbtn, #pwrbtn { cursor: pointer; font: 12px ui-monospace, monospace;
-                       padding: 4px 10px; border-radius: 4px; }
-    #ocrbtn { color: #cdf; background: rgba(0,0,0,.6); border: 1px solid #46c; }
-    #ocrbtn:hover { background: rgba(40,80,160,.7); }
-    #pwrbtn { color: #fca; background: rgba(0,0,0,.6); border: 1px solid #840;
-              display: none; }
-    #pwrbtn:hover { background: rgba(80,30,0,.7); }
-    #pwrmodal { position: absolute; inset: 0; z-index: 10; display: none;
-                align-items: center; justify-content: center;
-                background: rgba(0,0,0,.7); }
-    #pwrmodal.show { display: flex; }
-    #pwrbox { background: #111; border: 1px solid #840; border-radius: 8px;
-              padding: 20px 24px; display: flex; flex-direction: column; gap: 14px;
-              color: #ddd; font: 13px ui-monospace, monospace; max-width: 300px; }
-    #pwrbox p { color: #fca; }
-    #pwrbtns { display: flex; gap: 10px; justify-content: flex-end; }
-    #pwrcancel { cursor: pointer; background: none; border: 1px solid #555;
-                 border-radius: 4px; color: #aaa; padding: 4px 14px; font: inherit; }
-    #pwrcancel:hover { border-color: #888; color: #ddd; }
-    #pwrconfirm { cursor: pointer; background: rgba(80,30,0,.8); border: 1px solid #a60;
-                  border-radius: 4px; color: #fca; padding: 4px 14px; font: inherit; }
-    #pwrconfirm:hover { background: rgba(120,50,0,.9); }
-    #ocrpanel { position: absolute; inset: 8px 8px auto 8px; max-height: 70%; z-index: 4;
-                display: none; flex-direction: column; background: rgba(0,0,0,.92);
-                border: 1px solid #46c; border-radius: 6px; }
-    #ocrpanel.show { display: flex; }
-    #ocrhead { display: flex; justify-content: space-between; align-items: center;
-               padding: 6px 10px; border-bottom: 1px solid #333; color: #cdf; }
-    #ocrclose { cursor: pointer; color: #f88; padding: 0 6px; font-size: 16px; }
-    #ocrtext { margin: 0; padding: 10px; overflow: auto; white-space: pre-wrap;
-               color: #dfd; font: 12px ui-monospace, monospace; }
-
-    /* right-panel layout */
-    body.layout-right { flex-direction: row; }
-    body.layout-right #video { flex: 1 1 0; min-width: 0; min-height: 0; }
-    body.layout-right #sidebar { flex: 0 0 380px; min-width: 380px; min-height: 0;
-                                  border-top: none; border-left: 1px solid #333; }
-    body.layout-right #bar { border-top: none; border-bottom: 1px solid #333; }
-    body.layout-right #serial { flex: 1 1 0; min-height: 0; flex-direction: column; }
-    body.layout-right .serial-pane + .serial-pane { border-left: none; border-top: 1px solid #333; }
-  </style>
-</head>
-<body>
-  <div id="video">
-    <img id="feed" src="/preview" alt="HDMI capture feed">
-    <div id="videobtns">
-      <button id="ocrbtn">⌕ OCR</button>
-      <button id="pwrbtn">⏻ Power Cycle</button>
-    </div>
-    <div id="vstatus">connecting…</div>
-    <div id="ocrpanel">
-      <div id="ocrhead"><span id="ocrtitle">OCR</span><span id="ocrclose">×</span></div>
-      <pre id="ocrtext"></pre>
-    </div>
-    <div id="pwrmodal">
-      <div id="pwrbox">
-        <p>Power cycle the target?</p>
-        <div id="pwrbtns">
-          <button id="pwrcancel">Cancel</button>
-          <button id="pwrconfirm">Power Cycle</button>
-        </div>
-      </div>
-    </div>
-  </div>
-  <div id="sidebar">
-    <div id="bar">
-      <span class="label">serial</span>
-      <span id="sstatus">disconnected</span>
-      <button id="layoutbtn" title="Toggle serial panel position"></button>
-    </div>
-    <div id="serial"></div>
-  </div>
-
-  <script src="/xterm.js"></script>
-  <script src="/xterm-addon-fit.js"></script>
-  <script>
-    // ── layout toggle ──
-    const layoutBtn = document.getElementById('layoutbtn');
-    const LAYOUT_KEY = 'paniolo-serial-layout';
-    const allFits = [];
-    function fitAll() { allFits.forEach(f => { try { f.fit(); } catch (e) {} }); }
-    function setLayout(layout) {
-      const right = layout === 'right';
-      document.body.classList.toggle('layout-right', right);
-      layoutBtn.textContent = right ? 'serial ↓ bottom' : 'serial → right';
-      localStorage.setItem(LAYOUT_KEY, layout);
-      setTimeout(fitAll, 50);
-    }
-    layoutBtn.onclick = () =>
-      setLayout(document.body.classList.contains('layout-right') ? 'bottom' : 'right');
-    setLayout(localStorage.getItem(LAYOUT_KEY) || 'bottom');
-
-    window.addEventListener('resize', fitAll);
-
-    // ── video: poll signal/resolution from this (hdmicap) daemon ──
-    const vimg = document.getElementById('feed');
-    const vst  = document.getElementById('vstatus');
-    function pollVideo() {
-      fetch('/status').then(r => r.json()).then(d => {
-        vst.textContent = d.signal + ' · ' + d.width + '×' + d.height;
-        vst.style.color = d.signal === 'stable' ? '#0f0' : '#fa0';
-      }).catch(() => { vst.textContent = 'daemon unreachable'; vst.style.color = '#f44'; });
-    }
-    pollVideo();
-    setInterval(pollVideo, 2000);
-    vimg.onerror = () => { vst.textContent = 'stream error — reload'; vst.style.color = '#f44'; };
-
-    // ── OCR: run Apple Vision on the current frame via the /ocr endpoint ──
-    const ocrPanel = document.getElementById('ocrpanel');
-    const ocrText = document.getElementById('ocrtext');
-    const ocrTitle = document.getElementById('ocrtitle');
-    document.getElementById('ocrclose').onclick = () => ocrPanel.classList.remove('show');
-    document.getElementById('ocrbtn').onclick = () => {
-      ocrPanel.classList.add('show');
-      ocrTitle.textContent = 'OCR — reading…';
-      ocrText.textContent = '';
-      fetch('/ocr')
-        .then(r => r.text().then(t => ({ ok: r.ok, t })))
-        .then(({ ok, t }) => {
-          ocrTitle.textContent = ok ? 'OCR' : 'OCR — error';
-          ocrText.textContent = ok ? (t.trim() || '(no text detected)') : t;
-        })
-        .catch(e => { ocrTitle.textContent = 'OCR — error'; ocrText.textContent = String(e); });
-    };
-
-    // ── Power Cycle button — only shown when /power-cycle is available ──
-    const pwrBtn = document.getElementById('pwrbtn');
-    const pwrModal = document.getElementById('pwrmodal');
-    fetch('/power-cycle', { method: 'POST' })
-      .then(r => { if (r.status !== 501) pwrBtn.style.display = ''; })
-      .catch(() => {});
-    pwrBtn.onclick = () => pwrModal.classList.add('show');
-    document.getElementById('pwrcancel').onclick = () => pwrModal.classList.remove('show');
-    document.getElementById('pwrconfirm').onclick = () => {
-      pwrModal.classList.remove('show');
-      pwrBtn.textContent = '⏻ cycling…';
-      pwrBtn.disabled = true;
-      fetch('/power-cycle', { method: 'POST' })
-        .then(r => r.text().then(t => {
-          pwrBtn.textContent = r.ok ? '⏻ Power Cycle' : '⏻ Error';
-          if (!r.ok) console.error('power-cycle:', t);
-        }))
-        .catch(e => { pwrBtn.textContent = '⏻ Error'; console.error(e); })
-        .finally(() => { pwrBtn.disabled = false; });
-    };
-
-    // ── serial: xterm.js panes fed by serialcap WebSocket (cross-port) ──
-    // ?serial=PORT or ?serialws=URL override the default serialcap location.
-    // ?interface=NAME locks to a single interface (single-pane mode).
-    // Without ?interface, all daemon interfaces get their own pane side-by-side.
-    const params = new URLSearchParams(location.search);
-    const serialPort = params.get('serial') || '8724';
-    const baseWsUrl = params.get('serialws') ||
-                      ('ws://' + location.hostname + ':' + serialPort + '/stream');
-    const httpBase = baseWsUrl.replace(/^ws/, 'http').replace(/\/stream.*$/, '');
-    const singleInterface = params.get('interface') || null;
-
-    const sst = document.getElementById('sstatus');
-    const serialEl = document.getElementById('serial');
-
-    function wsUrlFor(iface) {
-      if (!iface) return baseWsUrl;
-      const sep = baseWsUrl.includes('?') ? '&' : '?';
-      return baseWsUrl + sep + 'interface=' + encodeURIComponent(iface);
-    }
-
-    function openTerminal(ifaceName, termDiv, statusEl) {
-      const term = new Terminal({
-        fontSize: 13, cursorBlink: true, scrollback: 5000,
-        theme: { background: '#000000' },
-      });
-      const fit = new FitAddon.FitAddon();
-      term.loadAddon(fit);
-      term.open(termDiv);
-      allFits.push(fit);
-
-      const wsUrl = wsUrlFor(ifaceName);
-      let ws, gen = 0;
-      function connect() {
-        const myGen = ++gen;
-        statusEl.textContent = 'connecting…';
-        statusEl.style.color = '#fa0';
-        ws = new WebSocket(wsUrl);
-        ws.binaryType = 'arraybuffer';
-        ws.onopen = () => { statusEl.textContent = 'connected'; statusEl.style.color = '#0f0'; };
-        ws.onmessage = ev => {
-          if (ev.data instanceof ArrayBuffer) term.write(new Uint8Array(ev.data));
-          else term.write(ev.data);
-        };
-        ws.onclose = () => {
-          if (myGen !== gen) return;
-          statusEl.textContent = 'unreachable — retrying';
-          statusEl.style.color = '#f44';
-          setTimeout(() => { if (myGen === gen) connect(); }, 3000);
-        };
-        ws.onerror = () => { try { ws.close(); } catch (e) {} };
-      }
-      term.onData(d => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(d); });
-      connect();
-    }
-
-    function buildPanes(ifaceNames) {
-      serialEl.innerHTML = '';
-      allFits.length = 0;
-
-      if (ifaceNames.length <= 1) {
-        // Single pane: global #sstatus, no per-pane label
-        const termDiv = document.createElement('div');
-        termDiv.className = 'pane-term';
-        serialEl.appendChild(termDiv);
-        openTerminal(ifaceNames[0] || null, termDiv, sst);
-      } else {
-        // Multi-pane: hide global status; each pane gets a label + status bar
-        sst.style.display = 'none';
-        for (const name of ifaceNames) {
-          const pane = document.createElement('div');
-          pane.className = 'serial-pane';
-
-          const bar = document.createElement('div');
-          bar.className = 'pane-bar';
-          const nameEl = document.createElement('span');
-          nameEl.className = 'pane-name';
-          nameEl.textContent = name;
-          const statusEl = document.createElement('span');
-          statusEl.className = 'pane-status';
-          bar.append(nameEl, statusEl);
-
-          const termDiv = document.createElement('div');
-          termDiv.className = 'pane-term';
-
-          pane.append(bar, termDiv);
-          serialEl.appendChild(pane);
-          openTerminal(name, termDiv, statusEl);
-        }
-      }
-      setTimeout(fitAll, 50);
-    }
-
-    if (singleInterface) {
-      buildPanes([singleInterface]);
-    } else {
-      fetch(httpBase + '/interfaces')
-        .then(r => r.json())
-        .then(list => buildPanes(Array.isArray(list) ? list.map(i => i.name) : [null]))
-        .catch(() => buildPanes([null]));
-    }
-  </script>
-</body>
-</html>
 ````
 
 ## File: hdmicap/assets/xterm-addon-fit.js
@@ -4987,6 +4607,97 @@ Send a command and watch the reply:
 /visionocr
 ````
 
+## File: ocr/linuxocr
+````
+#!/usr/bin/env python3
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Linux OCR helper using Tesseract. Mirrors the visionocr interface.
+
+Reads a PNG from stdin (pass '-') or a file path, applies 2x upscale and
+black padding (same preprocessing as visionocr for small console fonts),
+then pipes to tesseract and prints the recognized text.
+
+Requires: tesseract-ocr  (sudo apt-get install tesseract-ocr)
+Optional: Pillow         (pip install Pillow) — used for preprocessing;
+          without it, the raw PNG is passed directly to tesseract.
+"""
+
+import argparse
+import io
+import os
+import subprocess
+import sys
+import tempfile
+
+
+def _preprocess(png: bytes) -> bytes:
+    """2x upscale + black pad. Falls back to identity if Pillow is absent."""
+    try:
+        from PIL import Image  # type: ignore
+
+        img = Image.open(io.BytesIO(png)).convert("RGB")
+        w, h = img.size
+        img = img.resize((w * 2, h * 2), Image.LANCZOS)
+        padded = Image.new("RGB", (w * 2 + 20, h * 2 + 20), (0, 0, 0))
+        padded.paste(img, (10, 10))
+        buf = io.BytesIO()
+        padded.save(buf, "PNG")
+        return buf.getvalue()
+    except ImportError:
+        return png
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="OCR a PNG image using Tesseract (Linux visionocr replacement)."
+    )
+    ap.add_argument("input", nargs="?", default="-", help="PNG file path, or - for stdin")
+    ap.add_argument("--json", action="store_true", help="Ignored (reserved for future use)")
+    args = ap.parse_args()
+
+    if args.input == "-":
+        png = sys.stdin.buffer.read()
+    else:
+        with open(args.input, "rb") as f:
+            png = f.read()
+
+    png = _preprocess(png)
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+        tf.write(png)
+        tmp = tf.name
+
+    try:
+        result = subprocess.run(
+            ["tesseract", tmp, "stdout", "--psm", "6", "--oem", "1"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            sys.stderr.write(result.stderr)
+            sys.exit(1)
+        sys.stdout.write(result.stdout)
+    finally:
+        os.unlink(tmp)
+
+
+if __name__ == "__main__":
+    main()
+````
+
 ## File: ocr/visionocr.swift
 ````swift
 // Copyright 2026 Curtis Galloway
@@ -5433,533 +5144,6 @@ lto = "thin"
 # limitations under the License.
 ````
 
-## File: src/paniolo/_config.py
-````python
-# Copyright 2026 Curtis Galloway
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-from __future__ import annotations
-
-import dataclasses
-import tomllib
-from pathlib import Path
-from typing import Optional
-
-CONFIG_DIR = Path.home() / ".config" / "paniolo"
-TARGETS_DIR = CONFIG_DIR / "targets"
-
-DEFAULT_SERIAL_NAME = "console"
-
-
-VALID_SENSE_SIGNALS = ("cts", "dsr", "dcd", "ri")
-
-
-@dataclasses.dataclass
-class SerialInterface:
-    """A named serial console attached to a target (e.g. 'console', 'bmc')."""
-
-    name: str
-    device: str
-    baud: int = 115200
-    power_sense_signal: Optional[str] = None  # "cts" | "dsr" | "dcd" | "ri" | None
-
-
-@dataclasses.dataclass
-class TargetConfig:
-    name: str
-    interface: str
-    host_ip: str = "192.168.99.1"
-    tftp_root: Optional[str] = None
-    power_cycle_cmd: Optional[str] = None
-    power_serial_interface: Optional[str] = None
-    serial_interfaces: list[SerialInterface] = dataclasses.field(default_factory=list)
-
-    def serial_interface(self, name: Optional[str] = None) -> SerialInterface:
-        """Resolve a serial interface by name, defaulting to the sole one.
-
-        Raises ValueError if none are configured, the name is unknown, or no name
-        was given but several exist (ambiguous)."""
-        if not self.serial_interfaces:
-            raise ValueError(f"no serial interfaces configured for '{self.name}'")
-        if name is None:
-            if len(self.serial_interfaces) == 1:
-                return self.serial_interfaces[0]
-            have = ", ".join(i.name for i in self.serial_interfaces)
-            raise ValueError(f"multiple serial interfaces ({have}); specify one with --interface")
-        for iface in self.serial_interfaces:
-            if iface.name == name:
-                return iface
-        have = ", ".join(i.name for i in self.serial_interfaces)
-        raise ValueError(f"no serial interface '{name}' (have: {have})")
-
-    def upsert_serial_interface(self, iface: SerialInterface) -> None:
-        """Add the interface, or replace an existing one with the same name."""
-        for idx, existing in enumerate(self.serial_interfaces):
-            if existing.name == iface.name:
-                self.serial_interfaces[idx] = iface
-                return
-        self.serial_interfaces.append(iface)
-
-    def remove_serial_interface(self, name: str) -> bool:
-        """Drop the named interface; return True if one was removed."""
-        kept = [i for i in self.serial_interfaces if i.name != name]
-        removed = len(kept) != len(self.serial_interfaces)
-        self.serial_interfaces = kept
-        return removed
-
-
-def target_path(name: str) -> Path:
-    return TARGETS_DIR / f"{name}.toml"
-
-
-def save_target(cfg: TargetConfig) -> None:
-    TARGETS_DIR.mkdir(parents=True, exist_ok=True)
-    target_path(cfg.name).write_text(_to_toml(cfg))
-
-
-def load_target(name: str) -> TargetConfig:
-    path = target_path(name)
-    if not path.exists():
-        raise FileNotFoundError(name)
-    with open(path, "rb") as f:
-        data = tomllib.load(f)
-    return _from_dict(data)
-
-
-def list_targets() -> list[str]:
-    if not TARGETS_DIR.exists():
-        return []
-    return sorted(p.stem for p in TARGETS_DIR.glob("*.toml"))
-
-
-def _from_dict(data: dict) -> TargetConfig:
-    """Build a TargetConfig from parsed TOML, migrating the legacy single-serial
-    fields (`serial_device`/`serial_baud`) into a named interface."""
-    data = dict(data)
-    serial = data.pop("serial", None)
-    legacy_device = data.pop("serial_device", None)
-    legacy_baud = data.pop("serial_baud", None)
-    data.pop("ha_power_entity", None)  # removed field — ignore if present in old configs
-
-    interfaces: list[SerialInterface] = []
-    if serial:
-        for entry in serial:
-            interfaces.append(
-                SerialInterface(
-                    name=entry["name"],
-                    device=entry["device"],
-                    baud=int(entry.get("baud", 115200)),
-                    power_sense_signal=entry.get("power_sense_signal"),
-                )
-            )
-    elif legacy_device:
-        interfaces.append(
-            SerialInterface(
-                name=DEFAULT_SERIAL_NAME,
-                device=legacy_device,
-                baud=int(legacy_baud or 115200),
-            )
-        )
-
-    return TargetConfig(serial_interfaces=interfaces, **data)
-
-
-def _toml_kv(key: str, value) -> str:
-    if isinstance(value, bool):
-        return f'{key} = {"true" if value else "false"}'
-    if isinstance(value, str):
-        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-        return f'{key} = "{escaped}"'
-    return f"{key} = {value}"
-
-
-def _to_toml(cfg: TargetConfig) -> str:
-    scalars = {
-        "name": cfg.name,
-        "interface": cfg.interface,
-        "host_ip": cfg.host_ip,
-        "tftp_root": cfg.tftp_root,
-        "power_cycle_cmd": cfg.power_cycle_cmd,
-        "power_serial_interface": cfg.power_serial_interface,
-    }
-    lines = [_toml_kv(k, v) for k, v in scalars.items() if v is not None]
-    out = "\n".join(lines) + "\n"
-    for iface in cfg.serial_interfaces:
-        out += "\n[[serial]]\n"
-        out += _toml_kv("name", iface.name) + "\n"
-        out += _toml_kv("device", iface.device) + "\n"
-        out += _toml_kv("baud", iface.baud) + "\n"
-        if iface.power_sense_signal is not None:
-            out += _toml_kv("power_sense_signal", iface.power_sense_signal) + "\n"
-    return out
-````
-
-## File: src/paniolo/_hid.py
-````python
-# Copyright 2026 Curtis Galloway
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Host control client for the KB2040 HID rig (see hidrig/).
-
-Sends line-based text commands to the control board over its USB CDC *data*
-port; the control board parses them and relays HID keyboard/mouse events to the
-target board, which injects them into the Pi over USB. The board owns the wire
-protocol — `hidrig/control/code.py` and `hidrig/README.md` are the source of
-truth. This module is a thin text-command client plus host-side sequencing.
-"""
-
-from __future__ import annotations
-
-import dataclasses
-import glob
-import sys
-import time
-import tomllib
-from pathlib import Path
-from typing import Callable, Optional
-
-from . import _config
-
-HID_CONFIG_PATH = _config.CONFIG_DIR / "hid.toml"
-
-DEFAULT_BAUD = 115200  # irrelevant over USB CDC, but pyserial requires a value
-
-# Absolute-mouse logical range the OS spreads across the screen (HID convention).
-ABS_MAX = 32767
-
-
-@dataclasses.dataclass
-class HidConfig:
-    """Saved configuration for the HID control board."""
-
-    port: str
-
-
-def _to_toml(data: dict) -> str:
-    lines = []
-    for key, value in data.items():
-        if value is None:
-            continue
-        if isinstance(value, str):
-            escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-            lines.append(f'{key} = "{escaped}"')
-        elif isinstance(value, bool):
-            lines.append(f'{key} = {"true" if value else "false"}')
-        else:
-            lines.append(f"{key} = {value}")
-    return "\n".join(lines) + "\n"
-
-
-def save_hid_config(cfg: HidConfig) -> None:
-    _config.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    HID_CONFIG_PATH.write_text(_to_toml(dataclasses.asdict(cfg)))
-
-
-def load_hid_config() -> Optional[HidConfig]:
-    if not HID_CONFIG_PATH.exists():
-        return None
-    with open(HID_CONFIG_PATH, "rb") as f:
-        data = tomllib.load(f)
-    return HidConfig(port=data["port"])
-
-
-def list_serial_ports() -> list[str]:
-    """Candidate USB CDC ports for the control board."""
-    if sys.platform == "darwin":
-        return sorted(glob.glob("/dev/cu.usbmodem*"))
-    return sorted(glob.glob("/dev/ttyACM*"))
-
-
-def guess_data_port() -> Optional[str]:
-    """Best guess at the control board's *data* CDC port.
-
-    The board exposes two CDC ports (console + data); the data port is
-    conventionally the higher-numbered node. Returns None if no candidates.
-    """
-    ports = list_serial_ports()
-    return ports[-1] if ports else None
-
-
-def scale_to_logical(px: int, screen_px: int) -> int:
-    """Map a pixel coordinate to the 0..32767 absolute-mouse logical range.
-
-    The host OS maps that range across the full screen dimension, so callers
-    scale each pixel axis against the screen's size in that axis. Clamped.
-    """
-    if screen_px <= 1:
-        return 0
-    v = round(px * ABS_MAX / (screen_px - 1))
-    return max(0, min(ABS_MAX, v))
-
-
-class HidRig:
-    """Text-command client for the control board over USB serial.
-
-    Pass `transport` (any object with `write(bytes)`, `readline() -> bytes`,
-    `close()`) to drive it without real hardware (used by tests). Otherwise a
-    `pyserial` Serial port is opened lazily on the given `port`.
-    """
-
-    def __init__(
-        self,
-        port: Optional[str] = None,
-        baud: int = DEFAULT_BAUD,
-        timeout: float = 1.0,
-        transport=None,
-    ):
-        if transport is not None:
-            self._transport = transport
-            return
-        try:
-            import serial  # lazy: only the live path needs pyserial
-        except ImportError as exc:
-            raise RuntimeError(
-                "pyserial not installed — install the hid extra: "
-                "uv sync --extra hid  (or: pip install 'paniolo[hid]')"
-            ) from exc
-        if not port:
-            raise ValueError("no serial port given")
-        self._transport = serial.Serial(port, baud, timeout=timeout)
-        time.sleep(0.2)
-        self._transport.reset_input_buffer()
-
-    def cmd(self, text: str) -> str:
-        """Send one command line; return the board's reply, raise on ERR."""
-        self._transport.write((text + "\n").encode("utf-8"))
-        reply = self._transport.readline().decode("utf-8", "replace").strip()
-        if reply.startswith("ERR"):
-            raise RuntimeError(f"control board rejected '{text}': {reply}")
-        return reply
-
-    # Command wrappers — mirror hidrig/control/code.py's text protocol.
-    def type(self, text: str) -> str:
-        return self.cmd(f"type {text}")
-
-    def key(self, name: str) -> str:
-        return self.cmd(f"key {name}")
-
-    def combo(self, *names: str) -> str:
-        return self.cmd("combo " + " ".join(names))
-
-    def down(self, name: str) -> str:
-        return self.cmd(f"down {name}")
-
-    def up(self, name: str) -> str:
-        return self.cmd(f"up {name}")
-
-    def releaseall(self) -> str:
-        return self.cmd("releaseall")
-
-    def move(self, dx: int, dy: int) -> str:
-        return self.cmd(f"move {dx} {dy}")
-
-    def click(self, button: str = "left") -> str:
-        return self.cmd(f"click {button}")
-
-    def mdown(self, button: str = "left") -> str:
-        return self.cmd(f"mdown {button}")
-
-    def mup(self, button: str = "left") -> str:
-        return self.cmd(f"mup {button}")
-
-    def scroll(self, amount: int) -> str:
-        return self.cmd(f"scroll {amount}")
-
-    def close(self) -> None:
-        self._transport.close()
-
-
-# --- Host-side sequencing / timing (the board firmware stays dumb) ----------
-
-def parse_sequence(text: str) -> list[tuple[str, object]]:
-    """Parse a command file into steps.
-
-    Each non-blank, non-`#`-comment line is either a command or a timing
-    directive: `delay <ms>` or `sleep <seconds>`. Returns a list of
-    `("cmd", line)` / `("delay", seconds)` tuples.
-    """
-    steps: list[tuple[str, object]] = []
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        head, _, rest = line.partition(" ")
-        low = head.lower()
-        if low == "delay":
-            steps.append(("delay", float(rest) / 1000.0))
-        elif low == "sleep":
-            steps.append(("delay", float(rest)))
-        else:
-            steps.append(("cmd", line))
-    return steps
-
-
-def run_sequence(
-    rig: HidRig,
-    steps: list[tuple[str, object]],
-    default_delay: float = 0.0,
-    sleep: Callable[[float], None] = time.sleep,
-) -> None:
-    """Execute parsed steps against `rig`. `sleep` is injectable for tests."""
-    for kind, value in steps:
-        if kind == "delay":
-            sleep(float(value))
-        else:
-            rig.cmd(str(value))
-            if default_delay:
-                sleep(default_delay)
-
-
-def repeat_key(
-    rig: HidRig,
-    name: str,
-    count: int,
-    delay: float = 0.0,
-    sleep: Callable[[float], None] = time.sleep,
-) -> None:
-    """Tap a key `count` times with an inter-tap delay (auto-repeat)."""
-    for i in range(count):
-        rig.key(name)
-        if delay and i < count - 1:
-            sleep(delay)
-````
-
-## File: src/paniolo/_ocr.py
-````python
-# Copyright 2026 Curtis Galloway
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""OCR helpers — wraps platform OCR tools.
-
-- macOS: `visionocr` (Apple Vision framework, compiled from ocr/visionocr.swift)
-- Linux: `linuxocr` (Tesseract-backed, from ocr/linuxocr)
-
-Both tools share the same interface: read PNG on stdin, print text on stdout.
-"""
-
-from __future__ import annotations
-
-import shutil
-import subprocess
-import sys
-from pathlib import Path
-from typing import Optional
-
-
-def visionocr_binary() -> Optional[str]:
-    """Return the installed visionocr path: PATH, then ~/.cargo/bin. None if absent."""
-    found = shutil.which("visionocr")
-    if found:
-        return found
-    cargo_bin = Path.home() / ".cargo" / "bin" / "visionocr"
-    return str(cargo_bin) if cargo_bin.exists() else None
-
-
-def visionocr_source() -> Path:
-    """Path to the visionocr Swift source in the repo (for `paniolo setup`)."""
-    return Path(__file__).parent.parent.parent / "ocr" / "visionocr.swift"
-
-
-def build_visionocr(dest: Path) -> None:
-    """Compile visionocr.swift to `dest` (used by `paniolo setup`). Raises on error."""
-    source = visionocr_source()
-    if not source.exists():
-        raise FileNotFoundError(f"visionocr source not found: {source}")
-    if not shutil.which("swiftc"):
-        raise FileNotFoundError("swiftc not found (install Xcode command line tools)")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["swiftc", "-O", "-o", str(dest), str(source)], check=True)
-
-
-def linuxocr_binary() -> Optional[str]:
-    """Return the installed linuxocr path: PATH, then ~/.cargo/bin. None if absent."""
-    found = shutil.which("linuxocr")
-    if found:
-        return found
-    cargo_bin = Path.home() / ".cargo" / "bin" / "linuxocr"
-    return str(cargo_bin) if cargo_bin.exists() else None
-
-
-def linuxocr_source() -> Path:
-    """Path to the linuxocr Python script in the repo (for `paniolo setup`)."""
-    return Path(__file__).parent.parent.parent / "ocr" / "linuxocr"
-
-
-def install_linuxocr(dest: Path) -> None:
-    """Copy ocr/linuxocr to `dest` and make it executable (used by `paniolo setup`)."""
-    import shutil as _shutil
-    source = linuxocr_source()
-    if not source.exists():
-        raise FileNotFoundError(f"linuxocr source not found: {source}")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    _shutil.copy2(source, dest)
-    dest.chmod(0o755)
-
-
-def ocr_binary() -> Optional[str]:
-    """Return the platform OCR binary: visionocr on macOS, linuxocr on Linux."""
-    if sys.platform == "darwin":
-        return visionocr_binary()
-    return linuxocr_binary()
-
-
-def read_text(png: bytes, fast: bool = False, as_json: bool = False) -> str:
-    """OCR PNG bytes and return recognized text (or JSON with bboxes).
-
-    `fast` is only meaningful on macOS (visionocr --fast); ignored on Linux.
-    `as_json` requests bounding-box JSON output; not yet supported on Linux.
-    """
-    binary = ocr_binary()
-    if not binary:
-        platform = "macOS" if sys.platform == "darwin" else "Linux"
-        tool = "visionocr" if sys.platform == "darwin" else "linuxocr"
-        raise FileNotFoundError(f"{tool} not installed on {platform} — run: paniolo setup")
-    cmd = [binary]
-    if sys.platform == "darwin":
-        if fast:
-            cmd.append("--fast")
-        if as_json:
-            cmd.append("--json")
-    cmd.append("-")
-    result = subprocess.run(cmd, input=png, capture_output=True)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.decode(errors="replace").strip() or f"{binary} failed")
-    return result.stdout.decode(errors="replace")
-````
-
 ## File: src/paniolo/_power.py
 ````python
 # Copyright 2026 Curtis Galloway
@@ -6035,266 +5219,6 @@ def dtr_direct_button_press(device: str, duration_ms: int) -> None:
         port.dtr = False
     finally:
         port.close()
-````
-
-## File: tests/test_config.py
-````python
-# Copyright 2026 Curtis Galloway
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Tests for target config (de)serialization and serial-interface helpers."""
-
-from __future__ import annotations
-
-import tomllib
-
-import pytest
-
-from paniolo import _config
-from paniolo._config import SerialInterface, TargetConfig
-
-
-def roundtrip(cfg: TargetConfig) -> TargetConfig:
-    return _config._from_dict(tomllib.loads(_config._to_toml(cfg)))
-
-
-def test_roundtrip_multiple_interfaces():
-    cfg = TargetConfig(
-        name="fortune",
-        interface="en3",
-        tftp_root="/pxe",
-        serial_interfaces=[
-            SerialInterface("console", "/dev/ttyUSB0", 115200),
-            SerialInterface("bmc", "/dev/ttyUSB1", 9600),
-        ],
-    )
-    got = roundtrip(cfg)
-    assert (got.name, got.interface, got.tftp_root) == ("fortune", "en3", "/pxe")
-    assert [(i.name, i.device, i.baud) for i in got.serial_interfaces] == [
-        ("console", "/dev/ttyUSB0", 115200),
-        ("bmc", "/dev/ttyUSB1", 9600),
-    ]
-
-
-def test_roundtrip_no_interfaces():
-    got = roundtrip(TargetConfig(name="x", interface="en0"))
-    assert got.serial_interfaces == []
-
-
-def test_legacy_single_serial_migrates():
-    data = tomllib.loads(
-        'name = "x"\ninterface = "en0"\nserial_device = "/dev/ttyUSB0"\nserial_baud = 57600\n'
-    )
-    cfg = _config._from_dict(data)
-    assert len(cfg.serial_interfaces) == 1
-    iface = cfg.serial_interfaces[0]
-    assert (iface.name, iface.device, iface.baud) == (_config.DEFAULT_SERIAL_NAME, "/dev/ttyUSB0", 57600)
-
-
-def test_legacy_default_baud():
-    data = tomllib.loads('name = "x"\ninterface = "en0"\nserial_device = "/dev/ttyUSB0"\n')
-    assert _config._from_dict(data).serial_interfaces[0].baud == 115200
-
-
-def test_serial_interface_resolution():
-    cfg = TargetConfig(
-        name="x",
-        interface="en0",
-        serial_interfaces=[SerialInterface("console", "/dev/a"), SerialInterface("bmc", "/dev/b")],
-    )
-    assert cfg.serial_interface("bmc").device == "/dev/b"
-    with pytest.raises(ValueError):
-        cfg.serial_interface()  # ambiguous
-    with pytest.raises(ValueError):
-        cfg.serial_interface("nope")  # unknown
-
-
-def test_serial_interface_single_is_default():
-    cfg = TargetConfig(name="x", interface="en0", serial_interfaces=[SerialInterface("console", "/dev/a")])
-    assert cfg.serial_interface().name == "console"
-
-
-def test_serial_interface_none_configured():
-    with pytest.raises(ValueError):
-        TargetConfig(name="x", interface="en0").serial_interface()
-
-
-def test_upsert_replaces_same_name():
-    cfg = TargetConfig(name="x", interface="en0")
-    cfg.upsert_serial_interface(SerialInterface("console", "/dev/a", 115200))
-    cfg.upsert_serial_interface(SerialInterface("console", "/dev/a2", 9600))
-    assert len(cfg.serial_interfaces) == 1
-    assert (cfg.serial_interfaces[0].device, cfg.serial_interfaces[0].baud) == ("/dev/a2", 9600)
-
-
-def test_remove_interface():
-    cfg = TargetConfig(
-        name="x",
-        interface="en0",
-        serial_interfaces=[SerialInterface("console", "/dev/a"), SerialInterface("bmc", "/dev/b")],
-    )
-    assert cfg.remove_serial_interface("console") is True
-    assert cfg.remove_serial_interface("console") is False
-    assert [i.name for i in cfg.serial_interfaces] == ["bmc"]
-````
-
-## File: tests/test_hid.py
-````python
-# Copyright 2026 Curtis Galloway
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Host-side tests for the HID rig client — no hardware, no pyserial."""
-
-from __future__ import annotations
-
-import pytest
-
-from paniolo import _hid
-
-
-class FakeTransport:
-    """Stand-in for a pyserial port: records writes, replies from a queue."""
-
-    def __init__(self, replies=None):
-        self.writes: list[bytes] = []
-        self._replies = list(replies) if replies else []
-        self.closed = False
-
-    def write(self, data: bytes) -> None:
-        self.writes.append(data)
-
-    def readline(self) -> bytes:
-        return self._replies.pop(0) if self._replies else b"OK\n"
-
-    def close(self) -> None:
-        self.closed = True
-
-
-def make_rig(replies=None):
-    t = FakeTransport(replies)
-    return _hid.HidRig(transport=t), t
-
-
-# --- command construction ---------------------------------------------------
-
-@pytest.mark.parametrize(
-    "call, expected",
-    [
-        (lambda r: r.type("hello world"), b"type hello world\n"),
-        (lambda r: r.key("ENTER"), b"key ENTER\n"),
-        (lambda r: r.combo("LEFT_CONTROL", "C"), b"combo LEFT_CONTROL C\n"),
-        (lambda r: r.down("LEFT_SHIFT"), b"down LEFT_SHIFT\n"),
-        (lambda r: r.up("LEFT_SHIFT"), b"up LEFT_SHIFT\n"),
-        (lambda r: r.releaseall(), b"releaseall\n"),
-        (lambda r: r.move(300, -50), b"move 300 -50\n"),
-        (lambda r: r.click(), b"click left\n"),
-        (lambda r: r.click("right"), b"click right\n"),
-        (lambda r: r.mdown("middle"), b"mdown middle\n"),
-        (lambda r: r.mup("middle"), b"mup middle\n"),
-        (lambda r: r.scroll(-3), b"scroll -3\n"),
-    ],
-)
-def test_command_construction(call, expected):
-    rig, t = make_rig()
-    call(rig)
-    assert t.writes == [expected]
-
-
-def test_cmd_returns_reply():
-    rig, _ = make_rig(replies=[b"OK\n"])
-    assert rig.cmd("releaseall") == "OK"
-
-
-def test_cmd_raises_on_err():
-    rig, _ = make_rig(replies=[b"ERR unknown command: frob\n"])
-    with pytest.raises(RuntimeError, match="control board rejected"):
-        rig.cmd("frob")
-
-
-def test_close_delegates():
-    rig, t = make_rig()
-    rig.close()
-    assert t.closed
-
-
-# --- absolute-mouse scaling -------------------------------------------------
-
-@pytest.mark.parametrize(
-    "px, screen, expected",
-    [
-        (0, 1920, 0),
-        (1919, 1920, 32767),
-        (960, 1920, 16392),
-        (-100, 1920, 0),        # clamp low
-        (99999, 1920, 32767),   # clamp high
-        (5, 1, 0),              # degenerate screen size
-    ],
-)
-def test_scale_to_logical(px, screen, expected):
-    assert _hid.scale_to_logical(px, screen) == expected
-
-
-# --- sequence parsing -------------------------------------------------------
-
-def test_parse_sequence_skips_blanks_and_comments():
-    text = "\n# a comment\n  \nkey ENTER\n# another\ntype hi\n"
-    assert _hid.parse_sequence(text) == [("cmd", "key ENTER"), ("cmd", "type hi")]
-
-
-def test_parse_sequence_timing_directives():
-    text = "delay 250\nkey A\nsleep 2\n"
-    assert _hid.parse_sequence(text) == [
-        ("delay", 0.25),
-        ("cmd", "key A"),
-        ("delay", 2.0),
-    ]
-
-
-def test_run_sequence_executes_in_order_with_delays():
-    rig, t = make_rig(replies=[b"OK\n", b"OK\n"])
-    slept: list[float] = []
-    steps = [("cmd", "key A"), ("delay", 0.5), ("cmd", "type hi")]
-    _hid.run_sequence(rig, steps, default_delay=0.0, sleep=slept.append)
-    assert t.writes == [b"key A\n", b"type hi\n"]
-    assert slept == [0.5]
-
-
-def test_run_sequence_default_delay_between_commands():
-    rig, _ = make_rig(replies=[b"OK\n", b"OK\n"])
-    slept: list[float] = []
-    steps = [("cmd", "key A"), ("cmd", "key B")]
-    _hid.run_sequence(rig, steps, default_delay=0.1, sleep=slept.append)
-    assert slept == [0.1, 0.1]
-
-
-def test_repeat_key():
-    rig, t = make_rig(replies=[b"OK\n"] * 3)
-    slept: list[float] = []
-    _hid.repeat_key(rig, "TAB", 3, delay=0.2, sleep=slept.append)
-    assert t.writes == [b"key TAB\n"] * 3
-    assert slept == [0.2, 0.2]  # no trailing delay after the last tap
 ````
 
 ## File: tests/test_serial.py
@@ -6629,127 +5553,293 @@ dev = [
 where = ["src"]
 ````
 
-## File: README.md
-````markdown
-# paniolo
+## File: hdmicap/assets/index.html
+````html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>paniolo · video + serial</title>
+  <link rel="stylesheet" href="/xterm.css">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { height: 100%; }
+    body { background: #000; display: flex; flex-direction: column;
+           font: 12px ui-monospace, Menlo, monospace; color: #ddd; }
+    #video { flex: 1 1 auto; min-height: 0; position: relative;
+             display: flex; align-items: center; justify-content: center; }
+    #video img { max-width: 100%; max-height: 100%; object-fit: contain; }
+    #vstatus { position: absolute; top: 8px; right: 12px; color: #0f0;
+               background: rgba(0,0,0,.6); padding: 4px 8px; border-radius: 4px; }
+    #sidebar { flex: 0 0 auto; display: flex; flex-direction: column; min-height: 0; }
+    #bar { flex: 0 0 24px; background: #111; display: flex; align-items: center;
+           gap: 14px; padding: 0 12px; border-top: 1px solid #333; }
+    #bar .label { color: #888; }
+    #sstatus { color: #fa0; flex: 1 1 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #layoutbtn { margin-left: auto; cursor: pointer; background: none; border: 1px solid #444;
+                 border-radius: 3px; color: #888; font: 11px ui-monospace, monospace;
+                 padding: 1px 6px; }
+    #layoutbtn:hover { color: #cdf; border-color: #46c; }
+    #serial { flex: 0 0 40vh; background: #000; min-height: 0; display: flex; }
+    .serial-pane { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; }
+    .serial-pane + .serial-pane { border-left: 1px solid #333; }
+    .pane-bar { flex: 0 0 20px; background: #111; border-bottom: 1px solid #222;
+                display: flex; align-items: center; padding: 0 8px; gap: 8px; font-size: 11px; }
+    .pane-name { color: #888; }
+    .pane-status { color: #fa0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .pane-term { flex: 1 1 0; min-height: 0; padding: 4px 6px; }
+    #videobtns { position: absolute; top: 8px; left: 12px; z-index: 3;
+                 display: flex; gap: 6px; }
+    #ocrbtn, #pwrbtn { cursor: pointer; font: 12px ui-monospace, monospace;
+                       padding: 4px 10px; border-radius: 4px; }
+    #ocrbtn { color: #cdf; background: rgba(0,0,0,.6); border: 1px solid #46c; }
+    #ocrbtn:hover { background: rgba(40,80,160,.7); }
+    #pwrbtn { color: #fca; background: rgba(0,0,0,.6); border: 1px solid #840;
+              display: none; }
+    #pwrbtn:hover { background: rgba(80,30,0,.7); }
+    #pwrmodal { position: absolute; inset: 0; z-index: 10; display: none;
+                align-items: center; justify-content: center;
+                background: rgba(0,0,0,.7); }
+    #pwrmodal.show { display: flex; }
+    #pwrbox { background: #111; border: 1px solid #840; border-radius: 8px;
+              padding: 20px 24px; display: flex; flex-direction: column; gap: 14px;
+              color: #ddd; font: 13px ui-monospace, monospace; max-width: 300px; }
+    #pwrbox p { color: #fca; }
+    #pwrbtns { display: flex; gap: 10px; justify-content: flex-end; }
+    #pwrcancel { cursor: pointer; background: none; border: 1px solid #555;
+                 border-radius: 4px; color: #aaa; padding: 4px 14px; font: inherit; }
+    #pwrcancel:hover { border-color: #888; color: #ddd; }
+    #pwrconfirm { cursor: pointer; background: rgba(80,30,0,.8); border: 1px solid #a60;
+                  border-radius: 4px; color: #fca; padding: 4px 14px; font: inherit; }
+    #pwrconfirm:hover { background: rgba(120,50,0,.9); }
+    #ocrpanel { position: absolute; inset: 8px 8px auto 8px; max-height: 70%; z-index: 4;
+                display: none; flex-direction: column; background: rgba(0,0,0,.92);
+                border: 1px solid #46c; border-radius: 6px; }
+    #ocrpanel.show { display: flex; }
+    #ocrhead { display: flex; justify-content: space-between; align-items: center;
+               padding: 6px 10px; border-bottom: 1px solid #333; color: #cdf; }
+    #ocrclose { cursor: pointer; color: #f88; padding: 0 6px; font-size: 16px; }
+    #ocrtext { margin: 0; padding: 10px; overflow: auto; white-space: pre-wrap;
+               color: #dfd; font: 12px ui-monospace, monospace; }
 
-Agent-controlled target machine wrangler for low-level software development.
+    /* right-panel layout */
+    body.layout-right { flex-direction: row; }
+    body.layout-right #video { flex: 1 1 0; min-width: 0; min-height: 0; }
+    body.layout-right #sidebar { flex: 0 0 380px; min-width: 380px; min-height: 0;
+                                  border-top: none; border-left: 1px solid #333; }
+    body.layout-right #bar { border-top: none; border-bottom: 1px solid #333; }
+    body.layout-right #serial { flex: 1 1 0; min-height: 0; flex-direction: column; }
+    body.layout-right .serial-pane + .serial-pane { border-left: none; border-top: 1px solid #333; }
+  </style>
+</head>
+<body>
+  <div id="video">
+    <img id="feed" src="/preview" alt="HDMI capture feed">
+    <div id="videobtns">
+      <button id="ocrbtn">⌕ OCR</button>
+      <button id="pwrbtn">⏻ Power Cycle</button>
+    </div>
+    <div id="vstatus">connecting…</div>
+    <div id="ocrpanel">
+      <div id="ocrhead"><span id="ocrtitle">OCR</span><span id="ocrclose">×</span></div>
+      <pre id="ocrtext"></pre>
+    </div>
+    <div id="pwrmodal">
+      <div id="pwrbox">
+        <p>Power cycle the target?</p>
+        <div id="pwrbtns">
+          <button id="pwrcancel">Cancel</button>
+          <button id="pwrconfirm">Power Cycle</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div id="sidebar">
+    <div id="bar">
+      <span class="label">serial</span>
+      <span id="sstatus">disconnected</span>
+      <button id="layoutbtn" title="Toggle serial panel position"></button>
+    </div>
+    <div id="serial"></div>
+  </div>
 
-"Paniolo" is the Hawaiian word for cowboy. The idea: an AI agent sits at the
-reins while you're writing bootloaders, firmware, or OS bring-up code — paniolo
-gives it the controls to netboot the target, watch its output, send it input,
-and power-cycle it without human intervention at each iteration.
+  <script src="/xterm.js"></script>
+  <script src="/xterm-addon-fit.js"></script>
+  <script>
+    // ── layout toggle ──
+    const layoutBtn = document.getElementById('layoutbtn');
+    const LAYOUT_KEY = 'paniolo-serial-layout';
+    const allFits = [];
+    function fitAll() { allFits.forEach(f => { try { f.fit(); } catch (e) {} }); }
+    function setLayout(layout) {
+      const right = layout === 'right';
+      document.body.classList.toggle('layout-right', right);
+      layoutBtn.textContent = right ? 'serial ↓ bottom' : 'serial → right';
+      localStorage.setItem(LAYOUT_KEY, layout);
+      setTimeout(fitAll, 50);
+    }
+    layoutBtn.onclick = () =>
+      setLayout(document.body.classList.contains('layout-right') ? 'bottom' : 'right');
+    setLayout(localStorage.getItem(LAYOUT_KEY) || 'bottom');
 
----
+    window.addEventListener('resize', fitAll);
 
-## Capabilities
+    // ── video: poll signal/resolution from this (hdmicap) daemon ──
+    const vimg = document.getElementById('feed');
+    const vst  = document.getElementById('vstatus');
+    function pollVideo() {
+      fetch('/status').then(r => r.json()).then(d => {
+        vst.textContent = d.signal + ' · ' + d.width + '×' + d.height;
+        vst.style.color = d.signal === 'stable' ? '#0f0' : '#fa0';
+      }).catch(() => { vst.textContent = 'daemon unreachable'; vst.style.color = '#f44'; });
+    }
+    pollVideo();
+    setInterval(pollVideo, 2000);
+    vimg.onerror = () => { vst.textContent = 'stream error — reload'; vst.style.color = '#f44'; };
 
-| Subsystem | Commands | What it does |
-|---|---|---|
-| [Netboot](docs/netboot.md) | `paniolo netboot` | DHCP + TFTP netboot over a direct USB-Ethernet link |
-| [Video](docs/video.md) | `paniolo video` | HDMI capture via warm-stream daemon; on-device OCR |
-| [Serial](docs/serial.md) | `paniolo serial` | Serial console — interactive (tio) or daemon-backed with timestamped rolling log |
-| [Power control](docs/power.md) | `paniolo button/reset/power-cycle/power-state` | Hardware power button via FTDI DTR line wired to Pi J2 header |
-| [HID injection](docs/hid.md) | `paniolo hid` | USB keyboard/mouse injection via a two-board KB2040 rig |
-| [Dashboard](docs/dashboard.md) | `paniolo console` | Combined video + serial web UI; `-i <name>` preselects a serial interface |
-| [HA power switch](docs/power.md#home-assistant-power-switch) | `paniolo power-switch` | Cut/restore power via a Home Assistant smart switch |
+    // ── OCR: run Apple Vision on the current frame via the /ocr endpoint ──
+    const ocrPanel = document.getElementById('ocrpanel');
+    const ocrText = document.getElementById('ocrtext');
+    const ocrTitle = document.getElementById('ocrtitle');
+    document.getElementById('ocrclose').onclick = () => ocrPanel.classList.remove('show');
+    document.getElementById('ocrbtn').onclick = () => {
+      ocrPanel.classList.add('show');
+      ocrTitle.textContent = 'OCR — reading…';
+      ocrText.textContent = '';
+      fetch('/ocr')
+        .then(r => r.text().then(t => ({ ok: r.ok, t })))
+        .then(({ ok, t }) => {
+          ocrTitle.textContent = ok ? 'OCR' : 'OCR — error';
+          ocrText.textContent = ok ? (t.trim() || '(no text detected)') : t;
+        })
+        .catch(e => { ocrTitle.textContent = 'OCR — error'; ocrText.textContent = String(e); });
+    };
 
----
+    // ── Power Cycle button — only shown when /power-cycle is available ──
+    const pwrBtn = document.getElementById('pwrbtn');
+    const pwrModal = document.getElementById('pwrmodal');
+    fetch('/power-cycle', { method: 'POST' })
+      .then(r => { if (r.status !== 501) pwrBtn.style.display = ''; })
+      .catch(() => {});
+    pwrBtn.onclick = () => pwrModal.classList.add('show');
+    document.getElementById('pwrcancel').onclick = () => pwrModal.classList.remove('show');
+    document.getElementById('pwrconfirm').onclick = () => {
+      pwrModal.classList.remove('show');
+      pwrBtn.textContent = '⏻ cycling…';
+      pwrBtn.disabled = true;
+      fetch('/power-cycle', { method: 'POST' })
+        .then(r => r.text().then(t => {
+          pwrBtn.textContent = r.ok ? '⏻ Power Cycle' : '⏻ Error';
+          if (!r.ok) console.error('power-cycle:', t);
+        }))
+        .catch(e => { pwrBtn.textContent = '⏻ Error'; console.error(e); })
+        .finally(() => { pwrBtn.disabled = false; });
+    };
 
-## Requirements
+    // ── serial: xterm.js panes fed by serialcap WebSocket (cross-port) ──
+    // ?serial=PORT or ?serialws=URL override the default serialcap location.
+    // ?interface=NAME locks to a single interface (single-pane mode).
+    // Without ?interface, all daemon interfaces get their own pane side-by-side.
+    const params = new URLSearchParams(location.search);
+    const serialPort = params.get('serial') || '8724';
+    const baseWsUrl = params.get('serialws') ||
+                      ('ws://' + location.hostname + ':' + serialPort + '/stream');
+    const httpBase = baseWsUrl.replace(/^ws/, 'http').replace(/\/stream.*$/, '');
+    const singleInterface = params.get('interface') || null;
 
-- macOS 10.14 (Mojave) or later
-- Python 3.11+
-- [uv](https://docs.astral.sh/uv/) (`brew install uv`)
-- [Homebrew](https://brew.sh)
-- Rust toolchain (for hdmicap, serialcap — `brew install rustup`)
+    const sst = document.getElementById('sstatus');
+    const serialEl = document.getElementById('serial');
 
----
+    function wsUrlFor(iface) {
+      if (!iface) return baseWsUrl;
+      const sep = baseWsUrl.includes('?') ? '&' : '?';
+      return baseWsUrl + sep + 'interface=' + encodeURIComponent(iface);
+    }
 
-## Installation
+    function openTerminal(ifaceName, termDiv, statusEl) {
+      const term = new Terminal({
+        fontSize: 13, cursorBlink: true, scrollback: 5000,
+        theme: { background: '#000000' },
+      });
+      const fit = new FitAddon.FitAddon();
+      term.loadAddon(fit);
+      term.open(termDiv);
+      allFits.push(fit);
 
-```bash
-git clone https://github.com/curtisgalloway/paniolo ~/src/paniolo
-uv tool install ~/src/paniolo
-paniolo setup          # installs dnsmasq, tftp-now, hdmicap, serialcap, visionocr
-```
+      const wsUrl = wsUrlFor(ifaceName);
+      let ws, gen = 0;
+      function connect() {
+        const myGen = ++gen;
+        statusEl.textContent = 'connecting…';
+        statusEl.style.color = '#fa0';
+        ws = new WebSocket(wsUrl);
+        ws.binaryType = 'arraybuffer';
+        ws.onopen = () => { statusEl.textContent = 'connected'; statusEl.style.color = '#0f0'; };
+        ws.onmessage = ev => {
+          if (ev.data instanceof ArrayBuffer) term.write(new Uint8Array(ev.data));
+          else term.write(ev.data);
+        };
+        ws.onclose = () => {
+          if (myGen !== gen) return;
+          statusEl.textContent = 'unreachable — retrying';
+          statusEl.style.color = '#f44';
+          setTimeout(() => { if (myGen === gen) connect(); }, 3000);
+        };
+        ws.onerror = () => { try { ws.close(); } catch (e) {} };
+      }
+      term.onData(d => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(d); });
+      connect();
+    }
 
-`paniolo setup` compiles and installs the Rust daemons (`hdmicap`, `serialcap`)
-and the Swift OCR helper (`visionocr`) into `~/.cargo/bin`, and installs the
-TFTP and DHCP servers via Homebrew.
+    function buildPanes(ifaceNames) {
+      serialEl.innerHTML = '';
+      allFits.length = 0;
 
-To pick up code changes after pulling or editing:
+      if (ifaceNames.length <= 1) {
+        // Single pane: global #sstatus, no per-pane label
+        const termDiv = document.createElement('div');
+        termDiv.className = 'pane-term';
+        serialEl.appendChild(termDiv);
+        openTerminal(ifaceNames[0] || null, termDiv, sst);
+      } else {
+        // Multi-pane: hide global status; each pane gets a label + status bar
+        sst.style.display = 'none';
+        for (const name of ifaceNames) {
+          const pane = document.createElement('div');
+          pane.className = 'serial-pane';
 
-```bash
-uv tool install --reinstall ~/src/paniolo
-cargo install --path ~/src/paniolo/hdmicap    # if hdmicap changed
-cargo install --path ~/src/paniolo/serialcap  # if serialcap changed
-```
+          const bar = document.createElement('div');
+          bar.className = 'pane-bar';
+          const nameEl = document.createElement('span');
+          nameEl.className = 'pane-name';
+          nameEl.textContent = name;
+          const statusEl = document.createElement('span');
+          statusEl.className = 'pane-status';
+          bar.append(nameEl, statusEl);
 
-For the USB HID commands, install the optional `pyserial` extra:
+          const termDiv = document.createElement('div');
+          termDiv.className = 'pane-term';
 
-```bash
-uv tool install --with pyserial ~/src/paniolo
-```
+          pane.append(bar, termDiv);
+          serialEl.appendChild(pane);
+          openTerminal(name, termDiv, statusEl);
+        }
+      }
+      setTimeout(fitAll, 50);
+    }
 
----
-
-## Remote control pattern
-
-The intended use is an AI agent or script on a dev machine SSHing into the
-control Mac to drive the target:
-
-```bash
-# Configure target once
-ssh control-mac "paniolo target set target-machine \
-    --interface en3 \
-    --tftp-root ~/pxe \
-    --ha-power-entity switch.my_plug"
-
-# Deploy a new kernel and boot
-TFTP_ROOT=$(ssh control-mac "paniolo netboot tftp-root target-machine")
-scp out/kernel.img control-mac:"${TFTP_ROOT}/kernel_2712.img"
-ssh control-mac "paniolo netboot start target-machine"
-ssh control-mac "paniolo netboot logs -f target-machine"
-
-# Interact with the console
-ssh control-mac "paniolo serial log -i console --since --tail 50 target-machine"
-
-# Power cycle and repeat
-ssh control-mac "paniolo power-cycle target-machine"
-```
-
----
-
-## Concepts
-
-### Target
-
-A *target* is a named machine you want to control. Its configuration lives in
-`~/.config/paniolo/targets/<name>.toml`. One config file per target; no daemon
-required. If exactly one target is configured it is the default and can be
-omitted from every command.
-
-See [`paniolo target set --help`](docs/netboot.md#target-configuration) for all fields.
-
-### Runtime paths
-
-| Purpose | Path |
-|---|---|
-| Target configs | `~/.config/paniolo/targets/<name>.toml` |
-| Video config | `~/.config/paniolo/video.toml` |
-| HA config | `~/.config/paniolo/ha.toml` |
-| HID config | `~/.config/paniolo/hid.toml` |
-| Netboot daemon state | `~/.local/share/paniolo/<name>/netboot.json` |
-| hdmicap discovery | `$TMPDIR/hdmicap/daemon.json` |
-| serialcap discovery | `$TMPDIR/serialcap/daemon.json` |
-| Serial capture logs | `$TMPDIR/serialcap/capture/<name>/serial.jsonl` |
-
----
-
-## License
-
-Apache 2.0 — see [LICENSE](LICENSE).
+    if (singleInterface) {
+      buildPanes([singleInterface]);
+    } else {
+      fetch(httpBase + '/interfaces')
+        .then(r => r.json())
+        .then(list => buildPanes(Array.isArray(list) ? list.map(i => i.name) : [null]))
+        .catch(() => buildPanes([null]));
+    }
+  </script>
+</body>
+</html>
 ````
 
 ## File: hdmicap/src/capture_thread.rs
@@ -7321,403 +6411,70 @@ mod tests {
 }
 ````
 
-## File: hdmicap/src/server.rs
-````rust
-// Copyright 2026 Curtis Galloway
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+## File: hdmicap/Cargo.toml
+````toml
+[package]
+name = "hdmicap"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Warm-stream HDMI capture daemon optimized for agent screenshotting + human preview"
 
-//! Localhost HTTP API. Handlers never touch the device — they only read the
-//! latest FrameState from their `watch::Receiver`. PNG encoding is lazy, here.
+[[bin]]
+name = "hdmicap"
+path = "src/main.rs"
 
-use std::io::Cursor;
-use std::process::Stdio;
-use std::time::{Duration, Instant};
+[dependencies]
+# --- Capture -------------------------------------------------------------
+# nokhwa unifies V4L2 (Linux) and AVFoundation (macOS) behind one API.
+# `input-native` pulls the right per-OS backend in recent 0.10.x.
+nokhwa = { version = "0.10", features = ["input-native"] }
 
-use axum::{
-    body::Body,
-    extract::{Query, State},
-    http::{header, StatusCode},
-    response::{IntoResponse, Response},
-    routing::{get, post},
-    Json, Router,
-};
-use bytes::Bytes;
-use image::codecs::jpeg::JpegEncoder;
-use image::{ImageBuffer, ImageEncoder, Rgb};
-#[cfg(target_os = "linux")]
-use turbojpeg;
-use serde::Deserialize;
-use tokio::sync::watch;
+# --- Async runtime + HTTP ------------------------------------------------
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "net", "process", "io-util"] }
+axum = "0.7"
 
-use crate::capture_thread::FrameRx;
-use crate::frame::{FrameState, Signal, StatusDto};
+# --- Imaging -------------------------------------------------------------
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
-#[derive(Clone)]
-pub struct AppState {
-    pub frames: FrameRx,
-}
+# --- CLI -----------------------------------------------------------------
+clap = { version = "4", features = ["derive"] }
 
-pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/", get(index))
-        .route("/status", get(status))
-        .route("/snapshot", get(snapshot))
-        .route("/preview", get(preview))
-        .route("/ocr", get(ocr))
-        .route("/power-cycle", post(power_cycle))
-        .route("/devices", get(devices))
-        // Vendored xterm.js assets for the serial terminal pane.
-        .route("/xterm.js", get(xterm_js))
-        .route("/xterm.css", get(xterm_css))
-        .route("/xterm-addon-fit.js", get(xterm_fit_js))
-        .with_state(state)
-}
+# --- Daemon plumbing -----------------------------------------------------
+fs2 = "0.4"
+directories = "5"
 
-async fn index() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        include_str!("../assets/index.html"),
-    )
-}
+# --- Errors / logging / serde -------------------------------------------
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
-async fn xterm_js() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
-        include_str!("../assets/xterm.js"),
-    )
-}
+# --- Client subcommands --------------------------------------------------
+ureq = "2"
+nix = { version = "0.29", features = ["signal", "process"] }
 
-async fn xterm_css() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        include_str!("../assets/xterm.css"),
-    )
-}
+# --- Preview stream ------------------------------------------------------
+async-stream = "0.3"
+bytes = "1"
 
-async fn xterm_fit_js() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
-        include_str!("../assets/xterm-addon-fit.js"),
-    )
-}
+# On Linux we bypass nokhwa for the actual frame loop and use v4l directly
+# so we can call stream.set_timeout() and avoid an indefinite VIDIOC_DQBUF block.
+# turbojpeg provides fast MJPEG decode (~5ms vs ~50ms pure-Rust) for signal detection.
+[target.'cfg(target_os = "linux")'.dependencies]
+v4l = "0.14"
+turbojpeg = { version = "1.4", features = ["image"] }
 
-async fn status(State(s): State<AppState>) -> Json<StatusDto> {
-    let f = s.frames.borrow().clone();
-    Json(StatusDto::from(f.as_ref()))
-}
+[patch.crates-io]
+# Local patch: skip activeVideoMin/MaxFrameDuration KVC calls that throw NSException
+# on HDMI capture cards (MS2109) under AVFoundation. See vendor/nokhwa-bindings-macos.
+nokhwa-bindings-macos = { path = "vendor/nokhwa-bindings-macos" }
 
-#[derive(Deserialize)]
-struct SnapReq {
-    /// "stable" -> wait until signal == Stable.
-    wait: Option<String>,
-    /// Hex hash from a prior /status; wait until the published hash differs.
-    changed_since: Option<String>,
-    /// Milliseconds; default applied below.
-    timeout: Option<u64>,
-}
-
-const DEFAULT_TIMEOUT_MS: u64 = 2000;
-
-async fn snapshot(State(s): State<AppState>, Query(q): Query<SnapReq>) -> Response {
-    let mut rx = s.frames.clone();
-    let timeout_ms = q.timeout.unwrap_or(DEFAULT_TIMEOUT_MS);
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms).min(Duration::from_secs(60));
-    let want_stable = q.wait.as_deref() == Some("stable");
-    let changed_since = q
-        .changed_since
-        .as_ref()
-        .and_then(|h| u64::from_str_radix(h, 16).ok());
-
-    loop {
-        let ready = {
-            let f = rx.borrow_and_update();
-            match (want_stable, changed_since) {
-                (true, _) => f.signal == Signal::Stable,
-                (_, Some(h)) => f.hash != h,
-                _ => true,
-            }
-        };
-
-        if ready {
-            let f = rx.borrow().clone();
-            return png_response(&f, false);
-        }
-
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            let f = rx.borrow().clone();
-            return png_response(&f, true);
-        }
-        if tokio::time::timeout(remaining, rx.changed()).await.is_err() {
-            let f = rx.borrow().clone();
-            return png_response(&f, true);
-        }
-    }
-}
-
-/// Decode the frame to an RGB image. On the Linux MJPEG path `rgb` is empty
-/// and we decode `jpeg` with turbojpeg. On other paths `rgb` is pre-decoded.
-fn decode_rgb(f: &FrameState) -> Option<ImageBuffer<Rgb<u8>, Vec<u8>>> {
-    if !f.rgb.is_empty() {
-        return ImageBuffer::from_raw(f.width, f.height, f.rgb.to_vec());
-    }
-    #[cfg(target_os = "linux")]
-    if let Some(ref jpeg) = f.jpeg {
-        return turbojpeg::decompress_image::<Rgb<u8>>(jpeg).ok();
-    }
-    None
-}
-
-/// Encode the frame to PNG bytes. Shared by /snapshot and /ocr.
-fn encode_png(f: &FrameState) -> Option<Vec<u8>> {
-    let img = decode_rgb(f)?;
-    let mut bytes = Vec::new();
-    img.write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
-        .ok()?;
-    Some(bytes)
-}
-
-/// Lazily encode the current RGB buffer to PNG. PNG for agent snapshots: text
-/// edges matter for OCR and the dongle already adds MJPEG artifacts.
-fn png_response(f: &FrameState, timed_out: bool) -> Response {
-    if f.signal == Signal::NoDevice || f.width == 0 {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [(header::HeaderName::from_static("x-signal"), "no_device")],
-            "no capture device",
-        )
-            .into_response();
-    }
-
-    let bytes = match encode_png(f) {
-        Some(b) => b,
-        None => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "frame buffer size mismatch")
-                .into_response()
-        }
-    };
-
-    let signal_str = signal_name(f.signal);
-
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "image/png".to_string()),
-            (header::HeaderName::from_static("x-signal"), signal_str.to_string()),
-            (
-                header::HeaderName::from_static("x-resolution-epoch"),
-                f.resolution_epoch.to_string(),
-            ),
-            (
-                header::HeaderName::from_static("x-frame-hash"),
-                format!("{:016x}", f.hash),
-            ),
-            (
-                header::HeaderName::from_static("x-timeout"),
-                (timed_out as u8).to_string(),
-            ),
-        ],
-        bytes,
-    )
-        .into_response()
-}
-
-/// multipart/x-mixed-replace MJPEG stream for the human browser preview.
-/// Reads the same warm buffer as /snapshot — zero device contention.
-/// When raw JPEG bytes are available (Linux MJPEG path), they are served
-/// directly with zero server-side decode or re-encode. Otherwise we re-encode
-/// from the decoded RGB buffer at quality 80.
-async fn preview(State(s): State<AppState>) -> Response {
-    let mut frames = s.frames.clone();
-
-    let stream = async_stream::stream! {
-        let mut interval = tokio::time::interval(Duration::from_millis(67));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        loop {
-            interval.tick().await;
-            let f = frames.borrow_and_update().clone();
-
-            if f.signal == Signal::NoDevice || f.width == 0 {
-                continue;
-            }
-
-            // Fast path: raw JPEG bytes from the device — no decode/re-encode.
-            let jpeg_bytes: Vec<u8> = if let Some(ref raw) = f.jpeg {
-                raw.to_vec()
-            } else {
-                // Fallback: re-encode from decoded RGB (macOS / YUYV path).
-                let img: ImageBuffer<Rgb<u8>, _> =
-                    match ImageBuffer::from_raw(f.width, f.height, f.rgb.to_vec()) {
-                        Some(i) => i,
-                        None => continue,
-                    };
-                let mut buf = Vec::new();
-                let encoder = JpegEncoder::new_with_quality(Cursor::new(&mut buf), 80);
-                if encoder
-                    .write_image(
-                        img.as_raw(),
-                        img.width(),
-                        img.height(),
-                        image::ExtendedColorType::Rgb8,
-                    )
-                    .is_err()
-                {
-                    continue;
-                }
-                buf
-            };
-
-            let part_header = format!(
-                "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
-                jpeg_bytes.len()
-            );
-            let mut chunk = Vec::with_capacity(part_header.len() + jpeg_bytes.len() + 2);
-            chunk.extend_from_slice(part_header.as_bytes());
-            chunk.extend_from_slice(&jpeg_bytes);
-            chunk.extend_from_slice(b"\r\n");
-
-            yield Ok::<Bytes, std::io::Error>(Bytes::from(chunk));
-        }
-    };
-
-    Response::builder()
-        .header(
-            header::CONTENT_TYPE,
-            "multipart/x-mixed-replace;boundary=frame",
-        )
-        .body(Body::from_stream(stream))
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
-}
-
-/// OCR the current warm frame by shelling out to the `visionocr` tool (Apple
-/// Vision). The daemon doesn't link Vision itself — it pipes a PNG to whatever
-/// `PANIOLO_VISIONOCR` points at (paniolo sets this), falling back to PATH.
-async fn ocr(State(s): State<AppState>) -> Response {
-    let f = s.frames.borrow().clone();
-    if f.signal == Signal::NoDevice || f.width == 0 {
-        return (StatusCode::SERVICE_UNAVAILABLE, "no capture device").into_response();
-    }
-    let png = match encode_png(&f) {
-        Some(p) => p,
-        None => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "png encode failed").into_response()
-        }
-    };
-
-    let bin = std::env::var("PANIOLO_VISIONOCR").unwrap_or_else(|_| "visionocr".to_string());
-    let mut child = match tokio::process::Command::new(&bin)
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::NOT_IMPLEMENTED,
-                format!("visionocr unavailable ({bin}): {e}"),
-            )
-                .into_response()
-        }
-    };
-
-    // Write the PNG to stdin on a task while we collect stdout, so a large
-    // frame can't deadlock the pipe.
-    if let Some(mut stdin) = child.stdin.take() {
-        tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
-            let _ = stdin.write_all(&png).await;
-            // stdin dropped here -> EOF, so visionocr stops reading.
-        });
-    }
-
-    match child.wait_with_output().await {
-        Ok(out) if out.status.success() => (
-            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            out.stdout,
-        )
-            .into_response(),
-        Ok(out) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("visionocr failed: {}", String::from_utf8_lossy(&out.stderr)),
-        )
-            .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("visionocr wait: {e}")).into_response(),
-    }
-}
-
-/// Trigger a power cycle by calling `paniolo power-cycle <target>`.
-/// Requires PANIOLO_TARGET to be set in the daemon's environment (done by
-/// `paniolo video watch <target>`). Returns 501 if not configured.
-async fn power_cycle() -> Response {
-    let target = match std::env::var("PANIOLO_TARGET") {
-        Ok(t) if !t.is_empty() => t,
-        _ => {
-            return (
-                StatusCode::NOT_IMPLEMENTED,
-                "PANIOLO_TARGET not set — start the daemon with: paniolo video watch <target>",
-            )
-                .into_response()
-        }
-    };
-    let paniolo = std::env::var("PANIOLO_BIN").unwrap_or_else(|_| "paniolo".to_string());
-    match tokio::process::Command::new(&paniolo)
-        .args(["power-cycle", &target])
-        .status()
-        .await
-    {
-        Ok(s) if s.success() => (StatusCode::OK, "power cycle triggered").into_response(),
-        Ok(s) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("paniolo power-cycle exited with {s}"),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to run {paniolo}: {e}"),
-        )
-            .into_response(),
-    }
-}
-
-async fn devices() -> Response {
-    match crate::capture::enumerate() {
-        Ok(list) => Json(
-            list.into_iter()
-                .map(|d| {
-                    serde_json::json!({"index": d.index, "name": d.name, "misc": d.misc})
-                })
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
-    }
-}
-
-fn signal_name(s: Signal) -> &'static str {
-    match s {
-        Signal::Stable => "stable",
-        Signal::ModeSwitching => "mode_switching",
-        Signal::NoSignal => "no_signal",
-        Signal::NoDevice => "no_device",
-    }
-}
-
-#[allow(unused_imports)]
-use watch as _watch;
+[profile.release]
+opt-level = 3
+lto = "thin"
 ````
 
 ## File: serialcap/src/capture.rs
@@ -8873,6 +7630,8 @@ paniolo serial log [-i name] [options]         # print captured output (timestam
 paniolo serial show [target]                   # list interfaces + daemon status
 paniolo serial stop                            # release the ports
 paniolo serial devices                         # list serial devices on the host
+paniolo serial dtr [target] [-i name] [--ms N] # pulse DTR line (J2 power button header)
+paniolo serial reset [target] [-i name]        # soft reset via brief DTR pulse
 ```
 
 `--name` defaults to `console`, so a single-interface setup needs no flags. With
@@ -8903,15 +7662,23 @@ later with `--since <seq>` to get only what's new, or `--from/--to` to re-read a
 exact span. Output is ANSI-stripped by default; a `*` after the sequence number
 marks the current unterminated line (e.g. a `login:` prompt with no newline yet).
 
-## Power-cycle
+## Power control
 
 ```
-paniolo power-cycle [target] [--off-seconds N]
+paniolo power-cycle [target]           # run the target's power_cycle_cmd script
+paniolo power-state [target]           # show power state (requires sense signal + daemon)
+paniolo serial dtr [target] [--ms N]   # pulse DTR line on J2 header (soft/hard press)
+paniolo serial reset [target]          # soft reset via brief DTR pulse
 ```
 
-Toggles the target's Home Assistant switch off, waits, then on. Configure with
-`paniolo ha setup` and set `--ha-power-entity` on the target. Provide the HA
-token via the `HA_TOKEN` environment variable (e.g. through a secrets manager).
+`power-cycle` runs the shell script set with
+`paniolo target set <name> --power-cycle-cmd <script>`.
+The script is responsible for the full off→on sequence (HA API, PDU relay, GPIO, etc.).
+
+DTR commands drive the target's physical power button via an FTDI serial
+adapter wired to the Pi J2 header. A ≤500 ms pulse is a soft button event; ≥3000 ms
+is a hard PMIC power-off. Set the default interface with
+`paniolo target set <name> --power-serial console`.
 
 ## Driving it remotely over SSH
 
@@ -8929,8 +7696,9 @@ ssh control "paniolo netboot stop fortune"
 ## Quick reference — gotchas
 
 - Serial port is exclusive: one of `connect` / `watch` / external `tio`/`screen`.
-- `~/.cargo/bin` must be on `PATH` (that's where `paniolo setup` installs the daemons).
-- Netboot requires passwordless `sudo` for `ifconfig`.
+- `~/.local/bin` (uv tool) and `~/.cargo/bin` (Rust daemons) must be on `PATH`.
+- `paniolo console` auto-starts both daemons if they aren't running.
+- Netboot requires passwordless `sudo` (`ip` on Linux, `ifconfig` on macOS).
 - OCR is strongest on large text; tiny console fonts may misread some characters.
 
 ---
@@ -8938,343 +7706,7 @@ ssh control "paniolo netboot stop fortune"
 Licensed under the Apache License, Version 2.0.
 ````
 
-## File: src/paniolo/_dhcp.py
-````python
-# Copyright 2026 Curtis Galloway
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Minimal DHCP server for paniolo netboot.
-
-Sends broadcast DHCP responses (no BPF required, no root required on macOS 14+).
-Handles DISCOVER→OFFER and REQUEST→ACK for a single netboot client.
-
-Usage (as subprocess):
-    python -m paniolo._dhcp <host_ip> [--boot-file <filename>]
-
-host_ip is both the interface address and the TFTP/siaddr advertised to clients.
-"""
-
-from __future__ import annotations
-
-import argparse
-import logging
-import socket
-import struct
-import subprocess
-import sys
-import threading
-import time
-from pathlib import Path
-
-_BOOTREQUEST = 1
-_BOOTREPLY = 2
-_HTYPE_ETHERNET = 1
-_MAGIC = b"\x63\x82\x53\x63"
-
-_OPT_SUBNET = 1
-_OPT_ROUTER = 3
-_OPT_LEASE = 51
-_OPT_MSG_TYPE = 53
-_OPT_SERVER_ID = 54
-_OPT_TFTP_SERVER = 66
-_OPT_BOOTFILE = 67
-_OPT_END = 255
-
-_DHCP_DISCOVER = 1
-_DHCP_OFFER = 2
-_DHCP_REQUEST = 3
-_DHCP_ACK = 5
-_DHCP_NAK = 6
-
-_LEASE_SECONDS = 12 * 3600
-_ASSIGNED_IP = "192.168.99.100"
-
-# Shared file written by this DHCP server, read by the co-process TFTP server.
-# The TFTP server needs the client's real MAC to build BPF raw frames (the Pi
-# bootloader sends TFTP from a different ephemeral MAC than the one it used for
-# DHCP, which causes macOS to install the wrong ARP entry — see _tftp.py).
-_CLIENT_MAC_FILE = Path("/tmp/paniolo-client-mac")
-
-log = logging.getLogger(__name__)
-
-
-def _parse_options(options: bytes) -> dict[int, bytes]:
-    result: dict[int, bytes] = {}
-    if options[:4] != _MAGIC:
-        return result
-    i = 4
-    while i < len(options):
-        tag = options[i]
-        if tag == _OPT_END:
-            break
-        if tag == 0:
-            i += 1
-            continue
-        if i + 1 >= len(options):
-            break
-        length = options[i + 1]
-        result[tag] = options[i + 2 : i + 2 + length]
-        i += 2 + length
-    return result
-
-
-def _encode_option(tag: int, value: bytes) -> bytes:
-    return bytes([tag, len(value)]) + value
-
-
-def _build_reply(
-    xid: bytes,
-    chaddr: bytes,
-    msg_type: int,
-    server_ip: str,
-    assigned_ip: str,
-    boot_file: str,
-) -> bytes:
-    server_b = socket.inet_aton(server_ip)
-    client_b = socket.inet_aton(assigned_ip)
-
-    opts = _MAGIC
-    opts += _encode_option(_OPT_MSG_TYPE, bytes([msg_type]))
-    opts += _encode_option(_OPT_SERVER_ID, server_b)
-    opts += _encode_option(_OPT_LEASE, struct.pack("!I", _LEASE_SECONDS))
-    opts += _encode_option(_OPT_SUBNET, socket.inet_aton("255.255.255.0"))
-    opts += _encode_option(_OPT_ROUTER, server_b)
-    opts += _encode_option(_OPT_TFTP_SERVER, server_ip.encode())
-    opts += _encode_option(_OPT_BOOTFILE, boot_file.encode())
-    opts += bytes([_OPT_END])
-
-    pkt = struct.pack("!BBBB", _BOOTREPLY, _HTYPE_ETHERNET, 6, 0)
-    pkt += xid
-    pkt += struct.pack("!HH", 0, 0x8000)
-    pkt += b"\x00" * 4  # ciaddr
-    pkt += client_b  # yiaddr
-    pkt += server_b  # siaddr (next-server = TFTP)
-    pkt += b"\x00" * 4  # giaddr
-    pkt += chaddr[:16]  # chaddr (padded to 16)
-    pkt += b"\x00" * 64  # sname
-    file_bytes = boot_file.encode()[:127]
-    pkt += file_bytes + b"\x00" * (128 - len(file_bytes))  # file (null-padded)
-    pkt += opts
-    return pkt
-
-
-def _set_arp(ip: str, mac: str, interface: str | None = None) -> None:
-    """Pin a static ARP entry mapping the client IP to the MAC we just saw in a
-    DHCP packet.
-
-    The Pi's netboot firmware sends us DHCP/TFTP but does NOT answer ARP
-    requests. We already know the MAC from the DHCP frame, so install it
-    directly. Calling this on each DHCP exchange tracks the active MAC (the Pi
-    cycles through several boot phases). Needs root.
-
-    macOS: uses `arp -s` (net-tools syntax).
-    Linux: uses `ip neigh replace` (iproute2, requires interface name).
-    """
-    if sys.platform == "darwin":
-        r = subprocess.run(
-            ["sudo", "arp", "-s", ip, mac], capture_output=True, text=True
-        )
-        if r.returncode != 0:
-            log.warning("arp -s %s %s failed: %s", ip, mac, r.stderr.strip() or r.stdout.strip())
-    else:
-        cmd = ["sudo", "ip", "neigh", "replace", ip, "lladdr", mac, "nud", "permanent"]
-        if interface:
-            cmd += ["dev", interface]
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            log.warning(
-                "ip neigh replace %s lladdr %s failed: %s", ip, mac, r.stderr.strip()
-            )
-    # Share with the co-process TFTP server so it can build BPF raw frames
-    # (macOS) or just for diagnostics (Linux).
-    try:
-        _CLIENT_MAC_FILE.write_text(mac)
-    except OSError as exc:
-        log.debug("could not write client MAC file: %s", exc)
-
-
-def _has_interface_ip(interface: str, host_ip: str) -> bool:
-    """Return True if `host_ip` is currently assigned to `interface`."""
-    if sys.platform == "darwin":
-        try:
-            out = subprocess.check_output(
-                ["ifconfig", interface], text=True, stderr=subprocess.DEVNULL
-            )
-            return f"inet {host_ip} " in out
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            return False
-    else:
-        # Check sysfs; /sys/class/net/<iface>/address holds MAC but not IP.
-        # Use `ip addr show` instead.
-        try:
-            out = subprocess.check_output(
-                ["ip", "addr", "show", "dev", interface],
-                text=True,
-                stderr=subprocess.DEVNULL,
-            )
-            return f"inet {host_ip}/" in out or f"inet {host_ip} " in out
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            return False
-
-
-def _is_link_up(interface: str) -> bool:
-    """Return True if the interface link is currently up."""
-    if sys.platform == "darwin":
-        try:
-            out = subprocess.check_output(
-                ["ifconfig", interface], text=True, stderr=subprocess.DEVNULL
-            )
-            return "status: active" in out
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            return False
-    else:
-        try:
-            carrier = Path(f"/sys/class/net/{interface}/carrier").read_text().strip()
-            return carrier == "1"
-        except OSError:
-            return False
-
-
-def _monitor_interface(interface: str, host_ip: str) -> None:
-    """Continuously enforce the static IP on the interface.
-
-    The netboot client flaps the link on every power-cycle and at several
-    points during its own boot. macOS drops a manually-set IPv4 on link flap;
-    Linux is more stable but NetworkManager may reset the address. We poll fast
-    and re-apply immediately so the client's next retry always succeeds.
-    """
-    had_ip = True
-    while True:
-        time.sleep(0.25)
-        has_ip = _has_interface_ip(interface, host_ip)
-        is_active = _is_link_up(interface)
-
-        if not has_ip and is_active:
-            if sys.platform == "darwin":
-                subprocess.run(
-                    ["sudo", "ifconfig", interface, host_ip, "netmask", "255.255.255.0", "up"],
-                    check=False,
-                )
-            else:
-                subprocess.run(
-                    ["sudo", "ip", "addr", "add", f"{host_ip}/24", "dev", interface],
-                    check=False,
-                    capture_output=True,
-                )
-            if had_ip:
-                log.warning("interface %s lost IP %s — restoring", interface, host_ip)
-        elif has_ip and not had_ip:
-            log.info("interface %s restored with IP %s", interface, host_ip)
-
-        had_ip = has_ip
-
-
-def serve(
-    host_ip: str, boot_file: str = "kernel_2712.img", interface: str | None = None
-) -> None:
-    prefix = host_ip.rsplit(".", 1)[0]
-    bcast = f"{prefix}.255"
-
-    if interface:
-        t = threading.Thread(
-            target=_monitor_interface, args=(interface, host_ip), daemon=True
-        )
-        t.start()
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    try:
-        sock.bind(("", 67))
-    except PermissionError:
-        log.error(
-            "Cannot bind to port 67 (DHCP). On Linux, run paniolo as root or "
-            "grant CAP_NET_BIND_SERVICE: sudo setcap cap_net_bind_service=+ep "
-            "$(which python3)"
-        )
-        raise
-    log.info(
-        "DHCP listening on 0.0.0.0:67  host_ip=%s  bcast=%s  boot_file=%s",
-        host_ip,
-        bcast,
-        boot_file,
-    )
-
-    while True:
-        try:
-            data, _addr = sock.recvfrom(4096)
-        except OSError as exc:
-            log.error("recvfrom: %s", exc)
-            continue
-
-        if len(data) < 240:
-            continue
-        op = data[0]
-        if op != _BOOTREQUEST:
-            continue
-
-        xid = data[4:8]
-        chaddr = data[28:44]
-        mac = data[28:34].hex(":")
-        options = _parse_options(data[236:])
-
-        msg_type = options.get(_OPT_MSG_TYPE, b"")
-        if not msg_type:
-            continue
-        msg_type_val = msg_type[0]
-
-        if msg_type_val == _DHCP_DISCOVER:
-            log.info("DHCPDISCOVER from %s", mac)
-            _set_arp(_ASSIGNED_IP, mac, interface)
-            reply = _build_reply(xid, chaddr, _DHCP_OFFER, host_ip, _ASSIGNED_IP, boot_file)
-            sock.sendto(reply, (bcast, 68))
-            log.info(
-                "DHCPOFFER → %s  ip=%s  tftp=%s  file=%s",
-                mac,
-                _ASSIGNED_IP,
-                host_ip,
-                boot_file,
-            )
-
-        elif msg_type_val == _DHCP_REQUEST:
-            log.info("DHCPREQUEST from %s", mac)
-            _set_arp(_ASSIGNED_IP, mac, interface)
-            reply = _build_reply(xid, chaddr, _DHCP_ACK, host_ip, _ASSIGNED_IP, boot_file)
-            sock.sendto(reply, (bcast, 68))
-            log.info("DHCPACK → %s  ip=%s", mac, _ASSIGNED_IP)
-
-
-def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        stream=sys.stderr,
-    )
-    parser = argparse.ArgumentParser(description="Paniolo minimal DHCP server")
-    parser.add_argument("host_ip", help="Interface IP (also advertised as TFTP server)")
-    parser.add_argument("--boot-file", default="kernel_2712.img")
-    parser.add_argument("--interface", help="Interface device name (e.g. en11) for IP monitoring")
-    args = parser.parse_args()
-    serve(args.host_ip, args.boot_file, args.interface)
-
-
-if __name__ == "__main__":
-    main()
-````
-
-## File: src/paniolo/_state.py
+## File: src/paniolo/_config.py
 ````python
 # Copyright 2026 Curtis Galloway
 #
@@ -9293,854 +7725,972 @@ if __name__ == "__main__":
 from __future__ import annotations
 
 import dataclasses
-import json
-import os
-import subprocess
-from pathlib import Path
-from typing import Optional
-
-STATE_DIR = Path.home() / ".local" / "share" / "paniolo"
-
-
-@dataclasses.dataclass
-class NetbootState:
-    target: str
-    dhcp_pid: int
-    tftp_pid: int
-    started_at: float
-    interface: str
-    tftp_root: str
-
-
-def _target_dir(target: str) -> Path:
-    return STATE_DIR / target
-
-
-def netboot_state_path(target: str) -> Path:
-    return _target_dir(target) / "netboot.json"
-
-
-def netboot_log_path(target: str) -> Path:
-    return _target_dir(target) / "netboot.log"
-
-
-def ensure_target_dir(target: str) -> Path:
-    d = _target_dir(target)
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def save_netboot_state(state: NetbootState) -> None:
-    ensure_target_dir(state.target)
-    netboot_state_path(state.target).write_text(
-        json.dumps(dataclasses.asdict(state), indent=2)
-    )
-
-
-def load_netboot_state(target: str) -> Optional[NetbootState]:
-    path = netboot_state_path(target)
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text())
-        return NetbootState(**data)
-    except (json.JSONDecodeError, TypeError, KeyError):
-        return None
-
-
-def is_pid_alive(pid: int) -> bool:
-    """Return True if any process with this PID exists (signal-0 probe)."""
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # PID exists but we cannot signal it -- still alive.
-        return True
-
-
-def _pid_cmdline(pid: int) -> str:
-    """Return the full command-line string for pid, or empty string on failure."""
-    try:
-        result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "args="],
-            capture_output=True,
-            text=True,
-        )
-        return result.stdout.strip()
-    except Exception:  # pylint: disable=broad-except
-        return ""
-
-
-def is_paniolo_child_alive(pid: int, module: str) -> bool:
-    """Return True only if pid is alive AND its command line contains module.
-
-    Guards against stale PIDs reused by unrelated processes after a paniolo
-    child crashes.  module is the Python module name passed to -m, e.g.
-    'paniolo._tftp'.
-    """
-    if not is_pid_alive(pid):
-        return False
-    return module in _pid_cmdline(pid)
-
-
-def is_netboot_running(target: str) -> bool:
-    """Return True only if both child processes are alive and are our processes."""
-    state = load_netboot_state(target)
-    if state is None:
-        return False
-    return (
-        is_paniolo_child_alive(state.dhcp_pid, "paniolo._dhcp")
-        and is_paniolo_child_alive(state.tftp_pid, "paniolo._tftp")
-    )
-````
-
-## File: src/paniolo/_tftp.py
-````python
-# Copyright 2026 Curtis Galloway
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Minimal read-only TFTP server for paniolo netboot.
-
-Read-only (RRQ) TFTP per RFC 1350, with the blksize (RFC 2348) and tsize
-(RFC 2349) options the Raspberry Pi bootloader negotiates.
-
-Why a custom server instead of an off-the-shelf one (e.g. tftp-now): on macOS
-a non-root process can bind a privileged port (69) only on the wildcard
-address 0.0.0.0, NOT on a specific interface IP. But the host we serve sits on
-a *secondary* USB-Ethernet interface, and a reply socket left on 0.0.0.0 lets
-macOS pick the wrong egress (the primary interface) -> sendto() fails with
-EHOSTUNREACH ("no route to host"). The first fix is to listen on the wildcard
-while binding each reply socket to the specific interface IP on an ephemeral
-port, pinning egress to the right NIC.
-
-However, on macOS 15+ (Sequoia / "macOS 26") the kernel refuses to unicast to
-the Pi bootloader even with a permanent static ARP entry, because the bootloader
-sends TFTP packets from a different ephemeral source MAC than the one it used for
-DHCP. The kernel learns that ephemeral MAC as the host route for the client IP,
-then won't deliver frames to it (the bootloader only receives on its real MAC).
-The second fix is a BPF raw-frame sender: when sendto returns EHOSTUNREACH we
-write a complete Ethernet/IPv4/UDP frame directly to /dev/bpf, using the
-bootloader's real DHCP MAC (shared via /tmp/paniolo-client-mac by _dhcp.py) as
-the destination, bypassing the kernel's ARP table entirely.
-
-Usage (as subprocess):
-    python -m paniolo._tftp <host_ip> <root> [--port 69] [--interface <iface>]
-"""
-
-from __future__ import annotations
-
-import argparse
-import errno
-import fcntl
 import logging
-import os
 import re
-import socket
-import struct
-import subprocess
-import sys
-import threading
-import time
-from pathlib import Path
-
-_OP_RRQ = 1
-_OP_WRQ = 2
-_OP_DATA = 3
-_OP_ACK = 4
-_OP_ERROR = 5
-_OP_OACK = 6
-
-_ERR_NOT_FOUND = 1
-_ERR_ACCESS = 2
-_ERR_ILLEGAL = 4
-
-_DEFAULT_BLKSIZE = 512
-_ACK_TIMEOUT = 1.0
-_MAX_RETRIES = 6
-_ARP_RESOLVE_TIMEOUT = 4.0
-
-# Shared with _dhcp.py: the DHCP server writes the client MAC here so we can
-# use it as the BPF frame destination, bypassing the kernel's ARP table.
-_CLIENT_MAC_FILE = Path("/tmp/paniolo-client-mac")
-
-# macOS BPF ioctl constants (64-bit).  Used by BpfSender below.
-_BIOCSETIF = 0x8020426C  # bind BPF fd to an interface (struct ifreq, 32 B)
-_BIOCSHDRCMPLT = 0x80044275  # tell kernel we write complete L2 headers
-
-log = logging.getLogger(__name__)
-
-
-# ── BPF raw-frame sender ──────────────────────────────────────────────────────
-
-
-def _inet_checksum(data: bytes) -> int:
-    if len(data) % 2:
-        data += b"\x00"
-    total = sum(struct.unpack("!%dH" % (len(data) // 2), data))
-    while total >> 16:
-        total = (total & 0xFFFF) + (total >> 16)
-    return ~total & 0xFFFF
-
-
-def _build_udp_frame(
-    src_mac: bytes,
-    dst_mac: bytes,
-    src_ip: str,
-    dst_ip: str,
-    src_port: int,
-    dst_port: int,
-    payload: bytes,
-) -> bytes:
-    """Construct a raw Ethernet/IPv4/UDP frame."""
-    src_a = socket.inet_aton(src_ip)
-    dst_a = socket.inet_aton(dst_ip)
-    udp_len = 8 + len(payload)
-    ip_len = 20 + udp_len
-
-    ip_hdr = struct.pack(
-        "!BBHHHBBH4s4s",
-        0x45,
-        0,
-        ip_len,
-        0,
-        0x4000,
-        64,
-        17,
-        0,
-        src_a,
-        dst_a,
-    )
-    ip_ck = _inet_checksum(ip_hdr)
-    ip_hdr = ip_hdr[:10] + struct.pack("!H", ip_ck) + ip_hdr[12:]
-
-    udp_hdr_no_ck = struct.pack("!HHH", src_port, dst_port, udp_len)
-    pseudo = src_a + dst_a + b"\x00\x11" + struct.pack("!H", udp_len)
-    udp_ck = _inet_checksum(pseudo + udp_hdr_no_ck + b"\x00\x00" + payload)
-    udp_hdr = udp_hdr_no_ck + struct.pack("!H", udp_ck)
-
-    return dst_mac + src_mac + b"\x08\x00" + ip_hdr + udp_hdr + payload
-
-
-def _get_if_mac(iface: str) -> bytes:
-    if sys.platform != "darwin":
-        # Linux: read directly from sysfs (no ifconfig needed).
-        addr = Path(f"/sys/class/net/{iface}/address").read_text().strip()
-        return bytes(int(b, 16) for b in addr.split(":"))
-    out = subprocess.check_output(
-        ["ifconfig", iface], text=True, stderr=subprocess.DEVNULL
-    )
-    m = re.search(r"\bether\s+((?:[0-9a-f]{2}:){5}[0-9a-f]{2})\b", out)
-    if not m:
-        raise ValueError(f"No ether address for {iface}")
-    return bytes(int(b, 16) for b in m.group(1).split(":"))
-
-
-def _open_bpf_fd(iface: str) -> int | None:
-    """Open a writable BPF device bound to iface. macOS only; returns None elsewhere."""
-    if sys.platform != "darwin":
-        return None
-    for n in range(10):
-        try:
-            fd = os.open(f"/dev/bpf{n}", os.O_RDWR)
-        except OSError:
-            continue
-        try:
-            ifreq = bytearray(32)
-            ifreq[: len(iface)] = iface.encode()
-            fcntl.ioctl(fd, _BIOCSETIF, ifreq)
-            fcntl.ioctl(fd, _BIOCSHDRCMPLT, struct.pack("I", 1))
-            return fd
-        except OSError as exc:
-            os.close(fd)
-            log.debug("BPF /dev/bpf%d bind %s: %s", n, iface, exc)
-    return None
-
-
-class BpfSender:
-    """Sends UDP packets as raw Ethernet frames via /dev/bpf, bypassing the
-    kernel ARP table.  Used on macOS when sendto returns EHOSTUNREACH because
-    the kernel has installed the wrong destination MAC for the Pi bootloader.
-    On Linux, BPF is not available; `available` is always False."""
-
-    def __init__(self, iface: str, host_ip: str) -> None:
-        self._host_ip = host_ip
-        self._fd: int | None = None
-        self._src_mac: bytes | None = None
-        self._lock = threading.Lock()
-        if sys.platform != "darwin":
-            return
-        try:
-            self._src_mac = _get_if_mac(iface)
-            self._fd = _open_bpf_fd(iface)
-            if self._fd is not None:
-                log.info(
-                    "BPF sender ready on %s (src %s)",
-                    iface,
-                    self._src_mac.hex(":"),
-                )
-            else:
-                log.warning(
-                    "BPF unavailable on %s — check /dev/bpf* permissions or "
-                    "add user to 'access_bpf' group",
-                    iface,
-                )
-        except Exception as exc:
-            log.warning("BPF init failed: %s", exc)
-
-    @property
-    def available(self) -> bool:
-        return self._fd is not None and self._src_mac is not None
-
-    def _read_client_mac(self) -> bytes | None:
-        try:
-            mac_str = _CLIENT_MAC_FILE.read_text().strip()
-            return bytes(int(b, 16) for b in mac_str.split(":"))
-        except Exception:
-            return None
-
-    def send(self, sock: socket.socket, packet: bytes, peer: tuple) -> bool:
-        """Send packet as a raw frame. sock supplies the ephemeral src port."""
-        if not self.available:
-            return False
-        dst_mac = self._read_client_mac()
-        if dst_mac is None:
-            log.warning("BPF: no client MAC in %s", _CLIENT_MAC_FILE)
-            return False
-        src_port = sock.getsockname()[1]
-        dst_ip, dst_port = peer
-        try:
-            frame = _build_udp_frame(
-                self._src_mac,
-                dst_mac,  # type: ignore[arg-type]
-                self._host_ip,
-                dst_ip,
-                src_port,
-                dst_port,
-                packet,
-            )
-            with self._lock:
-                os.write(self._fd, frame)  # type: ignore[arg-type]
-            log.debug(
-                "BPF sent %d B to %s:%d (dst MAC %s)",
-                len(frame),
-                dst_ip,
-                dst_port,
-                dst_mac.hex(":"),
-            )
-            return True
-        except OSError as exc:
-            log.warning("BPF write failed: %s", exc)
-            return False
-
-    def close(self) -> None:
-        if self._fd is not None:
-            os.close(self._fd)
-            self._fd = None
-
-
-def _sendto(
-    sock: socket.socket, packet: bytes, peer, bpf: "BpfSender | None" = None
-) -> bool:
-    """sendto() with BPF raw-frame fallback for EHOSTUNREACH.
-
-    macOS 15+ refuses to deliver unicast UDP to the Pi bootloader even with a
-    permanent static ARP entry, because the bootloader's TFTP packets arrive
-    from a random source MAC (different from its DHCP MAC), and the kernel
-    installs that ephemeral MAC as the host route.  When sendto hits
-    EHOSTUNREACH we fall back to a /dev/bpf raw frame addressed to the real
-    DHCP MAC (written by _dhcp.py to _CLIENT_MAC_FILE).  If BPF is not
-    available, retry for _ARP_RESOLVE_TIMEOUT seconds in case the ARP entry
-    heals on its own (covers older macOS and the brief post-link-flap window).
-    """
-    if bpf is not None and bpf.available:
-        # With arp_llreach_base=0 (NUD disabled), sendto() to the Pi "succeeds"
-        # even when the kernel's ARP table has the wrong ephemeral source MAC the
-        # bootloader used for TFTP (not its DHCP/receive MAC).  The packet is sent
-        # but the Pi never receives it.  Always use BPF when available so we bypass
-        # the ARP table entirely and address frames to the real DHCP MAC directly.
-        if bpf.send(sock, packet, peer):
-            return True
-        log.debug("BPF failed, falling back to kernel sendto %s:%d", peer[0], peer[1])
-
-    deadline = time.monotonic() + _ARP_RESOLVE_TIMEOUT
-    while True:
-        try:
-            sock.sendto(packet, peer)
-            return True
-        except OSError as exc:
-            if exc.errno == errno.EHOSTUNREACH and time.monotonic() < deadline:
-                time.sleep(0.1)
-                continue
-            log.warning("sendto %s:%d failed: %s", peer[0], peer[1], exc)
-            return False
-
-
-def _parse_rrq(data: bytes) -> tuple[str, str, dict[str, str]] | None:
-    """Return (filename, mode, options) from an RRQ payload, or None if malformed."""
-    parts = data[2:].split(b"\x00")
-    if len(parts) < 2:
-        return None
-    filename = parts[0].decode("latin-1")
-    mode = parts[1].decode("latin-1").lower()
-    options: dict[str, str] = {}
-    rest = parts[2:]
-    for i in range(0, len(rest) - 1, 2):
-        key = rest[i].decode("latin-1").lower()
-        if key:
-            options[key] = rest[i + 1].decode("latin-1")
-    return filename, mode, options
-
-
-def _error_packet(code: int, msg: str) -> bytes:
-    return struct.pack("!HH", _OP_ERROR, code) + msg.encode("latin-1") + b"\x00"
-
-
-def _resolve(root: Path, filename: str) -> Path | None:
-    """Resolve a requested filename inside root, rejecting traversal outside it."""
-    candidate = (root / filename.lstrip("/")).resolve()
-    try:
-        candidate.relative_to(root.resolve())
-    except ValueError:
-        return None
-    return candidate
-
-
-def _send_and_wait_ack(
-    sock: socket.socket,
-    packet: bytes,
-    peer,
-    expect_block: int,
-    bpf: "BpfSender | None" = None,
-) -> bool:
-    """Send a packet and wait for ACK of expect_block, retransmitting on timeout."""
-    for attempt in range(_MAX_RETRIES):
-        if not _sendto(sock, packet, peer, bpf):
-            log.warning(
-                "sendto %s:%d failed (attempt %d/%d), retrying",
-                peer[0],
-                peer[1],
-                attempt + 1,
-                _MAX_RETRIES,
-            )
-            time.sleep(0.05)
-            continue
-        sock.settimeout(_ACK_TIMEOUT)
-        try:
-            while True:
-                resp, raddr = sock.recvfrom(4)
-                if raddr != peer:
-                    continue
-                if len(resp) < 4:
-                    continue
-                opcode, block = struct.unpack("!HH", resp[:4])
-                if opcode == _OP_ACK and block == expect_block:
-                    return True
-                if opcode == _OP_ERROR:
-                    log.warning(
-                        "ERROR from %s:%d (code=%d) waiting for ACK of block %d",
-                        peer[0],
-                        peer[1],
-                        block,
-                        expect_block,
-                    )
-                    return False
-        except socket.timeout:
-            continue
-    return False
-
-
-def _handle_rrq(
-    host_ip: str,
-    root: Path,
-    data: bytes,
-    peer,
-    bpf: "BpfSender | None" = None,
-) -> None:
-    try:
-        _do_rrq(host_ip, root, data, peer, bpf)
-    except Exception:  # noqa: BLE001 - never let a transfer crash the server
-        log.exception("RRQ handler from %s:%d crashed", peer[0], peer[1])
-
-
-def _bind_reply_socket(host_ip: str) -> socket.socket | None:
-    """Create a reply socket bound to host_ip:ephemeral. Retries briefly because
-    the interface IP may be momentarily absent while a link flap is being
-    repaired (bind would otherwise fail with EADDRNOTAVAIL)."""
-    deadline = time.monotonic() + _ARP_RESOLVE_TIMEOUT
-    while True:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            sock.bind((host_ip, 0))
-            return sock
-        except OSError as exc:
-            sock.close()
-            if exc.errno == errno.EADDRNOTAVAIL and time.monotonic() < deadline:
-                time.sleep(0.1)
-                continue
-            log.warning("cannot bind reply socket to %s: %s", host_ip, exc)
-            return None
-
-
-def _do_rrq(
-    host_ip: str,
-    root: Path,
-    data: bytes,
-    peer,
-    bpf: "BpfSender | None" = None,
-) -> None:
-    parsed = _parse_rrq(data)
-    # Bind the reply socket to the specific interface IP (ephemeral port) so
-    # macOS routes the transfer out the correct (secondary) interface.
-    xfer = _bind_reply_socket(host_ip)
-    if xfer is None:
-        return
-    try:
-        if parsed is None:
-            _sendto(xfer, _error_packet(_ERR_ILLEGAL, "malformed request"), peer, bpf)
-            return
-        filename, mode, options = parsed
-        if mode != "octet":
-            _sendto(
-                xfer, _error_packet(_ERR_ILLEGAL, f"unsupported mode {mode}"), peer, bpf
-            )
-            return
-
-        path = _resolve(root, filename)
-        if path is None or not path.is_file():
-            log.info("RRQ %s from %s:%d -> NOT FOUND", filename, peer[0], peer[1])
-            _sendto(xfer, _error_packet(_ERR_NOT_FOUND, "file not found"), peer, bpf)
-            return
-
-        size = path.stat().st_size
-        blksize = _DEFAULT_BLKSIZE
-        oack_opts: dict[str, str] = {}
-        if "blksize" in options:
-            try:
-                req = int(options["blksize"])
-                blksize = max(8, min(req, 65464))
-                oack_opts["blksize"] = str(blksize)
-            except ValueError:
-                pass
-        if "tsize" in options:
-            oack_opts["tsize"] = str(size)
-
-        log.info(
-            "RRQ %s from %s:%d -> serving %d bytes (blksize=%d)",
-            filename,
-            peer[0],
-            peer[1],
-            size,
-            blksize,
-        )
-
-        if oack_opts:
-            payload = struct.pack("!H", _OP_OACK)
-            for k, v in oack_opts.items():
-                payload += k.encode("latin-1") + b"\x00" + v.encode("latin-1") + b"\x00"
-            if not _send_and_wait_ack(xfer, payload, peer, 0, bpf):
-                log.warning("no ACK for OACK from %s:%d", peer[0], peer[1])
-                return
-
-        with path.open("rb") as f:
-            block = 1
-            while True:
-                chunk = f.read(blksize)
-                packet = struct.pack("!HH", _OP_DATA, block & 0xFFFF) + chunk
-                if not _send_and_wait_ack(xfer, packet, peer, block & 0xFFFF, bpf):
-                    log.warning(
-                        "transfer of %s to %s:%d failed at block %d",
-                        filename,
-                        peer[0],
-                        peer[1],
-                        block,
-                    )
-                    return
-                block += 1
-                if len(chunk) < blksize:
-                    break
-        log.info("completed %s to %s:%d", filename, peer[0], peer[1])
-    finally:
-        xfer.close()
-
-
-def serve(
-    host_ip: str, root: str, port: int = 69, interface: str | None = None
-) -> None:
-    root_path = Path(root).resolve()
-
-    bpf: BpfSender | None = None
-    if interface is not None:
-        bpf = BpfSender(interface, host_ip)
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    # Wildcard bind on 0.0.0.0: rootless on macOS 14+ for privileged ports.
-    # On Linux, port 69 requires root or CAP_NET_BIND_SERVICE.
-    try:
-        sock.bind(("", port))
-    except PermissionError:
-        log.error(
-            "Cannot bind to port %d (TFTP). On Linux, run paniolo as root or "
-            "grant CAP_NET_BIND_SERVICE.", port
-        )
-        raise
-    log.info(
-        "TFTP listening on 0.0.0.0:%d  reply_src=%s  root=%s  bpf=%s",
-        port,
-        host_ip,
-        root_path,
-        "yes" if (bpf and bpf.available) else "no",
-    )
-
-    while True:
-        try:
-            data, peer = sock.recvfrom(4096)
-        except OSError as exc:
-            log.error("recvfrom: %s", exc)
-            continue
-        if len(data) < 2:
-            continue
-        opcode = struct.unpack("!H", data[:2])[0]
-        if opcode == _OP_RRQ:
-            t = threading.Thread(
-                target=_handle_rrq,
-                args=(host_ip, root_path, data, peer, bpf),
-                daemon=True,
-            )
-            t.start()
-        elif opcode == _OP_WRQ:
-            err = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            err.bind((host_ip, 0))
-            _sendto(err, _error_packet(_ERR_ACCESS, "read-only server"), peer, bpf)
-            err.close()
-
-
-def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        stream=sys.stderr,
-    )
-    parser = argparse.ArgumentParser(
-        description="Paniolo minimal read-only TFTP server"
-    )
-    parser.add_argument("host_ip", help="Interface IP to bind reply sockets to")
-    parser.add_argument("root", help="TFTP root directory")
-    parser.add_argument("--port", type=int, default=69)
-    parser.add_argument(
-        "--interface", help="Interface name for BPF raw-frame fallback (e.g. en14)"
-    )
-    args = parser.parse_args()
-    serve(args.host_ip, args.root, args.port, args.interface)
-
-
-if __name__ == "__main__":
-    main()
-````
-
-## File: src/paniolo/_video.py
-````python
-# Copyright 2026 Curtis Galloway
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Video capture helpers — delegates to the hdmicap daemon."""
-
-from __future__ import annotations
-
-import dataclasses
-import json
-import os
-import re
-import shutil
-import subprocess
-import tempfile
 import tomllib
 from pathlib import Path
 from typing import Optional
 
-from . import _config
+log = logging.getLogger(__name__)
 
-VIDEO_CONFIG_PATH = _config.CONFIG_DIR / "video.toml"
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_CTRL_ESCAPE = {"\n": "\\n", "\r": "\\r", "\t": "\\t", "\x08": "\\b", "\x0c": "\\f"}
 
-_BUILTIN_NAMES = ("FaceTime", "Capture screen", "iSight", "iPhone", "iPad")
+CONFIG_DIR = Path.home() / ".config" / "paniolo"
+TARGETS_DIR = CONFIG_DIR / "targets"
+
+DEFAULT_SERIAL_NAME = "console"
+
+
+VALID_SENSE_SIGNALS = ("cts", "dsr", "dcd", "ri")
 
 
 @dataclasses.dataclass
-class VideoConfig:
-    """Saved configuration for the HDMI/USB capture device."""
+class SerialInterface:
+    """A named serial console attached to a target (e.g. 'console', 'bmc')."""
 
+    name: str
     device: str
+    baud: int = 115200
+    power_sense_signal: Optional[str] = None  # "cts" | "dsr" | "dcd" | "ri" | None
+
+
+@dataclasses.dataclass
+class TargetConfig:
+    name: str
+    interface: str
+    host_ip: str = "192.168.99.1"
+    tftp_root: Optional[str] = None
+    power_cycle_cmd: Optional[str] = None
+    power_serial_interface: Optional[str] = None
+    serial_interfaces: list[SerialInterface] = dataclasses.field(default_factory=list)
+
+    def serial_interface(self, name: Optional[str] = None) -> SerialInterface:
+        """Resolve a serial interface by name, defaulting to the sole one.
+
+        Raises ValueError if none are configured, the name is unknown, or no name
+        was given but several exist (ambiguous)."""
+        if not self.serial_interfaces:
+            raise ValueError(f"no serial interfaces configured for '{self.name}'")
+        if name is None:
+            if len(self.serial_interfaces) == 1:
+                return self.serial_interfaces[0]
+            have = ", ".join(i.name for i in self.serial_interfaces)
+            raise ValueError(f"multiple serial interfaces ({have}); specify one with --interface")
+        for iface in self.serial_interfaces:
+            if iface.name == name:
+                return iface
+        have = ", ".join(i.name for i in self.serial_interfaces)
+        raise ValueError(f"no serial interface '{name}' (have: {have})")
+
+    def upsert_serial_interface(self, iface: SerialInterface) -> None:
+        """Add the interface, or replace an existing one with the same name."""
+        for idx, existing in enumerate(self.serial_interfaces):
+            if existing.name == iface.name:
+                self.serial_interfaces[idx] = iface
+                return
+        self.serial_interfaces.append(iface)
+
+    def remove_serial_interface(self, name: str) -> bool:
+        """Drop the named interface; return True if one was removed."""
+        kept = [i for i in self.serial_interfaces if i.name != name]
+        removed = len(kept) != len(self.serial_interfaces)
+        self.serial_interfaces = kept
+        return removed
+
+
+def target_path(name: str) -> Path:
+    return TARGETS_DIR / f"{name}.toml"
+
+
+def save_target(cfg: TargetConfig) -> None:
+    TARGETS_DIR.mkdir(parents=True, exist_ok=True)
+    target_path(cfg.name).write_text(_to_toml(cfg))
+
+
+def load_target(name: str) -> TargetConfig:
+    path = target_path(name)
+    if not path.exists():
+        raise FileNotFoundError(name)
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+    return _from_dict(data)
+
+
+def list_targets() -> list[str]:
+    if not TARGETS_DIR.exists():
+        return []
+    return sorted(p.stem for p in TARGETS_DIR.glob("*.toml"))
+
+
+def _from_dict(data: dict) -> TargetConfig:
+    """Build a TargetConfig from parsed TOML, migrating the legacy single-serial
+    fields (`serial_device`/`serial_baud`) into a named interface."""
+    data = dict(data)
+    serial = data.pop("serial", None)
+    legacy_device = data.pop("serial_device", None)
+    legacy_baud = data.pop("serial_baud", None)
+    data.pop("ha_power_entity", None)  # removed field — ignore if present in old configs
+
+    interfaces: list[SerialInterface] = []
+    if serial:
+        for entry in serial:
+            interfaces.append(
+                SerialInterface(
+                    name=entry["name"],
+                    device=entry["device"],
+                    baud=int(entry.get("baud", 115200)),
+                    power_sense_signal=entry.get("power_sense_signal"),
+                )
+            )
+    elif legacy_device:
+        interfaces.append(
+            SerialInterface(
+                name=DEFAULT_SERIAL_NAME,
+                device=legacy_device,
+                baud=int(legacy_baud or 115200),
+            )
+        )
+
+    _known = {f.name for f in dataclasses.fields(TargetConfig)} - {"serial_interfaces"}
+    unknown = set(data) - _known
+    if unknown:
+        log.warning("ignoring unknown config keys: %s", ", ".join(sorted(unknown)))
+    data = {k: v for k, v in data.items() if k in _known}
+    return TargetConfig(serial_interfaces=interfaces, **data)
+
+
+def _escape_toml_string(s: str) -> str:
+    """Escape a string for use in a TOML basic string (double-quoted)."""
+    s = s.replace("\\", "\\\\").replace('"', '\\"')
+    return _CTRL_RE.sub(lambda m: _CTRL_ESCAPE.get(m.group(), f"\\u{ord(m.group()):04x}"), s)
+
+
+def _toml_kv(key: str, value) -> str:
+    if isinstance(value, bool):
+        return f'{key} = {"true" if value else "false"}'
+    if isinstance(value, str):
+        return f'{key} = "{_escape_toml_string(value)}"'
+    return f"{key} = {value}"
+
+
+def _to_toml(cfg: TargetConfig) -> str:
+    scalars = {
+        "name": cfg.name,
+        "interface": cfg.interface,
+        "host_ip": cfg.host_ip,
+        "tftp_root": cfg.tftp_root,
+        "power_cycle_cmd": cfg.power_cycle_cmd,
+        "power_serial_interface": cfg.power_serial_interface,
+    }
+    lines = [_toml_kv(k, v) for k, v in scalars.items() if v is not None]
+    out = "\n".join(lines) + "\n"
+    for iface in cfg.serial_interfaces:
+        out += "\n[[serial]]\n"
+        out += _toml_kv("name", iface.name) + "\n"
+        out += _toml_kv("device", iface.device) + "\n"
+        out += _toml_kv("baud", iface.baud) + "\n"
+        if iface.power_sense_signal is not None:
+            out += _toml_kv("power_sense_signal", iface.power_sense_signal) + "\n"
+    return out
+````
+
+## File: src/paniolo/_hid.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Host control client for the KB2040 HID rig (see hidrig/).
+
+Sends line-based text commands to the control board over its USB CDC *data*
+port; the control board parses them and relays HID keyboard/mouse events to the
+target board, which injects them into the Pi over USB. The board owns the wire
+protocol — `hidrig/control/code.py` and `hidrig/README.md` are the source of
+truth. This module is a thin text-command client plus host-side sequencing.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import glob
+import sys
+import time
+import tomllib
+from pathlib import Path
+from typing import Callable, Optional
+
+from . import _config
+from ._config import _toml_kv
+
+HID_CONFIG_PATH = _config.CONFIG_DIR / "hid.toml"
+
+DEFAULT_BAUD = 115200  # irrelevant over USB CDC, but pyserial requires a value
+
+# Absolute-mouse logical range the OS spreads across the screen (HID convention).
+ABS_MAX = 32767
+
+
+@dataclasses.dataclass
+class HidConfig:
+    """Saved configuration for the HID control board."""
+
+    port: str
 
 
 def _to_toml(data: dict) -> str:
-    lines = []
-    for key, value in data.items():
-        if value is None:
-            continue
-        if isinstance(value, str):
-            escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-            lines.append(f'{key} = "{escaped}"')
-        elif isinstance(value, bool):
-            lines.append(f'{key} = {"true" if value else "false"}')
-        else:
-            lines.append(f"{key} = {value}")
+    lines = [_toml_kv(k, v) for k, v in data.items() if v is not None]
     return "\n".join(lines) + "\n"
 
 
-def save_video_config(cfg: VideoConfig) -> None:
+def save_hid_config(cfg: HidConfig) -> None:
     _config.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    VIDEO_CONFIG_PATH.write_text(_to_toml(dataclasses.asdict(cfg)))
+    HID_CONFIG_PATH.write_text(_to_toml(dataclasses.asdict(cfg)))
 
 
-def load_video_config() -> Optional[VideoConfig]:
-    if not VIDEO_CONFIG_PATH.exists():
+def load_hid_config() -> Optional[HidConfig]:
+    if not HID_CONFIG_PATH.exists():
         return None
-    with open(VIDEO_CONFIG_PATH, "rb") as f:
+    with open(HID_CONFIG_PATH, "rb") as f:
         data = tomllib.load(f)
-    return VideoConfig(device=data["device"])
+    return HidConfig(port=data["port"])
 
 
-def hdmicap_binary() -> Optional[str]:
-    """Return the installed hdmicap path: PATH, then ~/.cargo/bin. None if absent.
+def list_serial_ports() -> list[str]:
+    """Candidate USB CDC ports for the control board."""
+    if sys.platform == "darwin":
+        return sorted(glob.glob("/dev/cu.usbmodem*"))
+    return sorted(glob.glob("/dev/ttyACM*"))
 
-    Installed by `paniolo setup` (cargo install). Never resolved from the in-repo
-    build tree, so a running daemon can't point at an ephemeral build artifact.
+
+def guess_data_port() -> Optional[str]:
+    """Best guess at the control board's *data* CDC port.
+
+    The board exposes two CDC ports (console + data); the data port is
+    conventionally the higher-numbered node. Returns None if no candidates.
     """
-    found = shutil.which("hdmicap")
+    ports = list_serial_ports()
+    return ports[-1] if ports else None
+
+
+def scale_to_logical(px: int, screen_px: int) -> int:
+    """Map a pixel coordinate to the 0..32767 absolute-mouse logical range.
+
+    The host OS maps that range across the full screen dimension, so callers
+    scale each pixel axis against the screen's size in that axis. Clamped.
+    """
+    if screen_px <= 1:
+        return 0
+    v = round(px * ABS_MAX / (screen_px - 1))
+    return max(0, min(ABS_MAX, v))
+
+
+class HidRig:
+    """Text-command client for the control board over USB serial.
+
+    Pass `transport` (any object with `write(bytes)`, `readline() -> bytes`,
+    `close()`) to drive it without real hardware (used by tests). Otherwise a
+    `pyserial` Serial port is opened lazily on the given `port`.
+    """
+
+    def __init__(
+        self,
+        port: Optional[str] = None,
+        baud: int = DEFAULT_BAUD,
+        timeout: float = 1.0,
+        transport=None,
+    ):
+        if transport is not None:
+            self._transport = transport
+            return
+        try:
+            import serial  # lazy: only the live path needs pyserial
+        except ImportError as exc:
+            raise RuntimeError(
+                "pyserial not installed — install the hid extra: "
+                "uv sync --extra hid  (or: pip install 'paniolo[hid]')"
+            ) from exc
+        if not port:
+            raise ValueError("no serial port given")
+        self._transport = serial.Serial(port, baud, timeout=timeout)
+        time.sleep(0.2)
+        self._transport.reset_input_buffer()
+
+    def cmd(self, text: str) -> str:
+        """Send one command line; return the board's reply, raise on ERR."""
+        if "\n" in text or "\r" in text:
+            raise ValueError(f"command contains newline: {text!r}")
+        self._transport.write((text + "\n").encode("utf-8"))
+        reply = self._transport.readline().decode("utf-8", "replace").strip()
+        if reply.startswith("ERR"):
+            raise RuntimeError(f"control board rejected '{text}': {reply}")
+        return reply
+
+    # Command wrappers — mirror hidrig/control/code.py's text protocol.
+    def type(self, text: str) -> str:
+        return self.cmd(f"type {text}")
+
+    def key(self, name: str) -> str:
+        return self.cmd(f"key {name}")
+
+    def combo(self, *names: str) -> str:
+        return self.cmd("combo " + " ".join(names))
+
+    def down(self, name: str) -> str:
+        return self.cmd(f"down {name}")
+
+    def up(self, name: str) -> str:
+        return self.cmd(f"up {name}")
+
+    def releaseall(self) -> str:
+        return self.cmd("releaseall")
+
+    def move(self, dx: int, dy: int) -> str:
+        return self.cmd(f"move {dx} {dy}")
+
+    def click(self, button: str = "left") -> str:
+        return self.cmd(f"click {button}")
+
+    def mdown(self, button: str = "left") -> str:
+        return self.cmd(f"mdown {button}")
+
+    def mup(self, button: str = "left") -> str:
+        return self.cmd(f"mup {button}")
+
+    def scroll(self, amount: int) -> str:
+        return self.cmd(f"scroll {amount}")
+
+    def close(self) -> None:
+        self._transport.close()
+
+
+# --- Host-side sequencing / timing (the board firmware stays dumb) ----------
+
+def parse_sequence(text: str) -> list[tuple[str, object]]:
+    """Parse a command file into steps.
+
+    Each non-blank, non-`#`-comment line is either a command or a timing
+    directive: `delay <ms>` or `sleep <seconds>`. Returns a list of
+    `("cmd", line)` / `("delay", seconds)` tuples.
+    """
+    steps: list[tuple[str, object]] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        head, _, rest = line.partition(" ")
+        low = head.lower()
+        if low == "delay":
+            try:
+                steps.append(("delay", float(rest) / 1000.0))
+            except ValueError:
+                raise ValueError(f"invalid delay value: {rest!r}")
+        elif low == "sleep":
+            try:
+                steps.append(("delay", float(rest)))
+            except ValueError:
+                raise ValueError(f"invalid sleep value: {rest!r}")
+        else:
+            steps.append(("cmd", line))
+    return steps
+
+
+def run_sequence(
+    rig: HidRig,
+    steps: list[tuple[str, object]],
+    default_delay: float = 0.0,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Execute parsed steps against `rig`. `sleep` is injectable for tests."""
+    for kind, value in steps:
+        if kind == "delay":
+            sleep(float(value))
+        else:
+            rig.cmd(str(value))
+            if default_delay:
+                sleep(default_delay)
+
+
+def repeat_key(
+    rig: HidRig,
+    name: str,
+    count: int,
+    delay: float = 0.0,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Tap a key `count` times with an inter-tap delay (auto-repeat)."""
+    for i in range(count):
+        rig.key(name)
+        if delay and i < count - 1:
+            sleep(delay)
+````
+
+## File: src/paniolo/_ocr.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""OCR helpers — wraps platform OCR tools.
+
+- macOS: `visionocr` (Apple Vision framework, compiled from ocr/visionocr.swift)
+- Linux: `linuxocr` (Tesseract-backed, from ocr/linuxocr)
+
+Both tools share the same interface: read PNG on stdin, print text on stdout.
+"""
+
+from __future__ import annotations
+
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Optional
+
+
+def visionocr_binary() -> Optional[str]:
+    """Return the installed visionocr path: PATH, then ~/.cargo/bin. None if absent."""
+    found = shutil.which("visionocr")
     if found:
         return found
-    cargo_bin = Path.home() / ".cargo" / "bin" / "hdmicap"
+    cargo_bin = Path.home() / ".cargo" / "bin" / "visionocr"
     return str(cargo_bin) if cargo_bin.exists() else None
 
 
-_DEVICE_RE = re.compile(r"^\s*(\d+)\s+(.+?)\s+\[([^\]]*)\]")
+def visionocr_source() -> Path:
+    """Path to the visionocr Swift source in the repo (for `paniolo setup`)."""
+    return Path(__file__).parent.parent.parent / "ocr" / "visionocr.swift"
 
 
-def list_devices() -> list[dict]:
-    """Return [{index, name, misc}, ...] via `hdmicap devices`."""
-    binary = hdmicap_binary()
-    if not binary:
-        return []
-    try:
-        result = subprocess.run(
-            [binary, "devices"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            return []
-        devices = []
-        for line in result.stdout.splitlines():
-            m = _DEVICE_RE.match(line)
-            if m:
-                devices.append({"index": int(m.group(1)), "name": m.group(2), "misc": m.group(3)})
-        return devices
-    except FileNotFoundError:
-        return []
+def build_visionocr(dest: Path) -> None:
+    """Compile visionocr.swift to `dest` (used by `paniolo setup`). Raises on error."""
+    source = visionocr_source()
+    if not source.exists():
+        raise FileNotFoundError(f"visionocr source not found: {source}")
+    if not shutil.which("swiftc"):
+        raise FileNotFoundError("swiftc not found (install Xcode command line tools)")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["swiftc", "-O", "-o", str(dest), str(source)], check=True)
 
 
-def guess_capture_device(devices: list[dict]) -> Optional[dict]:
-    """Return the one non-built-in device, or None if ambiguous."""
-    candidates = [d for d in devices if not any(s in d["name"] for s in _BUILTIN_NAMES)]
-    return candidates[0] if len(candidates) == 1 else None
+def linuxocr_binary() -> Optional[str]:
+    """Return the installed linuxocr path: PATH, then ~/.cargo/bin. None if absent."""
+    found = shutil.which("linuxocr")
+    if found:
+        return found
+    cargo_bin = Path.home() / ".cargo" / "bin" / "linuxocr"
+    return str(cargo_bin) if cargo_bin.exists() else None
 
 
-def _discovery_path() -> Path:
-    """Path where hdmicap writes its daemon.json discovery file.
+def linuxocr_source() -> Path:
+    """Path to the linuxocr Python script in the repo (for `paniolo setup`)."""
+    return Path(__file__).parent.parent.parent / "ocr" / "linuxocr"
 
-    Mirrors hdmicap/src/daemon.rs::runtime_dir(): prefer $XDG_RUNTIME_DIR
-    (set by systemd on Linux), fall back to tempfile.gettempdir().
+
+def install_linuxocr(dest: Path) -> None:
+    """Copy ocr/linuxocr to `dest` and make it executable (used by `paniolo setup`)."""
+    import shutil as _shutil
+    source = linuxocr_source()
+    if not source.exists():
+        raise FileNotFoundError(f"linuxocr source not found: {source}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    _shutil.copy2(source, dest)
+    dest.chmod(0o755)
+
+
+def ocr_binary() -> Optional[str]:
+    """Return the platform OCR binary: visionocr on macOS, linuxocr on Linux."""
+    if sys.platform == "darwin":
+        return visionocr_binary()
+    return linuxocr_binary()
+
+
+def read_text(png: bytes, fast: bool = False, as_json: bool = False) -> str:
+    """OCR PNG bytes and return recognized text (or JSON with bboxes).
+
+    `fast` is only meaningful on macOS (visionocr --fast); ignored on Linux.
+    `as_json` requests bounding-box JSON output; not yet supported on Linux.
     """
-    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
-    return Path(base) / "hdmicap" / "daemon.json"
-
-
-def read_discovery() -> Optional[dict]:
-    """Read hdmicap's discovery file, returning {pid, port} or None."""
-    path = _discovery_path()
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
-def daemon_url() -> Optional[str]:
-    """Return the base URL of the running daemon, or None if not running."""
-    disc = read_discovery()
-    if disc is None:
-        return None
-    try:
-        os.kill(int(disc["pid"]), 0)
-    except (ProcessLookupError, PermissionError, KeyError):
-        return None
-    return f"http://127.0.0.1:{disc['port']}"
-
-
-def start_daemon(
-    cfg: VideoConfig,
-    port: int = 8723,
-    ocr_bin: Optional[str] = None,
-    target_name: Optional[str] = None,
-) -> subprocess.Popen:
-    """Start hdmicap daemon in the background; caller should poll daemon_url().
-
-    ocr_bin is exported as PANIOLO_VISIONOCR for the /ocr endpoint.
-    target_name is exported as PANIOLO_TARGET so the /power-cycle endpoint
-    can call `paniolo power-cycle <target>`.
-    """
-    binary = hdmicap_binary()
+    binary = ocr_binary()
     if not binary:
-        raise FileNotFoundError("hdmicap not found in PATH or project build dir")
-    env = dict(os.environ)
-    if ocr_bin:
-        env["PANIOLO_VISIONOCR"] = ocr_bin
-    if target_name:
-        env["PANIOLO_TARGET"] = target_name
-    return subprocess.Popen(
-        [binary, "daemon", "--device", cfg.device, "--port", str(port)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        env=env,
+        platform = "macOS" if sys.platform == "darwin" else "Linux"
+        tool = "visionocr" if sys.platform == "darwin" else "linuxocr"
+        raise FileNotFoundError(f"{tool} not installed on {platform} — run: paniolo setup")
+    cmd = [binary]
+    if sys.platform == "darwin":
+        if fast:
+            cmd.append("--fast")
+        if as_json:
+            cmd.append("--json")
+    cmd.append("-")
+    result = subprocess.run(cmd, input=png, capture_output=True)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode(errors="replace").strip() or f"{binary} failed")
+    return result.stdout.decode(errors="replace")
+````
+
+## File: tests/test_config.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for target config (de)serialization and serial-interface helpers."""
+
+from __future__ import annotations
+
+import tomllib
+
+import pytest
+
+from paniolo import _config
+from paniolo._config import SerialInterface, TargetConfig
+
+
+def roundtrip(cfg: TargetConfig) -> TargetConfig:
+    return _config._from_dict(tomllib.loads(_config._to_toml(cfg)))
+
+
+def test_roundtrip_multiple_interfaces():
+    cfg = TargetConfig(
+        name="fortune",
+        interface="en3",
+        tftp_root="/pxe",
+        serial_interfaces=[
+            SerialInterface("console", "/dev/ttyUSB0", 115200),
+            SerialInterface("bmc", "/dev/ttyUSB1", 9600),
+        ],
     )
+    got = roundtrip(cfg)
+    assert (got.name, got.interface, got.tftp_root) == ("fortune", "en3", "/pxe")
+    assert [(i.name, i.device, i.baud) for i in got.serial_interfaces] == [
+        ("console", "/dev/ttyUSB0", 115200),
+        ("bmc", "/dev/ttyUSB1", 9600),
+    ]
 
 
-def stop_daemon() -> bool:
-    """Ask the running hdmicap daemon to stop. Returns True if it was running."""
-    binary = hdmicap_binary()
-    if not binary:
-        return False
-    result = subprocess.run([binary, "stop"], check=False,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return result.returncode == 0
+def test_roundtrip_no_interfaces():
+    got = roundtrip(TargetConfig(name="x", interface="en0"))
+    assert got.serial_interfaces == []
+
+
+def test_legacy_single_serial_migrates():
+    data = tomllib.loads(
+        'name = "x"\ninterface = "en0"\nserial_device = "/dev/ttyUSB0"\nserial_baud = 57600\n'
+    )
+    cfg = _config._from_dict(data)
+    assert len(cfg.serial_interfaces) == 1
+    iface = cfg.serial_interfaces[0]
+    assert (iface.name, iface.device, iface.baud) == (_config.DEFAULT_SERIAL_NAME, "/dev/ttyUSB0", 57600)
+
+
+def test_legacy_default_baud():
+    data = tomllib.loads('name = "x"\ninterface = "en0"\nserial_device = "/dev/ttyUSB0"\n')
+    assert _config._from_dict(data).serial_interfaces[0].baud == 115200
+
+
+def test_serial_interface_resolution():
+    cfg = TargetConfig(
+        name="x",
+        interface="en0",
+        serial_interfaces=[SerialInterface("console", "/dev/a"), SerialInterface("bmc", "/dev/b")],
+    )
+    assert cfg.serial_interface("bmc").device == "/dev/b"
+    with pytest.raises(ValueError):
+        cfg.serial_interface()  # ambiguous
+    with pytest.raises(ValueError):
+        cfg.serial_interface("nope")  # unknown
+
+
+def test_serial_interface_single_is_default():
+    cfg = TargetConfig(name="x", interface="en0", serial_interfaces=[SerialInterface("console", "/dev/a")])
+    assert cfg.serial_interface().name == "console"
+
+
+def test_serial_interface_none_configured():
+    with pytest.raises(ValueError):
+        TargetConfig(name="x", interface="en0").serial_interface()
+
+
+def test_upsert_replaces_same_name():
+    cfg = TargetConfig(name="x", interface="en0")
+    cfg.upsert_serial_interface(SerialInterface("console", "/dev/a", 115200))
+    cfg.upsert_serial_interface(SerialInterface("console", "/dev/a2", 9600))
+    assert len(cfg.serial_interfaces) == 1
+    assert (cfg.serial_interfaces[0].device, cfg.serial_interfaces[0].baud) == ("/dev/a2", 9600)
+
+
+def test_remove_interface():
+    cfg = TargetConfig(
+        name="x",
+        interface="en0",
+        serial_interfaces=[SerialInterface("console", "/dev/a"), SerialInterface("bmc", "/dev/b")],
+    )
+    assert cfg.remove_serial_interface("console") is True
+    assert cfg.remove_serial_interface("console") is False
+    assert [i.name for i in cfg.serial_interfaces] == ["bmc"]
+
+
+# --- S2: TOML control-character escaping -----------------------------------
+
+def test_toml_roundtrip_newline_in_power_cycle_cmd():
+    """Newlines in string values must survive a TOML round-trip without breaking the file."""
+    cfg = TargetConfig(name="x", interface="en0", power_cycle_cmd="cmd1\ncmd2")
+    got = roundtrip(cfg)
+    assert got.power_cycle_cmd == "cmd1\ncmd2"
+
+
+def test_toml_roundtrip_tab_and_cr():
+    cfg = TargetConfig(name="x", interface="en0", power_cycle_cmd="a\tb\rc")
+    got = roundtrip(cfg)
+    assert got.power_cycle_cmd == "a\tb\rc"
+
+
+def test_toml_kv_escapes_backslash():
+    line = _config._toml_kv("k", "a\\b")
+    assert line == 'k = "a\\\\b"'
+    parsed = tomllib.loads(line)
+    assert parsed["k"] == "a\\b"
+
+
+# --- C2: unknown TOML keys are ignored gracefully --------------------------
+
+def test_unknown_keys_in_toml_are_silently_dropped():
+    data = tomllib.loads('name = "x"\ninterface = "en0"\nunknown_future_key = "foo"\n')
+    cfg = _config._from_dict(data)
+    assert cfg.name == "x"
+    assert not hasattr(cfg, "unknown_future_key")
+````
+
+## File: tests/test_hid.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Host-side tests for the HID rig client — no hardware, no pyserial."""
+
+from __future__ import annotations
+
+import pytest
+
+from paniolo import _hid
+
+
+class FakeTransport:
+    """Stand-in for a pyserial port: records writes, replies from a queue."""
+
+    def __init__(self, replies=None):
+        self.writes: list[bytes] = []
+        self._replies = list(replies) if replies else []
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        self.writes.append(data)
+
+    def readline(self) -> bytes:
+        return self._replies.pop(0) if self._replies else b"OK\n"
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def make_rig(replies=None):
+    t = FakeTransport(replies)
+    return _hid.HidRig(transport=t), t
+
+
+# --- command construction ---------------------------------------------------
+
+@pytest.mark.parametrize(
+    "call, expected",
+    [
+        (lambda r: r.type("hello world"), b"type hello world\n"),
+        (lambda r: r.key("ENTER"), b"key ENTER\n"),
+        (lambda r: r.combo("LEFT_CONTROL", "C"), b"combo LEFT_CONTROL C\n"),
+        (lambda r: r.down("LEFT_SHIFT"), b"down LEFT_SHIFT\n"),
+        (lambda r: r.up("LEFT_SHIFT"), b"up LEFT_SHIFT\n"),
+        (lambda r: r.releaseall(), b"releaseall\n"),
+        (lambda r: r.move(300, -50), b"move 300 -50\n"),
+        (lambda r: r.click(), b"click left\n"),
+        (lambda r: r.click("right"), b"click right\n"),
+        (lambda r: r.mdown("middle"), b"mdown middle\n"),
+        (lambda r: r.mup("middle"), b"mup middle\n"),
+        (lambda r: r.scroll(-3), b"scroll -3\n"),
+    ],
+)
+def test_command_construction(call, expected):
+    rig, t = make_rig()
+    call(rig)
+    assert t.writes == [expected]
+
+
+def test_cmd_returns_reply():
+    rig, _ = make_rig(replies=[b"OK\n"])
+    assert rig.cmd("releaseall") == "OK"
+
+
+def test_cmd_raises_on_err():
+    rig, _ = make_rig(replies=[b"ERR unknown command: frob\n"])
+    with pytest.raises(RuntimeError, match="control board rejected"):
+        rig.cmd("frob")
+
+
+def test_close_delegates():
+    rig, t = make_rig()
+    rig.close()
+    assert t.closed
+
+
+# --- absolute-mouse scaling -------------------------------------------------
+
+@pytest.mark.parametrize(
+    "px, screen, expected",
+    [
+        (0, 1920, 0),
+        (1919, 1920, 32767),
+        (960, 1920, 16392),
+        (-100, 1920, 0),        # clamp low
+        (99999, 1920, 32767),   # clamp high
+        (5, 1, 0),              # degenerate screen size
+    ],
+)
+def test_scale_to_logical(px, screen, expected):
+    assert _hid.scale_to_logical(px, screen) == expected
+
+
+# --- sequence parsing -------------------------------------------------------
+
+def test_parse_sequence_skips_blanks_and_comments():
+    text = "\n# a comment\n  \nkey ENTER\n# another\ntype hi\n"
+    assert _hid.parse_sequence(text) == [("cmd", "key ENTER"), ("cmd", "type hi")]
+
+
+def test_parse_sequence_timing_directives():
+    text = "delay 250\nkey A\nsleep 2\n"
+    assert _hid.parse_sequence(text) == [
+        ("delay", 0.25),
+        ("cmd", "key A"),
+        ("delay", 2.0),
+    ]
+
+
+def test_run_sequence_executes_in_order_with_delays():
+    rig, t = make_rig(replies=[b"OK\n", b"OK\n"])
+    slept: list[float] = []
+    steps = [("cmd", "key A"), ("delay", 0.5), ("cmd", "type hi")]
+    _hid.run_sequence(rig, steps, default_delay=0.0, sleep=slept.append)
+    assert t.writes == [b"key A\n", b"type hi\n"]
+    assert slept == [0.5]
+
+
+def test_run_sequence_default_delay_between_commands():
+    rig, _ = make_rig(replies=[b"OK\n", b"OK\n"])
+    slept: list[float] = []
+    steps = [("cmd", "key A"), ("cmd", "key B")]
+    _hid.run_sequence(rig, steps, default_delay=0.1, sleep=slept.append)
+    assert slept == [0.1, 0.1]
+
+
+def test_repeat_key():
+    rig, t = make_rig(replies=[b"OK\n"] * 3)
+    slept: list[float] = []
+    _hid.repeat_key(rig, "TAB", 3, delay=0.2, sleep=slept.append)
+    assert t.writes == [b"key TAB\n"] * 3
+    assert slept == [0.2, 0.2]  # no trailing delay after the last tap
+
+
+# --- S3: newline injection guard -------------------------------------------
+
+def test_cmd_rejects_newline():
+    rig, _ = make_rig()
+    with pytest.raises(ValueError, match="newline"):
+        rig.cmd("type hello\nkey ENTER")
+
+
+def test_cmd_rejects_carriage_return():
+    rig, _ = make_rig()
+    with pytest.raises(ValueError, match="newline"):
+        rig.cmd("type hello\rworld")
+
+
+def test_type_rejects_embedded_newline():
+    rig, _ = make_rig()
+    with pytest.raises(ValueError, match="newline"):
+        rig.type("line1\nline2")
+
+
+# --- C3: parse_sequence error messages -------------------------------------
+
+def test_parse_sequence_bad_delay_raises_friendly_error():
+    with pytest.raises(ValueError, match="invalid delay value"):
+        _hid.parse_sequence("delay abc\nkey A\n")
+
+
+def test_parse_sequence_bad_sleep_raises_friendly_error():
+    with pytest.raises(ValueError, match="invalid sleep value"):
+        _hid.parse_sequence("sleep xyz\n")
+````
+
+## File: README.md
+````markdown
+# paniolo
+
+Agent-controlled target machine wrangler for low-level software development.
+
+"Paniolo" is the Hawaiian word for cowboy. The idea: an AI agent sits at the
+reins while you're writing bootloaders, firmware, or OS bring-up code — paniolo
+gives it the controls to netboot the target, watch its output, send it input,
+and power-cycle it without human intervention at each iteration.
+
+---
+
+## Capabilities
+
+| Subsystem | Commands | What it does |
+|---|---|---|
+| [Netboot](docs/netboot.md) | `paniolo netboot` | DHCP + TFTP netboot over a direct USB-Ethernet link |
+| [Video](docs/video.md) | `paniolo video` | HDMI capture via warm-stream daemon; on-device OCR |
+| [Serial](docs/serial.md) | `paniolo serial` | Serial console — interactive (tio) or daemon-backed with timestamped rolling log |
+| [Power control](docs/power.md) | `paniolo serial dtr/reset`, `paniolo power-cycle`, `paniolo power-state` | DTR-based hardware power button (J2 header) and script-based power cycling |
+| [HID injection](docs/hid.md) | `paniolo hid` | USB keyboard/mouse injection via a two-board KB2040 rig |
+| [Dashboard](docs/dashboard.md) | `paniolo console` | Combined video + serial web UI; auto-starts daemons; `-i <name>` preselects a serial interface |
+
+---
+
+## Requirements
+
+- macOS 10.14 (Mojave) or later, or Linux (x86-64 / arm64)
+- Python 3.11+
+- [uv](https://docs.astral.sh/uv/) (`brew install uv` on macOS, or the [uv installer](https://docs.astral.sh/uv/getting-started/installation/) on Linux)
+- [Homebrew](https://brew.sh) (macOS only — Linux uses the system package manager)
+- Rust toolchain (for hdmicap, serialcap — `brew install rustup` on macOS, or `rustup.rs` on Linux)
+
+---
+
+## Installation
+
+```bash
+git clone https://github.com/curtisgalloway/paniolo ~/src/paniolo
+uv tool install ~/src/paniolo
+paniolo setup          # installs dnsmasq, tftp-now, hdmicap, serialcap, visionocr
+```
+
+`paniolo setup` compiles and installs the Rust daemons (`hdmicap`, `serialcap`)
+and the Swift OCR helper (`visionocr`) into `~/.cargo/bin`, and installs the
+TFTP and DHCP servers via Homebrew.
+
+To pick up code changes after pulling or editing:
+
+```bash
+uv tool install --reinstall ~/src/paniolo
+cargo install --path ~/src/paniolo/hdmicap    # if hdmicap changed
+cargo install --path ~/src/paniolo/serialcap  # if serialcap changed
+```
+
+For the USB HID commands, install the optional `pyserial` extra:
+
+```bash
+uv tool install --with pyserial ~/src/paniolo
+```
+
+---
+
+## Remote control pattern
+
+The intended use is an AI agent or script on a dev machine SSHing into the
+control Mac to drive the target:
+
+```bash
+# Configure target once
+ssh control-mac "paniolo target set target-machine \
+    --interface en3 \
+    --tftp-root ~/pxe \
+    --power-cycle-cmd /path/to/power-cycle.sh"
+
+# Deploy a new kernel and boot
+TFTP_ROOT=$(ssh control-mac "paniolo netboot tftp-root target-machine")
+scp out/kernel.img control-mac:"${TFTP_ROOT}/kernel_2712.img"
+ssh control-mac "paniolo netboot start target-machine"
+ssh control-mac "paniolo netboot logs -f target-machine"
+
+# Interact with the console
+ssh control-mac "paniolo serial log -i console --since --tail 50 target-machine"
+
+# Power cycle and repeat
+ssh control-mac "paniolo power-cycle target-machine"
+```
+
+---
+
+## Concepts
+
+### Target
+
+A *target* is a named machine you want to control. Its configuration lives in
+`~/.config/paniolo/targets/<name>.toml`. One config file per target; no daemon
+required. If exactly one target is configured it is the default and can be
+omitted from every command.
+
+See [`paniolo target set --help`](docs/netboot.md#target-configuration) for all fields.
+
+### Runtime paths
+
+| Purpose | Path |
+|---|---|
+| Target configs | `~/.config/paniolo/targets/<name>.toml` |
+| Video config | `~/.config/paniolo/video.toml` |
+| HID config | `~/.config/paniolo/hid.toml` |
+| Netboot daemon state | `~/.local/share/paniolo/<name>/netboot.json` |
+| hdmicap discovery | `$XDG_RUNTIME_DIR/hdmicap/daemon.json` (Linux) / `$TMPDIR/hdmicap/daemon.json` (macOS) |
+| serialcap discovery | `$XDG_RUNTIME_DIR/serialcap/daemon.json` (Linux) / `$TMPDIR/serialcap/daemon.json` (macOS) |
+| Serial capture logs | `$XDG_RUNTIME_DIR/serialcap/capture/<name>/serial.jsonl` (Linux) |
+
+---
+
+## License
+
+Apache 2.0 — see [LICENSE](LICENSE).
 ````
 
 ## File: .github/workflows/ci.yml
@@ -10613,70 +9163,403 @@ mod macos {
 }
 ````
 
-## File: hdmicap/Cargo.toml
-````toml
-[package]
-name = "hdmicap"
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
-description = "Warm-stream HDMI capture daemon optimized for agent screenshotting + human preview"
+## File: hdmicap/src/server.rs
+````rust
+// Copyright 2026 Curtis Galloway
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-[[bin]]
-name = "hdmicap"
-path = "src/main.rs"
+//! Localhost HTTP API. Handlers never touch the device — they only read the
+//! latest FrameState from their `watch::Receiver`. PNG encoding is lazy, here.
 
-[dependencies]
-# --- Capture -------------------------------------------------------------
-# nokhwa unifies V4L2 (Linux) and AVFoundation (macOS) behind one API.
-# `input-native` pulls the right per-OS backend in recent 0.10.x.
-nokhwa = { version = "0.10", features = ["input-native"] }
+use std::io::Cursor;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
 
-# --- Async runtime + HTTP ------------------------------------------------
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "net", "process", "io-util"] }
-axum = "0.7"
+use axum::{
+    body::Body,
+    extract::{Query, State},
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use bytes::Bytes;
+use image::codecs::jpeg::JpegEncoder;
+use image::{ImageBuffer, ImageEncoder, Rgb};
+#[cfg(target_os = "linux")]
+use turbojpeg;
+use serde::Deserialize;
+use tokio::sync::watch;
 
-# --- Imaging -------------------------------------------------------------
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+use crate::capture_thread::FrameRx;
+use crate::frame::{FrameState, Signal, StatusDto};
 
-# --- CLI -----------------------------------------------------------------
-clap = { version = "4", features = ["derive"] }
+#[derive(Clone)]
+pub struct AppState {
+    pub frames: FrameRx,
+}
 
-# --- Daemon plumbing -----------------------------------------------------
-fs2 = "0.4"
-directories = "5"
+pub fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/", get(index))
+        .route("/status", get(status))
+        .route("/snapshot", get(snapshot))
+        .route("/preview", get(preview))
+        .route("/ocr", get(ocr))
+        .route("/power-cycle", post(power_cycle))
+        .route("/devices", get(devices))
+        // Vendored xterm.js assets for the serial terminal pane.
+        .route("/xterm.js", get(xterm_js))
+        .route("/xterm.css", get(xterm_css))
+        .route("/xterm-addon-fit.js", get(xterm_fit_js))
+        .with_state(state)
+}
 
-# --- Errors / logging / serde -------------------------------------------
-anyhow = "1"
-thiserror = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+async fn index() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("../assets/index.html"),
+    )
+}
 
-# --- Client subcommands --------------------------------------------------
-ureq = "2"
-nix = { version = "0.29", features = ["signal", "process"] }
+async fn xterm_js() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        include_str!("../assets/xterm.js"),
+    )
+}
 
-# --- Preview stream ------------------------------------------------------
-async-stream = "0.3"
-bytes = "1"
+async fn xterm_css() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../assets/xterm.css"),
+    )
+}
 
-# On Linux we bypass nokhwa for the actual frame loop and use v4l directly
-# so we can call stream.set_timeout() and avoid an indefinite VIDIOC_DQBUF block.
-# turbojpeg provides fast MJPEG decode (~5ms vs ~50ms pure-Rust) for signal detection.
-[target.'cfg(target_os = "linux")'.dependencies]
-v4l = "0.14"
-turbojpeg = { version = "1.4", features = ["image"] }
+async fn xterm_fit_js() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        include_str!("../assets/xterm-addon-fit.js"),
+    )
+}
 
-[patch.crates-io]
-# Local patch: skip activeVideoMin/MaxFrameDuration KVC calls that throw NSException
-# on HDMI capture cards (MS2109) under AVFoundation. See vendor/nokhwa-bindings-macos.
-nokhwa-bindings-macos = { path = "vendor/nokhwa-bindings-macos" }
+async fn status(State(s): State<AppState>) -> Json<StatusDto> {
+    let f = s.frames.borrow().clone();
+    Json(StatusDto::from(f.as_ref()))
+}
 
-[profile.release]
-opt-level = 3
-lto = "thin"
+#[derive(Deserialize)]
+struct SnapReq {
+    /// "stable" -> wait until signal == Stable.
+    wait: Option<String>,
+    /// Hex hash from a prior /status; wait until the published hash differs.
+    changed_since: Option<String>,
+    /// Milliseconds; default applied below.
+    timeout: Option<u64>,
+}
+
+const DEFAULT_TIMEOUT_MS: u64 = 2000;
+
+async fn snapshot(State(s): State<AppState>, Query(q): Query<SnapReq>) -> Response {
+    let mut rx = s.frames.clone();
+    let timeout_ms = q.timeout.unwrap_or(DEFAULT_TIMEOUT_MS);
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms).min(Duration::from_secs(60));
+    let want_stable = q.wait.as_deref() == Some("stable");
+    let changed_since = q
+        .changed_since
+        .as_ref()
+        .and_then(|h| u64::from_str_radix(h, 16).ok());
+
+    loop {
+        let ready = {
+            let f = rx.borrow_and_update();
+            match (want_stable, changed_since) {
+                (true, _) => f.signal == Signal::Stable,
+                (_, Some(h)) => f.hash != h,
+                _ => true,
+            }
+        };
+
+        if ready {
+            let f = rx.borrow().clone();
+            return png_response(&f, false);
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let f = rx.borrow().clone();
+            return png_response(&f, true);
+        }
+        if tokio::time::timeout(remaining, rx.changed()).await.is_err() {
+            let f = rx.borrow().clone();
+            return png_response(&f, true);
+        }
+    }
+}
+
+/// Decode the frame to an RGB image. On the Linux MJPEG path `rgb` is empty
+/// and we decode `jpeg` with turbojpeg. On other paths `rgb` is pre-decoded.
+fn decode_rgb(f: &FrameState) -> Option<ImageBuffer<Rgb<u8>, Vec<u8>>> {
+    if !f.rgb.is_empty() {
+        return ImageBuffer::from_raw(f.width, f.height, f.rgb.to_vec());
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(ref jpeg) = f.jpeg {
+        return turbojpeg::decompress_image::<Rgb<u8>>(jpeg).ok();
+    }
+    None
+}
+
+/// Encode the frame to PNG bytes. Shared by /snapshot and /ocr.
+fn encode_png(f: &FrameState) -> Option<Vec<u8>> {
+    let img = decode_rgb(f)?;
+    let mut bytes = Vec::new();
+    img.write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
+        .ok()?;
+    Some(bytes)
+}
+
+/// Lazily encode the current RGB buffer to PNG. PNG for agent snapshots: text
+/// edges matter for OCR and the dongle already adds MJPEG artifacts.
+fn png_response(f: &FrameState, timed_out: bool) -> Response {
+    if f.signal == Signal::NoDevice || f.width == 0 {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::HeaderName::from_static("x-signal"), "no_device")],
+            "no capture device",
+        )
+            .into_response();
+    }
+
+    let bytes = match encode_png(f) {
+        Some(b) => b,
+        None => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "frame buffer size mismatch")
+                .into_response()
+        }
+    };
+
+    let signal_str = signal_name(f.signal);
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "image/png".to_string()),
+            (header::HeaderName::from_static("x-signal"), signal_str.to_string()),
+            (
+                header::HeaderName::from_static("x-resolution-epoch"),
+                f.resolution_epoch.to_string(),
+            ),
+            (
+                header::HeaderName::from_static("x-frame-hash"),
+                format!("{:016x}", f.hash),
+            ),
+            (
+                header::HeaderName::from_static("x-timeout"),
+                (timed_out as u8).to_string(),
+            ),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+/// multipart/x-mixed-replace MJPEG stream for the human browser preview.
+/// Reads the same warm buffer as /snapshot — zero device contention.
+/// When raw JPEG bytes are available (Linux MJPEG path), they are served
+/// directly with zero server-side decode or re-encode. Otherwise we re-encode
+/// from the decoded RGB buffer at quality 80.
+async fn preview(State(s): State<AppState>) -> Response {
+    let mut frames = s.frames.clone();
+
+    let stream = async_stream::stream! {
+        let mut interval = tokio::time::interval(Duration::from_millis(67));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            let f = frames.borrow_and_update().clone();
+
+            if f.signal == Signal::NoDevice || f.width == 0 {
+                continue;
+            }
+
+            // Fast path: raw JPEG bytes from the device — no decode/re-encode.
+            let jpeg_bytes: Vec<u8> = if let Some(ref raw) = f.jpeg {
+                raw.to_vec()
+            } else {
+                // Fallback: re-encode from decoded RGB (macOS / YUYV path).
+                let img: ImageBuffer<Rgb<u8>, _> =
+                    match ImageBuffer::from_raw(f.width, f.height, f.rgb.to_vec()) {
+                        Some(i) => i,
+                        None => continue,
+                    };
+                let mut buf = Vec::new();
+                let encoder = JpegEncoder::new_with_quality(Cursor::new(&mut buf), 80);
+                if encoder
+                    .write_image(
+                        img.as_raw(),
+                        img.width(),
+                        img.height(),
+                        image::ExtendedColorType::Rgb8,
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+                buf
+            };
+
+            let part_header = format!(
+                "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+                jpeg_bytes.len()
+            );
+            let mut chunk = Vec::with_capacity(part_header.len() + jpeg_bytes.len() + 2);
+            chunk.extend_from_slice(part_header.as_bytes());
+            chunk.extend_from_slice(&jpeg_bytes);
+            chunk.extend_from_slice(b"\r\n");
+
+            yield Ok::<Bytes, std::io::Error>(Bytes::from(chunk));
+        }
+    };
+
+    Response::builder()
+        .header(
+            header::CONTENT_TYPE,
+            "multipart/x-mixed-replace;boundary=frame",
+        )
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// OCR the current warm frame by shelling out to the `visionocr` tool (Apple
+/// Vision). The daemon doesn't link Vision itself — it pipes a PNG to whatever
+/// `PANIOLO_VISIONOCR` points at (paniolo sets this), falling back to PATH.
+async fn ocr(State(s): State<AppState>) -> Response {
+    let f = s.frames.borrow().clone();
+    if f.signal == Signal::NoDevice || f.width == 0 {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no capture device").into_response();
+    }
+    let png = match encode_png(&f) {
+        Some(p) => p,
+        None => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "png encode failed").into_response()
+        }
+    };
+
+    let bin = std::env::var("PANIOLO_VISIONOCR").unwrap_or_else(|_| "visionocr".to_string());
+    let mut child = match tokio::process::Command::new(&bin)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                format!("visionocr unavailable ({bin}): {e}"),
+            )
+                .into_response()
+        }
+    };
+
+    // Write the PNG to stdin on a task while we collect stdout, so a large
+    // frame can't deadlock the pipe.
+    if let Some(mut stdin) = child.stdin.take() {
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(&png).await;
+            // stdin dropped here -> EOF, so visionocr stops reading.
+        });
+    }
+
+    match child.wait_with_output().await {
+        Ok(out) if out.status.success() => (
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            out.stdout,
+        )
+            .into_response(),
+        Ok(out) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("visionocr failed: {}", String::from_utf8_lossy(&out.stderr)),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("visionocr wait: {e}")).into_response(),
+    }
+}
+
+/// Trigger a power cycle by calling `paniolo power-cycle <target>`.
+/// Requires PANIOLO_TARGET to be set in the daemon's environment (done by
+/// `paniolo video watch <target>`). Returns 501 if not configured.
+async fn power_cycle() -> Response {
+    let target = match std::env::var("PANIOLO_TARGET") {
+        Ok(t) if !t.is_empty() => t,
+        _ => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                "PANIOLO_TARGET not set — start the daemon with: paniolo video watch <target>",
+            )
+                .into_response()
+        }
+    };
+    let paniolo = std::env::var("PANIOLO_BIN").unwrap_or_else(|_| "paniolo".to_string());
+    match tokio::process::Command::new(&paniolo)
+        .args(["power-cycle", &target])
+        .status()
+        .await
+    {
+        Ok(s) if s.success() => (StatusCode::OK, "power cycle triggered").into_response(),
+        Ok(s) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("paniolo power-cycle exited with {s}"),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to run {paniolo}: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn devices() -> Response {
+    match crate::capture::enumerate() {
+        Ok(list) => Json(
+            list.into_iter()
+                .map(|d| {
+                    serde_json::json!({"index": d.index, "name": d.name, "misc": d.misc})
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    }
+}
+
+fn signal_name(s: Signal) -> &'static str {
+    match s {
+        Signal::Stable => "stable",
+        Signal::ModeSwitching => "mode_switching",
+        Signal::NoSignal => "no_signal",
+        Signal::NoDevice => "no_device",
+    }
+}
+
+#[allow(unused_imports)]
+use watch as _watch;
 ````
 
 ## File: serialcap/src/serial_io.rs
@@ -11118,7 +10001,7 @@ fn describe(t: &tokio_serial::SerialPortType) -> String {
 }
 ````
 
-## File: src/paniolo/_netboot.py
+## File: src/paniolo/_dhcp.py
 ````python
 # Copyright 2026 Curtis Galloway
 #
@@ -11134,403 +10017,326 @@ fn describe(t: &tokio_serial::SerialPortType) -> String {
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Minimal DHCP server for paniolo netboot.
+
+Sends broadcast DHCP responses (no BPF required, no root required on macOS 14+).
+Handles DISCOVER→OFFER and REQUEST→ACK for a single netboot client.
+
+Usage (as subprocess):
+    python -m paniolo._dhcp <host_ip> [--boot-file <filename>]
+
+host_ip is both the interface address and the TFTP/siaddr advertised to clients.
+"""
+
 from __future__ import annotations
 
-import os
-import shutil
-import signal
+import argparse
+import logging
+import socket
+import struct
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
-from ._config import TargetConfig
-from ._state import (
-    NetbootState,
-    ensure_target_dir,
-    is_netboot_running,
-    is_paniolo_child_alive,
-    is_pid_alive,
-    load_netboot_state,
-    netboot_log_path,
-    netboot_state_path,
-    save_netboot_state,
-)
+_BOOTREQUEST = 1
+_BOOTREPLY = 2
+_HTYPE_ETHERNET = 1
+_MAGIC = b"\x63\x82\x53\x63"
 
-_BREW_PATHS = [
-    "/opt/homebrew/bin",
-    "/opt/homebrew/sbin",
-    "/usr/local/bin",
-    "/usr/local/sbin",
-]
+_OPT_SUBNET = 1
+_OPT_ROUTER = 3
+_OPT_LEASE = 51
+_OPT_MSG_TYPE = 53
+_OPT_SERVER_ID = 54
+_OPT_TFTP_SERVER = 66
+_OPT_BOOTFILE = 67
+_OPT_END = 255
 
-# Linux: dnsmasq and other netboot tools commonly live in /usr/sbin or /sbin.
-_LINUX_SBIN_PATHS = ["/usr/sbin", "/sbin"]
+_DHCP_DISCOVER = 1
+_DHCP_OFFER = 2
+_DHCP_REQUEST = 3
+_DHCP_ACK = 5
+_DHCP_NAK = 6
 
-_EXCLUDE_PORT_PREFIXES = (
-    "Wi-Fi",
-    "Thunderbolt",
-    "Bluetooth",
-    "FireWire",
-    "iPhone",
-    "iPad",
-)
-_EXCLUDE_DEVICES = {"bridge0", "lo0"}
+_LEASE_SECONDS = 12 * 3600
+_ASSIGNED_IP = "192.168.99.100"
 
-# Linux interfaces to skip when listing candidates for netboot.
-_LINUX_SKIP_PREFIXES = ("lo", "docker", "veth", "br", "virbr", "vlan", "bond", "dummy")
+# Shared file written by this DHCP server, read by the co-process TFTP server.
+# The TFTP server needs the client's real MAC to build BPF raw frames (the Pi
+# bootloader sends TFTP from a different ephemeral MAC than the one it used for
+# DHCP, which causes macOS to install the wrong ARP entry — see _tftp.py).
+# Placed in the user state dir (not /tmp) to prevent symlink and spoofing attacks.
+_CLIENT_MAC_FILE = Path.home() / ".local" / "share" / "paniolo" / "client-mac"
+
+log = logging.getLogger(__name__)
 
 
-def _find_bin(name: str) -> str:
-    found = shutil.which(name)
-    if found:
-        return found
-    extra = _LINUX_SBIN_PATHS if sys.platform != "darwin" else _BREW_PATHS
-    for d in extra:
-        p = Path(d) / name
-        if p.exists():
-            return str(p)
-    return name
+def _parse_options(options: bytes) -> dict[int, bytes]:
+    result: dict[int, bytes] = {}
+    if options[:4] != _MAGIC:
+        return result
+    i = 4
+    while i < len(options):
+        tag = options[i]
+        if tag == _OPT_END:
+            break
+        if tag == 0:
+            i += 1
+            continue
+        if i + 1 >= len(options):
+            break
+        length = options[i + 1]
+        result[tag] = options[i + 2 : i + 2 + length]
+        i += 2 + length
+    return result
 
 
-def check_deps() -> list[str]:
-    # DHCP and TFTP are both pure-Python (see _dhcp.py, _tftp.py); no external
-    # binaries required.
-    return []
+def _encode_option(tag: int, value: bytes) -> bytes:
+    return bytes([tag, len(value)]) + value
 
 
-def _is_interface_active(device: str) -> bool:
+def _build_reply(
+    xid: bytes,
+    chaddr: bytes,
+    msg_type: int,
+    server_ip: str,
+    assigned_ip: str,
+    boot_file: str,
+) -> bytes:
+    server_b = socket.inet_aton(server_ip)
+    client_b = socket.inet_aton(assigned_ip)
+
+    opts = _MAGIC
+    opts += _encode_option(_OPT_MSG_TYPE, bytes([msg_type]))
+    opts += _encode_option(_OPT_SERVER_ID, server_b)
+    opts += _encode_option(_OPT_LEASE, struct.pack("!I", _LEASE_SECONDS))
+    opts += _encode_option(_OPT_SUBNET, socket.inet_aton("255.255.255.0"))
+    opts += _encode_option(_OPT_ROUTER, server_b)
+    opts += _encode_option(_OPT_TFTP_SERVER, server_ip.encode())
+    opts += _encode_option(_OPT_BOOTFILE, boot_file.encode())
+    opts += bytes([_OPT_END])
+
+    pkt = struct.pack("!BBBB", _BOOTREPLY, _HTYPE_ETHERNET, 6, 0)
+    pkt += xid
+    pkt += struct.pack("!HH", 0, 0x8000)
+    pkt += b"\x00" * 4  # ciaddr
+    pkt += client_b  # yiaddr
+    pkt += server_b  # siaddr (next-server = TFTP)
+    pkt += b"\x00" * 4  # giaddr
+    pkt += chaddr[:16]  # chaddr (padded to 16)
+    pkt += b"\x00" * 64  # sname
+    file_bytes = boot_file.encode()[:127]
+    pkt += file_bytes + b"\x00" * (128 - len(file_bytes))  # file (null-padded)
+    pkt += opts
+    return pkt
+
+
+def _set_arp(ip: str, mac: str, interface: str | None = None) -> None:
+    """Pin a static ARP entry mapping the client IP to the MAC we just saw in a
+    DHCP packet.
+
+    The Pi's netboot firmware sends us DHCP/TFTP but does NOT answer ARP
+    requests. We already know the MAC from the DHCP frame, so install it
+    directly. Calling this on each DHCP exchange tracks the active MAC (the Pi
+    cycles through several boot phases). Needs root.
+
+    macOS: uses `arp -s` (net-tools syntax).
+    Linux: uses `ip neigh replace` (iproute2, requires interface name).
+    """
+    if sys.platform == "darwin":
+        r = subprocess.run(
+            ["sudo", "arp", "-s", ip, mac], capture_output=True, text=True
+        )
+        if r.returncode != 0:
+            log.warning("arp -s %s %s failed: %s", ip, mac, r.stderr.strip() or r.stdout.strip())
+    else:
+        cmd = ["sudo", "ip", "neigh", "replace", ip, "lladdr", mac, "nud", "permanent"]
+        if interface:
+            cmd += ["dev", interface]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            log.warning(
+                "ip neigh replace %s lladdr %s failed: %s", ip, mac, r.stderr.strip()
+            )
+    # Share with the co-process TFTP server so it can build BPF raw frames
+    # (macOS) or just for diagnostics (Linux).
+    try:
+        _CLIENT_MAC_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _CLIENT_MAC_FILE.write_text(mac)
+    except OSError as exc:
+        log.debug("could not write client MAC file: %s", exc)
+
+
+def _has_interface_ip(interface: str, host_ip: str) -> bool:
+    """Return True if `host_ip` is currently assigned to `interface`."""
     if sys.platform == "darwin":
         try:
             out = subprocess.check_output(
-                ["ifconfig", device], text=True, stderr=subprocess.DEVNULL
+                ["ifconfig", interface], text=True, stderr=subprocess.DEVNULL
+            )
+            return f"inet {host_ip} " in out
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
+    else:
+        # Check sysfs; /sys/class/net/<iface>/address holds MAC but not IP.
+        # Use `ip addr show` instead.
+        try:
+            out = subprocess.check_output(
+                ["ip", "addr", "show", "dev", interface],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            return f"inet {host_ip}/" in out or f"inet {host_ip} " in out
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
+
+
+def _is_link_up(interface: str) -> bool:
+    """Return True if the interface link is currently up."""
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.check_output(
+                ["ifconfig", interface], text=True, stderr=subprocess.DEVNULL
             )
             return "status: active" in out
         except (subprocess.CalledProcessError, FileNotFoundError):
             return False
     else:
         try:
-            carrier = Path(f"/sys/class/net/{device}/carrier").read_text().strip()
+            carrier = Path(f"/sys/class/net/{interface}/carrier").read_text().strip()
             return carrier == "1"
         except OSError:
             return False
 
 
-def _list_linux_ethernet_interfaces() -> list[dict]:
-    """Return Ethernet interfaces on Linux using sysfs.
+def _monitor_interface(interface: str, host_ip: str) -> None:
+    """Continuously enforce the static IP on the interface.
 
-    Each entry: {"port": str, "device": str, "active": bool}
-    Skips loopback, virtual bridges, Docker, and other non-physical interfaces.
+    The netboot client flaps the link on every power-cycle and at several
+    points during its own boot. macOS drops a manually-set IPv4 on link flap;
+    Linux is more stable but NetworkManager may reset the address. We poll fast
+    and re-apply immediately so the client's next retry always succeeds.
     """
-    net_dir = Path("/sys/class/net")
-    candidates: list[dict] = []
-    try:
-        entries = sorted(net_dir.iterdir())
-    except OSError:
-        return []
-    for iface_path in entries:
-        name = iface_path.name
-        if any(name.startswith(p) for p in _LINUX_SKIP_PREFIXES):
-            continue
-        # Type 1 = Ethernet (ARPHRD_ETHER).
-        try:
-            if (iface_path / "type").read_text().strip() != "1":
-                continue
-        except OSError:
-            continue
-        active = _is_interface_active(name)
-        candidates.append({"port": name, "device": name, "active": active})
-    return sorted(candidates, key=lambda x: (not x["active"], x["device"]))
+    had_ip = True
+    while True:
+        time.sleep(1.0)
+        has_ip = _has_interface_ip(interface, host_ip)
+        is_active = _is_link_up(interface)
 
-
-def list_usb_ethernet_interfaces() -> list[dict]:
-    """Return external (non-built-in) Ethernet interfaces, active ones first.
-
-    Each entry: {"port": str, "device": str, "active": bool}
-    On macOS: queries networksetup and excludes Wi-Fi, Thunderbolt, Bluetooth, etc.
-    On Linux: reads sysfs and excludes loopback and virtual interfaces.
-    """
-    if sys.platform != "darwin":
-        return _list_linux_ethernet_interfaces()
-
-    try:
-        out = subprocess.check_output(
-            ["networksetup", "-listallhardwareports"],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return []
-
-    candidates: list[dict] = []
-    port: str | None = None
-    for line in out.splitlines():
-        if line.startswith("Hardware Port:"):
-            port = line.split(":", 1)[1].strip()
-        elif line.startswith("Device:") and port is not None:
-            device = line.split(":", 1)[1].strip()
-            if device not in _EXCLUDE_DEVICES and not any(
-                port.startswith(p) for p in _EXCLUDE_PORT_PREFIXES
-            ):
-                candidates.append(
-                    {
-                        "port": port,
-                        "device": device,
-                        "active": _is_interface_active(device),
-                    }
+        if not has_ip and is_active:
+            if sys.platform == "darwin":
+                subprocess.run(
+                    ["sudo", "ifconfig", interface, host_ip, "netmask", "255.255.255.0", "up"],
+                    check=False,
                 )
-            port = None
+            else:
+                subprocess.run(
+                    ["sudo", "ip", "addr", "add", f"{host_ip}/24", "dev", interface],
+                    check=False,
+                    capture_output=True,
+                )
+            if had_ip:
+                log.warning("interface %s lost IP %s — restoring", interface, host_ip)
+        elif has_ip and not had_ip:
+            log.info("interface %s restored with IP %s", interface, host_ip)
 
-    return sorted(candidates, key=lambda x: (not x["active"], x["device"]))
-
-
-
-
-def _spawn(cmd: list[str], log_path: Path, append: bool = False) -> subprocess.Popen:
-    if not append:
-        log_path.unlink(missing_ok=True)
-    log_file = open(log_path, "a")
-    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
-    return subprocess.Popen(
-        cmd,
-        stdout=log_file,
-        stderr=log_file,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-        env=env,
-    )
+        had_ip = has_ip
 
 
-def _sudo_prefix() -> list[str]:
-    """Return a sudo prefix for privileged subprocesses on Linux.
+def serve(
+    host_ip: str, boot_file: str = "kernel_2712.img", interface: str | None = None
+) -> None:
+    prefix = host_ip.rsplit(".", 1)[0]
+    bcast = f"{prefix}.255"
 
-    On macOS, DHCP/TFTP bind to ports 67/69 without root; no prefix needed.
-    On Linux they require root (or CAP_NET_BIND_SERVICE). If we're already
-    running as root, no prefix needed either.
+    if interface:
+        t = threading.Thread(
+            target=_monitor_interface, args=(interface, host_ip), daemon=True
+        )
+        t.start()
 
-    Uses 'sudo env PYTHONUNBUFFERED=1' so the env var reaches Python through
-    sudo's environment reset without requiring the SETENV sudoers option.
-    Each exec in the chain (sudo → env → python) keeps the same PID, so the
-    saved PID in the state file still refers to the Python process.
-    """
-    if sys.platform == "darwin" or os.getuid() == 0:
-        return []
-    return ["sudo", "env", "PYTHONUNBUFFERED=1"]
-
-
-def _find_network_service(interface: str) -> str | None:
-    """Return the networksetup service name for a given device (e.g. 'en11' → 'USB 10/100/1000 LAN').
-    macOS only; returns None on Linux."""
-    if sys.platform != "darwin":
-        return None
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     try:
-        out = subprocess.check_output(
-            ["networksetup", "-listallhardwareports"],
-            text=True,
-            stderr=subprocess.DEVNULL,
+        sock.bind(("", 67))
+    except PermissionError:
+        log.error(
+            "Cannot bind to port 67 (DHCP). On Linux, run paniolo as root or "
+            "grant CAP_NET_BIND_SERVICE: sudo setcap cap_net_bind_service=+ep "
+            "$(which python3)"
         )
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return None
-    service: str | None = None
-    for line in out.splitlines():
-        if line.startswith("Hardware Port:"):
-            service = line.split(":", 1)[1].strip()
-        elif line.startswith("Device:"):
-            if line.split(":", 1)[1].strip() == interface:
-                return service
-    return None
-
-
-def _configure_interface(interface: str, host_ip: str) -> None:
-    if sys.platform == "darwin":
-        service = _find_network_service(interface)
-        if service:
-            subprocess.run(
-                ["sudo", "networksetup", "-setmanual", service, host_ip, "255.255.255.0"],
-                check=False,
-            )
-        result = subprocess.run(
-            ["sudo", "ifconfig", interface, host_ip, "netmask", "255.255.255.0", "up"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"ifconfig {interface} failed: {result.stderr.strip()}\n"
-                "Ensure passwordless sudo is configured (NOPASSWD) for the control machine."
-            )
-    else:
-        # Remove any existing addresses on this interface, then assign ours.
-        subprocess.run(
-            ["sudo", "ip", "addr", "flush", "dev", interface],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        result = subprocess.run(
-            ["sudo", "ip", "addr", "add", f"{host_ip}/24", "dev", interface],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0 and "already assigned" not in result.stderr:
-            raise RuntimeError(
-                f"ip addr add {host_ip}/24 dev {interface} failed: {result.stderr.strip()}\n"
-                "Ensure passwordless sudo is configured (NOPASSWD) for the control machine."
-            )
-        subprocess.run(
-            ["sudo", "ip", "link", "set", interface, "up"],
-            check=False,
-        )
-
-
-def _restore_interface(interface: str) -> None:
-    """Release the static IP and return the interface to OS-managed networking."""
-    if sys.platform == "darwin":
-        service = _find_network_service(interface)
-        if service:
-            subprocess.run(
-                ["sudo", "networksetup", "-setdhcp", service],
-                check=False,
-            )
-    else:
-        # Flush our static address; leave link up. A DHCP client (NetworkManager,
-        # systemd-networkd, dhclient) will re-acquire an address if configured.
-        subprocess.run(
-            ["sudo", "ip", "addr", "flush", "dev", interface],
-            check=False,
-        )
-
-
-def _tune_arp_for_silent_client() -> None:
-    """Tweak OS neighbor-unreachability detection (NUD) for the netboot link.
-
-    The Pi's bootloader sends us DHCP/TFTP but never answers ARP probes. Without
-    tuning, the OS may mark the neighbor unreachable and refuse to send packets.
-
-    macOS (26.x+): zeros arp_llreach_base and host_down_time so NUD never fires.
-    Linux: no tuning needed — ARP entries installed via _dhcp._set_arp persist
-    across link flaps and Linux's NUD does not block sends to permanent entries.
-    """
-    if sys.platform != "darwin":
-        return
-    for key, val in (
-        ("net.link.ether.inet.arp_llreach_base", "0"),
-        ("net.link.ether.inet.host_down_time", "0"),
-    ):
-        subprocess.run(["sudo", "sysctl", "-w", f"{key}={val}"], capture_output=True, text=True)
-
-
-def _cleanup_stale(target: str) -> None:
-    """Kill any lingering pids from a previous crashed netboot session."""
-    state = load_netboot_state(target)
-    if state is None:
-        return
-    for pid, module in (
-        (state.dhcp_pid, "paniolo._dhcp"),
-        (state.tftp_pid, "paniolo._tftp"),
-    ):
-        if is_paniolo_child_alive(pid, module):
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                pass
-    netboot_state_path(target).unlink(missing_ok=True)
-
-
-def start(cfg: TargetConfig) -> None:
-    if is_netboot_running(cfg.name):
-        raise RuntimeError(f"netboot already running for '{cfg.name}'")
-
-    missing = check_deps()
-    if missing:
-        raise RuntimeError(
-            f"Missing required tools: {', '.join(missing)}\n"
-            "Run: paniolo setup"
-        )
-
-    if not cfg.tftp_root:
-        raise RuntimeError("No tftp_root configured. Run: paniolo target set <name> --tftp-root <path>")
-    tftp_root = Path(cfg.tftp_root)
-    if not tftp_root.exists():
-        raise RuntimeError(f"TFTP root does not exist: {tftp_root}")
-
-    _cleanup_stale(cfg.name)
-    _configure_interface(cfg.interface, cfg.host_ip)
-    _tune_arp_for_silent_client()
-
-    ensure_target_dir(cfg.name)
-    log_path = netboot_log_path(cfg.name)
-    sudo = _sudo_prefix()
-
-    dhcp = _spawn(
-        sudo + [sys.executable, "-m", "paniolo._dhcp", cfg.host_ip, "--interface", cfg.interface],
-        log_path,
-    )
-    # Pure-Python TFTP server. Binds the listen socket on the wildcard so a
-    # non-root process can use port 69 on macOS; on Linux we prepend sudo
-    # (see _sudo_prefix). Each reply socket is bound to cfg.host_ip so the
-    # OS routes transfers out the correct secondary interface (see _tftp.py).
-    tftp = _spawn(
-        sudo + [sys.executable, "-m", "paniolo._tftp", cfg.host_ip, str(tftp_root),
-                "--interface", cfg.interface],
-        log_path,
-        append=True,
+        raise
+    log.info(
+        "DHCP listening on 0.0.0.0:67  host_ip=%s  bcast=%s  boot_file=%s",
+        host_ip,
+        bcast,
+        boot_file,
     )
 
-    save_netboot_state(NetbootState(
-        target=cfg.name,
-        dhcp_pid=dhcp.pid,
-        tftp_pid=tftp.pid,
-        started_at=time.time(),
-        interface=cfg.interface,
-        tftp_root=str(tftp_root),
-    ))
+    while True:
+        try:
+            data, _addr = sock.recvfrom(4096)
+        except OSError as exc:
+            log.error("recvfrom: %s", exc)
+            continue
+
+        if len(data) < 240:
+            continue
+        op = data[0]
+        if op != _BOOTREQUEST:
+            continue
+
+        xid = data[4:8]
+        chaddr = data[28:44]
+        mac = data[28:34].hex(":")
+        options = _parse_options(data[236:])
+
+        msg_type = options.get(_OPT_MSG_TYPE, b"")
+        if not msg_type:
+            continue
+        msg_type_val = msg_type[0]
+
+        if msg_type_val == _DHCP_DISCOVER:
+            log.info("DHCPDISCOVER from %s", mac)
+            _set_arp(_ASSIGNED_IP, mac, interface)
+            reply = _build_reply(xid, chaddr, _DHCP_OFFER, host_ip, _ASSIGNED_IP, boot_file)
+            sock.sendto(reply, (bcast, 68))
+            log.info(
+                "DHCPOFFER → %s  ip=%s  tftp=%s  file=%s",
+                mac,
+                _ASSIGNED_IP,
+                host_ip,
+                boot_file,
+            )
+
+        elif msg_type_val == _DHCP_REQUEST:
+            log.info("DHCPREQUEST from %s", mac)
+            _set_arp(_ASSIGNED_IP, mac, interface)
+            reply = _build_reply(xid, chaddr, _DHCP_ACK, host_ip, _ASSIGNED_IP, boot_file)
+            sock.sendto(reply, (bcast, 68))
+            log.info("DHCPACK → %s  ip=%s", mac, _ASSIGNED_IP)
 
 
-def stop(target: str) -> None:
-    state = load_netboot_state(target)
-    if state is None:
-        raise RuntimeError(f"No netboot state for '{target}'")
-
-    for pid in (state.dhcp_pid, state.tftp_pid):
-        if is_pid_alive(pid):
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            except PermissionError:
-                subprocess.run(["sudo", "kill", "-TERM", str(pid)], check=False)
-
-    deadline = time.time() + 3.0
-    while time.time() < deadline:
-        if not is_pid_alive(state.dhcp_pid) and not is_pid_alive(state.tftp_pid):
-            break
-        time.sleep(0.1)
-
-    netboot_state_path(target).unlink(missing_ok=True)
-    _restore_interface(state.interface)
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        stream=sys.stderr,
+    )
+    parser = argparse.ArgumentParser(description="Paniolo minimal DHCP server")
+    parser.add_argument("host_ip", help="Interface IP (also advertised as TFTP server)")
+    parser.add_argument("--boot-file", default="kernel_2712.img")
+    parser.add_argument("--interface", help="Interface device name (e.g. en11) for IP monitoring")
+    args = parser.parse_args()
+    serve(args.host_ip, args.boot_file, args.interface)
 
 
-def get_status(target: str) -> dict:
-    state = load_netboot_state(target)
-    if state is None:
-        return {"running": False, "target": target}
-
-    dhcp_alive = is_pid_alive(state.dhcp_pid)
-    tftp_alive = is_pid_alive(state.tftp_pid)
-
-    return {
-        "running": dhcp_alive and tftp_alive,
-        "target": target,
-        "dhcp_pid": state.dhcp_pid,
-        "dhcp_alive": dhcp_alive,
-        "tftp_pid": state.tftp_pid,
-        "tftp_alive": tftp_alive,
-        "interface": state.interface,
-        "tftp_root": state.tftp_root,
-        "started_at": state.started_at,
-        "uptime_seconds": time.time() - state.started_at if (dhcp_alive and tftp_alive) else None,
-    }
+if __name__ == "__main__":
+    main()
 ````
 
 ## File: src/paniolo/_serial.py
@@ -11789,6 +10595,1121 @@ def start_daemon(
     )
 ````
 
+## File: src/paniolo/_state.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Optional
+
+STATE_DIR = Path.home() / ".local" / "share" / "paniolo"
+
+
+@dataclasses.dataclass
+class NetbootState:
+    target: str
+    dhcp_pid: int
+    tftp_pid: int
+    started_at: float
+    interface: str
+    tftp_root: str
+
+
+def _target_dir(target: str) -> Path:
+    return STATE_DIR / target
+
+
+def netboot_state_path(target: str) -> Path:
+    return _target_dir(target) / "netboot.json"
+
+
+def netboot_log_path(target: str) -> Path:
+    return _target_dir(target) / "netboot.log"
+
+
+def ensure_target_dir(target: str) -> Path:
+    d = _target_dir(target)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def save_netboot_state(state: NetbootState) -> None:
+    ensure_target_dir(state.target)
+    netboot_state_path(state.target).write_text(
+        json.dumps(dataclasses.asdict(state), indent=2)
+    )
+
+
+def load_netboot_state(target: str) -> Optional[NetbootState]:
+    path = netboot_state_path(target)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+        return NetbootState(**data)
+    except (json.JSONDecodeError, TypeError, KeyError):
+        return None
+
+
+def is_pid_alive(pid: int) -> bool:
+    """Return True if any process with this PID exists (signal-0 probe)."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # PID exists but we cannot signal it -- still alive.
+        return True
+
+
+def _pid_cmdline(pid: int) -> str:
+    """Return the full command-line string for pid, or empty string on failure."""
+    if sys.platform != "darwin":
+        try:
+            return (
+                Path(f"/proc/{pid}/cmdline")
+                .read_bytes()
+                .replace(b"\x00", b" ")
+                .decode(errors="replace")
+                .strip()
+            )
+        except OSError:
+            return ""
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "args="],
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+    except Exception:  # pylint: disable=broad-except
+        return ""
+
+
+def is_paniolo_child_alive(pid: int, module: str) -> bool:
+    """Return True only if pid is alive AND its command line contains module.
+
+    Guards against stale PIDs reused by unrelated processes after a paniolo
+    child crashes.  module is the Python module name passed to -m, e.g.
+    'paniolo._tftp'.
+    """
+    if not is_pid_alive(pid):
+        return False
+    return module in _pid_cmdline(pid)
+
+
+def is_netboot_running(target: str) -> bool:
+    """Return True only if both child processes are alive and are our processes."""
+    state = load_netboot_state(target)
+    if state is None:
+        return False
+    return (
+        is_paniolo_child_alive(state.dhcp_pid, "paniolo._dhcp")
+        and is_paniolo_child_alive(state.tftp_pid, "paniolo._tftp")
+    )
+````
+
+## File: src/paniolo/_tftp.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Minimal read-only TFTP server for paniolo netboot.
+
+Read-only (RRQ) TFTP per RFC 1350, with the blksize (RFC 2348) and tsize
+(RFC 2349) options the Raspberry Pi bootloader negotiates.
+
+Why a custom server instead of an off-the-shelf one (e.g. tftp-now): on macOS
+a non-root process can bind a privileged port (69) only on the wildcard
+address 0.0.0.0, NOT on a specific interface IP. But the host we serve sits on
+a *secondary* USB-Ethernet interface, and a reply socket left on 0.0.0.0 lets
+macOS pick the wrong egress (the primary interface) -> sendto() fails with
+EHOSTUNREACH ("no route to host"). The first fix is to listen on the wildcard
+while binding each reply socket to the specific interface IP on an ephemeral
+port, pinning egress to the right NIC.
+
+However, on macOS 15+ (Sequoia / "macOS 26") the kernel refuses to unicast to
+the Pi bootloader even with a permanent static ARP entry, because the bootloader
+sends TFTP packets from a different ephemeral source MAC than the one it used for
+DHCP. The kernel learns that ephemeral MAC as the host route for the client IP,
+then won't deliver frames to it (the bootloader only receives on its real MAC).
+The second fix is a BPF raw-frame sender: when sendto returns EHOSTUNREACH we
+write a complete Ethernet/IPv4/UDP frame directly to /dev/bpf, using the
+bootloader's real DHCP MAC (shared via /tmp/paniolo-client-mac by _dhcp.py) as
+the destination, bypassing the kernel's ARP table entirely.
+
+Usage (as subprocess):
+    python -m paniolo._tftp <host_ip> <root> [--port 69] [--interface <iface>]
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import logging
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+_OP_RRQ = 1
+_OP_WRQ = 2
+_OP_DATA = 3
+_OP_ACK = 4
+_OP_ERROR = 5
+_OP_OACK = 6
+
+_ERR_NOT_FOUND = 1
+_ERR_ACCESS = 2
+_ERR_ILLEGAL = 4
+
+_DEFAULT_BLKSIZE = 512
+_ACK_TIMEOUT = 1.0
+_MAX_RETRIES = 6
+_ARP_RESOLVE_TIMEOUT = 4.0
+
+# Shared with _dhcp.py: the DHCP server writes the client MAC here so we can
+# use it as the BPF frame destination, bypassing the kernel's ARP table.
+# Placed in the user state dir (not /tmp) to prevent symlink and spoofing attacks.
+_CLIENT_MAC_FILE = Path.home() / ".local" / "share" / "paniolo" / "client-mac"
+
+# macOS BPF ioctl constants (64-bit).  Used by BpfSender below.
+_BIOCSETIF = 0x8020426C  # bind BPF fd to an interface (struct ifreq, 32 B)
+_BIOCSHDRCMPLT = 0x80044275  # tell kernel we write complete L2 headers
+
+log = logging.getLogger(__name__)
+
+
+# ── BPF raw-frame sender ──────────────────────────────────────────────────────
+
+
+def _inet_checksum(data: bytes) -> int:
+    if len(data) % 2:
+        data += b"\x00"
+    total = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return ~total & 0xFFFF
+
+
+def _build_udp_frame(
+    src_mac: bytes,
+    dst_mac: bytes,
+    src_ip: str,
+    dst_ip: str,
+    src_port: int,
+    dst_port: int,
+    payload: bytes,
+) -> bytes:
+    """Construct a raw Ethernet/IPv4/UDP frame."""
+    src_a = socket.inet_aton(src_ip)
+    dst_a = socket.inet_aton(dst_ip)
+    udp_len = 8 + len(payload)
+    ip_len = 20 + udp_len
+
+    ip_hdr = struct.pack(
+        "!BBHHHBBH4s4s",
+        0x45,
+        0,
+        ip_len,
+        0,
+        0x4000,
+        64,
+        17,
+        0,
+        src_a,
+        dst_a,
+    )
+    ip_ck = _inet_checksum(ip_hdr)
+    ip_hdr = ip_hdr[:10] + struct.pack("!H", ip_ck) + ip_hdr[12:]
+
+    udp_hdr_no_ck = struct.pack("!HHH", src_port, dst_port, udp_len)
+    pseudo = src_a + dst_a + b"\x00\x11" + struct.pack("!H", udp_len)
+    udp_ck = _inet_checksum(pseudo + udp_hdr_no_ck + b"\x00\x00" + payload)
+    udp_hdr = udp_hdr_no_ck + struct.pack("!H", udp_ck)
+
+    return dst_mac + src_mac + b"\x08\x00" + ip_hdr + udp_hdr + payload
+
+
+def _get_if_mac(iface: str) -> bytes:
+    if sys.platform != "darwin":
+        # Linux: read directly from sysfs (no ifconfig needed).
+        addr = Path(f"/sys/class/net/{iface}/address").read_text().strip()
+        return bytes(int(b, 16) for b in addr.split(":"))
+    out = subprocess.check_output(
+        ["ifconfig", iface], text=True, stderr=subprocess.DEVNULL
+    )
+    m = re.search(r"\bether\s+((?:[0-9a-f]{2}:){5}[0-9a-f]{2})\b", out)
+    if not m:
+        raise ValueError(f"No ether address for {iface}")
+    return bytes(int(b, 16) for b in m.group(1).split(":"))
+
+
+def _open_bpf_fd(iface: str) -> int | None:
+    """Open a writable BPF device bound to iface. macOS only; returns None elsewhere."""
+    if sys.platform != "darwin":
+        return None
+    for n in range(10):
+        try:
+            fd = os.open(f"/dev/bpf{n}", os.O_RDWR)
+        except OSError:
+            continue
+        try:
+            ifreq = bytearray(32)
+            ifreq[: len(iface)] = iface.encode()
+            fcntl.ioctl(fd, _BIOCSETIF, ifreq)
+            fcntl.ioctl(fd, _BIOCSHDRCMPLT, struct.pack("I", 1))
+            return fd
+        except OSError as exc:
+            os.close(fd)
+            log.debug("BPF /dev/bpf%d bind %s: %s", n, iface, exc)
+    return None
+
+
+class BpfSender:
+    """Sends UDP packets as raw Ethernet frames via /dev/bpf, bypassing the
+    kernel ARP table.  Used on macOS when sendto returns EHOSTUNREACH because
+    the kernel has installed the wrong destination MAC for the Pi bootloader.
+    On Linux, BPF is not available; `available` is always False."""
+
+    def __init__(self, iface: str, host_ip: str) -> None:
+        self._host_ip = host_ip
+        self._fd: int | None = None
+        self._src_mac: bytes | None = None
+        self._lock = threading.Lock()
+        if sys.platform != "darwin":
+            return
+        try:
+            self._src_mac = _get_if_mac(iface)
+            self._fd = _open_bpf_fd(iface)
+            if self._fd is not None:
+                log.info(
+                    "BPF sender ready on %s (src %s)",
+                    iface,
+                    self._src_mac.hex(":"),
+                )
+            else:
+                log.warning(
+                    "BPF unavailable on %s — check /dev/bpf* permissions or "
+                    "add user to 'access_bpf' group",
+                    iface,
+                )
+        except Exception as exc:
+            log.warning("BPF init failed: %s", exc)
+
+    @property
+    def available(self) -> bool:
+        return self._fd is not None and self._src_mac is not None
+
+    def _read_client_mac(self) -> bytes | None:
+        try:
+            mac_str = _CLIENT_MAC_FILE.read_text().strip()
+            return bytes(int(b, 16) for b in mac_str.split(":"))
+        except Exception:
+            return None
+
+    def send(self, sock: socket.socket, packet: bytes, peer: tuple) -> bool:
+        """Send packet as a raw frame. sock supplies the ephemeral src port."""
+        if not self.available:
+            return False
+        dst_mac = self._read_client_mac()
+        if dst_mac is None:
+            log.warning("BPF: no client MAC in %s", _CLIENT_MAC_FILE)
+            return False
+        src_port = sock.getsockname()[1]
+        dst_ip, dst_port = peer
+        try:
+            frame = _build_udp_frame(
+                self._src_mac,
+                dst_mac,  # type: ignore[arg-type]
+                self._host_ip,
+                dst_ip,
+                src_port,
+                dst_port,
+                packet,
+            )
+            with self._lock:
+                os.write(self._fd, frame)  # type: ignore[arg-type]
+            log.debug(
+                "BPF sent %d B to %s:%d (dst MAC %s)",
+                len(frame),
+                dst_ip,
+                dst_port,
+                dst_mac.hex(":"),
+            )
+            return True
+        except OSError as exc:
+            log.warning("BPF write failed: %s", exc)
+            return False
+
+    def close(self) -> None:
+        with self._lock:
+            if self._fd is not None:
+                os.close(self._fd)
+                self._fd = None
+
+
+def _sendto(
+    sock: socket.socket, packet: bytes, peer, bpf: "BpfSender | None" = None
+) -> bool:
+    """sendto() with BPF raw-frame fallback for EHOSTUNREACH.
+
+    macOS 15+ refuses to deliver unicast UDP to the Pi bootloader even with a
+    permanent static ARP entry, because the bootloader's TFTP packets arrive
+    from a random source MAC (different from its DHCP MAC), and the kernel
+    installs that ephemeral MAC as the host route.  When sendto hits
+    EHOSTUNREACH we fall back to a /dev/bpf raw frame addressed to the real
+    DHCP MAC (written by _dhcp.py to _CLIENT_MAC_FILE).  If BPF is not
+    available, retry for _ARP_RESOLVE_TIMEOUT seconds in case the ARP entry
+    heals on its own (covers older macOS and the brief post-link-flap window).
+    """
+    if bpf is not None and bpf.available:
+        # With arp_llreach_base=0 (NUD disabled), sendto() to the Pi "succeeds"
+        # even when the kernel's ARP table has the wrong ephemeral source MAC the
+        # bootloader used for TFTP (not its DHCP/receive MAC).  The packet is sent
+        # but the Pi never receives it.  Always use BPF when available so we bypass
+        # the ARP table entirely and address frames to the real DHCP MAC directly.
+        if bpf.send(sock, packet, peer):
+            return True
+        log.debug("BPF failed, falling back to kernel sendto %s:%d", peer[0], peer[1])
+
+    deadline = time.monotonic() + _ARP_RESOLVE_TIMEOUT
+    while True:
+        try:
+            sock.sendto(packet, peer)
+            return True
+        except OSError as exc:
+            if exc.errno == errno.EHOSTUNREACH and time.monotonic() < deadline:
+                time.sleep(0.1)
+                continue
+            log.warning("sendto %s:%d failed: %s", peer[0], peer[1], exc)
+            return False
+
+
+def _parse_rrq(data: bytes) -> tuple[str, str, dict[str, str]] | None:
+    """Return (filename, mode, options) from an RRQ payload, or None if malformed."""
+    parts = data[2:].split(b"\x00")
+    if len(parts) < 2:
+        return None
+    filename = parts[0].decode("latin-1")
+    mode = parts[1].decode("latin-1").lower()
+    options: dict[str, str] = {}
+    rest = parts[2:]
+    for i in range(0, len(rest) - 1, 2):
+        key = rest[i].decode("latin-1").lower()
+        if key:
+            options[key] = rest[i + 1].decode("latin-1")
+    return filename, mode, options
+
+
+def _error_packet(code: int, msg: str) -> bytes:
+    return struct.pack("!HH", _OP_ERROR, code) + msg.encode("latin-1") + b"\x00"
+
+
+def _resolve(root: Path, filename: str) -> Path | None:
+    """Resolve a requested filename inside root, rejecting traversal outside it."""
+    candidate = (root / filename.lstrip("/")).resolve()
+    try:
+        candidate.relative_to(root.resolve())
+    except ValueError:
+        return None
+    return candidate
+
+
+def _send_and_wait_ack(
+    sock: socket.socket,
+    packet: bytes,
+    peer,
+    expect_block: int,
+    bpf: "BpfSender | None" = None,
+) -> bool:
+    """Send a packet and wait for ACK of expect_block, retransmitting on timeout."""
+    for attempt in range(_MAX_RETRIES):
+        if not _sendto(sock, packet, peer, bpf):
+            log.warning(
+                "sendto %s:%d failed (attempt %d/%d), retrying",
+                peer[0],
+                peer[1],
+                attempt + 1,
+                _MAX_RETRIES,
+            )
+            time.sleep(0.05)
+            continue
+        sock.settimeout(_ACK_TIMEOUT)
+        try:
+            while True:
+                resp, raddr = sock.recvfrom(4)
+                if raddr != peer:
+                    continue
+                if len(resp) < 4:
+                    continue
+                opcode, block = struct.unpack("!HH", resp[:4])
+                if opcode == _OP_ACK and block == expect_block:
+                    return True
+                if opcode == _OP_ERROR:
+                    log.warning(
+                        "ERROR from %s:%d (code=%d) waiting for ACK of block %d",
+                        peer[0],
+                        peer[1],
+                        block,
+                        expect_block,
+                    )
+                    return False
+        except socket.timeout:
+            continue
+    return False
+
+
+def _handle_rrq(
+    host_ip: str,
+    root: Path,
+    data: bytes,
+    peer,
+    bpf: "BpfSender | None" = None,
+) -> None:
+    try:
+        _do_rrq(host_ip, root, data, peer, bpf)
+    except Exception:  # noqa: BLE001 - never let a transfer crash the server
+        log.exception("RRQ handler from %s:%d crashed", peer[0], peer[1])
+
+
+def _bind_reply_socket(host_ip: str) -> socket.socket | None:
+    """Create a reply socket bound to host_ip:ephemeral. Retries briefly because
+    the interface IP may be momentarily absent while a link flap is being
+    repaired (bind would otherwise fail with EADDRNOTAVAIL)."""
+    deadline = time.monotonic() + _ARP_RESOLVE_TIMEOUT
+    while True:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.bind((host_ip, 0))
+            return sock
+        except OSError as exc:
+            sock.close()
+            if exc.errno == errno.EADDRNOTAVAIL and time.monotonic() < deadline:
+                time.sleep(0.1)
+                continue
+            log.warning("cannot bind reply socket to %s: %s", host_ip, exc)
+            return None
+
+
+def _do_rrq(
+    host_ip: str,
+    root: Path,
+    data: bytes,
+    peer,
+    bpf: "BpfSender | None" = None,
+) -> None:
+    parsed = _parse_rrq(data)
+    # Bind the reply socket to the specific interface IP (ephemeral port) so
+    # macOS routes the transfer out the correct (secondary) interface.
+    xfer = _bind_reply_socket(host_ip)
+    if xfer is None:
+        return
+    try:
+        if parsed is None:
+            _sendto(xfer, _error_packet(_ERR_ILLEGAL, "malformed request"), peer, bpf)
+            return
+        filename, mode, options = parsed
+        if mode != "octet":
+            _sendto(
+                xfer, _error_packet(_ERR_ILLEGAL, f"unsupported mode {mode}"), peer, bpf
+            )
+            return
+
+        path = _resolve(root, filename)
+        if path is None or not path.is_file():
+            log.info("RRQ %s from %s:%d -> NOT FOUND", filename, peer[0], peer[1])
+            _sendto(xfer, _error_packet(_ERR_NOT_FOUND, "file not found"), peer, bpf)
+            return
+
+        size = path.stat().st_size
+        blksize = _DEFAULT_BLKSIZE
+        oack_opts: dict[str, str] = {}
+        if "blksize" in options:
+            try:
+                req = int(options["blksize"])
+                blksize = max(8, min(req, 65464))
+                oack_opts["blksize"] = str(blksize)
+            except ValueError:
+                pass
+        if "tsize" in options:
+            oack_opts["tsize"] = str(size)
+
+        log.info(
+            "RRQ %s from %s:%d -> serving %d bytes (blksize=%d)",
+            filename,
+            peer[0],
+            peer[1],
+            size,
+            blksize,
+        )
+
+        if oack_opts:
+            payload = struct.pack("!H", _OP_OACK)
+            for k, v in oack_opts.items():
+                payload += k.encode("latin-1") + b"\x00" + v.encode("latin-1") + b"\x00"
+            if not _send_and_wait_ack(xfer, payload, peer, 0, bpf):
+                log.warning("no ACK for OACK from %s:%d", peer[0], peer[1])
+                return
+
+        with path.open("rb") as f:
+            block = 1
+            while True:
+                chunk = f.read(blksize)
+                packet = struct.pack("!HH", _OP_DATA, block & 0xFFFF) + chunk
+                if not _send_and_wait_ack(xfer, packet, peer, block & 0xFFFF, bpf):
+                    log.warning(
+                        "transfer of %s to %s:%d failed at block %d",
+                        filename,
+                        peer[0],
+                        peer[1],
+                        block,
+                    )
+                    return
+                block += 1
+                if len(chunk) < blksize:
+                    break
+        log.info("completed %s to %s:%d", filename, peer[0], peer[1])
+    finally:
+        xfer.close()
+
+
+def serve(
+    host_ip: str, root: str, port: int = 69, interface: str | None = None
+) -> None:
+    root_path = Path(root).resolve()
+
+    bpf: BpfSender | None = None
+    if interface is not None:
+        bpf = BpfSender(interface, host_ip)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    # Wildcard bind on 0.0.0.0: rootless on macOS 14+ for privileged ports.
+    # On Linux, port 69 requires root or CAP_NET_BIND_SERVICE.
+    try:
+        sock.bind(("", port))
+    except PermissionError:
+        log.error(
+            "Cannot bind to port %d (TFTP). On Linux, run paniolo as root or "
+            "grant CAP_NET_BIND_SERVICE.", port
+        )
+        raise
+    log.info(
+        "TFTP listening on 0.0.0.0:%d  reply_src=%s  root=%s  bpf=%s",
+        port,
+        host_ip,
+        root_path,
+        "yes" if (bpf and bpf.available) else "no",
+    )
+
+    while True:
+        try:
+            data, peer = sock.recvfrom(4096)
+        except OSError as exc:
+            log.error("recvfrom: %s", exc)
+            continue
+        if len(data) < 2:
+            continue
+        opcode = struct.unpack("!H", data[:2])[0]
+        if opcode == _OP_RRQ:
+            t = threading.Thread(
+                target=_handle_rrq,
+                args=(host_ip, root_path, data, peer, bpf),
+                daemon=True,
+            )
+            t.start()
+        elif opcode == _OP_WRQ:
+            err_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                err_sock.bind((host_ip, 0))
+                _sendto(err_sock, _error_packet(_ERR_ACCESS, "read-only server"), peer, bpf)
+            except OSError as exc:
+                log.debug("WRQ error reply failed: %s", exc)
+            finally:
+                err_sock.close()
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        stream=sys.stderr,
+    )
+    parser = argparse.ArgumentParser(
+        description="Paniolo minimal read-only TFTP server"
+    )
+    parser.add_argument("host_ip", help="Interface IP to bind reply sockets to")
+    parser.add_argument("root", help="TFTP root directory")
+    parser.add_argument("--port", type=int, default=69)
+    parser.add_argument(
+        "--interface", help="Interface name for BPF raw-frame fallback (e.g. en14)"
+    )
+    args = parser.parse_args()
+    serve(args.host_ip, args.root, args.port, args.interface)
+
+
+if __name__ == "__main__":
+    main()
+````
+
+## File: src/paniolo/_netboot.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from ._config import TargetConfig
+from ._state import (
+    NetbootState,
+    ensure_target_dir,
+    is_netboot_running,
+    is_paniolo_child_alive,
+    is_pid_alive,
+    load_netboot_state,
+    netboot_log_path,
+    netboot_state_path,
+    save_netboot_state,
+)
+
+_BREW_PATHS = [
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+]
+
+# Linux: dnsmasq and other netboot tools commonly live in /usr/sbin or /sbin.
+_LINUX_SBIN_PATHS = ["/usr/sbin", "/sbin"]
+
+_EXCLUDE_PORT_PREFIXES = (
+    "Wi-Fi",
+    "Thunderbolt",
+    "Bluetooth",
+    "FireWire",
+    "iPhone",
+    "iPad",
+)
+_EXCLUDE_DEVICES = {"bridge0", "lo0"}
+
+# Linux interfaces to skip when listing candidates for netboot.
+_LINUX_SKIP_PREFIXES = ("lo", "docker", "veth", "br", "virbr", "vlan", "bond", "dummy")
+
+
+def _find_bin(name: str) -> str:
+    found = shutil.which(name)
+    if found:
+        return found
+    extra = _LINUX_SBIN_PATHS if sys.platform != "darwin" else _BREW_PATHS
+    for d in extra:
+        p = Path(d) / name
+        if p.exists():
+            return str(p)
+    return name
+
+
+def check_deps() -> list[str]:
+    # DHCP and TFTP are both pure-Python (see _dhcp.py, _tftp.py); no external
+    # binaries required.
+    return []
+
+
+def _is_interface_active(device: str) -> bool:
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.check_output(
+                ["ifconfig", device], text=True, stderr=subprocess.DEVNULL
+            )
+            return "status: active" in out
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
+    else:
+        try:
+            carrier = Path(f"/sys/class/net/{device}/carrier").read_text().strip()
+            return carrier == "1"
+        except OSError:
+            return False
+
+
+def _list_linux_ethernet_interfaces() -> list[dict]:
+    """Return Ethernet interfaces on Linux using sysfs.
+
+    Each entry: {"port": str, "device": str, "active": bool}
+    Skips loopback, virtual bridges, Docker, and other non-physical interfaces.
+    """
+    net_dir = Path("/sys/class/net")
+    candidates: list[dict] = []
+    try:
+        entries = sorted(net_dir.iterdir())
+    except OSError:
+        return []
+    for iface_path in entries:
+        name = iface_path.name
+        if any(name.startswith(p) for p in _LINUX_SKIP_PREFIXES):
+            continue
+        # Type 1 = Ethernet (ARPHRD_ETHER).
+        try:
+            if (iface_path / "type").read_text().strip() != "1":
+                continue
+        except OSError:
+            continue
+        active = _is_interface_active(name)
+        candidates.append({"port": name, "device": name, "active": active})
+    return sorted(candidates, key=lambda x: (not x["active"], x["device"]))
+
+
+def list_usb_ethernet_interfaces() -> list[dict]:
+    """Return external (non-built-in) Ethernet interfaces, active ones first.
+
+    Each entry: {"port": str, "device": str, "active": bool}
+    On macOS: queries networksetup and excludes Wi-Fi, Thunderbolt, Bluetooth, etc.
+    On Linux: reads sysfs and excludes loopback and virtual interfaces.
+    """
+    if sys.platform != "darwin":
+        return _list_linux_ethernet_interfaces()
+
+    try:
+        out = subprocess.check_output(
+            ["networksetup", "-listallhardwareports"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []
+
+    candidates: list[dict] = []
+    port: str | None = None
+    for line in out.splitlines():
+        if line.startswith("Hardware Port:"):
+            port = line.split(":", 1)[1].strip()
+        elif line.startswith("Device:") and port is not None:
+            device = line.split(":", 1)[1].strip()
+            if device not in _EXCLUDE_DEVICES and not any(
+                port.startswith(p) for p in _EXCLUDE_PORT_PREFIXES
+            ):
+                candidates.append(
+                    {
+                        "port": port,
+                        "device": device,
+                        "active": _is_interface_active(device),
+                    }
+                )
+            port = None
+
+    return sorted(candidates, key=lambda x: (not x["active"], x["device"]))
+
+
+
+
+def _spawn(cmd: list[str], log_path: Path, append: bool = False) -> subprocess.Popen:
+    if not append:
+        log_path.unlink(missing_ok=True)
+    log_file = open(log_path, "a")
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_file,
+            stderr=log_file,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            env=env,
+        )
+    finally:
+        log_file.close()
+    return proc
+
+
+def _sudo_prefix() -> list[str]:
+    """Return a sudo prefix for privileged subprocesses on Linux.
+
+    On macOS, DHCP/TFTP bind to ports 67/69 without root; no prefix needed.
+    On Linux they require root (or CAP_NET_BIND_SERVICE). If we're already
+    running as root, no prefix needed either.
+
+    Uses 'sudo env PYTHONUNBUFFERED=1' so the env var reaches Python through
+    sudo's environment reset without requiring the SETENV sudoers option.
+    Each exec in the chain (sudo → env → python) keeps the same PID, so the
+    saved PID in the state file still refers to the Python process.
+    """
+    if sys.platform == "darwin" or os.getuid() == 0:
+        return []
+    return ["sudo", "env", "PYTHONUNBUFFERED=1"]
+
+
+def _find_network_service(interface: str) -> str | None:
+    """Return the networksetup service name for a given device (e.g. 'en11' → 'USB 10/100/1000 LAN').
+    macOS only; returns None on Linux."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        out = subprocess.check_output(
+            ["networksetup", "-listallhardwareports"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    service: str | None = None
+    for line in out.splitlines():
+        if line.startswith("Hardware Port:"):
+            service = line.split(":", 1)[1].strip()
+        elif line.startswith("Device:"):
+            if line.split(":", 1)[1].strip() == interface:
+                return service
+    return None
+
+
+def _configure_interface(interface: str, host_ip: str) -> None:
+    if sys.platform == "darwin":
+        service = _find_network_service(interface)
+        if service:
+            subprocess.run(
+                ["sudo", "networksetup", "-setmanual", service, host_ip, "255.255.255.0"],
+                check=False,
+            )
+        result = subprocess.run(
+            ["sudo", "ifconfig", interface, host_ip, "netmask", "255.255.255.0", "up"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"ifconfig {interface} failed: {result.stderr.strip()}\n"
+                "Ensure passwordless sudo is configured (NOPASSWD) for the control machine."
+            )
+    else:
+        # Remove any existing addresses on this interface, then assign ours.
+        subprocess.run(
+            ["sudo", "ip", "addr", "flush", "dev", interface],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        result = subprocess.run(
+            ["sudo", "ip", "addr", "add", f"{host_ip}/24", "dev", interface],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0 and "already assigned" not in result.stderr:
+            raise RuntimeError(
+                f"ip addr add {host_ip}/24 dev {interface} failed: {result.stderr.strip()}\n"
+                "Ensure passwordless sudo is configured (NOPASSWD) for the control machine."
+            )
+        subprocess.run(
+            ["sudo", "ip", "link", "set", interface, "up"],
+            check=False,
+        )
+
+
+def _restore_interface(interface: str) -> None:
+    """Release the static IP and return the interface to OS-managed networking."""
+    if sys.platform == "darwin":
+        service = _find_network_service(interface)
+        if service:
+            subprocess.run(
+                ["sudo", "networksetup", "-setdhcp", service],
+                check=False,
+            )
+    else:
+        # Flush our static address; leave link up. A DHCP client (NetworkManager,
+        # systemd-networkd, dhclient) will re-acquire an address if configured.
+        subprocess.run(
+            ["sudo", "ip", "addr", "flush", "dev", interface],
+            check=False,
+        )
+
+
+def _tune_arp_for_silent_client() -> None:
+    """Tweak OS neighbor-unreachability detection (NUD) for the netboot link.
+
+    The Pi's bootloader sends us DHCP/TFTP but never answers ARP probes. Without
+    tuning, the OS may mark the neighbor unreachable and refuse to send packets.
+
+    macOS (26.x+): zeros arp_llreach_base and host_down_time so NUD never fires.
+    Linux: no tuning needed — ARP entries installed via _dhcp._set_arp persist
+    across link flaps and Linux's NUD does not block sends to permanent entries.
+    """
+    if sys.platform != "darwin":
+        return
+    for key, val in (
+        ("net.link.ether.inet.arp_llreach_base", "0"),
+        ("net.link.ether.inet.host_down_time", "0"),
+    ):
+        subprocess.run(["sudo", "sysctl", "-w", f"{key}={val}"], capture_output=True, text=True)
+
+
+def _cleanup_stale(target: str) -> None:
+    """Kill any lingering pids from a previous crashed netboot session."""
+    state = load_netboot_state(target)
+    if state is None:
+        return
+    for pid, module in (
+        (state.dhcp_pid, "paniolo._dhcp"),
+        (state.tftp_pid, "paniolo._tftp"),
+    ):
+        if is_paniolo_child_alive(pid, module):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+    netboot_state_path(target).unlink(missing_ok=True)
+
+
+def start(cfg: TargetConfig) -> None:
+    if is_netboot_running(cfg.name):
+        raise RuntimeError(f"netboot already running for '{cfg.name}'")
+
+    missing = check_deps()
+    if missing:
+        raise RuntimeError(
+            f"Missing required tools: {', '.join(missing)}\n"
+            "Run: paniolo setup"
+        )
+
+    if not cfg.tftp_root:
+        raise RuntimeError("No tftp_root configured. Run: paniolo target set <name> --tftp-root <path>")
+    tftp_root = Path(cfg.tftp_root)
+    if not tftp_root.exists():
+        raise RuntimeError(f"TFTP root does not exist: {tftp_root}")
+
+    _cleanup_stale(cfg.name)
+    _configure_interface(cfg.interface, cfg.host_ip)
+    _tune_arp_for_silent_client()
+
+    ensure_target_dir(cfg.name)
+    log_path = netboot_log_path(cfg.name)
+    sudo = _sudo_prefix()
+
+    dhcp = _spawn(
+        sudo + [sys.executable, "-m", "paniolo._dhcp", cfg.host_ip, "--interface", cfg.interface],
+        log_path,
+    )
+    # Pure-Python TFTP server. Binds the listen socket on the wildcard so a
+    # non-root process can use port 69 on macOS; on Linux we prepend sudo
+    # (see _sudo_prefix). Each reply socket is bound to cfg.host_ip so the
+    # OS routes transfers out the correct secondary interface (see _tftp.py).
+    tftp = _spawn(
+        sudo + [sys.executable, "-m", "paniolo._tftp", cfg.host_ip, str(tftp_root),
+                "--interface", cfg.interface],
+        log_path,
+        append=True,
+    )
+
+    save_netboot_state(NetbootState(
+        target=cfg.name,
+        dhcp_pid=dhcp.pid,
+        tftp_pid=tftp.pid,
+        started_at=time.time(),
+        interface=cfg.interface,
+        tftp_root=str(tftp_root),
+    ))
+
+
+def stop(target: str) -> None:
+    state = load_netboot_state(target)
+    if state is None:
+        raise RuntimeError(f"No netboot state for '{target}'")
+
+    for pid in (state.dhcp_pid, state.tftp_pid):
+        if is_pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                subprocess.run(["sudo", "kill", "-TERM", str(pid)], check=False)
+
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        if not is_pid_alive(state.dhcp_pid) and not is_pid_alive(state.tftp_pid):
+            break
+        time.sleep(0.1)
+
+    netboot_state_path(target).unlink(missing_ok=True)
+    _restore_interface(state.interface)
+
+
+def get_status(target: str) -> dict:
+    state = load_netboot_state(target)
+    if state is None:
+        return {"running": False, "target": target}
+
+    dhcp_alive = is_pid_alive(state.dhcp_pid)
+    tftp_alive = is_pid_alive(state.tftp_pid)
+
+    return {
+        "running": dhcp_alive and tftp_alive,
+        "target": target,
+        "dhcp_pid": state.dhcp_pid,
+        "dhcp_alive": dhcp_alive,
+        "tftp_pid": state.tftp_pid,
+        "tftp_alive": tftp_alive,
+        "interface": state.interface,
+        "tftp_root": state.tftp_root,
+        "started_at": state.started_at,
+        "uptime_seconds": time.time() - state.started_at if (dhcp_alive and tftp_alive) else None,
+    }
+````
+
 ## File: AGENTS.md
 ````markdown
 <!--
@@ -11853,7 +11774,7 @@ Current capabilities:
   one daemon owns several named interfaces, each with a timestamped rolling capture
   log queryable by line range (`paniolo serial log -i <name>`)
 - Combined video+serial web dashboard (hdmicap's `GET /`: video on top, xterm.js terminal below)
-- On-device OCR of the captured screen via Apple Vision (`paniolo video read`, dashboard OCR button)
+- On-device OCR of the captured screen (`paniolo video read`, dashboard OCR button): Apple Vision on macOS, Tesseract on Linux
 - USB HID input (keyboard/mouse injection) via the KB2040 rig (`paniolo hid`)
 - Power cycling via DTR (J2 wiring) or a configurable shell script (`paniolo serial dtr`, `paniolo power-cycle`)
 
@@ -11894,7 +11815,7 @@ hdmicap/         Rust crate: warm-stream HDMI capture daemon
     capture_thread.rs  std::thread owning device, publishes into watch channel
     frame.rs     FrameState, Signal enum, aHash, is_no_signal
     server.rs    axum HTTP API: GET / (dashboard), /status, /snapshot, /preview,
-                 /ocr, /devices, and /xterm.* static assets
+                 /ocr, /devices, POST /power-cycle, and /xterm.* static assets
     daemon.rs    advisory lock, discovery file, tokio runtime, graceful shutdown
   assets/        index.html (combined dashboard) + vendored xterm.js/css/fit addon
   vendor/
@@ -11960,6 +11881,13 @@ pinned to that interface.
 bottom (default, 40 vh) and right-panel (380 px fixed, video fills remaining
 width) layouts. The choice is persisted in `localStorage` under the key
 `paniolo-serial-layout`.
+
+**Power-cycle button:** an amber "⏻ Power Cycle" button appears in the video
+overlay when hdmicap's `POST /power-cycle` endpoint returns non-501. The endpoint
+delegates to `paniolo power-cycle <target>` using the `PANIOLO_TARGET` env var set
+when the daemon is started with `paniolo video watch <target>`. Clicking the button
+shows a confirmation modal before firing. The button is hidden if no target was
+passed at daemon start, so it is safe to use on shared dashboards.
 
 ## OCR
 
@@ -12253,18 +12181,20 @@ exactly one target is configured, use it; otherwise require an explicit name.
 
 Subcommand groups:
 - `target_app` (`paniolo target`) — `set`, `show`, `clear`
-- `netboot_app` (`paniolo netboot`) — `start`, `stop`, `status`, `tftp-root`, `logs`,
-  `link-up` (assign host IP and bring interface up), `link-down` (release IP),
-  `link-status` (show carrier, operstate, and addresses for the target interface)
-- `video_app` (`paniolo video`) — `setup`, `watch`, `preview`, `shot`, `read` (OCR), `devices`, `show`, `stop`
+- `netboot_app` (`paniolo netboot`) — `start`, `stop`, `status`, `tftp-root`,
+  `logs` (Rich viewer; `--boot` for current session, `--dhcp`/`--tftp`/`--errors`
+  to filter, `--tail N`, `-f` to follow), `link-up`, `link-down`, `link-status`
+- `video_app` (`paniolo video`) — `setup`, `watch [TARGET]` (optional target enables
+  the dashboard power-cycle button via `PANIOLO_TARGET`), `preview`, `shot`,
+  `read` (OCR), `devices`, `show`, `stop`
 - `serial_app` (`paniolo serial`) — `setup` (`--name`), `remove`, `connect` (tio, `-i`),
   `watch`/`stop` (serialcap daemon, all interfaces), `log` (captured output, `-i`),
   `devices`, `show`, `dtr` (`--ms`, `-i` — pulse DTR on any interface), `reset` (`--ms`, `-i`)
 - `hid_app` (`paniolo hid`) — `setup`, `type`, `key`, `releaseall`, `combo`, `down`, `up`, `click`, `mdown`, `mup`, `move`, `scroll`, `run <file>`, `show`
 
 Top-level commands:
-- `paniolo console [-i INTERFACE]` — open the combined video+serial dashboard; checks both
-  daemons are running, then opens the hdmicap URL (with optional `?interface=NAME`) in the browser
+- `paniolo console [TARGET] [-i INTERFACE]` — open the combined video+serial dashboard;
+  starts daemons if needed (using TARGET for power-cycle wiring), opens the hdmicap URL
 - `paniolo power-cycle [TARGET]` — runs `cfg.power_cycle_cmd` via `subprocess.run(..., shell=True)`
 - `paniolo power-state [TARGET]` — reads power state from the serialcap daemon `/status` endpoint (requires sense signal wired)
 - `paniolo setup` — installs tftp-now (Homebrew) and builds/installs paniolo's
@@ -12385,6 +12315,188 @@ Paniolo runs on Linux as well as macOS. Platform differences:
   font to work around this — the font is relied upon by other agents (see OCR section).
   On macOS, `VNRecognizeTextRequest` `.accurate` returns nothing on thin console
   fonts; visionocr uses `.fast`.
+````
+
+## File: src/paniolo/_video.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Video capture helpers — delegates to the hdmicap daemon."""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import tomllib
+from pathlib import Path
+from typing import Optional
+
+from . import _config
+from ._config import _toml_kv
+
+VIDEO_CONFIG_PATH = _config.CONFIG_DIR / "video.toml"
+
+_BUILTIN_NAMES = ("FaceTime", "Capture screen", "iSight", "iPhone", "iPad")
+
+
+@dataclasses.dataclass
+class VideoConfig:
+    """Saved configuration for the HDMI/USB capture device."""
+
+    device: str
+
+
+def _to_toml(data: dict) -> str:
+    lines = [_toml_kv(k, v) for k, v in data.items() if v is not None]
+    return "\n".join(lines) + "\n"
+
+
+def save_video_config(cfg: VideoConfig) -> None:
+    _config.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    VIDEO_CONFIG_PATH.write_text(_to_toml(dataclasses.asdict(cfg)))
+
+
+def load_video_config() -> Optional[VideoConfig]:
+    if not VIDEO_CONFIG_PATH.exists():
+        return None
+    with open(VIDEO_CONFIG_PATH, "rb") as f:
+        data = tomllib.load(f)
+    return VideoConfig(device=data["device"])
+
+
+def hdmicap_binary() -> Optional[str]:
+    """Return the installed hdmicap path: PATH, then ~/.cargo/bin. None if absent.
+
+    Installed by `paniolo setup` (cargo install). Never resolved from the in-repo
+    build tree, so a running daemon can't point at an ephemeral build artifact.
+    """
+    found = shutil.which("hdmicap")
+    if found:
+        return found
+    cargo_bin = Path.home() / ".cargo" / "bin" / "hdmicap"
+    return str(cargo_bin) if cargo_bin.exists() else None
+
+
+_DEVICE_RE = re.compile(r"^\s*(\d+)\s+(.+?)\s+\[([^\]]*)\]")
+
+
+def list_devices() -> list[dict]:
+    """Return [{index, name, misc}, ...] via `hdmicap devices`."""
+    binary = hdmicap_binary()
+    if not binary:
+        return []
+    try:
+        result = subprocess.run(
+            [binary, "devices"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return []
+        devices = []
+        for line in result.stdout.splitlines():
+            m = _DEVICE_RE.match(line)
+            if m:
+                devices.append({"index": int(m.group(1)), "name": m.group(2), "misc": m.group(3)})
+        return devices
+    except FileNotFoundError:
+        return []
+
+
+def guess_capture_device(devices: list[dict]) -> Optional[dict]:
+    """Return the one non-built-in device, or None if ambiguous."""
+    candidates = [d for d in devices if not any(s in d["name"] for s in _BUILTIN_NAMES)]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _discovery_path() -> Path:
+    """Path where hdmicap writes its daemon.json discovery file.
+
+    Mirrors hdmicap/src/daemon.rs::runtime_dir(): prefer $XDG_RUNTIME_DIR
+    (set by systemd on Linux), fall back to tempfile.gettempdir().
+    """
+    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    return Path(base) / "hdmicap" / "daemon.json"
+
+
+def read_discovery() -> Optional[dict]:
+    """Read hdmicap's discovery file, returning {pid, port} or None."""
+    path = _discovery_path()
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def daemon_url() -> Optional[str]:
+    """Return the base URL of the running daemon, or None if not running."""
+    disc = read_discovery()
+    if disc is None:
+        return None
+    try:
+        os.kill(int(disc["pid"]), 0)
+    except (ProcessLookupError, PermissionError, KeyError):
+        return None
+    return f"http://127.0.0.1:{disc['port']}"
+
+
+def start_daemon(
+    cfg: VideoConfig,
+    port: int = 8723,
+    ocr_bin: Optional[str] = None,
+    target_name: Optional[str] = None,
+) -> subprocess.Popen:
+    """Start hdmicap daemon in the background; caller should poll daemon_url().
+
+    ocr_bin is exported as PANIOLO_VISIONOCR for the /ocr endpoint.
+    target_name is exported as PANIOLO_TARGET so the /power-cycle endpoint
+    can call `paniolo power-cycle <target>`.
+    """
+    binary = hdmicap_binary()
+    if not binary:
+        raise FileNotFoundError("hdmicap not found in PATH or project build dir")
+    env = dict(os.environ)
+    if ocr_bin:
+        env["PANIOLO_VISIONOCR"] = ocr_bin
+    if target_name:
+        env["PANIOLO_TARGET"] = target_name
+    return subprocess.Popen(
+        [binary, "daemon", "--device", cfg.device, "--port", str(port)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        env=env,
+    )
+
+
+def stop_daemon() -> bool:
+    """Ask the running hdmicap daemon to stop. Returns True if it was running."""
+    binary = hdmicap_binary()
+    if not binary:
+        return False
+    result = subprocess.run([binary, "stop"], check=False,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return result.returncode == 0
 ````
 
 ## File: src/paniolo/_cli.py
@@ -13049,21 +13161,59 @@ def open_dashboard(
         Optional[str],
         typer.Option("--interface", "-i", help="Serial interface name to preselect"),
     ] = None,
+    video_port: Annotated[int, typer.Option("--video-port")] = 8723,
+    serial_port: Annotated[int, typer.Option("--serial-port")] = 8724,
 ) -> None:
-    """Open the combined video+serial dashboard in the default browser.
-
-    Both daemons must be running:
-      paniolo video watch [target]
-      paniolo serial watch [target]
-    """
+    """Open the combined video+serial dashboard, starting daemons if needed."""
+    # ── video daemon ──────────────────────────────────────────────────────────
     video_url = _video.daemon_url()
     if not video_url:
-        err.print("[red]No video daemon running.[/red] Start it with: paniolo video watch")
-        raise typer.Exit(1)
+        cfg_v = _video.load_video_config()
+        if not cfg_v:
+            err.print("[red]No video device configured.[/red] Run: paniolo video setup")
+            raise typer.Exit(1)
+        binary_v = _video.hdmicap_binary()
+        if not binary_v:
+            err.print("[red]hdmicap not found.[/red] Run: paniolo setup")
+            raise typer.Exit(1)
+        ocr_bin = _ocr.visionocr_binary()
+        _video.start_daemon(cfg_v, video_port, ocr_bin=ocr_bin)
+        console.print("[dim]Starting video daemon…[/dim]")
+        for _ in range(50):
+            time.sleep(0.1)
+            video_url = _video.daemon_url()
+            if video_url:
+                break
+        if not video_url:
+            err.print("[red]Video daemon did not start within 5 s.[/red]")
+            raise typer.Exit(1)
+        console.print(f"[green]Video daemon started.[/green]")
 
+    # ── serial daemon ─────────────────────────────────────────────────────────
     if not _serial.daemon_url():
-        err.print("[red]No serial daemon running.[/red] Start it with: paniolo serial watch")
-        raise typer.Exit(1)
+        cfg_s = _resolve(target)
+        if not cfg_s.serial_interfaces:
+            err.print(
+                f"[red]No serial interfaces configured for '{cfg_s.name}'.[/red] "
+                "Run: paniolo serial setup"
+            )
+            raise typer.Exit(1)
+        if not _serial.serialcap_binary():
+            err.print("[red]serialcap not found.[/red] Run: paniolo setup")
+            raise typer.Exit(1)
+        _serial.start_daemon(cfg_s.serial_interfaces, serial_port)
+        names = ", ".join(i.name for i in cfg_s.serial_interfaces)
+        console.print(f"[dim]Starting serial daemon ({names})…[/dim]")
+        serial_url = None
+        for _ in range(50):
+            time.sleep(0.1)
+            serial_url = _serial.daemon_url()
+            if serial_url:
+                break
+        if not serial_url:
+            err.print("[red]Serial daemon did not start within 5 s.[/red]")
+            raise typer.Exit(1)
+        console.print(f"[green]Serial daemon started.[/green]")
 
     url = video_url if not interface else f"{video_url}?interface={interface}"
 

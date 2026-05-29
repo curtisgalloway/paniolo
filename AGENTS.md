@@ -60,7 +60,7 @@ Current capabilities:
   one daemon owns several named interfaces, each with a timestamped rolling capture
   log queryable by line range (`paniolo serial log -i <name>`)
 - Combined video+serial web dashboard (hdmicap's `GET /`: video on top, xterm.js terminal below)
-- On-device OCR of the captured screen via Apple Vision (`paniolo video read`, dashboard OCR button)
+- On-device OCR of the captured screen (`paniolo video read`, dashboard OCR button): Apple Vision on macOS, Tesseract on Linux
 - USB HID input (keyboard/mouse injection) via the KB2040 rig (`paniolo hid`)
 - Power cycling via DTR (J2 wiring) or a configurable shell script (`paniolo serial dtr`, `paniolo power-cycle`)
 
@@ -101,7 +101,7 @@ hdmicap/         Rust crate: warm-stream HDMI capture daemon
     capture_thread.rs  std::thread owning device, publishes into watch channel
     frame.rs     FrameState, Signal enum, aHash, is_no_signal
     server.rs    axum HTTP API: GET / (dashboard), /status, /snapshot, /preview,
-                 /ocr, /devices, and /xterm.* static assets
+                 /ocr, /devices, POST /power-cycle, and /xterm.* static assets
     daemon.rs    advisory lock, discovery file, tokio runtime, graceful shutdown
   assets/        index.html (combined dashboard) + vendored xterm.js/css/fit addon
   vendor/
@@ -167,6 +167,13 @@ pinned to that interface.
 bottom (default, 40 vh) and right-panel (380 px fixed, video fills remaining
 width) layouts. The choice is persisted in `localStorage` under the key
 `paniolo-serial-layout`.
+
+**Power-cycle button:** an amber "⏻ Power Cycle" button appears in the video
+overlay when hdmicap's `POST /power-cycle` endpoint returns non-501. The endpoint
+delegates to `paniolo power-cycle <target>` using the `PANIOLO_TARGET` env var set
+when the daemon is started with `paniolo video watch <target>`. Clicking the button
+shows a confirmation modal before firing. The button is hidden if no target was
+passed at daemon start, so it is safe to use on shared dashboards.
 
 ## OCR
 
@@ -460,18 +467,20 @@ exactly one target is configured, use it; otherwise require an explicit name.
 
 Subcommand groups:
 - `target_app` (`paniolo target`) — `set`, `show`, `clear`
-- `netboot_app` (`paniolo netboot`) — `start`, `stop`, `status`, `tftp-root`, `logs`,
-  `link-up` (assign host IP and bring interface up), `link-down` (release IP),
-  `link-status` (show carrier, operstate, and addresses for the target interface)
-- `video_app` (`paniolo video`) — `setup`, `watch`, `preview`, `shot`, `read` (OCR), `devices`, `show`, `stop`
+- `netboot_app` (`paniolo netboot`) — `start`, `stop`, `status`, `tftp-root`,
+  `logs` (Rich viewer; `--boot` for current session, `--dhcp`/`--tftp`/`--errors`
+  to filter, `--tail N`, `-f` to follow), `link-up`, `link-down`, `link-status`
+- `video_app` (`paniolo video`) — `setup`, `watch [TARGET]` (optional target enables
+  the dashboard power-cycle button via `PANIOLO_TARGET`), `preview`, `shot`,
+  `read` (OCR), `devices`, `show`, `stop`
 - `serial_app` (`paniolo serial`) — `setup` (`--name`), `remove`, `connect` (tio, `-i`),
   `watch`/`stop` (serialcap daemon, all interfaces), `log` (captured output, `-i`),
   `devices`, `show`, `dtr` (`--ms`, `-i` — pulse DTR on any interface), `reset` (`--ms`, `-i`)
 - `hid_app` (`paniolo hid`) — `setup`, `type`, `key`, `releaseall`, `combo`, `down`, `up`, `click`, `mdown`, `mup`, `move`, `scroll`, `run <file>`, `show`
 
 Top-level commands:
-- `paniolo console [-i INTERFACE]` — open the combined video+serial dashboard; checks both
-  daemons are running, then opens the hdmicap URL (with optional `?interface=NAME`) in the browser
+- `paniolo console [TARGET] [-i INTERFACE]` — open the combined video+serial dashboard;
+  starts daemons if needed (using TARGET for power-cycle wiring), opens the hdmicap URL
 - `paniolo power-cycle [TARGET]` — runs `cfg.power_cycle_cmd` via `subprocess.run(..., shell=True)`
 - `paniolo power-state [TARGET]` — reads power state from the serialcap daemon `/status` endpoint (requires sense signal wired)
 - `paniolo setup` — installs tftp-now (Homebrew) and builds/installs paniolo's
