@@ -53,16 +53,14 @@ fn parse_interface(s: &str) -> Result<InterfaceSpec, String> {
         return Err("interface name is empty".into());
     }
 
-    // Peel off optional :SENSE suffix (must be a known signal name).
+    // Peel off optional :SENSE suffix. Only recognised signal names count;
+    // anything else (including colons embedded in /dev/serial/by-path/… paths)
+    // is treated as part of the device path.
     let (dev_baud, power_sense_signal) = if let Some((prefix, maybe_sense)) = rest.rsplit_once(':')
     {
         match maybe_sense {
             "cts" | "dsr" | "dcd" | "ri" => (prefix, Some(maybe_sense.to_string())),
-            _ => {
-                return Err(format!(
-                    "unknown sense signal '{maybe_sense}'; valid values: cts, dsr, dcd, ri"
-                ))
-            }
+            _ => (rest, None),
         }
     } else {
         (rest, None)

@@ -39,12 +39,37 @@ if TYPE_CHECKING:
 
 
 def list_serial_devices() -> list[str]:
-    """Return available serial device paths on this platform."""
+    """Return available serial device paths on this platform.
+
+    On Linux, returns /dev/serial/by-path/ symlinks when available so the paths
+    are stable across USB re-enumeration. Falls back to raw /dev/ttyUSB* paths.
+    """
     if sys.platform == "darwin":
         paths = glob.glob("/dev/tty.usbserial-*") + glob.glob("/dev/tty.usbmodem*")
-    else:
-        paths = glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")
-    return sorted(paths)
+        return sorted(paths)
+    by_path = sorted(glob.glob("/dev/serial/by-path/*"))
+    if by_path:
+        return by_path
+    return sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
+
+
+def canonical_device_path(device: str) -> str:
+    """Return the stable /dev/serial/by-path symlink for a raw device path.
+
+    If device already contains '/dev/serial/', it is returned unchanged.
+    On macOS, returns device unchanged. Returns device unchanged if no
+    matching by-path symlink is found.
+    """
+    if sys.platform == "darwin" or "/dev/serial/" in device:
+        return device
+    try:
+        target = Path(device).resolve()
+        for link in sorted(Path("/dev/serial/by-path").glob("*")):
+            if link.resolve() == target:
+                return str(link)
+    except OSError:
+        pass
+    return device
 
 
 def tio_binary() -> str | None:

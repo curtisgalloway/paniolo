@@ -283,13 +283,19 @@ Two paths share this module:
   `hdmicap_binary`), `start_daemon(interfaces, port, buffer_lines=None)` spawns
   one daemon owning *all* the target's interfaces (`daemon_cmd()` builds the argv,
   one repeated `--interface NAME=DEVICE@BAUD` per interface via `interface_arg()`),
-  `daemon_url()` reads `$TMPDIR/serialcap/daemon.json` and verifies the PID,
+  `daemon_url()` reads the discovery file (see Runtime paths) and verifies the PID,
   mirroring `_video.py`. Interfaces come from the target's
   `TargetConfig.serial_interfaces`.
 
-`list_serial_devices()` globs `/dev/tty.usb*` (macOS) or `/dev/ttyUSB*` /
-`/dev/ttyACM*` (Linux). serialcap itself enumerates via the cross-platform
-`serialport` crate (`serialcap devices`), which gives richer USB VID/PID info.
+`list_serial_devices()` returns `/dev/serial/by-path/` symlinks on Linux when
+available (stable across USB re-enumeration), falling back to raw `/dev/ttyUSB*`
+/ `/dev/ttyACM*` paths. On macOS it globs `/dev/tty.usb*`. serialcap itself
+enumerates via the cross-platform `serialport` crate (`serialcap devices`), which
+gives richer USB VID/PID info.
+
+`canonical_device_path(device)` upgrades a raw `/dev/ttyUSBX` path to its
+corresponding `/dev/serial/by-path/` symlink when one exists. `serial setup`
+calls this automatically before saving, so the stored config is always stable.
 
 **Captured output (`paniolo serial log`):** `log_cmd()` builds the `serialcap
 log` argv; `_cli.py` resolves the binary and execs it as a passthrough. All the
@@ -440,7 +446,9 @@ exactly one target is configured, use it; otherwise require an explicit name.
 
 Subcommand groups:
 - `target_app` (`paniolo target`) — `set`, `show`, `clear`
-- `netboot_app` (`paniolo netboot`) — `start`, `stop`, `status`, `tftp-root`, `logs`
+- `netboot_app` (`paniolo netboot`) — `start`, `stop`, `status`, `tftp-root`, `logs`,
+  `link-up` (assign host IP and bring interface up), `link-down` (release IP),
+  `link-status` (show carrier, operstate, and addresses for the target interface)
 - `video_app` (`paniolo video`) — `setup`, `watch`, `preview`, `shot`, `read` (OCR), `devices`, `show`, `stop`
 - `serial_app` (`paniolo serial`) — `setup` (`--name`), `remove`, `connect` (tio, `-i`),
   `watch`/`stop` (serialcap daemon, all interfaces), `log` (captured output, `-i`),
@@ -465,12 +473,12 @@ Top-level commands:
 | Netboot daemon state | `~/.local/share/paniolo/<name>/netboot.json` |
 | Generated dnsmasq config | `~/.local/share/paniolo/<name>/dnsmasq.conf` |
 | Combined netboot log | `~/.local/share/paniolo/<name>/netboot.log` |
-| hdmicap discovery file | `$TMPDIR/hdmicap/daemon.json` (`{pid, port}`) |
-| hdmicap advisory lock | `$TMPDIR/hdmicap/daemon.lock` |
-| serialcap discovery file | `$TMPDIR/serialcap/daemon.json` (`{pid, port, interfaces:[{name, device, baud}]}`) |
-| serialcap advisory lock | `$TMPDIR/serialcap/daemon.lock` |
-| serialcap capture log | `$TMPDIR/serialcap/capture/<name>/serial.jsonl(.1..)` (rotated JSONL, per interface) |
-| serialcap pending line | `$TMPDIR/serialcap/capture/<name>/pending.json` (current unterminated line) |
+| hdmicap discovery file | `$XDG_RUNTIME_DIR/hdmicap/daemon.json` (`{pid, port}`) — falls back to `$TMPDIR` |
+| hdmicap advisory lock | `$XDG_RUNTIME_DIR/hdmicap/daemon.lock` |
+| serialcap discovery file | `$XDG_RUNTIME_DIR/serialcap/daemon.json` (`{pid, port, interfaces:[{name, device, baud}]}`) — falls back to `$TMPDIR` |
+| serialcap advisory lock | `$XDG_RUNTIME_DIR/serialcap/daemon.lock` |
+| serialcap capture log | `$XDG_RUNTIME_DIR/serialcap/capture/<name>/serial.jsonl(.1..)` (rotated JSONL, per interface) |
+| serialcap pending line | `$XDG_RUNTIME_DIR/serialcap/capture/<name>/pending.json` (current unterminated line) |
 
 ## Source code constraints
 
@@ -529,6 +537,13 @@ Paniolo runs on Linux as well as macOS. Platform differences:
   `v4l2-sys-mit`). `paniolo setup` prints a reminder.
 - **Interface listing uses sysfs on Linux.** `list_usb_ethernet_interfaces()`
   reads `/sys/class/net/` (type, carrier) instead of `networksetup`.
+- **Serial device paths use by-path symlinks on Linux.** `list_serial_devices()`
+  returns `/dev/serial/by-path/` entries when available; `canonical_device_path()`
+  upgrades a raw `ttyUSBX` path to its stable symlink. Store by-path paths in
+  target configs so serial interfaces survive USB adapter re-enumeration. The
+  serialcap `--interface` parser accepts by-path paths (colons in the path are
+  not confused with the optional `:SENSE` suffix because only known signal names
+  `cts`, `dsr`, `dcd`, `ri` are treated as the sense suffix).
 
 ## Known limitations / gotchas
 
