@@ -3,13 +3,13 @@
 ```
 .github/
   workflows/
-    ci.yml (86 lines)
+    ci.yml (103 lines)
 docs/
   dashboard.md (71 lines)
   hid.md (105 lines)
   netboot.md (129 lines)
-  power.md (118 lines)
-  serial.md (149 lines)
+  power.md (145 lines)
+  serial.md (157 lines)
   video.md (91 lines)
 hdmicap/
   assets/
@@ -18,12 +18,12 @@ hdmicap/
     xterm.css (209 lines)
     xterm.js (2 lines)
   src/
-    capture_thread.rs (131 lines)
-    capture.rs (214 lines)
-    daemon.rs (141 lines)
-    frame.rs (197 lines)
+    capture_thread.rs (212 lines)
+    capture.rs (359 lines)
+    daemon.rs (143 lines)
+    frame.rs (202 lines)
     main.rs (202 lines)
-    server.rs (338 lines)
+    server.rs (360 lines)
   vendor/
     nokhwa-bindings-macos/
       src/
@@ -35,7 +35,7 @@ hdmicap/
       Cargo.toml (64 lines)
       README.md (6 lines)
   .gitignore (1 lines)
-  Cargo.toml (55 lines)
+  Cargo.toml (62 lines)
 hidrig/
   control/
     boot.py (29 lines)
@@ -51,36 +51,36 @@ ocr/
   visionocr.swift (138 lines)
 serialcap/
   src/
-    capture.rs (677 lines)
-    daemon.rs (160 lines)
-    main.rs (196 lines)
-    serial_io.rs (423 lines)
+    capture.rs (683 lines)
+    daemon.rs (162 lines)
+    main.rs (194 lines)
+    serial_io.rs (435 lines)
     server.rs (229 lines)
   .gitignore (1 lines)
   Cargo.toml (45 lines)
 skills/
   paniolo/
-    SKILL.md (154 lines)
+    SKILL.md (163 lines)
 src/
   paniolo/
     __init__.py (13 lines)
-    _cli.py (1188 lines)
-    _config.py (167 lines)
-    _dhcp.py (277 lines)
+    _cli.py (1247 lines)
+    _config.py (168 lines)
+    _dhcp.py (332 lines)
     _hid.py (237 lines)
-    _netboot.py (309 lines)
+    _netboot.py (411 lines)
     _ocr.py (73 lines)
-    _power.py (153 lines)
-    _serial.py (222 lines)
-    _state.py (84 lines)
-    _tftp.py (536 lines)
-    _video.py (166 lines)
+    _power.py (73 lines)
+    _serial.py (252 lines)
+    _state.py (118 lines)
+    _tftp.py (552 lines)
+    _video.py (181 lines)
 tests/
   test_config.py (108 lines)
   test_hid.py (144 lines)
   test_serial.py (73 lines)
 .gitignore (10 lines)
-AGENTS.md (519 lines)
+AGENTS.md (577 lines)
 LICENSE (201 lines)
 pyproject.toml (32 lines)
 README.md (119 lines)

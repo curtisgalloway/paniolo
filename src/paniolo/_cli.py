@@ -293,6 +293,78 @@ def netboot_logs(
     subprocess.run(cmd)
 
 
+def _link_state(interface: str) -> dict:
+    """Read raw link state for an interface from sysfs (Linux) or ifconfig (macOS)."""
+    if sys.platform == "darwin":
+        result = subprocess.run(
+            ["ifconfig", interface], capture_output=True, text=True
+        )
+        output = result.stdout
+        up = "status: active" in output
+        addrs = [
+            line.strip().split()[1]
+            for line in output.splitlines()
+            if line.strip().startswith("inet ")
+        ]
+        return {"up": up, "carrier": up, "addrs": addrs}
+    sysfs = Path(f"/sys/class/net/{interface}")
+    operstate = (sysfs / "operstate").read_text().strip() if (sysfs / "operstate").exists() else "unknown"
+    try:
+        carrier = int((sysfs / "carrier").read_text().strip()) == 1
+    except (OSError, ValueError):
+        carrier = False
+    result = subprocess.run(
+        ["ip", "-brief", "addr", "show", "dev", interface],
+        capture_output=True, text=True,
+    )
+    addrs = result.stdout.split()[2:] if result.returncode == 0 else []
+    return {"up": operstate in ("up", "unknown"), "carrier": carrier, "addrs": addrs, "operstate": operstate}
+
+
+@netboot_app.command("link-up")
+def netboot_link_up(
+    target: Annotated[Optional[str], typer.Argument()] = None,
+) -> None:
+    """Bring the target's USB-Ethernet link up and assign the host IP."""
+    cfg = _resolve(target)
+    try:
+        _netboot._configure_interface(cfg.interface, cfg.host_ip)
+    except RuntimeError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    state = _link_state(cfg.interface)
+    status = "[green]up[/green]" if state["up"] else "[yellow]not yet up[/yellow]"
+    console.print(f"Link {status}  {cfg.interface}  {cfg.host_ip}")
+
+
+@netboot_app.command("link-down")
+def netboot_link_down(
+    target: Annotated[Optional[str], typer.Argument()] = None,
+) -> None:
+    """Take the target's USB-Ethernet link down and release the host IP."""
+    cfg = _resolve(target)
+    _netboot._restore_interface(cfg.interface)
+    console.print(f"Link down  {cfg.interface}")
+
+
+@netboot_app.command("link-status")
+def netboot_link_status(
+    target: Annotated[Optional[str], typer.Argument()] = None,
+) -> None:
+    """Show the current state of the target's USB-Ethernet link."""
+    cfg = _resolve(target)
+    state = _link_state(cfg.interface)
+    t = Table(show_header=False, box=None, padding=(0, 2))
+    t.add_row("interface", cfg.interface)
+    if sys.platform != "darwin":
+        t.add_row("operstate", state.get("operstate", "unknown"))
+    carrier_str = "[green]yes[/green]" if state["carrier"] else "[red]no[/red]"
+    t.add_row("carrier", carrier_str)
+    t.add_row("link", "[green]up[/green]" if state["up"] else "[red]down[/red]")
+    t.add_row("addresses", " ".join(state["addrs"]) if state["addrs"] else "(none)")
+    console.print(t)
+
+
 # ── video ─────────────────────────────────────────────────────────────────────
 
 
@@ -695,6 +767,8 @@ def serial_setup(
                 console.print(f"  {d}")
             err.print("[red]Multiple devices found — specify one with --device.[/red]")
             raise typer.Exit(1)
+
+    device = _serial.canonical_device_path(device)
 
     if power_sense is not None and power_sense.lower() == "none":
         power_sense = None
