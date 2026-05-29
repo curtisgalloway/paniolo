@@ -6,6 +6,10 @@
 > (the how). **Update the Status column as work lands.**
 >
 > Last updated: 2026-05-29 — *analysis/design complete; implementation not started.*
+>
+> **Current focus:** single user (the owner) doing a **Fuchsia port** with an agent — no
+> existing users, breaking changes are free. M1 leads with the Fuchsia-critical path (PTY +
+> power); Adapter B (Fuchsia) is sequenced before Adapter A (LAVA).
 
 ## Status legend
 
@@ -46,7 +50,8 @@ milestone.
 | PWR-2 | `paniolo power off` — cuts power | LAVA | M | ☐ | DTR long-press (≥3s) or PDU script |
 | PWR-3 | `paniolo power reset` — off+delay+on (hard reset) | LAVA | M | ☐ | Reuse `power_cycle_cmd`; fallback off+sleep+on |
 | PWR-4 | `paniolo power state` — read on/off | BOTH | S | ☑* | Exists today via sense signal (`/status`); *verify rename only |
-| PWR-5 | `[power]` config block w/ `backend = script\|dtr\|pdu\|jtag` + on/off/reset cmds | BOTH | M | ☐ | Back-compat: keep `power_cycle_cmd` working |
+| PWR-5 | `[power]` config block w/ `backend = script\|dtr\|pdu\|jtag` + on/off/reset cmds | BOTH | M | ☐ | **Breaking**: replaces flat `power_cycle_cmd` (no alias); update `AGENTS.md` |
+| PWR-7 | Update `AGENTS.md` agent guidance for the new `[power]` config + power verbs | OWNER | M | ☐ | Agent reconfigures targets on redeploy |
 | PWR-6 | Power commands usable as plain shell cmds (string or list) from a generator | LAVA | M | ☐ | LAVA fields accept string OR list (brief discrepancy #3) |
 
 ### Serial (core gap)
@@ -57,7 +62,7 @@ milestone.
 | SER-2 | serialcap exposes a **PTY** whose slave path is a real device file | FX | M | ☐ | Handed to botanist as `DeviceConfig.serial`; botanist opens it |
 | SER-3 | New endpoints **tee off existing supervisor** (JSONL + WebSocket + dashboard unaffected) | OWNER | M | ☐ | Must not regress interactive workflow |
 | SER-4 | `paniolo serial send <bytes\|->` one-shot write (agent feature) | OWNER | M | ☐ | Same `write_tx` channel; `--enter`/`--hex`/stdin |
-| SER-5 | Write arbitration: cooperative last-writer + advisory lock + `--exclusive` | OWNER | M | ☐ | Per D-3; current writer shown in `/status` |
+| SER-5 | Write arbitration: cooperative last-writer + advisory lock + `--exclusive` | OWNER | M | ☐ | Per D-3; current writer shown in `/status`; exclusive lock auto-releases on client disconnect (+ optional `--lock-timeout`) |
 | SER-6 | Stable socket/PTY paths under `$XDG_RUNTIME_DIR/paniolo/<target>/` | BOTH | S | ☐ | Predictable for adapters |
 | SER-7 | Existing JSONL log, `/stream` WS, `tio`, `serial log/dtr/reset` unchanged | OWNER | M | ☐ | Regression guard / tests |
 
@@ -126,10 +131,10 @@ milestone.
 | M3 — Verify on hardware | LAVA-4, FX-3/FX-5, BOOT-1 | ☐ |
 | M4 — Full (deferred) | DEP-3, JTAG-2 | ⤵ |
 
-## G. Open implementation questions (must resolve before/within M1)
+## G. Implementation questions (resolved 2026-05-29)
 
-| ID | Question | Affects |
+| ID | Question | Resolution |
 |---|---|---|
-| SER-Q1 | Native Rust TCP listener vs. external ser2net pointed at the PTY (SER-2)? | SER-1, LAVA-1 |
-| SER-Q2 | Exact write-arbitration UX & lock lifetime (timeout? auto-release?) | SER-5 |
-| PWR-Q1 | `[power]` block final shape + migration of existing `power_cycle_cmd` | PWR-5 |
+| SER-Q1 | Native Rust TCP listener vs. external ser2net pointed at the PTY (SER-2)? | **Native listener** in serialcap; ser2net-on-PTY documented as LAVA fallback |
+| SER-Q2 | Write-arbitration lock lifetime | Exclusive hold is **tied to the client connection — auto-releases on disconnect**; optional `--lock-timeout` safety net |
+| PWR-Q1 | `[power]` block shape + migration of `power_cycle_cmd` | **Breaking change accepted** — clean `[power]` block, drop the flat `power_cycle_cmd`; update agent guidance (`AGENTS.md`) so the agent reconfigures targets accordingly |

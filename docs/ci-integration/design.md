@@ -244,13 +244,33 @@ test orchestrator or result producer.
 6. **First milestone** — *not started yet.* Owner wants to discuss implementation specifics
    (see §8) before any code.
 
-## 8. Open implementation questions to discuss before coding
+## 8. Implementation decisions (resolved 2026-05-29)
 
-- **Native TCP listener vs. ser2net-on-PTY for LAVA.** Since botanist forces us to expose a PTY
-  anyway, pointing stock `ser2net` at that PTY would give LAVA its `telnet host port` for free —
-  possibly removing the need for a Rust-side TCP listener. Trade-off: one external dep on the
-  Debian worker (ser2net, LAVA-blessed) vs. a self-contained `paniolo serial attach --tcp`.
-- **Where the PTY/TCP listeners live.** serialcap (Rust) owns the port, so the new endpoints must
-  be added to the daemon; a Python wrapper can't see the bytes. Confirms a Rust change.
-- **Power backend config shape** (the `[power]` block) and back-compat with `power_cycle_cmd`.
-- **Milestone slicing** of the minimum-viable core into small reviewable commits.
+- **Native TCP listener.** serialcap (Rust) grows a built-in raw bidirectional TCP listener
+  (`serial attach --tcp`); ser2net-on-PTY remains documented as the LAVA-blessed fallback. Keeps
+  paniolo self-contained and gives agents a trivial raw endpoint.
+- **PTY/TCP listeners live in the daemon.** serialcap owns the port, so both endpoints are added
+  to the Rust daemon off the existing read-broadcast / `write_tx` channels — a Python wrapper
+  can't see the bytes.
+- **Serial write lock auto-releases on disconnect.** The `--exclusive` hold is tied to the client
+  connection (drops when the socket closes), with an optional `--lock-timeout` safety net; the
+  current holder is shown in `/status`.
+- **`[power]` block is a breaking change (accepted).** Clean `[power]` block, no `power_cycle_cmd`
+  alias; `AGENTS.md` guidance is updated so the agent reconfigures targets on redeploy.
+
+### Milestone slicing of M1 (smallest reversible steps, each with tests)
+
+**Current focus: the owner is doing a Fuchsia port with an agent**, so M1 leads with the
+Fuchsia-critical path (PTY + power); the LAVA TCP listener follows in the same milestone but
+need not block first hardware bring-up of the Fuchsia target.
+
+1. serialcap: **PTY** proxy (SER-2) + `serial attach --pty` — *Fuchsia `DeviceConfig.serial`.*
+2. `paniolo serial send` (SER-4) — agent write-to-serial, same `write_tx` channel.
+3. `[power]` config block + `power on/off/reset` verbs (PWR-1..6) + `AGENTS.md` update (PWR-7).
+4. Write arbiter: advisory lock, `/status` holder, `--exclusive` + auto-release (SER-5).
+5. serialcap: raw **TCP** listener (SER-1) + `serial attach --tcp` — *LAVA; can trail.*
+6. netboot CI stand-down guard (DEP-1); `[jtag]`/`debug` verb stubs (JTAG-1).
+
+Then Adapter B first (FX-1 device-config emitter, FX-2 power wrapper, FX-4 verify against a real
+Fuchsia checkout), since that's the active use case; Adapter A (LAVA) after.
+Regression guard throughout: JSONL, `/stream`, `tio`, dashboard, `serial log/dtr/reset` (SER-7, NF-1).
