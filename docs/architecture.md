@@ -196,7 +196,10 @@ and the macOS-only bits (Vision OCR, BPF, `tftp-now`) are irrelevant there.
 
 ## 10. Where this is going
 
-The active line of work is making paniolo's primitives consumable by hardware-CI orchestrators
+Paniolo is **already in day-to-day use** — driving an agent through real low-level hardware
+bring-up, where the agent iterates on bootloader/firmware/OS code and uses paniolo to deploy,
+boot, observe, and power-cycle the target without a human at the bench each cycle. The active
+line of work builds on that: making paniolo's primitives consumable by hardware-CI orchestrators
 (KernelCI/LAVA, Fuchsia/botanist) — a stable, ecosystem-agnostic device-control API (discrete
 power verbs, raw serial passthrough as a TCP socket + PTY, agent write-to-serial, a JTAG
 extension point) plus thin adapters. That design and its rationale are in
