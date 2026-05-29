@@ -27,6 +27,9 @@ Run through this checklist before calling `gh pr create`:
 
 1. **Update docs that the PR affects.** For each changed subsystem, check:
    - `docs/<subsystem>.md` — commands, config fields, workflows
+   - `docs/architecture.md` — whole-system design, data flows, runtime paths (if structure changed)
+   - `docs/README.md` — the docs index (if a doc was added/removed)
+   - `docs/requirements.md` — the requirements tracker status (if scope/progress changed)
    - `README.md` — capabilities table, installation steps
    - `AGENTS.md` — module layout, command descriptions, architecture notes
    Include doc updates in the same PR, not a follow-up.
@@ -85,7 +88,10 @@ src/paniolo/
                             top-level commands: console, power-cycle, power-state, setup
   _config.py    TargetConfig CRUD (+ named SerialInterface list) (~/.config/paniolo/targets/<name>.toml)
   _state.py     daemon state files (~/.local/share/paniolo/<target>/)
-  _netboot.py   dnsmasq + tftp-now subprocess management
+  _netboot.py   pure-Python DHCP + TFTP subprocess management (_dhcp.py, _tftp.py)
+  _dhcp.py      pure-Python DHCP server (run as `python -m paniolo._dhcp`)
+  _tftp.py      pure-Python read-only TFTP server (run as `python -m paniolo._tftp`);
+                macOS BPF raw-frame sender for Sequoia routing
   _video.py     VideoConfig, hdmicap device discovery, daemon start/stop/URL helpers
   _serial.py    serial helpers: tio (interactive) + serialcap daemon start/stop/URL
   _ocr.py       OCR tool discovery + read_text(): visionocr (macOS) or linuxocr (Linux)
@@ -237,9 +243,11 @@ Config files live at `~/.config/paniolo/targets/<name>.toml`.
 
 Runtime state for each subsystem daemon. Currently only netboot.
 
-`NetbootState` is a `@dataclass`: `target`, `dnsmasq_pid`, `tftp_pid`,
+`NetbootState` is a `@dataclass`: `target`, `dhcp_pid`, `tftp_pid`,
 `started_at` (float epoch), `interface`, `tftp_root`. Stored as JSON at
-`~/.local/share/paniolo/<name>/netboot.json`.
+`~/.local/share/paniolo/<name>/netboot.json`. `is_netboot_running()` confirms
+both children are alive *and* their cmdlines contain `paniolo._dhcp` /
+`paniolo._tftp` (guards against reused stale PIDs).
 
 `is_pid_alive(pid)` uses `os.kill(pid, 0)`: returns `True` if the process
 exists; catches `ProcessLookupError` (dead) and `PermissionError` (exists but
@@ -247,28 +255,28 @@ owned by another user — treat as alive).
 
 ## _netboot.py
 
-Manages dnsmasq and tftp-now as backgrounded subprocesses.
+Manages paniolo's **pure-Python** DHCP and TFTP servers (`_dhcp.py`, `_tftp.py`)
+as backgrounded subprocesses. No external daemons (`dnsmasq`/`tftp-now`) are
+used at runtime — `check_deps()` returns `[]`.
 
 **`_find_bin(name)`** searches `PATH` via `shutil.which`, then falls back to
-`_BREW_PATHS = ["/opt/homebrew/bin", "/usr/local/bin"]`. This is needed
-because SSH non-interactive shells often lack Homebrew in PATH even when the
-user's interactive shell has it.
+`_BREW_PATHS` on macOS / `_LINUX_SBIN_PATHS` (`/usr/sbin`, `/sbin`) on Linux.
+This is needed because SSH non-interactive shells often lack those dirs in PATH.
 
-**`_dnsmasq_conf(cfg, tftp_root)`** generates the dnsmasq config string.
-Key choices:
-- `bind-interfaces` is intentionally absent — dnsmasq binds `0.0.0.0:67`,
-  which works without root on macOS 10.14+.
-- `dhcp-boot=kernel_2712.img,,{host_ip}` sets `siaddr` (BOOTP next-server).
-- `dhcp-option=66,{host_ip}` sets DHCP option 66 (TFTP server name). The
-  RPi 5 EEPROM reads option 66 preferentially over `siaddr` — set both.
-- `log-facility=-` redirects dnsmasq syslog output to stderr → log file.
-- `port=0` disables DNS.
+**`_sudo_prefix()`** is empty on macOS (ports 67/69 bind rootless on 10.14+) and
+`["sudo", "env", "PYTHONUNBUFFERED=1"]` on Linux (privileged ports need root).
 
-**`start(cfg)`** flow: guard → check deps → validate tftp_root →
-configure interface (sudo ifconfig) → write dnsmasq config → spawn dnsmasq
-→ spawn tftp-now → save state.
+**`start(cfg)`** flow: guard (`is_netboot_running`) → `check_deps` (no-op) →
+validate `tftp_root` → clean up stale pids → configure interface (`ifconfig`
+on macOS / `ip addr` on Linux) → tune ARP for the silent client → spawn
+`python -m paniolo._dhcp <host_ip> --interface <iface>` and
+`python -m paniolo._tftp <host_ip> <tftp_root> --interface <iface>` (with the
+sudo prefix on Linux), logging both to `netboot.log` → save state. The DHCP
+server sets both `siaddr` and DHCP option 66 to `host_ip`; the RPi 5 EEPROM
+prefers option 66 but both are set for older firmware.
 
-**`stop(target)`** sends SIGTERM to both PIDs, waits up to 3 s, removes state.
+**`stop(target)`** sends SIGTERM to both PIDs (escalating to `sudo kill` on
+PermissionError), waits up to 3 s, then restores the interface and removes state.
 
 ## _video.py
 
@@ -494,7 +502,6 @@ Top-level commands:
 | Target configs | `~/.config/paniolo/targets/<name>.toml` |
 | Video config | `~/.config/paniolo/video.toml` |
 | Netboot daemon state | `~/.local/share/paniolo/<name>/netboot.json` |
-| Generated dnsmasq config | `~/.local/share/paniolo/<name>/dnsmasq.conf` |
 | Combined netboot log | `~/.local/share/paniolo/<name>/netboot.log` |
 | hdmicap discovery file | `$XDG_RUNTIME_DIR/hdmicap/daemon.json` (`{pid, port}`) — falls back to `$TMPDIR` |
 | hdmicap advisory lock | `$XDG_RUNTIME_DIR/hdmicap/daemon.lock` |

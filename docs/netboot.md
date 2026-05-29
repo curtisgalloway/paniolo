@@ -43,7 +43,7 @@ Target config fields:
 | `--interface` | (required) | USB-Ethernet interface name (e.g. `en3`) |
 | `--host-ip` | `192.168.99.1` | Static IP assigned to the interface; also the TFTP server address |
 | `--tftp-root` | (none) | Directory whose contents are served over TFTP |
-| `--ha-power-entity` | (none) | Home Assistant switch entity for power cycling |
+| `--power-cycle-cmd` | (none) | Shell command run by `paniolo power-cycle` |
 | `--power-serial` | (none) | Serial interface name used for DTR power control |
 
 ---
@@ -55,15 +55,18 @@ paniolo netboot start [target-machine]
 paniolo netboot stop  [target-machine]
 ```
 
-`start` assigns a static IP to the interface (`sudo ifconfig`), writes a
-dnsmasq config, and launches dnsmasq + tftp-now as background daemons.
-`stop` sends SIGTERM to both and clears the state file.
+`start` assigns the static `host_ip` to the interface, then launches paniolo's
+own **pure-Python DHCP and TFTP servers** as background subprocesses
+(`python -m paniolo._dhcp` and `python -m paniolo._tftp`). No external daemons
+(`dnsmasq`, `tftp-now`) are required at runtime. `stop` sends SIGTERM to both
+and clears the state file.
 
-**No root for ports 67/69:** macOS 10.14+ allows binding to `0.0.0.0` on
-privileged ports without root. paniolo binds to `0.0.0.0` and uses dnsmasq's
-`--interface` flag for filtering. The only step requiring sudo is `ifconfig`
-to assign the static IP — configure NOPASSWD sudo on the control Mac for
-unattended agent use.
+**Privileged ports (67/69):** macOS 10.14+ allows binding `0.0.0.0` on
+privileged ports without root, so on macOS the only step needing sudo is
+assigning the static IP. On **Linux**, ports 67/69 require root, so `start`
+auto-prepends `sudo` when spawning the two servers, and interface configuration
+(`ip addr add`) uses sudo as well. Configure **NOPASSWD sudo** on the control
+host for unattended agent use.
 
 ---
 
@@ -71,7 +74,7 @@ unattended agent use.
 
 ```bash
 paniolo netboot status [target-machine]      # running? interface? uptime?
-paniolo netboot logs   [target-machine]      # tail the combined dnsmasq + tftp log
+paniolo netboot logs   [target-machine]      # tail the combined DHCP + TFTP log
 paniolo netboot logs -f [target-machine]     # follow
 ```
 
@@ -109,14 +112,14 @@ and `kernel_2712.img`.
 
 ---
 
-## dnsmasq configuration notes
+## DHCP / TFTP behavior notes
 
-paniolo sets both `siaddr` (BOOTP next-server, via `dhcp-boot`) and DHCP
-option 66 (TFTP server name). The Pi 5 EEPROM reads option 66 preferentially,
-but setting both ensures compatibility with older EEPROM firmware.
-
-DNS is disabled (`port=0`). dnsmasq log output is redirected to the combined
-log file at `~/.local/share/paniolo/<name>/netboot.log`.
+The DHCP server hands the target a fixed lease and sets **both** `siaddr` (the
+BOOTP next-server) and **DHCP option 66** (TFTP server name) to `host_ip`. The
+Pi 5 EEPROM reads option 66 preferentially, but setting both ensures
+compatibility with older EEPROM firmware. The TFTP server is **read-only**
+(RFC 1350) and negotiates `blksize`/`tsize` options. Both servers log to the
+combined log at `~/.local/share/paniolo/<name>/netboot.log`.
 
 ---
 
@@ -124,6 +127,5 @@ log file at `~/.local/share/paniolo/<name>/netboot.log`.
 
 | Purpose | Path |
 |---|---|
-| Generated dnsmasq config | `~/.local/share/paniolo/<name>/dnsmasq.conf` |
-| Daemon state (PIDs, uptime) | `~/.local/share/paniolo/<name>/netboot.json` |
+| Daemon state (DHCP/TFTP PIDs, uptime) | `~/.local/share/paniolo/<name>/netboot.json` |
 | Combined log | `~/.local/share/paniolo/<name>/netboot.log` |
