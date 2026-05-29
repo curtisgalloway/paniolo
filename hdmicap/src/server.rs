@@ -24,7 +24,7 @@ use axum::{
     extract::{Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use bytes::Bytes;
@@ -50,6 +50,7 @@ pub fn router(state: AppState) -> Router {
         .route("/snapshot", get(snapshot))
         .route("/preview", get(preview))
         .route("/ocr", get(ocr))
+        .route("/power-cycle", post(power_cycle))
         .route("/devices", get(devices))
         // Vendored xterm.js assets for the serial terminal pane.
         .route("/xterm.js", get(xterm_js))
@@ -330,6 +331,40 @@ async fn ocr(State(s): State<AppState>) -> Response {
         )
             .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("visionocr wait: {e}")).into_response(),
+    }
+}
+
+/// Trigger a power cycle by calling `paniolo power-cycle <target>`.
+/// Requires PANIOLO_TARGET to be set in the daemon's environment (done by
+/// `paniolo video watch <target>`). Returns 501 if not configured.
+async fn power_cycle() -> Response {
+    let target = match std::env::var("PANIOLO_TARGET") {
+        Ok(t) if !t.is_empty() => t,
+        _ => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                "PANIOLO_TARGET not set — start the daemon with: paniolo video watch <target>",
+            )
+                .into_response()
+        }
+    };
+    let paniolo = std::env::var("PANIOLO_BIN").unwrap_or_else(|_| "paniolo".to_string());
+    match tokio::process::Command::new(&paniolo)
+        .args(["power-cycle", &target])
+        .status()
+        .await
+    {
+        Ok(s) if s.success() => (StatusCode::OK, "power cycle triggered").into_response(),
+        Ok(s) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("paniolo power-cycle exited with {s}"),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to run {paniolo}: {e}"),
+        )
+            .into_response(),
     }
 }
 

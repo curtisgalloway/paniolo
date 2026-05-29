@@ -88,7 +88,7 @@ src/paniolo/
   _netboot.py   dnsmasq + tftp-now subprocess management
   _video.py     VideoConfig, hdmicap device discovery, daemon start/stop/URL helpers
   _serial.py    serial helpers: tio (interactive) + serialcap daemon start/stop/URL
-  _ocr.py       visionocr tool discovery (builds it if needed) + read_text()
+  _ocr.py       OCR tool discovery + read_text(): visionocr (macOS) or linuxocr (Linux)
   _hid.py       HID rig client: text commands over serial, scaling + sequencing
   _power.py     DTR button-press helpers: dtr_button_press() (via serialcap daemon), dtr_direct_button_press() (pyserial fallback)
 
@@ -128,8 +128,9 @@ serialcap/       Rust crate: serial console daemon (parallels hdmicap)
     daemon.rs    advisory lock, discovery file, tokio runtime, graceful shutdown;
                  spawns one supervisor per interface
 
-ocr/             visionocr.swift: tiny Apple Vision OCR helper (compiled binary
-                 is gitignored; built on demand by _ocr.py via swiftc)
+ocr/             OCR helpers (compiled/installed binaries are gitignored):
+                   visionocr.swift  Apple Vision OCR (macOS); built by paniolo setup via swiftc
+                   linuxocr         Tesseract OCR wrapper (Linux); copied by paniolo setup
 
 hidrig/          CircuitPython firmware for the USB HID injection rig
   target/code.py   I2C target -> USB HID (KB2040 plugged into the Pi)
@@ -167,29 +168,42 @@ bottom (default, 40 vh) and right-panel (380 px fixed, video fills remaining
 width) layouts. The choice is persisted in `localStorage` under the key
 `paniolo-serial-layout`.
 
-## OCR (Apple Vision)
+## OCR
 
-`ocr/visionocr.swift` is a one-file helper using `VNRecognizeTextRequest`:
-on-device, no network, no model download. Reads a PNG on stdin (or a path),
-prints recognized text in reading order, or `--json` with bounding boxes.
-`paniolo setup` compiles it (`swiftc`) into `~/.cargo/bin`; `_ocr.visionocr_binary()`
-resolves it from PATH then `~/.cargo/bin` (never the build tree).
-
-Two entry points, both feeding it the same warm frame:
+Two entry points, both feeding the same warm frame:
 - **`paniolo video read`** — fetches a snapshot (via `hdmicap shot`) and OCRs it.
 - **Dashboard button + hdmicap `GET /ocr`** — the daemon PNG-encodes the current
-  frame and pipes it to `visionocr` (`tokio::process`), returning the text. The
+  frame and pipes it to the OCR tool (`tokio::process`), returning the text. The
   daemon finds the tool via `PANIOLO_VISIONOCR` (the installed path, set by
   `paniolo video watch`), falling back to PATH; if absent, `/ocr` returns 501 and
   the button shows an error.
 
-Tuning that matters for **small console text** (learned the hard way — see gotchas):
+`_ocr.ocr_binary()` returns the platform-appropriate tool; `paniolo setup`
+installs it. `PANIOLO_VISIONOCR` is set to the resolved path when the daemon
+starts, so the daemon always uses the installed binary (never a stale PATH hit).
+
+**macOS — `ocr/visionocr.swift`** (`VNRecognizeTextRequest`, Apple Vision):
+on-device, no network, no model download. `paniolo setup` compiles it (`swiftc`)
+into `~/.cargo/bin`.
+
+Tuning that matters for small console text:
 - `recognitionLevel = .fast` is the default, not `.accurate`. `.accurate` is
   tuned for natural document text and returns *nothing* on thin console fonts.
 - The tool 2×-upscales and black-pads the frame before recognition (fixes colon
   misreads and first-character clipping at the frame edge).
 - `minimumTextHeight` is lowered (it's a fraction of image height; the default
   1/32 skips ~16px console text).
+
+**Linux — `ocr/linuxocr`** (Tesseract via `tesseract-ocr` system package):
+`paniolo setup` copies the script to `~/.cargo/bin/linuxocr`. Requires
+`sudo apt-get install tesseract-ocr`; Pillow (`pip install Pillow`) is optional
+but enables the same 2×-upscale + black-pad preprocessing as visionocr.
+
+**Do not change the target's console font** to try to improve OCR accuracy —
+the font is relied upon by other agents (e.g. the Fuchsia bring-up agent that
+reads kernel/bootloader output). Character confusions on thin console fonts
+(`1`↔`l`↔`I`, IPv6 colons, etc.) are better addressed by increasing capture
+resolution or adjusting Tesseract's `--psm` mode.
 
 ## _config.py
 
@@ -461,8 +475,8 @@ Top-level commands:
 - `paniolo power-cycle [TARGET]` — runs `cfg.power_cycle_cmd` via `subprocess.run(..., shell=True)`
 - `paniolo power-state [TARGET]` — reads power state from the serialcap daemon `/status` endpoint (requires sense signal wired)
 - `paniolo setup` — installs tftp-now (Homebrew) and builds/installs paniolo's
-  own binaries: hdmicap + serialcap (`cargo install`) and visionocr (`swiftc`),
-  all into `~/.cargo/bin`
+  own binaries: hdmicap + serialcap (`cargo install`), visionocr (`swiftc`,
+  macOS only), and linuxocr (copied script, Linux only) — all into `~/.cargo/bin`
 
 ## Runtime paths
 
@@ -515,9 +529,10 @@ ssh control-mac "paniolo netboot stop target-machine"
 
 Paniolo runs on Linux as well as macOS. Platform differences:
 
-- **OCR is macOS-only.** `paniolo video read` and the dashboard OCR button
-  require Apple Vision (`visionocr.swift`, compiled by `paniolo setup` on macOS).
-  On Linux they return an error; the rest of the video pipeline works.
+- **OCR backend is platform-specific.** macOS uses Apple Vision (`visionocr.swift`,
+  compiled by `paniolo setup`). Linux uses Tesseract (`ocr/linuxocr`, copied by
+  `paniolo setup`; requires `tesseract-ocr` system package). Both expose the same
+  stdin-PNG → stdout-text interface via `PANIOLO_VISIONOCR`.
 - **Netboot uses `sudo` internally on Linux.** DHCP (port 67) and TFTP (port 69)
   require root on Linux; macOS 14+ allows them rootless. `paniolo netboot start`
   auto-prepends `sudo env PYTHONUNBUFFERED=1 <python>` when spawning the two
@@ -570,8 +585,10 @@ Paniolo runs on Linux as well as macOS. Platform differences:
   `IOSSIOSPEED` ioctl, which returns ENOTTY ("Not a typewriter") on pseudo-
   terminals. serialcap byte-flow can only be tested against a real serial device,
   not a `pty.openpty()` pair.
-- **Vision `.accurate` misses small console text.** `VNRecognizeTextRequest`'s
-  `.accurate` level returns nothing on thin terminal fonts (it's tuned for
-  natural document text); `.fast` reads them. visionocr defaults to `.fast` and
-  2×-upscales + pads. Even so, small thin fonts produce character confusions
-  (`1`↔`l`↔`I`, `2`↔`Z`); accuracy improves markedly on larger boot-screen text.
+- **OCR character confusions on small console fonts.** Both visionocr and linuxocr
+  2×-upscale and black-pad before recognition, but thin terminal fonts still
+  produce confusions (`1`↔`l`↔`I`, `2`↔`Z`, colon spacing in IPv6). Accuracy
+  improves markedly on larger boot-screen text. Do not change the target's console
+  font to work around this — the font is relied upon by other agents (see OCR section).
+  On macOS, `VNRecognizeTextRequest` `.accurate` returns nothing on thin console
+  fonts; visionocr uses `.fast`.

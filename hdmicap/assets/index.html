@@ -32,10 +32,30 @@
     .pane-name { color: #888; }
     .pane-status { color: #fa0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .pane-term { flex: 1 1 0; min-height: 0; padding: 4px 6px; }
-    #ocrbtn { position: absolute; top: 8px; left: 12px; z-index: 3; cursor: pointer;
-              font: 12px ui-monospace, monospace; color: #cdf; padding: 4px 10px;
-              background: rgba(0,0,0,.6); border: 1px solid #46c; border-radius: 4px; }
+    #videobtns { position: absolute; top: 8px; left: 12px; z-index: 3;
+                 display: flex; gap: 6px; }
+    #ocrbtn, #pwrbtn { cursor: pointer; font: 12px ui-monospace, monospace;
+                       padding: 4px 10px; border-radius: 4px; }
+    #ocrbtn { color: #cdf; background: rgba(0,0,0,.6); border: 1px solid #46c; }
     #ocrbtn:hover { background: rgba(40,80,160,.7); }
+    #pwrbtn { color: #fca; background: rgba(0,0,0,.6); border: 1px solid #840;
+              display: none; }
+    #pwrbtn:hover { background: rgba(80,30,0,.7); }
+    #pwrmodal { position: absolute; inset: 0; z-index: 10; display: none;
+                align-items: center; justify-content: center;
+                background: rgba(0,0,0,.7); }
+    #pwrmodal.show { display: flex; }
+    #pwrbox { background: #111; border: 1px solid #840; border-radius: 8px;
+              padding: 20px 24px; display: flex; flex-direction: column; gap: 14px;
+              color: #ddd; font: 13px ui-monospace, monospace; max-width: 300px; }
+    #pwrbox p { color: #fca; }
+    #pwrbtns { display: flex; gap: 10px; justify-content: flex-end; }
+    #pwrcancel { cursor: pointer; background: none; border: 1px solid #555;
+                 border-radius: 4px; color: #aaa; padding: 4px 14px; font: inherit; }
+    #pwrcancel:hover { border-color: #888; color: #ddd; }
+    #pwrconfirm { cursor: pointer; background: rgba(80,30,0,.8); border: 1px solid #a60;
+                  border-radius: 4px; color: #fca; padding: 4px 14px; font: inherit; }
+    #pwrconfirm:hover { background: rgba(120,50,0,.9); }
     #ocrpanel { position: absolute; inset: 8px 8px auto 8px; max-height: 70%; z-index: 4;
                 display: none; flex-direction: column; background: rgba(0,0,0,.92);
                 border: 1px solid #46c; border-radius: 6px; }
@@ -59,11 +79,23 @@
 <body>
   <div id="video">
     <img id="feed" src="/preview" alt="HDMI capture feed">
-    <button id="ocrbtn">⌕ OCR</button>
+    <div id="videobtns">
+      <button id="ocrbtn">⌕ OCR</button>
+      <button id="pwrbtn">⏻ Power Cycle</button>
+    </div>
     <div id="vstatus">connecting…</div>
     <div id="ocrpanel">
       <div id="ocrhead"><span id="ocrtitle">OCR</span><span id="ocrclose">×</span></div>
       <pre id="ocrtext"></pre>
+    </div>
+    <div id="pwrmodal">
+      <div id="pwrbox">
+        <p>Power cycle the target?</p>
+        <div id="pwrbtns">
+          <button id="pwrcancel">Cancel</button>
+          <button id="pwrconfirm">Power Cycle</button>
+        </div>
+      </div>
     </div>
   </div>
   <div id="sidebar">
@@ -125,6 +157,27 @@
           ocrText.textContent = ok ? (t.trim() || '(no text detected)') : t;
         })
         .catch(e => { ocrTitle.textContent = 'OCR — error'; ocrText.textContent = String(e); });
+    };
+
+    // ── Power Cycle button — only shown when /power-cycle is available ──
+    const pwrBtn = document.getElementById('pwrbtn');
+    const pwrModal = document.getElementById('pwrmodal');
+    fetch('/power-cycle', { method: 'POST' })
+      .then(r => { if (r.status !== 501) pwrBtn.style.display = ''; })
+      .catch(() => {});
+    pwrBtn.onclick = () => pwrModal.classList.add('show');
+    document.getElementById('pwrcancel').onclick = () => pwrModal.classList.remove('show');
+    document.getElementById('pwrconfirm').onclick = () => {
+      pwrModal.classList.remove('show');
+      pwrBtn.textContent = '⏻ cycling…';
+      pwrBtn.disabled = true;
+      fetch('/power-cycle', { method: 'POST' })
+        .then(r => r.text().then(t => {
+          pwrBtn.textContent = r.ok ? '⏻ Power Cycle' : '⏻ Error';
+          if (!r.ok) console.error('power-cycle:', t);
+        }))
+        .catch(e => { pwrBtn.textContent = '⏻ Error'; console.error(e); })
+        .finally(() => { pwrBtn.disabled = false; });
     };
 
     // ── serial: xterm.js panes fed by serialcap WebSocket (cross-port) ──
