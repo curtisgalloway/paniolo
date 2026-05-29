@@ -1,0 +1,51 @@
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "netbootd"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Single-client netboot daemon — DHCP + read-only TFTP in one process (PoC, no BPF path yet)"
+
+[[bin]]
+name = "netbootd"
+path = "src/main.rs"
+
+[dependencies]
+# --- Async runtime -------------------------------------------------------
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util", "fs"] }
+
+# --- Socket options (SO_REUSEADDR, interface-pinned reply sockets) -------
+socket2 = "0.5"
+
+# --- Raw L2 frame injection (macOS /dev/bpf) + low-level socket FFI -------
+# pnet_datalink's macOS backend already does BIOCSETIF + BIOCSHDRCMPLT(1) +
+# full-frame write preserving the caller's source MAC — the exact recipe the
+# Python BpfSender hand-codes. Used only on macOS at runtime; compiled on all
+# platforms so the call sites stay type-checked.
+pnet_datalink = "0.35"
+libc = "0.2"
+
+# --- CLI -----------------------------------------------------------------
+clap = { version = "4", features = ["derive"] }
+
+# --- Errors / logging ----------------------------------------------------
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
