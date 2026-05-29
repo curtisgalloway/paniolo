@@ -1,0 +1,244 @@
+# Paniolo hardware-CI integration — Design
+
+> Companion to `gap-analysis.md`. Defines one ecosystem-agnostic **paniolo device-control
+> API**, then two thin **adapters** (LAVA, Fuchsia/botanist) that consume it. Includes a
+> **minimum-viable** path and a **full** path, the exact CLI/socket surface each adapter
+> touches, and a blunt **verdict** per ecosystem.
+>
+> Guiding constraints (owner-set): (1) the interactive, agent-driven bringup workflow
+> (dashboard, OCR, HID, `tio`, JSONL) must not regress — CI is **additive**; (2) the owner
+> *wants* agent write-to-serial and a future JTAG backend anyway, so the agnostic API is
+> designed for those, not just CI; (3) paniolo is the owner's project and may be refactored
+> freely, so we choose the *right* shape over the timid one where they differ.
+
+External contracts cited inline are verified May 2026; see `gap-analysis.md` §0 for the two
+points where the verified source overrides the original brief.
+
+---
+
+## 1. Design principle: verbs backed by per-target backends
+
+Both ecosystems, the agent workflow, and future JTAG need the **same primitives in different
+shapes**. So model paniolo's device control as **stable verbs** whose implementation is a
+**selectable per-target backend**, and **expose every live primitive as both a discrete CLI
+verb and a machine-drivable socket** off the daemon that already owns that hardware.
+
+```
+                         ┌───────────────────────── paniolo device-control API ─────────────────────────┐
+   agent / CLI ───────►  │  power {on|off|reset|state}   serial {send|attach|log|...}   deploy   debug   │
+   LAVA adapter ──────►  │        │                            │                           │       │      │
+   botanist adapter ──►  │   power backend                serialcap (owns UART)        netboot   jtag    │
+                         │   {script|dtr|pdu|jtag}        ├─ JSONL log (tee)            (stands   backend │
+                         │                                ├─ WebSocket /stream (exists) down in   {openocd}│
+                         │                                ├─ raw TCP listener  (NEW)    CI)               │
+                         │                                ├─ PTY device path   (NEW)                      │
+                         │                                └─ write arbiter (tio|sock|send)                │
+                         └──────────────────────────────────────────────────────────────────────────────┘
+```
+
+The serial daemon is **already** a fan-out supervisor (read → broadcast + JSONL tee; write via
+`write_tx`). We add two *raw* egress shapes and a write arbiter — siblings to the existing
+WebSocket/JSONL, not replacements. That keeps the interactive workflow intact by construction.
+
+---
+
+## 2. The agnostic device-control API (target contract)
+
+### 2.1 Power
+
+New discrete verbs (over existing mechanisms; backend selected per target):
+
+| Verb | Semantics | Backend mapping |
+|---|---|---|
+| `paniolo power on` | apply power; **DUT must begin booting unattended** | PDU script "on" / board-boots-on-power / JTAG `reset run` |
+| `paniolo power off` | cut power | PDU script "off" / DTR long-press (≥3 s) |
+| `paniolo power reset` | off + delay + on (= hard reset) | existing `power-cycle` script / PDU / JTAG `SRST` |
+| `paniolo power state` | report on/off (read-only, exists) | sense signal via daemon `/status` |
+
+Config (per target) gains an explicit power backend, e.g.:
+
+```toml
+[power]
+backend = "script"            # "script" | "dtr" | "pdu" | "jtag"
+on_cmd   = "pdu --port 3 on"  # used by "script"/"pdu"
+off_cmd  = "pdu --port 3 off"
+reset_cmd = "pdu --port 3 cycle"   # falls back to off+sleep+on if unset
+# dtr backend reuses existing power_serial_interface + pulse durations
+```
+
+Backward-compat: keep `power_cycle_cmd` working (maps to `reset`/`script`). Exit codes stay
+`0`/`1`.
+
+### 2.2 Serial (the core work)
+
+`serialcap` stays the single exclusive owner of the UART and gains, off the same supervisor:
+
+1. **Raw TCP listener** — `paniolo serial attach --tcp [--port N]` (or always-on when
+   configured). A client connecting gets a **raw, bidirectional, persistent** byte stream:
+   all UART output, and bytes written back are injected via the existing `write_tx` path.
+   This is the ser2net equivalent → LAVA's `connection_command = telnet <host> <port>`.
+2. **PTY proxy** — `paniolo serial attach --pty` prints/records a slave device path (e.g.
+   `/dev/pts/N`, optionally a stable symlink under `$XDG_RUNTIME_DIR/paniolo/…`). Bytes flow
+   raw both ways. botanist is handed this path as `DeviceConfig.serial` and opens it like a
+   real UART, while paniolo keeps owning the physical port (so JSONL/dashboard keep working).
+3. **`paniolo serial send <bytes|->`** — one-shot write to the port (owner's wanted feature;
+   agent-friendly; same `write_tx` channel). `--enter`, `--hex`, stdin supported.
+4. **Write arbitration** — because `tio`, TCP clients, PTY clients, and `send` can all write,
+   define a policy. Recommended v1: **cooperative, last-writer-wins with an advisory lock**
+   surfaced in `/status` (who currently holds write), plus an opt-in `--exclusive` for CI
+   attach so the orchestrator isn't fighting a stray `tio`. (Decision flagged below.)
+
+Existing surfaces unchanged: JSONL log + rotation, `/stream` WebSocket, `serial log`,
+`serial dtr/reset`, `tio` via `serial connect`, dashboard.
+
+### 2.3 Deploy
+
+No new deploy *engine*. In CI, **netboot stands down**; the orchestrator owns deploy (LAVA
+TFTP; botanist pave). Keep netboot for interactive bringup and non-CI boards. Add a guard so
+`netboot start` warns/refuses when a CI attach is active on the same interface (avoid DHCP/TFTP
+contention). A future "paniolo serves images to LAVA" path is explicitly **deferred**.
+
+### 2.4 Boot detect (optional ergonomics)
+
+`paniolo serial wait --match <regex> [--timeout ms] [--since <seq>]` → exits `0` on match,
+non-zero on timeout, prints the matching line. Reads the existing JSONL/stream; **not required**
+by either orchestrator (LAVA matches `prompts:`, botanist polls `summary.json`) but valuable for
+the agent workflow and the minimum-viable CI smoke path.
+
+### 2.5 Debug / JTAG (extension point; implement later)
+
+Reserve verbs `paniolo debug {halt|resume|reset|gdb}` and a `[jtag]` config block selecting an
+`openocd` backend that exposes the GDB (`:3333`) / Tcl (`:6666`) sockets. v1 ships the **config
+schema + verb stubs as the extension point**; the OpenOCD backend is a follow-on.
+
+---
+
+## 3. Adapter A — LAVA lab
+
+paniolo becomes the thing a **LAVA dispatcher** (Debian host) shells out to for one board.
+LAVA owns deploy/boot/test; paniolo provides **power + raw serial**.
+
+**Serial:** run `ser2net` (or paniolo's own raw TCP listener) pointed at paniolo's serial
+endpoint, exposing `telnet <host> <port>`. Two wiring options:
+- *Simplest:* `paniolo serial attach --tcp --port 7001 --exclusive` and set
+  `connection_command = telnet localhost 7001`.
+- *ser2net-classic:* point ser2net at the **PTY** from `serial attach --pty`. Either yields
+  the raw bidirectional persistent stream LAVA requires.
+
+**Power:** a generated **device dictionary** whose commands shell out to paniolo:
+
+```jinja2
+{% extends "<base-device-type>.jinja2" %}
+{% set power_on_command  = 'paniolo power on  --target {{ paniolo_target }}' %}
+{% set power_off_command = 'paniolo power off --target {{ paniolo_target }}' %}
+{% set hard_reset_command = 'paniolo power reset --target {{ paniolo_target }}' %}
+{% set connection_command = 'telnet localhost {{ serial_tcp_port }}' %}
+```
+(Generator supports list-valued power commands too — gap-analysis §0 DISCREPANCY 3. `power_on`
+must start the boot — ensure the board/PDU wiring honors that.)
+
+**Deploy:** none in paniolo — LAVA's dispatcher downloads + serves TFTP. paniolo netboot is
+**off** for LAVA targets.
+
+**Host OS:** Debian Linux (LAVA workers are Debian-only). Keep macOS for interactive bringup.
+
+**Deliverable:** a small generator `paniolo lava device-dict --target <t>` that emits the
+device dictionary + a device-type template snippet, plus a "first-device" doc.
+
+---
+
+## 4. Adapter B — Fuchsia / botanist
+
+paniolo registers the control host as a **Swarming bot** advertising the board's dimensions
+(`get_dimensions()` → `device_type:<board>`, entry in `bots.cfg`, matching `test_platforms`
+entry in `//build/testing/platforms.gni`; the board is RFC-0130 **Experimental** tier =
+self-hosted CI). The Swarming task runs `botanist run` → `testrunner`.
+
+**Serial:** emit a botanist **device config** whose `serial` points at paniolo's **PTY**:
+
+```json
+{ "network": { "nodename": "<board>", "ipv4": "" },
+  "keys": [],
+  "serial": "/run/paniolo/<target>/serial.pty" }
+```
+botanist opens the PTY, runs its own `serial.Server`, and creates `$FUCHSIA_SERIAL_SOCKET` for
+`testrunner` (which drives `run-test-suite` over serial when `$FUCHSIA_SSH_KEY` is unset). The
+socket is **botanist's**, downstream of paniolo — paniolo only supplies the device-file path
+(gap-analysis §0 DISCREPANCY 1). paniolo keeps owning the physical UART, so JSONL/dashboard
+stay live during the run.
+
+**Power:** **not** a device-config field (DISCREPANCY 2). Provide power at the **bot-host /
+recipe layer** — a wrapper invoked before/around `botanist run` that calls
+`paniolo power {on|reset|off}` (and/or implement a `botanist/power` method that shells to
+paniolo). Confirm against `tools/botanist/target/device.go` in a checkout before building.
+
+**Deploy:** botanist owns pave/zedboot + CIPD/CAS. paniolo netboot **off** for Fuchsia targets.
+
+**Deliverable:** `paniolo botanist device-config --target <t>` emitter, a `bot_config.py`
+`get_dimensions()` snippet, and a thin power-wrapper for the recipe/bot-host layer.
+
+---
+
+## 5. Minimum-viable vs full
+
+**Minimum viable (recommended first milestone) — "power + raw serial, orchestrator owns deploy":**
+- `power on/off/reset` verbs (§2.1) + raw **TCP** serial listener (§2.2.1) + **PTY** (§2.2.2)
+  + `serial send` (§2.2.3) + write arbiter (§2.2.4).
+- LAVA device-dict generator; botanist device-config emitter + power wrapper.
+- netboot stands down under CI; Linux CI host.
+- This is enough to bring a board up under **both** orchestrators. It is also exactly the
+  owner's wanted "agents read+write serial" feature.
+
+**Full path (later):**
+- `serial wait --match` boot-detect helper.
+- JTAG backend (reset/deploy/debug + GDB socket).
+- Optional: paniolo-serves-images LAVA deploy method (non-standard; only if a board can't use
+  LAVA's TFTP).
+- Optional: KCIDB emission — **only if** the owner decides paniolo should grow a result story
+  (this is above the device-control line; see verdict).
+
+---
+
+## 6. Verdict — is paniolo suitable?
+
+**KernelCI via LAVA lab: SUITABLE WITH CHANGES — good fit.** paniolo's model (one host wired to
+one board, owns power+serial) is exactly LAVA's lab model. Required changes are modest and
+ranked: (1) discrete power verbs [small], (2) raw TCP serial passthrough [medium], (3) device-
+dictionary generator [small], (4) run on Debian, netboot off [trivial]. The only "can't" is
+**macOS as a LAVA worker** — not supported upstream; use Linux. No blockers.
+
+**KernelCI via KCIDB: OUT OF SCOPE (recommended).** This path needs a real test-execution +
+result-collection story and KCIDB schema emission — that's orchestration/results, **above** the
+device-control line paniolo occupies. Building it would turn paniolo into a mini-LAVA. Recommend
+**no**, unless the owner explicitly wants paniolo to grow upward. (Decision flagged.)
+
+**Fuchsia / Swarming+botanist: SUITABLE WITH CHANGES — fit is good but seam is subtler.**
+paniolo can be the bot's device-control layer. The serial seam is a **PTY** (not a socket
+paniolo serves — DISCREPANCY 1), and **power is a recipe/bot-host hook** (not a device-config
+field — DISCREPANCY 2). Both are tractable: PTY proxy [medium], power wrapper [small], device-
+config emitter [small], bot registration [small + upstream coordination for `bots.cfg`/
+`platforms.gni`]. Biggest non-code dependency: a community board is RFC-0130 **Experimental**
+tier, so this is **self-hosted CI**, which is fine for the stated goal. One thing to verify in a
+real Fuchsia checkout before coding: the exact `DeviceConfig`/power plumbing (pkg.go.dev hides
+unexported fields).
+
+**Net:** paniolo is a **genuinely good device-control layer for both**, with one shared core
+change (raw serial passthrough in two shapes — TCP + PTY) that *also* delivers the owner's
+agent-write feature, plus small per-ecosystem adapters. It is **not** and should not become a
+test orchestrator or result producer.
+
+---
+
+## 7. Open decisions (need owner sign-off before coding)
+
+1. **KCIDB scope** — confirm out of scope (recommended), or in scope as a "full path" item?
+2. **Fuchsia serial port ownership** — PTY proxy (paniolo keeps the port + JSONL during CI;
+   recommended) vs. cede the port to botanist during the task?
+3. **Serial write arbitration** — cooperative last-writer + advisory lock + `--exclusive` for
+   CI (recommended) vs. hard mutex / reject-on-conflict?
+4. **JTAG in v1** — ship as extension point (schema + stubs) now, full OpenOCD backend later
+   (recommended) vs. implement OpenOCD backend in the first pass?
+5. **CI host OS** — accept Linux-only for the CI control host (macOS stays for interactive
+   bringup) (recommended)?
+6. **First milestone** — build the "minimum viable" set (§5) first, smallest reversible steps,
+   with tests, before adapters?
