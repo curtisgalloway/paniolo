@@ -169,3 +169,13 @@ def start_daemon(
         start_new_session=True,
         env=env,
     )
+
+
+def stop_daemon() -> bool:
+    """Ask the running hdmicap daemon to stop. Returns True if it was running."""
+    binary = hdmicap_binary()
+    if not binary:
+        return False
+    result = subprocess.run([binary, "stop"], check=False,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return result.returncode == 0
