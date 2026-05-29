@@ -306,7 +306,11 @@ async fn supervisor(
         let exit = loop {
             tokio::select! {
                 read = rd.read(&mut buf) => match read {
-                    Ok(0) => {}
+                    Ok(0) => {
+                        // Serial ports don't have EOF; Ok(0) means the async
+                        // read resolved without data. Yield to avoid a spin loop.
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
                     Ok(n) => {
                         let chunk = Bytes::copy_from_slice(&buf[..n]);
                         push_ring(&ring, &chunk);
@@ -316,7 +320,9 @@ async fn supervisor(
                         // Err just means no subscribers; that's fine.
                         let _ = to_clients.send(chunk);
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
                     Err(e) => { warn!("serial read error: {e}"); break InnerExit::Disconnect; }
                 },
                 Some(data) = write_rx.recv() => {
