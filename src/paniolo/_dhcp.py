@@ -62,7 +62,8 @@ _ASSIGNED_IP = "192.168.99.100"
 # The TFTP server needs the client's real MAC to build BPF raw frames (the Pi
 # bootloader sends TFTP from a different ephemeral MAC than the one it used for
 # DHCP, which causes macOS to install the wrong ARP entry — see _tftp.py).
-_CLIENT_MAC_FILE = Path("/tmp/paniolo-client-mac")
+# Placed in the user state dir (not /tmp) to prevent symlink and spoofing attacks.
+_CLIENT_MAC_FILE = Path.home() / ".local" / "share" / "paniolo" / "client-mac"
 
 log = logging.getLogger(__name__)
 
@@ -157,6 +158,7 @@ def _set_arp(ip: str, mac: str, interface: str | None = None) -> None:
     # Share with the co-process TFTP server so it can build BPF raw frames
     # (macOS) or just for diagnostics (Linux).
     try:
+        _CLIENT_MAC_FILE.parent.mkdir(parents=True, exist_ok=True)
         _CLIENT_MAC_FILE.write_text(mac)
     except OSError as exc:
         log.debug("could not write client MAC file: %s", exc)
@@ -214,7 +216,7 @@ def _monitor_interface(interface: str, host_ip: str) -> None:
     """
     had_ip = True
     while True:
-        time.sleep(0.25)
+        time.sleep(1.0)
         has_ip = _has_interface_ip(interface, host_ip)
         is_active = _is_link_up(interface)
 

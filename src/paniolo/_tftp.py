@@ -74,7 +74,8 @@ _ARP_RESOLVE_TIMEOUT = 4.0
 
 # Shared with _dhcp.py: the DHCP server writes the client MAC here so we can
 # use it as the BPF frame destination, bypassing the kernel's ARP table.
-_CLIENT_MAC_FILE = Path("/tmp/paniolo-client-mac")
+# Placed in the user state dir (not /tmp) to prevent symlink and spoofing attacks.
+_CLIENT_MAC_FILE = Path.home() / ".local" / "share" / "paniolo" / "client-mac"
 
 # macOS BPF ioctl constants (64-bit).  Used by BpfSender below.
 _BIOCSETIF = 0x8020426C  # bind BPF fd to an interface (struct ifreq, 32 B)
@@ -246,9 +247,10 @@ class BpfSender:
             return False
 
     def close(self) -> None:
-        if self._fd is not None:
-            os.close(self._fd)
-            self._fd = None
+        with self._lock:
+            if self._fd is not None:
+                os.close(self._fd)
+                self._fd = None
 
 
 def _sendto(
@@ -523,10 +525,14 @@ def serve(
             )
             t.start()
         elif opcode == _OP_WRQ:
-            err = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            err.bind((host_ip, 0))
-            _sendto(err, _error_packet(_ERR_ACCESS, "read-only server"), peer, bpf)
-            err.close()
+            err_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                err_sock.bind((host_ip, 0))
+                _sendto(err_sock, _error_packet(_ERR_ACCESS, "read-only server"), peer, bpf)
+            except OSError as exc:
+                log.debug("WRQ error reply failed: %s", exc)
+            finally:
+                err_sock.close()
 
 
 def main() -> None:

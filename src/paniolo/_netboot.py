@@ -169,14 +169,18 @@ def _spawn(cmd: list[str], log_path: Path, append: bool = False) -> subprocess.P
         log_path.unlink(missing_ok=True)
     log_file = open(log_path, "a")
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
-    return subprocess.Popen(
-        cmd,
-        stdout=log_file,
-        stderr=log_file,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-        env=env,
-    )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_file,
+            stderr=log_file,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            env=env,
+        )
+    finally:
+        log_file.close()
+    return proc
 
 
 def _sudo_prefix() -> list[str]:
