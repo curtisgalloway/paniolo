@@ -77,7 +77,7 @@ pub struct CapturedFrame {
     pub rgb: RgbImage,
 }
 
-pub trait CaptureBackend: Send {
+pub trait CaptureBackend {
     fn frame(&mut self) -> Result<CapturedFrame>;
     fn dims(&self) -> (u32, u32);
 }
