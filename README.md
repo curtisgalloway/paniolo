@@ -22,6 +22,15 @@ and power-cycle it without human intervention at each iteration.
 
 ---
 
+## Documentation
+
+Full docs live in [`docs/`](docs/README.md). Start with the
+[**architecture overview**](docs/architecture.md) for the whole-system design, then the
+per-subsystem guides linked above. Hardware-CI integration (KernelCI/LAVA, Fuchsia/botanist)
+design and the project requirements tracker are under [`docs/`](docs/README.md) as well.
+
+---
+
 ## Requirements
 
 - macOS 10.14 (Mojave) or later, or Linux (x86-64 / arm64)
@@ -37,12 +46,14 @@ and power-cycle it without human intervention at each iteration.
 ```bash
 git clone https://github.com/curtisgalloway/paniolo ~/src/paniolo
 uv tool install ~/src/paniolo
-paniolo setup          # installs dnsmasq, tftp-now, hdmicap, serialcap, visionocr
+paniolo setup          # builds hdmicap + serialcap; installs the OCR helper
 ```
 
 `paniolo setup` compiles and installs the Rust daemons (`hdmicap`, `serialcap`)
-and the Swift OCR helper (`visionocr`) into `~/.cargo/bin`, and installs the
-TFTP and DHCP servers via Homebrew.
+and the OCR helper (`visionocr` on macOS via `swiftc`, `linuxocr` on Linux) into
+`~/.cargo/bin`. The DHCP and TFTP netboot servers are **pure-Python** — no
+external servers to install. (On macOS, `setup` also installs the legacy
+`tftp-now` via Homebrew.)
 
 To pick up code changes after pulling or editing:
 
