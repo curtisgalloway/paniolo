@@ -487,25 +487,64 @@ def video_stop() -> None:
 
 @app.command("console")
 def open_dashboard(
+    target: Annotated[Optional[str], typer.Argument()] = None,
     interface: Annotated[
         Optional[str],
         typer.Option("--interface", "-i", help="Serial interface name to preselect"),
     ] = None,
+    video_port: Annotated[int, typer.Option("--video-port")] = 8723,
+    serial_port: Annotated[int, typer.Option("--serial-port")] = 8724,
 ) -> None:
-    """Open the combined video+serial dashboard in the default browser.
-
-    Both daemons must be running:
-      paniolo video watch
-      paniolo serial watch [target]
-    """
+    """Open the combined video+serial dashboard, starting daemons if needed."""
+    # ── video daemon ──────────────────────────────────────────────────────────
     video_url = _video.daemon_url()
     if not video_url:
-        err.print("[red]No video daemon running.[/red] Start it with: paniolo video watch")
-        raise typer.Exit(1)
+        cfg_v = _video.load_video_config()
+        if not cfg_v:
+            err.print("[red]No video device configured.[/red] Run: paniolo video setup")
+            raise typer.Exit(1)
+        binary_v = _video.hdmicap_binary()
+        if not binary_v:
+            err.print("[red]hdmicap not found.[/red] Run: paniolo setup")
+            raise typer.Exit(1)
+        ocr_bin = _ocr.visionocr_binary()
+        _video.start_daemon(cfg_v, video_port, ocr_bin=ocr_bin)
+        console.print("[dim]Starting video daemon…[/dim]")
+        for _ in range(50):
+            time.sleep(0.1)
+            video_url = _video.daemon_url()
+            if video_url:
+                break
+        if not video_url:
+            err.print("[red]Video daemon did not start within 5 s.[/red]")
+            raise typer.Exit(1)
+        console.print(f"[green]Video daemon started.[/green]")
 
+    # ── serial daemon ─────────────────────────────────────────────────────────
     if not _serial.daemon_url():
-        err.print("[red]No serial daemon running.[/red] Start it with: paniolo serial watch")
-        raise typer.Exit(1)
+        cfg_s = _resolve(target)
+        if not cfg_s.serial_interfaces:
+            err.print(
+                f"[red]No serial interfaces configured for '{cfg_s.name}'.[/red] "
+                "Run: paniolo serial setup"
+            )
+            raise typer.Exit(1)
+        if not _serial.serialcap_binary():
+            err.print("[red]serialcap not found.[/red] Run: paniolo setup")
+            raise typer.Exit(1)
+        _serial.start_daemon(cfg_s.serial_interfaces, serial_port)
+        names = ", ".join(i.name for i in cfg_s.serial_interfaces)
+        console.print(f"[dim]Starting serial daemon ({names})…[/dim]")
+        serial_url = None
+        for _ in range(50):
+            time.sleep(0.1)
+            serial_url = _serial.daemon_url()
+            if serial_url:
+                break
+        if not serial_url:
+            err.print("[red]Serial daemon did not start within 5 s.[/red]")
+            raise typer.Exit(1)
+        console.print(f"[green]Serial daemon started.[/green]")
 
     url = video_url if not interface else f"{video_url}?interface={interface}"
 

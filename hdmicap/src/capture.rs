@@ -55,6 +55,11 @@ impl DeviceSpec {
             DeviceSpec::Auto
         } else if let Ok(i) = s.parse::<u32>() {
             DeviceSpec::Index(i)
+        } else if let Some(idx) = s
+            .strip_prefix("/dev/video")
+            .and_then(|n| n.parse::<u32>().ok())
+        {
+            DeviceSpec::Index(idx)
         } else {
             DeviceSpec::Name(s.to_string())
         }
