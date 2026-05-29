@@ -229,16 +229,28 @@ test orchestrator or result producer.
 
 ---
 
-## 7. Open decisions (need owner sign-off before coding)
+## 7. Decisions (owner-confirmed 2026-05-29)
 
-1. **KCIDB scope** — confirm out of scope (recommended), or in scope as a "full path" item?
-2. **Fuchsia serial port ownership** — PTY proxy (paniolo keeps the port + JSONL during CI;
-   recommended) vs. cede the port to botanist during the task?
-3. **Serial write arbitration** — cooperative last-writer + advisory lock + `--exclusive` for
-   CI (recommended) vs. hard mutex / reject-on-conflict?
-4. **JTAG in v1** — ship as extension point (schema + stubs) now, full OpenOCD backend later
-   (recommended) vs. implement OpenOCD backend in the first pass?
-5. **CI host OS** — accept Linux-only for the CI control host (macOS stays for interactive
-   bringup) (recommended)?
-6. **First milestone** — build the "minimum viable" set (§5) first, smallest reversible steps,
-   with tests, before adapters?
+1. **KCIDB scope** — **OUT OF SCOPE.** paniolo stays a pure device-control layer; KernelCI is
+   targeted via the LAVA-lab path only. LAVA/Maestro produce results.
+2. **Fuchsia serial port ownership** — **PTY proxy** (paniolo keeps the physical port and its
+   JSONL/dashboard during CI; hands botanist a PTY device-file path).
+3. **Serial write arbitration** — **cooperative, last-writer-wins + advisory lock** surfaced in
+   `/status`, plus opt-in `--exclusive` for CI attach.
+4. **JTAG in v1** — **extension point only**: ship the `[jtag]`/`[debug]` config schema + verb
+   stubs now; OpenOCD backend is a follow-on.
+5. **CI host OS** — **Linux-only** for the CI control host; macOS remains a first-class
+   interactive-bringup host.
+6. **First milestone** — *not started yet.* Owner wants to discuss implementation specifics
+   (see §8) before any code.
+
+## 8. Open implementation questions to discuss before coding
+
+- **Native TCP listener vs. ser2net-on-PTY for LAVA.** Since botanist forces us to expose a PTY
+  anyway, pointing stock `ser2net` at that PTY would give LAVA its `telnet host port` for free —
+  possibly removing the need for a Rust-side TCP listener. Trade-off: one external dep on the
+  Debian worker (ser2net, LAVA-blessed) vs. a self-contained `paniolo serial attach --tcp`.
+- **Where the PTY/TCP listeners live.** serialcap (Rust) owns the port, so the new endpoints must
+  be added to the daemon; a Python wrapper can't see the bytes. Confirms a Rust change.
+- **Power backend config shape** (the `[power]` block) and back-compat with `power_cycle_cmd`.
+- **Milestone slicing** of the minimum-viable core into small reviewable commits.
