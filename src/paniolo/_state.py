@@ -18,6 +18,7 @@ import dataclasses
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -84,6 +85,17 @@ def is_pid_alive(pid: int) -> bool:
 
 def _pid_cmdline(pid: int) -> str:
     """Return the full command-line string for pid, or empty string on failure."""
+    if sys.platform != "darwin":
+        try:
+            return (
+                Path(f"/proc/{pid}/cmdline")
+                .read_bytes()
+                .replace(b"\x00", b" ")
+                .decode(errors="replace")
+                .strip()
+            )
+        except OSError:
+            return ""
     try:
         result = subprocess.run(
             ["ps", "-p", str(pid), "-o", "args="],

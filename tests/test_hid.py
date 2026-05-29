@@ -142,3 +142,35 @@ def test_repeat_key():
     _hid.repeat_key(rig, "TAB", 3, delay=0.2, sleep=slept.append)
     assert t.writes == [b"key TAB\n"] * 3
     assert slept == [0.2, 0.2]  # no trailing delay after the last tap
+
+
+# --- S3: newline injection guard -------------------------------------------
+
+def test_cmd_rejects_newline():
+    rig, _ = make_rig()
+    with pytest.raises(ValueError, match="newline"):
+        rig.cmd("type hello\nkey ENTER")
+
+
+def test_cmd_rejects_carriage_return():
+    rig, _ = make_rig()
+    with pytest.raises(ValueError, match="newline"):
+        rig.cmd("type hello\rworld")
+
+
+def test_type_rejects_embedded_newline():
+    rig, _ = make_rig()
+    with pytest.raises(ValueError, match="newline"):
+        rig.type("line1\nline2")
+
+
+# --- C3: parse_sequence error messages -------------------------------------
+
+def test_parse_sequence_bad_delay_raises_friendly_error():
+    with pytest.raises(ValueError, match="invalid delay value"):
+        _hid.parse_sequence("delay abc\nkey A\n")
+
+
+def test_parse_sequence_bad_sleep_raises_friendly_error():
+    with pytest.raises(ValueError, match="invalid sleep value"):
+        _hid.parse_sequence("sleep xyz\n")

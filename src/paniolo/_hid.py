@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import _config
+from ._config import _toml_kv
 
 HID_CONFIG_PATH = _config.CONFIG_DIR / "hid.toml"
 
@@ -49,17 +50,7 @@ class HidConfig:
 
 
 def _to_toml(data: dict) -> str:
-    lines = []
-    for key, value in data.items():
-        if value is None:
-            continue
-        if isinstance(value, str):
-            escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-            lines.append(f'{key} = "{escaped}"')
-        elif isinstance(value, bool):
-            lines.append(f'{key} = {"true" if value else "false"}')
-        else:
-            lines.append(f"{key} = {value}")
+    lines = [_toml_kv(k, v) for k, v in data.items() if v is not None]
     return "\n".join(lines) + "\n"
 
 
@@ -138,6 +129,8 @@ class HidRig:
 
     def cmd(self, text: str) -> str:
         """Send one command line; return the board's reply, raise on ERR."""
+        if "\n" in text or "\r" in text:
+            raise ValueError(f"command contains newline: {text!r}")
         self._transport.write((text + "\n").encode("utf-8"))
         reply = self._transport.readline().decode("utf-8", "replace").strip()
         if reply.startswith("ERR"):
@@ -199,9 +192,15 @@ def parse_sequence(text: str) -> list[tuple[str, object]]:
         head, _, rest = line.partition(" ")
         low = head.lower()
         if low == "delay":
-            steps.append(("delay", float(rest) / 1000.0))
+            try:
+                steps.append(("delay", float(rest) / 1000.0))
+            except ValueError:
+                raise ValueError(f"invalid delay value: {rest!r}")
         elif low == "sleep":
-            steps.append(("delay", float(rest)))
+            try:
+                steps.append(("delay", float(rest)))
+            except ValueError:
+                raise ValueError(f"invalid sleep value: {rest!r}")
         else:
             steps.append(("cmd", line))
     return steps

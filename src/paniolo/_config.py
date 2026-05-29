@@ -15,9 +15,16 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
+import re
 import tomllib
 from pathlib import Path
 from typing import Optional
+
+log = logging.getLogger(__name__)
+
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_CTRL_ESCAPE = {"\n": "\\n", "\r": "\\r", "\t": "\\t", "\x08": "\\b", "\x0c": "\\f"}
 
 CONFIG_DIR = Path.home() / ".config" / "paniolo"
 TARGETS_DIR = CONFIG_DIR / "targets"
@@ -135,15 +142,25 @@ def _from_dict(data: dict) -> TargetConfig:
             )
         )
 
+    _known = {f.name for f in dataclasses.fields(TargetConfig)} - {"serial_interfaces"}
+    unknown = set(data) - _known
+    if unknown:
+        log.warning("ignoring unknown config keys: %s", ", ".join(sorted(unknown)))
+    data = {k: v for k, v in data.items() if k in _known}
     return TargetConfig(serial_interfaces=interfaces, **data)
+
+
+def _escape_toml_string(s: str) -> str:
+    """Escape a string for use in a TOML basic string (double-quoted)."""
+    s = s.replace("\\", "\\\\").replace('"', '\\"')
+    return _CTRL_RE.sub(lambda m: _CTRL_ESCAPE.get(m.group(), f"\\u{ord(m.group()):04x}"), s)
 
 
 def _toml_kv(key: str, value) -> str:
     if isinstance(value, bool):
         return f'{key} = {"true" if value else "false"}'
     if isinstance(value, str):
-        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-        return f'{key} = "{escaped}"'
+        return f'{key} = "{_escape_toml_string(value)}"'
     return f"{key} = {value}"
 
 

@@ -106,3 +106,34 @@ def test_remove_interface():
     assert cfg.remove_serial_interface("console") is True
     assert cfg.remove_serial_interface("console") is False
     assert [i.name for i in cfg.serial_interfaces] == ["bmc"]
+
+
+# --- S2: TOML control-character escaping -----------------------------------
+
+def test_toml_roundtrip_newline_in_power_cycle_cmd():
+    """Newlines in string values must survive a TOML round-trip without breaking the file."""
+    cfg = TargetConfig(name="x", interface="en0", power_cycle_cmd="cmd1\ncmd2")
+    got = roundtrip(cfg)
+    assert got.power_cycle_cmd == "cmd1\ncmd2"
+
+
+def test_toml_roundtrip_tab_and_cr():
+    cfg = TargetConfig(name="x", interface="en0", power_cycle_cmd="a\tb\rc")
+    got = roundtrip(cfg)
+    assert got.power_cycle_cmd == "a\tb\rc"
+
+
+def test_toml_kv_escapes_backslash():
+    line = _config._toml_kv("k", "a\\b")
+    assert line == 'k = "a\\\\b"'
+    parsed = tomllib.loads(line)
+    assert parsed["k"] == "a\\b"
+
+
+# --- C2: unknown TOML keys are ignored gracefully --------------------------
+
+def test_unknown_keys_in_toml_are_silently_dropped():
+    data = tomllib.loads('name = "x"\ninterface = "en0"\nunknown_future_key = "foo"\n')
+    cfg = _config._from_dict(data)
+    assert cfg.name == "x"
+    assert not hasattr(cfg, "unknown_future_key")

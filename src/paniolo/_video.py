@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import _config
+from ._config import _toml_kv
 
 VIDEO_CONFIG_PATH = _config.CONFIG_DIR / "video.toml"
 
@@ -42,17 +43,7 @@ class VideoConfig:
 
 
 def _to_toml(data: dict) -> str:
-    lines = []
-    for key, value in data.items():
-        if value is None:
-            continue
-        if isinstance(value, str):
-            escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-            lines.append(f'{key} = "{escaped}"')
-        elif isinstance(value, bool):
-            lines.append(f'{key} = {"true" if value else "false"}')
-        else:
-            lines.append(f"{key} = {value}")
+    lines = [_toml_kv(k, v) for k, v in data.items() if v is not None]
     return "\n".join(lines) + "\n"
 
 
