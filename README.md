@@ -16,20 +16,19 @@ and power-cycle it without human intervention at each iteration.
 | [Netboot](docs/netboot.md) | `paniolo netboot` | DHCP + TFTP netboot over a direct USB-Ethernet link |
 | [Video](docs/video.md) | `paniolo video` | HDMI capture via warm-stream daemon; on-device OCR |
 | [Serial](docs/serial.md) | `paniolo serial` | Serial console — interactive (tio) or daemon-backed with timestamped rolling log |
-| [Power control](docs/power.md) | `paniolo button/reset/power-cycle/power-state` | Hardware power button via FTDI DTR line wired to Pi J2 header |
+| [Power control](docs/power.md) | `paniolo serial dtr/reset`, `paniolo power-cycle`, `paniolo power-state` | DTR-based hardware power button (J2 header) and script-based power cycling |
 | [HID injection](docs/hid.md) | `paniolo hid` | USB keyboard/mouse injection via a two-board KB2040 rig |
-| [Dashboard](docs/dashboard.md) | `paniolo console` | Combined video + serial web UI; `-i <name>` preselects a serial interface |
-| [HA power switch](docs/power.md#home-assistant-power-switch) | `paniolo power-switch` | Cut/restore power via a Home Assistant smart switch |
+| [Dashboard](docs/dashboard.md) | `paniolo console` | Combined video + serial web UI; auto-starts daemons; `-i <name>` preselects a serial interface |
 
 ---
 
 ## Requirements
 
-- macOS 10.14 (Mojave) or later
+- macOS 10.14 (Mojave) or later, or Linux (x86-64 / arm64)
 - Python 3.11+
-- [uv](https://docs.astral.sh/uv/) (`brew install uv`)
-- [Homebrew](https://brew.sh)
-- Rust toolchain (for hdmicap, serialcap — `brew install rustup`)
+- [uv](https://docs.astral.sh/uv/) (`brew install uv` on macOS, or the [uv installer](https://docs.astral.sh/uv/getting-started/installation/) on Linux)
+- [Homebrew](https://brew.sh) (macOS only — Linux uses the system package manager)
+- Rust toolchain (for hdmicap, serialcap — `brew install rustup` on macOS, or `rustup.rs` on Linux)
 
 ---
 
@@ -71,7 +70,7 @@ control Mac to drive the target:
 ssh control-mac "paniolo target set target-machine \
     --interface en3 \
     --tftp-root ~/pxe \
-    --ha-power-entity switch.my_plug"
+    --power-cycle-cmd /path/to/power-cycle.sh"
 
 # Deploy a new kernel and boot
 TFTP_ROOT=$(ssh control-mac "paniolo netboot tftp-root target-machine")
@@ -105,12 +104,11 @@ See [`paniolo target set --help`](docs/netboot.md#target-configuration) for all 
 |---|---|
 | Target configs | `~/.config/paniolo/targets/<name>.toml` |
 | Video config | `~/.config/paniolo/video.toml` |
-| HA config | `~/.config/paniolo/ha.toml` |
 | HID config | `~/.config/paniolo/hid.toml` |
 | Netboot daemon state | `~/.local/share/paniolo/<name>/netboot.json` |
-| hdmicap discovery | `$TMPDIR/hdmicap/daemon.json` |
-| serialcap discovery | `$TMPDIR/serialcap/daemon.json` |
-| Serial capture logs | `$TMPDIR/serialcap/capture/<name>/serial.jsonl` |
+| hdmicap discovery | `$XDG_RUNTIME_DIR/hdmicap/daemon.json` (Linux) / `$TMPDIR/hdmicap/daemon.json` (macOS) |
+| serialcap discovery | `$XDG_RUNTIME_DIR/serialcap/daemon.json` (Linux) / `$TMPDIR/serialcap/daemon.json` (macOS) |
+| Serial capture logs | `$XDG_RUNTIME_DIR/serialcap/capture/<name>/serial.jsonl` (Linux) |
 
 ---
 

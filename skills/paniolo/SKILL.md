@@ -16,11 +16,20 @@ configured, the name can be omitted.
 ## First-time setup
 
 ```
-paniolo setup
+cd ~/src/paniolo
+uv tool install .          # installs the `paniolo` CLI into ~/.local/bin
+paniolo setup              # installs dnsmasq, tftp-now, hdmicap, serialcap, visionocr
 ```
 
-Installs the required tools and builds paniolo's helper daemons into
-`~/.cargo/bin`. Run once per machine. Make sure `~/.cargo/bin` is on your `PATH`.
+`uv tool install .` is required first — without it the `paniolo` command doesn't
+exist yet. Run both steps once per machine. Make sure `~/.local/bin` (uv tools)
+and `~/.cargo/bin` (Rust daemons) are on your `PATH`.
+
+To pick up Python code changes after pulling or editing:
+
+```
+cd ~/src/paniolo && uv tool install --reinstall .
+```
 
 ## Configure a target
 
@@ -89,6 +98,8 @@ paniolo serial log [-i name] [options]         # print captured output (timestam
 paniolo serial show [target]                   # list interfaces + daemon status
 paniolo serial stop                            # release the ports
 paniolo serial devices                         # list serial devices on the host
+paniolo serial dtr [target] [-i name] [--ms N] # pulse DTR line (J2 power button header)
+paniolo serial reset [target] [-i name]        # soft reset via brief DTR pulse
 ```
 
 `--name` defaults to `console`, so a single-interface setup needs no flags. With
@@ -119,15 +130,23 @@ later with `--since <seq>` to get only what's new, or `--from/--to` to re-read a
 exact span. Output is ANSI-stripped by default; a `*` after the sequence number
 marks the current unterminated line (e.g. a `login:` prompt with no newline yet).
 
-## Power-cycle
+## Power control
 
 ```
-paniolo power-cycle [target] [--off-seconds N]
+paniolo power-cycle [target]           # run the target's power_cycle_cmd script
+paniolo power-state [target]           # show power state (requires sense signal + daemon)
+paniolo serial dtr [target] [--ms N]   # pulse DTR line on J2 header (soft/hard press)
+paniolo serial reset [target]          # soft reset via brief DTR pulse
 ```
 
-Toggles the target's Home Assistant switch off, waits, then on. Configure with
-`paniolo ha setup` and set `--ha-power-entity` on the target. Provide the HA
-token via the `HA_TOKEN` environment variable (e.g. through a secrets manager).
+`power-cycle` runs the shell script set with
+`paniolo target set <name> --power-cycle-cmd <script>`.
+The script is responsible for the full off→on sequence (HA API, PDU relay, GPIO, etc.).
+
+DTR commands drive the target's physical power button via an FTDI serial
+adapter wired to the Pi J2 header. A ≤500 ms pulse is a soft button event; ≥3000 ms
+is a hard PMIC power-off. Set the default interface with
+`paniolo target set <name> --power-serial console`.
 
 ## Driving it remotely over SSH
 
@@ -145,8 +164,9 @@ ssh control "paniolo netboot stop fortune"
 ## Quick reference — gotchas
 
 - Serial port is exclusive: one of `connect` / `watch` / external `tio`/`screen`.
-- `~/.cargo/bin` must be on `PATH` (that's where `paniolo setup` installs the daemons).
-- Netboot requires passwordless `sudo` for `ifconfig`.
+- `~/.local/bin` (uv tool) and `~/.cargo/bin` (Rust daemons) must be on `PATH`.
+- `paniolo console` auto-starts both daemons if they aren't running.
+- Netboot requires passwordless `sudo` (`ip` on Linux, `ifconfig` on macOS).
 - OCR is strongest on large text; tiny console fonts may misread some characters.
 
 ---
