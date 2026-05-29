@@ -140,19 +140,25 @@ def daemon_url() -> Optional[str]:
 
 
 def start_daemon(
-    cfg: VideoConfig, port: int = 8723, ocr_bin: Optional[str] = None
+    cfg: VideoConfig,
+    port: int = 8723,
+    ocr_bin: Optional[str] = None,
+    target_name: Optional[str] = None,
 ) -> subprocess.Popen:
     """Start hdmicap daemon in the background; caller should poll daemon_url().
 
-    If ocr_bin is given, it's exported as PANIOLO_VISIONOCR so the daemon's
-    /ocr endpoint can find the Vision OCR tool.
+    ocr_bin is exported as PANIOLO_VISIONOCR for the /ocr endpoint.
+    target_name is exported as PANIOLO_TARGET so the /power-cycle endpoint
+    can call `paniolo power-cycle <target>`.
     """
     binary = hdmicap_binary()
     if not binary:
         raise FileNotFoundError("hdmicap not found in PATH or project build dir")
-    env = None
+    env = dict(os.environ)
     if ocr_bin:
-        env = {**os.environ, "PANIOLO_VISIONOCR": ocr_bin}
+        env["PANIOLO_VISIONOCR"] = ocr_bin
+    if target_name:
+        env["PANIOLO_TARGET"] = target_name
     return subprocess.Popen(
         [binary, "daemon", "--device", cfg.device, "--port", str(port)],
         stdout=subprocess.DEVNULL,

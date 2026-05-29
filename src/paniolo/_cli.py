@@ -278,19 +278,101 @@ def netboot_tftp_root(
         raise typer.Exit(1)
 
 
+def _netboot_format_line(line: str) -> Optional[str]:
+    """Return a Rich markup string for one log line, or None to skip blank lines."""
+    line = line.rstrip()
+    if not line:
+        return None
+    parts = line.split(" ", 3)
+    if len(parts) < 4:
+        return line
+    ts = f"[dim]{parts[0]} {parts[1]}[/dim]"
+    level, msg = parts[2], parts[3]
+    if level == "WARNING":
+        return f"{ts} [yellow]{msg}[/yellow]"
+    if level == "ERROR" or level == "CRITICAL":
+        return f"{ts} [red bold]{msg}[/red bold]"
+    if any(k in msg for k in ("DHCP", "dhcp")):
+        return f"{ts} [cyan]{msg}[/cyan]"
+    if msg.startswith("completed "):
+        return f"{ts} [green]{msg}[/green]"
+    if "NOT FOUND" in msg:
+        return f"{ts} [dim yellow]{msg}[/dim yellow]"
+    if msg.startswith("RRQ ") or msg.startswith("TFTP "):
+        return f"{ts} [blue]{msg}[/blue]"
+    return f"{ts} {msg}"
+
+
+def _netboot_line_passes(line: str, dhcp: bool, tftp: bool, errors: bool) -> bool:
+    if not (dhcp or tftp or errors):
+        return True
+    parts = line.split(" ", 3)
+    level = parts[2] if len(parts) >= 3 else ""
+    msg = parts[3] if len(parts) >= 4 else line
+    if errors and level in ("WARNING", "ERROR", "CRITICAL"):
+        return True
+    if dhcp and any(k in msg for k in ("DHCP", "dhcp")):
+        return True
+    if tftp and any(k in msg for k in ("RRQ", "completed", "TFTP", "NOT FOUND", "OACK")):
+        return True
+    return False
+
+
 @netboot_app.command("logs")
 def netboot_logs(
     target: Annotated[Optional[str], typer.Argument()] = None,
-    follow: Annotated[bool, typer.Option("--follow", "-f")] = False,
+    follow: Annotated[bool, typer.Option("--follow", "-f", help="Stream new lines as they arrive")] = False,
+    tail: Annotated[int, typer.Option("--tail", "-n", help="Number of recent lines to show")] = 100,
+    boot: Annotated[bool, typer.Option("--boot", help="Show only the current boot session")] = False,
+    dhcp: Annotated[bool, typer.Option("--dhcp", help="Show only DHCP events")] = False,
+    tftp: Annotated[bool, typer.Option("--tftp", help="Show only TFTP events")] = False,
+    errors: Annotated[bool, typer.Option("--errors", "-e", help="Show only warnings and errors")] = False,
 ) -> None:
-    """Show netboot logs for a target."""
+    """Show DHCP/TFTP netboot logs with color-coded DHCP and TFTP events.
+
+    Use --dhcp / --tftp / --errors to filter. --boot shows only the current
+    session (from the last 'netboot start'). --follow streams live output."""
     cfg = _resolve(target)
     log_path = _state.netboot_log_path(cfg.name)
     if not log_path.exists():
         console.print("No log file yet.")
         return
-    cmd = ["tail", "-f" if follow else "-100", str(log_path)]
-    subprocess.run(cmd)
+
+    lines = log_path.read_text(errors="replace").splitlines()
+
+    if boot:
+        # Find the last session start (last "DHCP listening" line).
+        start = 0
+        for i, ln in enumerate(lines):
+            if "DHCP listening on" in ln:
+                start = i
+        lines = lines[start:]
+    else:
+        lines = lines[-tail:]
+
+    for ln in lines:
+        if _netboot_line_passes(ln, dhcp, tftp, errors):
+            formatted = _netboot_format_line(ln)
+            if formatted:
+                console.print(formatted, highlight=False)
+
+    if not follow:
+        return
+
+    with log_path.open(errors="replace") as f:
+        f.seek(0, 2)  # seek to end
+        while True:
+            ln = f.readline()
+            if ln:
+                if _netboot_line_passes(ln, dhcp, tftp, errors):
+                    formatted = _netboot_format_line(ln)
+                    if formatted:
+                        console.print(formatted, highlight=False)
+            else:
+                try:
+                    time.sleep(0.2)
+                except KeyboardInterrupt:
+                    break
 
 
 def _link_state(interface: str) -> dict:
@@ -402,16 +484,19 @@ def video_setup(
     console.print(f"[green]Video device configured:[/green] {device}")
 
 
-def _start_video_daemon(cfg: "_video.VideoConfig", port: int) -> str:
+def _start_video_daemon(
+    cfg: "_video.VideoConfig", port: int, target_name: Optional[str] = None
+) -> str:
     """Start the hdmicap daemon and wait for it to come up. Returns the URL.
 
-    Raises typer.Exit on failure."""
+    target_name is passed as PANIOLO_TARGET so the /power-cycle endpoint can
+    call `paniolo power-cycle <target>`. Raises typer.Exit on failure."""
     binary = _video.hdmicap_binary()
     if not binary:
         err.print("[red]hdmicap not found.[/red] Run: paniolo setup")
         raise typer.Exit(1)
-    ocr_bin = _ocr.visionocr_binary()
-    _video.start_daemon(cfg, port, ocr_bin=ocr_bin)
+    ocr_bin = _ocr.ocr_binary()
+    _video.start_daemon(cfg, port, ocr_bin=ocr_bin, target_name=target_name)
     for _ in range(50):
         time.sleep(0.1)
         url = _video.daemon_url()
@@ -423,16 +508,20 @@ def _start_video_daemon(cfg: "_video.VideoConfig", port: int) -> str:
 
 @video_app.command("watch")
 def video_watch(
+    target: Annotated[Optional[str], typer.Argument()] = None,
     port: Annotated[int, typer.Option("--port")] = 8723,
     restart: Annotated[bool, typer.Option("--restart")] = False,
 ) -> None:
     """Start the hdmicap daemon in the background.
 
+    Pass a target name to enable the dashboard power-cycle button.
     Use --restart to force-restart a running (but possibly stalled) daemon."""
     cfg = _video.load_video_config()
     if not cfg:
         err.print("[red]No video device configured.[/red] Run: paniolo video setup")
         raise typer.Exit(1)
+
+    target_name = _resolve(target).name if target else None
 
     url = _video.daemon_url()
     if url and not restart:
@@ -443,7 +532,7 @@ def video_watch(
         time.sleep(1)
 
     console.print("[dim]Starting video daemon…[/dim]")
-    url = _start_video_daemon(cfg, port)
+    url = _start_video_daemon(cfg, port, target_name=target_name)
     console.print(f"[green]Daemon started.[/green] Preview at {url}")
 
 
@@ -1273,13 +1362,26 @@ def setup() -> None:
                 err.print(f"  [red]✗[/red] {crate}: cargo install failed")
                 raise typer.Exit(1)
 
-    # 3. visionocr (Apple Vision OCR) via swiftc — macOS only.
-    try:
-        dest = cargo_bin / "visionocr"
-        _ocr.build_visionocr(dest)
-        console.print(f"  [green]✓[/green] visionocr    {dest}")
-    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
-        console.print(f"  [yellow]…[/yellow] visionocr: skipped ({exc})")
+    # 3. OCR helper: visionocr on macOS, linuxocr on Linux.
+    if sys.platform == "darwin":
+        try:
+            dest = cargo_bin / "visionocr"
+            _ocr.build_visionocr(dest)
+            console.print(f"  [green]✓[/green] visionocr    {dest}")
+        except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+            console.print(f"  [yellow]…[/yellow] visionocr: skipped ({exc})")
+    else:
+        try:
+            dest = cargo_bin / "linuxocr"
+            _ocr.install_linuxocr(dest)
+            console.print(f"  [green]✓[/green] linuxocr     {dest}")
+        except (FileNotFoundError, OSError) as exc:
+            console.print(f"  [yellow]…[/yellow] linuxocr: skipped ({exc})")
+        if not shutil.which("tesseract"):
+            console.print(
+                "  [yellow]![/yellow] tesseract not found — install it for OCR:\n"
+                "    sudo apt-get install tesseract-ocr"
+            )
 
     console.print("\n[green]Setup complete.[/green]")
     if cargo and str(cargo_bin) not in os.environ.get("PATH", "").split(os.pathsep):

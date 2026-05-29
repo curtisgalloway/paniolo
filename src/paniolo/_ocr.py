@@ -12,27 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""OCR helpers — wraps the `visionocr` Swift tool (Apple Vision framework).
+"""OCR helpers — wraps platform OCR tools.
 
-On-device, no network, no model download. macOS only. The tool reads a PNG on
-stdin and prints recognized text (or `--json` with bounding boxes).
+- macOS: `visionocr` (Apple Vision framework, compiled from ocr/visionocr.swift)
+- Linux: `linuxocr` (Tesseract-backed, from ocr/linuxocr)
+
+Both tools share the same interface: read PNG on stdin, print text on stdout.
 """
 
 from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
 
 def visionocr_binary() -> Optional[str]:
-    """Return the installed visionocr path: PATH, then ~/.cargo/bin. None if absent.
-
-    Built and installed by `paniolo setup`; never resolved from the in-repo build
-    tree, so a running daemon can't point at an ephemeral build artifact that a
-    checkout/cleanup could delete.
-    """
+    """Return the installed visionocr path: PATH, then ~/.cargo/bin. None if absent."""
     found = shutil.which("visionocr")
     if found:
         return found
@@ -56,18 +54,57 @@ def build_visionocr(dest: Path) -> None:
     subprocess.run(["swiftc", "-O", "-o", str(dest), str(source)], check=True)
 
 
+def linuxocr_binary() -> Optional[str]:
+    """Return the installed linuxocr path: PATH, then ~/.cargo/bin. None if absent."""
+    found = shutil.which("linuxocr")
+    if found:
+        return found
+    cargo_bin = Path.home() / ".cargo" / "bin" / "linuxocr"
+    return str(cargo_bin) if cargo_bin.exists() else None
+
+
+def linuxocr_source() -> Path:
+    """Path to the linuxocr Python script in the repo (for `paniolo setup`)."""
+    return Path(__file__).parent.parent.parent / "ocr" / "linuxocr"
+
+
+def install_linuxocr(dest: Path) -> None:
+    """Copy ocr/linuxocr to `dest` and make it executable (used by `paniolo setup`)."""
+    import shutil as _shutil
+    source = linuxocr_source()
+    if not source.exists():
+        raise FileNotFoundError(f"linuxocr source not found: {source}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    _shutil.copy2(source, dest)
+    dest.chmod(0o755)
+
+
+def ocr_binary() -> Optional[str]:
+    """Return the platform OCR binary: visionocr on macOS, linuxocr on Linux."""
+    if sys.platform == "darwin":
+        return visionocr_binary()
+    return linuxocr_binary()
+
+
 def read_text(png: bytes, fast: bool = False, as_json: bool = False) -> str:
-    """OCR PNG bytes and return recognized text (or JSON with bboxes)."""
-    binary = visionocr_binary()
+    """OCR PNG bytes and return recognized text (or JSON with bboxes).
+
+    `fast` is only meaningful on macOS (visionocr --fast); ignored on Linux.
+    `as_json` requests bounding-box JSON output; not yet supported on Linux.
+    """
+    binary = ocr_binary()
     if not binary:
-        raise FileNotFoundError("visionocr not installed — run: paniolo setup")
+        platform = "macOS" if sys.platform == "darwin" else "Linux"
+        tool = "visionocr" if sys.platform == "darwin" else "linuxocr"
+        raise FileNotFoundError(f"{tool} not installed on {platform} — run: paniolo setup")
     cmd = [binary]
-    if fast:
-        cmd.append("--fast")
-    if as_json:
-        cmd.append("--json")
+    if sys.platform == "darwin":
+        if fast:
+            cmd.append("--fast")
+        if as_json:
+            cmd.append("--json")
     cmd.append("-")
     result = subprocess.run(cmd, input=png, capture_output=True)
     if result.returncode != 0:
-        raise RuntimeError(result.stderr.decode(errors="replace").strip() or "visionocr failed")
+        raise RuntimeError(result.stderr.decode(errors="replace").strip() or f"{binary} failed")
     return result.stdout.decode(errors="replace")
