@@ -330,44 +330,49 @@ def video_setup(
     console.print(f"[green]Video device configured:[/green] {device}")
 
 
+def _start_video_daemon(cfg: "_video.VideoConfig", port: int) -> str:
+    """Start the hdmicap daemon and wait for it to come up. Returns the URL.
+
+    Raises typer.Exit on failure."""
+    binary = _video.hdmicap_binary()
+    if not binary:
+        err.print("[red]hdmicap not found.[/red] Run: paniolo setup")
+        raise typer.Exit(1)
+    ocr_bin = _ocr.visionocr_binary()
+    _video.start_daemon(cfg, port, ocr_bin=ocr_bin)
+    for _ in range(50):
+        time.sleep(0.1)
+        url = _video.daemon_url()
+        if url:
+            return url
+    err.print("[red]Video daemon did not start within 5 s.[/red]")
+    raise typer.Exit(1)
+
+
 @video_app.command("watch")
 def video_watch(
     port: Annotated[int, typer.Option("--port")] = 8723,
+    restart: Annotated[bool, typer.Option("--restart")] = False,
 ) -> None:
-    """Start the hdmicap daemon in the background."""
+    """Start the hdmicap daemon in the background.
+
+    Use --restart to force-restart a running (but possibly stalled) daemon."""
     cfg = _video.load_video_config()
     if not cfg:
         err.print("[red]No video device configured.[/red] Run: paniolo video setup")
         raise typer.Exit(1)
 
     url = _video.daemon_url()
-    if url:
+    if url and not restart:
         console.print(f"[dim]Daemon already running at[/dim] {url}")
         return
+    if url and restart:
+        _video.stop_daemon()
+        time.sleep(1)
 
-    binary = _video.hdmicap_binary()
-    if not binary:
-        err.print("[red]hdmicap not found.[/red] Build: cargo build --release in hdmicap/")
-        raise typer.Exit(1)
-
-    # Resolve (build if needed) the Vision OCR tool so the dashboard's OCR
-    # button works; harmless if unavailable (the /ocr endpoint just 501s).
-    ocr_bin = _ocr.visionocr_binary()
-    _video.start_daemon(cfg, port, ocr_bin=ocr_bin)
-    console.print("[dim]Starting daemon…[/dim]")
-
-    url = None
-    for _ in range(50):
-        time.sleep(0.1)
-        url = _video.daemon_url()
-        if url:
-            break
-
-    if url:
-        console.print(f"[green]Daemon started.[/green] Preview at {url}")
-    else:
-        err.print("[red]Daemon did not start within 5 s.[/red]")
-        raise typer.Exit(1)
+    console.print("[dim]Starting video daemon…[/dim]")
+    url = _start_video_daemon(cfg, port)
+    console.print(f"[green]Daemon started.[/green] Preview at {url}")
 
 
 @video_app.command("preview")

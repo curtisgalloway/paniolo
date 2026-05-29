@@ -47,8 +47,12 @@ pub enum Signal {
 /// Immutable snapshot of "what's on screen right now", shared via `watch`.
 #[derive(Clone)]
 pub struct FrameState {
-    /// Decoded RGB8. `Arc<[u8]>` so handlers share without copying; PNG/JPEG
-    /// encode happens lazily downstream.
+    /// Raw JPEG/MJPEG bytes as delivered by the capture device. Present when
+    /// the device natively delivers MJPEG (always on Linux). The preview
+    /// endpoint serves these directly — no server-side decode/re-encode.
+    pub jpeg: Option<Arc<[u8]>>,
+    /// Decoded RGB8, populated when jpeg is None (YUYV sources) or on demand
+    /// for snapshot/OCR. Empty slice when not available.
     pub rgb: Arc<[u8]>,
     pub width: u32,
     pub height: u32,
@@ -65,6 +69,7 @@ pub struct FrameState {
 impl FrameState {
     pub fn no_device() -> Self {
         FrameState {
+            jpeg: None,
             rgb: Arc::from(Vec::new().into_boxed_slice()),
             width: 0,
             height: 0,

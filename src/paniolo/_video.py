@@ -116,8 +116,13 @@ def guess_capture_device(devices: list[dict]) -> Optional[dict]:
 
 
 def _discovery_path() -> Path:
-    """Path where hdmicap writes its daemon.json discovery file."""
-    return Path(tempfile.gettempdir()) / "hdmicap" / "daemon.json"
+    """Path where hdmicap writes its daemon.json discovery file.
+
+    Mirrors hdmicap/src/daemon.rs::runtime_dir(): prefer $XDG_RUNTIME_DIR
+    (set by systemd on Linux), fall back to tempfile.gettempdir().
+    """
+    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    return Path(base) / "hdmicap" / "daemon.json"
 
 
 def read_discovery() -> Optional[dict]:
@@ -164,3 +169,13 @@ def start_daemon(
         start_new_session=True,
         env=env,
     )
+
+
+def stop_daemon() -> bool:
+    """Ask the running hdmicap daemon to stop. Returns True if it was running."""
+    binary = hdmicap_binary()
+    if not binary:
+        return False
+    result = subprocess.run([binary, "stop"], check=False,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return result.returncode == 0

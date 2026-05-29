@@ -16,11 +16,20 @@ configured, the name can be omitted.
 ## First-time setup
 
 ```
-paniolo setup
+cd ~/src/paniolo
+uv tool install .          # installs the `paniolo` CLI into ~/.local/bin
+paniolo setup              # installs dnsmasq, tftp-now, hdmicap, serialcap, visionocr
 ```
 
-Installs the required tools and builds paniolo's helper daemons into
-`~/.cargo/bin`. Run once per machine. Make sure `~/.cargo/bin` is on your `PATH`.
+`uv tool install .` is required first — without it the `paniolo` command doesn't
+exist yet. Run both steps once per machine. Make sure `~/.local/bin` (uv tools)
+and `~/.cargo/bin` (Rust daemons) are on your `PATH`.
+
+To pick up Python code changes after pulling or editing:
+
+```
+cd ~/src/paniolo && uv tool install --reinstall .
+```
 
 ## Configure a target
 

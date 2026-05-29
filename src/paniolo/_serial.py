@@ -112,8 +112,13 @@ def serialcap_binary() -> Optional[str]:
 
 
 def _discovery_path() -> Path:
-    """Path where serialcap writes its daemon.json discovery file."""
-    return Path(tempfile.gettempdir()) / "serialcap" / "daemon.json"
+    """Path where serialcap writes its daemon.json discovery file.
+
+    Mirrors serialcap/src/daemon.rs::runtime_dir(): prefer $XDG_RUNTIME_DIR
+    (set by systemd on Linux), fall back to tempfile.gettempdir().
+    """
+    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    return Path(base) / "serialcap" / "daemon.json"
 
 
 def read_discovery() -> Optional[dict]:

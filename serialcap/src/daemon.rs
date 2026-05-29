@@ -119,10 +119,12 @@ pub fn run(interfaces: Vec<InterfaceSpec>, port: u16, buffer_lines: u64) -> Resu
         // in-flight requests a brief grace period, then hard-exit (the OS
         // releases the serial port).
         let disc = discovery_path()?;
+        let lock = lock_path()?;
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
                 shutdown_signal().await;
                 let _ = fs::remove_file(&disc);
+                let _ = fs::remove_file(&lock);
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 info!("daemon shut down");
                 std::process::exit(0);

@@ -30,6 +30,8 @@ use axum::{
 use bytes::Bytes;
 use image::codecs::jpeg::JpegEncoder;
 use image::{ImageBuffer, ImageEncoder, Rgb};
+#[cfg(target_os = "linux")]
+use turbojpeg;
 use serde::Deserialize;
 use tokio::sync::watch;
 
@@ -138,10 +140,22 @@ async fn snapshot(State(s): State<AppState>, Query(q): Query<SnapReq>) -> Respon
     }
 }
 
-/// Encode the RGB buffer to PNG bytes. Shared by /snapshot and /ocr.
+/// Decode the frame to an RGB image. On the Linux MJPEG path `rgb` is empty
+/// and we decode `jpeg` with turbojpeg. On other paths `rgb` is pre-decoded.
+fn decode_rgb(f: &FrameState) -> Option<ImageBuffer<Rgb<u8>, Vec<u8>>> {
+    if !f.rgb.is_empty() {
+        return ImageBuffer::from_raw(f.width, f.height, f.rgb.to_vec());
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(ref jpeg) = f.jpeg {
+        return turbojpeg::decompress_image::<Rgb<u8>>(jpeg).ok();
+    }
+    None
+}
+
+/// Encode the frame to PNG bytes. Shared by /snapshot and /ocr.
 fn encode_png(f: &FrameState) -> Option<Vec<u8>> {
-    let img: ImageBuffer<Rgb<u8>, _> =
-        ImageBuffer::from_raw(f.width, f.height, f.rgb.to_vec())?;
+    let img = decode_rgb(f)?;
     let mut bytes = Vec::new();
     img.write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
         .ok()?;
@@ -195,7 +209,9 @@ fn png_response(f: &FrameState, timed_out: bool) -> Response {
 
 /// multipart/x-mixed-replace MJPEG stream for the human browser preview.
 /// Reads the same warm buffer as /snapshot — zero device contention.
-/// Throttled to ~15 fps; JPEG quality 80 is fine for a monitoring preview.
+/// When raw JPEG bytes are available (Linux MJPEG path), they are served
+/// directly with zero server-side decode or re-encode. Otherwise we re-encode
+/// from the decoded RGB buffer at quality 80.
 async fn preview(State(s): State<AppState>) -> Response {
     let mut frames = s.frames.clone();
 
@@ -211,25 +227,31 @@ async fn preview(State(s): State<AppState>) -> Response {
                 continue;
             }
 
-            let img: ImageBuffer<Rgb<u8>, _> =
-                match ImageBuffer::from_raw(f.width, f.height, f.rgb.to_vec()) {
-                    Some(i) => i,
-                    None => continue,
-                };
-
-            let mut jpeg_bytes = Vec::new();
-            let encoder = JpegEncoder::new_with_quality(Cursor::new(&mut jpeg_bytes), 80);
-            if encoder
-                .write_image(
-                    img.as_raw(),
-                    img.width(),
-                    img.height(),
-                    image::ExtendedColorType::Rgb8,
-                )
-                .is_err()
-            {
-                continue;
-            }
+            // Fast path: raw JPEG bytes from the device — no decode/re-encode.
+            let jpeg_bytes: Vec<u8> = if let Some(ref raw) = f.jpeg {
+                raw.to_vec()
+            } else {
+                // Fallback: re-encode from decoded RGB (macOS / YUYV path).
+                let img: ImageBuffer<Rgb<u8>, _> =
+                    match ImageBuffer::from_raw(f.width, f.height, f.rgb.to_vec()) {
+                        Some(i) => i,
+                        None => continue,
+                    };
+                let mut buf = Vec::new();
+                let encoder = JpegEncoder::new_with_quality(Cursor::new(&mut buf), 80);
+                if encoder
+                    .write_image(
+                        img.as_raw(),
+                        img.width(),
+                        img.height(),
+                        image::ExtendedColorType::Rgb8,
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+                buf
+            };
 
             let part_header = format!(
                 "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",

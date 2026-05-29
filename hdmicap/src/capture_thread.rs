@@ -19,6 +19,7 @@
 //! must not sit on the async runtime. `watch::Sender::send` is sync, so the
 //! thread publishes freely.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,7 +27,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::capture::{CaptureBackend, DeviceSpec, NokhwaBackend};
+use crate::capture::{open_backend, DeviceSpec};
 use crate::frame::{ahash, is_no_signal, FrameState, Signal, STABLE_FRAMES};
 
 pub type FrameRx = watch::Receiver<Arc<FrameState>>;
@@ -47,7 +48,7 @@ fn capture_loop(spec: DeviceSpec, tx: watch::Sender<Arc<FrameState>>) {
     // Reconnect loop: if the device is absent or vanishes mid-run, publish
     // NoDevice and keep retrying so hot-plug just works.
     loop {
-        let mut backend = match NokhwaBackend::open(&spec) {
+        let mut backend = match open_backend(&spec) {
             Ok(b) => {
                 info!("capture device opened");
                 b
@@ -58,14 +59,61 @@ fn capture_loop(spec: DeviceSpec, tx: watch::Sender<Arc<FrameState>>) {
                 if all_receivers_gone(&tx) {
                     return;
                 }
-                thread::sleep(Duration::from_millis(750));
+                // Brief pause before retry. The MS2109 firmware needs time to
+                // reset its isochronous endpoint state after a stream stop;
+                // immediately reopening can catch it mid-reset and cause stalls.
+                thread::sleep(Duration::from_secs(1));
                 continue;
             }
         };
 
+        // Watchdog: fallback for any stall the v4l timeout doesn't catch.
+        // The cancel flag is set when we exit the inner loop normally so the
+        // watchdog doesn't fire across reconnect iterations.
+        let frame_count = Arc::new(AtomicU64::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        {
+            let frame_count = frame_count.clone();
+            let cancelled = cancelled.clone();
+            thread::Builder::new()
+                .name("stall-watchdog".into())
+                .spawn(move || {
+                    const GRACE: Duration = Duration::from_secs(12);
+                    const POLL: Duration = Duration::from_secs(4);
+                    thread::sleep(GRACE);
+                    if cancelled.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let mut prev = frame_count.load(Ordering::Relaxed);
+                    if prev == 0 {
+                        warn!("no frames in {GRACE:?} after device open — exiting for restart");
+                        std::process::exit(1);
+                    }
+                    loop {
+                        thread::sleep(POLL);
+                        if cancelled.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let cur = frame_count.load(Ordering::Relaxed);
+                        if cur == prev {
+                            warn!("capture stalled ({POLL:?} with no new frames) — exiting for restart");
+                            std::process::exit(1);
+                        }
+                        prev = cur;
+                    }
+                })
+                .ok();
+        }
+
         let mut last_dims = (0u32, 0u32);
         let mut epoch = 0u64;
         let mut stable_count = 0u32;
+        let mut last_hash = 0u64;
+        let mut frame_start = Instant::now();
+        // Consecutive decode errors. Transient errors (bad buffer after open,
+        // UVC flush frames) are tolerated; only a sustained run triggers reconnect.
+        let mut consecutive_errors = 0u32;
+        const MAX_CONSECUTIVE_ERRORS: u32 = 8;
 
         loop {
             if all_receivers_gone(&tx) {
@@ -73,16 +121,26 @@ fn capture_loop(spec: DeviceSpec, tx: watch::Sender<Arc<FrameState>>) {
                 return;
             }
 
-            let img = match backend.frame() {
-                Ok(img) => img,
+            let captured = match backend.frame() {
+                Ok(f) => {
+                    consecutive_errors = 0;
+                    f
+                }
                 Err(e) => {
-                    // A dropped frame is normal during mode switches; only
-                    // treat a sustained failure as device loss.
-                    warn!("frame error: {e:#}");
-                    let _ = tx.send(Arc::new(FrameState::no_device()));
-                    break; // fall back to the reconnect loop
+                    consecutive_errors += 1;
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        warn!("frame error ({consecutive_errors} consecutive): {e:#}");
+                        cancelled.store(true, Ordering::Relaxed);
+                        let _ = tx.send(Arc::new(FrameState::no_device()));
+                        break;
+                    }
+                    // Transient: skip this frame and try again.
+                    tracing::debug!("transient frame error (#{consecutive_errors}): {e:#}");
+                    continue;
                 }
             };
+            let jpeg = captured.jpeg;
+            let img = captured.rgb;
 
             let (w, h) = (img.width(), img.height());
 
@@ -90,12 +148,18 @@ fn capture_loop(spec: DeviceSpec, tx: watch::Sender<Arc<FrameState>>) {
                 epoch += 1;
                 stable_count = 0;
                 last_dims = (w, h);
+                last_hash = 0;
                 info!("resolution -> {w}x{h} (epoch {epoch})");
             }
 
             let hash = ahash(&img);
 
-            let signal = if is_no_signal(&img) {
+            // Skip the expensive per-pixel is_no_signal scan when the frame
+            // hash is unchanged and we're already Stable — static screens cost
+            // almost nothing after the first pass.
+            let signal = if hash == last_hash && stable_count >= STABLE_FRAMES {
+                Signal::Stable
+            } else if is_no_signal(&img) {
                 stable_count = 0;
                 Signal::NoSignal
             } else if stable_count < STABLE_FRAMES {
@@ -105,16 +169,24 @@ fn capture_loop(spec: DeviceSpec, tx: watch::Sender<Arc<FrameState>>) {
                 Signal::Stable
             };
 
-            // Some backends (e.g. nokhwa's AVFoundation YUYV decoder) emit a
-            // buffer with stride padding beyond width*height*3. Trim to exact
-            // size so PNG and JPEG encoders don't assert on the extra bytes.
-            let expected = w as usize * h as usize * 3;
-            let mut raw = img.into_raw();
-            raw.truncate(expected);
-            let rgb: Arc<[u8]> = Arc::from(raw.into_boxed_slice());
+            last_hash = hash;
+            frame_count.fetch_add(1, Ordering::Relaxed);
+
+            // When raw JPEG bytes are available (Linux MJPEG path), store them
+            // for zero-cost preview serving. The RGB is kept for snapshot/OCR
+            // but only when JPEG is absent (YUYV or macOS paths).
+            let (jpeg_arc, rgb_arc) = if let Some(j) = jpeg {
+                (Some(j), Arc::from([] as [u8; 0]) as Arc<[u8]>)
+            } else {
+                let expected = w as usize * h as usize * 3;
+                let mut raw = img.into_raw();
+                raw.truncate(expected);
+                (None, Arc::from(raw.into_boxed_slice()) as Arc<[u8]>)
+            };
 
             let _ = tx.send(Arc::new(FrameState {
-                rgb,
+                jpeg: jpeg_arc,
+                rgb: rgb_arc,
                 width: w,
                 height: h,
                 hash,
@@ -122,6 +194,15 @@ fn capture_loop(spec: DeviceSpec, tx: watch::Sender<Arc<FrameState>>) {
                 resolution_epoch: epoch,
                 captured_at: Instant::now(),
             }));
+
+            // Cap to TARGET_FPS. MJPEG decode is ~50ms/frame in software, so
+            // 10fps is a reasonable ceiling until the hot path uses lazy decode.
+            const TARGET_INTERVAL: Duration = Duration::from_millis(1000 / 10);
+            let elapsed = frame_start.elapsed();
+            if elapsed < TARGET_INTERVAL {
+                thread::sleep(TARGET_INTERVAL - elapsed);
+            }
+            frame_start = Instant::now();
         }
     }
 }

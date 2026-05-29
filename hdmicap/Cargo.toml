@@ -14,6 +14,11 @@ path = "src/main.rs"
 # nokhwa unifies V4L2 (Linux) and AVFoundation (macOS) behind one API.
 # `input-native` pulls the right per-OS backend in recent 0.10.x.
 nokhwa = { version = "0.10", features = ["input-native"] }
+# On Linux we bypass nokhwa for the actual frame loop and use v4l directly
+# so we can call stream.set_timeout() and avoid an indefinite VIDIOC_DQBUF block.
+[target.'cfg(target_os = "linux")'.dependencies]
+v4l = "0.14"
+turbojpeg = { version = "1.4", features = ["image"] }
 
 # --- Async runtime + HTTP ------------------------------------------------
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "net", "process", "io-util"] }
