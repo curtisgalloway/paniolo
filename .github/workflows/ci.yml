@@ -66,6 +66,27 @@ jobs:
       - name: Test
         run: cargo test
 
+  netbootd:
+    name: netbootd (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: netbootd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: netbootd
+      - name: Format check
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+
   hdmicap-linux:
     name: hdmicap (Linux, V4L2 build)
     runs-on: ubuntu-latest

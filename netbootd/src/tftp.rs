@@ -159,8 +159,10 @@ fn bind_reply_socket(host_ip: Ipv4Addr, interface: Option<&str>) -> Result<UdpSo
 
     #[cfg(target_os = "macos")]
     {
-        // Pin egress to the interface, then bind a wildcard ephemeral port so we
-        // do not depend on the interface IP being present at this instant.
+        // Egress is pinned via IP_BOUND_IF, not the bind address, so host_ip is
+        // unused here. Bind a wildcard ephemeral port so we do not depend on the
+        // interface IP being present at this instant.
+        let _ = host_ip;
         if let Some(iface) = interface {
             if let Err(e) = bind_socket_to_interface(&sock, iface) {
                 warn!("IP_BOUND_IF {iface} failed: {e}");
@@ -260,11 +262,23 @@ async fn handle_rrq(
         }
     };
     let Some(rrq) = parse_rrq(&data) else {
-        let _ = send_pkt(&sock, &error_packet(ERR_ILLEGAL, "malformed request"), peer, &xfer).await;
+        let _ = send_pkt(
+            &sock,
+            &error_packet(ERR_ILLEGAL, "malformed request"),
+            peer,
+            &xfer,
+        )
+        .await;
         return;
     };
     if rrq.mode != "octet" {
-        let _ = send_pkt(&sock, &error_packet(ERR_ILLEGAL, "unsupported mode"), peer, &xfer).await;
+        let _ = send_pkt(
+            &sock,
+            &error_packet(ERR_ILLEGAL, "unsupported mode"),
+            peer,
+            &xfer,
+        )
+        .await;
         return;
     }
 
@@ -272,7 +286,13 @@ async fn handle_rrq(
         Some(p) if p.is_file() => p,
         _ => {
             info!("RRQ {} from {peer} -> NOT FOUND", rrq.filename);
-            let _ = send_pkt(&sock, &error_packet(ERR_NOT_FOUND, "file not found"), peer, &xfer).await;
+            let _ = send_pkt(
+                &sock,
+                &error_packet(ERR_NOT_FOUND, "file not found"),
+                peer,
+                &xfer,
+            )
+            .await;
             return;
         }
     };
@@ -281,7 +301,13 @@ async fn handle_rrq(
         Ok(c) => c,
         Err(e) => {
             warn!("read {}: {e}", path.display());
-            let _ = send_pkt(&sock, &error_packet(ERR_NOT_FOUND, "read error"), peer, &xfer).await;
+            let _ = send_pkt(
+                &sock,
+                &error_packet(ERR_NOT_FOUND, "read error"),
+                peer,
+                &xfer,
+            )
+            .await;
             return;
         }
     };
@@ -330,7 +356,10 @@ async fn handle_rrq(
         match send_and_wait_ack(&sock, &packet, peer, block, &xfer).await {
             Ok(true) => {}
             _ => {
-                warn!("transfer of {} to {peer} failed at block {block}", rrq.filename);
+                warn!(
+                    "transfer of {} to {peer} failed at block {block}",
+                    rrq.filename
+                );
                 return;
             }
         }
@@ -348,8 +377,9 @@ fn bind_server(port: u16) -> Result<UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_reuse_address(true)?;
     let addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
-    sock.bind(&addr.into())
-        .with_context(|| format!("bind TFTP port {port} (need root/CAP_NET_BIND_SERVICE on Linux)"))?;
+    sock.bind(&addr.into()).with_context(|| {
+        format!("bind TFTP port {port} (need root/CAP_NET_BIND_SERVICE on Linux)")
+    })?;
     sock.set_nonblocking(true)?;
     Ok(UdpSocket::from_std(sock.into())?)
 }
@@ -398,9 +428,7 @@ pub async fn serve(
                 let data = buf[..n].to_vec();
                 let root = root.clone();
                 let interface = interface.clone();
-                tokio::spawn(
-                    async move { handle_rrq(root, data, peer, interface, xfer).await },
-                );
+                tokio::spawn(async move { handle_rrq(root, data, peer, interface, xfer).await });
             }
             OP_WRQ => {
                 // Read-only server: reject writes.

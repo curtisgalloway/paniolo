@@ -32,7 +32,6 @@
 
 mod bpf;
 mod dhcp;
-mod frame;
 mod netcfg;
 mod tftp;
 
@@ -75,13 +74,11 @@ struct Cli {
 async fn main() -> Result<()> {
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_writer(std::io::stderr)
         .finish();
-    tracing::subscriber::set_global_default(subscriber)
-        .context("install tracing subscriber")?;
+    tracing::subscriber::set_global_default(subscriber).context("install tracing subscriber")?;
 
     let cli = Cli::parse();
 
@@ -89,12 +86,26 @@ async fn main() -> Result<()> {
         anyhow::bail!("TFTP root {} does not exist", cli.tftp_root.display());
     }
 
+    // Refuse to run on a primary NIC: netbootd reconfigures its interface to the
+    // static host IP, which would clobber the host's real networking. The
+    // netboot link must be a dedicated secondary interface.
+    if let Some(iface) = cli.interface.as_deref() {
+        if netcfg::is_primary_interface(iface) {
+            anyhow::bail!(
+                "refusing to run on {iface}: it carries the system default route \
+                 (a primary NIC). netboot would force {} onto it and break host \
+                 networking. Use a dedicated USB-Ethernet adapter.",
+                cli.host_ip
+            );
+        }
+    }
+
     info!(
         host_ip = %cli.host_ip,
         tftp_root = %cli.tftp_root.display(),
         boot_file = cli.boot_file,
         interface = cli.interface.as_deref().unwrap_or("-"),
-        "netbootd starting (PoC, no BPF path)"
+        "netbootd starting"
     );
 
     // Optional interface-IP enforcement (matches _dhcp.py's monitor thread).
@@ -106,13 +117,12 @@ async fn main() -> Result<()> {
     // In-process DHCP→TFTP client-MAC handoff (replaces the on-disk file).
     let (mac_tx, mac_rx) = tokio::sync::watch::channel::<Option<[u8; 6]>>(None);
 
-    // Raw-frame sender: only opened on macOS (Linux uses the kernel send path,
-    // matching the Python servers). Constructed unconditionally as a type, so
-    // the TFTP call sites stay compiled and checked on every platform.
-    let bpf = Arc::new(match (cfg!(target_os = "macos"), cli.interface.as_deref()) {
-        (true, Some(iface)) => bpf::BpfSender::new(iface),
-        _ => bpf::BpfSender::unavailable(),
-    });
+    // Raw-frame sender: on macOS the bound /dev/bpf descriptor is obtained from
+    // the setuid-root helper via SCM_RIGHTS (netbootd itself stays unprivileged).
+    // Linux uses the kernel send path, matching the Python servers. Constructed
+    // unconditionally as a type, so the TFTP call sites stay compiled and checked
+    // on every platform.
+    let bpf = Arc::new(build_bpf_sender(cli.interface.as_deref()));
 
     let dhcp = tokio::spawn(dhcp::serve(
         cli.host_ip,
@@ -148,4 +158,48 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Construct the raw-frame sender. On macOS, request a bound `/dev/bpf`
+/// descriptor from the privileged helper and pair it with the interface's MAC
+/// (read here, unprivileged). Any failure — no interface, helper missing, helper
+/// error — is non-fatal: we log it and return an inert sender so TFTP falls back
+/// to the kernel `send_to` path, exactly as on Linux.
+fn build_bpf_sender(interface: Option<&str>) -> bpf::BpfSender {
+    #[cfg(target_os = "macos")]
+    {
+        let Some(iface) = interface else {
+            return bpf::BpfSender::unavailable();
+        };
+        let Some(src_mac) = mac_of(iface) else {
+            error!("no MAC address for {iface}; BPF disabled, using kernel send_to");
+            return bpf::BpfSender::unavailable();
+        };
+        match netbootd::handoff::request_bpf_fd(iface) {
+            Ok(fd) => bpf::BpfSender::from_handoff(fd, src_mac),
+            Err(e) => {
+                error!(
+                    "BPF handoff failed ({e}); falling back to kernel send_to. \
+                     Install the privileged helper with `paniolo setup`."
+                );
+                bpf::BpfSender::unavailable()
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = interface;
+        bpf::BpfSender::unavailable()
+    }
+}
+
+/// Read an interface's hardware (MAC) address. Unprivileged — no `/dev/bpf`
+/// involved.
+#[cfg(target_os = "macos")]
+fn mac_of(iface: &str) -> Option<[u8; 6]> {
+    pnet_datalink::interfaces()
+        .into_iter()
+        .find(|i| i.name == iface)
+        .and_then(|i| i.mac)
+        .map(|m| [m.0, m.1, m.2, m.3, m.4, m.5])
 }

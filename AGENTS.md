@@ -266,17 +266,65 @@ This is needed because SSH non-interactive shells often lack those dirs in PATH.
 **`_sudo_prefix()`** is empty on macOS (ports 67/69 bind rootless on 10.14+) and
 `["sudo", "env", "PYTHONUNBUFFERED=1"]` on Linux (privileged ports need root).
 
-**`start(cfg)`** flow: guard (`is_netboot_running`) → `check_deps` (no-op) →
-validate `tftp_root` → clean up stale pids → configure interface (`ifconfig`
-on macOS / `ip addr` on Linux) → tune ARP for the silent client → spawn
-`python -m paniolo._dhcp <host_ip> --interface <iface>` and
-`python -m paniolo._tftp <host_ip> <tftp_root> --interface <iface>` (with the
-sudo prefix on Linux), logging both to `netboot.log` → save state. The DHCP
-server sets both `siaddr` and DHCP option 66 to `host_ip`; the RPi 5 EEPROM
-prefers option 66 but both are set for older firmware.
+**`start(cfg, engine="python")`** flow: validate engine → guard
+(`is_netboot_running`) → `check_deps` (no-op) → validate `tftp_root` →
+**refuse if `cfg.interface` is a primary NIC** (`_is_primary_interface`, see
+below) → clean up stale pids → configure interface (`ifconfig` on macOS /
+`ip addr` on Linux) → tune ARP for the silent client → spawn the engine →
+save state. The DHCP server sets both `siaddr` and DHCP option 66 to `host_ip`;
+the RPi 5 EEPROM prefers option 66 but both are set for older firmware.
 
-**`stop(target)`** sends SIGTERM to both PIDs (escalating to `sudo kill` on
-PermissionError), waits up to 3 s, then restores the interface and removes state.
+- **`engine="python"`** (default): spawns `python -m paniolo._dhcp …` and
+  `python -m paniolo._tftp …` (with the sudo prefix on Linux), logging both to
+  `netboot.log`. State stores both PIDs.
+- **`engine="rust"`** (`_start_rust`): spawns the single installed `netbootd`
+  binary serving DHCP+TFTP (`NO_COLOR=1` so tracing output stays parseable).
+  Both `*_pid` fields hold the one netbootd PID; `NetbootState.engine="rust"`.
+  Resolved via `_resolve_netbootd()` (PATH then `~/.cargo/bin`). See the
+  **netbootd** section below.
+
+**Primary-NIC guard.** `_default_route_interface()` reads the default-route
+interface (`route -n get default` on macOS, `ip route show default` on Linux);
+`_is_primary_interface(iface)` is true when they match. `start()` refuses such
+an interface for **both** engines, because reconfiguring it to the static
+`host_ip` would clobber the host's real networking. The netboot link must be a
+dedicated secondary (USB-Ethernet) interface. netbootd enforces the same guard
+itself (see below).
+
+**`stop(target)`** sends SIGTERM to the PID(s) (escalating to `sudo kill` on
+PermissionError), waits up to 3 s, then restores the interface and removes
+state. `_cleanup_stale` matches the process cmdline against `paniolo._dhcp`/
+`paniolo._tftp` (python) or `netbootd` (rust), per `state.engine`.
+
+## netbootd (Rust netboot engine, experimental)
+
+`netbootd/` is a single-binary Rust port of `_dhcp.py` + `_tftp.py` — DHCP and
+read-only TFTP as tokio tasks in one process, selectable via
+`paniolo netboot start --engine rust`. The Python engine remains the default;
+this is opt-in for validation before any reconciliation.
+
+Key differences from the Python servers:
+
+- **In-process MAC handoff.** The DHCP task publishes the client's hardware
+  address to the TFTP task via `tokio::sync::watch` — no on-disk `client-mac`
+  file.
+- **Privilege-separated `/dev/bpf` on macOS.** The macOS raw-frame send path
+  (the Sequoia workaround) needs a BPF descriptor, which only root can open.
+  Rather than run the daemon as root, a tiny **setuid-root** helper —
+  `netbootd-bpf-helper` — opens `/dev/bpfN`, binds it (`BIOCSETIF`), sets
+  `BIOCSHDRCMPLT`, and passes the fd back over a `socketpair` via `SCM_RIGHTS`
+  (`src/handoff.rs`), then exits. netbootd itself runs **unprivileged** and only
+  `write(2)`s frames to the fd (`src/bpf.rs::BpfSender::from_handoff`). The
+  helper is the *only* component that runs as root; `paniolo setup` installs it
+  setuid (the one-time sudo). If the helper is missing/not-setuid, netbootd logs
+  it and falls back to the kernel `send_to` path (broken on macOS 15+).
+- **Primary-NIC guard.** `netcfg::is_primary_interface` mirrors the Python
+  guard; `main()` refuses to start, and `monitor_interface` refuses to enforce,
+  on the default-route interface.
+- **Layout.** `src/lib.rs` exposes `frame` (frame builder, unit-tested) and
+  `handoff` (BPF open + fd passing) so both the `netbootd` and
+  `netbootd-bpf-helper` binaries share them. On Linux netbootd uses the kernel
+  send path (no BPF), matching the Python behavior.
 
 ## _video.py
 
@@ -492,8 +540,10 @@ Top-level commands:
 - `paniolo power-cycle [TARGET]` — runs `cfg.power_cycle_cmd` via `subprocess.run(..., shell=True)`
 - `paniolo power-state [TARGET]` — reads power state from the serialcap daemon `/status` endpoint (requires sense signal wired)
 - `paniolo setup` — installs tftp-now (Homebrew) and builds/installs paniolo's
-  own binaries: hdmicap + serialcap (`cargo install`), visionocr (`swiftc`,
-  macOS only), and linuxocr (copied script, Linux only) — all into `~/.cargo/bin`
+  own binaries: hdmicap + serialcap + netbootd (`cargo install`), visionocr
+  (`swiftc`, macOS only), and linuxocr (copied script, Linux only) — all into
+  `~/.cargo/bin`. On macOS it then installs `netbootd-bpf-helper` **setuid-root**
+  (the one-time sudo) so the rust netboot engine's BPF path works unprivileged.
 
 ## Runtime paths
 
@@ -562,7 +612,10 @@ Paniolo runs on Linux as well as macOS. Platform differences:
   `arp -s` on macOS and `ip neigh replace ... nud permanent` on Linux.
 - **BPF raw-frame sender is macOS-only.** `BpfSender` in `_tftp.py` uses
   `/dev/bpf*` ioctls that don't exist on Linux. On Linux `available` is always
-  `False` and the server falls back to normal `sendto()` with retry.
+  `False` and the server falls back to normal `sendto()` with retry. The Python
+  server opens `/dev/bpf` in-process (needs root or `access_bpf`); the rust
+  `netbootd` engine instead receives the descriptor from the setuid
+  `netbootd-bpf-helper` and stays unprivileged (see the **netbootd** section).
 - **hdmicap build deps on Linux.** Building hdmicap requires system packages:
   `build-essential pkg-config libclang-dev clang` (for V4L2 bindgen via
   `v4l2-sys-mit`). `paniolo setup` prints a reminder.

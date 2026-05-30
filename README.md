@@ -49,11 +49,12 @@ uv tool install ~/src/paniolo
 paniolo setup          # builds hdmicap + serialcap; installs the OCR helper
 ```
 
-`paniolo setup` compiles and installs the Rust daemons (`hdmicap`, `serialcap`)
-and the OCR helper (`visionocr` on macOS via `swiftc`, `linuxocr` on Linux) into
-`~/.cargo/bin`. The DHCP and TFTP netboot servers are **pure-Python** — no
-external servers to install. (On macOS, `setup` also installs the legacy
-`tftp-now` via Homebrew.)
+`paniolo setup` compiles and installs the Rust daemons (`hdmicap`, `serialcap`,
+`netbootd`) and the OCR helper (`visionocr` on macOS via `swiftc`, `linuxocr` on
+Linux) into `~/.cargo/bin`. The default DHCP and TFTP netboot servers are
+**pure-Python** — no external servers to install. (On macOS, `setup` also
+installs the legacy `tftp-now` via Homebrew, and installs `netbootd-bpf-helper`
+setuid-root — one sudo — for the experimental `--engine rust` netboot path.)
 
 To pick up code changes after pulling or editing:
 
@@ -61,6 +62,7 @@ To pick up code changes after pulling or editing:
 uv tool install --reinstall ~/src/paniolo
 cargo install --path ~/src/paniolo/hdmicap    # if hdmicap changed
 cargo install --path ~/src/paniolo/serialcap  # if serialcap changed
+cargo install --path ~/src/paniolo/netbootd   # if netbootd changed (re-run `paniolo setup` to re-setuid the helper on macOS)
 ```
 
 For the USB HID commands, install the optional `pyserial` extra:

@@ -165,8 +165,9 @@ fn bind_server(port: u16) -> Result<UdpSocket> {
     sock.set_reuse_address(true)?;
     sock.set_broadcast(true)?;
     let addr: std::net::SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
-    sock.bind(&addr.into())
-        .with_context(|| format!("bind DHCP port {port} (need root/CAP_NET_BIND_SERVICE on Linux)"))?;
+    sock.bind(&addr.into()).with_context(|| {
+        format!("bind DHCP port {port} (need root/CAP_NET_BIND_SERVICE on Linux)")
+    })?;
     sock.set_nonblocking(true)?;
     Ok(UdpSocket::from_std(sock.into())?)
 }
@@ -227,9 +228,9 @@ pub async fn serve(
             continue;
         }
         match reply_type {
-            DHCP_OFFER => info!(
-                "DHCPOFFER -> {mac}  ip={ASSIGNED_IP}  tftp={host_ip}  file={boot_file}"
-            ),
+            DHCP_OFFER => {
+                info!("DHCPOFFER -> {mac}  ip={ASSIGNED_IP}  tftp={host_ip}  file={boot_file}")
+            }
             _ => info!("DHCPACK -> {mac}  ip={ASSIGNED_IP}"),
         }
     }

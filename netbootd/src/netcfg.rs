@@ -24,6 +24,46 @@ use std::time::Duration;
 
 use tracing::warn;
 
+/// The interface carrying the system default route, if any.
+///
+/// - macOS: `route -n get default` emits a line `  interface: en0`.
+/// - Linux: `ip route show default` emits `default via <gw> dev en0 ...`.
+fn default_route_interface() -> Option<String> {
+    if cfg!(target_os = "macos") {
+        let out = Command::new("route")
+            .args(["-n", "get", "default"])
+            .output()
+            .ok()?;
+        let s = String::from_utf8_lossy(&out.stdout);
+        s.lines()
+            .filter_map(|l| l.trim().strip_prefix("interface:"))
+            .map(|v| v.trim().to_string())
+            .next()
+    } else {
+        let out = Command::new("ip")
+            .args(["route", "show", "default"])
+            .output()
+            .ok()?;
+        let s = String::from_utf8_lossy(&out.stdout);
+        let mut toks = s.split_whitespace();
+        while let Some(tok) = toks.next() {
+            if tok == "dev" {
+                return toks.next().map(str::to_string);
+            }
+        }
+        None
+    }
+}
+
+/// Whether `interface` is a primary NIC — i.e. it carries the system default
+/// route. The netboot link must be a *dedicated secondary* interface: forcing
+/// our static `192.168.99.1` onto a primary NIC (via [`apply_interface_ip`])
+/// clobbers the host's real networking. Used to refuse that case loudly rather
+/// than silently break connectivity.
+pub fn is_primary_interface(interface: &str) -> bool {
+    default_route_interface().as_deref() == Some(interface)
+}
+
 /// Pin a static ARP/neighbor entry mapping `ip` → `mac`.
 ///
 /// The Pi netboot firmware sends DHCP/TFTP but never answers ARP, so we install
@@ -39,7 +79,14 @@ pub fn set_arp(ip: Ipv4Addr, mac: &str, interface: Option<&str>) {
     } else {
         let mut cmd = Command::new("sudo");
         cmd.args([
-            "ip", "neigh", "replace", &ip.to_string(), "lladdr", mac, "nud", "permanent",
+            "ip",
+            "neigh",
+            "replace",
+            &ip.to_string(),
+            "lladdr",
+            mac,
+            "nud",
+            "permanent",
         ]);
         if let Some(iface) = interface {
             cmd.args(["dev", iface]);
@@ -59,9 +106,7 @@ fn has_interface_ip(interface: &str, host_ip: Ipv4Addr) -> bool {
         Command::new("ifconfig")
             .arg(interface)
             .output()
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout).contains(&format!("inet {host_ip} "))
-            })
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("inet {host_ip} ")))
             .unwrap_or(false)
     } else {
         Command::new("ip")
@@ -93,12 +138,24 @@ fn apply_interface_ip(interface: &str, host_ip: Ipv4Addr) {
     let _ = if cfg!(target_os = "macos") {
         Command::new("sudo")
             .args([
-                "ifconfig", interface, &host_ip.to_string(), "netmask", "255.255.255.0", "up",
+                "ifconfig",
+                interface,
+                &host_ip.to_string(),
+                "netmask",
+                "255.255.255.0",
+                "up",
             ])
             .status()
     } else {
         Command::new("sudo")
-            .args(["ip", "addr", "add", &format!("{host_ip}/24"), "dev", interface])
+            .args([
+                "ip",
+                "addr",
+                "add",
+                &format!("{host_ip}/24"),
+                "dev",
+                interface,
+            ])
             .status()
     };
 }
@@ -110,6 +167,15 @@ fn apply_interface_ip(interface: &str, host_ip: Ipv4Addr) {
 /// NetworkManager may reset it. Poll and re-apply so the client's next retry
 /// always finds the host reachable. Runs until the task is cancelled.
 pub async fn monitor_interface(interface: String, host_ip: Ipv4Addr) {
+    // Defense in depth: never enforce a static IP on a primary NIC. main()
+    // already refuses to start in that case; this guards direct callers.
+    if is_primary_interface(&interface) {
+        warn!(
+            "{interface} carries the default route — refusing to enforce {host_ip} \
+             on a primary NIC; IP monitor disabled"
+        );
+        return;
+    }
     let mut had_ip = true;
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;

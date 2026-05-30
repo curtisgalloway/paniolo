@@ -68,6 +68,31 @@ auto-prepends `sudo` when spawning the two servers, and interface configuration
 (`ip addr add`) uses sudo as well. Configure **NOPASSWD sudo** on the control
 host for unattended agent use.
 
+**Interface safety:** `start` **refuses** an interface that carries your system
+default route (a primary NIC). netboot reconfigures the interface to the static
+`host_ip`, which would break your real networking — the netboot link must be a
+dedicated USB-Ethernet adapter.
+
+### Experimental rust engine
+
+```bash
+paniolo netboot start --engine rust [target-machine]
+```
+
+`--engine rust` launches a single `netbootd` binary (a Rust port of the two
+Python servers) instead of the `_dhcp`/`_tftp` subprocesses. The default stays
+`python`; the rust engine is **opt-in for validation** before any reconciliation.
+`stop`/`status`/`logs` follow whichever engine `start` recorded.
+
+On macOS, netbootd's raw-frame send path (the Sequoia delivery workaround) needs
+a `/dev/bpf` descriptor. Rather than run the daemon as root, `paniolo setup`
+installs a tiny **setuid-root** helper, `netbootd-bpf-helper`, whose only job is
+to open `/dev/bpf`, bind the interface, and hand the descriptor to the
+unprivileged `netbootd`. It is the only paniolo component that runs as root. If
+it is missing or not setuid, the rust engine logs a warning and falls back to
+the kernel send path (which is unreliable on macOS 15+). Run `paniolo setup`
+(one sudo) to install it.
+
 ---
 
 ## Status and logs
