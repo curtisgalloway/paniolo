@@ -32,6 +32,7 @@ orchestration or results.
 |---|---|
 | [Gap analysis](ci-integration/gap-analysis.md) | Per-primitive (power/serial/deploy/boot) × per-ecosystem (KernelCI/LAVA, Fuchsia/botanist) deltas, with the verified contract corrections. |
 | [Integration design](ci-integration/design.md) | The ecosystem-agnostic device-control API + LAVA and botanist adapters; minimum-viable vs full paths; verdict. |
+| [Related work: paniolo vs. labgrid](ci-integration/related-work.md) | How paniolo compares to the closest existing tool (labgrid), and why paniolo exists alongside it. |
 
 ## For contributors / agents
 
