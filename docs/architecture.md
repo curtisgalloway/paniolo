@@ -206,3 +206,18 @@ extension point) plus thin adapters. That design and its rationale are in
 [`ci-integration/design.md`](ci-integration/design.md) and
 [`ci-integration/gap-analysis.md`](ci-integration/gap-analysis.md); progress is tracked in
 [`requirements.md`](requirements.md).
+
+## 11. Prior art & why paniolo
+
+The closest existing tool is **labgrid** (Pengutronix) — like paniolo, a Python device-control
+layer that sits *under* a test framework and produces no verdicts of its own. labgrid is the
+mature, broad, **distributed** board-farm standard (coordinator/exporter/client over gRPC, a
+large driver catalog, multi-user reservations/locking) and is **Linux-only**. Paniolo
+deliberately occupies a different niche: a **single control host, zero-infrastructure,
+agent-in-the-loop** tool that adds capabilities labgrid lacks — on-device **OCR** of the screen,
+a **USB-HID injection** rig, and a combined video+serial dashboard — and runs first-class on
+**macOS** as well as Linux. Where the two overlap (raw-socket serial, discrete power verbs, a
+driver/protocol abstraction), labgrid's design independently *validates* the direction of
+paniolo's CI-integration work. For a multi-board, multi-user farm, labgrid is the right tool;
+paniolo targets the single-target bring-up loop it under-serves. Full comparison:
+[`ci-integration/related-work.md`](ci-integration/related-work.md).
