@@ -120,3 +120,39 @@ listener is **wire-compatible with the ser2net stream labgrid already consumes**
 could plausibly present a labgrid-compatible serial (and power) surface, positioning itself as
 the agent-friendly, OCR/HID-equipped front end over hardware that a labgrid farm also uses. This
 is recorded as a question, not a decision.
+
+---
+
+## Redfish interop (provider direction)
+
+A second, **higher-value** interop target is **Redfish** (DMTF's vendor-neutral hardware-
+management standard) — and unlike labgrid it is an *orchestrator-facing* surface, not a peer at
+paniolo's own layer. The decided direction is **provider**: paniolo exposes a Redfish API *in
+front of* BMC-less boards (so it effectively *becomes the BMC*), rather than acting as a Redfish
+client driving existing BMCs. Full design sketch: [`redfish-provider.md`](redfish-provider.md);
+tracked as **RF-\*** in [`../requirements.md`](../requirements.md) §9.6.
+
+**Why it's compelling, in brief:**
+
+- **Clean mapping for 3 of 4 primitives** onto work paniolo already has or is building:
+  `#ComputerSystem.Reset` + `PowerState` ← the discrete power verbs (PWR-1..6, already on the
+  LAVA roadmap); `Boot.BootSourceOverrideTarget=Pxe`/`Once` ← netboot; `VirtualMedia
+  Insert/Eject` ← image deploy.
+- **It subsumes adapters.** Redfish is the de-facto bare-metal control plane (Ironic's and
+  Metal3's *primary* one; LAVA can `curl` it). One Redfish face lets *anything that speaks
+  Redfish* drive a BMC-less paniolo board — potentially higher leverage than the per-ecosystem
+  LAVA/botanist adapters.
+- **Direct precedent:** **sushy-tools / sushy-emulator** already exposes Redfish in front of
+  BMC-less VMs via a pluggable systems-driver design; paniolo would be the same pattern over real
+  hardware. The recommendation is to **back a sushy-tools-style emulator with a paniolo backend
+  driver**, not hand-roll the OData service.
+- **Same serial caveat, same answer:** Redfish carries no serial bytes — `SerialConsole` only
+  advertises a separate SSH/IPMI-SOL endpoint. That's the identical control-plane/console split
+  as LAVA, botanist, and OpenBMC, so paniolo's raw-serial socket (SER-1) is the one serial answer
+  the Redfish face just points at.
+
+**labgrid vs. Redfish, as interop targets:** labgrid is **passive wire-compat** (free; a labgrid
+farm could point its existing ser2net / `ExternalPowerDriver` at paniolo with no paniolo-side
+work) and a **validation reference**. Redfish-provider is an **active build** worth doing —
+sequenced after the M1 device-control core, since it consumes the same power verbs and serial
+socket.
