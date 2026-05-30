@@ -164,11 +164,35 @@ def list_usb_ethernet_interfaces() -> list[dict]:
 
 
 
-def _spawn(cmd: list[str], log_path: Path, append: bool = False) -> subprocess.Popen:
+def _resolve_netbootd() -> str:
+    """Locate the installed netbootd binary (rust netboot engine).
+
+    Prefers the cargo-installed copy (~/.cargo/bin/netbootd, where the setuid
+    bpf-helper sits beside it), then PATH. Raises if it isn't installed.
+    """
+    found = shutil.which("netbootd")
+    if found:
+        return found
+    cargo_bin = Path.home() / ".cargo" / "bin" / "netbootd"
+    if cargo_bin.exists():
+        return str(cargo_bin)
+    raise RuntimeError(
+        "netbootd not found. Build and install it with: paniolo setup"
+    )
+
+
+def _spawn(
+    cmd: list[str],
+    log_path: Path,
+    append: bool = False,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.Popen:
     if not append:
         log_path.unlink(missing_ok=True)
     log_file = open(log_path, "a")
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    if extra_env:
+        env.update(extra_env)
     try:
         proc = subprocess.Popen(
             cmd,
@@ -221,6 +245,48 @@ def _find_network_service(interface: str) -> str | None:
             if line.split(":", 1)[1].strip() == interface:
                 return service
     return None
+
+
+def _default_route_interface() -> str | None:
+    """The interface carrying the system default route, or None.
+
+    macOS: `route -n get default` -> a line `  interface: en0`.
+    Linux: `ip route show default` -> `default via <gw> dev en0 ...`.
+    """
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.check_output(
+                ["route", "-n", "get", "default"], text=True, stderr=subprocess.DEVNULL
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return None
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("interface:"):
+                return line.split(":", 1)[1].strip()
+        return None
+    try:
+        out = subprocess.check_output(
+            ["ip", "route", "show", "default"], text=True, stderr=subprocess.DEVNULL
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    toks = out.split()
+    if "dev" in toks:
+        i = toks.index("dev")
+        if i + 1 < len(toks):
+            return toks[i + 1]
+    return None
+
+
+def _is_primary_interface(interface: str) -> bool:
+    """True if `interface` carries the system default route (a primary NIC).
+
+    netboot reconfigures its interface to the static host IP; doing that to a
+    primary NIC breaks host networking. The link must be a dedicated secondary
+    interface (a USB-Ethernet adapter).
+    """
+    return _default_route_interface() == interface
 
 
 def _configure_interface(interface: str, host_ip: str) -> None:
@@ -307,10 +373,14 @@ def _cleanup_stale(target: str) -> None:
     state = load_netboot_state(target)
     if state is None:
         return
-    for pid, module in (
-        (state.dhcp_pid, "paniolo._dhcp"),
-        (state.tftp_pid, "paniolo._tftp"),
-    ):
+    if state.engine == "rust":
+        pids_modules = ((state.dhcp_pid, "netbootd"),)
+    else:
+        pids_modules = (
+            (state.dhcp_pid, "paniolo._dhcp"),
+            (state.tftp_pid, "paniolo._tftp"),
+        )
+    for pid, module in pids_modules:
         if is_paniolo_child_alive(pid, module):
             try:
                 os.kill(pid, signal.SIGTERM)
@@ -319,7 +389,46 @@ def _cleanup_stale(target: str) -> None:
     netboot_state_path(target).unlink(missing_ok=True)
 
 
-def start(cfg: TargetConfig) -> None:
+def _start_rust(
+    cfg: TargetConfig, tftp_root: Path, log_path: Path, sudo: list[str]
+) -> None:
+    """Launch the single netbootd binary (rust engine) serving DHCP + TFTP.
+
+    On macOS netbootd runs unprivileged: ports 67/69 bind on the wildcard, and
+    its raw-frame send path gets a /dev/bpf descriptor from the setuid
+    netbootd-bpf-helper (installed by `paniolo setup`). On Linux the ports need
+    root, so _sudo_prefix prepends sudo. NO_COLOR keeps netbootd's tracing
+    output free of ANSI escapes so the log viewer can parse it.
+    """
+    netbootd = _resolve_netbootd()
+    args = [
+        netbootd,
+        "--host-ip", cfg.host_ip,
+        "--tftp-root", str(tftp_root),
+        "--interface", cfg.interface,
+    ]
+    if sudo:
+        # sudo resets the environment; inject NO_COLOR through the `env` in the
+        # sudo prefix rather than the spawned process's env.
+        proc = _spawn(sudo + ["NO_COLOR=1"] + args, log_path)
+    else:
+        proc = _spawn(args, log_path, extra_env={"NO_COLOR": "1"})
+
+    save_netboot_state(NetbootState(
+        target=cfg.name,
+        # Single process; both pid fields hold the netbootd PID (see NetbootState).
+        dhcp_pid=proc.pid,
+        tftp_pid=proc.pid,
+        started_at=time.time(),
+        interface=cfg.interface,
+        tftp_root=str(tftp_root),
+        engine="rust",
+    ))
+
+
+def start(cfg: TargetConfig, engine: str = "python") -> None:
+    if engine not in ("python", "rust"):
+        raise RuntimeError(f"unknown netboot engine '{engine}' (use python or rust)")
     if is_netboot_running(cfg.name):
         raise RuntimeError(f"netboot already running for '{cfg.name}'")
 
@@ -336,6 +445,14 @@ def start(cfg: TargetConfig) -> None:
     if not tftp_root.exists():
         raise RuntimeError(f"TFTP root does not exist: {tftp_root}")
 
+    if _is_primary_interface(cfg.interface):
+        raise RuntimeError(
+            f"refusing to start netboot on '{cfg.interface}': it carries the system "
+            "default route (your primary network interface). netboot reconfigures it "
+            f"to {cfg.host_ip} and would break host networking. Use a dedicated "
+            "USB-Ethernet adapter for the netboot link."
+        )
+
     _cleanup_stale(cfg.name)
     _configure_interface(cfg.interface, cfg.host_ip)
     _tune_arp_for_silent_client()
@@ -343,6 +460,10 @@ def start(cfg: TargetConfig) -> None:
     ensure_target_dir(cfg.name)
     log_path = netboot_log_path(cfg.name)
     sudo = _sudo_prefix()
+
+    if engine == "rust":
+        _start_rust(cfg, tftp_root, log_path, sudo)
+        return
 
     dhcp = _spawn(
         sudo + [sys.executable, "-m", "paniolo._dhcp", cfg.host_ip, "--interface", cfg.interface],
@@ -398,12 +519,27 @@ def get_status(target: str) -> dict:
     if state is None:
         return {"running": False, "target": target}
 
+    if state.engine == "rust":
+        alive = is_pid_alive(state.dhcp_pid)
+        return {
+            "running": alive,
+            "target": target,
+            "engine": "rust",
+            "netbootd_pid": state.dhcp_pid,
+            "netbootd_alive": alive,
+            "interface": state.interface,
+            "tftp_root": state.tftp_root,
+            "started_at": state.started_at,
+            "uptime_seconds": time.time() - state.started_at if alive else None,
+        }
+
     dhcp_alive = is_pid_alive(state.dhcp_pid)
     tftp_alive = is_pid_alive(state.tftp_pid)
 
     return {
         "running": dhcp_alive and tftp_alive,
         "target": target,
+        "engine": "python",
         "dhcp_pid": state.dhcp_pid,
         "dhcp_alive": dhcp_alive,
         "tftp_pid": state.tftp_pid,

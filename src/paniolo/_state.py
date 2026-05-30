@@ -33,6 +33,11 @@ class NetbootState:
     started_at: float
     interface: str
     tftp_root: str
+    # Netboot engine: "python" (the default _dhcp.py + _tftp.py subprocesses) or
+    # "rust" (the single netbootd binary serving both). For the rust engine both
+    # *_pid fields hold the one netbootd PID. Defaulted so pre-existing state
+    # files (written before the field existed) still load.
+    engine: str = "python"
 
 
 def _target_dir(target: str) -> Path:
@@ -120,10 +125,16 @@ def is_paniolo_child_alive(pid: int, module: str) -> bool:
 
 
 def is_netboot_running(target: str) -> bool:
-    """Return True only if both child processes are alive and are our processes."""
+    """Return True only if our netboot process(es) are alive.
+
+    Python engine: both the _dhcp and _tftp children must be alive. Rust engine:
+    the single netbootd process must be alive.
+    """
     state = load_netboot_state(target)
     if state is None:
         return False
+    if state.engine == "rust":
+        return is_paniolo_child_alive(state.dhcp_pid, "netbootd")
     return (
         is_paniolo_child_alive(state.dhcp_pid, "paniolo._dhcp")
         and is_paniolo_child_alive(state.tftp_pid, "paniolo._tftp")

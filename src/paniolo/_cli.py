@@ -196,11 +196,19 @@ def target_clear(
 @netboot_app.command("start")
 def netboot_start(
     target: Annotated[Optional[str], typer.Argument()] = None,
+    engine: Annotated[
+        str,
+        typer.Option(
+            "--engine",
+            help="Netboot engine: 'python' (default) or 'rust' (experimental "
+            "single-binary netbootd).",
+        ),
+    ] = "python",
 ) -> None:
     """Start DHCP + TFTP netboot for a target."""
     cfg = _resolve(target)
     try:
-        _netboot.start(cfg)
+        _netboot.start(cfg, engine=engine)
     except RuntimeError as exc:
         err.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(1)
@@ -208,8 +216,10 @@ def netboot_start(
     time.sleep(0.5)
     s = _netboot.get_status(cfg.name)
     if s["running"]:
+        label = "netbootd (rust)" if s.get("engine") == "rust" else "DHCP+TFTP"
         console.print(f"[green]Netboot started[/green] for [bold]{cfg.name}[/bold]")
-        console.print(f"  DHCP+TFTP  {cfg.interface}  ({cfg.host_ip}/24)")
+        console.print(f"  engine     {s.get('engine', 'python')}")
+        console.print(f"  {label:9.9s}  {cfg.interface}  ({cfg.host_ip}/24)")
         console.print(f"  tftp_root  {s['tftp_root']}")
         console.print(f"  log        {_state.netboot_log_path(cfg.name)}")
     else:
@@ -254,9 +264,14 @@ def netboot_status(
     t = Table(show_header=False, box=None, padding=(0, 2))
     t.add_row("target", cfg.name)
     t.add_row("status", "[green]running[/green]")
+    t.add_row("engine", s.get("engine", "python"))
     t.add_row("interface", s["interface"])
-    t.add_row("dhcp", f"pid {s['dhcp_pid']}  {'[green]alive[/green]' if s['dhcp_alive'] else '[red]dead[/red]'}")
-    t.add_row("tftp-now", f"pid {s['tftp_pid']}  {'[green]alive[/green]' if s['tftp_alive'] else '[red]dead[/red]'}")
+    if s.get("engine") == "rust":
+        alive = "[green]alive[/green]" if s["netbootd_alive"] else "[red]dead[/red]"
+        t.add_row("netbootd", f"pid {s['netbootd_pid']}  {alive}  (dhcp+tftp)")
+    else:
+        t.add_row("dhcp", f"pid {s['dhcp_pid']}  {'[green]alive[/green]' if s['dhcp_alive'] else '[red]dead[/red]'}")
+        t.add_row("tftp-now", f"pid {s['tftp_pid']}  {'[green]alive[/green]' if s['tftp_alive'] else '[red]dead[/red]'}")
     t.add_row("tftp_root", s["tftp_root"])
     t.add_row("uptime", f"{h:02d}:{m:02d}:{sec:02d}")
     console.print(t)
@@ -1349,7 +1364,7 @@ def setup() -> None:
             "to build hdmicap/serialcap"
         )
     else:
-        for crate in ("hdmicap", "serialcap"):
+        for crate in ("hdmicap", "serialcap", "netbootd"):
             crate_dir = repo / crate
             if not (crate_dir / "Cargo.toml").exists():
                 console.print(f"  [yellow]…[/yellow] {crate}: source not found at {crate_dir}, skipping")
@@ -1361,6 +1376,39 @@ def setup() -> None:
             except subprocess.CalledProcessError:
                 err.print(f"  [red]✗[/red] {crate}: cargo install failed")
                 raise typer.Exit(1)
+
+        # netbootd's macOS raw-frame send path needs a /dev/bpf descriptor, which
+        # only root can open. Rather than run the whole daemon as root, install
+        # netbootd-bpf-helper setuid-root: it is the ONLY paniolo component that
+        # runs as root, and its sole job is to open /dev/bpf and hand the
+        # descriptor to the unprivileged netbootd over a socketpair. This is the
+        # one-time sudo of `paniolo setup`. cargo install writes the helper mode
+        # 0755 owned by the user, so the setuid bit must be re-applied here after
+        # every (re)install.
+        if sys.platform == "darwin":
+            helper = cargo_bin / "netbootd-bpf-helper"
+            if helper.exists():
+                console.print(
+                    "  [dim]…[/dim] installing netbootd-bpf-helper setuid-root "
+                    "(one-time sudo; the only root component)"
+                )
+                chown = subprocess.run(["sudo", "chown", "root:wheel", str(helper)]).returncode
+                chmod = subprocess.run(["sudo", "chmod", "4755", str(helper)]).returncode
+                if chown == 0 and chmod == 0:
+                    console.print(
+                        f"  [green]✓[/green] {'bpf-helper':12s} setuid-root  {helper}"
+                    )
+                else:
+                    err.print(
+                        "  [yellow]![/yellow] could not setuid netbootd-bpf-helper; "
+                        "the rust netboot engine will fall back to the kernel send "
+                        "path (broken on macOS 15+). Re-run `paniolo setup` with sudo "
+                        "access to fix."
+                    )
+            else:
+                console.print(
+                    "  [yellow]…[/yellow] netbootd-bpf-helper not found; skipping setuid install"
+                )
 
     # 3. OCR helper: visionocr on macOS, linuxocr on Linux.
     if sys.platform == "darwin":

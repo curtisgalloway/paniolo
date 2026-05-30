@@ -17,11 +17,17 @@ name = "netbootd"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Single-client netboot daemon — DHCP + read-only TFTP in one process (PoC, no BPF path yet)"
+description = "Single-client netboot daemon — DHCP + read-only TFTP in one process, with a privilege-separated /dev/bpf send path on macOS"
 
 [[bin]]
 name = "netbootd"
 path = "src/main.rs"
+
+# The privileged BPF-fd helper: opens /dev/bpf as root (installed setuid by
+# `paniolo setup`) and hands the descriptor to the unprivileged netbootd.
+[[bin]]
+name = "netbootd-bpf-helper"
+path = "src/bin/netbootd-bpf-helper.rs"
 
 [dependencies]
 # --- Async runtime -------------------------------------------------------
@@ -30,13 +36,14 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 # --- Socket options (SO_REUSEADDR, interface-pinned reply sockets) -------
 socket2 = "0.5"
 
-# --- Raw L2 frame injection (macOS /dev/bpf) + low-level socket FFI -------
-# pnet_datalink's macOS backend already does BIOCSETIF + BIOCSHDRCMPLT(1) +
-# full-frame write preserving the caller's source MAC — the exact recipe the
-# Python BpfSender hand-codes. Used only on macOS at runtime; compiled on all
-# platforms so the call sites stay type-checked.
-pnet_datalink = "0.35"
+# --- Low-level socket / BPF FFI ------------------------------------------
+# libc drives the /dev/bpf ioctls (in the helper), the SCM_RIGHTS fd handoff,
+# and the raw write(2) on the BPF descriptor (the macOS send path).
 libc = "0.2"
+# pnet_datalink is used only to read an interface's MAC address (unprivileged);
+# the BPF descriptor itself now comes from the setuid helper, not pnet's
+# channel(). Candidate for removal in favor of getifaddrs(3).
+pnet_datalink = "0.35"
 
 # --- CLI -----------------------------------------------------------------
 clap = { version = "4", features = ["derive"] }
