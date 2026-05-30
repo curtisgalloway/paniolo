@@ -33,7 +33,11 @@
 //! spawns the helper and calls [`recv_fd`]).
 
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+// AsRawFd is only used by the macOS-gated open_bpf/request_bpf_fd; on Linux the
+// send_fd/recv_fd paths take a RawFd directly, so importing it there is unused.
+#[cfg(target_os = "macos")]
+use std::os::fd::AsRawFd;
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
 /// macOS BPF ioctls (64-bit), identical to the constants `_tftp.py` hardcodes.
 #[cfg(target_os = "macos")]
