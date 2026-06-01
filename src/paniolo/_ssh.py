@@ -68,10 +68,18 @@ class Host:
     ssh: str
     identity: Optional[str] = None
     control_path: Optional[str] = None
+    # How to invoke paniolo on this host. Defaults to bare "paniolo"; set it to
+    # an absolute path when paniolo isn't on the host's non-interactive ssh PATH
+    # (e.g. installed under ~/.local/bin, which login-only PATHs miss).
+    paniolo_cmd: Optional[str] = None
 
     @property
     def is_local(self) -> bool:
         return self.ssh == LOCAL or self.name == LOCAL
+
+    @property
+    def paniolo(self) -> str:
+        return self.paniolo_cmd or "paniolo"
 
 
 class SSHError(RuntimeError):

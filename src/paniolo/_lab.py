@@ -88,6 +88,7 @@ class Lab:
                 ssh=h["ssh"],
                 identity=h.get("identity"),
                 control_path=h.get("control_path"),
+                paniolo_cmd=h.get("paniolo_cmd"),
             )
         targets = data.get("targets") or {}
         return cls(hosts=hosts, targets=targets)

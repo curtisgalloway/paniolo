@@ -66,7 +66,9 @@ class TargetConfig:
             if len(self.serial_interfaces) == 1:
                 return self.serial_interfaces[0]
             have = ", ".join(i.name for i in self.serial_interfaces)
-            raise ValueError(f"multiple serial interfaces ({have}); specify one with --interface")
+            raise ValueError(
+                f"multiple serial interfaces ({have}); specify one with --interface"
+            )
         for iface in self.serial_interfaces:
             if iface.name == name:
                 return iface
@@ -107,6 +109,17 @@ def load_target(name: str) -> TargetConfig:
     return _from_dict(data)
 
 
+def load_target_file(path: str) -> TargetConfig:
+    """Load a TargetConfig from an arbitrary TOML file (not the targets dir).
+
+    Used for the config slice shipped to a remote host (PANIOLO_TARGET_CONFIG):
+    the stateless control host runs against this single injected target.
+    """
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+    return _from_dict(data)
+
+
 def list_targets() -> list[str]:
     if not TARGETS_DIR.exists():
         return []
@@ -120,7 +133,9 @@ def _from_dict(data: dict) -> TargetConfig:
     serial = data.pop("serial", None)
     legacy_device = data.pop("serial_device", None)
     legacy_baud = data.pop("serial_baud", None)
-    data.pop("ha_power_entity", None)  # removed field — ignore if present in old configs
+    data.pop(
+        "ha_power_entity", None
+    )  # removed field — ignore if present in old configs
 
     interfaces: list[SerialInterface] = []
     if serial:
@@ -153,7 +168,9 @@ def _from_dict(data: dict) -> TargetConfig:
 def _escape_toml_string(s: str) -> str:
     """Escape a string for use in a TOML basic string (double-quoted)."""
     s = s.replace("\\", "\\\\").replace('"', '\\"')
-    return _CTRL_RE.sub(lambda m: _CTRL_ESCAPE.get(m.group(), f"\\u{ord(m.group()):04x}"), s)
+    return _CTRL_RE.sub(
+        lambda m: _CTRL_ESCAPE.get(m.group(), f"\\u{ord(m.group()):04x}"), s
+    )
 
 
 def _toml_kv(key: str, value) -> str:

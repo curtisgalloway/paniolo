@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import functools
 import grp
 import os
 import pwd
@@ -36,6 +37,7 @@ from . import (
     _netif,
     _ocr,
     _power,
+    _remote,
     _serial,
     _ssh,
     _state,
@@ -113,6 +115,18 @@ def _resolve_with_host(name: Optional[str]) -> tuple[_config.TargetConfig, _ssh.
     the local host. The host is consumed by remote dispatch (a later phase);
     today every command body uses only the TargetConfig.
     """
+    # On a remote control host, the dev machine has shipped a single config
+    # slice and set PANIOLO_TARGET_CONFIG; run against it locally. This takes
+    # precedence over any lab/legacy lookup and prevents a re-dispatch loop.
+    slice_path = os.environ.get("PANIOLO_TARGET_CONFIG")
+    if slice_path:
+        try:
+            cfg = _config.load_target_file(slice_path)
+        except (OSError, ValueError) as exc:
+            err.print(f"[red]Failed to read PANIOLO_TARGET_CONFIG: {exc}[/red]")
+            raise typer.Exit(1)
+        return cfg, _ssh.Host(name=_ssh.LOCAL, ssh=_ssh.LOCAL)
+
     try:
         lab = _lab.load()
     except _lab.LabError as exc:
@@ -140,6 +154,34 @@ def _resolve_with_host(name: Optional[str]) -> tuple[_config.TargetConfig, _ssh.
 
 def _resolve(name: Optional[str]) -> _config.TargetConfig:
     return _resolve_with_host(name)[0]
+
+
+def remote_capable(mode: str = _remote.REEXEC):
+    """Make a target command transparently run on its host's control machine.
+
+    Wraps a Typer command: it resolves the target's host first; if that's the
+    local dev machine the command runs here unchanged, otherwise the whole
+    invocation is re-exec'd on the host over SSH (``mode=INTERACTIVE`` uses an
+    ssh -t PTY, for tio). The command body never runs locally for a remote
+    target. Apply *below* the ``@*_app.command(...)`` decorator.
+    """
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            _cfg, host = _resolve_with_host(kwargs.get("target"))
+            if host.is_local:
+                return fn(*args, **kwargs)
+            try:
+                code = _remote.dispatch(host, _cfg, mode, sys.argv)
+            except _ssh.SSHError as exc:
+                err.print(f"[red]ssh: {exc}[/red]")
+                raise typer.Exit(1)
+            raise typer.Exit(code)
+
+        return wrapper
+
+    return decorator
 
 
 # ── target ────────────────────────────────────────────────────────────────────
@@ -299,6 +341,7 @@ def target_clear(
 
 
 @netboot_app.command("start")
+@remote_capable()
 def netboot_start(
     target: Annotated[Optional[str], typer.Argument()] = None,
     engine: Annotated[
@@ -334,6 +377,7 @@ def netboot_start(
 
 
 @netboot_app.command("stop")
+@remote_capable()
 def netboot_stop(
     target: Annotated[Optional[str], typer.Argument()] = None,
 ) -> None:
@@ -351,6 +395,7 @@ def netboot_stop(
 
 
 @netboot_app.command("status")
+@remote_capable()
 def netboot_status(
     target: Annotated[Optional[str], typer.Argument()] = None,
 ) -> None:
@@ -389,6 +434,7 @@ def netboot_status(
 
 
 @netboot_app.command("tftp-root")
+@remote_capable()
 def netboot_tftp_root(
     target: Annotated[Optional[str], typer.Argument()] = None,
 ) -> None:
@@ -447,6 +493,7 @@ def _netboot_line_passes(line: str, dhcp: bool, tftp: bool, errors: bool) -> boo
 
 
 @netboot_app.command("logs")
+@remote_capable()
 def netboot_logs(
     target: Annotated[Optional[str], typer.Argument()] = None,
     follow: Annotated[
@@ -548,6 +595,7 @@ def _link_state(interface: str) -> dict:
 
 
 @netboot_app.command("link-up")
+@remote_capable()
 def netboot_link_up(
     target: Annotated[Optional[str], typer.Argument()] = None,
 ) -> None:
@@ -564,6 +612,7 @@ def netboot_link_up(
 
 
 @netboot_app.command("link-down")
+@remote_capable()
 def netboot_link_down(
     target: Annotated[Optional[str], typer.Argument()] = None,
 ) -> None:
@@ -574,6 +623,7 @@ def netboot_link_down(
 
 
 @netboot_app.command("link-status")
+@remote_capable()
 def netboot_link_status(
     target: Annotated[Optional[str], typer.Argument()] = None,
 ) -> None:
@@ -623,6 +673,7 @@ def _print_netif_status(cfg: _config.TargetConfig) -> None:
 
 
 @netif_app.command("mode")
+@remote_capable()
 def netif_mode(
     mode: Annotated[str, typer.Argument(help="netboot | ffx | off")],
     target: Annotated[Optional[str], typer.Argument()] = None,
@@ -663,6 +714,7 @@ def netif_mode(
 
 
 @netif_app.command("status")
+@remote_capable()
 def netif_status(
     target: Annotated[Optional[str], typer.Argument()] = None,
 ) -> None:
@@ -994,6 +1046,7 @@ def _dtr_button(
 
 
 @app.command("power-cycle")
+@remote_capable()
 def power_cycle(
     target: Annotated[Optional[str], typer.Argument()] = None,
 ) -> None:
@@ -1024,6 +1077,7 @@ def power_cycle(
 
 
 @app.command("power-state")
+@remote_capable()
 def power_state(
     target: Annotated[Optional[str], typer.Argument()] = None,
 ) -> None:
@@ -1173,6 +1227,7 @@ def _resolve_interface(
 
 
 @serial_app.command("dtr")
+@remote_capable()
 def serial_dtr(
     target: Annotated[Optional[str], typer.Argument()] = None,
     ms: Annotated[
@@ -1202,6 +1257,7 @@ def serial_dtr(
 
 
 @serial_app.command("reset")
+@remote_capable()
 def serial_reset(
     target: Annotated[Optional[str], typer.Argument()] = None,
     ms: Annotated[
@@ -1228,6 +1284,7 @@ def serial_reset(
 
 
 @serial_app.command("connect")
+@remote_capable(_remote.INTERACTIVE)
 def serial_connect(
     target: Annotated[Optional[str], typer.Argument()] = None,
     interface: Annotated[
@@ -1250,6 +1307,7 @@ def serial_connect(
 
 
 @serial_app.command("watch")
+@remote_capable()
 def serial_watch(
     target: Annotated[Optional[str], typer.Argument()] = None,
     port: Annotated[int, typer.Option("--port")] = 8724,
@@ -1385,6 +1443,7 @@ def serial_log(
 
 
 @serial_app.command("show")
+@remote_capable()
 def serial_show(
     target: Annotated[Optional[str], typer.Argument()] = None,
 ) -> None:
