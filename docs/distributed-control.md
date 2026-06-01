@@ -1,10 +1,10 @@
 # Distributed control: one lab, one file
 
-> **Status: Phases 0–3 implemented** (PR #20, 2026-06-01); the rest is still
-> design. Shipped: the SSH transport, the one-file lab model (`--lab` /
-> `PANIOLO_LAB`), transparent re-exec of one-shot commands on a target's host,
-> and a tunnelled `console` for a remote target. Still design-only:
-> discovery-assisted `configure`, multi-host targets, `console --detach`, and
+> **Status: Phases 0–5 implemented** (#20 for 0–3, #22 for 4–5; 2026-06-01).
+> Shipped: the SSH transport, the one-file lab model (`--lab` / `PANIOLO_LAB`),
+> transparent re-exec of one-shot commands on a target's host, a tunnelled
+> `console` for a remote target, remote `setup --host`, and discovery-assisted
+> `configure`. Still design-only: multi-host targets, `console --detach`, and
 > multi-user locking (see the [implementation plan](distributed-control-plan.md)
 > for the phasing). Compare [related work: paniolo vs. labgrid](ci-integration/related-work.md),
 > whose distributed model directly informs this.

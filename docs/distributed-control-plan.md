@@ -1,7 +1,8 @@
 # Distributed control: implementation plan
 
-> **Status: Phases 0–3 shipped** (PR #20, 2026-06-01); Phases 4–5 and the
-> deferred items remain. This sequences the build of the
+> **Status: Phases 0–5 shipped** (#20 for 0–3, #22 for 4–5; 2026-06-01); the
+> deferred items (multi-host targets, `console --detach`, locking) remain. This
+> sequences the build of the
 > [distributed-control design](distributed-control.md) into self-contained,
 > independently mergeable phases. Read the design doc first — this is the *how*
 > and *in what order*, not the *what* and *why*.
@@ -140,7 +141,7 @@ reach each other — which is what makes multi-host dashboards work later for fr
 and the constructed URL resolves end-to-end. **Delivers:** the console feels
 local.
 
-## Phase 4 — `setup --host <name>` — pending
+## Phase 4 — `setup --host <name>` ✅ (shipped, #22)
 
 **Touches:** `_cli.py`.
 
@@ -149,7 +150,7 @@ host wired to the hardware. The remote variant re-execs `paniolo setup` on the
 named host over SSH. Small. **Delivers:** provision a control host from the dev
 machine.
 
-## Phase 5 — Discovery-assisted `configure` — pending
+## Phase 5 — Discovery-assisted `configure` ✅ (shipped, #22)
 
 **Touches:** `_cli.py`, `_lab.py`.
 

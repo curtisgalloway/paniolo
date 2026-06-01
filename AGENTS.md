@@ -274,9 +274,9 @@ owned by another user — treat as alive).
 Lets a single command on the dev machine drive a target wired to a **remote
 control host**, transparently. Design + rationale: [`docs/distributed-control.md`](docs/distributed-control.md);
 phasing/status: [`docs/distributed-control-plan.md`](docs/distributed-control-plan.md).
-Phases 0–3 are shipped (one-shot re-exec + tunnelled `console`); multi-host
-targets, `console --detach`, `setup --host`, and discovery-assisted `configure`
-are still design-only.
+Phases 0–5 are shipped (one-shot re-exec, tunnelled `console`, remote
+`setup --host`, discovery-assisted `configure`); multi-host targets,
+`console --detach`, and multi-user locking are still design-only.
 
 **`_lab.py`** parses the one-file lab (pointed at by the global `--lab` option /
 `PANIOLO_LAB`): `[hosts.*]` (each → an `_ssh.Host`) and `[targets.*]` with nested
@@ -316,6 +316,14 @@ stateless remote — nor to host-global commands without a target (serial log,
 video shot). Remote `console` (`_cli._remote_console`) starts both daemons on the
 host, forwards their discovery ports, and opens the dashboard at the forwarded
 video port with the terminal aimed at the forwarded serial port via `?serialws=`.
+
+**Host provisioning + authoring.** `setup --host <h>` re-execs `paniolo setup`
+on host `h` over an ssh -t PTY (Phase 4). `discover [--json]` lists a host's
+lab-relevant hardware (USB-Ethernet/serial/capture); `configure <target>
+--host <h>` runs `discover` on `h` over SSH and prints a proposed
+`[targets.<target>]` block via `_lab.propose_target_block` (Phase 5) — it writes
+nothing, the human reviews/pastes/commits (the lab is the reviewed source of
+truth).
 
 ## _netboot.py
 

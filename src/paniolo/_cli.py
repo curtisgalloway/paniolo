@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import functools
 import grp
+import json
 import os
 import pwd
 import shutil
@@ -154,6 +155,27 @@ def _resolve_with_host(name: Optional[str]) -> tuple[_config.TargetConfig, _ssh.
 
 def _resolve(name: Optional[str]) -> _config.TargetConfig:
     return _resolve_with_host(name)[0]
+
+
+def _resolve_host(name: str) -> _ssh.Host:
+    """Look up a control host by name in the lab (for host-scoped commands)."""
+    if name == _ssh.LOCAL:
+        return _ssh.Host(name=_ssh.LOCAL, ssh=_ssh.LOCAL)
+    try:
+        lab = _lab.load()
+    except _lab.LabError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    if lab is None:
+        err.print(
+            "[red]--host needs a lab.[/red] Point at one with --lab / PANIOLO_LAB."
+        )
+        raise typer.Exit(1)
+    if name not in lab.hosts:
+        have = ", ".join(sorted(lab.hosts)) or "(none)"
+        err.print(f"[red]Host '{name}' not in lab.[/red] Hosts: {have}")
+        raise typer.Exit(1)
+    return lab.hosts[name]
 
 
 def remote_capable(mode: str = _remote.REEXEC):
@@ -1363,7 +1385,9 @@ def serial_send(
     target: Annotated[Optional[str], typer.Option("--target", "-t")] = None,
     interface: Annotated[
         Optional[str],
-        typer.Option("--interface", "-i", help="Serial interface name (default: the only one)"),
+        typer.Option(
+            "--interface", "-i", help="Serial interface name (default: the only one)"
+        ),
     ] = None,
     pace_ms: Annotated[
         int,
@@ -1377,7 +1401,9 @@ def serial_send(
     ] = 0,
     newline: Annotated[
         bool,
-        typer.Option("--newline/--no-newline", help="Append a carriage return after the text"),
+        typer.Option(
+            "--newline/--no-newline", help="Append a carriage return after the text"
+        ),
     ] = True,
 ) -> None:
     """Send a line of input to a target's console through the running daemon.
@@ -1400,7 +1426,9 @@ def serial_send(
 
     payload = text.encode() + (b"\r" if newline else b"")
     pace_note = f" paced {pace_ms} ms/byte" if pace_ms else ""
-    console.print(f"[dim]Sending {len(payload)} bytes to '{iface.name}'{pace_note}[/dim]")
+    console.print(
+        f"[dim]Sending {len(payload)} bytes to '{iface.name}'{pace_note}[/dim]"
+    )
     try:
         _serial.send_input(daemon_url, iface.name, payload, pace_ms)
     except OSError as exc:
@@ -1811,15 +1839,124 @@ def _ensure_linux_groups() -> bool:
     return changed
 
 
+def _local_inventory() -> dict:
+    """This host's lab-relevant hardware (USB-Ethernet, serial, capture devices)."""
+    return {
+        "ethernet": _netboot.list_usb_ethernet_interfaces(),
+        "serial": _serial.list_serial_devices(),
+        "video": _video.list_devices(),
+    }
+
+
+@app.command("discover")
+def discover(
+    json_out: Annotated[
+        bool, typer.Option("--json", help="Emit machine-readable JSON")
+    ] = False,
+) -> None:
+    """List this host's hardware for lab authoring — USB-Ethernet interfaces,
+    serial devices, and capture devices. `configure` runs this over SSH."""
+    inv = _local_inventory()
+    if json_out:
+        print(json.dumps(inv))
+        return
+    t = Table(show_header=False, box=None, padding=(0, 2))
+    eths = " ".join(
+        f"{e['device']}{'*' if e.get('active') else ''}" for e in inv["ethernet"]
+    )
+    t.add_row("usb-ethernet", eths or "(none)")
+    t.add_row("serial", "\n".join(inv["serial"]) if inv["serial"] else "(none)")
+    t.add_row(
+        "capture",
+        "\n".join(f"{d['index']}: {d['name']}" for d in inv["video"]) or "(none)",
+    )
+    console.print(t)
+    console.print("[dim]* = carrier up[/dim]")
+
+
+@app.command("configure")
+def configure(
+    target: Annotated[str, typer.Argument(help="Target name to propose a block for")],
+    host: Annotated[
+        str, typer.Option("--host", "-H", help="Lab host the target is wired to")
+    ],
+) -> None:
+    """Propose a `[targets.<name>]` lab block from hardware discovered on a host.
+
+    Runs `paniolo discover` on the host over SSH and prints a proposed TOML block
+    for you to review, paste into your lab file, and commit. Writes nothing — you
+    approve it by committing. The host must already be in the lab (its connection
+    info is authored by hand)."""
+    resolved = _resolve_host(host)
+    if resolved.is_local:
+        inv = _local_inventory()
+    else:
+        console.print(f"[dim]Discovering hardware on {host} ({resolved.ssh})…[/dim]")
+        try:
+            result = _ssh.run(resolved, [resolved.paniolo, "discover", "--json"])
+        except _ssh.SSHError as exc:
+            err.print(f"[red]ssh: {exc}[/red]")
+            raise typer.Exit(1)
+        if result.returncode != 0:
+            err.print(
+                f"[red]discover failed on {host}:[/red] "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+            raise typer.Exit(1)
+        try:
+            inv = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            err.print(f"[red]unparseable discover output from {host}:[/red] {exc}")
+            raise typer.Exit(1)
+
+    block = _lab.propose_target_block(target, host, inv)
+    try:
+        lab = _lab.load()
+    except _lab.LabError:
+        lab = None
+    console.print(
+        "[dim]# Proposed lab block — review, add to your lab file, and commit.[/dim]"
+    )
+    if lab is not None and target in lab.targets:
+        console.print(
+            f"[yellow]# NOTE: target '{target}' already exists in the lab — "
+            "reconcile by hand.[/yellow]"
+        )
+    print(block)
+
+
 @app.command()
-def setup() -> None:
+def setup(
+    host: Annotated[
+        Optional[str],
+        typer.Option(
+            "--host",
+            help="Provision this lab host over SSH (runs `paniolo setup` there) "
+            "instead of locally. Requires the paniolo CLI + source already on the host.",
+        ),
+    ] = None,
+) -> None:
     """Install system tools and build/install paniolo's binaries.
 
     Builds hdmicap and serialcap (cargo install) into ~/.cargo/bin so the
     daemons resolve from a stable installed path, not the in-repo build tree.
     On macOS, also installs the visionocr OCR helper (swiftc) and tftp-now
     (Homebrew).  On Linux, DHCP and TFTP are pure-Python; no extra tools needed.
+
+    With --host, re-execs this same setup on the named lab host over SSH (a PTY,
+    so its sudo steps can prompt).
     """
+    if host is not None:
+        target_host = _resolve_host(host)
+        if not target_host.is_local:
+            console.print(
+                f"[dim]Running paniolo setup on {host} ({target_host.ssh})…[/dim]"
+            )
+            raise typer.Exit(
+                _ssh.run_interactive(target_host, [target_host.paniolo, "setup"])
+            )
+        console.print(f"[dim]'{host}' is the local machine; setting up here.[/dim]")
+
     repo = Path(__file__).parent.parent.parent
     cargo_bin = Path.home() / ".cargo" / "bin"
 
