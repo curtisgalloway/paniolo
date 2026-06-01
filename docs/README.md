@@ -24,6 +24,12 @@ and power-cycle it without a person at the bench each iteration. See the root
 | [Dashboard](dashboard.md) | `paniolo console` | Combined video + serial web UI. |
 | [HID injection](hid.md) | `paniolo hid` | USB keyboard/mouse injection via the KB2040 rig. |
 
+## Distributed control (in design)
+
+| Doc | What it covers |
+|---|---|
+| [Distributed control: one lab, one file](distributed-control.md) | Abstracting away control-host location: a single git-tracked lab file describing hosts + targets, SSH-tunnelled transport with the dev machine as the data-plane hub, per-resource host binding (multi-host-ready), and a discovery-proposes/human-approves config flow. |
+
 ## Hardware-CI integration (in design)
 
 Making paniolo's primitives consumable by hardware-CI orchestrators, without paniolo owning test
