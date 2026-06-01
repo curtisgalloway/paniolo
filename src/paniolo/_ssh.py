@@ -114,7 +114,9 @@ def _control_args(host: Host) -> list[str]:
     ]
 
 
-def _base_args(host: Host, *, interactive: bool = False) -> list[str]:
+def _base_args(
+    host: Host, *, interactive: bool = False, multiplex: bool = True
+) -> list[str]:
     if host.is_local:
         raise ValueError(f"_ssh called for local host '{host.name}'")
     args = ["ssh"]
@@ -124,7 +126,14 @@ def _base_args(host: Host, *, interactive: bool = False) -> list[str]:
     args += ["-o", f"ConnectTimeout={_CONNECT_TIMEOUT}"]
     if host.identity:
         args += ["-i", os.path.expanduser(host.identity), "-o", "IdentitiesOnly=yes"]
-    args += _control_args(host)
+    if multiplex:
+        args += _control_args(host)
+    else:
+        # A standalone connection that owns its own channel. Port forwards must
+        # NOT multiplex: an `ssh -N -L` client that attaches to a ControlMaster
+        # hands the forward to the master and then exits, so the process no
+        # longer represents (or can tear down) the tunnel.
+        args += ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
     return args
 
 
@@ -211,7 +220,9 @@ def _wait_for_port(port: int, proc: subprocess.Popen, timeout: float) -> None:
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             stderr = proc.stderr.read() if proc.stderr else ""
-            raise SSHError(f"ssh forward exited early: {stderr.strip()}")
+            raise SSHError(
+                f"ssh forward exited early (rc={proc.returncode}): {stderr.strip()}"
+            )
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.5):
                 return
@@ -236,7 +247,7 @@ def forward(
     """
     local_port = _free_local_port()
     spec = f"{local_port}:{remote_bind}:{remote_port}"
-    args = _base_args(host) + ["-N", "-L", spec, host.ssh]
+    args = _base_args(host, multiplex=False) + ["-N", "-L", spec, host.ssh]
     proc = subprocess.Popen(
         args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
     )

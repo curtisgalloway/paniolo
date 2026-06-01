@@ -94,6 +94,14 @@ def test_base_args_identity_uses_identities_only():
     assert not args[idx + 1].startswith("~")
 
 
+def test_forward_args_disable_multiplexing():
+    # A port forward must own a standalone connection, not attach to the master.
+    args = _ssh._base_args(Host(name="b", ssh="u@b"), multiplex=False)
+    assert "ControlMaster=no" in args
+    assert "ControlPath=none" in args
+    assert "ControlMaster=auto" not in args
+
+
 def test_custom_control_path_is_honored():
     args = _ssh._base_args(Host(name="b", ssh="u@b", control_path="/tmp/cm-test"))
     assert "ControlPath=/tmp/cm-test" in args
