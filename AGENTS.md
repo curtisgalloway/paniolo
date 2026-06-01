@@ -34,7 +34,16 @@ Run through this checklist before calling `gh pr create`:
    - `AGENTS.md` — module layout, command descriptions, architecture notes
    Include doc updates in the same PR, not a follow-up.
 
-2. **Regenerate the reference skill.** Use the Repomix CLI (`brew install repomix`,
+2. **Update the usage skill (`skills/paniolo/SKILL.md`).** This is the
+   agent-facing skill for *driving* a target — distinct from the
+   `paniolo-reference` codebase skill regenerated below. If the PR adds, removes,
+   or changes a user-facing command, flag, or workflow, update the relevant
+   section (and the "gotchas" list) so an agent using paniolo sees the new
+   surface. (It's symlinked into `~/.claude/skills/paniolo`, so the repo copy is
+   the source of truth.) Purely internal changes that don't alter the CLI surface
+   can skip this.
+
+3. **Regenerate the reference skill.** Use the Repomix CLI (`brew install repomix`,
    or `npx -y repomix@latest`) from the repo root:
 
    ```
@@ -47,7 +56,7 @@ Run through this checklist before calling `gh pr create`:
    Excluding `.claude/skills/**` prevents the old skill from being packed into
    the new one. Stage the updated skill files in the same commit.
 
-3. **Open the PR; do not merge it.** Push the branch and create the PR with
+4. **Open the PR; do not merge it.** Push the branch and create the PR with
    `gh pr create`, then stop. The merge decision belongs to the user.
 
 ## Purpose
@@ -84,11 +93,12 @@ of option A is no longer sufficient.
 
 ```
 src/paniolo/
-  _cli.py       typer CLI — subcommand groups: target, netboot, video, serial, hid
+  _cli.py       typer CLI — subcommand groups: target, netboot, netif, video, serial, hid
                             top-level commands: console, power-cycle, power-state, setup
   _config.py    TargetConfig CRUD (+ named SerialInterface list) (~/.config/paniolo/targets/<name>.toml)
   _state.py     daemon state files (~/.local/share/paniolo/<target>/)
   _netboot.py   pure-Python DHCP + TFTP subprocess management (_dhcp.py, _tftp.py)
+  _netif.py     netboot↔ffx link-mode switch (atomic netboot teardown + IPv6 LL setup)
   _dhcp.py      pure-Python DHCP server (run as `python -m paniolo._dhcp`)
   _tftp.py      pure-Python read-only TFTP server (run as `python -m paniolo._tftp`);
                 macOS BPF raw-frame sender for Sequoia routing
@@ -325,6 +335,40 @@ Key differences from the Python servers:
   `handoff` (BPF open + fd passing) so both the `netbootd` and
   `netbootd-bpf-helper` binaries share them. On Linux netbootd uses the kernel
   send path (no BPF), matching the Python behavior.
+
+## _netif.py
+
+Switches the target's USB-Ethernet link between two **mutually-exclusive** modes
+that share the one physical point-to-point link, via
+`paniolo netif mode <netboot|ffx|off>`:
+
+- **netboot** — today's IPv4 `host_ip`/24 + DHCP + TFTP (the Pi TFTP-boots).
+  Delegates to `_netboot.start` (which keeps the primary-NIC guard).
+- **ffx** — IPv6 link-local `fe80::1`/64 (`FFX_HOST_LL`) on the host interface,
+  **no** DHCP/TFTP. The Pi boots from SD and is reached over ffx at
+  `fe80::<dev-slaac>%<iface>`.
+- **off** — tears down both.
+
+The command exists to kill two hand-switching seams: (1) `mode ffx` runs
+`netboot stop` **first**, so the next power-cycle falls through to SD instead of
+silently TFTP-booting a stale image; (2) `mode ffx` adds the host-side
+`fe80::1`/64 that ffx needs and that nothing else sets up (Linux: enable IPv6 via
+`sysctl net/ipv6/conf/<iface>/disable_ipv6=0`, then `ip -6 addr add`; macOS:
+`ifconfig … inet6 … alias`). All privileged steps reuse the same `sudo` path as
+`_netboot` — no new privilege model.
+
+**Idempotent and re-runnable.** The IPv6 link-local is ephemeral (lost on a
+control-host reboot), so `mode ffx` just re-adds it when absent; `mode netboot`
+clears it and skips a redundant start if netboot is already running; `mode off`
+removes only what netif set up (the `fe80::1` LL and a lingering `host_ip`/24),
+never flushing unrelated addresses.
+
+**Mode is probed, not stored** (`get_status`): netboot daemons running →
+`netboot`; else the `fe80::1` host LL present → `ffx`; else `off`. So
+`paniolo netif status` stays correct even after a reboot clears state. In ffx
+mode it also reports IPv6 neighbours on the link (`ip -6 neigh`, Linux) and
+prints a ready-to-paste `ffx target add fe80::…%<iface>` — surfacing the
+device's address without scraping the serial log.
 
 ## _video.py
 

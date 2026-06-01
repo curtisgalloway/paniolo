@@ -68,6 +68,34 @@ Put boot files in the target's TFTP root (for a Raspberry Pi 5, the kernel goes
 in as `kernel_2712.img`). Needs passwordless `sudo` for `ifconfig` (it assigns
 the interface's static IP).
 
+## Link mode — switch between netboot and ffx
+
+The same USB-Ethernet link can't be in netboot mode and ffx-over-network mode at
+once (they want incompatible host addressing). Use `netif` to flip between them
+atomically instead of doing it by hand:
+
+```
+paniolo netif mode netboot [target]        # IPv4 + DHCP + TFTP (= netboot start)
+paniolo netif mode ffx [target]            # stop netboot, add host fe80::1/64 for ffx
+paniolo netif mode off [target]            # tear down both
+paniolo netif status [target]              # which mode is active, addresses, peer
+```
+
+- **Switching to ffx stops netboot first** — otherwise a power-cycle TFTP-boots a
+  stale image instead of falling through to the SD card. This is the safe way to
+  hand the link off to `ffx`.
+- `mode ffx` adds the host-side `fe80::1/64` that `ffx` needs (nothing else sets
+  it up, and it's lost on a control-host reboot). Re-run `mode ffx` any time to
+  re-add it — every mode is idempotent.
+- `netif status` in ffx mode reads the IPv6 neighbor table and prints a
+  ready-to-paste `ffx target add fe80::…%<iface>` for the discovered device. If
+  no peer shows, power-cycle the target and wait for it to finish SLAAC.
+
+Typical ffx hand-off: `paniolo netif mode ffx fortune` → `paniolo power-cycle
+fortune` → `paniolo netif status fortune` (grab the address) → `ffx target list`.
+Go back to TFTP bring-up with `paniolo netif mode netboot fortune`. Same
+passwordless `sudo` requirement as netboot (`ip` on Linux, `ifconfig` on macOS).
+
 ## Video — capture, preview, OCR
 
 ```
@@ -175,6 +203,8 @@ ssh control "paniolo netboot stop fortune"
 - `~/.local/bin` (uv tool) and `~/.cargo/bin` (Rust daemons) must be on `PATH`.
 - `paniolo console` auto-starts both daemons if they aren't running.
 - Netboot requires passwordless `sudo` (`ip` on Linux, `ifconfig` on macOS).
+- netboot and ffx are mutually exclusive on the link — use `paniolo netif mode`
+  to switch; entering ffx mode stops netboot so a power-cycle boots from SD.
 - OCR is strongest on large text; tiny console fonts may misread some characters.
 
 ---

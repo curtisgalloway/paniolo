@@ -48,6 +48,7 @@
 | NET-2 | `netboot start/stop/status`, `tftp-root`, `logs` (filterable, followable) | M | ☑ | `_cli.py`; `_netboot.py` |
 | NET-3 | `netboot link-up/down/status` for interface configuration | M | ☑ | |
 | NET-4 | TFTP root configurable per target (`--tftp-root`) | M | ☑ | required for `netboot start` |
+| NET-5 | `netif mode netboot\|ffx\|off` — atomic, idempotent link-mode switch; stops netboot before SD boot, sets up host `fe80::1`/64 for ffx; `netif status` probes the active mode | S | ☑ | `_netif.py`; from rpi5-bringup ffx-over-network bring-up |
 
 ## 3. Serial console
 

@@ -37,6 +37,25 @@
 - .gitignore
 - Cargo.toml
 
+## Tech Stack: netbootd
+
+### Languages
+
+- Rust
+
+### Frameworks
+
+- Tokio
+
+### Dependencies
+
+- tokio
+
+### Configuration Files
+
+- .gitignore
+- Cargo.toml
+
 ## Tech Stack: serialcap
 
 ### Languages
