@@ -156,6 +156,27 @@ def _resolve(name: Optional[str]) -> _config.TargetConfig:
     return _resolve_with_host(name)[0]
 
 
+def _resolve_host(name: str) -> _ssh.Host:
+    """Look up a control host by name in the lab (for host-scoped commands)."""
+    if name == _ssh.LOCAL:
+        return _ssh.Host(name=_ssh.LOCAL, ssh=_ssh.LOCAL)
+    try:
+        lab = _lab.load()
+    except _lab.LabError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    if lab is None:
+        err.print(
+            "[red]--host needs a lab.[/red] Point at one with --lab / PANIOLO_LAB."
+        )
+        raise typer.Exit(1)
+    if name not in lab.hosts:
+        have = ", ".join(sorted(lab.hosts)) or "(none)"
+        err.print(f"[red]Host '{name}' not in lab.[/red] Hosts: {have}")
+        raise typer.Exit(1)
+    return lab.hosts[name]
+
+
 def remote_capable(mode: str = _remote.REEXEC):
     """Make a target command transparently run on its host's control machine.
 
@@ -1363,7 +1384,9 @@ def serial_send(
     target: Annotated[Optional[str], typer.Option("--target", "-t")] = None,
     interface: Annotated[
         Optional[str],
-        typer.Option("--interface", "-i", help="Serial interface name (default: the only one)"),
+        typer.Option(
+            "--interface", "-i", help="Serial interface name (default: the only one)"
+        ),
     ] = None,
     pace_ms: Annotated[
         int,
@@ -1377,7 +1400,9 @@ def serial_send(
     ] = 0,
     newline: Annotated[
         bool,
-        typer.Option("--newline/--no-newline", help="Append a carriage return after the text"),
+        typer.Option(
+            "--newline/--no-newline", help="Append a carriage return after the text"
+        ),
     ] = True,
 ) -> None:
     """Send a line of input to a target's console through the running daemon.
@@ -1400,7 +1425,9 @@ def serial_send(
 
     payload = text.encode() + (b"\r" if newline else b"")
     pace_note = f" paced {pace_ms} ms/byte" if pace_ms else ""
-    console.print(f"[dim]Sending {len(payload)} bytes to '{iface.name}'{pace_note}[/dim]")
+    console.print(
+        f"[dim]Sending {len(payload)} bytes to '{iface.name}'{pace_note}[/dim]"
+    )
     try:
         _serial.send_input(daemon_url, iface.name, payload, pace_ms)
     except OSError as exc:
@@ -1812,14 +1839,37 @@ def _ensure_linux_groups() -> bool:
 
 
 @app.command()
-def setup() -> None:
+def setup(
+    host: Annotated[
+        Optional[str],
+        typer.Option(
+            "--host",
+            help="Provision this lab host over SSH (runs `paniolo setup` there) "
+            "instead of locally. Requires the paniolo CLI + source already on the host.",
+        ),
+    ] = None,
+) -> None:
     """Install system tools and build/install paniolo's binaries.
 
     Builds hdmicap and serialcap (cargo install) into ~/.cargo/bin so the
     daemons resolve from a stable installed path, not the in-repo build tree.
     On macOS, also installs the visionocr OCR helper (swiftc) and tftp-now
     (Homebrew).  On Linux, DHCP and TFTP are pure-Python; no extra tools needed.
+
+    With --host, re-execs this same setup on the named lab host over SSH (a PTY,
+    so its sudo steps can prompt).
     """
+    if host is not None:
+        target_host = _resolve_host(host)
+        if not target_host.is_local:
+            console.print(
+                f"[dim]Running paniolo setup on {host} ({target_host.ssh})…[/dim]"
+            )
+            raise typer.Exit(
+                _ssh.run_interactive(target_host, [target_host.paniolo, "setup"])
+            )
+        console.print(f"[dim]'{host}' is the local machine; setting up here.[/dim]")
+
     repo = Path(__file__).parent.parent.parent
     cargo_bin = Path.home() / ".cargo" / "bin"
 
