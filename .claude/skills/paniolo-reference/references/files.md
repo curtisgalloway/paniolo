@@ -1,217 +1,5 @@
 # Files
 
-## File: docs/distributed-control-plan.md
-````markdown
-# Distributed control: implementation plan
-
-> **Status: Phases 0–3 shipped** (PR #20, 2026-06-01); Phases 4–5 and the
-> deferred items remain. This sequences the build of the
-> [distributed-control design](distributed-control.md) into self-contained,
-> independently mergeable phases. Read the design doc first — this is the *how*
-> and *in what order*, not the *what* and *why*.
->
-> **Shipped in 0–3:** `_ssh.py` transport, `_lab.py` lab model + `--lab`,
-> `@remote_capable` transparent re-exec (`_remote.py`), and the tunnelled remote
-> `console`. Two refinements emerged during the build and are in the code: a
-> per-host **`paniolo_cmd`** (the remote PATH problem) and the guidance to set a
-> per-host **`identity`** (ssh-agent key-spray vs. `MaxAuthTries`) — both folded
-> into "Open decisions" below.
-
-## Backbone
-
-Two facts about the current code (verified against `src/paniolo/`) shape the
-whole plan:
-
-1. **`_resolve(name)` in `src/paniolo/_cli.py` is the single chokepoint** every
-   one of the ~20 target-bearing commands passes through to load its
-   `TargetConfig`. That means **one interception point can make all the one-shot
-   commands location-aware at once** — when the target's host is remote, re-exec
-   the entire `paniolo` invocation on that host and never run the local body.
-   Only the four streaming commands (`console`, `video preview`, `serial watch`,
-   `serial connect`) need bespoke handling.
-2. **Control hosts are stateless** (design principle 3), so a re-exec'd command
-   must be *handed* the config slice it needs — the dev machine owns the lab
-   file. The daemons (`serialcap`, `hdmicap`) already write a `daemon.json`
-   discovery file with their TCP `port`, and the dashboard already honors a
-   `?serialws=` override — so streaming needs **no daemon changes**, only SSH
-   port-forwarding plus URL construction.
-
-There is **no existing SSH code** in the Python source — the transport layer is
-greenfield.
-
-### The localhost-ssh test fixture
-
-A single trick makes the entire remote path testable in dev and CI without a
-second machine: define a host whose ssh destination is `localhost`. Re-exec,
-config-shipping, and tunnelling then run against the same machine over *real*
-SSH. Every phase below is validated this way; CI gets a step that adds the
-runner's own key to `authorized_keys` and exercises a `localhost` host.
-
-## Phase 0 — SSH foundation ✅ (shipped, #20)
-
-**New:** `src/paniolo/_ssh.py`. Pure infrastructure; nothing user-facing.
-
-Owns one **ControlMaster** connection per host (so only the first call per host
-pays the SSH handshake; the socket path comes from the host's lab config). API:
-
-- `run(host, argv, *, input=None) -> CompletedProcess` — non-interactive re-exec.
-- `run_interactive(host, argv) -> int` — `ssh -t` for tio and other PTY commands.
-- `forward(host, remote_port) -> contextmanager(local_port)` — holds an `ssh -L`
-  tunnel for its lifetime; picks a free local port.
-- `read_remote_file(host, path) -> str | None` — reads a remote discovery file.
-
-A `Host` dataclass: `ssh` destination (required), optional `identity`,
-`control_path`.
-
-**Tests:** point a `Host` at `localhost`; assert `run` round-trips stdout/exit
-code, `forward` yields a working local port, `read_remote_file` reads a known
-file. **Delivers:** the transport primitives, unused so far.
-
-## Phase 1 — Lab file model ✅ (shipped, #20)
-
-**New:** `src/paniolo/_lab.py`. **Touches:** `_config.py`, `_cli.py`.
-
-Parse the single git-tracked lab file: `[hosts.*]` plus nested `[targets.*]`
-with `[targets.X.netboot]`, `[[targets.X.serial]]`, `[targets.X.video]`,
-`[targets.X.power]`. **Per-resource `host` is parsed from day one** (forward-
-compatible with multi-host targets), but this phase **validates that all of a
-target's resources resolve to one host** and errors clearly on a cross-host
-target. That restriction is what the deferred multi-host phase lifts.
-
-The compatibility hinge: `_lab` resolves a target down to the **existing flat
-`TargetConfig`** plus a single `host` string. Command bodies stay unchanged —
-they keep consuming `TargetConfig` exactly as today. `_resolve()` is widened to
-return `(TargetConfig, host)`.
-
-- "Point paniolo at the lab": a `--lab` global option / `PANIOLO_LAB` env var /
-  conventional default path (exact spelling is an open decision — see below).
-- **Backward compatibility:** with no lab configured, paniolo reads the legacy
-  `~/.config/paniolo/targets/*.toml` as today and `host` is always `local`, so
-  behavior is byte-for-byte identical. Migration into a lab file is opt-in.
-
-**Tests:** lab round-trip; target-default `host` inheritance by resources;
-cross-host target rejected; legacy-mode behavior unchanged. **Delivers:** you can
-*describe* a (single- or multi-host) lab and load it; everything still executes
-locally.
-
-## Phase 2 — Transparent re-exec for one-shot commands ✅ (shipped, #20)
-
-**Touches:** `_cli.py`, `_ssh.py`, the config loader.
-
-The interception. A `@remote_capable` decorator on each target command (≈20
-one-line additions) that, after Typer parses args, inspects the resolved `host`;
-if remote it:
-
-1. Serializes the resolved `TargetConfig` to a temp TOML and ships it over the
-   ControlMaster connection.
-2. Re-execs `paniolo <same subcommand + args>` on the host with
-   `PANIOLO_TARGET_CONFIG=<tmp>` — a new env var the loader honors so the
-   stateless remote runs against the injected slice.
-3. Streams stdout/stderr, propagates the exit code, cleans up the temp file.
-
-The local body is skipped entirely for remote targets. Streaming commands are
-marked `@remote_capable(mode="tunnel")` and are no-ops here (Phase 3 handles
-them).
-
-**Tests:** against the localhost-ssh host, assert `power-cycle`,
-`netboot status`, and `serial log` produce identical results run "remotely" vs
-locally. **Delivers:** every fire-and-read command is location-transparent.
-
-## Phase 3 — Streaming & the console ✅ (shipped, #20)
-
-**Touches:** `_cli.py`, `_serial.py`, `_video.py`.
-
-The headline capability. For a remote `console` / `video preview`:
-
-1. Re-exec the daemon start (`serial watch` / `video watch`) on the host
-   (idempotent).
-2. `read_remote_file` each daemon's `daemon.json` to learn its port.
-3. Open `forward()` tunnels for **both** hdmicap and serialcap.
-4. Open the browser at
-   `http://127.0.0.1:<local-hdmi>/?serialws=ws://127.0.0.1:<local-serial>/stream`
-   — the existing override stitches the two forwarded ports together with no
-   daemon changes.
-
-`console` is **foreground-blocking**: it holds the tunnels until Ctrl-C, then
-tears them down (no persistent local state). `serial connect` routes through
-`_ssh.run_interactive` (`ssh -t`, no tunnel needed).
-
-This is also where the design's anti-reverse-proxy decision pays off: the browser
-on the dev machine is the rendezvous point, so the two daemons never need to
-reach each other — which is what makes multi-host dashboards work later for free.
-
-**Tests:** localhost-ssh host — assert the forwarded ports serve the dashboard
-and the constructed URL resolves end-to-end. **Delivers:** the console feels
-local.
-
-## Phase 4 — `setup --host <name>` — pending
-
-**Touches:** `_cli.py`.
-
-`setup` builds the Rust daemons and installs helpers, which must happen on the
-host wired to the hardware. The remote variant re-execs `paniolo setup` on the
-named host over SSH. Small. **Delivers:** provision a control host from the dev
-machine.
-
-## Phase 5 — Discovery-assisted `configure` — pending
-
-**Touches:** `_cli.py`, `_lab.py`.
-
-`paniolo configure <target> --serial <host> --video <host>` runs discovery on the
-named hosts over SSH (enumerate serial devices, USB-Ethernet interfaces, capture
-devices), merges the inventories into a **proposed** target block, prints a
-**diff** against the lab file, and writes nothing until approved. Because the lab
-file is in git, approval is a commit; an agent can stage a proposal but never
-silently mutate the authoritative config. **Delivers:** the propose/approve
-configuration workflow from the design.
-
-## Sequencing
-
-Phases **0 → 1 → 2 → 3** deliver the headline value — location-transparent
-commands plus a local-feeling console — and are the natural first milestone.
-Phases **4 and 5** are quality-of-life and may be reordered or deferred past the
-first milestone. Each phase is an independently reviewable, mergeable PR with its
-own tests and doc updates.
-
-## Deferred (designed-for, not built)
-
-- **Multi-host per-resource routing.** Phase 1's same-host validation is the
-  single gate; lifting it means `_resolve` returns per-resource hosts and the
-  dispatch routes each resource independently. The schema and the dev-machine-hub
-  transport already accommodate it.
-- **`console --detach`** and the local tunnel registry it requires (transient
-  dev-machine runtime state).
-- **Multi-user locking / reservations.**
-- **Multi-file / multi-lab composition.**
-
-## Decisions (resolved during the build)
-
-- **Config-shipping mechanism (Phase 2).** ✅ Temp TOML over SSH +
-  `PANIOLO_TARGET_CONFIG` (keeps stdin free, avoids arg-quoting fragility).
-- **How to "point at the lab"** ✅ `--lab` global option with `envvar=PANIOLO_LAB`;
-  no lab configured → the legacy `~/.config/paniolo/targets/*.toml` (host = local),
-  so existing behavior is byte-for-byte unchanged.
-- **Per-resource schema carried ahead of use.** ✅ Done — Phase 1 parses
-  per-resource `host` (and rejects cross-host targets) so the multi-host phase
-  needs no schema migration.
-- **Remote `paniolo` discovery.** ✅ New finding: re-exec runs over a
-  *non-interactive* ssh whose PATH may omit `~/.local/bin`, so bare `paniolo`
-  can fail to resolve. Added a per-host **`paniolo_cmd`** (default `"paniolo"`)
-  to pin an absolute path. Caught by the localhost integration test.
-- **ssh-agent key-spray.** ✅ New finding: an agent offering many keys (1Password)
-  trips `MaxAuthTries` on the first connect. Setting a per-host **`identity`**
-  makes paniolo pass `-i <key> -o IdentitiesOnly=yes`. This is the user's ssh
-  config concern; the lab field is the lever.
-
-## Validation status
-
-Phases 0–3 are CI-green (unit + a localhost-ssh integration tier on the Linux
-runner) and were validated locally end-to-end against a real `localhost` host.
-The macOS SSH path (`_control_dir`'s `/tmp` socket-path handling) is confirmed on
-macOS 26.5/arm64. **Not yet validated:** the full `console` flow on real
-hardware (HDMI capture + serial), which CI can't exercise.
-````
-
 ## File: .claude/scheduled_tasks.lock
 ````
 {"sessionId":"f05aa849-67fb-4efd-89ae-da8900eb8c41","pid":88472,"procStart":"Wed May 27 22:29:02 2026","acquiredAt":1779925529556}
@@ -955,274 +743,217 @@ default serialcap port). The `?serial=` and `?serialws=` parameters let you
 point it at a different port or host if serialcap is running elsewhere.
 ````
 
-## File: docs/distributed-control.md
+## File: docs/distributed-control-plan.md
 ````markdown
-# Distributed control: one lab, one file
+# Distributed control: implementation plan
 
-> **Status: Phases 0–3 implemented** (PR #20, 2026-06-01); the rest is still
-> design. Shipped: the SSH transport, the one-file lab model (`--lab` /
-> `PANIOLO_LAB`), transparent re-exec of one-shot commands on a target's host,
-> and a tunnelled `console` for a remote target. Still design-only:
-> discovery-assisted `configure`, multi-host targets, `console --detach`, and
-> multi-user locking (see the [implementation plan](distributed-control-plan.md)
-> for the phasing). Compare [related work: paniolo vs. labgrid](ci-integration/related-work.md),
-> whose distributed model directly informs this.
+> **Status: Phases 0–5 shipped** (#20 for 0–3, #22 for 4–5; 2026-06-01); the
+> deferred items (multi-host targets, `console --detach`, locking) remain. This
+> sequences the build of the
+> [distributed-control design](distributed-control.md) into self-contained,
+> independently mergeable phases. Read the design doc first — this is the *how*
+> and *in what order*, not the *what* and *why*.
+>
+> **Shipped in 0–3:** `_ssh.py` transport, `_lab.py` lab model + `--lab`,
+> `@remote_capable` transparent re-exec (`_remote.py`), and the tunnelled remote
+> `console`. Two refinements emerged during the build and are in the code: a
+> per-host **`paniolo_cmd`** (the remote PATH problem) and the guidance to set a
+> per-host **`identity`** (ssh-agent key-spray vs. `MaxAuthTries`) — both folded
+> into "Open decisions" below.
 
-## The problem
+## Backbone
 
-Today paniolo assumes the machine you run it on is the machine wired to the
-target. When your dev machine isn't the control host — the common case — you
-SSH into the control host by hand and run `paniolo …` there (the remote-control
-pattern in the root [README](../README.md)). That works, but it leaks the host
-boundary into every workflow: you manage SSH sessions yourself, and anything
-that serves a port (the dashboard, `serial watch`, `video preview`) means
-hand-rolling `ssh -L` port forwards. The friction is acute for the console —
-making the live dashboard reachable from your laptop is just enough manual SSH
-plumbing to discourage using it.
+Two facts about the current code (verified against `src/paniolo/`) shape the
+whole plan:
 
-The goal: **abstract away host location.** From your dev machine you say
-`paniolo console fortune` and it transparently does the right thing on whichever
-control host `fortune` is wired to — including, eventually, a target whose
-hardware is spread across more than one control host.
+1. **`_resolve(name)` in `src/paniolo/_cli.py` is the single chokepoint** every
+   one of the ~20 target-bearing commands passes through to load its
+   `TargetConfig`. That means **one interception point can make all the one-shot
+   commands location-aware at once** — when the target's host is remote, re-exec
+   the entire `paniolo` invocation on that host and never run the local body.
+   Only the four streaming commands (`console`, `video preview`, `serial watch`,
+   `serial connect`) need bespoke handling.
+2. **Control hosts are stateless** (design principle 3), so a re-exec'd command
+   must be *handed* the config slice it needs — the dev machine owns the lab
+   file. The daemons (`serialcap`, `hdmicap`) already write a `daemon.json`
+   discovery file with their TCP `port`, and the dashboard already honors a
+   `?serialws=` override — so streaming needs **no daemon changes**, only SSH
+   port-forwarding plus URL construction.
 
-## The core decision: one lab, one file
+There is **no existing SSH code** in the Python source — the transport layer is
+greenfield.
 
-A **lab** is described by a single config file that lives in a git repo. You
-point paniolo at it (a `--lab` flag or `PANIOLO_LAB` env var, defaulting to a
-conventional path). That file declares every **host** in the lab and every
-**target**, and which host each piece of a target's hardware lives on. One lab,
-one file — deliberately simple; multi-file / multi-lab composition can come
-later if it ever earns its keep.
+### The localhost-ssh test fixture
 
-The file is the contract. It is plain, reviewable config under version control,
-edited by a human (optionally with an agent's help — see
-[Configuration workflow](#configuration-workflow)); paniolo reads it but is not
-the authority over it. This keeps paniolo's existing grain, where target config
-is reviewable TOML rather than daemon-managed state.
+A single trick makes the entire remote path testable in dev and CI without a
+second machine: define a host whose ssh destination is `localhost`. Re-exec,
+config-shipping, and tunnelling then run against the same machine over *real*
+SSH. Every phase below is validated this way; CI gets a step that adds the
+runner's own key to `authorized_keys` and exercises a `localhost` host.
 
-## Design principles
+## Phase 0 — SSH foundation ✅ (shipped, #20)
 
-These fell out of the discussion and constrain everything below:
+**New:** `src/paniolo/_ssh.py`. Pure infrastructure; nothing user-facing.
 
-1. **The dev machine is the hub.** It is the only node guaranteed to reach every
-   control host (a star topology). Control hosts cannot be assumed to reach each
-   other — they may sit on isolated lab segments with no mutual SSH trust. So the
-   data plane must **rendezvous at the dev machine**, never between control hosts.
-2. **Config is centralized and reviewed; runtime state lives next to the
-   hardware.** The lab file (config) lives in one place a human reviews. Only
-   *runtime* state — daemons, capture logs, advisory locks, discovery files —
-   lives on the control host, because it must be co-located with the hardware it
-   describes. This sharpens paniolo's old "state lives next to the hardware" rule,
-   which was only ever true because everything ran on one host.
-3. **Control hosts are stateless executors.** They hold no durable target config.
-   paniolo ships the relevant slice of config to a host at command time. A control
-   host is therefore *disposable*: re-image it, re-run `paniolo setup` on it, and
-   it resumes its role from the lab file with nothing to restore.
-4. **SSH is the transport.** It already solves auth, encryption, and identity, and
-   the key infrastructure exists. A custom agent/RPC server would either reinvent
-   that or tunnel over SSH anyway. labgrid uses SSH for its data plane for exactly
-   this reason.
-5. **Don't preclude multi-host targets.** A single logical target may span control
-   hosts (serial on one, HDMI capture on another, power on a third). The schema is
-   designed for this from day one even though the first implementation handles only
-   the same-host case.
+Owns one **ControlMaster** connection per host (so only the first call per host
+pays the SSH handshake; the socket path comes from the host's lab config). API:
 
-## The config model
+- `run(host, argv, *, input=None) -> CompletedProcess` — non-interactive re-exec.
+- `run_interactive(host, argv) -> int` — `ssh -t` for tio and other PTY commands.
+- `forward(host, remote_port) -> contextmanager(local_port)` — holds an `ssh -L`
+  tunnel for its lifetime; picks a free local port.
+- `read_remote_file(host, path) -> str | None` — reads a remote discovery file.
 
-Host binding lives on **each resource**, not on the target as a whole — because a
-target can span hosts. This mirrors labgrid's Resource model (a Resource is
-passive access-info bound to a specific exporter). A target-level `host` sets the
-default; each resource inherits it unless it overrides. The default-of-the-default
-is `local` (the dev machine itself), so a lab with one local host and one target
-reproduces today's single-host behavior exactly.
+A `Host` dataclass: `ssh` destination (required), optional `identity`,
+`control_path`.
 
-```toml
-# mylab.toml — checked into a git repo; PANIOLO_LAB points here.
+**Tests:** point a `Host` at `localhost`; assert `run` round-trips stdout/exit
+code, `forward` yields a working local port, `read_remote_file` reads a known
+file. **Delivers:** the transport primitives, unused so far.
 
-[hosts.bench1]
-ssh = "curtisg@bench1.local"      # ssh destination; the only required field
-# identity = "~/.ssh/id_lab"      # optional key; set it to avoid agent key-spray (below)
-# control_path = "~/.ssh/cm-%h"   # optional ControlMaster socket (see Transport)
-# paniolo_cmd = "/Users/me/.local/bin/paniolo"  # if paniolo isn't on the host's ssh PATH
+## Phase 1 — Lab file model ✅ (shipped, #20)
 
-[hosts.bench2]
-ssh = "curtisg@bench2.local"
+**New:** `src/paniolo/_lab.py`. **Touches:** `_config.py`, `_cli.py`.
 
-# A normal single-host target. Everything inherits host = bench1.
-[targets.fortune]
-host = "bench1"                   # default host for this target's resources
+Parse the single git-tracked lab file: `[hosts.*]` plus nested `[targets.*]`
+with `[targets.X.netboot]`, `[[targets.X.serial]]`, `[targets.X.video]`,
+`[targets.X.power]`. **Per-resource `host` is parsed from day one** (forward-
+compatible with multi-host targets), but this phase **validates that all of a
+target's resources resolve to one host** and errors clearly on a cross-host
+target. That restriction is what the deferred multi-host phase lifts.
 
-[targets.fortune.netboot]
-interface = "enx00e04c08d9a0"
-host_ip   = "192.168.99.1"
-tftp_root = "/home/curtisg/tftp/fortune"
+The compatibility hinge: `_lab` resolves a target down to the **existing flat
+`TargetConfig`** plus a single `host` string. Command bodies stay unchanged —
+they keep consuming `TargetConfig` exactly as today. `_resolve()` is widened to
+return `(TargetConfig, host)`.
 
-[[targets.fortune.serial]]
-name   = "console"
-device = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG00W7NY-if00-port0"
-baud   = 115200
+- "Point paniolo at the lab": a `--lab` global option / `PANIOLO_LAB` env var /
+  conventional default path (exact spelling is an open decision — see below).
+- **Backward compatibility:** with no lab configured, paniolo reads the legacy
+  `~/.config/paniolo/targets/*.toml` as today and `host` is always `local`, so
+  behavior is byte-for-byte identical. Migration into a lab file is opt-in.
 
-[targets.fortune.power]
-cycle_cmd = "/home/curtisg/src/rpi5-bringup/scripts/power-cycle.sh"
+**Tests:** lab round-trip; target-default `host` inheritance by resources;
+cross-host target rejected; legacy-mode behavior unchanged. **Delivers:** you can
+*describe* a (single- or multi-host) lab and load it; everything still executes
+locally.
 
-# --- the future case: one target spanning two control hosts ---
-[targets.fortune.video]
-host   = "bench2"                 # HDMI capture is on a different host
-device = "MS2109"
-```
+## Phase 2 — Transparent re-exec for one-shot commands ✅ (shipped, #20)
 
-- `host = "local"` (or unset, on a single-host lab) means the dev machine — i.e.
-  today's behavior, no SSH involved.
-- Existing `~/.config/paniolo/targets/*.toml` files are effectively an *implicit
-  local lab*. Backward compatibility: with no `--lab`/`PANIOLO_LAB`, paniolo uses
-  those exactly as now. The migration path is to fold them into a lab file; it is
-  opt-in, not forced.
+**Touches:** `_cli.py`, `_ssh.py`, the config loader.
 
-## Transport (the "Fork B" model)
+The interception. A `@remote_capable` decorator on each target command (≈20
+one-line additions) that, after Typer parses args, inspects the resolved `host`;
+if remote it:
 
-The transport splits by command type, and leans entirely on SSH and the fact
-that paniolo's subsystem daemons (`serialcap`, `hdmicap`) are *already* network
-services speaking HTTP/WebSocket on a discovery port.
+1. Serializes the resolved `TargetConfig` to a temp TOML and ships it over the
+   ControlMaster connection.
+2. Re-execs `paniolo <same subcommand + args>` on the host with
+   `PANIOLO_TARGET_CONFIG=<tmp>` — a new env var the loader honors so the
+   stateless remote runs against the injected slice.
+3. Streams stdout/stderr, propagates the exit code, cleans up the temp file.
 
-**One-shot control commands** — `power-cycle`, `netboot start/stop`,
-`video shot`, `serial log`, `serial send`, config reads — **re-exec over SSH.**
-For a resource on `bench1`, paniolo runs the same command on `bench1` and
-forwards stdin/stdout/stderr and the exit code. The far-side paniolo is
-unchanged, so this reuses 100% of existing logic; runtime state (logs, locks,
-discovery) naturally stays on the control host where it belongs.
+The local body is skipped entirely for remote targets. Streaming commands are
+marked `@remote_capable(mode="tunnel")` and are no-ops here (Phase 3 handles
+them).
 
-**Streaming / port-serving commands** — the dashboard, `serial watch`,
-`video preview` — **SSH-tunnel to the existing daemon.** paniolo re-execs the
-daemon start remotely (idempotent), reads the remote discovery port over SSH,
-opens an `ssh -L` forward to it, and points the local client/browser at the
-forwarded local port. No new protocol and no always-on server: the daemon's
-existing HTTP/WS *is* the API.
+**Tests:** against the localhost-ssh host, assert `power-cycle`,
+`netboot status`, and `serial log` produce identical results run "remotely" vs
+locally. **Delivers:** every fire-and-read command is location-transparent.
 
-**Latency** is handled with one **ControlMaster** connection per host, shared by
-every re-exec and every `-L` forward, so only the first command per host pays the
-SSH handshake. The host's `control_path` in the lab file names the master socket.
+## Phase 3 — Streaming & the console ✅ (shipped, #20)
 
-**Interactive `serial connect`** (tio) needs **no tunnel** — `ssh -t bench1
-paniolo serial connect fortune` runs tio straight over SSH's own PTY. The tunnel
-machinery is only for the browser dashboard, not the terminal CLI.
+**Touches:** `_cli.py`, `_serial.py`, `_video.py`.
 
-**Two operational notes** (learned while implementing this):
+The headline capability. For a remote `console` / `video preview`:
 
-- **`paniolo` must be reachable on the host.** Re-exec runs `paniolo …` over a
-  *non-interactive* ssh, whose PATH often omits `~/.local/bin`. If bare `paniolo`
-  doesn't resolve there, set the host's `paniolo_cmd` to an absolute path.
-- **Set `identity` to avoid ssh-agent key-spray.** An agent offering many keys
-  (e.g. 1Password) can trip the host's `MaxAuthTries` *before* the right key on
-  the first connect. A per-host `identity` makes paniolo pass
-  `-i <key> -o IdentitiesOnly=yes`, offering exactly one. (This is the user's ssh
-  setup, not something paniolo can fix for them — but the lab field is the lever.)
+1. Re-exec the daemon start (`serial watch` / `video watch`) on the host
+   (idempotent).
+2. `read_remote_file` each daemon's `daemon.json` to learn its port.
+3. Open `forward()` tunnels for **both** hdmicap and serialcap.
+4. Open the browser at
+   `http://127.0.0.1:<local-hdmi>/?serialws=ws://127.0.0.1:<local-serial>/stream`
+   — the existing override stitches the two forwarded ports together with no
+   daemon changes.
 
-### The dashboard, and why multi-host rules out a reverse-proxy
+`console` is **foreground-blocking**: it holds the tunnels until Ctrl-C, then
+tears them down (no persistent local state). `serial connect` routes through
+`_ssh.run_interactive` (`ssh -t`, no tunnel needed).
 
-The dashboard is the one place two subsystems interlock: hdmicap serves the page
-but reaches serialcap by an **absolute URL** (`ws://<host>:8724/stream`), with a
-`?serialws=` override (see [architecture §7](architecture.md)). So the browser
-makes a *second* connection, to serialcap, possibly on a different port and a
-different host.
+This is also where the design's anti-reverse-proxy decision pays off: the browser
+on the dev machine is the rendezvous point, so the two daemons never need to
+reach each other — which is what makes multi-host dashboards work later for free.
 
-The clean answer uses the override and the hub principle together: forward each
-daemon's port to the dev machine, then open the dashboard at
-`http://127.0.0.1:<local-hdmi>/?serialws=ws://127.0.0.1:<local-serial>/stream`.
-The `?serialws=` knob — which already exists — stitches the two together and does
-not care that the daemons are on different hosts, only that both resolve as
-forwarded local ports. This needs **zero changes to hdmicap or serialcap.**
+**Tests:** localhost-ssh host — assert the forwarded ports serve the dashboard
+and the constructed URL resolves end-to-end. **Delivers:** the console feels
+local.
 
-We explicitly considered, and rejected, making hdmicap **reverse-proxy** serialcap
-to collapse the dashboard to one origin/one forward. It would require hdmicap on
-one host to connect to serialcap on another — exactly the cross-host path
-principle 1 says we cannot assume. The forward-each-daemon-to-the-dev-machine
-model is the only one that always works, and it generalizes to multi-host targets
-for free.
+## Phase 4 — `setup --host <name>` ✅ (shipped, #22)
 
-### Why not a long-running agent daemon (labgrid's exporter)
+**Touches:** `_cli.py`.
 
-A per-host paniolo agent with its own RPC API (labgrid's exporter / "Option B" in
-`AGENTS.md`) would give cleaner streaming multiplexing and a natural home for
-multi-user locking. We chose against it for now because it directly trades away
-paniolo's stated identity — *zero-infrastructure, no coordinator/exporter/client
-to stand up* ([related-work](ci-integration/related-work.md)). SSH-tunnelling the
-daemons that already exist gets local-feeling console with no always-on server and
-no new auth surface. The agent remains a *someday* option, gated on whether
-multi-user/board-farm scale ever becomes a goal — at which point paniolo would be
-choosing to become a different kind of tool, deliberately.
+`setup` builds the Rust daemons and installs helpers, which must happen on the
+host wired to the hardware. The remote variant re-execs `paniolo setup` on the
+named host over SSH. Small. **Delivers:** provision a control host from the dev
+machine.
 
-## Console lifecycle
+## Phase 5 — Discovery-assisted `configure` ✅ (shipped, #22)
 
-`paniolo console <target>` is **foreground-blocking** by default: it opens the
-forward(s), launches the browser, and blocks holding the tunnel until you Ctrl-C,
-then tears down. This feels exactly like a local dashboard and needs **no
-persistent local runtime state** — the forwards die with the process. It assumes a
-human is present, which is consistent with the fact that physical setup already
-requires interactive access to the control host.
+**Touches:** `_cli.py`, `_lab.py`.
 
-A non-blocking `--detach` mode (set up the forward, print the URL, return; reap on
-`console --down` or idle timeout) is a plausible later addition for agent use, but
-it introduces a *local tunnel registry* — transient runtime state on the dev
-machine — so it is deferred until something actually needs the live console
-without a terminal held open. (Most agent workflows use `video shot`/`read`, not
-the live stream.)
+`paniolo configure <target> --serial <host> --video <host>` runs discovery on the
+named hosts over SSH (enumerate serial devices, USB-Ethernet interfaces, capture
+devices), merges the inventories into a **proposed** target block, prints a
+**diff** against the lab file, and writes nothing until approved. Because the lab
+file is in git, approval is a commit; an agent can stage a proposal but never
+silently mutate the authoritative config. **Delivers:** the propose/approve
+configuration workflow from the design.
 
-## Configuration workflow
+## Sequencing
 
-Discovery **assists** authoring; it does not replace it. Control hosts can
-enumerate their hardware (serial devices, USB-Ethernet interfaces, HDMI capture
-devices) to scaffold config, but the authoritative lab file is always written and
-approved by a human.
+Phases **0 → 1 → 2 → 3** deliver the headline value — location-transparent
+commands plus a local-feeling console — and are the natural first milestone.
+Phases **4 and 5** are quality-of-life and may be reordered or deferred past the
+first milestone. Each phase is an independently reviewable, mergeable PR with its
+own tests and doc updates.
 
-The flow is two-phase — **propose, then approve**:
+## Deferred (designed-for, not built)
 
-1. `paniolo configure fortune --serial bench1 --video bench2` runs discovery on
-   the named hosts over SSH and merges their inventories into a **proposed** target
-   definition.
-2. paniolo shows the **diff** against the current lab file and writes nothing
-   authoritative.
-3. The human reviews and approves; the change lands as a git commit to the lab
-   repo.
+- **Multi-host per-resource routing.** Phase 1's same-host validation is the
+  single gate; lifting it means `_resolve` returns per-resource hosts and the
+  dispatch routes each resource independently. The schema and the dev-machine-hub
+  transport already accommodate it.
+- **`console --detach`** and the local tunnel registry it requires (transient
+  dev-machine runtime state).
+- **Multi-user locking / reservations.**
+- **Multi-file / multi-lab composition.**
 
-An agent can drive step 1 and prepare the diff, but it can only *stage* a
-proposal — it never silently mutates the authoritative config. Because the lab
-file is in git, every change is a reviewable, revertible commit. Reconfiguration
-is the same flow against the existing file.
+## Decisions (resolved during the build)
 
-## What's deferred
+- **Config-shipping mechanism (Phase 2).** ✅ Temp TOML over SSH +
+  `PANIOLO_TARGET_CONFIG` (keeps stdin free, avoids arg-quoting fragility).
+- **How to "point at the lab"** ✅ `--lab` global option with `envvar=PANIOLO_LAB`;
+  no lab configured → the legacy `~/.config/paniolo/targets/*.toml` (host = local),
+  so existing behavior is byte-for-byte unchanged.
+- **Per-resource schema carried ahead of use.** ✅ Done — Phase 1 parses
+  per-resource `host` (and rejects cross-host targets) so the multi-host phase
+  needs no schema migration.
+- **Remote `paniolo` discovery.** ✅ New finding: re-exec runs over a
+  *non-interactive* ssh whose PATH may omit `~/.local/bin`, so bare `paniolo`
+  can fail to resolve. Added a per-host **`paniolo_cmd`** (default `"paniolo"`)
+  to pin an absolute path. Caught by the localhost integration test.
+- **ssh-agent key-spray.** ✅ New finding: an agent offering many keys (1Password)
+  trips `MaxAuthTries` on the first connect. Setting a per-host **`identity`**
+  makes paniolo pass `-i <key> -o IdentitiesOnly=yes`. This is the user's ssh
+  config concern; the lab field is the lever.
 
-Designed-for but **not** in the first implementation:
+## Validation status
 
-- **Multi-host targets.** The schema (per-resource `host`) and the transport
-  (dev-machine rendezvous) both support it; the first cut handles same-host
-  targets only and rejects cross-host targets with a clear error.
-- **`console --detach`** and the local tunnel registry it requires.
-- **Multi-user / locking / reservations** (labgrid's coordinator-enforced
-  *places*). Single-user is assumed.
-- **A long-running agent daemon / RPC API.** Only if scale demands it.
-- **Multi-file / multi-lab composition.** One lab, one file, for now.
-
-## Relationship to labgrid
-
-This design is, knowingly, a smaller-footprint rediscovery of labgrid's
-distributed shape: per-resource host binding ≈ labgrid Resources bound to
-exporters; SSH data plane ≈ labgrid's client→exporter-over-SSH data plane;
-discovery-assisted config ≈ a coordinator-as-registry, minus the always-on
-server. The deliberate divergence is **no coordinator and no exporter daemon** —
-a single git-tracked lab file plus SSH, preserving paniolo's zero-infrastructure,
-agent-in-the-loop niche. See [related work](ci-integration/related-work.md) for
-the full comparison.
-
-## Open questions
-
-- Exact spelling of "point paniolo at the lab" (`--lab` flag, `PANIOLO_LAB`,
-  default path, or a `[lab]` pointer in user config) and how it composes with the
-  legacy `~/.config/paniolo/targets/*.toml` during migration.
-- Whether the per-command config slice shipped to a host travels as CLI args, a
-  temp file over SSH, or stdin — a mechanism choice, not an architecture one.
-- How `paniolo setup` is invoked per remote host (`setup --host bench1` re-execing
-  over SSH is the obvious answer, since building daemons must happen on the host
-  wired to the hardware).
+Phases 0–3 are CI-green (unit + a localhost-ssh integration tier on the Linux
+runner) and were validated locally end-to-end against a real `localhost` host.
+The macOS SSH path (`_control_dir`'s `/tmp` socket-path handling) is confirmed on
+macOS 26.5/arm64. **Not yet validated:** the full `console` flow on real
+hardware (HDMI capture + serial), which CI can't exercise.
 ````
 
 ## File: docs/hid.md
@@ -6442,201 +6173,6 @@ lto = "thin"
 # limitations under the License.
 ````
 
-## File: src/paniolo/_lab.py
-````python
-# Copyright 2026 Curtis Galloway
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""The lab model: one git-tracked file describing all hosts and targets.
-
-A *lab* is a single TOML file (pointed at by ``--lab`` / ``PANIOLO_LAB``) that
-declares every control **host** paniolo reaches over SSH and every **target**,
-with each piece of a target's hardware bound to a host. See
-docs/distributed-control.md.
-
-```toml
-[hosts.bench1]
-ssh = "curtisg@bench1.local"     # required; "local" means the dev machine
-# identity = "~/.ssh/id_lab"     # optional
-# control_path = "~/.ssh/cm-%C"  # optional
-
-[targets.fortune]
-host = "bench1"                   # default host for this target's resources
-
-[targets.fortune.netboot]
-interface = "enx00e04c08d9a0"
-host_ip   = "192.168.99.1"
-tftp_root = "/home/curtisg/tftp/fortune"
-
-[[targets.fortune.serial]]
-name   = "console"
-device = "/dev/serial/by-id/usb-…"
-baud   = 115200
-
-[targets.fortune.power]
-cycle_cmd = "/path/cycle.sh"
-```
-
-**Per-resource host binding** (``host`` on any resource, defaulting to the
-target's ``host``, defaulting to ``local``) is parsed so the schema is ready for
-targets that span control hosts — but this first implementation **enforces that
-a target's resources all resolve to one host** and rejects cross-host targets.
-Resolution flattens a target down to the existing :class:`TargetConfig` plus the
-single :class:`~paniolo._ssh.Host` it lives on, so command bodies are unchanged.
-"""
-
-from __future__ import annotations
-
-import dataclasses
-import os
-import tomllib
-from pathlib import Path
-from typing import Optional
-
-from ._config import SerialInterface, TargetConfig
-from ._ssh import LOCAL, Host
-
-# Default host name when neither a resource nor its target names one.
-DEFAULT_HOST = LOCAL
-DEFAULT_HOST_IP = "192.168.99.1"
-
-
-class LabError(RuntimeError):
-    """The lab file is malformed or describes something unsupported."""
-
-
-@dataclasses.dataclass
-class Lab:
-    """A parsed lab: named hosts plus raw target tables (resolved on demand)."""
-
-    hosts: dict[str, Host]
-    targets: dict[str, dict]
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "Lab":
-        hosts: dict[str, Host] = {}
-        for name, h in (data.get("hosts") or {}).items():
-            if "ssh" not in h:
-                raise LabError(f"host '{name}': missing required 'ssh' field")
-            hosts[name] = Host(
-                name=name,
-                ssh=h["ssh"],
-                identity=h.get("identity"),
-                control_path=h.get("control_path"),
-                paniolo_cmd=h.get("paniolo_cmd"),
-            )
-        targets = data.get("targets") or {}
-        return cls(hosts=hosts, targets=targets)
-
-    def target_names(self) -> list[str]:
-        return sorted(self.targets)
-
-    def _host(self, name: str) -> Host:
-        if name == LOCAL:
-            # The dev machine is implicit; an explicit [hosts.local] may override.
-            return self.hosts.get(LOCAL, Host(name=LOCAL, ssh=LOCAL))
-        if name not in self.hosts:
-            raise LabError(f"reference to unknown host '{name}'")
-        return self.hosts[name]
-
-    def resolve_target(self, name: str) -> tuple[TargetConfig, Host]:
-        """Flatten a target to a (TargetConfig, Host), enforcing one host.
-
-        Raises KeyError if the target is unknown, LabError if its resources span
-        more than one host (not yet supported) or reference an unknown host.
-        """
-        if name not in self.targets:
-            raise KeyError(name)
-        t = self.targets[name]
-        default_host = t.get("host", DEFAULT_HOST)
-        used: set[str] = set()
-
-        netboot = t.get("netboot") or {}
-        if netboot:
-            used.add(netboot.get("host", default_host))
-
-        serial_interfaces: list[SerialInterface] = []
-        for s in t.get("serial") or []:
-            if "name" not in s or "device" not in s:
-                raise LabError(f"target '{name}': each [[serial]] needs name + device")
-            serial_interfaces.append(
-                SerialInterface(
-                    name=s["name"],
-                    device=s["device"],
-                    baud=int(s.get("baud", 115200)),
-                    power_sense_signal=s.get("power_sense_signal"),
-                )
-            )
-            used.add(s.get("host", default_host))
-
-        power = t.get("power") or {}
-        if power:
-            used.add(power.get("host", default_host))
-
-        # No resources named a host → the target falls on its default host.
-        if not used:
-            used.add(default_host)
-        if len(used) > 1:
-            raise LabError(
-                f"target '{name}' spans multiple hosts {sorted(used)}; "
-                "multi-host targets are not yet supported"
-            )
-
-        cfg = TargetConfig(
-            name=name,
-            interface=netboot.get("interface", ""),
-            host_ip=netboot.get("host_ip", DEFAULT_HOST_IP),
-            tftp_root=netboot.get("tftp_root"),
-            power_cycle_cmd=power.get("cycle_cmd"),
-            power_serial_interface=power.get("serial_interface"),
-            serial_interfaces=serial_interfaces,
-        )
-        return cfg, self._host(next(iter(used)))
-
-
-def load_lab(path: str) -> Lab:
-    with open(os.path.expanduser(path), "rb") as f:
-        data = tomllib.load(f)
-    return Lab.from_dict(data)
-
-
-# ── "which lab" resolution ───────────────────────────────────────────────────
-
-_override_path: Optional[str] = None
-
-
-def set_lab_path(path: Optional[str]) -> None:
-    """Record a lab path from the CLI (--lab), overriding PANIOLO_LAB."""
-    global _override_path
-    _override_path = path
-
-
-def lab_path() -> Optional[str]:
-    """The active lab file path: --lab if given, else $PANIOLO_LAB, else None."""
-    return _override_path or os.environ.get("PANIOLO_LAB")
-
-
-def load() -> Optional[Lab]:
-    """Load the active lab, or None when none is configured (legacy mode)."""
-    path = lab_path()
-    if not path:
-        return None
-    if not Path(os.path.expanduser(path)).exists():
-        raise LabError(f"lab file not found: {path}")
-    return load_lab(path)
-````
-
 ## File: src/paniolo/_netif.py
 ````python
 # Copyright 2026 Curtis Galloway
@@ -7441,177 +6977,6 @@ def close_master(host: Host) -> None:
     )
 ````
 
-## File: tests/test_lab.py
-````python
-# Copyright 2026 Curtis Galloway
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Tests for the lab-file model (_lab.py): parsing, host resolution, the
-single-host (multi-host-rejecting) constraint, and lab-path selection."""
-
-from __future__ import annotations
-
-import pytest
-
-from paniolo import _lab
-from paniolo._lab import Lab, LabError
-
-# A representative single-host lab spanning every resource kind.
-_LAB = {
-    "hosts": {
-        "bench1": {"ssh": "curtisg@bench1.local", "identity": "~/.ssh/id_lab"},
-        "bench2": {"ssh": "curtisg@bench2.local"},
-    },
-    "targets": {
-        "fortune": {
-            "host": "bench1",
-            "netboot": {
-                "interface": "enx00e04c08d9a0",
-                "tftp_root": "/srv/tftp/fortune",
-            },
-            "serial": [
-                {"name": "console", "device": "/dev/ttyUSB0", "baud": 115200},
-                {"name": "bmc", "device": "/dev/ttyUSB1", "baud": 9600},
-            ],
-            "power": {"cycle_cmd": "/bin/cycle.sh", "serial_interface": "console"},
-        },
-        "apple": {"host": "bench2", "netboot": {"interface": "en5"}},
-    },
-}
-
-
-def test_resolve_single_host_target_flattens_to_config_and_host():
-    lab = Lab.from_dict(_LAB)
-    cfg, host = lab.resolve_target("fortune")
-    assert cfg.name == "fortune"
-    assert cfg.interface == "enx00e04c08d9a0"
-    assert cfg.tftp_root == "/srv/tftp/fortune"
-    assert cfg.host_ip == "192.168.99.1"  # default applied
-    assert cfg.power_cycle_cmd == "/bin/cycle.sh"
-    assert cfg.power_serial_interface == "console"
-    assert [(s.name, s.device, s.baud) for s in cfg.serial_interfaces] == [
-        ("console", "/dev/ttyUSB0", 115200),
-        ("bmc", "/dev/ttyUSB1", 9600),
-    ]
-    assert host.name == "bench1"
-    assert host.ssh == "curtisg@bench1.local"
-    assert host.identity == "~/.ssh/id_lab"
-    assert not host.is_local
-
-
-def test_target_names_sorted():
-    assert Lab.from_dict(_LAB).target_names() == ["apple", "fortune"]
-
-
-def test_resource_inherits_target_default_host():
-    # serial has no explicit host → inherits target host bench1; still single-host.
-    _, host = Lab.from_dict(_LAB).resolve_target("fortune")
-    assert host.name == "bench1"
-
-
-def test_target_without_host_resolves_to_local():
-    lab = Lab.from_dict({"targets": {"t": {"netboot": {"interface": "en0"}}}})
-    _, host = lab.resolve_target("t")
-    assert host.is_local
-
-
-def test_empty_target_resolves_to_local():
-    lab = Lab.from_dict({"targets": {"t": {}}})
-    cfg, host = lab.resolve_target("t")
-    assert host.is_local
-    assert cfg.interface == ""  # no netboot section
-
-
-def test_unknown_target_raises_keyerror():
-    with pytest.raises(KeyError):
-        Lab.from_dict(_LAB).resolve_target("ghost")
-
-
-def test_unknown_host_reference_raises():
-    lab = Lab.from_dict(
-        {"targets": {"t": {"host": "nope", "power": {"cycle_cmd": "x"}}}}
-    )
-    with pytest.raises(LabError, match="unknown host 'nope'"):
-        lab.resolve_target("t")
-
-
-def test_multi_host_target_is_rejected():
-    lab = Lab.from_dict(
-        {
-            "hosts": {"a": {"ssh": "u@a"}, "b": {"ssh": "u@b"}},
-            "targets": {
-                "split": {
-                    "netboot": {"interface": "en0", "host": "a"},
-                    "serial": [{"name": "c", "device": "/dev/x", "host": "b"}],
-                }
-            },
-        }
-    )
-    with pytest.raises(LabError, match="multiple hosts"):
-        lab.resolve_target("split")
-
-
-def test_host_missing_ssh_raises():
-    with pytest.raises(LabError, match="missing required 'ssh'"):
-        Lab.from_dict({"hosts": {"bad": {"identity": "k"}}})
-
-
-def test_serial_missing_fields_raises():
-    lab = Lab.from_dict({"targets": {"t": {"serial": [{"name": "c"}]}}})
-    with pytest.raises(LabError, match="name . device"):
-        lab.resolve_target("t")
-
-
-def test_load_lab_parses_a_real_toml_file(tmp_path):
-    f = tmp_path / "lab.toml"
-    f.write_text(
-        '[hosts.bench1]\nssh = "u@bench1"\n\n'
-        '[targets.fortune]\nhost = "bench1"\n\n'
-        '[targets.fortune.netboot]\ninterface = "en0"\n'
-    )
-    lab = _lab.load_lab(str(f))
-    cfg, host = lab.resolve_target("fortune")
-    assert cfg.interface == "en0"
-    assert host.ssh == "u@bench1"
-
-
-# ── lab-path selection ───────────────────────────────────────────────────────
-
-
-@pytest.fixture(autouse=True)
-def _reset_override(monkeypatch):
-    monkeypatch.setattr(_lab, "_override_path", None)
-    monkeypatch.delenv("PANIOLO_LAB", raising=False)
-
-
-def test_load_is_none_without_a_configured_lab():
-    assert _lab.load() is None
-
-
-def test_lab_path_prefers_override_then_env(monkeypatch):
-    monkeypatch.setenv("PANIOLO_LAB", "/from/env.toml")
-    assert _lab.lab_path() == "/from/env.toml"
-    _lab.set_lab_path("/from/flag.toml")
-    assert _lab.lab_path() == "/from/flag.toml"
-
-
-def test_load_raises_on_missing_file():
-    _lab.set_lab_path("/no/such/lab.toml")
-    with pytest.raises(LabError, match="not found"):
-        _lab.load()
-````
-
 ## File: tests/test_netif.py
 ````python
 # Copyright 2026 Curtis Galloway
@@ -7772,189 +7137,6 @@ def test_mode_off_when_not_running_skips_stop(monkeypatch, calls):
     monkeypatch.setattr(_netif, "is_netboot_running", lambda name: False)
     _netif.mode_off(_cfg())
     assert calls == ["del_ll", "del_ip"]
-````
-
-## File: tests/test_remote.py
-````python
-# Copyright 2026 Curtis Galloway
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Tests for transparent remote re-exec (_remote.py).
-
-Unit tests cover argv rewriting (always run). Integration tests cover the real
-ship-config + re-exec round-trip and a full CLI dispatch; they are gated on
-PANIOLO_SSH_IT (see test_ssh.py) so the suite never needs an ssh-agent.
-"""
-
-from __future__ import annotations
-
-import os
-import shutil
-import subprocess
-import sys
-import tomllib
-import types
-from pathlib import Path
-
-import pytest
-
-from paniolo import _cli, _config, _remote, _ssh
-from paniolo._config import TargetConfig
-from paniolo._ssh import Host
-
-# ── unit: argv rewriting ─────────────────────────────────────────────────────
-
-
-def test_strip_lab_option_spaced_and_equals_forms():
-    assert _remote.strip_lab_option(["--lab", "/x.toml", "netboot", "status"]) == [
-        "netboot",
-        "status",
-    ]
-    assert _remote.strip_lab_option(["--lab=/x.toml", "power-cycle", "t"]) == [
-        "power-cycle",
-        "t",
-    ]
-
-
-def test_strip_lab_option_noop_without_lab():
-    assert _remote.strip_lab_option(["serial", "log", "-i", "console"]) == [
-        "serial",
-        "log",
-        "-i",
-        "console",
-    ]
-
-
-def test_remote_argv_replaces_launcher_and_defaults_to_paniolo():
-    argv = ["/usr/local/bin/paniolo", "--lab", "/x.toml", "netboot", "status", "t"]
-    assert _remote.remote_argv(argv) == ["paniolo", "netboot", "status", "t"]
-
-
-def test_remote_argv_honors_host_paniolo_cmd():
-    argv = ["/local/paniolo", "netif", "status", "t"]
-    assert _remote.remote_argv(argv, "/opt/paniolo/bin/paniolo") == [
-        "/opt/paniolo/bin/paniolo",
-        "netif",
-        "status",
-        "t",
-    ]
-
-
-def test_host_paniolo_property_default_and_override():
-    assert Host(name="h", ssh="u@h").paniolo == "paniolo"
-    assert Host(name="h", ssh="u@h", paniolo_cmd="/x/paniolo").paniolo == "/x/paniolo"
-
-
-# ── unit: remote console plumbing ────────────────────────────────────────────
-
-
-def _completed(stdout="", returncode=0, stderr=""):
-    return types.SimpleNamespace(stdout=stdout, returncode=returncode, stderr=stderr)
-
-
-def test_remote_daemon_port_parses_discovery_json(monkeypatch):
-    monkeypatch.setattr(
-        _remote._ssh, "run", lambda *a, **k: _completed('{"pid": 5, "port": 8723}')
-    )
-    assert _remote.remote_daemon_port(Host(name="h", ssh="u@h"), "hdmicap") == 8723
-
-
-def test_remote_daemon_port_none_when_absent_or_bad(monkeypatch):
-    h = Host(name="h", ssh="u@h")
-    monkeypatch.setattr(_remote._ssh, "run", lambda *a, **k: _completed("", 1))
-    assert _remote.remote_daemon_port(h, "hdmicap") is None
-    monkeypatch.setattr(_remote._ssh, "run", lambda *a, **k: _completed("not json"))
-    assert _remote.remote_daemon_port(h, "hdmicap") is None
-
-
-def test_dashboard_url_builds_query():
-    base = "http://127.0.0.1:9001"
-    assert _cli._dashboard_url(base, None, None) == base
-    assert (
-        _cli._dashboard_url(base, "ws://127.0.0.1:9002/stream", None)
-        == f"{base}/?serialws=ws://127.0.0.1:9002/stream"
-    )
-    assert (
-        _cli._dashboard_url(base, "ws://127.0.0.1:9002/stream", "console")
-        == f"{base}/?serialws=ws://127.0.0.1:9002/stream&interface=console"
-    )
-
-
-# ── integration: real ssh re-exec, opt-in ───────────────────────────────────
-
-_DEST = os.environ.get("PANIOLO_SSH_IT")
-_IDENT = os.environ.get("PANIOLO_SSH_IT_IDENTITY")
-# The paniolo matching the code under test — the console script next to the
-# running interpreter (the venv), not whatever happens to be first on PATH.
-_colocated = Path(sys.executable).parent / "paniolo"
-_PANIOLO = str(_colocated) if _colocated.exists() else shutil.which("paniolo")
-
-integration = pytest.mark.skipif(
-    not _DEST, reason="set PANIOLO_SSH_IT to run remote re-exec integration tests"
-)
-
-
-@pytest.fixture
-def host():
-    h = Host(
-        name="it",
-        ssh=_DEST,
-        identity=_IDENT,
-        control_path=f"/tmp/pcm-remote-{os.getpid()}-%C",
-        paniolo_cmd=_PANIOLO,
-    )
-    yield h
-    _ssh.close_master(h)
-
-
-def _cfg() -> TargetConfig:
-    return TargetConfig(name="t", interface="lo", tftp_root="/tmp/tftp-t")
-
-
-@integration
-def test_ship_config_round_trips(host):
-    remote_path = _remote.ship_config(host, _cfg())
-    try:
-        text = _ssh.read_remote_file(host, remote_path)
-        assert text is not None
-        back = _config._from_dict(tomllib.loads(text))
-        assert back.name == "t"
-        assert back.interface == "lo"
-        assert back.tftp_root == "/tmp/tftp-t"
-    finally:
-        _ssh.run(host, ["rm", "-f", remote_path])
-
-
-@integration
-@pytest.mark.skipif(not _PANIOLO, reason="paniolo not installed on PATH")
-def test_full_cli_dispatch_runs_on_remote(host, tmp_path):
-    # A lab whose single target lives on the (remote) integration host.
-    ident = f'identity = "{_IDENT}"\n' if _IDENT else ""
-    lab = tmp_path / "lab.toml"
-    lab.write_text(
-        f'[hosts.h]\nssh = "{_DEST}"\n{ident}paniolo_cmd = "{_PANIOLO}"\n\n'
-        f'[targets.t]\nhost = "h"\n\n[targets.t.netboot]\ninterface = "lo"\n'
-    )
-    result = subprocess.run(
-        [_PANIOLO, "--lab", str(lab), "netboot", "status", "t"],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert result.returncode == 0, result.stderr
-    # The status text is produced by the *remote* paniolo and passed through.
-    assert "stopped" in result.stdout or "running" in result.stdout
 ````
 
 ## File: tests/test_ssh.py
@@ -8581,6 +7763,276 @@ farm could point its existing ser2net / `ExternalPowerDriver` at paniolo with no
 work) and a **validation reference**. Redfish-provider is an **active build** worth doing —
 sequenced after the M1 device-control core, since it consumes the same power verbs and serial
 socket.
+````
+
+## File: docs/distributed-control.md
+````markdown
+# Distributed control: one lab, one file
+
+> **Status: Phases 0–5 implemented** (#20 for 0–3, #22 for 4–5; 2026-06-01).
+> Shipped: the SSH transport, the one-file lab model (`--lab` / `PANIOLO_LAB`),
+> transparent re-exec of one-shot commands on a target's host, a tunnelled
+> `console` for a remote target, remote `setup --host`, and discovery-assisted
+> `configure`. Still design-only: multi-host targets, `console --detach`, and
+> multi-user locking (see the [implementation plan](distributed-control-plan.md)
+> for the phasing). Compare [related work: paniolo vs. labgrid](ci-integration/related-work.md),
+> whose distributed model directly informs this.
+
+## The problem
+
+Today paniolo assumes the machine you run it on is the machine wired to the
+target. When your dev machine isn't the control host — the common case — you
+SSH into the control host by hand and run `paniolo …` there (the remote-control
+pattern in the root [README](../README.md)). That works, but it leaks the host
+boundary into every workflow: you manage SSH sessions yourself, and anything
+that serves a port (the dashboard, `serial watch`, `video preview`) means
+hand-rolling `ssh -L` port forwards. The friction is acute for the console —
+making the live dashboard reachable from your laptop is just enough manual SSH
+plumbing to discourage using it.
+
+The goal: **abstract away host location.** From your dev machine you say
+`paniolo console fortune` and it transparently does the right thing on whichever
+control host `fortune` is wired to — including, eventually, a target whose
+hardware is spread across more than one control host.
+
+## The core decision: one lab, one file
+
+A **lab** is described by a single config file that lives in a git repo. You
+point paniolo at it (a `--lab` flag or `PANIOLO_LAB` env var, defaulting to a
+conventional path). That file declares every **host** in the lab and every
+**target**, and which host each piece of a target's hardware lives on. One lab,
+one file — deliberately simple; multi-file / multi-lab composition can come
+later if it ever earns its keep.
+
+The file is the contract. It is plain, reviewable config under version control,
+edited by a human (optionally with an agent's help — see
+[Configuration workflow](#configuration-workflow)); paniolo reads it but is not
+the authority over it. This keeps paniolo's existing grain, where target config
+is reviewable TOML rather than daemon-managed state.
+
+## Design principles
+
+These fell out of the discussion and constrain everything below:
+
+1. **The dev machine is the hub.** It is the only node guaranteed to reach every
+   control host (a star topology). Control hosts cannot be assumed to reach each
+   other — they may sit on isolated lab segments with no mutual SSH trust. So the
+   data plane must **rendezvous at the dev machine**, never between control hosts.
+2. **Config is centralized and reviewed; runtime state lives next to the
+   hardware.** The lab file (config) lives in one place a human reviews. Only
+   *runtime* state — daemons, capture logs, advisory locks, discovery files —
+   lives on the control host, because it must be co-located with the hardware it
+   describes. This sharpens paniolo's old "state lives next to the hardware" rule,
+   which was only ever true because everything ran on one host.
+3. **Control hosts are stateless executors.** They hold no durable target config.
+   paniolo ships the relevant slice of config to a host at command time. A control
+   host is therefore *disposable*: re-image it, re-run `paniolo setup` on it, and
+   it resumes its role from the lab file with nothing to restore.
+4. **SSH is the transport.** It already solves auth, encryption, and identity, and
+   the key infrastructure exists. A custom agent/RPC server would either reinvent
+   that or tunnel over SSH anyway. labgrid uses SSH for its data plane for exactly
+   this reason.
+5. **Don't preclude multi-host targets.** A single logical target may span control
+   hosts (serial on one, HDMI capture on another, power on a third). The schema is
+   designed for this from day one even though the first implementation handles only
+   the same-host case.
+
+## The config model
+
+Host binding lives on **each resource**, not on the target as a whole — because a
+target can span hosts. This mirrors labgrid's Resource model (a Resource is
+passive access-info bound to a specific exporter). A target-level `host` sets the
+default; each resource inherits it unless it overrides. The default-of-the-default
+is `local` (the dev machine itself), so a lab with one local host and one target
+reproduces today's single-host behavior exactly.
+
+```toml
+# mylab.toml — checked into a git repo; PANIOLO_LAB points here.
+
+[hosts.bench1]
+ssh = "curtisg@bench1.local"      # ssh destination; the only required field
+# identity = "~/.ssh/id_lab"      # optional key; set it to avoid agent key-spray (below)
+# control_path = "~/.ssh/cm-%h"   # optional ControlMaster socket (see Transport)
+# paniolo_cmd = "/Users/me/.local/bin/paniolo"  # if paniolo isn't on the host's ssh PATH
+
+[hosts.bench2]
+ssh = "curtisg@bench2.local"
+
+# A normal single-host target. Everything inherits host = bench1.
+[targets.fortune]
+host = "bench1"                   # default host for this target's resources
+
+[targets.fortune.netboot]
+interface = "enx00e04c08d9a0"
+host_ip   = "192.168.99.1"
+tftp_root = "/home/curtisg/tftp/fortune"
+
+[[targets.fortune.serial]]
+name   = "console"
+device = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG00W7NY-if00-port0"
+baud   = 115200
+
+[targets.fortune.power]
+cycle_cmd = "/home/curtisg/src/rpi5-bringup/scripts/power-cycle.sh"
+
+# --- the future case: one target spanning two control hosts ---
+[targets.fortune.video]
+host   = "bench2"                 # HDMI capture is on a different host
+device = "MS2109"
+```
+
+- `host = "local"` (or unset, on a single-host lab) means the dev machine — i.e.
+  today's behavior, no SSH involved.
+- Existing `~/.config/paniolo/targets/*.toml` files are effectively an *implicit
+  local lab*. Backward compatibility: with no `--lab`/`PANIOLO_LAB`, paniolo uses
+  those exactly as now. The migration path is to fold them into a lab file; it is
+  opt-in, not forced.
+
+## Transport (the "Fork B" model)
+
+The transport splits by command type, and leans entirely on SSH and the fact
+that paniolo's subsystem daemons (`serialcap`, `hdmicap`) are *already* network
+services speaking HTTP/WebSocket on a discovery port.
+
+**One-shot control commands** — `power-cycle`, `netboot start/stop`,
+`video shot`, `serial log`, `serial send`, config reads — **re-exec over SSH.**
+For a resource on `bench1`, paniolo runs the same command on `bench1` and
+forwards stdin/stdout/stderr and the exit code. The far-side paniolo is
+unchanged, so this reuses 100% of existing logic; runtime state (logs, locks,
+discovery) naturally stays on the control host where it belongs.
+
+**Streaming / port-serving commands** — the dashboard, `serial watch`,
+`video preview` — **SSH-tunnel to the existing daemon.** paniolo re-execs the
+daemon start remotely (idempotent), reads the remote discovery port over SSH,
+opens an `ssh -L` forward to it, and points the local client/browser at the
+forwarded local port. No new protocol and no always-on server: the daemon's
+existing HTTP/WS *is* the API.
+
+**Latency** is handled with one **ControlMaster** connection per host, shared by
+every re-exec and every `-L` forward, so only the first command per host pays the
+SSH handshake. The host's `control_path` in the lab file names the master socket.
+
+**Interactive `serial connect`** (tio) needs **no tunnel** — `ssh -t bench1
+paniolo serial connect fortune` runs tio straight over SSH's own PTY. The tunnel
+machinery is only for the browser dashboard, not the terminal CLI.
+
+**Two operational notes** (learned while implementing this):
+
+- **`paniolo` must be reachable on the host.** Re-exec runs `paniolo …` over a
+  *non-interactive* ssh, whose PATH often omits `~/.local/bin`. If bare `paniolo`
+  doesn't resolve there, set the host's `paniolo_cmd` to an absolute path.
+- **Set `identity` to avoid ssh-agent key-spray.** An agent offering many keys
+  (e.g. 1Password) can trip the host's `MaxAuthTries` *before* the right key on
+  the first connect. A per-host `identity` makes paniolo pass
+  `-i <key> -o IdentitiesOnly=yes`, offering exactly one. (This is the user's ssh
+  setup, not something paniolo can fix for them — but the lab field is the lever.)
+
+### The dashboard, and why multi-host rules out a reverse-proxy
+
+The dashboard is the one place two subsystems interlock: hdmicap serves the page
+but reaches serialcap by an **absolute URL** (`ws://<host>:8724/stream`), with a
+`?serialws=` override (see [architecture §7](architecture.md)). So the browser
+makes a *second* connection, to serialcap, possibly on a different port and a
+different host.
+
+The clean answer uses the override and the hub principle together: forward each
+daemon's port to the dev machine, then open the dashboard at
+`http://127.0.0.1:<local-hdmi>/?serialws=ws://127.0.0.1:<local-serial>/stream`.
+The `?serialws=` knob — which already exists — stitches the two together and does
+not care that the daemons are on different hosts, only that both resolve as
+forwarded local ports. This needs **zero changes to hdmicap or serialcap.**
+
+We explicitly considered, and rejected, making hdmicap **reverse-proxy** serialcap
+to collapse the dashboard to one origin/one forward. It would require hdmicap on
+one host to connect to serialcap on another — exactly the cross-host path
+principle 1 says we cannot assume. The forward-each-daemon-to-the-dev-machine
+model is the only one that always works, and it generalizes to multi-host targets
+for free.
+
+### Why not a long-running agent daemon (labgrid's exporter)
+
+A per-host paniolo agent with its own RPC API (labgrid's exporter / "Option B" in
+`AGENTS.md`) would give cleaner streaming multiplexing and a natural home for
+multi-user locking. We chose against it for now because it directly trades away
+paniolo's stated identity — *zero-infrastructure, no coordinator/exporter/client
+to stand up* ([related-work](ci-integration/related-work.md)). SSH-tunnelling the
+daemons that already exist gets local-feeling console with no always-on server and
+no new auth surface. The agent remains a *someday* option, gated on whether
+multi-user/board-farm scale ever becomes a goal — at which point paniolo would be
+choosing to become a different kind of tool, deliberately.
+
+## Console lifecycle
+
+`paniolo console <target>` is **foreground-blocking** by default: it opens the
+forward(s), launches the browser, and blocks holding the tunnel until you Ctrl-C,
+then tears down. This feels exactly like a local dashboard and needs **no
+persistent local runtime state** — the forwards die with the process. It assumes a
+human is present, which is consistent with the fact that physical setup already
+requires interactive access to the control host.
+
+A non-blocking `--detach` mode (set up the forward, print the URL, return; reap on
+`console --down` or idle timeout) is a plausible later addition for agent use, but
+it introduces a *local tunnel registry* — transient runtime state on the dev
+machine — so it is deferred until something actually needs the live console
+without a terminal held open. (Most agent workflows use `video shot`/`read`, not
+the live stream.)
+
+## Configuration workflow
+
+Discovery **assists** authoring; it does not replace it. Control hosts can
+enumerate their hardware (serial devices, USB-Ethernet interfaces, HDMI capture
+devices) to scaffold config, but the authoritative lab file is always written and
+approved by a human.
+
+The flow is two-phase — **propose, then approve**:
+
+1. `paniolo configure fortune --serial bench1 --video bench2` runs discovery on
+   the named hosts over SSH and merges their inventories into a **proposed** target
+   definition.
+2. paniolo shows the **diff** against the current lab file and writes nothing
+   authoritative.
+3. The human reviews and approves; the change lands as a git commit to the lab
+   repo.
+
+An agent can drive step 1 and prepare the diff, but it can only *stage* a
+proposal — it never silently mutates the authoritative config. Because the lab
+file is in git, every change is a reviewable, revertible commit. Reconfiguration
+is the same flow against the existing file.
+
+## What's deferred
+
+Designed-for but **not** in the first implementation:
+
+- **Multi-host targets.** The schema (per-resource `host`) and the transport
+  (dev-machine rendezvous) both support it; the first cut handles same-host
+  targets only and rejects cross-host targets with a clear error.
+- **`console --detach`** and the local tunnel registry it requires.
+- **Multi-user / locking / reservations** (labgrid's coordinator-enforced
+  *places*). Single-user is assumed.
+- **A long-running agent daemon / RPC API.** Only if scale demands it.
+- **Multi-file / multi-lab composition.** One lab, one file, for now.
+
+## Relationship to labgrid
+
+This design is, knowingly, a smaller-footprint rediscovery of labgrid's
+distributed shape: per-resource host binding ≈ labgrid Resources bound to
+exporters; SSH data plane ≈ labgrid's client→exporter-over-SSH data plane;
+discovery-assisted config ≈ a coordinator-as-registry, minus the always-on
+server. The deliberate divergence is **no coordinator and no exporter daemon** —
+a single git-tracked lab file plus SSH, preserving paniolo's zero-infrastructure,
+agent-in-the-loop niche. See [related work](ci-integration/related-work.md) for
+the full comparison.
+
+## Open questions
+
+- Exact spelling of "point paniolo at the lab" (`--lab` flag, `PANIOLO_LAB`,
+  default path, or a `[lab]` pointer in user config) and how it composes with the
+  legacy `~/.config/paniolo/targets/*.toml` during migration.
+- Whether the per-command config slice shipped to a host travels as CLI args, a
+  temp file over SSH, or stdin — a mechanism choice, not an architecture one.
+- How `paniolo setup` is invoked per remote host (`setup --host bench1` re-execing
+  over SSH is the obvious answer, since building daemons must happen on the host
+  wired to the hardware).
 ````
 
 ## File: docs/serial.md
@@ -12602,6 +12054,242 @@ def repeat_key(
             sleep(delay)
 ````
 
+## File: src/paniolo/_lab.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""The lab model: one git-tracked file describing all hosts and targets.
+
+A *lab* is a single TOML file (pointed at by ``--lab`` / ``PANIOLO_LAB``) that
+declares every control **host** paniolo reaches over SSH and every **target**,
+with each piece of a target's hardware bound to a host. See
+docs/distributed-control.md.
+
+```toml
+[hosts.bench1]
+ssh = "curtisg@bench1.local"     # required; "local" means the dev machine
+# identity = "~/.ssh/id_lab"     # optional
+# control_path = "~/.ssh/cm-%C"  # optional
+
+[targets.fortune]
+host = "bench1"                   # default host for this target's resources
+
+[targets.fortune.netboot]
+interface = "enx00e04c08d9a0"
+host_ip   = "192.168.99.1"
+tftp_root = "/home/curtisg/tftp/fortune"
+
+[[targets.fortune.serial]]
+name   = "console"
+device = "/dev/serial/by-id/usb-…"
+baud   = 115200
+
+[targets.fortune.power]
+cycle_cmd = "/path/cycle.sh"
+```
+
+**Per-resource host binding** (``host`` on any resource, defaulting to the
+target's ``host``, defaulting to ``local``) is parsed so the schema is ready for
+targets that span control hosts — but this first implementation **enforces that
+a target's resources all resolve to one host** and rejects cross-host targets.
+Resolution flattens a target down to the existing :class:`TargetConfig` plus the
+single :class:`~paniolo._ssh.Host` it lives on, so command bodies are unchanged.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import os
+import tomllib
+from pathlib import Path
+from typing import Optional
+
+from ._config import SerialInterface, TargetConfig
+from ._ssh import LOCAL, Host
+
+# Default host name when neither a resource nor its target names one.
+DEFAULT_HOST = LOCAL
+DEFAULT_HOST_IP = "192.168.99.1"
+
+
+class LabError(RuntimeError):
+    """The lab file is malformed or describes something unsupported."""
+
+
+@dataclasses.dataclass
+class Lab:
+    """A parsed lab: named hosts plus raw target tables (resolved on demand)."""
+
+    hosts: dict[str, Host]
+    targets: dict[str, dict]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Lab":
+        hosts: dict[str, Host] = {}
+        for name, h in (data.get("hosts") or {}).items():
+            if "ssh" not in h:
+                raise LabError(f"host '{name}': missing required 'ssh' field")
+            hosts[name] = Host(
+                name=name,
+                ssh=h["ssh"],
+                identity=h.get("identity"),
+                control_path=h.get("control_path"),
+                paniolo_cmd=h.get("paniolo_cmd"),
+            )
+        targets = data.get("targets") or {}
+        return cls(hosts=hosts, targets=targets)
+
+    def target_names(self) -> list[str]:
+        return sorted(self.targets)
+
+    def _host(self, name: str) -> Host:
+        if name == LOCAL:
+            # The dev machine is implicit; an explicit [hosts.local] may override.
+            return self.hosts.get(LOCAL, Host(name=LOCAL, ssh=LOCAL))
+        if name not in self.hosts:
+            raise LabError(f"reference to unknown host '{name}'")
+        return self.hosts[name]
+
+    def resolve_target(self, name: str) -> tuple[TargetConfig, Host]:
+        """Flatten a target to a (TargetConfig, Host), enforcing one host.
+
+        Raises KeyError if the target is unknown, LabError if its resources span
+        more than one host (not yet supported) or reference an unknown host.
+        """
+        if name not in self.targets:
+            raise KeyError(name)
+        t = self.targets[name]
+        default_host = t.get("host", DEFAULT_HOST)
+        used: set[str] = set()
+
+        netboot = t.get("netboot") or {}
+        if netboot:
+            used.add(netboot.get("host", default_host))
+
+        serial_interfaces: list[SerialInterface] = []
+        for s in t.get("serial") or []:
+            if "name" not in s or "device" not in s:
+                raise LabError(f"target '{name}': each [[serial]] needs name + device")
+            serial_interfaces.append(
+                SerialInterface(
+                    name=s["name"],
+                    device=s["device"],
+                    baud=int(s.get("baud", 115200)),
+                    power_sense_signal=s.get("power_sense_signal"),
+                )
+            )
+            used.add(s.get("host", default_host))
+
+        power = t.get("power") or {}
+        if power:
+            used.add(power.get("host", default_host))
+
+        # No resources named a host → the target falls on its default host.
+        if not used:
+            used.add(default_host)
+        if len(used) > 1:
+            raise LabError(
+                f"target '{name}' spans multiple hosts {sorted(used)}; "
+                "multi-host targets are not yet supported"
+            )
+
+        cfg = TargetConfig(
+            name=name,
+            interface=netboot.get("interface", ""),
+            host_ip=netboot.get("host_ip", DEFAULT_HOST_IP),
+            tftp_root=netboot.get("tftp_root"),
+            power_cycle_cmd=power.get("cycle_cmd"),
+            power_serial_interface=power.get("serial_interface"),
+            serial_interfaces=serial_interfaces,
+        )
+        return cfg, self._host(next(iter(used)))
+
+
+def propose_target_block(name: str, host: str, inventory: dict) -> str:
+    """Render a proposed ``[targets.<name>]`` lab block from a host's hardware.
+
+    ``inventory`` is the shape emitted by ``paniolo discover --json``:
+    ``{"ethernet": [{device, active, ...}], "serial": [path, ...], ...}``. One
+    value is best-guessed per field (a carrier-up interface, the first serial as
+    ``console``); other candidates are listed as comments. Power and tftp_root
+    aren't discoverable, so they're left as commented stubs. The result is meant
+    to be reviewed, pasted into the lab file, and committed — paniolo never
+    writes it for you.
+    """
+    eths = sorted(inventory.get("ethernet") or [], key=lambda e: (not e.get("active"),))
+    serials = inventory.get("serial") or []
+    out = [f"[targets.{name}]", f'host = "{host}"', ""]
+
+    out.append(f"[targets.{name}.netboot]")
+    if eths:
+        note = "  # carrier up" if eths[0].get("active") else ""
+        out.append(f'interface = "{eths[0]["device"]}"{note}')
+        for e in eths[1:]:
+            out.append(f'# interface = "{e["device"]}"  # alternative')
+    else:
+        out.append('# interface = ""  # no USB-Ethernet interface discovered')
+    out.append('# tftp_root = "/path/to/tftp"  # set to enable netboot')
+    out.append("")
+
+    if serials:
+        out.append(f"[[targets.{name}.serial]]")
+        out.append('name = "console"')
+        out.append(f'device = "{serials[0]}"')
+        out.append("baud = 115200")
+        for extra in serials[1:]:
+            out.append(f"# another serial device: {extra}")
+    else:
+        out.append(f"# [[targets.{name}.serial]]  # no serial devices discovered")
+    out.append("")
+    out.append(f"# [targets.{name}.power]")
+    out.append('# cycle_cmd = "/path/to/power-cycle.sh"  # not discoverable')
+    return "\n".join(out).rstrip() + "\n"
+
+
+def load_lab(path: str) -> Lab:
+    with open(os.path.expanduser(path), "rb") as f:
+        data = tomllib.load(f)
+    return Lab.from_dict(data)
+
+
+# ── "which lab" resolution ───────────────────────────────────────────────────
+
+_override_path: Optional[str] = None
+
+
+def set_lab_path(path: Optional[str]) -> None:
+    """Record a lab path from the CLI (--lab), overriding PANIOLO_LAB."""
+    global _override_path
+    _override_path = path
+
+
+def lab_path() -> Optional[str]:
+    """The active lab file path: --lab if given, else $PANIOLO_LAB, else None."""
+    return _override_path or os.environ.get("PANIOLO_LAB")
+
+
+def load() -> Optional[Lab]:
+    """Load the active lab, or None when none is configured (legacy mode)."""
+    path = lab_path()
+    if not path:
+        return None
+    if not Path(os.path.expanduser(path)).exists():
+        raise LabError(f"lab file not found: {path}")
+    return load_lab(path)
+````
+
 ## File: src/paniolo/_ocr.py
 ````python
 # Copyright 2026 Curtis Galloway
@@ -13039,6 +12727,412 @@ def test_parse_sequence_bad_sleep_raises_friendly_error():
         _hid.parse_sequence("sleep xyz\n")
 ````
 
+## File: tests/test_lab.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for the lab-file model (_lab.py): parsing, host resolution, the
+single-host (multi-host-rejecting) constraint, and lab-path selection."""
+
+from __future__ import annotations
+
+import tomllib
+
+import pytest
+
+from paniolo import _lab
+from paniolo._lab import Lab, LabError
+
+# A representative single-host lab spanning every resource kind.
+_LAB = {
+    "hosts": {
+        "bench1": {"ssh": "curtisg@bench1.local", "identity": "~/.ssh/id_lab"},
+        "bench2": {"ssh": "curtisg@bench2.local"},
+    },
+    "targets": {
+        "fortune": {
+            "host": "bench1",
+            "netboot": {
+                "interface": "enx00e04c08d9a0",
+                "tftp_root": "/srv/tftp/fortune",
+            },
+            "serial": [
+                {"name": "console", "device": "/dev/ttyUSB0", "baud": 115200},
+                {"name": "bmc", "device": "/dev/ttyUSB1", "baud": 9600},
+            ],
+            "power": {"cycle_cmd": "/bin/cycle.sh", "serial_interface": "console"},
+        },
+        "apple": {"host": "bench2", "netboot": {"interface": "en5"}},
+    },
+}
+
+
+def test_resolve_single_host_target_flattens_to_config_and_host():
+    lab = Lab.from_dict(_LAB)
+    cfg, host = lab.resolve_target("fortune")
+    assert cfg.name == "fortune"
+    assert cfg.interface == "enx00e04c08d9a0"
+    assert cfg.tftp_root == "/srv/tftp/fortune"
+    assert cfg.host_ip == "192.168.99.1"  # default applied
+    assert cfg.power_cycle_cmd == "/bin/cycle.sh"
+    assert cfg.power_serial_interface == "console"
+    assert [(s.name, s.device, s.baud) for s in cfg.serial_interfaces] == [
+        ("console", "/dev/ttyUSB0", 115200),
+        ("bmc", "/dev/ttyUSB1", 9600),
+    ]
+    assert host.name == "bench1"
+    assert host.ssh == "curtisg@bench1.local"
+    assert host.identity == "~/.ssh/id_lab"
+    assert not host.is_local
+
+
+def test_target_names_sorted():
+    assert Lab.from_dict(_LAB).target_names() == ["apple", "fortune"]
+
+
+def test_resource_inherits_target_default_host():
+    # serial has no explicit host → inherits target host bench1; still single-host.
+    _, host = Lab.from_dict(_LAB).resolve_target("fortune")
+    assert host.name == "bench1"
+
+
+def test_target_without_host_resolves_to_local():
+    lab = Lab.from_dict({"targets": {"t": {"netboot": {"interface": "en0"}}}})
+    _, host = lab.resolve_target("t")
+    assert host.is_local
+
+
+def test_empty_target_resolves_to_local():
+    lab = Lab.from_dict({"targets": {"t": {}}})
+    cfg, host = lab.resolve_target("t")
+    assert host.is_local
+    assert cfg.interface == ""  # no netboot section
+
+
+def test_unknown_target_raises_keyerror():
+    with pytest.raises(KeyError):
+        Lab.from_dict(_LAB).resolve_target("ghost")
+
+
+def test_unknown_host_reference_raises():
+    lab = Lab.from_dict(
+        {"targets": {"t": {"host": "nope", "power": {"cycle_cmd": "x"}}}}
+    )
+    with pytest.raises(LabError, match="unknown host 'nope'"):
+        lab.resolve_target("t")
+
+
+def test_multi_host_target_is_rejected():
+    lab = Lab.from_dict(
+        {
+            "hosts": {"a": {"ssh": "u@a"}, "b": {"ssh": "u@b"}},
+            "targets": {
+                "split": {
+                    "netboot": {"interface": "en0", "host": "a"},
+                    "serial": [{"name": "c", "device": "/dev/x", "host": "b"}],
+                }
+            },
+        }
+    )
+    with pytest.raises(LabError, match="multiple hosts"):
+        lab.resolve_target("split")
+
+
+def test_host_missing_ssh_raises():
+    with pytest.raises(LabError, match="missing required 'ssh'"):
+        Lab.from_dict({"hosts": {"bad": {"identity": "k"}}})
+
+
+def test_serial_missing_fields_raises():
+    lab = Lab.from_dict({"targets": {"t": {"serial": [{"name": "c"}]}}})
+    with pytest.raises(LabError, match="name . device"):
+        lab.resolve_target("t")
+
+
+def test_propose_target_block_picks_carrier_up_and_first_serial():
+    inv = {
+        "ethernet": [
+            {"device": "eth0", "active": True},
+            {"device": "enx00e0", "active": True},
+        ],
+        "serial": ["/dev/ttyUSB0", "/dev/ttyUSB1"],
+    }
+    block = _lab.propose_target_block("fortune", "bench1", inv)
+    # Parses as valid TOML with the expected structure (one value chosen per
+    # field; the other interface + serial are commented out, not parsed).
+    t = tomllib.loads(block)["targets"]["fortune"]
+    assert t["host"] == "bench1"
+    assert t["netboot"]["interface"] in ("eth0", "enx00e0")
+    assert t["serial"][0] == {
+        "name": "console",
+        "device": "/dev/ttyUSB0",
+        "baud": 115200,
+    }
+    assert len(t["serial"]) == 1  # the second device is a comment, not an entry
+    assert "# another serial device: /dev/ttyUSB1" in block
+    assert "cycle_cmd" in block  # commented power stub
+
+
+def test_propose_target_block_handles_empty_inventory():
+    block = _lab.propose_target_block("t", "h", {"ethernet": [], "serial": []})
+    assert "no USB-Ethernet interface discovered" in block
+    assert "no serial devices discovered" in block
+    tomllib.loads(block)  # still valid TOML (commented-out resource sections)
+
+
+def test_load_lab_parses_a_real_toml_file(tmp_path):
+    f = tmp_path / "lab.toml"
+    f.write_text(
+        '[hosts.bench1]\nssh = "u@bench1"\n\n'
+        '[targets.fortune]\nhost = "bench1"\n\n'
+        '[targets.fortune.netboot]\ninterface = "en0"\n'
+    )
+    lab = _lab.load_lab(str(f))
+    cfg, host = lab.resolve_target("fortune")
+    assert cfg.interface == "en0"
+    assert host.ssh == "u@bench1"
+
+
+# ── lab-path selection ───────────────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _reset_override(monkeypatch):
+    monkeypatch.setattr(_lab, "_override_path", None)
+    monkeypatch.delenv("PANIOLO_LAB", raising=False)
+
+
+def test_load_is_none_without_a_configured_lab():
+    assert _lab.load() is None
+
+
+def test_lab_path_prefers_override_then_env(monkeypatch):
+    monkeypatch.setenv("PANIOLO_LAB", "/from/env.toml")
+    assert _lab.lab_path() == "/from/env.toml"
+    _lab.set_lab_path("/from/flag.toml")
+    assert _lab.lab_path() == "/from/flag.toml"
+
+
+def test_load_raises_on_missing_file():
+    _lab.set_lab_path("/no/such/lab.toml")
+    with pytest.raises(LabError, match="not found"):
+        _lab.load()
+````
+
+## File: tests/test_remote.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for transparent remote re-exec (_remote.py).
+
+Unit tests cover argv rewriting (always run). Integration tests cover the real
+ship-config + re-exec round-trip and a full CLI dispatch; they are gated on
+PANIOLO_SSH_IT (see test_ssh.py) so the suite never needs an ssh-agent.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+import tomllib
+import types
+from pathlib import Path
+
+import pytest
+
+from paniolo import _cli, _config, _remote, _ssh
+from paniolo._config import TargetConfig
+from paniolo._ssh import Host
+
+# ── unit: argv rewriting ─────────────────────────────────────────────────────
+
+
+def test_strip_lab_option_spaced_and_equals_forms():
+    assert _remote.strip_lab_option(["--lab", "/x.toml", "netboot", "status"]) == [
+        "netboot",
+        "status",
+    ]
+    assert _remote.strip_lab_option(["--lab=/x.toml", "power-cycle", "t"]) == [
+        "power-cycle",
+        "t",
+    ]
+
+
+def test_strip_lab_option_noop_without_lab():
+    assert _remote.strip_lab_option(["serial", "log", "-i", "console"]) == [
+        "serial",
+        "log",
+        "-i",
+        "console",
+    ]
+
+
+def test_remote_argv_replaces_launcher_and_defaults_to_paniolo():
+    argv = ["/usr/local/bin/paniolo", "--lab", "/x.toml", "netboot", "status", "t"]
+    assert _remote.remote_argv(argv) == ["paniolo", "netboot", "status", "t"]
+
+
+def test_remote_argv_honors_host_paniolo_cmd():
+    argv = ["/local/paniolo", "netif", "status", "t"]
+    assert _remote.remote_argv(argv, "/opt/paniolo/bin/paniolo") == [
+        "/opt/paniolo/bin/paniolo",
+        "netif",
+        "status",
+        "t",
+    ]
+
+
+def test_host_paniolo_property_default_and_override():
+    assert Host(name="h", ssh="u@h").paniolo == "paniolo"
+    assert Host(name="h", ssh="u@h", paniolo_cmd="/x/paniolo").paniolo == "/x/paniolo"
+
+
+# ── unit: remote console plumbing ────────────────────────────────────────────
+
+
+def _completed(stdout="", returncode=0, stderr=""):
+    return types.SimpleNamespace(stdout=stdout, returncode=returncode, stderr=stderr)
+
+
+def test_remote_daemon_port_parses_discovery_json(monkeypatch):
+    monkeypatch.setattr(
+        _remote._ssh, "run", lambda *a, **k: _completed('{"pid": 5, "port": 8723}')
+    )
+    assert _remote.remote_daemon_port(Host(name="h", ssh="u@h"), "hdmicap") == 8723
+
+
+def test_remote_daemon_port_none_when_absent_or_bad(monkeypatch):
+    h = Host(name="h", ssh="u@h")
+    monkeypatch.setattr(_remote._ssh, "run", lambda *a, **k: _completed("", 1))
+    assert _remote.remote_daemon_port(h, "hdmicap") is None
+    monkeypatch.setattr(_remote._ssh, "run", lambda *a, **k: _completed("not json"))
+    assert _remote.remote_daemon_port(h, "hdmicap") is None
+
+
+def test_dashboard_url_builds_query():
+    base = "http://127.0.0.1:9001"
+    assert _cli._dashboard_url(base, None, None) == base
+    assert (
+        _cli._dashboard_url(base, "ws://127.0.0.1:9002/stream", None)
+        == f"{base}/?serialws=ws://127.0.0.1:9002/stream"
+    )
+    assert (
+        _cli._dashboard_url(base, "ws://127.0.0.1:9002/stream", "console")
+        == f"{base}/?serialws=ws://127.0.0.1:9002/stream&interface=console"
+    )
+
+
+# ── integration: real ssh re-exec, opt-in ───────────────────────────────────
+
+_DEST = os.environ.get("PANIOLO_SSH_IT")
+_IDENT = os.environ.get("PANIOLO_SSH_IT_IDENTITY")
+# The paniolo matching the code under test — the console script next to the
+# running interpreter (the venv), not whatever happens to be first on PATH.
+_colocated = Path(sys.executable).parent / "paniolo"
+_PANIOLO = str(_colocated) if _colocated.exists() else shutil.which("paniolo")
+
+integration = pytest.mark.skipif(
+    not _DEST, reason="set PANIOLO_SSH_IT to run remote re-exec integration tests"
+)
+
+
+@pytest.fixture
+def host():
+    h = Host(
+        name="it",
+        ssh=_DEST,
+        identity=_IDENT,
+        control_path=f"/tmp/pcm-remote-{os.getpid()}-%C",
+        paniolo_cmd=_PANIOLO,
+    )
+    yield h
+    _ssh.close_master(h)
+
+
+def _cfg() -> TargetConfig:
+    return TargetConfig(name="t", interface="lo", tftp_root="/tmp/tftp-t")
+
+
+@integration
+def test_ship_config_round_trips(host):
+    remote_path = _remote.ship_config(host, _cfg())
+    try:
+        text = _ssh.read_remote_file(host, remote_path)
+        assert text is not None
+        back = _config._from_dict(tomllib.loads(text))
+        assert back.name == "t"
+        assert back.interface == "lo"
+        assert back.tftp_root == "/tmp/tftp-t"
+    finally:
+        _ssh.run(host, ["rm", "-f", remote_path])
+
+
+@integration
+@pytest.mark.skipif(not _PANIOLO, reason="paniolo not installed on PATH")
+def test_configure_discovers_over_ssh(tmp_path):
+    # `configure --host h` runs `paniolo discover --json` on h over ssh and
+    # prints a proposed [targets.<name>] block built from the result.
+    ident = f'identity = "{_IDENT}"\n' if _IDENT else ""
+    lab = tmp_path / "lab.toml"
+    lab.write_text(f'[hosts.h]\nssh = "{_DEST}"\n{ident}paniolo_cmd = "{_PANIOLO}"\n')
+    result = subprocess.run(
+        [_PANIOLO, "--lab", str(lab), "configure", "newtgt", "--host", "h"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "[targets.newtgt]" in result.stdout
+    assert 'host = "h"' in result.stdout
+
+
+@integration
+@pytest.mark.skipif(not _PANIOLO, reason="paniolo not installed on PATH")
+def test_full_cli_dispatch_runs_on_remote(host, tmp_path):
+    # A lab whose single target lives on the (remote) integration host.
+    ident = f'identity = "{_IDENT}"\n' if _IDENT else ""
+    lab = tmp_path / "lab.toml"
+    lab.write_text(
+        f'[hosts.h]\nssh = "{_DEST}"\n{ident}paniolo_cmd = "{_PANIOLO}"\n\n'
+        f'[targets.t]\nhost = "h"\n\n[targets.t.netboot]\ninterface = "lo"\n'
+    )
+    result = subprocess.run(
+        [_PANIOLO, "--lab", str(lab), "netboot", "status", "t"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    # The status text is produced by the *remote* paniolo and passed through.
+    assert "stopped" in result.stdout or "running" in result.stdout
+````
+
 ## File: tests/test_serial.py
 ````python
 # Copyright 2026 Curtis Galloway
@@ -13132,268 +13226,6 @@ def test_log_cmd_boolean_flags():
     assert cmd == ["serialcap", "log", "--raw", "--json", "--no-pending"]
     # Defaults stay off.
     assert "--raw" not in _serial.log_cmd("serialcap", tail=1)
-````
-
-## File: docs/requirements.md
-````markdown
-# Paniolo — Requirements & progress tracker
-
-> Project-wide requirements for **paniolo**, an agent-controlled target-machine wrangler for
-> low-level software development (bootloaders, firmware, OS bring-up). This is the single
-> source of truth for *what paniolo must do* and *how far along each capability is* — covering
-> both shipped capabilities and planned work.
->
-> Scope note: paniolo is a **device-control / "wrangling" layer** (power, serial, deploy/netboot,
-> video, HID). It deliberately does **not** own test orchestration or result production — when
-> integrated with hardware-CI ecosystems, those stay above paniolo (see §9).
->
-> Companion design docs live under [`docs/ci-integration/`](ci-integration/) (gap analysis +
-> integration design) and per-feature docs under [`docs/`](.). **Update the Status column as
-> work lands.**
->
-> Last updated: 2026-05-29.
-
-## Status legend
-
-| Symbol | Meaning |
-|---|---|
-| ☑ | Done / shipped |
-| ◐ | In progress |
-| ☐ | Not started |
-| ⤵ | Deferred (planned, later) |
-| ⊘ | Out of scope (recorded, not planned) |
-
-**Pri** = M(ust) / S(hould) / C(ould). **Source/Notes** cites the driving need or contract.
-
----
-
-## 1. Foundations / platform
-
-| ID | Requirement | Pri | Status | Notes |
-|---|---|---|---|---|
-| CORE-1 | Per-target config in `~/.config/paniolo/targets/<name>.toml`; one file per target, no daemon required | M | ☑ | `_config.py`; single target is the default |
-| CORE-2 | CLI (`paniolo`) over subcommands; SSH-drivable from a dev machine into the control host | M | ☑ | Remote-control pattern (README) |
-| CORE-3 | Run on macOS 10.14+ and Linux (x86-64/arm64) | M | ☑ | `paniolo setup` installs daemons/tools |
-| CORE-4 | Rust daemons (`hdmicap`, `serialcap`) + Swift `visionocr` helper build & install | M | ☑ | `paniolo setup` |
-| CORE-5 | Predictable runtime paths (configs, daemon discovery, capture logs) | M | ☑ | README "Runtime paths" |
-| CORE-6 | Agent-oriented guidance kept current (`AGENTS.md`) as the surface changes | M | ◐ | Must track power/serial changes in §9 |
-| CORE-7 | One-file **lab** model (`--lab`/`PANIOLO_LAB`): hosts + targets, per-resource host binding; legacy targets dir as fallback | S | ☑ | `_lab.py`; [distributed-control](distributed-control.md) |
-| CORE-8 | Transparent re-exec of host-operating commands on a target's **remote control host** over SSH | S | ☑ | `_remote.py`, `@remote_capable`; `_ssh.py` transport |
-| CORE-9 | Tunnelled `console` for a remote target (dashboard reachable locally) | S | ☑ | `_cli._remote_console`; `?serialws=` stitch |
-| CORE-10 | Multi-host targets (one target spanning control hosts) | C | ☐ | schema ready (per-resource host); single-host enforced for now |
-| CORE-11 | Remote `setup --host` + discovery-assisted `configure` (Phases 4–5) | C | ☐ | [plan](distributed-control-plan.md) |
-
-## 2. Netboot / deploy
-
-| ID | Requirement | Pri | Status | Notes |
-|---|---|---|---|---|
-| NET-1 | Built-in DHCP + TFTP over a direct USB-Ethernet link | M | ☑ | `_dhcp.py`, `_tftp.py`; `192.168.99.1/24` |
-| NET-2 | `netboot start/stop/status`, `tftp-root`, `logs` (filterable, followable) | M | ☑ | `_cli.py`; `_netboot.py` |
-| NET-3 | `netboot link-up/down/status` for interface configuration | M | ☑ | |
-| NET-4 | TFTP root configurable per target (`--tftp-root`) | M | ☑ | required for `netboot start` |
-| NET-5 | `netif mode netboot\|ffx\|off` — atomic, idempotent link-mode switch; stops netboot before SD boot, sets up host `fe80::1`/64 for ffx; `netif status` probes the active mode | S | ☑ | `_netif.py`; from rpi5-bringup ffx-over-network bring-up |
-
-## 3. Serial console
-
-| ID | Requirement | Pri | Status | Notes |
-|---|---|---|---|---|
-| SER-A | `serialcap` daemon owns the port exclusively; supervisor fans out reads | M | ☑ | `serialcap/`; lockfile |
-| SER-B | Timestamped rolling JSONL capture log, addressable by seq; rotation | M | ☑ | `capture.rs`; `serial log` |
-| SER-C | Interactive terminal via `tio` (`serial connect`) | M | ☑ | |
-| SER-D | Bidirectional live `/stream` (WebSocket) — read + write-back | M | ☑ | `server.rs` (used by dashboard) |
-| SER-E | `serial setup/remove/devices/show`, multi-interface per target | M | ☑ | |
-| SER-F | DTR control: `serial dtr`, `serial reset` (soft-reset semantics) | M | ☑ | `_power.py` |
-| SER-G | Power-sense read via modem-control input (`--power-sense cts\|dsr\|dcd\|ri`) | S | ☑ | `/status` → `power_on` |
-
-## 4. Power control
-
-| ID | Requirement | Pri | Status | Notes |
-|---|---|---|---|---|
-| PWR-A | `power-cycle` via configurable script (`--power-cycle-cmd`) | M | ☑ | *to be superseded by `[power]` block — PWR-5 in §9* |
-| PWR-B | `power-state` (read-only on/off via sense signal) | M | ☑ | `power-state` |
-| PWR-C | DTR-based hardware power-button toggling (J2 header): ≤500ms soft / ≥3s hard | M | ☑ | `_power.py` |
-
-## 5. Video / OCR
-
-| ID | Requirement | Pri | Status | Notes |
-|---|---|---|---|---|
-| VID-1 | HDMI/USB capture via warm-stream `hdmicap` daemon | M | ☑ | `hdmicap/`; Linux V4L2 + macOS |
-| VID-2 | `video watch/preview/shot/read/devices/show/stop`; stable & changed-since capture | M | ☑ | |
-| VID-3 | On-device OCR (`video read`): Apple Vision (macOS), Tesseract (Linux); `--json` | S | ☑ | `_ocr.py` |
-
-## 6. HID injection
-
-| ID | Requirement | Pri | Status | Notes |
-|---|---|---|---|---|
-| HID-1 | USB keyboard/mouse injection via two-board KB2040 rig | S | ☑ | `hidrig/`; needs `pyserial` extra |
-| HID-2 | `hid type/key/combo/releaseall/click/move/scroll/run/setup/show` | S | ☑ | `_cli.py` |
-
-## 7. Dashboard
-
-| ID | Requirement | Pri | Status | Notes |
-|---|---|---|---|---|
-| DASH-1 | Combined video + serial web UI (`paniolo console`); auto-starts daemons | S | ☑ | preselect serial via `-i` |
-| DASH-2 | Dashboard power-cycle control | S | ☑ | |
-
-## 8. Cross-cutting / non-functional
-
-| ID | Requirement | Pri | Status | Notes |
-|---|---|---|---|---|
-| NF-1 | Interactive/agent bring-up workflow (dashboard, OCR, HID, `tio`, JSONL) never regresses | M | ◐ | Regression guard on every change, esp. §9 serial work |
-| NF-2 | Changes land as smallest reversible steps, each with tests | M | ◐ | |
-| NF-3 | Core power/serial path stays functional on both macOS and Linux | M | ☑ | CI-only features may be Linux-only (see §9) |
-| NF-4 | External contracts re-verified against upstream before relying on them | M | ◐ | re-check Fuchsia `device.go` (FX-4) |
-
----
-
-## 9. Hardware-CI integration (KernelCI/LAVA + Fuchsia/botanist)
-
-> Goal: make paniolo's primitives **consumable by** LAVA (under KernelCI's Maestro) and
-> `botanist`+`testrunner` (under Fuchsia/LUCI) — *without* paniolo owning orchestration or
-> results. Full analysis: [`ci-integration/gap-analysis.md`](ci-integration/gap-analysis.md);
-> design: [`ci-integration/design.md`](ci-integration/design.md).
->
-> **Current focus:** the owner is doing a **Fuchsia port** with an agent — single user, no
-> existing users, breaking changes are free. M1 leads with the Fuchsia-critical path (PTY +
-> power); the botanist adapter is sequenced before LAVA.
-
-### 9.0 Decisions (locked 2026-05-29)
-
-| ID | Decision | Resolution |
-|---|---|---|
-| D-1 | KCIDB results path | ⊘ Out of scope — LAVA-lab path only for KernelCI |
-| D-2 | Fuchsia serial ownership | PTY proxy; paniolo keeps the physical port (JSONL/dashboard stay live) |
-| D-3 | Serial write arbitration | Cooperative last-writer-wins + advisory lock in `/status` + opt-in `--exclusive`, **auto-released on client disconnect** (+ optional `--lock-timeout`) |
-| D-4 | JTAG in v1 | Extension point only (schema + verb stubs); OpenOCD backend deferred |
-| D-5 | CI control-host OS | Linux-only for CI; macOS stays first-class for interactive bring-up |
-| D-6 | Deploy ownership in CI | Orchestrator owns deploy (LAVA TFTP / botanist pave); paniolo netboot stands down |
-| D-7 | Serial TCP endpoint | Native Rust TCP listener in serialcap; ser2net-on-PTY as LAVA fallback |
-| D-8 | `[power]` config | Breaking change accepted — clean `[power]` block, no `power_cycle_cmd` alias; update `AGENTS.md` |
-
-### 9.1 Agnostic device-control API — Power
-
-| ID | Requirement | Source | Pri | Status | Notes |
-|---|---|---|---|---|---|
-| PWR-1 | `paniolo power on` — applies power; DUT begins booting unattended | LAVA | M | ☐ | Maps to `power_on_command` (hard requirement) |
-| PWR-2 | `paniolo power off` — cuts power | LAVA | M | ☐ | DTR long-press or PDU script |
-| PWR-3 | `paniolo power reset` — off+delay+on (hard reset) | LAVA | M | ☐ | Supersedes `power-cycle` (PWR-A) |
-| PWR-4 | `paniolo power state` — read on/off | BOTH | M | ☑ | exists as `power-state` (PWR-B); rename only |
-| PWR-5 | `[power]` config block w/ `backend = script\|dtr\|pdu\|jtag` + on/off/reset cmds | BOTH | M | ☐ | **Breaking**: replaces flat `power_cycle_cmd` (no alias) |
-| PWR-6 | Power commands usable as plain shell cmds (string or list) from a generator | LAVA | M | ☐ | LAVA fields accept string OR list |
-| PWR-7 | Update `AGENTS.md` for the new `[power]` config + verbs | OWNER | M | ☐ | Agent reconfigures targets on redeploy |
-
-### 9.2 Agnostic device-control API — Serial (core gap)
-
-| ID | Requirement | Source | Pri | Status | Notes |
-|---|---|---|---|---|---|
-| SER-1 | serialcap exposes a **raw bidirectional TCP listener** (ser2net-equivalent) | LAVA | M | ☐ | backs `connection_command = telnet host port` |
-| SER-2 | serialcap exposes a **PTY** whose slave path is a real device file | FX | M | ☐ | handed to botanist as `DeviceConfig.serial` |
-| SER-3 | New endpoints **tee off the existing supervisor** (JSONL/WS/dashboard unaffected) | OWNER | M | ☐ | preserves NF-1 |
-| SER-4 | `paniolo serial send <bytes\|->` one-shot write (agent feature) | OWNER | M | ☐ | same `write_tx` channel; `--enter`/`--hex`/stdin |
-| SER-5 | Write arbitration per D-3 (lock, `/status` holder, `--exclusive`, auto-release) | OWNER | M | ☐ | |
-| SER-6 | Stable socket/PTY paths under `$XDG_RUNTIME_DIR/paniolo/<target>/` | BOTH | S | ☐ | predictable for adapters |
-| SER-7 | Existing JSONL log, `/stream`, `tio`, `serial log/dtr/reset` unchanged | OWNER | M | ☐ | regression guard / tests |
-
-### 9.3 Agnostic device-control API — Deploy / boot / debug
-
-| ID | Requirement | Source | Pri | Status | Notes |
-|---|---|---|---|---|---|
-| DEP-1 | netboot **stands down** under CI; no DHCP/TFTP contention | BOTH | M | ☐ | guard `netboot start` when CI attach active |
-| DEP-2 | netboot remains available for interactive/non-CI use | OWNER | M | ☑ | exists (NET-1..4); just not the CI path |
-| DEP-3 | (Full) paniolo-serves-images as a non-standard LAVA deploy method | LAVA | C | ⤵ | only if a board can't use LAVA TFTP |
-| BOOT-1 | `paniolo serial wait --match <regex> [--timeout]` boot-detect helper | OWNER | S | ⤵ | not required by either orchestrator; ergonomics |
-| JTAG-1 | `[jtag]`/`[debug]` config schema + `paniolo debug {halt\|resume\|reset\|gdb}` stubs | OWNER | C | ☐ | extension point only per D-4 |
-| JTAG-2 | OpenOCD backend: reset, flash-deploy, GDB `:3333` / Tcl `:6666` sockets | OWNER | C | ⤵ | deferred |
-
-### 9.4 Adapter A — LAVA lab
-
-| ID | Requirement | Source | Pri | Status | Notes |
-|---|---|---|---|---|---|
-| LAVA-1 | Device-dictionary + device-type template generator (`paniolo lava device-dict`) | LAVA | M | ☐ | power_* → `paniolo power …`; connection → telnet |
-| LAVA-2 | Generator supports list-valued power commands | LAVA | S | ☐ | |
-| LAVA-3 | "First device" onboarding doc (Debian worker, ser2net/TCP wiring, tokens) | LAVA | S | ☐ | internet-reachable lab; tokens to KernelCI admins |
-| LAVA-4 | Verified on a Debian LAVA worker against a real board | LAVA | S | ☐ | macOS unsupported (D-5) |
-
-### 9.5 Adapter B — Fuchsia / botanist
-
-| ID | Requirement | Source | Pri | Status | Notes |
-|---|---|---|---|---|---|
-| FX-1 | botanist device-config emitter (`paniolo botanist device-config`) → PTY path | FX | M | ☐ | `{network,keys,serial}`; serial = PTY (SER-2) |
-| FX-2 | Bot-host/recipe **power wrapper** calling `paniolo power {on\|reset\|off}` | FX | M | ☐ | power is NOT a device-config field |
-| FX-3 | `bot_config.py` `get_dimensions()` snippet advertising `device_type:<board>` | FX | S | ☐ | + `bots.cfg`, `platforms.gni` (upstream coord) |
-| FX-4 | Verify `DeviceConfig`/power plumbing against a real Fuchsia checkout | FX | M | ☐ | confirm `tools/botanist/target/device.go` |
-| FX-5 | Document RFC-0130 Experimental tier (self-hosted CI) | FX | C | ☐ | community board is not "Supported" tier |
-
----
-
-### 9.6 Adapter C — Redfish provider
-
-> **Decision (D-9, 2026-05-29):** Redfish interop = **provider** direction (paniolo exposes a
-> Redfish API in front of BMC-less boards), **not client**. Higher-leverage than per-ecosystem
-> adapters because Redfish is the bare-metal lingua franca (Ironic/Metal3 primary control plane;
-> LAVA can `curl` it). Sequenced **after** M1 — consumes the power verbs (PWR-1..6) and the raw
-> serial socket (SER-1). Design sketch: [`ci-integration/redfish-provider.md`](ci-integration/redfish-provider.md).
-> Verified against DMTF canonical CSDL (DSP0266 v1.22.0, DSP8010 2025.2), OpenBMC, Ironic/sushy.
-
-| ID | Requirement | Source | Pri | Status | Notes |
-|---|---|---|---|---|---|
-| RF-1 | Redfish provider service: `ServiceRoot` → `ComputerSystem` → `Manager` (→ `VirtualMedia`) resource tree | OWNER | S | ⤵ | deferred after M1; provider, not client |
-| RF-2 | `#ComputerSystem.Reset` → power verbs (On→on, ForceOff→off, PowerCycle/ForceRestart→reset); `PowerState` → power-state | OWNER | S | ⤵ | depends on PWR-1..6 |
-| RF-3 | `Boot.BootSourceOverrideTarget=Pxe` + `BootSourceOverrideEnabled=Once` → netboot | OWNER | S | ⤵ | maps to existing netboot |
-| RF-4 | `VirtualMedia` `InsertMedia`/`EjectMedia` → image deploy | OWNER | C | ⤵ | open: needed vs. Pxe-once sufficient? |
-| RF-5 | `SerialConsole` advertises out-of-band SSH/console endpoint pointing at paniolo raw-serial socket (metadata only) | OWNER | S | ⤵ | depends on SER-1; Redfish carries no serial bytes |
-| RF-6 | Honest per-node `ResetType@Redfish.AllowableValues` / `ActionInfo` for the supported subset | OWNER | S | ⤵ | relay/DTR boards can't do every `ResetType` |
-| RF-7 | Implement via a sushy-tools-style emulator + paniolo backend driver (not a hand-rolled OData service) | OWNER | S | ⤵ | open: dependency footprint (core = `typer` only) |
-| RF-8 | Document/decide whether Redfish provider replaces or complements LAVA/botanist adapters | OWNER | S | ⤵ | botanist PTY serial seam still needs the direct path → not a full replacement |
-
-## 10. Security
-
-> **TODO — owner to populate.** This section needs dedicated attention and is intentionally
-> unfinished. Paniolo grants an agent physical-equivalent control of a target (power, raw
-> serial read/write, netboot/TFTP, HID injection) and, with the §9 work, opens **network-facing
-> serial endpoints** and is **SSH-driven from a dev machine into the control host** — so the
-> threat model and controls deserve first-class requirements, not afterthoughts.
-
-| ID | Requirement | Pri | Status | Notes |
-|---|---|---|---|---|
-| SEC-0 | Define paniolo's threat model and security requirements | M | ☐ | **Placeholder — to be written.** |
-
-Prompts to resolve when populating (not yet requirements — discussion seeds):
-
-- **Serial endpoint exposure (§9):** the raw TCP listener (SER-1) currently mirrors serialcap's
-  loopback-only bind (`127.0.0.1`). For a LAVA worker / Swarming bot, who may connect? Auth,
-  bind address, TLS, or rely on SSH-tunnel/localhost-only + network isolation?
-- **Write arbitration as a safety control (SER-5/D-3):** is `--exclusive` purely cooperative, or
-  also a guard against an unexpected writer driving the target?
-- **Netboot/DHCP/TFTP:** read-only TFTP, single-client; any spoofing/rogue-DHCP concerns on a
-  shared lab network vs. the assumed direct USB-Ethernet link?
-- **Power/HID authority:** anyone who can reach the control host can power-cycle and inject HID —
-  what bounds that (host access model, per-target ACLs)?
-- **Secrets:** LAVA submission tokens, `$FUCHSIA_SSH_KEY`, CIPD/Swarming creds — storage and
-  handling.
-- **Supply chain:** `paniolo setup` builds/install Rust + Swift + Homebrew components.
-
----
-
-## 11. Milestones
-
-| Milestone | Contents | Status |
-|---|---|---|
-| M0 — Analysis & design | gap-analysis, design, this tracker, decisions | ☑ |
-| Shipped baseline | §1–§7 capabilities (netboot, serial, power, video, HID, dashboard) | ☑ |
-| M1 — Agnostic device-control core | SER-2, SER-4, PWR-1..7, SER-5, SER-1, DEP-1, JTAG-1 (Fuchsia path first) | ☐ (awaiting go-ahead) |
-| M2 — Adapters | FX-1..4 (first), then LAVA-1..3 | ☐ |
-| M3 — Verify on hardware | FX-3/FX-5, LAVA-4, BOOT-1 | ☐ |
-| Security | §10 (SEC-*) | ☐ (to be defined) |
-| M4 — Full (deferred) | DEP-3, JTAG-2 | ⤵ |
-
-## 12. Open implementation questions
-
-| ID | Question | Status |
-|---|---|---|
-| SER-Q1 | Native TCP listener vs. ser2net-on-PTY | ✓ Resolved (D-7): native listener; ser2net fallback |
-| SER-Q2 | Write-lock lifetime | ✓ Resolved (D-3): auto-release on disconnect + optional `--lock-timeout` |
-| PWR-Q1 | `[power]` shape + `power_cycle_cmd` migration | ✓ Resolved (D-8): clean breaking block, no alias |
 ````
 
 ## File: hdmicap/src/capture.rs
@@ -15683,6 +15515,268 @@ combined log at `~/.local/share/paniolo/<name>/netboot.log`.
 | Combined log | `~/.local/share/paniolo/<name>/netboot.log` |
 ````
 
+## File: docs/requirements.md
+````markdown
+# Paniolo — Requirements & progress tracker
+
+> Project-wide requirements for **paniolo**, an agent-controlled target-machine wrangler for
+> low-level software development (bootloaders, firmware, OS bring-up). This is the single
+> source of truth for *what paniolo must do* and *how far along each capability is* — covering
+> both shipped capabilities and planned work.
+>
+> Scope note: paniolo is a **device-control / "wrangling" layer** (power, serial, deploy/netboot,
+> video, HID). It deliberately does **not** own test orchestration or result production — when
+> integrated with hardware-CI ecosystems, those stay above paniolo (see §9).
+>
+> Companion design docs live under [`docs/ci-integration/`](ci-integration/) (gap analysis +
+> integration design) and per-feature docs under [`docs/`](.). **Update the Status column as
+> work lands.**
+>
+> Last updated: 2026-05-29.
+
+## Status legend
+
+| Symbol | Meaning |
+|---|---|
+| ☑ | Done / shipped |
+| ◐ | In progress |
+| ☐ | Not started |
+| ⤵ | Deferred (planned, later) |
+| ⊘ | Out of scope (recorded, not planned) |
+
+**Pri** = M(ust) / S(hould) / C(ould). **Source/Notes** cites the driving need or contract.
+
+---
+
+## 1. Foundations / platform
+
+| ID | Requirement | Pri | Status | Notes |
+|---|---|---|---|---|
+| CORE-1 | Per-target config in `~/.config/paniolo/targets/<name>.toml`; one file per target, no daemon required | M | ☑ | `_config.py`; single target is the default |
+| CORE-2 | CLI (`paniolo`) over subcommands; SSH-drivable from a dev machine into the control host | M | ☑ | Remote-control pattern (README) |
+| CORE-3 | Run on macOS 10.14+ and Linux (x86-64/arm64) | M | ☑ | `paniolo setup` installs daemons/tools |
+| CORE-4 | Rust daemons (`hdmicap`, `serialcap`) + Swift `visionocr` helper build & install | M | ☑ | `paniolo setup` |
+| CORE-5 | Predictable runtime paths (configs, daemon discovery, capture logs) | M | ☑ | README "Runtime paths" |
+| CORE-6 | Agent-oriented guidance kept current (`AGENTS.md`) as the surface changes | M | ◐ | Must track power/serial changes in §9 |
+| CORE-7 | One-file **lab** model (`--lab`/`PANIOLO_LAB`): hosts + targets, per-resource host binding; legacy targets dir as fallback | S | ☑ | `_lab.py`; [distributed-control](distributed-control.md) |
+| CORE-8 | Transparent re-exec of host-operating commands on a target's **remote control host** over SSH | S | ☑ | `_remote.py`, `@remote_capable`; `_ssh.py` transport |
+| CORE-9 | Tunnelled `console` for a remote target (dashboard reachable locally) | S | ☑ | `_cli._remote_console`; `?serialws=` stitch |
+| CORE-10 | Multi-host targets (one target spanning control hosts) | C | ☐ | schema ready (per-resource host); single-host enforced for now |
+| CORE-11 | Remote `setup --host` + discovery-assisted `configure` (Phases 4–5) | C | ☐ | [plan](distributed-control-plan.md) |
+
+## 2. Netboot / deploy
+
+| ID | Requirement | Pri | Status | Notes |
+|---|---|---|---|---|
+| NET-1 | Built-in DHCP + TFTP over a direct USB-Ethernet link | M | ☑ | `_dhcp.py`, `_tftp.py`; `192.168.99.1/24` |
+| NET-2 | `netboot start/stop/status`, `tftp-root`, `logs` (filterable, followable) | M | ☑ | `_cli.py`; `_netboot.py` |
+| NET-3 | `netboot link-up/down/status` for interface configuration | M | ☑ | |
+| NET-4 | TFTP root configurable per target (`--tftp-root`) | M | ☑ | required for `netboot start` |
+| NET-5 | `netif mode netboot\|ffx\|off` — atomic, idempotent link-mode switch; stops netboot before SD boot, sets up host `fe80::1`/64 for ffx; `netif status` probes the active mode | S | ☑ | `_netif.py`; from rpi5-bringup ffx-over-network bring-up |
+
+## 3. Serial console
+
+| ID | Requirement | Pri | Status | Notes |
+|---|---|---|---|---|
+| SER-A | `serialcap` daemon owns the port exclusively; supervisor fans out reads | M | ☑ | `serialcap/`; lockfile |
+| SER-B | Timestamped rolling JSONL capture log, addressable by seq; rotation | M | ☑ | `capture.rs`; `serial log` |
+| SER-C | Interactive terminal via `tio` (`serial connect`) | M | ☑ | |
+| SER-D | Bidirectional live `/stream` (WebSocket) — read + write-back | M | ☑ | `server.rs` (used by dashboard) |
+| SER-E | `serial setup/remove/devices/show`, multi-interface per target | M | ☑ | |
+| SER-F | DTR control: `serial dtr`, `serial reset` (soft-reset semantics) | M | ☑ | `_power.py` |
+| SER-G | Power-sense read via modem-control input (`--power-sense cts\|dsr\|dcd\|ri`) | S | ☑ | `/status` → `power_on` |
+
+## 4. Power control
+
+| ID | Requirement | Pri | Status | Notes |
+|---|---|---|---|---|
+| PWR-A | `power-cycle` via configurable script (`--power-cycle-cmd`) | M | ☑ | *to be superseded by `[power]` block — PWR-5 in §9* |
+| PWR-B | `power-state` (read-only on/off via sense signal) | M | ☑ | `power-state` |
+| PWR-C | DTR-based hardware power-button toggling (J2 header): ≤500ms soft / ≥3s hard | M | ☑ | `_power.py` |
+
+## 5. Video / OCR
+
+| ID | Requirement | Pri | Status | Notes |
+|---|---|---|---|---|
+| VID-1 | HDMI/USB capture via warm-stream `hdmicap` daemon | M | ☑ | `hdmicap/`; Linux V4L2 + macOS |
+| VID-2 | `video watch/preview/shot/read/devices/show/stop`; stable & changed-since capture | M | ☑ | |
+| VID-3 | On-device OCR (`video read`): Apple Vision (macOS), Tesseract (Linux); `--json` | S | ☑ | `_ocr.py` |
+
+## 6. HID injection
+
+| ID | Requirement | Pri | Status | Notes |
+|---|---|---|---|---|
+| HID-1 | USB keyboard/mouse injection via two-board KB2040 rig | S | ☑ | `hidrig/`; needs `pyserial` extra |
+| HID-2 | `hid type/key/combo/releaseall/click/move/scroll/run/setup/show` | S | ☑ | `_cli.py` |
+
+## 7. Dashboard
+
+| ID | Requirement | Pri | Status | Notes |
+|---|---|---|---|---|
+| DASH-1 | Combined video + serial web UI (`paniolo console`); auto-starts daemons | S | ☑ | preselect serial via `-i` |
+| DASH-2 | Dashboard power-cycle control | S | ☑ | |
+
+## 8. Cross-cutting / non-functional
+
+| ID | Requirement | Pri | Status | Notes |
+|---|---|---|---|---|
+| NF-1 | Interactive/agent bring-up workflow (dashboard, OCR, HID, `tio`, JSONL) never regresses | M | ◐ | Regression guard on every change, esp. §9 serial work |
+| NF-2 | Changes land as smallest reversible steps, each with tests | M | ◐ | |
+| NF-3 | Core power/serial path stays functional on both macOS and Linux | M | ☑ | CI-only features may be Linux-only (see §9) |
+| NF-4 | External contracts re-verified against upstream before relying on them | M | ◐ | re-check Fuchsia `device.go` (FX-4) |
+
+---
+
+## 9. Hardware-CI integration (KernelCI/LAVA + Fuchsia/botanist)
+
+> Goal: make paniolo's primitives **consumable by** LAVA (under KernelCI's Maestro) and
+> `botanist`+`testrunner` (under Fuchsia/LUCI) — *without* paniolo owning orchestration or
+> results. Full analysis: [`ci-integration/gap-analysis.md`](ci-integration/gap-analysis.md);
+> design: [`ci-integration/design.md`](ci-integration/design.md).
+>
+> **Current focus:** the owner is doing a **Fuchsia port** with an agent — single user, no
+> existing users, breaking changes are free. M1 leads with the Fuchsia-critical path (PTY +
+> power); the botanist adapter is sequenced before LAVA.
+
+### 9.0 Decisions (locked 2026-05-29)
+
+| ID | Decision | Resolution |
+|---|---|---|
+| D-1 | KCIDB results path | ⊘ Out of scope — LAVA-lab path only for KernelCI |
+| D-2 | Fuchsia serial ownership | PTY proxy; paniolo keeps the physical port (JSONL/dashboard stay live) |
+| D-3 | Serial write arbitration | Cooperative last-writer-wins + advisory lock in `/status` + opt-in `--exclusive`, **auto-released on client disconnect** (+ optional `--lock-timeout`) |
+| D-4 | JTAG in v1 | Extension point only (schema + verb stubs); OpenOCD backend deferred |
+| D-5 | CI control-host OS | Linux-only for CI; macOS stays first-class for interactive bring-up |
+| D-6 | Deploy ownership in CI | Orchestrator owns deploy (LAVA TFTP / botanist pave); paniolo netboot stands down |
+| D-7 | Serial TCP endpoint | Native Rust TCP listener in serialcap; ser2net-on-PTY as LAVA fallback |
+| D-8 | `[power]` config | Breaking change accepted — clean `[power]` block, no `power_cycle_cmd` alias; update `AGENTS.md` |
+
+### 9.1 Agnostic device-control API — Power
+
+| ID | Requirement | Source | Pri | Status | Notes |
+|---|---|---|---|---|---|
+| PWR-1 | `paniolo power on` — applies power; DUT begins booting unattended | LAVA | M | ☐ | Maps to `power_on_command` (hard requirement) |
+| PWR-2 | `paniolo power off` — cuts power | LAVA | M | ☐ | DTR long-press or PDU script |
+| PWR-3 | `paniolo power reset` — off+delay+on (hard reset) | LAVA | M | ☐ | Supersedes `power-cycle` (PWR-A) |
+| PWR-4 | `paniolo power state` — read on/off | BOTH | M | ☑ | exists as `power-state` (PWR-B); rename only |
+| PWR-5 | `[power]` config block w/ `backend = script\|dtr\|pdu\|jtag` + on/off/reset cmds | BOTH | M | ☐ | **Breaking**: replaces flat `power_cycle_cmd` (no alias) |
+| PWR-6 | Power commands usable as plain shell cmds (string or list) from a generator | LAVA | M | ☐ | LAVA fields accept string OR list |
+| PWR-7 | Update `AGENTS.md` for the new `[power]` config + verbs | OWNER | M | ☐ | Agent reconfigures targets on redeploy |
+
+### 9.2 Agnostic device-control API — Serial (core gap)
+
+| ID | Requirement | Source | Pri | Status | Notes |
+|---|---|---|---|---|---|
+| SER-1 | serialcap exposes a **raw bidirectional TCP listener** (ser2net-equivalent) | LAVA | M | ☐ | backs `connection_command = telnet host port` |
+| SER-2 | serialcap exposes a **PTY** whose slave path is a real device file | FX | M | ☐ | handed to botanist as `DeviceConfig.serial` |
+| SER-3 | New endpoints **tee off the existing supervisor** (JSONL/WS/dashboard unaffected) | OWNER | M | ☐ | preserves NF-1 |
+| SER-4 | `paniolo serial send <bytes\|->` one-shot write (agent feature) | OWNER | M | ☐ | same `write_tx` channel; `--enter`/`--hex`/stdin |
+| SER-5 | Write arbitration per D-3 (lock, `/status` holder, `--exclusive`, auto-release) | OWNER | M | ☐ | |
+| SER-6 | Stable socket/PTY paths under `$XDG_RUNTIME_DIR/paniolo/<target>/` | BOTH | S | ☐ | predictable for adapters |
+| SER-7 | Existing JSONL log, `/stream`, `tio`, `serial log/dtr/reset` unchanged | OWNER | M | ☐ | regression guard / tests |
+
+### 9.3 Agnostic device-control API — Deploy / boot / debug
+
+| ID | Requirement | Source | Pri | Status | Notes |
+|---|---|---|---|---|---|
+| DEP-1 | netboot **stands down** under CI; no DHCP/TFTP contention | BOTH | M | ☐ | guard `netboot start` when CI attach active |
+| DEP-2 | netboot remains available for interactive/non-CI use | OWNER | M | ☑ | exists (NET-1..4); just not the CI path |
+| DEP-3 | (Full) paniolo-serves-images as a non-standard LAVA deploy method | LAVA | C | ⤵ | only if a board can't use LAVA TFTP |
+| BOOT-1 | `paniolo serial wait --match <regex> [--timeout]` boot-detect helper | OWNER | S | ⤵ | not required by either orchestrator; ergonomics |
+| JTAG-1 | `[jtag]`/`[debug]` config schema + `paniolo debug {halt\|resume\|reset\|gdb}` stubs | OWNER | C | ☐ | extension point only per D-4 |
+| JTAG-2 | OpenOCD backend: reset, flash-deploy, GDB `:3333` / Tcl `:6666` sockets | OWNER | C | ⤵ | deferred |
+
+### 9.4 Adapter A — LAVA lab
+
+| ID | Requirement | Source | Pri | Status | Notes |
+|---|---|---|---|---|---|
+| LAVA-1 | Device-dictionary + device-type template generator (`paniolo lava device-dict`) | LAVA | M | ☐ | power_* → `paniolo power …`; connection → telnet |
+| LAVA-2 | Generator supports list-valued power commands | LAVA | S | ☐ | |
+| LAVA-3 | "First device" onboarding doc (Debian worker, ser2net/TCP wiring, tokens) | LAVA | S | ☐ | internet-reachable lab; tokens to KernelCI admins |
+| LAVA-4 | Verified on a Debian LAVA worker against a real board | LAVA | S | ☐ | macOS unsupported (D-5) |
+
+### 9.5 Adapter B — Fuchsia / botanist
+
+| ID | Requirement | Source | Pri | Status | Notes |
+|---|---|---|---|---|---|
+| FX-1 | botanist device-config emitter (`paniolo botanist device-config`) → PTY path | FX | M | ☐ | `{network,keys,serial}`; serial = PTY (SER-2) |
+| FX-2 | Bot-host/recipe **power wrapper** calling `paniolo power {on\|reset\|off}` | FX | M | ☐ | power is NOT a device-config field |
+| FX-3 | `bot_config.py` `get_dimensions()` snippet advertising `device_type:<board>` | FX | S | ☐ | + `bots.cfg`, `platforms.gni` (upstream coord) |
+| FX-4 | Verify `DeviceConfig`/power plumbing against a real Fuchsia checkout | FX | M | ☐ | confirm `tools/botanist/target/device.go` |
+| FX-5 | Document RFC-0130 Experimental tier (self-hosted CI) | FX | C | ☐ | community board is not "Supported" tier |
+
+---
+
+### 9.6 Adapter C — Redfish provider
+
+> **Decision (D-9, 2026-05-29):** Redfish interop = **provider** direction (paniolo exposes a
+> Redfish API in front of BMC-less boards), **not client**. Higher-leverage than per-ecosystem
+> adapters because Redfish is the bare-metal lingua franca (Ironic/Metal3 primary control plane;
+> LAVA can `curl` it). Sequenced **after** M1 — consumes the power verbs (PWR-1..6) and the raw
+> serial socket (SER-1). Design sketch: [`ci-integration/redfish-provider.md`](ci-integration/redfish-provider.md).
+> Verified against DMTF canonical CSDL (DSP0266 v1.22.0, DSP8010 2025.2), OpenBMC, Ironic/sushy.
+
+| ID | Requirement | Source | Pri | Status | Notes |
+|---|---|---|---|---|---|
+| RF-1 | Redfish provider service: `ServiceRoot` → `ComputerSystem` → `Manager` (→ `VirtualMedia`) resource tree | OWNER | S | ⤵ | deferred after M1; provider, not client |
+| RF-2 | `#ComputerSystem.Reset` → power verbs (On→on, ForceOff→off, PowerCycle/ForceRestart→reset); `PowerState` → power-state | OWNER | S | ⤵ | depends on PWR-1..6 |
+| RF-3 | `Boot.BootSourceOverrideTarget=Pxe` + `BootSourceOverrideEnabled=Once` → netboot | OWNER | S | ⤵ | maps to existing netboot |
+| RF-4 | `VirtualMedia` `InsertMedia`/`EjectMedia` → image deploy | OWNER | C | ⤵ | open: needed vs. Pxe-once sufficient? |
+| RF-5 | `SerialConsole` advertises out-of-band SSH/console endpoint pointing at paniolo raw-serial socket (metadata only) | OWNER | S | ⤵ | depends on SER-1; Redfish carries no serial bytes |
+| RF-6 | Honest per-node `ResetType@Redfish.AllowableValues` / `ActionInfo` for the supported subset | OWNER | S | ⤵ | relay/DTR boards can't do every `ResetType` |
+| RF-7 | Implement via a sushy-tools-style emulator + paniolo backend driver (not a hand-rolled OData service) | OWNER | S | ⤵ | open: dependency footprint (core = `typer` only) |
+| RF-8 | Document/decide whether Redfish provider replaces or complements LAVA/botanist adapters | OWNER | S | ⤵ | botanist PTY serial seam still needs the direct path → not a full replacement |
+
+## 10. Security
+
+> **TODO — owner to populate.** This section needs dedicated attention and is intentionally
+> unfinished. Paniolo grants an agent physical-equivalent control of a target (power, raw
+> serial read/write, netboot/TFTP, HID injection) and, with the §9 work, opens **network-facing
+> serial endpoints** and is **SSH-driven from a dev machine into the control host** — so the
+> threat model and controls deserve first-class requirements, not afterthoughts.
+
+| ID | Requirement | Pri | Status | Notes |
+|---|---|---|---|---|
+| SEC-0 | Define paniolo's threat model and security requirements | M | ☐ | **Placeholder — to be written.** |
+
+Prompts to resolve when populating (not yet requirements — discussion seeds):
+
+- **Serial endpoint exposure (§9):** the raw TCP listener (SER-1) currently mirrors serialcap's
+  loopback-only bind (`127.0.0.1`). For a LAVA worker / Swarming bot, who may connect? Auth,
+  bind address, TLS, or rely on SSH-tunnel/localhost-only + network isolation?
+- **Write arbitration as a safety control (SER-5/D-3):** is `--exclusive` purely cooperative, or
+  also a guard against an unexpected writer driving the target?
+- **Netboot/DHCP/TFTP:** read-only TFTP, single-client; any spoofing/rogue-DHCP concerns on a
+  shared lab network vs. the assumed direct USB-Ethernet link?
+- **Power/HID authority:** anyone who can reach the control host can power-cycle and inject HID —
+  what bounds that (host access model, per-target ACLs)?
+- **Secrets:** LAVA submission tokens, `$FUCHSIA_SSH_KEY`, CIPD/Swarming creds — storage and
+  handling.
+- **Supply chain:** `paniolo setup` builds/install Rust + Swift + Homebrew components.
+
+---
+
+## 11. Milestones
+
+| Milestone | Contents | Status |
+|---|---|---|
+| M0 — Analysis & design | gap-analysis, design, this tracker, decisions | ☑ |
+| Shipped baseline | §1–§7 capabilities (netboot, serial, power, video, HID, dashboard) | ☑ |
+| M1 — Agnostic device-control core | SER-2, SER-4, PWR-1..7, SER-5, SER-1, DEP-1, JTAG-1 (Fuchsia path first) | ☐ (awaiting go-ahead) |
+| M2 — Adapters | FX-1..4 (first), then LAVA-1..3 | ☐ |
+| M3 — Verify on hardware | FX-3/FX-5, LAVA-4, BOOT-1 | ☐ |
+| Security | §10 (SEC-*) | ☐ (to be defined) |
+| M4 — Full (deferred) | DEP-3, JTAG-2 | ⤵ |
+
+## 12. Open implementation questions
+
+| ID | Question | Status |
+|---|---|---|
+| SER-Q1 | Native TCP listener vs. ser2net-on-PTY | ✓ Resolved (D-7): native listener; ser2net fallback |
+| SER-Q2 | Write-lock lifetime | ✓ Resolved (D-3): auto-release on disconnect + optional `--lock-timeout` |
+| PWR-Q1 | `[power]` shape + `power_cycle_cmd` migration | ✓ Resolved (D-8): clean breaking block, no alias |
+````
+
 ## File: serialcap/src/serial_io.rs
 ````rust
 // Copyright 2026 Curtis Galloway
@@ -16147,263 +16241,6 @@ fn describe(t: &tokio_serial::SerialPortType) -> String {
         SerialPortType::Unknown => "unknown".into(),
     }
 }
-````
-
-## File: skills/paniolo/SKILL.md
-````markdown
----
-name: paniolo
-description: Control a physical target machine (SBC, e.g. a Raspberry Pi) with the paniolo CLI during low-level bring-up — netboot it over a direct USB-Ethernet link, watch and OCR its HDMI screen, drive its serial console, and power-cycle it. Use when you need to boot, observe, type into, screenshot, read the screen of, or power a target/board through paniolo.
----
-
-# Paniolo — controlling a target machine
-
-Paniolo drives a physical target machine (a single-board computer such as a
-Raspberry Pi) during firmware/OS bring-up. It runs on the control host that is
-physically wired to the target (USB-Ethernet for netboot, an HDMI capture
-dongle for video, a USB-serial adapter for the console, a smart plug for power).
-
-Almost every command operates on a named **target**. If exactly one target is
-configured, the name can be omitted.
-
-## First-time setup
-
-```
-cd ~/src/paniolo
-uv tool install .          # installs the `paniolo` CLI into ~/.local/bin
-paniolo setup              # builds/installs hdmicap, serialcap, netbootd, visionocr;
-                           # on macOS also installs netbootd-bpf-helper setuid-root (one sudo)
-```
-
-`uv tool install .` is required first — without it the `paniolo` command doesn't
-exist yet. Run both steps once per machine. Make sure `~/.local/bin` (uv tools)
-and `~/.cargo/bin` (Rust daemons) are on your `PATH`.
-
-To pick up Python code changes after pulling or editing:
-
-```
-cd ~/src/paniolo && uv tool install --reinstall .
-```
-
-## Configure a target
-
-```
-paniolo target set <name> --interface <iface> \
-    [--tftp-root <dir>] \
-    [--ha-power-entity <switch.entity>]
-```
-
-- `--interface` auto-detects a USB-Ethernet adapter if omitted.
-- Serial consoles are configured separately with `paniolo serial setup` (a target
-  can have several named interfaces); they're preserved across `target set` runs.
-- Inspect or remove: `paniolo target show` / `paniolo target clear <name>`.
-
-## Netboot (DHCP + TFTP)
-
-Boot a board over the direct USB-Ethernet link:
-
-```
-paniolo netboot start [target]            # serve DHCP + TFTP on the interface (python engine)
-paniolo netboot start [target] --engine rust  # experimental single-binary netbootd
-paniolo netboot tftp-root [target]        # print where to drop boot files
-paniolo netboot status [target]
-paniolo netboot logs -f [target]          # follow the combined log
-paniolo netboot stop [target]
-```
-
-`start` refuses an interface that carries the system default route (a primary
-NIC) — the netboot link must be a dedicated USB-Ethernet adapter. The default
-engine is the pure-Python DHCP+TFTP pair; `--engine rust` runs the experimental
-`netbootd` binary (opt-in, for validation). On macOS the rust engine's BPF send
-path uses the setuid `netbootd-bpf-helper` installed by `paniolo setup`.
-
-Put boot files in the target's TFTP root (for a Raspberry Pi 5, the kernel goes
-in as `kernel_2712.img`). Needs passwordless `sudo` for `ifconfig` (it assigns
-the interface's static IP).
-
-## Link mode — switch between netboot and ffx
-
-The same USB-Ethernet link can't be in netboot mode and ffx-over-network mode at
-once (they want incompatible host addressing). Use `netif` to flip between them
-atomically instead of doing it by hand:
-
-```
-paniolo netif mode netboot [target]        # IPv4 + DHCP + TFTP (= netboot start)
-paniolo netif mode ffx [target]            # stop netboot, add host fe80::1/64 for ffx
-paniolo netif mode off [target]            # tear down both
-paniolo netif status [target]              # which mode is active, addresses, peer
-```
-
-- **Switching to ffx stops netboot first** — otherwise a power-cycle TFTP-boots a
-  stale image instead of falling through to the SD card. This is the safe way to
-  hand the link off to `ffx`.
-- `mode ffx` adds the host-side `fe80::1/64` that `ffx` needs (nothing else sets
-  it up, and it's lost on a control-host reboot). Re-run `mode ffx` any time to
-  re-add it — every mode is idempotent.
-- `netif status` in ffx mode reads the IPv6 neighbor table and prints a
-  ready-to-paste `ffx target add fe80::…%<iface>` for the discovered device. If
-  no peer shows, power-cycle the target and wait for it to finish SLAAC.
-
-Typical ffx hand-off: `paniolo netif mode ffx fortune` → `paniolo power-cycle
-fortune` → `paniolo netif status fortune` (grab the address) → `ffx target list`.
-Go back to TFTP bring-up with `paniolo netif mode netboot fortune`. Same
-passwordless `sudo` requirement as netboot (`ip` on Linux, `ifconfig` on macOS).
-
-## Video — capture, preview, OCR
-
-```
-paniolo video setup                   # detect + save the capture device
-paniolo video watch                   # start the capture daemon (background)
-paniolo video preview                 # open the dashboard in a browser
-paniolo video shot [--stable] [--out frame.png]   # one lossless PNG
-paniolo video read [--stable]         # OCR the current screen, print text
-paniolo video show                    # device + daemon status
-paniolo video stop
-```
-
-- The **dashboard** (default `http://127.0.0.1:8723/`) shows live video on top, a
-  serial terminal below, and an **OCR button** that reads the current screen.
-- `--stable` waits for a steady frame before capturing (useful right after a mode
-  switch or reboot).
-- **OCR** (`video read` and the dashboard button) is on-device (Apple Vision). It
-  reads large boot-screen / BIOS text well; very small console fonts can produce
-  a few character confusions (e.g. `1`/`l`, `2`/`Z`).
-
-## Serial console
-
-A target can have **several named serial interfaces** (e.g. a main `console` and
-a `bmc`). Each port is **exclusive** — only one consumer can hold it at a time —
-but a single `watch` daemon owns *all* of them at once.
-
-```
-paniolo serial setup [target] --name console   # add/update a named interface
-                                               #   (--device auto-detected if omitted)
-paniolo serial setup [target] --name bmc --device /dev/ttyUSB1 --baud 9600
-paniolo serial remove <name> [-t target]       # drop a named interface
-paniolo serial connect [target] [-i name]      # interactive terminal (tio) in your shell
-paniolo serial watch [target]                  # run the daemon for ALL interfaces;
-                                               #   they appear in the dashboard pane
-paniolo serial log [-i name] [options]         # print captured output (timestamped)
-paniolo serial show [target]                   # list interfaces + daemon status
-paniolo serial stop                            # release the ports
-paniolo serial devices                         # list serial devices on the host
-paniolo serial dtr [target] [-i name] [--ms N] # pulse DTR line (J2 power button header)
-paniolo serial reset [target] [-i name]        # soft reset via brief DTR pulse
-```
-
-`--name` defaults to `console`, so a single-interface setup needs no flags. With
-one interface, `-i`/`--interface` can be omitted everywhere. Don't run `connect`
-and `watch` (or an external `screen`/`tio`) on the **same device** at once —
-start one, or `stop`/close the other first.
-
-### Reading captured output
-
-While `watch` is running, the daemon keeps a **rolling, timestamped capture log**
-per interface (persisted on disk, so it survives a daemon restart and you can read
-it even after `stop`). The live view stays in the dashboard; use `serial log` when
-you want to *read back* what scrolled past:
-
-```
-paniolo serial log                    # most recent ~200 lines (sole interface)
-paniolo serial log -i bmc --tail 50   # most recent 50 lines of the 'bmc' interface
-paniolo serial log --since 1840       # only lines after sequence #1840 (polling)
-paniolo serial log --from 1800 --to 1860   # a specific line range
-paniolo serial log --json             # JSON Lines (seq, ts_ms, text) for parsing
-paniolo serial log --raw              # keep ANSI colors / control bytes
-```
-
-With more than one interface configured, pass `-i <name>` to choose one (omitting
-it errors and lists the names). Each line is shown as `[<UTC timestamp>] #<seq>
-<text>`. The `seq` is a stable, monotonic line number — note it, then come back
-later with `--since <seq>` to get only what's new, or `--from/--to` to re-read an
-exact span. Output is ANSI-stripped by default; a `*` after the sequence number
-marks the current unterminated line (e.g. a `login:` prompt with no newline yet).
-
-## Power control
-
-```
-paniolo power-cycle [target]           # run the target's power_cycle_cmd script
-paniolo power-state [target]           # show power state (requires sense signal + daemon)
-paniolo serial dtr [target] [--ms N]   # pulse DTR line on J2 header (soft/hard press)
-paniolo serial reset [target]          # soft reset via brief DTR pulse
-```
-
-`power-cycle` runs the shell script set with
-`paniolo target set <name> --power-cycle-cmd <script>`.
-The script is responsible for the full off→on sequence (HA API, PDU relay, GPIO, etc.).
-
-DTR commands drive the target's physical power button via an FTDI serial
-adapter wired to the Pi J2 header. A ≤500 ms pulse is a soft button event; ≥3000 ms
-is a hard PMIC power-off. Set the default interface with
-`paniolo target set <name> --power-serial console`.
-
-## Targets on a remote control host (a "lab")
-
-When the machine wired to the target isn't the one you're running paniolo on,
-describe your **lab** in one git-tracked TOML file and point paniolo at it with
-`--lab <file>` or `PANIOLO_LAB`. Each target's `host` names a control host;
-commands then run **transparently on that host over SSH** — you don't ssh by hand.
-
-```toml
-# mylab.toml
-[hosts.bench1]
-ssh = "curtisg@bench1.local"     # ssh destination ("local" = this machine)
-# identity = "~/.ssh/lab_key"    # set this if your ssh-agent offers many keys
-#                                  (avoids "Too many authentication failures")
-# paniolo_cmd = "/Users/curtisg/.local/bin/paniolo"  # if paniolo isn't on the
-#                                  host's non-interactive ssh PATH
-
-[targets.fortune]
-host = "bench1"
-
-[targets.fortune.netboot]
-interface = "enx00e04c08d9a0"
-tftp_root = "/home/curtisg/tftp/fortune"
-
-[[targets.fortune.serial]]
-name = "console"
-device = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG00W7NY-if00-port0"
-
-[targets.fortune.power]
-cycle_cmd = "/home/curtisg/scripts/power-cycle.sh"
-```
-
-```
-export PANIOLO_LAB=~/labs/mylab.toml
-paniolo netboot start fortune      # runs on bench1, transparently
-paniolo power-cycle fortune
-paniolo netboot logs -f fortune    # streams back live
-paniolo serial connect fortune     # interactive tio over ssh -t
-paniolo console fortune            # dashboard tunnelled to your browser; Ctrl-C to close
-```
-
-Notes:
-- With **no** `--lab`/`PANIOLO_LAB`, paniolo uses the legacy per-target files
-  (`paniolo target set …`) and everything runs locally — unchanged.
-- The lab file is **hand-edited** (it's your source of truth, in git). Config
-  authoring commands (`target set/show/clear`, `serial setup/remove`) still
-  operate on the local legacy config, not the lab, for now.
-- A target may currently live on only **one** host (multi-host targets are
-  designed-for but not yet supported).
-- Still over plain SSH if you prefer: `ssh bench1 "paniolo …"` works too, but the
-  lab makes location transparent.
-
-## Quick reference — gotchas
-
-- Serial port is exclusive: one of `connect` / `watch` / external `tio`/`screen`.
-- `~/.local/bin` (uv tool) and `~/.cargo/bin` (Rust daemons) must be on `PATH`.
-- `paniolo console` auto-starts both daemons if they aren't running.
-- Netboot requires passwordless `sudo` (`ip` on Linux, `ifconfig` on macOS).
-- netboot and ffx are mutually exclusive on the link — use `paniolo netif mode`
-  to switch; entering ffx mode stops netboot so a power-cycle boots from SD.
-- Remote (lab) targets: if ssh fails with "Too many authentication failures",
-  set the host's `identity` (agent key-spray); if the remote can't find paniolo,
-  set its `paniolo_cmd` to an absolute path.
-- OCR is strongest on large text; tiny console fonts may misread some characters.
-
----
-
-Licensed under the Apache License, Version 2.0.
 ````
 
 ## File: src/paniolo/_serial.py
@@ -16986,63 +16823,286 @@ jobs:
         run: swiftc -O -o "$RUNNER_TEMP/visionocr" ocr/visionocr.swift
 ````
 
-## File: docs/README.md
+## File: skills/paniolo/SKILL.md
 ````markdown
-# Paniolo documentation
+---
+name: paniolo
+description: Control a physical target machine (SBC, e.g. a Raspberry Pi) with the paniolo CLI during low-level bring-up — netboot it over a direct USB-Ethernet link, watch and OCR its HDMI screen, drive its serial console, and power-cycle it. Use when you need to boot, observe, type into, screenshot, read the screen of, or power a target/board through paniolo.
+---
 
-Paniolo is an **agent-controlled target-machine wrangler** for low-level software development —
-it gives an AI agent (or you) the controls to netboot a target, watch its output, send it input,
-and power-cycle it without a person at the bench each iteration. See the root
-[`README.md`](../README.md) for install and the quick remote-control pattern.
+# Paniolo — controlling a target machine
 
-## Start here
+Paniolo drives a physical target machine (a single-board computer such as a
+Raspberry Pi) during firmware/OS bring-up. It runs on the control host that is
+physically wired to the target (USB-Ethernet for netboot, an HDMI capture
+dongle for video, a USB-serial adapter for the console, a smart plug for power).
 
-| Doc | What it covers |
-|---|---|
-| [**Architecture**](architecture.md) | The whole system in its current state: deployment model, the CLI + per-subsystem daemons, config/state model, data flows, host-OS differences. **Read this first.** |
-| [Requirements & progress](requirements.md) | Project-wide requirements tracker (shipped capabilities + planned work + decisions), with status per item. |
+Almost every command operates on a named **target**. If exactly one target is
+configured, the name can be omitted.
 
-## Subsystem guides
+## First-time setup
 
-| Guide | Commands | Summary |
-|---|---|---|
-| [Netboot](netboot.md) | `paniolo netboot` | Pure-Python DHCP + TFTP over a direct USB-Ethernet link. |
-| [Link mode](netif.md) | `paniolo netif` | Atomically switch the link between netboot and ffx-over-IPv6 modes (stops netboot, sets up the host `fe80::1`). |
-| [Serial](serial.md) | `paniolo serial` | `serialcap` daemon (timestamped JSONL log + WebSocket terminal) and interactive `tio`. |
-| [Power](power.md) | `paniolo power-cycle`, `power-state`, `serial dtr/reset` | DTR power-button wiring (J2) and script-based power cycling. |
-| [Video](video.md) | `paniolo video` | `hdmicap` warm-stream HDMI capture + on-device OCR. |
-| [Dashboard](dashboard.md) | `paniolo console` | Combined video + serial web UI. |
-| [HID injection](hid.md) | `paniolo hid` | USB keyboard/mouse injection via the KB2040 rig. |
+```
+cd ~/src/paniolo
+uv tool install .          # installs the `paniolo` CLI into ~/.local/bin
+paniolo setup              # builds/installs hdmicap, serialcap, netbootd, visionocr;
+                           # on macOS also installs netbootd-bpf-helper setuid-root (one sudo)
+```
 
-## Distributed control (Phases 0–3 shipped)
+`uv tool install .` is required first — without it the `paniolo` command doesn't
+exist yet. Run both steps once per machine. Make sure `~/.local/bin` (uv tools)
+and `~/.cargo/bin` (Rust daemons) are on your `PATH`.
 
-| Doc | What it covers |
-|---|---|
-| [Distributed control: one lab, one file](distributed-control.md) | Driving targets on remote control hosts: a single git-tracked lab file describing hosts + targets, SSH transport with the dev machine as the data-plane hub, per-resource host binding (multi-host-ready), and a discovery-proposes/human-approves config flow. Shipped: `--lab`, transparent re-exec, tunnelled `console`. |
-| [Implementation plan](distributed-control-plan.md) | Phased build sequence — Phases 0–3 shipped (SSH transport, lab model, re-exec, console); Phases 4–5 (remote `setup`, discovery-assisted `configure`) and multi-host pending. |
+To pick up Python code changes after pulling or editing:
 
-## Hardware-CI integration (in design)
+```
+cd ~/src/paniolo && uv tool install --reinstall .
+```
 
-Making paniolo's primitives consumable by hardware-CI orchestrators, without paniolo owning test
-orchestration or results.
+## Configure a target
 
-| Doc | What it covers |
-|---|---|
-| [Gap analysis](ci-integration/gap-analysis.md) | Per-primitive (power/serial/deploy/boot) × per-ecosystem (KernelCI/LAVA, Fuchsia/botanist) deltas, with the verified contract corrections. |
-| [Integration design](ci-integration/design.md) | The ecosystem-agnostic device-control API + LAVA and botanist adapters; minimum-viable vs full paths; verdict. |
-| [Related work: paniolo vs. labgrid](ci-integration/related-work.md) | How paniolo compares to the closest existing tool (labgrid) and to Redfish, and why paniolo exists alongside them. |
-| [Redfish provider (design sketch)](ci-integration/redfish-provider.md) | Exposing a Redfish API in front of BMC-less boards so Ironic/Metal3/LAVA can drive a paniolo target as a managed server. |
+```
+paniolo target set <name> --interface <iface> \
+    [--tftp-root <dir>] \
+    [--ha-power-entity <switch.entity>]
+```
 
-## For contributors / agents
+- `--interface` auto-detects a USB-Ethernet adapter if omitted.
+- Serial consoles are configured separately with `paniolo serial setup` (a target
+  can have several named interfaces); they're preserved across `target set` runs.
+- Inspect or remove: `paniolo target show` / `paniolo target clear <name>`.
 
-- [`AGENTS.md`](../AGENTS.md) — module-by-module internals, source constraints, and how to add a subsystem.
-- [`hidrig/README.md`](../hidrig/README.md) — HID rig wiring, firmware, and wire protocol.
+## Netboot (DHCP + TFTP)
+
+Boot a board over the direct USB-Ethernet link:
+
+```
+paniolo netboot start [target]            # serve DHCP + TFTP on the interface (python engine)
+paniolo netboot start [target] --engine rust  # experimental single-binary netbootd
+paniolo netboot tftp-root [target]        # print where to drop boot files
+paniolo netboot status [target]
+paniolo netboot logs -f [target]          # follow the combined log
+paniolo netboot stop [target]
+```
+
+`start` refuses an interface that carries the system default route (a primary
+NIC) — the netboot link must be a dedicated USB-Ethernet adapter. The default
+engine is the pure-Python DHCP+TFTP pair; `--engine rust` runs the experimental
+`netbootd` binary (opt-in, for validation). On macOS the rust engine's BPF send
+path uses the setuid `netbootd-bpf-helper` installed by `paniolo setup`.
+
+Put boot files in the target's TFTP root (for a Raspberry Pi 5, the kernel goes
+in as `kernel_2712.img`). Needs passwordless `sudo` for `ifconfig` (it assigns
+the interface's static IP).
+
+## Link mode — switch between netboot and ffx
+
+The same USB-Ethernet link can't be in netboot mode and ffx-over-network mode at
+once (they want incompatible host addressing). Use `netif` to flip between them
+atomically instead of doing it by hand:
+
+```
+paniolo netif mode netboot [target]        # IPv4 + DHCP + TFTP (= netboot start)
+paniolo netif mode ffx [target]            # stop netboot, add host fe80::1/64 for ffx
+paniolo netif mode off [target]            # tear down both
+paniolo netif status [target]              # which mode is active, addresses, peer
+```
+
+- **Switching to ffx stops netboot first** — otherwise a power-cycle TFTP-boots a
+  stale image instead of falling through to the SD card. This is the safe way to
+  hand the link off to `ffx`.
+- `mode ffx` adds the host-side `fe80::1/64` that `ffx` needs (nothing else sets
+  it up, and it's lost on a control-host reboot). Re-run `mode ffx` any time to
+  re-add it — every mode is idempotent.
+- `netif status` in ffx mode reads the IPv6 neighbor table and prints a
+  ready-to-paste `ffx target add fe80::…%<iface>` for the discovered device. If
+  no peer shows, power-cycle the target and wait for it to finish SLAAC.
+
+Typical ffx hand-off: `paniolo netif mode ffx fortune` → `paniolo power-cycle
+fortune` → `paniolo netif status fortune` (grab the address) → `ffx target list`.
+Go back to TFTP bring-up with `paniolo netif mode netboot fortune`. Same
+passwordless `sudo` requirement as netboot (`ip` on Linux, `ifconfig` on macOS).
+
+## Video — capture, preview, OCR
+
+```
+paniolo video setup                   # detect + save the capture device
+paniolo video watch                   # start the capture daemon (background)
+paniolo video preview                 # open the dashboard in a browser
+paniolo video shot [--stable] [--out frame.png]   # one lossless PNG
+paniolo video read [--stable]         # OCR the current screen, print text
+paniolo video show                    # device + daemon status
+paniolo video stop
+```
+
+- The **dashboard** (default `http://127.0.0.1:8723/`) shows live video on top, a
+  serial terminal below, and an **OCR button** that reads the current screen.
+- `--stable` waits for a steady frame before capturing (useful right after a mode
+  switch or reboot).
+- **OCR** (`video read` and the dashboard button) is on-device (Apple Vision). It
+  reads large boot-screen / BIOS text well; very small console fonts can produce
+  a few character confusions (e.g. `1`/`l`, `2`/`Z`).
+
+## Serial console
+
+A target can have **several named serial interfaces** (e.g. a main `console` and
+a `bmc`). Each port is **exclusive** — only one consumer can hold it at a time —
+but a single `watch` daemon owns *all* of them at once.
+
+```
+paniolo serial setup [target] --name console   # add/update a named interface
+                                               #   (--device auto-detected if omitted)
+paniolo serial setup [target] --name bmc --device /dev/ttyUSB1 --baud 9600
+paniolo serial remove <name> [-t target]       # drop a named interface
+paniolo serial connect [target] [-i name]      # interactive terminal (tio) in your shell
+paniolo serial watch [target]                  # run the daemon for ALL interfaces;
+                                               #   they appear in the dashboard pane
+paniolo serial log [-i name] [options]         # print captured output (timestamped)
+paniolo serial show [target]                   # list interfaces + daemon status
+paniolo serial stop                            # release the ports
+paniolo serial devices                         # list serial devices on the host
+paniolo serial dtr [target] [-i name] [--ms N] # pulse DTR line (J2 power button header)
+paniolo serial reset [target] [-i name]        # soft reset via brief DTR pulse
+```
+
+`--name` defaults to `console`, so a single-interface setup needs no flags. With
+one interface, `-i`/`--interface` can be omitted everywhere. Don't run `connect`
+and `watch` (or an external `screen`/`tio`) on the **same device** at once —
+start one, or `stop`/close the other first.
+
+### Reading captured output
+
+While `watch` is running, the daemon keeps a **rolling, timestamped capture log**
+per interface (persisted on disk, so it survives a daemon restart and you can read
+it even after `stop`). The live view stays in the dashboard; use `serial log` when
+you want to *read back* what scrolled past:
+
+```
+paniolo serial log                    # most recent ~200 lines (sole interface)
+paniolo serial log -i bmc --tail 50   # most recent 50 lines of the 'bmc' interface
+paniolo serial log --since 1840       # only lines after sequence #1840 (polling)
+paniolo serial log --from 1800 --to 1860   # a specific line range
+paniolo serial log --json             # JSON Lines (seq, ts_ms, text) for parsing
+paniolo serial log --raw              # keep ANSI colors / control bytes
+```
+
+With more than one interface configured, pass `-i <name>` to choose one (omitting
+it errors and lists the names). Each line is shown as `[<UTC timestamp>] #<seq>
+<text>`. The `seq` is a stable, monotonic line number — note it, then come back
+later with `--since <seq>` to get only what's new, or `--from/--to` to re-read an
+exact span. Output is ANSI-stripped by default; a `*` after the sequence number
+marks the current unterminated line (e.g. a `login:` prompt with no newline yet).
+
+## Power control
+
+```
+paniolo power-cycle [target]           # run the target's power_cycle_cmd script
+paniolo power-state [target]           # show power state (requires sense signal + daemon)
+paniolo serial dtr [target] [--ms N]   # pulse DTR line on J2 header (soft/hard press)
+paniolo serial reset [target]          # soft reset via brief DTR pulse
+```
+
+`power-cycle` runs the shell script set with
+`paniolo target set <name> --power-cycle-cmd <script>`.
+The script is responsible for the full off→on sequence (HA API, PDU relay, GPIO, etc.).
+
+DTR commands drive the target's physical power button via an FTDI serial
+adapter wired to the Pi J2 header. A ≤500 ms pulse is a soft button event; ≥3000 ms
+is a hard PMIC power-off. Set the default interface with
+`paniolo target set <name> --power-serial console`.
+
+## Targets on a remote control host (a "lab")
+
+When the machine wired to the target isn't the one you're running paniolo on,
+describe your **lab** in one git-tracked TOML file and point paniolo at it with
+`--lab <file>` or `PANIOLO_LAB`. Each target's `host` names a control host;
+commands then run **transparently on that host over SSH** — you don't ssh by hand.
+
+```toml
+# mylab.toml
+[hosts.bench1]
+ssh = "curtisg@bench1.local"     # ssh destination ("local" = this machine)
+# identity = "~/.ssh/lab_key"    # set this if your ssh-agent offers many keys
+#                                  (avoids "Too many authentication failures")
+# paniolo_cmd = "/Users/curtisg/.local/bin/paniolo"  # if paniolo isn't on the
+#                                  host's non-interactive ssh PATH
+
+[targets.fortune]
+host = "bench1"
+
+[targets.fortune.netboot]
+interface = "enx00e04c08d9a0"
+tftp_root = "/home/curtisg/tftp/fortune"
+
+[[targets.fortune.serial]]
+name = "console"
+device = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG00W7NY-if00-port0"
+
+[targets.fortune.power]
+cycle_cmd = "/home/curtisg/scripts/power-cycle.sh"
+```
+
+```
+export PANIOLO_LAB=~/labs/mylab.toml
+paniolo netboot start fortune      # runs on bench1, transparently
+paniolo power-cycle fortune
+paniolo netboot logs -f fortune    # streams back live
+paniolo serial connect fortune     # interactive tio over ssh -t
+paniolo console fortune            # dashboard tunnelled to your browser; Ctrl-C to close
+```
+
+Notes:
+- With **no** `--lab`/`PANIOLO_LAB`, paniolo uses the legacy per-target files
+  (`paniolo target set …`) and everything runs locally — unchanged.
+- The lab file is **hand-edited** (it's your source of truth, in git). Config
+  authoring commands (`target set/show/clear`, `serial setup/remove`) still
+  operate on the local legacy config, not the lab, for now.
+- A target may currently live on only **one** host (multi-host targets are
+  designed-for but not yet supported).
+- Still over plain SSH if you prefer: `ssh bench1 "paniolo …"` works too, but the
+  lab makes location transparent.
+
+### Authoring a lab (discovery + provisioning)
+
+After hand-writing a host's connection info (`[hosts.bench1] ssh = …`), let
+paniolo discover its hardware and propose the target block:
+
+```
+paniolo discover                                  # list THIS host's hardware
+paniolo --lab mylab.toml configure fortune --host bench1
+```
+
+`configure` runs discovery on `bench1` over SSH and prints a proposed
+`[targets.fortune]` block — best-guessing the USB-Ethernet interface and serial
+device, listing other candidates as comments. It **writes nothing**: you review
+it, paste it into the lab file, and commit (the lab is your reviewed source of
+truth). Edit the guesses as needed; add `tftp_root`/`power` (not discoverable).
+
+Provision a control host's daemons from your dev machine:
+
+```
+paniolo --lab mylab.toml setup --host bench1       # runs `paniolo setup` on bench1
+```
+
+(The host needs the paniolo CLI + source already present; this builds the Rust
+daemons there over an ssh PTY.)
+
+## Quick reference — gotchas
+
+- Serial port is exclusive: one of `connect` / `watch` / external `tio`/`screen`.
+- `~/.local/bin` (uv tool) and `~/.cargo/bin` (Rust daemons) must be on `PATH`.
+- `paniolo console` auto-starts both daemons if they aren't running.
+- Netboot requires passwordless `sudo` (`ip` on Linux, `ifconfig` on macOS).
+- netboot and ffx are mutually exclusive on the link — use `paniolo netif mode`
+  to switch; entering ffx mode stops netboot so a power-cycle boots from SD.
+- Remote (lab) targets: if ssh fails with "Too many authentication failures",
+  set the host's `identity` (agent key-spray); if the remote can't find paniolo,
+  set its `paniolo_cmd` to an absolute path.
+- OCR is strongest on large text; tiny console fonts may misread some characters.
 
 ---
 
-*These docs describe paniolo's current state and are kept up to date as it changes. When you
-change a subsystem, update its guide here and the [architecture overview](architecture.md); when
-you change requirements/scope, update the [tracker](requirements.md).*
+Licensed under the Apache License, Version 2.0.
 ````
 
 ## File: src/paniolo/_netboot.py
@@ -17782,6 +17842,65 @@ def stop_daemon() -> bool:
     return result.returncode == 0
 ````
 
+## File: docs/README.md
+````markdown
+# Paniolo documentation
+
+Paniolo is an **agent-controlled target-machine wrangler** for low-level software development —
+it gives an AI agent (or you) the controls to netboot a target, watch its output, send it input,
+and power-cycle it without a person at the bench each iteration. See the root
+[`README.md`](../README.md) for install and the quick remote-control pattern.
+
+## Start here
+
+| Doc | What it covers |
+|---|---|
+| [**Architecture**](architecture.md) | The whole system in its current state: deployment model, the CLI + per-subsystem daemons, config/state model, data flows, host-OS differences. **Read this first.** |
+| [Requirements & progress](requirements.md) | Project-wide requirements tracker (shipped capabilities + planned work + decisions), with status per item. |
+
+## Subsystem guides
+
+| Guide | Commands | Summary |
+|---|---|---|
+| [Netboot](netboot.md) | `paniolo netboot` | Pure-Python DHCP + TFTP over a direct USB-Ethernet link. |
+| [Link mode](netif.md) | `paniolo netif` | Atomically switch the link between netboot and ffx-over-IPv6 modes (stops netboot, sets up the host `fe80::1`). |
+| [Serial](serial.md) | `paniolo serial` | `serialcap` daemon (timestamped JSONL log + WebSocket terminal) and interactive `tio`. |
+| [Power](power.md) | `paniolo power-cycle`, `power-state`, `serial dtr/reset` | DTR power-button wiring (J2) and script-based power cycling. |
+| [Video](video.md) | `paniolo video` | `hdmicap` warm-stream HDMI capture + on-device OCR. |
+| [Dashboard](dashboard.md) | `paniolo console` | Combined video + serial web UI. |
+| [HID injection](hid.md) | `paniolo hid` | USB keyboard/mouse injection via the KB2040 rig. |
+
+## Distributed control (Phases 0–3 shipped)
+
+| Doc | What it covers |
+|---|---|
+| [Distributed control: one lab, one file](distributed-control.md) | Driving targets on remote control hosts: a single git-tracked lab file describing hosts + targets, SSH transport with the dev machine as the data-plane hub, per-resource host binding (multi-host-ready), and a discovery-proposes/human-approves config flow. Shipped: `--lab`, transparent re-exec, tunnelled `console`. |
+| [Implementation plan](distributed-control-plan.md) | Phased build sequence — Phases 0–3 shipped (SSH transport, lab model, re-exec, console); Phases 4–5 (remote `setup`, discovery-assisted `configure`) and multi-host pending. |
+
+## Hardware-CI integration (in design)
+
+Making paniolo's primitives consumable by hardware-CI orchestrators, without paniolo owning test
+orchestration or results.
+
+| Doc | What it covers |
+|---|---|
+| [Gap analysis](ci-integration/gap-analysis.md) | Per-primitive (power/serial/deploy/boot) × per-ecosystem (KernelCI/LAVA, Fuchsia/botanist) deltas, with the verified contract corrections. |
+| [Integration design](ci-integration/design.md) | The ecosystem-agnostic device-control API + LAVA and botanist adapters; minimum-viable vs full paths; verdict. |
+| [Related work: paniolo vs. labgrid](ci-integration/related-work.md) | How paniolo compares to the closest existing tool (labgrid) and to Redfish, and why paniolo exists alongside them. |
+| [Redfish provider (design sketch)](ci-integration/redfish-provider.md) | Exposing a Redfish API in front of BMC-less boards so Ironic/Metal3/LAVA can drive a paniolo target as a managed server. |
+
+## For contributors / agents
+
+- [`AGENTS.md`](../AGENTS.md) — module-by-module internals, source constraints, and how to add a subsystem.
+- [`hidrig/README.md`](../hidrig/README.md) — HID rig wiring, firmware, and wire protocol.
+
+---
+
+*These docs describe paniolo's current state and are kept up to date as it changes. When you
+change a subsystem, update its guide here and the [architecture overview](architecture.md); when
+you change requirements/scope, update the [tracker](requirements.md).*
+````
+
 ## File: README.md
 ````markdown
 # paniolo
@@ -18196,9 +18315,9 @@ owned by another user — treat as alive).
 Lets a single command on the dev machine drive a target wired to a **remote
 control host**, transparently. Design + rationale: [`docs/distributed-control.md`](docs/distributed-control.md);
 phasing/status: [`docs/distributed-control-plan.md`](docs/distributed-control-plan.md).
-Phases 0–3 are shipped (one-shot re-exec + tunnelled `console`); multi-host
-targets, `console --detach`, `setup --host`, and discovery-assisted `configure`
-are still design-only.
+Phases 0–5 are shipped (one-shot re-exec, tunnelled `console`, remote
+`setup --host`, discovery-assisted `configure`); multi-host targets,
+`console --detach`, and multi-user locking are still design-only.
 
 **`_lab.py`** parses the one-file lab (pointed at by the global `--lab` option /
 `PANIOLO_LAB`): `[hosts.*]` (each → an `_ssh.Host`) and `[targets.*]` with nested
@@ -18238,6 +18357,14 @@ stateless remote — nor to host-global commands without a target (serial log,
 video shot). Remote `console` (`_cli._remote_console`) starts both daemons on the
 host, forwards their discovery ports, and opens the dashboard at the forwarded
 video port with the terminal aimed at the forwarded serial port via `?serialws=`.
+
+**Host provisioning + authoring.** `setup --host <h>` re-execs `paniolo setup`
+on host `h` over an ssh -t PTY (Phase 4). `discover [--json]` lists a host's
+lab-relevant hardware (USB-Ethernet/serial/capture); `configure <target>
+--host <h>` runs `discover` on `h` over SSH and prints a proposed
+`[targets.<target>]` block via `_lab.propose_target_block` (Phase 5) — it writes
+nothing, the human reviews/pastes/commits (the lab is the reviewed source of
+truth).
 
 ## _netboot.py
 
@@ -18708,6 +18835,7 @@ from __future__ import annotations
 
 import functools
 import grp
+import json
 import os
 import pwd
 import shutil
@@ -18846,6 +18974,27 @@ def _resolve_with_host(name: Optional[str]) -> tuple[_config.TargetConfig, _ssh.
 
 def _resolve(name: Optional[str]) -> _config.TargetConfig:
     return _resolve_with_host(name)[0]
+
+
+def _resolve_host(name: str) -> _ssh.Host:
+    """Look up a control host by name in the lab (for host-scoped commands)."""
+    if name == _ssh.LOCAL:
+        return _ssh.Host(name=_ssh.LOCAL, ssh=_ssh.LOCAL)
+    try:
+        lab = _lab.load()
+    except _lab.LabError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    if lab is None:
+        err.print(
+            "[red]--host needs a lab.[/red] Point at one with --lab / PANIOLO_LAB."
+        )
+        raise typer.Exit(1)
+    if name not in lab.hosts:
+        have = ", ".join(sorted(lab.hosts)) or "(none)"
+        err.print(f"[red]Host '{name}' not in lab.[/red] Hosts: {have}")
+        raise typer.Exit(1)
+    return lab.hosts[name]
 
 
 def remote_capable(mode: str = _remote.REEXEC):
@@ -20055,7 +20204,9 @@ def serial_send(
     target: Annotated[Optional[str], typer.Option("--target", "-t")] = None,
     interface: Annotated[
         Optional[str],
-        typer.Option("--interface", "-i", help="Serial interface name (default: the only one)"),
+        typer.Option(
+            "--interface", "-i", help="Serial interface name (default: the only one)"
+        ),
     ] = None,
     pace_ms: Annotated[
         int,
@@ -20069,7 +20220,9 @@ def serial_send(
     ] = 0,
     newline: Annotated[
         bool,
-        typer.Option("--newline/--no-newline", help="Append a carriage return after the text"),
+        typer.Option(
+            "--newline/--no-newline", help="Append a carriage return after the text"
+        ),
     ] = True,
 ) -> None:
     """Send a line of input to a target's console through the running daemon.
@@ -20092,7 +20245,9 @@ def serial_send(
 
     payload = text.encode() + (b"\r" if newline else b"")
     pace_note = f" paced {pace_ms} ms/byte" if pace_ms else ""
-    console.print(f"[dim]Sending {len(payload)} bytes to '{iface.name}'{pace_note}[/dim]")
+    console.print(
+        f"[dim]Sending {len(payload)} bytes to '{iface.name}'{pace_note}[/dim]"
+    )
     try:
         _serial.send_input(daemon_url, iface.name, payload, pace_ms)
     except OSError as exc:
@@ -20503,15 +20658,124 @@ def _ensure_linux_groups() -> bool:
     return changed
 
 
+def _local_inventory() -> dict:
+    """This host's lab-relevant hardware (USB-Ethernet, serial, capture devices)."""
+    return {
+        "ethernet": _netboot.list_usb_ethernet_interfaces(),
+        "serial": _serial.list_serial_devices(),
+        "video": _video.list_devices(),
+    }
+
+
+@app.command("discover")
+def discover(
+    json_out: Annotated[
+        bool, typer.Option("--json", help="Emit machine-readable JSON")
+    ] = False,
+) -> None:
+    """List this host's hardware for lab authoring — USB-Ethernet interfaces,
+    serial devices, and capture devices. `configure` runs this over SSH."""
+    inv = _local_inventory()
+    if json_out:
+        print(json.dumps(inv))
+        return
+    t = Table(show_header=False, box=None, padding=(0, 2))
+    eths = " ".join(
+        f"{e['device']}{'*' if e.get('active') else ''}" for e in inv["ethernet"]
+    )
+    t.add_row("usb-ethernet", eths or "(none)")
+    t.add_row("serial", "\n".join(inv["serial"]) if inv["serial"] else "(none)")
+    t.add_row(
+        "capture",
+        "\n".join(f"{d['index']}: {d['name']}" for d in inv["video"]) or "(none)",
+    )
+    console.print(t)
+    console.print("[dim]* = carrier up[/dim]")
+
+
+@app.command("configure")
+def configure(
+    target: Annotated[str, typer.Argument(help="Target name to propose a block for")],
+    host: Annotated[
+        str, typer.Option("--host", "-H", help="Lab host the target is wired to")
+    ],
+) -> None:
+    """Propose a `[targets.<name>]` lab block from hardware discovered on a host.
+
+    Runs `paniolo discover` on the host over SSH and prints a proposed TOML block
+    for you to review, paste into your lab file, and commit. Writes nothing — you
+    approve it by committing. The host must already be in the lab (its connection
+    info is authored by hand)."""
+    resolved = _resolve_host(host)
+    if resolved.is_local:
+        inv = _local_inventory()
+    else:
+        console.print(f"[dim]Discovering hardware on {host} ({resolved.ssh})…[/dim]")
+        try:
+            result = _ssh.run(resolved, [resolved.paniolo, "discover", "--json"])
+        except _ssh.SSHError as exc:
+            err.print(f"[red]ssh: {exc}[/red]")
+            raise typer.Exit(1)
+        if result.returncode != 0:
+            err.print(
+                f"[red]discover failed on {host}:[/red] "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+            raise typer.Exit(1)
+        try:
+            inv = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            err.print(f"[red]unparseable discover output from {host}:[/red] {exc}")
+            raise typer.Exit(1)
+
+    block = _lab.propose_target_block(target, host, inv)
+    try:
+        lab = _lab.load()
+    except _lab.LabError:
+        lab = None
+    console.print(
+        "[dim]# Proposed lab block — review, add to your lab file, and commit.[/dim]"
+    )
+    if lab is not None and target in lab.targets:
+        console.print(
+            f"[yellow]# NOTE: target '{target}' already exists in the lab — "
+            "reconcile by hand.[/yellow]"
+        )
+    print(block)
+
+
 @app.command()
-def setup() -> None:
+def setup(
+    host: Annotated[
+        Optional[str],
+        typer.Option(
+            "--host",
+            help="Provision this lab host over SSH (runs `paniolo setup` there) "
+            "instead of locally. Requires the paniolo CLI + source already on the host.",
+        ),
+    ] = None,
+) -> None:
     """Install system tools and build/install paniolo's binaries.
 
     Builds hdmicap and serialcap (cargo install) into ~/.cargo/bin so the
     daemons resolve from a stable installed path, not the in-repo build tree.
     On macOS, also installs the visionocr OCR helper (swiftc) and tftp-now
     (Homebrew).  On Linux, DHCP and TFTP are pure-Python; no extra tools needed.
+
+    With --host, re-execs this same setup on the named lab host over SSH (a PTY,
+    so its sudo steps can prompt).
     """
+    if host is not None:
+        target_host = _resolve_host(host)
+        if not target_host.is_local:
+            console.print(
+                f"[dim]Running paniolo setup on {host} ({target_host.ssh})…[/dim]"
+            )
+            raise typer.Exit(
+                _ssh.run_interactive(target_host, [target_host.paniolo, "setup"])
+            )
+        console.print(f"[dim]'{host}' is the local machine; setting up here.[/dim]")
+
     repo = Path(__file__).parent.parent.parent
     cargo_bin = Path.home() / ".cargo" / "bin"
 

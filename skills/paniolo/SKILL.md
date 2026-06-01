@@ -235,6 +235,31 @@ Notes:
 - Still over plain SSH if you prefer: `ssh bench1 "paniolo …"` works too, but the
   lab makes location transparent.
 
+### Authoring a lab (discovery + provisioning)
+
+After hand-writing a host's connection info (`[hosts.bench1] ssh = …`), let
+paniolo discover its hardware and propose the target block:
+
+```
+paniolo discover                                  # list THIS host's hardware
+paniolo --lab mylab.toml configure fortune --host bench1
+```
+
+`configure` runs discovery on `bench1` over SSH and prints a proposed
+`[targets.fortune]` block — best-guessing the USB-Ethernet interface and serial
+device, listing other candidates as comments. It **writes nothing**: you review
+it, paste it into the lab file, and commit (the lab is your reviewed source of
+truth). Edit the guesses as needed; add `tftp_root`/`power` (not discoverable).
+
+Provision a control host's daemons from your dev machine:
+
+```
+paniolo --lab mylab.toml setup --host bench1       # runs `paniolo setup` on bench1
+```
+
+(The host needs the paniolo CLI + source already present; this builds the Rust
+daemons there over an ssh PTY.)
+
 ## Quick reference — gotchas
 
 - Serial port is exclusive: one of `connect` / `watch` / external `tio`/`screen`.
