@@ -159,6 +159,47 @@ class Lab:
         return cfg, self._host(next(iter(used)))
 
 
+def propose_target_block(name: str, host: str, inventory: dict) -> str:
+    """Render a proposed ``[targets.<name>]`` lab block from a host's hardware.
+
+    ``inventory`` is the shape emitted by ``paniolo discover --json``:
+    ``{"ethernet": [{device, active, ...}], "serial": [path, ...], ...}``. One
+    value is best-guessed per field (a carrier-up interface, the first serial as
+    ``console``); other candidates are listed as comments. Power and tftp_root
+    aren't discoverable, so they're left as commented stubs. The result is meant
+    to be reviewed, pasted into the lab file, and committed — paniolo never
+    writes it for you.
+    """
+    eths = sorted(inventory.get("ethernet") or [], key=lambda e: (not e.get("active"),))
+    serials = inventory.get("serial") or []
+    out = [f"[targets.{name}]", f'host = "{host}"', ""]
+
+    out.append(f"[targets.{name}.netboot]")
+    if eths:
+        note = "  # carrier up" if eths[0].get("active") else ""
+        out.append(f'interface = "{eths[0]["device"]}"{note}')
+        for e in eths[1:]:
+            out.append(f'# interface = "{e["device"]}"  # alternative')
+    else:
+        out.append('# interface = ""  # no USB-Ethernet interface discovered')
+    out.append('# tftp_root = "/path/to/tftp"  # set to enable netboot')
+    out.append("")
+
+    if serials:
+        out.append(f"[[targets.{name}.serial]]")
+        out.append('name = "console"')
+        out.append(f'device = "{serials[0]}"')
+        out.append("baud = 115200")
+        for extra in serials[1:]:
+            out.append(f"# another serial device: {extra}")
+    else:
+        out.append(f"# [[targets.{name}.serial]]  # no serial devices discovered")
+    out.append("")
+    out.append(f"# [targets.{name}.power]")
+    out.append('# cycle_cmd = "/path/to/power-cycle.sh"  # not discoverable')
+    return "\n".join(out).rstrip() + "\n"
+
+
 def load_lab(path: str) -> Lab:
     with open(os.path.expanduser(path), "rb") as f:
         data = tomllib.load(f)

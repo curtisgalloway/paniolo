@@ -17,6 +17,8 @@ single-host (multi-host-rejecting) constraint, and lab-path selection."""
 
 from __future__ import annotations
 
+import tomllib
+
 import pytest
 
 from paniolo import _lab
@@ -126,6 +128,37 @@ def test_serial_missing_fields_raises():
     lab = Lab.from_dict({"targets": {"t": {"serial": [{"name": "c"}]}}})
     with pytest.raises(LabError, match="name . device"):
         lab.resolve_target("t")
+
+
+def test_propose_target_block_picks_carrier_up_and_first_serial():
+    inv = {
+        "ethernet": [
+            {"device": "eth0", "active": True},
+            {"device": "enx00e0", "active": True},
+        ],
+        "serial": ["/dev/ttyUSB0", "/dev/ttyUSB1"],
+    }
+    block = _lab.propose_target_block("fortune", "bench1", inv)
+    # Parses as valid TOML with the expected structure (one value chosen per
+    # field; the other interface + serial are commented out, not parsed).
+    t = tomllib.loads(block)["targets"]["fortune"]
+    assert t["host"] == "bench1"
+    assert t["netboot"]["interface"] in ("eth0", "enx00e0")
+    assert t["serial"][0] == {
+        "name": "console",
+        "device": "/dev/ttyUSB0",
+        "baud": 115200,
+    }
+    assert len(t["serial"]) == 1  # the second device is a comment, not an entry
+    assert "# another serial device: /dev/ttyUSB1" in block
+    assert "cycle_cmd" in block  # commented power stub
+
+
+def test_propose_target_block_handles_empty_inventory():
+    block = _lab.propose_target_block("t", "h", {"ethernet": [], "serial": []})
+    assert "no USB-Ethernet interface discovered" in block
+    assert "no serial devices discovered" in block
+    tomllib.loads(block)  # still valid TOML (commented-out resource sections)
 
 
 def test_load_lab_parses_a_real_toml_file(tmp_path):

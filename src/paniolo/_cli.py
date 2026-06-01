@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import functools
 import grp
+import json
 import os
 import pwd
 import shutil
@@ -1836,6 +1837,92 @@ def _ensure_linux_groups() -> bool:
                     f"({result.stderr.strip() or result.stdout.strip()})"
                 )
     return changed
+
+
+def _local_inventory() -> dict:
+    """This host's lab-relevant hardware (USB-Ethernet, serial, capture devices)."""
+    return {
+        "ethernet": _netboot.list_usb_ethernet_interfaces(),
+        "serial": _serial.list_serial_devices(),
+        "video": _video.list_devices(),
+    }
+
+
+@app.command("discover")
+def discover(
+    json_out: Annotated[
+        bool, typer.Option("--json", help="Emit machine-readable JSON")
+    ] = False,
+) -> None:
+    """List this host's hardware for lab authoring — USB-Ethernet interfaces,
+    serial devices, and capture devices. `configure` runs this over SSH."""
+    inv = _local_inventory()
+    if json_out:
+        print(json.dumps(inv))
+        return
+    t = Table(show_header=False, box=None, padding=(0, 2))
+    eths = " ".join(
+        f"{e['device']}{'*' if e.get('active') else ''}" for e in inv["ethernet"]
+    )
+    t.add_row("usb-ethernet", eths or "(none)")
+    t.add_row("serial", "\n".join(inv["serial"]) if inv["serial"] else "(none)")
+    t.add_row(
+        "capture",
+        "\n".join(f"{d['index']}: {d['name']}" for d in inv["video"]) or "(none)",
+    )
+    console.print(t)
+    console.print("[dim]* = carrier up[/dim]")
+
+
+@app.command("configure")
+def configure(
+    target: Annotated[str, typer.Argument(help="Target name to propose a block for")],
+    host: Annotated[
+        str, typer.Option("--host", "-H", help="Lab host the target is wired to")
+    ],
+) -> None:
+    """Propose a `[targets.<name>]` lab block from hardware discovered on a host.
+
+    Runs `paniolo discover` on the host over SSH and prints a proposed TOML block
+    for you to review, paste into your lab file, and commit. Writes nothing — you
+    approve it by committing. The host must already be in the lab (its connection
+    info is authored by hand)."""
+    resolved = _resolve_host(host)
+    if resolved.is_local:
+        inv = _local_inventory()
+    else:
+        console.print(f"[dim]Discovering hardware on {host} ({resolved.ssh})…[/dim]")
+        try:
+            result = _ssh.run(resolved, [resolved.paniolo, "discover", "--json"])
+        except _ssh.SSHError as exc:
+            err.print(f"[red]ssh: {exc}[/red]")
+            raise typer.Exit(1)
+        if result.returncode != 0:
+            err.print(
+                f"[red]discover failed on {host}:[/red] "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+            raise typer.Exit(1)
+        try:
+            inv = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            err.print(f"[red]unparseable discover output from {host}:[/red] {exc}")
+            raise typer.Exit(1)
+
+    block = _lab.propose_target_block(target, host, inv)
+    try:
+        lab = _lab.load()
+    except _lab.LabError:
+        lab = None
+    console.print(
+        "[dim]# Proposed lab block — review, add to your lab file, and commit.[/dim]"
+    )
+    if lab is not None and target in lab.targets:
+        console.print(
+            f"[yellow]# NOTE: target '{target}' already exists in the lab — "
+            "reconcile by hand.[/yellow]"
+        )
+    print(block)
 
 
 @app.command()

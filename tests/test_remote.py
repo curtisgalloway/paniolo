@@ -160,6 +160,25 @@ def test_ship_config_round_trips(host):
 
 @integration
 @pytest.mark.skipif(not _PANIOLO, reason="paniolo not installed on PATH")
+def test_configure_discovers_over_ssh(tmp_path):
+    # `configure --host h` runs `paniolo discover --json` on h over ssh and
+    # prints a proposed [targets.<name>] block built from the result.
+    ident = f'identity = "{_IDENT}"\n' if _IDENT else ""
+    lab = tmp_path / "lab.toml"
+    lab.write_text(f'[hosts.h]\nssh = "{_DEST}"\n{ident}paniolo_cmd = "{_PANIOLO}"\n')
+    result = subprocess.run(
+        [_PANIOLO, "--lab", str(lab), "configure", "newtgt", "--host", "h"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "[targets.newtgt]" in result.stdout
+    assert 'host = "h"' in result.stdout
+
+
+@integration
+@pytest.mark.skipif(not _PANIOLO, reason="paniolo not installed on PATH")
 def test_full_cli_dispatch_runs_on_remote(host, tmp_path):
     # A lab whose single target lives on the (remote) integration host.
     ident = f'identity = "{_IDENT}"\n' if _IDENT else ""
