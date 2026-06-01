@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import functools
 import grp
 import os
 import pwd
@@ -28,7 +29,20 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import _config, _hid, _netboot, _netif, _ocr, _power, _serial, _state, _video
+from . import (
+    _config,
+    _hid,
+    _lab,
+    _netboot,
+    _netif,
+    _ocr,
+    _power,
+    _remote,
+    _serial,
+    _ssh,
+    _state,
+    _video,
+)
 
 app = typer.Typer(
     help="Paniolo — agent-controlled target machine wrangler.", no_args_is_help=True
@@ -61,26 +75,113 @@ console = Console()
 err = Console(stderr=True)
 
 
-def _resolve(name: Optional[str]) -> _config.TargetConfig:
-    if name is None:
-        targets = _config.list_targets()
-        if len(targets) == 1:
-            name = targets[0]
-        elif not targets:
-            err.print(
-                "[red]No targets configured.[/red] Run: paniolo target set <name> --interface <iface>"
-            )
+@app.callback()
+def _main(
+    lab: Annotated[
+        Optional[str],
+        typer.Option(
+            "--lab",
+            envvar="PANIOLO_LAB",
+            help="Path to the lab config file (one file describing all hosts and "
+            "targets). Without it, the legacy ~/.config/paniolo/targets are used.",
+        ),
+    ] = None,
+) -> None:
+    """Paniolo — agent-controlled target machine wrangler."""
+    if lab is not None:
+        _lab.set_lab_path(lab)
+
+
+def _require_single(name: Optional[str], names: list[str]) -> str:
+    """Resolve an omitted target name to the sole configured one, or error."""
+    if name is not None:
+        return name
+    if len(names) == 1:
+        return names[0]
+    if not names:
+        err.print(
+            "[red]No targets configured.[/red] Run: paniolo target set <name> --interface <iface>"
+        )
+        raise typer.Exit(1)
+    err.print(f"[red]Multiple targets ({', '.join(names)}) — specify one.[/red]")
+    raise typer.Exit(1)
+
+
+def _resolve_with_host(name: Optional[str]) -> tuple[_config.TargetConfig, _ssh.Host]:
+    """Resolve a target to its config and the host it lives on.
+
+    Uses the lab file when one is configured (--lab / PANIOLO_LAB); otherwise the
+    legacy per-target files under ~/.config/paniolo/targets, which always run on
+    the local host. The host is consumed by remote dispatch (a later phase);
+    today every command body uses only the TargetConfig.
+    """
+    # On a remote control host, the dev machine has shipped a single config
+    # slice and set PANIOLO_TARGET_CONFIG; run against it locally. This takes
+    # precedence over any lab/legacy lookup and prevents a re-dispatch loop.
+    slice_path = os.environ.get("PANIOLO_TARGET_CONFIG")
+    if slice_path:
+        try:
+            cfg = _config.load_target_file(slice_path)
+        except (OSError, ValueError) as exc:
+            err.print(f"[red]Failed to read PANIOLO_TARGET_CONFIG: {exc}[/red]")
             raise typer.Exit(1)
-        else:
-            err.print(
-                f"[red]Multiple targets ({', '.join(targets)}) — specify one.[/red]"
-            )
-            raise typer.Exit(1)
+        return cfg, _ssh.Host(name=_ssh.LOCAL, ssh=_ssh.LOCAL)
+
     try:
-        return _config.load_target(name)
+        lab = _lab.load()
+    except _lab.LabError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+    if lab is not None:
+        name = _require_single(name, lab.target_names())
+        try:
+            return lab.resolve_target(name)
+        except KeyError:
+            err.print(f"[red]Target '{name}' not found in lab.[/red]")
+            raise typer.Exit(1)
+        except _lab.LabError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1)
+
+    name = _require_single(name, _config.list_targets())
+    try:
+        return _config.load_target(name), _ssh.Host(name=_ssh.LOCAL, ssh=_ssh.LOCAL)
     except FileNotFoundError:
         err.print(f"[red]Target '{name}' not found.[/red]")
         raise typer.Exit(1)
+
+
+def _resolve(name: Optional[str]) -> _config.TargetConfig:
+    return _resolve_with_host(name)[0]
+
+
+def remote_capable(mode: str = _remote.REEXEC):
+    """Make a target command transparently run on its host's control machine.
+
+    Wraps a Typer command: it resolves the target's host first; if that's the
+    local dev machine the command runs here unchanged, otherwise the whole
+    invocation is re-exec'd on the host over SSH (``mode=INTERACTIVE`` uses an
+    ssh -t PTY, for tio). The command body never runs locally for a remote
+    target. Apply *below* the ``@*_app.command(...)`` decorator.
+    """
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            _cfg, host = _resolve_with_host(kwargs.get("target"))
+            if host.is_local:
+                return fn(*args, **kwargs)
+            try:
+                code = _remote.dispatch(host, _cfg, mode, sys.argv)
+            except _ssh.SSHError as exc:
+                err.print(f"[red]ssh: {exc}[/red]")
+                raise typer.Exit(1)
+            raise typer.Exit(code)
+
+        return wrapper
+
+    return decorator
 
 
 # ── target ────────────────────────────────────────────────────────────────────
@@ -240,6 +341,7 @@ def target_clear(
 
 
 @netboot_app.command("start")
+@remote_capable()
 def netboot_start(
     target: Annotated[Optional[str], typer.Argument()] = None,
     engine: Annotated[
@@ -275,6 +377,7 @@ def netboot_start(
 
 
 @netboot_app.command("stop")
+@remote_capable()
 def netboot_stop(
     target: Annotated[Optional[str], typer.Argument()] = None,
 ) -> None:
@@ -292,6 +395,7 @@ def netboot_stop(
 
 
 @netboot_app.command("status")
+@remote_capable()
 def netboot_status(
     target: Annotated[Optional[str], typer.Argument()] = None,
 ) -> None:
@@ -330,6 +434,7 @@ def netboot_status(
 
 
 @netboot_app.command("tftp-root")
+@remote_capable()
 def netboot_tftp_root(
     target: Annotated[Optional[str], typer.Argument()] = None,
 ) -> None:
@@ -388,6 +493,7 @@ def _netboot_line_passes(line: str, dhcp: bool, tftp: bool, errors: bool) -> boo
 
 
 @netboot_app.command("logs")
+@remote_capable()
 def netboot_logs(
     target: Annotated[Optional[str], typer.Argument()] = None,
     follow: Annotated[
@@ -489,6 +595,7 @@ def _link_state(interface: str) -> dict:
 
 
 @netboot_app.command("link-up")
+@remote_capable()
 def netboot_link_up(
     target: Annotated[Optional[str], typer.Argument()] = None,
 ) -> None:
@@ -505,6 +612,7 @@ def netboot_link_up(
 
 
 @netboot_app.command("link-down")
+@remote_capable()
 def netboot_link_down(
     target: Annotated[Optional[str], typer.Argument()] = None,
 ) -> None:
@@ -515,6 +623,7 @@ def netboot_link_down(
 
 
 @netboot_app.command("link-status")
+@remote_capable()
 def netboot_link_status(
     target: Annotated[Optional[str], typer.Argument()] = None,
 ) -> None:
@@ -564,6 +673,7 @@ def _print_netif_status(cfg: _config.TargetConfig) -> None:
 
 
 @netif_app.command("mode")
+@remote_capable()
 def netif_mode(
     mode: Annotated[str, typer.Argument(help="netboot | ffx | off")],
     target: Annotated[Optional[str], typer.Argument()] = None,
@@ -604,6 +714,7 @@ def netif_mode(
 
 
 @netif_app.command("status")
+@remote_capable()
 def netif_status(
     target: Annotated[Optional[str], typer.Argument()] = None,
 ) -> None:
@@ -827,6 +938,75 @@ def video_stop() -> None:
 # ── console ───────────────────────────────────────────────────────────────────
 
 
+def _dashboard_url(
+    video_base: str, serial_ws: Optional[str], interface: Optional[str]
+) -> str:
+    """Build the dashboard URL, optionally overriding the serial WS origin.
+
+    ``serial_ws`` points the page's terminal at a specific serialcap (used when
+    it's reached through a forwarded local port); ``interface`` preselects one.
+    """
+    params = []
+    if serial_ws:
+        params.append(f"serialws={serial_ws}")
+    if interface:
+        params.append(f"interface={interface}")
+    return f"{video_base}/?{'&'.join(params)}" if params else video_base
+
+
+def _remote_console(
+    host: _ssh.Host, cfg: _config.TargetConfig, interface: Optional[str]
+) -> None:
+    """Open the dashboard for a target on a remote control host.
+
+    Starts both daemons on the host, forwards their ports to this machine, and
+    points the browser at the forwarded video port (with the serial terminal
+    aimed at the forwarded serial port via ?serialws). Blocks holding the
+    tunnels until interrupted — closing them on the way out.
+    """
+    console.print(f"[dim]Starting daemons on {host.name}…[/dim]")
+    for sub in (["video", "watch", cfg.name], ["serial", "watch", cfg.name]):
+        result = _remote.run_subcommand(host, cfg, sub)
+        if result.returncode != 0:
+            err.print(
+                f"[red]Failed to start '{' '.join(sub)}' on {host.name}:[/red] "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+            raise typer.Exit(1)
+
+    video_port = _remote.remote_daemon_port(host, "hdmicap")
+    serial_port = _remote.remote_daemon_port(host, "serialcap")
+    if not video_port or not serial_port:
+        err.print(f"[red]Could not read daemon ports on {host.name}.[/red]")
+        raise typer.Exit(1)
+
+    try:
+        with (
+            _ssh.forward(host, video_port) as local_video,
+            _ssh.forward(host, serial_port) as local_serial,
+        ):
+            url = _dashboard_url(
+                f"http://127.0.0.1:{local_video}",
+                f"ws://127.0.0.1:{local_serial}/stream",
+                interface,
+            )
+            import webbrowser
+
+            webbrowser.open(url)
+            console.print(f"Opened {url}")
+            console.print(
+                f"[dim]Tunnels to {host.name} open. Press Ctrl-C to close.[/dim]"
+            )
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                console.print("\n[dim]Closing tunnels.[/dim]")
+    except _ssh.SSHError as exc:
+        err.print(f"[red]ssh: {exc}[/red]")
+        raise typer.Exit(1)
+
+
 @app.command("console")
 def open_dashboard(
     target: Annotated[Optional[str], typer.Argument()] = None,
@@ -838,6 +1018,11 @@ def open_dashboard(
     serial_port: Annotated[int, typer.Option("--serial-port")] = 8724,
 ) -> None:
     """Open the combined video+serial dashboard, starting daemons if needed."""
+    _cfg, _host = _resolve_with_host(target)
+    if not _host.is_local:
+        _remote_console(_host, _cfg, interface)
+        return
+
     # ── video daemon ──────────────────────────────────────────────────────────
     video_url = _video.daemon_url()
     if not video_url:
@@ -935,6 +1120,7 @@ def _dtr_button(
 
 
 @app.command("power-cycle")
+@remote_capable()
 def power_cycle(
     target: Annotated[Optional[str], typer.Argument()] = None,
 ) -> None:
@@ -965,6 +1151,7 @@ def power_cycle(
 
 
 @app.command("power-state")
+@remote_capable()
 def power_state(
     target: Annotated[Optional[str], typer.Argument()] = None,
 ) -> None:
@@ -1114,6 +1301,7 @@ def _resolve_interface(
 
 
 @serial_app.command("dtr")
+@remote_capable()
 def serial_dtr(
     target: Annotated[Optional[str], typer.Argument()] = None,
     ms: Annotated[
@@ -1143,6 +1331,7 @@ def serial_dtr(
 
 
 @serial_app.command("reset")
+@remote_capable()
 def serial_reset(
     target: Annotated[Optional[str], typer.Argument()] = None,
     ms: Annotated[
@@ -1224,6 +1413,7 @@ def serial_send(
 
 
 @serial_app.command("connect")
+@remote_capable(_remote.INTERACTIVE)
 def serial_connect(
     target: Annotated[Optional[str], typer.Argument()] = None,
     interface: Annotated[
@@ -1246,6 +1436,7 @@ def serial_connect(
 
 
 @serial_app.command("watch")
+@remote_capable()
 def serial_watch(
     target: Annotated[Optional[str], typer.Argument()] = None,
     port: Annotated[int, typer.Option("--port")] = 8724,
@@ -1381,6 +1572,7 @@ def serial_log(
 
 
 @serial_app.command("show")
+@remote_capable()
 def serial_show(
     target: Annotated[Optional[str], typer.Argument()] = None,
 ) -> None:
