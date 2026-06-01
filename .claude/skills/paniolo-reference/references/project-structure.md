@@ -116,7 +116,7 @@ tests/
   test_serial.py (91 lines)
   test_ssh.py (205 lines)
 .gitignore (10 lines)
-AGENTS.md (774 lines)
+AGENTS.md (775 lines)
 LICENSE (201 lines)
 pyproject.toml (32 lines)
 README.md (132 lines)
