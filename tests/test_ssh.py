@@ -119,12 +119,14 @@ integration = pytest.mark.skipif(
 
 
 @pytest.fixture
-def host(tmp_path):
+def host():
+    # A short control path: a deep tmp_path overflows the ~104-char Unix-socket
+    # limit once ssh appends the %C hash. Unique per process; torn down below.
     h = Host(
         name="it",
         ssh=_DEST,
         identity=_IDENT,
-        control_path=str(tmp_path / "cm-%C"),
+        control_path=f"/tmp/pcm-{os.getpid()}-%C",
     )
     yield h
     _ssh.close_master(h)

@@ -41,7 +41,6 @@ import os
 import shlex
 import socket
 import subprocess
-import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -81,10 +80,18 @@ class SSHError(RuntimeError):
 
 
 def _control_dir() -> Path:
-    """Directory holding paniolo's default ControlMaster sockets."""
-    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
-    d = Path(base) / "paniolo" / "ssh"
+    """Short directory holding paniolo's default ControlMaster sockets.
+
+    Kept deliberately short: a Unix-domain socket path has a hard limit
+    (~104 chars on macOS, ~108 on Linux), and ssh appends a 40-char %C hash to
+    it. XDG_RUNTIME_DIR is short on Linux; elsewhere fall back to /tmp rather
+    than tempfile.gettempdir(), which on macOS is the long per-session $TMPDIR
+    and overflows the limit.
+    """
+    base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+    d = Path(base) / f"paniolo-{os.getuid()}"
     d.mkdir(parents=True, exist_ok=True)
+    os.chmod(d, 0o700)
     return d
 
 
