@@ -56,6 +56,15 @@ pub struct ButtonParam {
     ms: u64,
 }
 
+#[derive(Deserialize)]
+pub struct InputParam {
+    interface: Option<String>,
+    /// Per-byte pacing in milliseconds for a slow polled console with no flow
+    /// control. 0 (default) sends at full line rate.
+    #[serde(default)]
+    pace_ms: u64,
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/stream", get(stream))
@@ -63,6 +72,7 @@ pub fn router(state: AppState) -> Router {
         .route("/interfaces", get(interfaces))
         .route("/devices", get(devices))
         .route("/button", post(button))
+        .route("/input", post(input))
         .with_state(state)
 }
 
@@ -154,6 +164,37 @@ async fn button(State(s): State<AppState>, Query(q): Query<ButtonParam>) -> Resp
     };
     match handle.dtr_press(q.ms).await {
         Ok(()) => ([CORS], format!("button pressed for {} ms\n", q.ms)).into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, [CORS], format!("{e:#}\n")).into_response(),
+    }
+}
+
+/// Write the request body to the serial port the daemon already owns, so scripted
+/// input coexists with live capture (no stop/restart, no exclusive re-open).
+///
+/// `POST /input?[interface=NAME][&pace_ms=N]`, body = raw bytes to send.
+///
+/// With `pace_ms > 0` the bytes are dripped one at a time that many ms apart —
+/// the substitute for hardware flow control on a slow polled console. The call
+/// blocks until the whole body has been written, so a paced send of N bytes
+/// takes about `N * pace_ms` ms. Returns 200 on success, 404 for an unknown
+/// interface, 503 if the supervisor is not running.
+async fn input(State(s): State<AppState>, Query(q): Query<InputParam>, body: Bytes) -> Response {
+    let handle = match resolve(&s.serials, &q.interface) {
+        Some(h) => h.clone(),
+        None => {
+            let what = q.interface.as_deref().unwrap_or("(default)");
+            return (
+                StatusCode::NOT_FOUND,
+                [CORS],
+                format!("no interface '{what}'"),
+            )
+                .into_response();
+        }
+    };
+    let n = body.len();
+    let pace = std::time::Duration::from_millis(q.pace_ms);
+    match handle.write_paced(body, pace).await {
+        Ok(()) => ([CORS], format!("wrote {n} bytes\n")).into_response(),
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, [CORS], format!("{e:#}\n")).into_response(),
     }
 }

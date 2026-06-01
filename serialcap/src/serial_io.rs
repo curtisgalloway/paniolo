@@ -167,6 +167,33 @@ impl SerialHandle {
             .await
             .map_err(|_| anyhow::anyhow!("supervisor dropped response"))
     }
+
+    /// Write `data` to the port through the supervisor's normal write path.
+    ///
+    /// When `pace` is non-zero, the bytes are dripped one at a time with `pace`
+    /// between each, throttling input for a slow polled console that has no
+    /// hardware flow control (each byte is consumed before the next arrives, so
+    /// the receiver's RX FIFO can't overflow). When `pace` is zero the whole
+    /// buffer is sent in one message (full line-rate, same as interactive input).
+    ///
+    /// The supervisor's select loop is unchanged: it just sees one or many write
+    /// messages. The interactive WebSocket path shares `write_tx` but never paces,
+    /// so live typing stays immediate.
+    pub async fn write_paced(&self, data: Bytes, pace: Duration) -> anyhow::Result<()> {
+        let dead = |_| anyhow::anyhow!("supervisor not running");
+        if pace.is_zero() {
+            self.write_tx.send(data).await.map_err(dead)?;
+            return Ok(());
+        }
+        for i in 0..data.len() {
+            self.write_tx
+                .send(data.slice(i..i + 1))
+                .await
+                .map_err(dead)?;
+            tokio::time::sleep(pace).await;
+        }
+        Ok(())
+    }
 }
 
 /// Spawn the supervisor for one interface on the current tokio runtime and return
