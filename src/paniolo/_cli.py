@@ -28,7 +28,19 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import _config, _hid, _netboot, _netif, _ocr, _power, _serial, _state, _video
+from . import (
+    _config,
+    _hid,
+    _lab,
+    _netboot,
+    _netif,
+    _ocr,
+    _power,
+    _serial,
+    _ssh,
+    _state,
+    _video,
+)
 
 app = typer.Typer(
     help="Paniolo — agent-controlled target machine wrangler.", no_args_is_help=True
@@ -61,26 +73,73 @@ console = Console()
 err = Console(stderr=True)
 
 
-def _resolve(name: Optional[str]) -> _config.TargetConfig:
-    if name is None:
-        targets = _config.list_targets()
-        if len(targets) == 1:
-            name = targets[0]
-        elif not targets:
-            err.print(
-                "[red]No targets configured.[/red] Run: paniolo target set <name> --interface <iface>"
-            )
-            raise typer.Exit(1)
-        else:
-            err.print(
-                f"[red]Multiple targets ({', '.join(targets)}) — specify one.[/red]"
-            )
-            raise typer.Exit(1)
+@app.callback()
+def _main(
+    lab: Annotated[
+        Optional[str],
+        typer.Option(
+            "--lab",
+            envvar="PANIOLO_LAB",
+            help="Path to the lab config file (one file describing all hosts and "
+            "targets). Without it, the legacy ~/.config/paniolo/targets are used.",
+        ),
+    ] = None,
+) -> None:
+    """Paniolo — agent-controlled target machine wrangler."""
+    if lab is not None:
+        _lab.set_lab_path(lab)
+
+
+def _require_single(name: Optional[str], names: list[str]) -> str:
+    """Resolve an omitted target name to the sole configured one, or error."""
+    if name is not None:
+        return name
+    if len(names) == 1:
+        return names[0]
+    if not names:
+        err.print(
+            "[red]No targets configured.[/red] Run: paniolo target set <name> --interface <iface>"
+        )
+        raise typer.Exit(1)
+    err.print(f"[red]Multiple targets ({', '.join(names)}) — specify one.[/red]")
+    raise typer.Exit(1)
+
+
+def _resolve_with_host(name: Optional[str]) -> tuple[_config.TargetConfig, _ssh.Host]:
+    """Resolve a target to its config and the host it lives on.
+
+    Uses the lab file when one is configured (--lab / PANIOLO_LAB); otherwise the
+    legacy per-target files under ~/.config/paniolo/targets, which always run on
+    the local host. The host is consumed by remote dispatch (a later phase);
+    today every command body uses only the TargetConfig.
+    """
     try:
-        return _config.load_target(name)
+        lab = _lab.load()
+    except _lab.LabError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+    if lab is not None:
+        name = _require_single(name, lab.target_names())
+        try:
+            return lab.resolve_target(name)
+        except KeyError:
+            err.print(f"[red]Target '{name}' not found in lab.[/red]")
+            raise typer.Exit(1)
+        except _lab.LabError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1)
+
+    name = _require_single(name, _config.list_targets())
+    try:
+        return _config.load_target(name), _ssh.Host(name=_ssh.LOCAL, ssh=_ssh.LOCAL)
     except FileNotFoundError:
         err.print(f"[red]Target '{name}' not found.[/red]")
         raise typer.Exit(1)
+
+
+def _resolve(name: Optional[str]) -> _config.TargetConfig:
+    return _resolve_with_host(name)[0]
 
 
 # ── target ────────────────────────────────────────────────────────────────────
