@@ -12,7 +12,7 @@ docs/
     gap-analysis.md (228 lines)
     redfish-provider.md (147 lines)
     related-work.md (158 lines)
-  architecture.md (250 lines)
+  architecture.md (266 lines)
   dashboard.md (71 lines)
   distributed-control-plan.md (209 lines)
   distributed-control.md (266 lines)
@@ -88,7 +88,7 @@ serialcap/
   Cargo.toml (45 lines)
 skills/
   paniolo/
-    SKILL.md (278 lines)
+    SKILL.md (280 lines)
 src/
   paniolo/
     __init__.py (13 lines)
@@ -116,7 +116,7 @@ tests/
   test_serial.py (91 lines)
   test_ssh.py (205 lines)
 .gitignore (10 lines)
-AGENTS.md (774 lines)
+AGENTS.md (775 lines)
 LICENSE (201 lines)
 pyproject.toml (32 lines)
 README.md (132 lines)

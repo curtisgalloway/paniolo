@@ -39,9 +39,10 @@ Run through this checklist before calling `gh pr create`:
    `paniolo-reference` codebase skill regenerated below. If the PR adds, removes,
    or changes a user-facing command, flag, or workflow, update the relevant
    section (and the "gotchas" list) so an agent using paniolo sees the new
-   surface. (It's symlinked into `~/.claude/skills/paniolo`, so the repo copy is
-   the source of truth.) Purely internal changes that don't alter the CLI surface
-   can skip this.
+   surface. The repo copy at `skills/paniolo/SKILL.md` is the canonical source;
+   edit it here (however you install or link it into your agent's skills
+   directory). Purely internal changes that don't alter the CLI surface can skip
+   this.
 
 3. **Regenerate the reference skill.** Use the Repomix CLI (`brew install repomix`,
    or `npx -y repomix@latest`) from the repo root:

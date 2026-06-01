@@ -1,6 +1,6 @@
 ---
 name: paniolo
-description: Control a physical target machine (SBC, e.g. a Raspberry Pi) with the paniolo CLI during low-level bring-up — netboot it over a direct USB-Ethernet link, watch and OCR its HDMI screen, drive its serial console, and power-cycle it. Use when you need to boot, observe, type into, screenshot, read the screen of, or power a target/board through paniolo.
+description: Control a physical target machine (SBC, e.g. a Raspberry Pi) with the paniolo CLI during low-level bring-up — netboot it over a direct USB-Ethernet link, watch and OCR its HDMI screen, drive its serial console, power-cycle it, switch the link between netboot and ffx, and drive targets on remote control hosts transparently via a single git-tracked lab file over SSH. Use when you need to boot, observe, type into, screenshot, read the screen of, power, or remotely control a target/board through paniolo — including across multiple control hosts.
 ---
 
 # Paniolo — controlling a target machine
@@ -37,7 +37,9 @@ cd ~/src/paniolo && uv tool install --reinstall .
 ```
 paniolo target set <name> --interface <iface> \
     [--tftp-root <dir>] \
-    [--ha-power-entity <switch.entity>]
+    [--host-ip <ip>] \
+    [--power-cycle-cmd <script>] \
+    [--power-serial <serial-iface>]
 ```
 
 - `--interface` auto-detects a USB-Ethernet adapter if omitted.
