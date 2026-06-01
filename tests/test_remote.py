@@ -26,11 +26,12 @@ import shutil
 import subprocess
 import sys
 import tomllib
+import types
 from pathlib import Path
 
 import pytest
 
-from paniolo import _config, _remote, _ssh
+from paniolo import _cli, _config, _remote, _ssh
 from paniolo._config import TargetConfig
 from paniolo._ssh import Host
 
@@ -75,6 +76,41 @@ def test_remote_argv_honors_host_paniolo_cmd():
 def test_host_paniolo_property_default_and_override():
     assert Host(name="h", ssh="u@h").paniolo == "paniolo"
     assert Host(name="h", ssh="u@h", paniolo_cmd="/x/paniolo").paniolo == "/x/paniolo"
+
+
+# ── unit: remote console plumbing ────────────────────────────────────────────
+
+
+def _completed(stdout="", returncode=0, stderr=""):
+    return types.SimpleNamespace(stdout=stdout, returncode=returncode, stderr=stderr)
+
+
+def test_remote_daemon_port_parses_discovery_json(monkeypatch):
+    monkeypatch.setattr(
+        _remote._ssh, "run", lambda *a, **k: _completed('{"pid": 5, "port": 8723}')
+    )
+    assert _remote.remote_daemon_port(Host(name="h", ssh="u@h"), "hdmicap") == 8723
+
+
+def test_remote_daemon_port_none_when_absent_or_bad(monkeypatch):
+    h = Host(name="h", ssh="u@h")
+    monkeypatch.setattr(_remote._ssh, "run", lambda *a, **k: _completed("", 1))
+    assert _remote.remote_daemon_port(h, "hdmicap") is None
+    monkeypatch.setattr(_remote._ssh, "run", lambda *a, **k: _completed("not json"))
+    assert _remote.remote_daemon_port(h, "hdmicap") is None
+
+
+def test_dashboard_url_builds_query():
+    base = "http://127.0.0.1:9001"
+    assert _cli._dashboard_url(base, None, None) == base
+    assert (
+        _cli._dashboard_url(base, "ws://127.0.0.1:9002/stream", None)
+        == f"{base}/?serialws=ws://127.0.0.1:9002/stream"
+    )
+    assert (
+        _cli._dashboard_url(base, "ws://127.0.0.1:9002/stream", "console")
+        == f"{base}/?serialws=ws://127.0.0.1:9002/stream&interface=console"
+    )
 
 
 # ── integration: real ssh re-exec, opt-in ───────────────────────────────────

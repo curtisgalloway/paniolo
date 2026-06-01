@@ -938,6 +938,75 @@ def video_stop() -> None:
 # ── console ───────────────────────────────────────────────────────────────────
 
 
+def _dashboard_url(
+    video_base: str, serial_ws: Optional[str], interface: Optional[str]
+) -> str:
+    """Build the dashboard URL, optionally overriding the serial WS origin.
+
+    ``serial_ws`` points the page's terminal at a specific serialcap (used when
+    it's reached through a forwarded local port); ``interface`` preselects one.
+    """
+    params = []
+    if serial_ws:
+        params.append(f"serialws={serial_ws}")
+    if interface:
+        params.append(f"interface={interface}")
+    return f"{video_base}/?{'&'.join(params)}" if params else video_base
+
+
+def _remote_console(
+    host: _ssh.Host, cfg: _config.TargetConfig, interface: Optional[str]
+) -> None:
+    """Open the dashboard for a target on a remote control host.
+
+    Starts both daemons on the host, forwards their ports to this machine, and
+    points the browser at the forwarded video port (with the serial terminal
+    aimed at the forwarded serial port via ?serialws). Blocks holding the
+    tunnels until interrupted — closing them on the way out.
+    """
+    console.print(f"[dim]Starting daemons on {host.name}…[/dim]")
+    for sub in (["video", "watch", cfg.name], ["serial", "watch", cfg.name]):
+        result = _remote.run_subcommand(host, cfg, sub)
+        if result.returncode != 0:
+            err.print(
+                f"[red]Failed to start '{' '.join(sub)}' on {host.name}:[/red] "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+            raise typer.Exit(1)
+
+    video_port = _remote.remote_daemon_port(host, "hdmicap")
+    serial_port = _remote.remote_daemon_port(host, "serialcap")
+    if not video_port or not serial_port:
+        err.print(f"[red]Could not read daemon ports on {host.name}.[/red]")
+        raise typer.Exit(1)
+
+    try:
+        with (
+            _ssh.forward(host, video_port) as local_video,
+            _ssh.forward(host, serial_port) as local_serial,
+        ):
+            url = _dashboard_url(
+                f"http://127.0.0.1:{local_video}",
+                f"ws://127.0.0.1:{local_serial}/stream",
+                interface,
+            )
+            import webbrowser
+
+            webbrowser.open(url)
+            console.print(f"Opened {url}")
+            console.print(
+                f"[dim]Tunnels to {host.name} open. Press Ctrl-C to close.[/dim]"
+            )
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                console.print("\n[dim]Closing tunnels.[/dim]")
+    except _ssh.SSHError as exc:
+        err.print(f"[red]ssh: {exc}[/red]")
+        raise typer.Exit(1)
+
+
 @app.command("console")
 def open_dashboard(
     target: Annotated[Optional[str], typer.Argument()] = None,
@@ -949,6 +1018,11 @@ def open_dashboard(
     serial_port: Annotated[int, typer.Option("--serial-port")] = 8724,
 ) -> None:
     """Open the combined video+serial dashboard, starting daemons if needed."""
+    _cfg, _host = _resolve_with_host(target)
+    if not _host.is_local:
+        _remote_console(_host, _cfg, interface)
+        return
+
     # ── video daemon ──────────────────────────────────────────────────────────
     video_url = _video.daemon_url()
     if not video_url:

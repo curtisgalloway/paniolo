@@ -28,6 +28,9 @@ next to the command definitions and target resolution.
 
 from __future__ import annotations
 
+import json
+from typing import Optional
+
 from . import _config, _ssh
 from ._config import TargetConfig
 from ._ssh import Host
@@ -104,3 +107,38 @@ def dispatch(host: Host, cfg: TargetConfig, mode: str, argv: list[str]) -> int:
         return _ssh.run_passthrough(host, cmd, env=env)
     finally:
         _ssh.run(host, ["rm", "-f", remote_path])
+
+
+def run_subcommand(host: Host, cfg: TargetConfig, subargs: list[str]):
+    """Run ``paniolo <subargs>`` on ``host`` against a shipped config slice.
+
+    Captured (returns a CompletedProcess); used to drive helper commands on the
+    host, e.g. starting the streaming daemons before tunnelling to them.
+    """
+    remote_path = ship_config(host, cfg)
+    env = {TARGET_CONFIG_ENV: remote_path}
+    try:
+        return _ssh.run(host, [host.paniolo, *subargs], env=env)
+    finally:
+        _ssh.run(host, ["rm", "-f", remote_path])
+
+
+# Resolve the daemon discovery dir the same way the daemons do (see
+# _video/_serial._discovery_path): $XDG_RUNTIME_DIR, else $TMPDIR, else /tmp.
+_REMOTE_RUNTIME = "${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
+
+
+def remote_daemon_port(host: Host, subdir: str) -> Optional[int]:
+    """Read the TCP port of a daemon's discovery file on ``host``, or None.
+
+    ``subdir`` is the daemon's runtime subdir ("hdmicap" / "serialcap"). The
+    path is resolved by a remote shell so the host's own XDG_RUNTIME_DIR applies.
+    """
+    script = f'cat "{_REMOTE_RUNTIME}/{subdir}/daemon.json" 2>/dev/null'
+    result = _ssh.run(host, ["sh", "-c", script])
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        return int(json.loads(result.stdout)["port"])
+    except (ValueError, KeyError, json.JSONDecodeError):
+        return None
