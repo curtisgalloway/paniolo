@@ -146,6 +146,11 @@ compatibility with older EEPROM firmware. The TFTP server is **read-only**
 (RFC 1350) and negotiates `blksize`/`tsize` options. Both servers log to the
 combined log at `~/.local/share/paniolo/<name>/netboot.log`.
 
+> **Switching to ffx-over-network?** With NET-first boot order, leaving netboot
+> running means the next power-cycle TFTP-boots instead of falling through to
+> the SD card. Use [`paniolo netif mode ffx`](netif.md) to stop netboot and
+> ready the host IPv6 side in one atomic, idempotent step.
+
 ---
 
 ## Runtime paths

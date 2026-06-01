@@ -123,6 +123,18 @@ descriptor from a setuid-root `netbootd-bpf-helper` over `SCM_RIGHTS`, so the da
 unprivileged — the helper is the only root component, installed by `paniolo setup`. The Python
 pair remains the default; the rust engine is opt-in for validation before any reconciliation.
 
+### Link mode: netboot ↔ ffx ([`netif.md`](netif.md))
+The same USB-Ethernet link serves two **mutually-exclusive** roles: netboot (IPv4 + DHCP + TFTP,
+the target TFTP-boots) and ffx (host IPv6 link-local `fe80::1`/64, the target boots from SD and is
+reached over `ffx` at `fe80::…%<iface>`). `paniolo netif mode <netboot|ffx|off>` (`_netif.py`)
+makes the switch atomic: `ffx` runs `netboot stop` first (so a power-cycle falls through to SD
+rather than TFTP-booting a stale image) and adds the host `fe80::1` that ffx needs but nothing else
+sets up. Each mode is idempotent — the ephemeral IPv6 LL is re-added on demand. The active mode is
+**probed** (running daemons + interface addresses), not stored, so `paniolo netif status` stays
+correct across control-host reboots; in ffx mode it also reports the device's discovered
+link-local peer (`ip -6 neigh`) as a paste-ready `ffx target add`. Privileged steps reuse the same
+`sudo` path as netboot — no new privilege model.
+
 ### Serial console ([`serial.md`](serial.md))
 The `serialcap` daemon is the heart of the design. One daemon **exclusively owns all of a
 target's serial interfaces**; per interface a *supervisor* task owns the port (with a reconnect
@@ -205,6 +217,9 @@ and the macOS-only bits (Vision OCR, BPF, `tftp-now`) are irrelevant there.
   the device.
 - **Interface configuration needs root** — NOPASSWD sudo is the practical setup for unattended
   agent use.
+- **netboot and ffx are mutually exclusive on the link** — they want incompatible host addressing
+  (IPv4 + DHCP/TFTP vs. IPv6 link-local). `paniolo netif mode` enforces the exclusivity: entering
+  one mode tears down the other.
 
 ## 10. Where this is going
 

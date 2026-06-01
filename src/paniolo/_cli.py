@@ -28,16 +28,31 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import _config, _hid, _netboot, _ocr, _power, _serial, _state, _video
+from . import _config, _hid, _netboot, _netif, _ocr, _power, _serial, _state, _video
 
-app = typer.Typer(help="Paniolo — agent-controlled target machine wrangler.", no_args_is_help=True)
+app = typer.Typer(
+    help="Paniolo — agent-controlled target machine wrangler.", no_args_is_help=True
+)
 target_app = typer.Typer(help="Manage target configurations.", no_args_is_help=True)
-netboot_app = typer.Typer(help="Control DHCP+TFTP netboot for a target.", no_args_is_help=True)
-video_app = typer.Typer(help="Capture screen frames via HDMI/USB capture device.", no_args_is_help=True)
-serial_app = typer.Typer(help="Manage serial console connection to a target.", no_args_is_help=True)
-hid_app = typer.Typer(help="Inject USB keyboard/mouse input via the HID rig.", no_args_is_help=True)
+netboot_app = typer.Typer(
+    help="Control DHCP+TFTP netboot for a target.", no_args_is_help=True
+)
+netif_app = typer.Typer(
+    help="Switch the target's USB-Ethernet link between netboot and ffx modes.",
+    no_args_is_help=True,
+)
+video_app = typer.Typer(
+    help="Capture screen frames via HDMI/USB capture device.", no_args_is_help=True
+)
+serial_app = typer.Typer(
+    help="Manage serial console connection to a target.", no_args_is_help=True
+)
+hid_app = typer.Typer(
+    help="Inject USB keyboard/mouse input via the HID rig.", no_args_is_help=True
+)
 app.add_typer(target_app, name="target")
 app.add_typer(netboot_app, name="netboot")
+app.add_typer(netif_app, name="netif")
 app.add_typer(video_app, name="video")
 app.add_typer(serial_app, name="serial")
 app.add_typer(hid_app, name="hid")
@@ -52,10 +67,14 @@ def _resolve(name: Optional[str]) -> _config.TargetConfig:
         if len(targets) == 1:
             name = targets[0]
         elif not targets:
-            err.print("[red]No targets configured.[/red] Run: paniolo target set <name> --interface <iface>")
+            err.print(
+                "[red]No targets configured.[/red] Run: paniolo target set <name> --interface <iface>"
+            )
             raise typer.Exit(1)
         else:
-            err.print(f"[red]Multiple targets ({', '.join(targets)}) — specify one.[/red]")
+            err.print(
+                f"[red]Multiple targets ({', '.join(targets)}) — specify one.[/red]"
+            )
             raise typer.Exit(1)
     try:
         return _config.load_target(name)
@@ -72,13 +91,25 @@ def target_set(
     name: Annotated[str, typer.Argument(help="Target name (e.g. fortune)")],
     interface: Annotated[
         Optional[str],
-        typer.Option("--interface", "-i", help="USB-Ethernet interface (e.g. en3); auto-detected if omitted"),
+        typer.Option(
+            "--interface",
+            "-i",
+            help="USB-Ethernet interface (e.g. en3); auto-detected if omitted",
+        ),
     ] = None,
-    tftp_root: Annotated[Optional[str], typer.Option("--tftp-root", "-r", help="Path to TFTP files directory")] = None,
-    host_ip: Annotated[str, typer.Option("--host-ip", help="Static IP to assign to the interface")] = "192.168.99.1",
+    tftp_root: Annotated[
+        Optional[str],
+        typer.Option("--tftp-root", "-r", help="Path to TFTP files directory"),
+    ] = None,
+    host_ip: Annotated[
+        str, typer.Option("--host-ip", help="Static IP to assign to the interface")
+    ] = "192.168.99.1",
     power_cycle_cmd: Annotated[
         Optional[str],
-        typer.Option("--power-cycle-cmd", help="Shell command or script path to power-cycle the target"),
+        typer.Option(
+            "--power-cycle-cmd",
+            help="Shell command or script path to power-cycle the target",
+        ),
     ] = None,
     power_serial: Annotated[
         Optional[str],
@@ -95,12 +126,16 @@ def target_set(
     if interface is None:
         candidates = _netboot.list_usb_ethernet_interfaces()
         if not candidates:
-            err.print("[red]No USB-Ethernet interfaces found.[/red] Specify one with --interface.")
+            err.print(
+                "[red]No USB-Ethernet interfaces found.[/red] Specify one with --interface."
+            )
             raise typer.Exit(1)
         active = [c for c in candidates if c["active"]]
         if len(active) == 1:
             interface = active[0]["device"]
-            console.print(f"[dim]Auto-detected interface:[/dim] {interface} ({active[0]['port']})")
+            console.print(
+                f"[dim]Auto-detected interface:[/dim] {interface} ({active[0]['port']})"
+            )
         elif len(candidates) == 1:
             interface = candidates[0]["device"]
             console.print(
@@ -108,9 +143,13 @@ def target_set(
                 "[dim](no cable detected)[/dim]"
             )
         else:
-            console.print("[yellow]Multiple USB-Ethernet interfaces found — use --interface to choose:[/yellow]")
+            console.print(
+                "[yellow]Multiple USB-Ethernet interfaces found — use --interface to choose:[/yellow]"
+            )
             for c in candidates:
-                status = "[green]active[/green]" if c["active"] else "[dim]inactive[/dim]"
+                status = (
+                    "[green]active[/green]" if c["active"] else "[dim]inactive[/dim]"
+                )
                 console.print(f"  {c['device']:6s}  {c['port']}  {status}")
             raise typer.Exit(1)
 
@@ -125,11 +164,13 @@ def target_set(
         host_ip=host_ip,
         tftp_root=tftp_root,
         power_cycle_cmd=(
-            power_cycle_cmd if power_cycle_cmd is not None
+            power_cycle_cmd
+            if power_cycle_cmd is not None
             else (existing.power_cycle_cmd if existing else None)
         ),
         power_serial_interface=(
-            power_serial if power_serial is not None
+            power_serial
+            if power_serial is not None
             else (existing.power_serial_interface if existing else None)
         ),
         serial_interfaces=existing.serial_interfaces if existing else [],
@@ -163,7 +204,9 @@ def target_show(
         except FileNotFoundError:
             err.print(f"[red]Target '{tname}' not found.[/red]")
             continue
-        t = Table(title=f"Target: {cfg.name}", show_header=False, box=None, padding=(0, 2))
+        t = Table(
+            title=f"Target: {cfg.name}", show_header=False, box=None, padding=(0, 2)
+        )
         t.add_row("interface", cfg.interface)
         t.add_row("host_ip", cfg.host_ip)
         t.add_row("tftp_root", cfg.tftp_root or "[dim]not set[/dim]")
@@ -171,7 +214,10 @@ def target_show(
         t.add_row("power_serial", cfg.power_serial_interface or "[dim]not set[/dim]")
         if cfg.serial_interfaces:
             for idx, iface in enumerate(cfg.serial_interfaces):
-                t.add_row("serial" if idx == 0 else "", f"{iface.name}: {iface.device} @ {iface.baud}")
+                t.add_row(
+                    "serial" if idx == 0 else "",
+                    f"{iface.name}: {iface.device} @ {iface.baud}",
+                )
         else:
             t.add_row("serial", "[dim]not set[/dim]")
         console.print(t)
@@ -270,8 +316,14 @@ def netboot_status(
         alive = "[green]alive[/green]" if s["netbootd_alive"] else "[red]dead[/red]"
         t.add_row("netbootd", f"pid {s['netbootd_pid']}  {alive}  (dhcp+tftp)")
     else:
-        t.add_row("dhcp", f"pid {s['dhcp_pid']}  {'[green]alive[/green]' if s['dhcp_alive'] else '[red]dead[/red]'}")
-        t.add_row("tftp-now", f"pid {s['tftp_pid']}  {'[green]alive[/green]' if s['tftp_alive'] else '[red]dead[/red]'}")
+        t.add_row(
+            "dhcp",
+            f"pid {s['dhcp_pid']}  {'[green]alive[/green]' if s['dhcp_alive'] else '[red]dead[/red]'}",
+        )
+        t.add_row(
+            "tftp-now",
+            f"pid {s['tftp_pid']}  {'[green]alive[/green]' if s['tftp_alive'] else '[red]dead[/red]'}",
+        )
     t.add_row("tftp_root", s["tftp_root"])
     t.add_row("uptime", f"{h:02d}:{m:02d}:{sec:02d}")
     console.print(t)
@@ -328,7 +380,9 @@ def _netboot_line_passes(line: str, dhcp: bool, tftp: bool, errors: bool) -> boo
         return True
     if dhcp and any(k in msg for k in ("DHCP", "dhcp")):
         return True
-    if tftp and any(k in msg for k in ("RRQ", "completed", "TFTP", "NOT FOUND", "OACK")):
+    if tftp and any(
+        k in msg for k in ("RRQ", "completed", "TFTP", "NOT FOUND", "OACK")
+    ):
         return True
     return False
 
@@ -336,12 +390,20 @@ def _netboot_line_passes(line: str, dhcp: bool, tftp: bool, errors: bool) -> boo
 @netboot_app.command("logs")
 def netboot_logs(
     target: Annotated[Optional[str], typer.Argument()] = None,
-    follow: Annotated[bool, typer.Option("--follow", "-f", help="Stream new lines as they arrive")] = False,
-    tail: Annotated[int, typer.Option("--tail", "-n", help="Number of recent lines to show")] = 100,
-    boot: Annotated[bool, typer.Option("--boot", help="Show only the current boot session")] = False,
+    follow: Annotated[
+        bool, typer.Option("--follow", "-f", help="Stream new lines as they arrive")
+    ] = False,
+    tail: Annotated[
+        int, typer.Option("--tail", "-n", help="Number of recent lines to show")
+    ] = 100,
+    boot: Annotated[
+        bool, typer.Option("--boot", help="Show only the current boot session")
+    ] = False,
     dhcp: Annotated[bool, typer.Option("--dhcp", help="Show only DHCP events")] = False,
     tftp: Annotated[bool, typer.Option("--tftp", help="Show only TFTP events")] = False,
-    errors: Annotated[bool, typer.Option("--errors", "-e", help="Show only warnings and errors")] = False,
+    errors: Annotated[
+        bool, typer.Option("--errors", "-e", help="Show only warnings and errors")
+    ] = False,
 ) -> None:
     """Show DHCP/TFTP netboot logs with color-coded DHCP and TFTP events.
 
@@ -393,9 +455,7 @@ def netboot_logs(
 def _link_state(interface: str) -> dict:
     """Read raw link state for an interface from sysfs (Linux) or ifconfig (macOS)."""
     if sys.platform == "darwin":
-        result = subprocess.run(
-            ["ifconfig", interface], capture_output=True, text=True
-        )
+        result = subprocess.run(["ifconfig", interface], capture_output=True, text=True)
         output = result.stdout
         up = "status: active" in output
         addrs = [
@@ -405,17 +465,27 @@ def _link_state(interface: str) -> dict:
         ]
         return {"up": up, "carrier": up, "addrs": addrs}
     sysfs = Path(f"/sys/class/net/{interface}")
-    operstate = (sysfs / "operstate").read_text().strip() if (sysfs / "operstate").exists() else "unknown"
+    operstate = (
+        (sysfs / "operstate").read_text().strip()
+        if (sysfs / "operstate").exists()
+        else "unknown"
+    )
     try:
         carrier = int((sysfs / "carrier").read_text().strip()) == 1
     except (OSError, ValueError):
         carrier = False
     result = subprocess.run(
         ["ip", "-brief", "addr", "show", "dev", interface],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     addrs = result.stdout.split()[2:] if result.returncode == 0 else []
-    return {"up": operstate in ("up", "unknown"), "carrier": carrier, "addrs": addrs, "operstate": operstate}
+    return {
+        "up": operstate in ("up", "unknown"),
+        "carrier": carrier,
+        "addrs": addrs,
+        "operstate": operstate,
+    }
 
 
 @netboot_app.command("link-up")
@@ -462,12 +532,97 @@ def netboot_link_status(
     console.print(t)
 
 
+# ── netif ───────────────────────────────────────────────────────────────────
+
+
+_NETIF_MODE_COLOR = {"netboot": "cyan", "ffx": "magenta", "off": "dim"}
+
+
+def _print_netif_status(cfg: _config.TargetConfig) -> None:
+    s = _netif.get_status(cfg)
+    color = _NETIF_MODE_COLOR.get(s["mode"], "white")
+    t = Table(show_header=False, box=None, padding=(0, 2))
+    t.add_row("target", cfg.name)
+    t.add_row("interface", s["interface"])
+    t.add_row("mode", f"[{color}]{s['mode']}[/{color}]")
+    t.add_row("inet", " ".join(s["inet"]) if s["inet"] else "(none)")
+    t.add_row("inet6", " ".join(s["inet6"]) if s["inet6"] else "(none)")
+    if s["mode"] == "netboot":
+        t.add_row("dhcp+tftp", f"serving on {s['host_ip']}/24")
+    if s["mode"] == "ffx":
+        for peer in s["peers"]:
+            t.add_row(
+                "peer",
+                f"{peer}%{s['interface']}  (try: ffx target add {peer}%{s['interface']})",
+            )
+        if not s["peers"]:
+            t.add_row(
+                "peer",
+                "[dim]none discovered yet — power-cycle the target and wait for SLAAC[/dim]",
+            )
+    console.print(t)
+
+
+@netif_app.command("mode")
+def netif_mode(
+    mode: Annotated[str, typer.Argument(help="netboot | ffx | off")],
+    target: Annotated[Optional[str], typer.Argument()] = None,
+    engine: Annotated[
+        str,
+        typer.Option(
+            "--engine",
+            help="Netboot engine for 'netboot' mode: 'python' (default) or 'rust'.",
+        ),
+    ] = "python",
+) -> None:
+    """Switch the link to netboot, ffx, or off.
+
+    netboot — IPv4 + DHCP + TFTP (the Pi TFTP-boots).
+    ffx     — stops netboot, adds the host IPv6 link-local (fe80::1/64); the Pi
+              boots from SD and is reachable over ffx.
+    off     — tears down both.
+
+    Each mode is idempotent and safe to re-run (re-adds the ephemeral IPv6
+    link-local if a control-host reboot cleared it)."""
+    if mode not in _netif.MODES:
+        err.print(
+            f"[red]Unknown mode '{mode}'.[/red] Use one of: {', '.join(_netif.MODES)}"
+        )
+        raise typer.Exit(1)
+    cfg = _resolve(target)
+    try:
+        if mode == "netboot":
+            _netif.mode_netboot(cfg, engine=engine)
+        elif mode == "ffx":
+            _netif.mode_ffx(cfg)
+        else:
+            _netif.mode_off(cfg)
+    except RuntimeError as exc:
+        err.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1)
+    _print_netif_status(cfg)
+
+
+@netif_app.command("status")
+def netif_status(
+    target: Annotated[Optional[str], typer.Argument()] = None,
+) -> None:
+    """Show which mode the link is in (netboot / ffx / off) and its addresses."""
+    cfg = _resolve(target)
+    _print_netif_status(cfg)
+
+
 # ── video ─────────────────────────────────────────────────────────────────────
 
 
 @video_app.command("setup")
 def video_setup(
-    device: Annotated[Optional[str], typer.Option("--device", help="Device name or substring (auto-detected if omitted)")] = None,
+    device: Annotated[
+        Optional[str],
+        typer.Option(
+            "--device", help="Device name or substring (auto-detected if omitted)"
+        ),
+    ] = None,
 ) -> None:
     """Discover and save the HDMI/USB capture device configuration."""
     if device is None:
@@ -591,8 +746,12 @@ def video_shot(
 @video_app.command("read")
 def video_read(
     stable: Annotated[bool, typer.Option("--stable")] = False,
-    fast: Annotated[bool, typer.Option("--fast", help="Lower-latency, less accurate recognition")] = False,
-    as_json: Annotated[bool, typer.Option("--json", help="Emit text with bounding boxes")] = False,
+    fast: Annotated[
+        bool, typer.Option("--fast", help="Lower-latency, less accurate recognition")
+    ] = False,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Emit text with bounding boxes")
+    ] = False,
     timeout: Annotated[int, typer.Option("--timeout")] = 2000,
 ) -> None:
     """OCR the current captured frame (Apple Vision) and print the text."""
@@ -644,7 +803,9 @@ def video_show() -> None:
     url = _video.daemon_url()
     t = Table(show_header=False, box=None, padding=(0, 2))
     t.add_row("device", cfg.device)
-    t.add_row("daemon", f"[green]running[/green] at {url}" if url else "[dim]stopped[/dim]")
+    t.add_row(
+        "daemon", f"[green]running[/green] at {url}" if url else "[dim]stopped[/dim]"
+    )
     console.print(t)
 
 
@@ -739,7 +900,10 @@ def open_dashboard(
 
 
 def _dtr_button(
-    cfg: "_config.TargetConfig", interface_name: Optional[str], duration_ms: int, label: str
+    cfg: "_config.TargetConfig",
+    interface_name: Optional[str],
+    duration_ms: int,
+    label: str,
 ) -> None:
     """Assert DTR for duration_ms ms via daemon or direct fallback. Exits on error."""
     try:
@@ -760,7 +924,9 @@ def _dtr_button(
             err.print(f"[red]{label} failed:[/red] {exc}")
             raise typer.Exit(1)
     else:
-        console.print(f"[dim]{label} ({duration_ms} ms via {iface.device} directly)[/dim]")
+        console.print(
+            f"[dim]{label} ({duration_ms} ms via {iface.device} directly)[/dim]"
+        )
         try:
             _power.dtr_direct_button_press(iface.device, duration_ms)
         except (OSError, RuntimeError) as exc:
@@ -792,7 +958,9 @@ def power_cycle(
     if result.returncode == 0:
         console.print("[green]Power cycle complete.[/green]")
     else:
-        err.print(f"[red]Power cycle script exited with code {result.returncode}.[/red]")
+        err.print(
+            f"[red]Power cycle script exited with code {result.returncode}.[/red]"
+        )
         raise typer.Exit(result.returncode)
 
 
@@ -811,7 +979,9 @@ def power_state(
 
     daemon_url = _serial.daemon_url()
     if not daemon_url:
-        err.print("[red]serialcap daemon is not running.[/red] Start it with: paniolo serial watch")
+        err.print(
+            "[red]serialcap daemon is not running.[/red] Start it with: paniolo serial watch"
+        )
         raise typer.Exit(1)
 
     state = _serial.read_power_state(daemon_url, cfg.power_serial_interface)
@@ -833,8 +1003,13 @@ def power_state(
 @serial_app.command("setup")
 def serial_setup(
     target: Annotated[Optional[str], typer.Argument()] = None,
-    name: Annotated[str, typer.Option("--name", help="Interface name (e.g. console, bmc)")] = _config.DEFAULT_SERIAL_NAME,
-    device: Annotated[Optional[str], typer.Option("--device", help="Serial device path; auto-detected if omitted")] = None,
+    name: Annotated[
+        str, typer.Option("--name", help="Interface name (e.g. console, bmc)")
+    ] = _config.DEFAULT_SERIAL_NAME,
+    device: Annotated[
+        Optional[str],
+        typer.Option("--device", help="Serial device path; auto-detected if omitted"),
+    ] = None,
     baud: Annotated[int, typer.Option("--baud", help="Baud rate")] = 115200,
     power_sense: Annotated[
         Optional[str],
@@ -876,7 +1051,10 @@ def serial_setup(
 
     if power_sense is not None and power_sense.lower() == "none":
         power_sense = None
-    elif power_sense is not None and power_sense.lower() not in _config.VALID_SENSE_SIGNALS:
+    elif (
+        power_sense is not None
+        and power_sense.lower() not in _config.VALID_SENSE_SIGNALS
+    ):
         err.print(
             f"[red]Unknown sense signal '{power_sense}'.[/red] "
             f"Valid values: {', '.join(_config.VALID_SENSE_SIGNALS)}, none"
@@ -887,13 +1065,17 @@ def serial_setup(
 
     # Preserve existing sense signal when --power-sense is not given.
     if power_sense is None:
-        existing_iface = next((i for i in cfg.serial_interfaces if i.name == name), None)
+        existing_iface = next(
+            (i for i in cfg.serial_interfaces if i.name == name), None
+        )
         sense = existing_iface.power_sense_signal if existing_iface else None
     else:
         sense = power_sense
 
     cfg.upsert_serial_interface(
-        _config.SerialInterface(name=name, device=device, baud=baud, power_sense_signal=sense)
+        _config.SerialInterface(
+            name=name, device=device, baud=baud, power_sense_signal=sense
+        )
     )
     _config.save_target(cfg)
     sense_label = f"  power_sense : {sense}" if sense else ""
@@ -921,7 +1103,9 @@ def serial_remove(
         raise typer.Exit(1)
 
 
-def _resolve_interface(cfg: "_config.TargetConfig", interface: Optional[str]) -> "_config.SerialInterface":
+def _resolve_interface(
+    cfg: "_config.TargetConfig", interface: Optional[str]
+) -> "_config.SerialInterface":
     try:
         return cfg.serial_interface(interface)
     except ValueError as exc:
@@ -932,10 +1116,16 @@ def _resolve_interface(cfg: "_config.TargetConfig", interface: Optional[str]) ->
 @serial_app.command("dtr")
 def serial_dtr(
     target: Annotated[Optional[str], typer.Argument()] = None,
-    ms: Annotated[int, typer.Option("--ms", help="Duration of the DTR pulse in milliseconds")] = 200,
+    ms: Annotated[
+        int, typer.Option("--ms", help="Duration of the DTR pulse in milliseconds")
+    ] = 200,
     interface: Annotated[
         Optional[str],
-        typer.Option("--interface", "-i", help="Serial interface name (default: power_serial_interface or the only one)"),
+        typer.Option(
+            "--interface",
+            "-i",
+            help="Serial interface name (default: power_serial_interface or the only one)",
+        ),
     ] = None,
 ) -> None:
     """Pulse the DTR line (J2 power button header) on a serial interface.
@@ -955,10 +1145,16 @@ def serial_dtr(
 @serial_app.command("reset")
 def serial_reset(
     target: Annotated[Optional[str], typer.Argument()] = None,
-    ms: Annotated[int, typer.Option("--ms", help="Press duration in milliseconds")] = 200,
+    ms: Annotated[
+        int, typer.Option("--ms", help="Press duration in milliseconds")
+    ] = 200,
     interface: Annotated[
         Optional[str],
-        typer.Option("--interface", "-i", help="Serial interface name (default: power_serial_interface or the only one)"),
+        typer.Option(
+            "--interface",
+            "-i",
+            help="Serial interface name (default: power_serial_interface or the only one)",
+        ),
     ] = None,
 ) -> None:
     """Send a soft-reset signal via a brief J2 power button press.
@@ -975,13 +1171,20 @@ def serial_reset(
 @serial_app.command("connect")
 def serial_connect(
     target: Annotated[Optional[str], typer.Argument()] = None,
-    interface: Annotated[Optional[str], typer.Option("--interface", "-i", help="Interface name (default: the only one)")] = None,
+    interface: Annotated[
+        Optional[str],
+        typer.Option(
+            "--interface", "-i", help="Interface name (default: the only one)"
+        ),
+    ] = None,
 ) -> None:
     """Open an interactive serial console to a target (via tio)."""
     cfg = _resolve(target)
     iface = _resolve_interface(cfg, interface)
     if not _serial.tio_binary():
-        err.print("[red]tio not found in PATH.[/red] Install it (e.g. brew install tio).")
+        err.print(
+            "[red]tio not found in PATH.[/red] Install it (e.g. brew install tio)."
+        )
         raise typer.Exit(1)
     cmd = _serial.connect_cmd(iface.device, iface.baud)
     os.execvp(cmd[0], cmd)
@@ -1008,12 +1211,16 @@ def serial_watch(
         return
 
     if not _serial.serialcap_binary():
-        err.print("[red]serialcap not found.[/red] Build: cargo build --release in serialcap/")
+        err.print(
+            "[red]serialcap not found.[/red] Build: cargo build --release in serialcap/"
+        )
         raise typer.Exit(1)
 
     _serial.start_daemon(cfg.serial_interfaces, port)
     names = ", ".join(i.name for i in cfg.serial_interfaces)
-    console.print(f"[dim]Starting serial daemon for[/dim] {len(cfg.serial_interfaces)} interface(s): {names}…")
+    console.print(
+        f"[dim]Starting serial daemon for[/dim] {len(cfg.serial_interfaces)} interface(s): {names}…"
+    )
 
     url = None
     for _ in range(50):
@@ -1058,14 +1265,38 @@ def serial_devices() -> None:
 
 @serial_app.command("log")
 def serial_log(
-    interface: Annotated[Optional[str], typer.Option("--interface", "-i", help="Interface name (default: the only captured one)")] = None,
-    tail: Annotated[Optional[int], typer.Option("--tail", "-n", help="Show only the most recent N lines")] = None,
-    from_seq: Annotated[Optional[int], typer.Option("--from", help="Lowest line sequence number (inclusive)")] = None,
-    to_seq: Annotated[Optional[int], typer.Option("--to", help="Highest line sequence number (inclusive)")] = None,
-    since: Annotated[Optional[int], typer.Option("--since", help="Only lines newer than this sequence number")] = None,
-    raw: Annotated[bool, typer.Option("--raw", help="Keep raw bytes (ANSI/control) instead of cleaning")] = False,
-    as_json: Annotated[bool, typer.Option("--json", help="Emit JSON Lines instead of formatted text")] = False,
-    no_pending: Annotated[bool, typer.Option("--no-pending", help="Exclude the current unterminated line")] = False,
+    interface: Annotated[
+        Optional[str],
+        typer.Option(
+            "--interface", "-i", help="Interface name (default: the only captured one)"
+        ),
+    ] = None,
+    tail: Annotated[
+        Optional[int],
+        typer.Option("--tail", "-n", help="Show only the most recent N lines"),
+    ] = None,
+    from_seq: Annotated[
+        Optional[int],
+        typer.Option("--from", help="Lowest line sequence number (inclusive)"),
+    ] = None,
+    to_seq: Annotated[
+        Optional[int],
+        typer.Option("--to", help="Highest line sequence number (inclusive)"),
+    ] = None,
+    since: Annotated[
+        Optional[int],
+        typer.Option("--since", help="Only lines newer than this sequence number"),
+    ] = None,
+    raw: Annotated[
+        bool,
+        typer.Option("--raw", help="Keep raw bytes (ANSI/control) instead of cleaning"),
+    ] = False,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Emit JSON Lines instead of formatted text")
+    ] = False,
+    no_pending: Annotated[
+        bool, typer.Option("--no-pending", help="Exclude the current unterminated line")
+    ] = False,
 ) -> None:
     """Print captured serial output, timestamped and addressable by line range.
 
@@ -1074,7 +1305,9 @@ def serial_log(
     With multiple interfaces, pass --interface to choose one."""
     binary = _serial.serialcap_binary()
     if not binary:
-        err.print("[red]serialcap not found.[/red] Build: cargo build --release in serialcap/")
+        err.print(
+            "[red]serialcap not found.[/red] Build: cargo build --release in serialcap/"
+        )
         raise typer.Exit(1)
     cmd = _serial.log_cmd(
         binary,
@@ -1099,7 +1332,9 @@ def serial_show(
     """Show the serial interfaces configured for a target, and daemon status."""
     cfg = _resolve(target)
     if not cfg.serial_interfaces:
-        console.print(f"No serial interfaces configured for '{cfg.name}'. Run: paniolo serial setup")
+        console.print(
+            f"No serial interfaces configured for '{cfg.name}'. Run: paniolo serial setup"
+        )
         return
     url = _serial.daemon_url()
     t = Table(show_header=False, box=None, padding=(0, 2))
@@ -1108,7 +1343,9 @@ def serial_show(
         if iface.power_sense_signal:
             label += f"  [dim](sense: {iface.power_sense_signal})[/dim]"
         t.add_row(iface.name, label)
-    t.add_row("daemon", f"[green]running[/green] at {url}" if url else "[dim]stopped[/dim]")
+    t.add_row(
+        "daemon", f"[green]running[/green] at {url}" if url else "[dim]stopped[/dim]"
+    )
     console.print(t)
 
 
@@ -1129,18 +1366,25 @@ def _open_rig() -> "_hid.HidRig":
 
 @hid_app.command("setup")
 def hid_setup(
-    port: Annotated[Optional[str], typer.Option("--port", help="Data CDC port; auto-suggested if omitted")] = None,
+    port: Annotated[
+        Optional[str],
+        typer.Option("--port", help="Data CDC port; auto-suggested if omitted"),
+    ] = None,
 ) -> None:
     """Detect and save the control board's data serial port."""
     if port is None:
         ports = _hid.list_serial_ports()
         if not ports:
-            err.print("[red]No USB serial ports found.[/red] Is the control board plugged in?")
+            err.print(
+                "[red]No USB serial ports found.[/red] Is the control board plugged in?"
+            )
             raise typer.Exit(1)
         if len(ports) == 1:
             port = ports[0]
         else:
-            console.print("Candidate ports (the data port is usually the higher-numbered):")
+            console.print(
+                "Candidate ports (the data port is usually the higher-numbered):"
+            )
             for p in ports:
                 console.print(f"  {p}")
             port = typer.prompt("Enter the data port", default=_hid.guess_data_port())
@@ -1161,7 +1405,9 @@ def hid_type(
 
 
 @hid_app.command("key")
-def hid_key(name: Annotated[str, typer.Argument(help="Keycode name, e.g. ENTER")]) -> None:
+def hid_key(
+    name: Annotated[str, typer.Argument(help="Keycode name, e.g. ENTER")],
+) -> None:
     """Tap a key (press + release)."""
     rig = _open_rig()
     try:
@@ -1182,7 +1428,9 @@ def hid_releaseall() -> None:
 
 @hid_app.command("combo")
 def hid_combo(
-    names: Annotated[list[str], typer.Argument(help="Keycode names, e.g. LEFT_CONTROL C")],
+    names: Annotated[
+        list[str], typer.Argument(help="Keycode names, e.g. LEFT_CONTROL C")
+    ],
 ) -> None:
     """Chord: press all keys, then release all."""
     rig = _open_rig()
@@ -1229,8 +1477,15 @@ def hid_scroll(amount: Annotated[str, typer.Argument()]) -> None:
 
 @hid_app.command("run")
 def hid_run(
-    file: Annotated[Path, typer.Argument(help="Command file (one per line; # comments; delay/sleep directives)")],
-    delay: Annotated[int, typer.Option("--delay", help="Default ms between commands")] = 0,
+    file: Annotated[
+        Path,
+        typer.Argument(
+            help="Command file (one per line; # comments; delay/sleep directives)"
+        ),
+    ],
+    delay: Annotated[
+        int, typer.Option("--delay", help="Default ms between commands")
+    ] = 0,
 ) -> None:
     """Run a sequence of commands from a file, with optional timing."""
     if not file.exists():
@@ -1255,7 +1510,9 @@ def hid_show() -> None:
     present = Path(cfg.port).exists()
     t = Table(show_header=False, box=None, padding=(0, 2))
     t.add_row("port", cfg.port)
-    t.add_row("device", "[green]present[/green]" if present else "[yellow]not found[/yellow]")
+    t.add_row(
+        "device", "[green]present[/green]" if present else "[yellow]not found[/yellow]"
+    )
     console.print(t)
 
 
@@ -1279,7 +1536,7 @@ def _ensure_linux_groups() -> bool:
     """
     _REQUIRED_GROUPS = [
         ("dialout", "serial port access (/dev/ttyUSB*, /dev/ttyACM*)"),
-        ("video",   "V4L2 capture device access (/dev/video*)"),
+        ("video", "V4L2 capture device access (/dev/video*)"),
     ]
     username = pwd.getpwuid(os.getuid()).pw_name
     changed = False
@@ -1327,7 +1584,11 @@ def setup() -> None:
             err.print("[red]Homebrew not found.[/red] Install it: https://brew.sh")
             raise typer.Exit(1)
         tftp = shutil.which("tftp-now") or next(
-            (str(p) for d in _netboot._BREW_PATHS if (p := Path(d) / "tftp-now").exists()),
+            (
+                str(p)
+                for d in _netboot._BREW_PATHS
+                if (p := Path(d) / "tftp-now").exists()
+            ),
             None,
         )
         if tftp:
@@ -1367,11 +1628,17 @@ def setup() -> None:
         for crate in ("hdmicap", "serialcap", "netbootd"):
             crate_dir = repo / crate
             if not (crate_dir / "Cargo.toml").exists():
-                console.print(f"  [yellow]…[/yellow] {crate}: source not found at {crate_dir}, skipping")
+                console.print(
+                    f"  [yellow]…[/yellow] {crate}: source not found at {crate_dir}, skipping"
+                )
                 continue
-            console.print(f"  [dim]building {crate} (cargo install — may take a few minutes)…[/dim]")
+            console.print(
+                f"  [dim]building {crate} (cargo install — may take a few minutes)…[/dim]"
+            )
             try:
-                subprocess.run([cargo, "install", "--path", str(crate_dir), "--force"], check=True)
+                subprocess.run(
+                    [cargo, "install", "--path", str(crate_dir), "--force"], check=True
+                )
                 console.print(f"  [green]✓[/green] {crate:12s} {cargo_bin / crate}")
             except subprocess.CalledProcessError:
                 err.print(f"  [red]✗[/red] {crate}: cargo install failed")
@@ -1392,8 +1659,12 @@ def setup() -> None:
                     "  [dim]…[/dim] installing netbootd-bpf-helper setuid-root "
                     "(one-time sudo; the only root component)"
                 )
-                chown = subprocess.run(["sudo", "chown", "root:wheel", str(helper)]).returncode
-                chmod = subprocess.run(["sudo", "chmod", "4755", str(helper)]).returncode
+                chown = subprocess.run(
+                    ["sudo", "chown", "root:wheel", str(helper)]
+                ).returncode
+                chmod = subprocess.run(
+                    ["sudo", "chmod", "4755", str(helper)]
+                ).returncode
                 if chown == 0 and chmod == 0:
                     console.print(
                         f"  [green]✓[/green] {'bpf-helper':12s} setuid-root  {helper}"
@@ -1433,4 +1704,6 @@ def setup() -> None:
 
     console.print("\n[green]Setup complete.[/green]")
     if cargo and str(cargo_bin) not in os.environ.get("PATH", "").split(os.pathsep):
-        console.print(f"[yellow]Note:[/yellow] add {cargo_bin} to your PATH so the daemons resolve.")
+        console.print(
+            f"[yellow]Note:[/yellow] add {cargo_bin} to your PATH so the daemons resolve."
+        )
