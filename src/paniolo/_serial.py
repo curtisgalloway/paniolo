@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Sequence
@@ -180,6 +181,39 @@ def interface_arg(name: str, device: str, baud: int, power_sense_signal: Optiona
     if power_sense_signal:
         arg += f":{power_sense_signal}"
     return arg
+
+
+def input_url(daemon_url: str, interface_name: str, pace_ms: int = 0) -> str:
+    """Build the POST /input URL for sending bytes through the running daemon.
+
+    pace_ms > 0 drips the bytes one at a time that many ms apart, the substitute
+    for hardware flow control on a slow polled console with no flow control."""
+    url = f"{daemon_url}/input?interface={interface_name}"
+    if pace_ms:
+        url += f"&pace_ms={pace_ms}"
+    return url
+
+
+def send_input(daemon_url: str, interface_name: str, data: bytes, pace_ms: int = 0) -> int:
+    """POST raw bytes to the serial port the daemon owns; return bytes written.
+
+    Input coexists with live capture — the daemon writes to the port it already
+    holds, so there's no stop/restart and output keeps flowing to `serial log`.
+
+    A paced send blocks the daemon for about len(data) * pace_ms ms, so the
+    request timeout is scaled to match (plus headroom).
+
+    Raises RuntimeError on HTTP error, OSError on network failure.
+    """
+    url = input_url(daemon_url, interface_name, pace_ms)
+    req = urllib.request.Request(url, method="POST", data=data)
+    timeout = max(15.0, len(data) * pace_ms / 1000.0 + 10.0)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"serialcap /input returned {exc.code}: {exc.reason}") from exc
+    return len(data)
 
 
 def daemon_cmd(
