@@ -139,8 +139,10 @@ serialcap/       Rust crate: serial console daemon (parallels hdmicap)
                  the `log` reader (interface select; tail / range / since,
                  ANSI-stripped by default) + UTC formatting
     server.rs    axum: GET /stream (bidirectional WebSocket), /status, /interfaces,
-                 /devices. Per-interface endpoints take ?interface=NAME, defaulting
-                 to the first configured interface
+                 /devices; POST /button (DTR pulse), /input (write bytes to port,
+                 ?pace_ms=N drips one byte per N ms for a slow polled console).
+                 Per-interface endpoints take ?interface=NAME, defaulting to the
+                 first configured interface
     daemon.rs    advisory lock, discovery file, tokio runtime, graceful shutdown;
                  spawns one supervisor per interface
 
@@ -407,6 +409,11 @@ Two paths share this module:
   `daemon_url()` reads the discovery file (see Runtime paths) and verifies the PID,
   mirroring `_video.py`. Interfaces come from the target's
   `TargetConfig.serial_interfaces`.
+- **Scripted input (`paniolo serial send`):** `send_input()` POSTs raw bytes to
+  the running daemon's `/input` endpoint (`input_url()` builds the URL); the
+  daemon writes them to the port it already owns, so input coexists with capture
+  (no stop/restart). `--pace-ms N` adds per-byte pacing for a slow polled console
+  with no flow control — the daemon's `write_paced()` drips one byte per N ms.
 
 `list_serial_devices()` returns `/dev/serial/by-path/` symlinks on Linux when
 available (stable across USB re-enumeration), falling back to raw `/dev/ttyUSB*`

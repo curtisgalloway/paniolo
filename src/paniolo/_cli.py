@@ -1168,6 +1168,61 @@ def serial_reset(
     console.print("[green]Reset signal sent.[/green]")
 
 
+@serial_app.command("send")
+def serial_send(
+    text: Annotated[str, typer.Argument(help="Text to send to the console")],
+    target: Annotated[Optional[str], typer.Option("--target", "-t")] = None,
+    interface: Annotated[
+        Optional[str],
+        typer.Option("--interface", "-i", help="Serial interface name (default: the only one)"),
+    ] = None,
+    pace_ms: Annotated[
+        int,
+        typer.Option(
+            "--pace-ms",
+            help=(
+                "Per-byte pacing in milliseconds for a slow polled console with no "
+                "flow control (e.g. 8). 0 (default) sends at full line rate."
+            ),
+        ),
+    ] = 0,
+    newline: Annotated[
+        bool,
+        typer.Option("--newline/--no-newline", help="Append a carriage return after the text"),
+    ] = True,
+) -> None:
+    """Send a line of input to a target's console through the running daemon.
+
+    The serialcap daemon owns the port and keeps capturing, so input coexists
+    with `serial log` / the dashboard — no stop/restart and no exclusive re-open.
+    Requires the daemon to be running (paniolo serial watch).
+
+    Use --pace-ms on a slow polled console that drops characters at full rate;
+    it drips the bytes out one at a time the given number of ms apart."""
+    cfg = _resolve(target)
+    iface = _resolve_interface(cfg, interface)
+
+    daemon_url = _serial.daemon_url()
+    if not daemon_url:
+        err.print(
+            "[red]serialcap daemon is not running.[/red] Start it with: paniolo serial watch"
+        )
+        raise typer.Exit(1)
+
+    payload = text.encode() + (b"\r" if newline else b"")
+    pace_note = f" paced {pace_ms} ms/byte" if pace_ms else ""
+    console.print(f"[dim]Sending {len(payload)} bytes to '{iface.name}'{pace_note}[/dim]")
+    try:
+        _serial.send_input(daemon_url, iface.name, payload, pace_ms)
+    except OSError as exc:
+        err.print(f"[red]Could not reach serialcap daemon:[/red] {exc}")
+        raise typer.Exit(1)
+    except RuntimeError as exc:
+        err.print(f"[red]Send failed:[/red] {exc}")
+        raise typer.Exit(1)
+    console.print("[green]Sent.[/green]")
+
+
 @serial_app.command("connect")
 def serial_connect(
     target: Annotated[Optional[str], typer.Argument()] = None,

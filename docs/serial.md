@@ -104,6 +104,58 @@ Each interface writes to its own capture directory so logs never conflate:
 
 ---
 
+## Sending input
+
+`paniolo serial send` injects a line of input through the **running daemon**, so
+scripted input coexists with capture — no `serial stop`, no exclusive re-open,
+and output keeps flowing to `serial log` and the dashboard. (Contrast
+`serial connect`, which holds the port exclusively and can't run alongside the
+daemon.) The daemon must be running (`paniolo serial watch`).
+
+```bash
+# Send a command (a carriage return is appended by default)
+paniolo serial send -i console "iochk --live-dangerously /block/000" [target-machine]
+
+# Send without the trailing carriage return
+paniolo serial send -i console --no-newline "partial" [target-machine]
+```
+
+### Pacing a slow console (`--pace-ms`)
+
+A target whose console is **polled** (the CPU only reads the UART RX register when
+its loop comes around) with **no hardware flow control** will silently drop input
+characters: bytes arrive at the full line rate, the RX FIFO overflows while the
+CPU is busy, and the lost bytes are gone. This is common during early bring-up
+(e.g. a Zircon polled console).
+
+`--pace-ms` is the substitute for the missing flow control: the daemon drips the
+bytes out one at a time, that many milliseconds apart, so each byte is consumed
+before the next arrives. ~8 ms/byte is a known-good value for a 115200-baud
+polled console.
+
+```bash
+# Drip one byte every 8 ms — slow but overflow-proof
+paniolo serial send -i console --pace-ms 8 "iochk --live-dangerously /block/000"
+```
+
+A paced send of N bytes takes about `N * pace_ms` ms and blocks until the whole
+line is written. With `--pace-ms 0` (the default) the line is sent at full rate,
+which is fine for an interrupt-driven console or one with flow control wired.
+
+> **Why not RTS/CTS or XON/XOFF instead?** Hardware RTS/CTS *is* the proper fix,
+> but it needs the target's UART to enable auto-flow-control and the right pins
+> wired (the Pi 5 debug header is TX/RX/GND only — no flow-control pins), so it
+> can't be relied on during bring-up. Software flow control (XON/XOFF) is worse:
+> emitting XOFF needs the same CPU attention the polled console isn't giving the
+> UART, so it can't react in time, and it corrupts binary streams. Pacing depends
+> on nothing from the target, so it's the universal floor. RTS/CTS may be layered
+> in later as a per-interface opt-in for well-behaved consoles.
+
+Under the hood this is `POST /input?interface=NAME[&pace_ms=N]` on the daemon,
+with the raw bytes as the request body (see HTTP API below).
+
+---
+
 ## Integration with the video dashboard
 
 `paniolo console` opens the combined hdmicap dashboard in a browser. That page
@@ -155,3 +207,24 @@ a full command reference.
 | serialcap advisory lock | `$TMPDIR/serialcap/daemon.lock` |
 | Capture log (per interface) | `$TMPDIR/serialcap/capture/<name>/serial.jsonl(.1..)` |
 | Pending (unterminated) line | `$TMPDIR/serialcap/capture/<name>/pending.json` |
+
+---
+
+## HTTP API (serialcap daemon)
+
+All per-interface endpoints take `?interface=NAME`, defaulting to the first
+configured interface. Responses carry a permissive CORS header.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/stream` | Bidirectional WebSocket: serial output (binary) + client keystrokes |
+| GET | `/status` | One interface (`?interface=`) or all; `{name, device, baud, connected, power_on}` |
+| GET | `/interfaces` | All interfaces and their status |
+| GET | `/devices` | Serial devices on the host |
+| POST | `/button` | Pulse DTR for `?ms=N` (J2 power button); see [power.md](power.md) |
+| POST | `/input` | Write the request body to the port; `?pace_ms=N` drips one byte per N ms |
+
+`POST /input` writes through the port the daemon already owns, so input coexists
+with live capture. A paced write (`pace_ms > 0`) blocks until the whole body is
+sent (~`len × pace_ms` ms). Returns 200 on success, 404 for an unknown interface,
+503 if the supervisor isn't running.

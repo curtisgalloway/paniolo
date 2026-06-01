@@ -35,6 +35,24 @@ def test_log_cmd_interface():
     ]
 
 
+def test_input_url_no_pace():
+    assert (
+        _serial.input_url("http://127.0.0.1:8724", "console")
+        == "http://127.0.0.1:8724/input?interface=console"
+    )
+
+
+def test_input_url_with_pace():
+    assert (
+        _serial.input_url("http://127.0.0.1:8724", "console", pace_ms=8)
+        == "http://127.0.0.1:8724/input?interface=console&pace_ms=8"
+    )
+
+
+def test_input_url_zero_pace_omitted():
+    assert "pace_ms" not in _serial.input_url("http://x", "bmc", pace_ms=0)
+
+
 def test_interface_arg():
     assert _serial.interface_arg("console", "/dev/ttyUSB0", 115200) == "console=/dev/ttyUSB0@115200"
 
