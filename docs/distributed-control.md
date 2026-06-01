@@ -1,9 +1,12 @@
 # Distributed control: one lab, one file
 
-> **Status: design, not yet implemented** (sketched 2026-06-01). This captures a
-> design converged on in discussion; it is the durable record of *what* and
-> *why*, to be implemented incrementally. Nothing here ships until built and
-> tracked. Compare [related work: paniolo vs. labgrid](ci-integration/related-work.md),
+> **Status: Phases 0–3 implemented** (PR #20, 2026-06-01); the rest is still
+> design. Shipped: the SSH transport, the one-file lab model (`--lab` /
+> `PANIOLO_LAB`), transparent re-exec of one-shot commands on a target's host,
+> and a tunnelled `console` for a remote target. Still design-only:
+> discovery-assisted `configure`, multi-host targets, `console --detach`, and
+> multi-user locking (see the [implementation plan](distributed-control-plan.md)
+> for the phasing). Compare [related work: paniolo vs. labgrid](ci-integration/related-work.md),
 > whose distributed model directly informs this.
 
 ## The problem
@@ -79,8 +82,9 @@ reproduces today's single-host behavior exactly.
 
 [hosts.bench1]
 ssh = "curtisg@bench1.local"      # ssh destination; the only required field
-# identity = "~/.ssh/id_lab"      # optional explicit key
+# identity = "~/.ssh/id_lab"      # optional key; set it to avoid agent key-spray (below)
 # control_path = "~/.ssh/cm-%h"   # optional ControlMaster socket (see Transport)
+# paniolo_cmd = "/Users/me/.local/bin/paniolo"  # if paniolo isn't on the host's ssh PATH
 
 [hosts.bench2]
 ssh = "curtisg@bench2.local"
@@ -142,6 +146,17 @@ SSH handshake. The host's `control_path` in the lab file names the master socket
 **Interactive `serial connect`** (tio) needs **no tunnel** — `ssh -t bench1
 paniolo serial connect fortune` runs tio straight over SSH's own PTY. The tunnel
 machinery is only for the browser dashboard, not the terminal CLI.
+
+**Two operational notes** (learned while implementing this):
+
+- **`paniolo` must be reachable on the host.** Re-exec runs `paniolo …` over a
+  *non-interactive* ssh, whose PATH often omits `~/.local/bin`. If bare `paniolo`
+  doesn't resolve there, set the host's `paniolo_cmd` to an absolute path.
+- **Set `identity` to avoid ssh-agent key-spray.** An agent offering many keys
+  (e.g. 1Password) can trip the host's `MaxAuthTries` *before* the right key on
+  the first connect. A per-host `identity` makes paniolo pass
+  `-i <key> -o IdentitiesOnly=yes`, offering exactly one. (This is the user's ssh
+  setup, not something paniolo can fix for them — but the lab field is the lever.)
 
 ### The dashboard, and why multi-host rules out a reverse-proxy
 
