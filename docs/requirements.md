@@ -39,6 +39,11 @@
 | CORE-4 | Rust daemons (`hdmicap`, `serialcap`) + Swift `visionocr` helper build & install | M | ☑ | `paniolo setup` |
 | CORE-5 | Predictable runtime paths (configs, daemon discovery, capture logs) | M | ☑ | README "Runtime paths" |
 | CORE-6 | Agent-oriented guidance kept current (`AGENTS.md`) as the surface changes | M | ◐ | Must track power/serial changes in §9 |
+| CORE-7 | One-file **lab** model (`--lab`/`PANIOLO_LAB`): hosts + targets, per-resource host binding; legacy targets dir as fallback | S | ☑ | `_lab.py`; [distributed-control](distributed-control.md) |
+| CORE-8 | Transparent re-exec of host-operating commands on a target's **remote control host** over SSH | S | ☑ | `_remote.py`, `@remote_capable`; `_ssh.py` transport |
+| CORE-9 | Tunnelled `console` for a remote target (dashboard reachable locally) | S | ☑ | `_cli._remote_console`; `?serialws=` stitch |
+| CORE-10 | Multi-host targets (one target spanning control hosts) | C | ☐ | schema ready (per-resource host); single-host enforced for now |
+| CORE-11 | Remote `setup --host` + discovery-assisted `configure` (Phases 4–5) | C | ☐ | [plan](distributed-control-plan.md) |
 
 ## 2. Netboot / deploy
 

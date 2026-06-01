@@ -184,18 +184,56 @@ adapter wired to the Pi J2 header. A ≤500 ms pulse is a soft button event; ≥
 is a hard PMIC power-off. Set the default interface with
 `paniolo target set <name> --power-serial console`.
 
-## Driving it remotely over SSH
+## Targets on a remote control host (a "lab")
 
-The control host runs paniolo; you can operate it from anywhere:
+When the machine wired to the target isn't the one you're running paniolo on,
+describe your **lab** in one git-tracked TOML file and point paniolo at it with
+`--lab <file>` or `PANIOLO_LAB`. Each target's `host` names a control host;
+commands then run **transparently on that host over SSH** — you don't ssh by hand.
+
+```toml
+# mylab.toml
+[hosts.bench1]
+ssh = "curtisg@bench1.local"     # ssh destination ("local" = this machine)
+# identity = "~/.ssh/lab_key"    # set this if your ssh-agent offers many keys
+#                                  (avoids "Too many authentication failures")
+# paniolo_cmd = "/Users/curtisg/.local/bin/paniolo"  # if paniolo isn't on the
+#                                  host's non-interactive ssh PATH
+
+[targets.fortune]
+host = "bench1"
+
+[targets.fortune.netboot]
+interface = "enx00e04c08d9a0"
+tftp_root = "/home/curtisg/tftp/fortune"
+
+[[targets.fortune.serial]]
+name = "console"
+device = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG00W7NY-if00-port0"
+
+[targets.fortune.power]
+cycle_cmd = "/home/curtisg/scripts/power-cycle.sh"
+```
 
 ```
-ssh control "paniolo netboot start fortune"
-TFTP=$(ssh control "paniolo netboot tftp-root fortune")
-scp kernel.img control:"$TFTP/kernel_2712.img"
-ssh control "paniolo netboot logs -f fortune"
-ssh control "paniolo power-cycle fortune"
-ssh control "paniolo netboot stop fortune"
+export PANIOLO_LAB=~/labs/mylab.toml
+paniolo netboot start fortune      # runs on bench1, transparently
+paniolo power-cycle fortune
+paniolo netboot logs -f fortune    # streams back live
+paniolo serial connect fortune     # interactive tio over ssh -t
+paniolo console fortune            # dashboard tunnelled to your browser; Ctrl-C to close
 ```
+
+Notes:
+- With **no** `--lab`/`PANIOLO_LAB`, paniolo uses the legacy per-target files
+  (`paniolo target set …`) and everything runs locally — unchanged.
+- The lab file is **hand-edited** (it's your source of truth, in git). Config
+  authoring commands (`target set/show/clear`, `serial setup/remove`) still
+  operate on the local legacy config, not the lab, for now.
+- A target may currently live on only **one** host (multi-host targets are
+  designed-for but not yet supported).
+- Still over plain SSH if you prefer: `ssh bench1 "paniolo …"` works too, but the
+  lab makes location transparent.
 
 ## Quick reference — gotchas
 
@@ -205,6 +243,9 @@ ssh control "paniolo netboot stop fortune"
 - Netboot requires passwordless `sudo` (`ip` on Linux, `ifconfig` on macOS).
 - netboot and ffx are mutually exclusive on the link — use `paniolo netif mode`
   to switch; entering ffx mode stops netboot so a power-cycle boots from SD.
+- Remote (lab) targets: if ssh fails with "Too many authentication failures",
+  set the host's `identity` (agent key-spray); if the remote can't find paniolo,
+  set its `paniolo_cmd` to an absolute path.
 - OCR is strongest on large text; tiny console fonts may misread some characters.
 
 ---

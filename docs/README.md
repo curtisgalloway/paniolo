@@ -24,11 +24,12 @@ and power-cycle it without a person at the bench each iteration. See the root
 | [Dashboard](dashboard.md) | `paniolo console` | Combined video + serial web UI. |
 | [HID injection](hid.md) | `paniolo hid` | USB keyboard/mouse injection via the KB2040 rig. |
 
-## Distributed control (in design)
+## Distributed control (Phases 0–3 shipped)
 
 | Doc | What it covers |
 |---|---|
-| [Distributed control: one lab, one file](distributed-control.md) | Abstracting away control-host location: a single git-tracked lab file describing hosts + targets, SSH-tunnelled transport with the dev machine as the data-plane hub, per-resource host binding (multi-host-ready), and a discovery-proposes/human-approves config flow. |
+| [Distributed control: one lab, one file](distributed-control.md) | Driving targets on remote control hosts: a single git-tracked lab file describing hosts + targets, SSH transport with the dev machine as the data-plane hub, per-resource host binding (multi-host-ready), and a discovery-proposes/human-approves config flow. Shipped: `--lab`, transparent re-exec, tunnelled `console`. |
+| [Implementation plan](distributed-control-plan.md) | Phased build sequence — Phases 0–3 shipped (SSH transport, lab model, re-exec, console); Phases 4–5 (remote `setup`, discovery-assisted `configure`) and multi-host pending. |
 
 ## Hardware-CI integration (in design)
 

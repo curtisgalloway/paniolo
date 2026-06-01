@@ -95,8 +95,12 @@ of option A is no longer sufficient.
 src/paniolo/
   _cli.py       typer CLI — subcommand groups: target, netboot, netif, video, serial, hid
                             top-level commands: console, power-cycle, power-state, setup
+                            global --lab option; @remote_capable dispatches to remote hosts
   _config.py    TargetConfig CRUD (+ named SerialInterface list) (~/.config/paniolo/targets/<name>.toml)
   _state.py     daemon state files (~/.local/share/paniolo/<target>/)
+  _lab.py       one-file lab model (--lab/PANIOLO_LAB): hosts + targets, per-resource host binding
+  _ssh.py       SSH transport for remote control hosts (ControlMaster, run/forward/read)
+  _remote.py    transparent re-exec of a command on a target's remote host (config slice + ssh)
   _netboot.py   pure-Python DHCP + TFTP subprocess management (_dhcp.py, _tftp.py)
   _netif.py     netboot↔ffx link-mode switch (atomic netboot teardown + IPv6 LL setup)
   _dhcp.py      pure-Python DHCP server (run as `python -m paniolo._dhcp`)
@@ -264,6 +268,54 @@ both children are alive *and* their cmdlines contain `paniolo._dhcp` /
 `is_pid_alive(pid)` uses `os.kill(pid, 0)`: returns `True` if the process
 exists; catches `ProcessLookupError` (dead) and `PermissionError` (exists but
 owned by another user — treat as alive).
+
+## Distributed control (`_lab.py`, `_ssh.py`, `_remote.py`)
+
+Lets a single command on the dev machine drive a target wired to a **remote
+control host**, transparently. Design + rationale: [`docs/distributed-control.md`](docs/distributed-control.md);
+phasing/status: [`docs/distributed-control-plan.md`](docs/distributed-control-plan.md).
+Phases 0–3 are shipped (one-shot re-exec + tunnelled `console`); multi-host
+targets, `console --detach`, `setup --host`, and discovery-assisted `configure`
+are still design-only.
+
+**`_lab.py`** parses the one-file lab (pointed at by the global `--lab` option /
+`PANIOLO_LAB`): `[hosts.*]` (each → an `_ssh.Host`) and `[targets.*]` with nested
+`[netboot]`, `[[serial]]`, `[power]`. Host binding lives **per resource**
+(inheriting a target-level `host`, defaulting to `local`), so the schema is
+multi-host-ready; `Lab.resolve_target` flattens a target to the existing flat
+`TargetConfig` **plus one `Host`** and rejects targets whose resources span more
+than one host (not yet supported). With no lab configured, paniolo falls back to
+the legacy `~/.config/paniolo/targets/*.toml` (host = `local`) — byte-for-byte the
+old behavior.
+
+**`_ssh.py`** is the whole transport — no agent/daemon. A `Host` (ssh dest +
+optional `identity` / `control_path` / `paniolo_cmd`) drives a per-host
+**ControlMaster** connection (`ControlPersist=300`), so only the first call to a
+host pays the handshake (and, with an ssh-agent like 1Password, only the first
+triggers one confirmation per window). Provides `run` (captured),
+`run_passthrough` (inherit stdio, for re-exec), `run_interactive` (`ssh -t`, for
+tio), `forward` (an `ssh -L` tunnel context manager — **non-multiplexed**, so the
+process owns and can tear down the tunnel), and `read_remote_file`. Two
+host-config levers matter operationally: `paniolo_cmd` (pin paniolo's path when
+it isn't on the host's non-interactive ssh PATH) and `identity` (offer one key,
+avoiding agent key-spray that trips `MaxAuthTries`). `_control_dir` keeps the
+socket path short (XDG_RUNTIME_DIR or `/tmp`, not the long macOS `$TMPDIR`) to
+stay under the ~104-char Unix-socket limit.
+
+**`_remote.py`** + the **`@remote_capable`** decorator in `_cli.py` are the
+re-exec mechanism. The decorator wraps a target command, resolves its host via
+`_resolve_with_host`, and — if remote — ships the resolved `TargetConfig` to the
+host as a temp file, re-execs the (lab-stripped) `paniolo …` there with
+`PANIOLO_TARGET_CONFIG` pointed at the slice, passes stdio + exit code through,
+and cleans up. The remote, seeing `PANIOLO_TARGET_CONFIG`, runs against the slice
+locally (host = local), so it never re-dispatches. Applied to host-operating
+one-shot commands (netboot \*, netif \*, power-cycle/state, serial
+dtr/reset/watch/show) and `serial connect` (interactive). **Not** applied to
+config-authoring commands (serial setup/remove, target \*) — they'd write to the
+stateless remote — nor to host-global commands without a target (serial log,
+video shot). Remote `console` (`_cli._remote_console`) starts both daemons on the
+host, forwards their discovery ports, and opens the dashboard at the forwarded
+video port with the terminal aimed at the forwarded serial port via `?serialws=`.
 
 ## _netboot.py
 
