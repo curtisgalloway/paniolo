@@ -38,12 +38,12 @@ This skill contains the following reference files:
 
 ## Statistics
 
-94 files | 20,536 lines
+94 files | 20,554 lines
 
 | Language | Files | Lines |
 |----------|------:|------:|
 | Python | 25 | 7,085 |
-| Markdown | 23 | 4,330 |
+| Markdown | 23 | 4,348 |
 | Rust | 22 | 7,523 |
 | No Extension | 10 | 397 |
 | TOML | 5 | 261 |

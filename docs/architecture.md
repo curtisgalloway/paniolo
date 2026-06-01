@@ -39,8 +39,12 @@ produce verdicts — when integrated with hardware-CI ecosystems those concerns 
 ```
 
 - The **control host** is physically wired to one or more **targets** and runs paniolo.
-- The intended driver is an **agent or script that SSHes into the control host** and runs
-  `paniolo …` commands (see the remote-control pattern in the root [`README.md`](../README.md)).
+- The simplest driver is an **agent or script that SSHes into the control host** and runs
+  `paniolo …` commands (the remote-control pattern in the root [`README.md`](../README.md)).
+- **Or point paniolo at a [lab file](distributed-control.md)** (`--lab` / `PANIOLO_LAB`): the dev
+  machine then drives a target on its control host *transparently* — commands re-exec over SSH and
+  `console` tunnels the dashboard back — so you don't SSH by hand. The dev machine is the data-plane
+  hub; control hosts hold only runtime state. See §5 "Distributed control".
 - Runs on **macOS 10.14+** and **Linux** (x86-64/arm64). Platform differences are isolated to a
   handful of spots (§8).
 
@@ -170,6 +174,18 @@ optional `pyserial` extra.
 ### Dashboard ([`dashboard.md`](dashboard.md))
 `paniolo console` opens hdmicap's `GET /` — a two-pane web UI (live video on top, xterm.js
 terminal(s) below). See §7 for how the two daemons connect.
+
+### Distributed control ([`distributed-control.md`](distributed-control.md))
+Drives targets on **remote control hosts** from the dev machine, over SSH only — no agent or
+coordinator daemon. A single git-tracked **lab file** (`--lab` / `PANIOLO_LAB`) names the hosts and
+binds each target's resources to one (`_lab.py`); `_ssh.py` is the transport (per-host ControlMaster,
+`run`/`forward`/`run_interactive`). One-shot commands **re-exec** on the target's host
+(`@remote_capable` ships the config slice via `PANIOLO_TARGET_CONFIG`, `_remote.py`); `console`
+**tunnels** both daemon ports back and stitches them with the dashboard's `?serialws=` override.
+`setup --host` provisions a host; `discover`/`configure` propose a lab block from discovered
+hardware for the human to review and commit. With no lab, everything runs locally exactly as before.
+Shipped Phases 0–5; multi-host targets, `console --detach`, and locking remain design-only (see
+[`distributed-control-plan.md`](distributed-control-plan.md)).
 
 ## 6. Representative data flows
 
