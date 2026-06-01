@@ -182,9 +182,17 @@ def test_forward_reaches_a_local_listener(host):
     remote_port = server.getsockname()[1]
 
     def serve():
-        conn, _ = server.accept()
-        conn.sendall(b"BANNER-OK")
-        conn.close()
+        # Accept repeatedly: forward()'s readiness probe opens (and drops) a
+        # connection through the tunnel before the test's real one, so a
+        # single-accept server would be consumed by the probe. Real daemons
+        # serve many connections, so this matches production behaviour.
+        while True:
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            conn.sendall(b"BANNER-OK")
+            conn.close()
 
     t = threading.Thread(target=serve, daemon=True)
     t.start()
