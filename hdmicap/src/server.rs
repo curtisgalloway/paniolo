@@ -32,8 +32,6 @@ use image::codecs::jpeg::JpegEncoder;
 use image::{ImageBuffer, ImageEncoder, Rgb};
 use serde::Deserialize;
 use tokio::sync::watch;
-#[cfg(target_os = "linux")]
-use turbojpeg;
 
 use crate::capture_thread::FrameRx;
 use crate::frame::{FrameState, Signal, StatusDto};
