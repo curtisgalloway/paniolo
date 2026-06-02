@@ -174,7 +174,7 @@ def run(
     """
     full = _base_args(host) + [host.ssh, _remote_command(argv, env)]
     return subprocess.run(
-        full, input=stdin, capture_output=True, text=True, timeout=timeout
+        full, input=stdin, capture_output=True, text=True, timeout=timeout, check=False
     )
 
 
@@ -188,7 +188,7 @@ def run_passthrough(
     stderr *are* the local ones. Returns the exit code.
     """
     full = _base_args(host) + [host.ssh, _remote_command(argv, env)]
-    return subprocess.run(full).returncode
+    return subprocess.run(full, check=False).returncode
 
 
 def run_interactive(
@@ -201,7 +201,7 @@ def run_interactive(
     """
     full = _base_args(host, interactive=True)
     full += ["-t", host.ssh, _remote_command(argv, env)]
-    return subprocess.run(full).returncode
+    return subprocess.run(full, check=False).returncode
 
 
 def read_remote_file(host: Host, path: str) -> Optional[str]:
@@ -278,4 +278,5 @@ def close_master(host: Host) -> None:
         _base_args(host) + ["-O", "exit", host.ssh],
         capture_output=True,
         text=True,
+        check=False,
     )

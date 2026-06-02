@@ -12,18 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Power control helpers: FTDI DTR line via the serialcap daemon or pyserial fallback."""
+"""Power control helpers: FTDI DTR line via the serialcap daemon or pyserial fallback."""  # pylint: disable=line-too-long
 
 from __future__ import annotations
 
 import time
 import urllib.error
 import urllib.request
-from typing import Optional
 
 
 def dtr_button_press(daemon_url: str, interface_name: str, duration_ms: int) -> None:
-    """Assert DTR (J2 power button) for duration_ms milliseconds via the serialcap daemon.
+    """Assert DTR (J2 power button) for duration_ms ms via the serialcap daemon.
 
     The daemon owns the serial port exclusively and drives the DTR line on its
     supervisor task.  This call blocks until the press completes.
@@ -37,10 +36,14 @@ def dtr_button_press(daemon_url: str, interface_name: str, duration_ms: int) -> 
     url = f"{daemon_url}/button?interface={interface_name}&ms={duration_ms}"
     req = urllib.request.Request(url, method="POST", data=b"")
     try:
-        with urllib.request.urlopen(req, timeout=max(15, duration_ms // 1000 + 5)) as resp:
+        with urllib.request.urlopen(
+            req, timeout=max(15, duration_ms // 1000 + 5)
+        ) as resp:
             resp.read()
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"serialcap /button returned {exc.code}: {exc.reason}") from exc
+        raise RuntimeError(
+            f"serialcap /button returned {exc.code}: {exc.reason}"
+        ) from exc
 
 
 def dtr_direct_button_press(device: str, duration_ms: int) -> None:
@@ -52,7 +55,7 @@ def dtr_direct_button_press(device: str, duration_ms: int) -> None:
     Raises RuntimeError if pyserial is not installed or on serial errors.
     """
     try:
-        import serial as _serial
+        import serial as _serial  # pylint: disable=import-outside-toplevel
     except ImportError as exc:
         raise RuntimeError(
             "pyserial is required for direct DTR control. "
@@ -65,7 +68,7 @@ def dtr_direct_button_press(device: str, duration_ms: int) -> None:
     port.open()
     try:
         port.dtr = False
-        time.sleep(0.05)   # brief settle after open
+        time.sleep(0.05)  # brief settle after open
         port.dtr = True
         time.sleep(duration_ms / 1000.0)
         port.dtr = False

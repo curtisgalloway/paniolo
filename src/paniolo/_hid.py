@@ -28,7 +28,6 @@ import glob
 import sys
 import time
 import tomllib
-from pathlib import Path
 from typing import Callable, Optional
 
 from . import _config
@@ -115,7 +114,7 @@ class HidRig:
             self._transport = transport
             return
         try:
-            import serial  # lazy: only the live path needs pyserial
+            import serial  # pylint: disable=import-outside-toplevel
         except ImportError as exc:
             raise RuntimeError(
                 "pyserial not installed — install the hid extra: "
@@ -177,6 +176,7 @@ class HidRig:
 
 # --- Host-side sequencing / timing (the board firmware stays dumb) ----------
 
+
 def parse_sequence(text: str) -> list[tuple[str, object]]:
     """Parse a command file into steps.
 
@@ -194,13 +194,13 @@ def parse_sequence(text: str) -> list[tuple[str, object]]:
         if low == "delay":
             try:
                 steps.append(("delay", float(rest) / 1000.0))
-            except ValueError:
-                raise ValueError(f"invalid delay value: {rest!r}")
+            except ValueError as exc:
+                raise ValueError(f"invalid delay value: {rest!r}") from exc
         elif low == "sleep":
             try:
                 steps.append(("delay", float(rest)))
-            except ValueError:
-                raise ValueError(f"invalid sleep value: {rest!r}")
+            except ValueError as exc:
+                raise ValueError(f"invalid sleep value: {rest!r}") from exc
         else:
             steps.append(("cmd", line))
     return steps

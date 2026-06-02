@@ -142,15 +142,17 @@ def _set_arp(ip: str, mac: str, interface: str | None = None) -> None:
     """
     if sys.platform == "darwin":
         r = subprocess.run(
-            ["sudo", "arp", "-s", ip, mac], capture_output=True, text=True
+            ["sudo", "arp", "-s", ip, mac], capture_output=True, text=True, check=False
         )
         if r.returncode != 0:
-            log.warning("arp -s %s %s failed: %s", ip, mac, r.stderr.strip() or r.stdout.strip())
+            log.warning(
+                "arp -s %s %s failed: %s", ip, mac, r.stderr.strip() or r.stdout.strip()
+            )
     else:
         cmd = ["sudo", "ip", "neigh", "replace", ip, "lladdr", mac, "nud", "permanent"]
         if interface:
             cmd += ["dev", interface]
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if r.returncode != 0:
             log.warning(
                 "ip neigh replace %s lladdr %s failed: %s", ip, mac, r.stderr.strip()
@@ -200,7 +202,11 @@ def _is_link_up(interface: str) -> bool:
             return False
     else:
         try:
-            carrier = Path(f"/sys/class/net/{interface}/carrier").read_text().strip()
+            carrier = (
+                Path(f"/sys/class/net/{interface}/carrier")
+                .read_text(encoding="utf-8")
+                .strip()
+            )
             return carrier == "1"
         except OSError:
             return False
@@ -223,7 +229,15 @@ def _monitor_interface(interface: str, host_ip: str) -> None:
         if not has_ip and is_active:
             if sys.platform == "darwin":
                 subprocess.run(
-                    ["sudo", "ifconfig", interface, host_ip, "netmask", "255.255.255.0", "up"],
+                    [
+                        "sudo",
+                        "ifconfig",
+                        interface,
+                        host_ip,
+                        "netmask",
+                        "255.255.255.0",
+                        "up",
+                    ],
                     check=False,
                 )
             else:
@@ -274,7 +288,7 @@ def serve(
 
     while True:
         try:
-            data, _addr = sock.recvfrom(4096)
+            data, _ = sock.recvfrom(4096)
         except OSError as exc:
             log.error("recvfrom: %s", exc)
             continue
@@ -298,7 +312,9 @@ def serve(
         if msg_type_val == _DHCP_DISCOVER:
             log.info("DHCPDISCOVER from %s", mac)
             _set_arp(_ASSIGNED_IP, mac, interface)
-            reply = _build_reply(xid, chaddr, _DHCP_OFFER, host_ip, _ASSIGNED_IP, boot_file)
+            reply = _build_reply(
+                xid, chaddr, _DHCP_OFFER, host_ip, _ASSIGNED_IP, boot_file
+            )
             sock.sendto(reply, (bcast, 68))
             log.info(
                 "DHCPOFFER → %s  ip=%s  tftp=%s  file=%s",
@@ -311,7 +327,9 @@ def serve(
         elif msg_type_val == _DHCP_REQUEST:
             log.info("DHCPREQUEST from %s", mac)
             _set_arp(_ASSIGNED_IP, mac, interface)
-            reply = _build_reply(xid, chaddr, _DHCP_ACK, host_ip, _ASSIGNED_IP, boot_file)
+            reply = _build_reply(
+                xid, chaddr, _DHCP_ACK, host_ip, _ASSIGNED_IP, boot_file
+            )
             sock.sendto(reply, (bcast, 68))
             log.info("DHCPACK → %s  ip=%s", mac, _ASSIGNED_IP)
 
@@ -325,7 +343,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Paniolo minimal DHCP server")
     parser.add_argument("host_ip", help="Interface IP (also advertised as TFTP server)")
     parser.add_argument("--boot-file", default="kernel_2712.img")
-    parser.add_argument("--interface", help="Interface device name (e.g. en11) for IP monitoring")
+    parser.add_argument(
+        "--interface", help="Interface device name (e.g. en11) for IP monitoring"
+    )
     args = parser.parse_args()
     serve(args.host_ip, args.boot_file, args.interface)
 

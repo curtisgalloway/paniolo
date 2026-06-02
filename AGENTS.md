@@ -110,10 +110,12 @@ src/paniolo/
   _video.py     VideoConfig, hdmicap device discovery, daemon start/stop/URL helpers
   _serial.py    serial helpers: tio (interactive) + serialcap daemon start/stop/URL
   _ocr.py       OCR tool discovery + read_text(): visionocr (macOS) or linuxocr (Linux)
+  _paths.py     repo_root(): locates the source checkout (via __file__ or cwd) so
+                `paniolo setup` can build the native components from source
   _hid.py       HID rig client: text commands over serial, scaling + sequencing
   _power.py     DTR button-press helpers: dtr_button_press() (via serialcap daemon), dtr_direct_button_press() (pyserial fallback)
 
-tests/           pytest suite (host-side; no hardware) — currently test_hid.py
+tests/           pytest suite (host-side; no hardware) — one test_<module>.py per module
 
 hdmicap/         Rust crate: warm-stream HDMI capture daemon
   src/
@@ -693,6 +695,16 @@ native side. Re-run it after editing anything. Narrower targets: `make python`,
 - **No new dependencies without discussion.** Core dep: `typer` only; stdlib for
   everything else (`urllib.request`, `tomllib`, `subprocess`). `pyserial` is an
   optional extra (`[hid]`), lazy-imported, used only by `paniolo hid`. Dev: `pytest`.
+- **Python is formatted with `pyink` and linted with `pylint`, both at
+  line-length 88.** `pyproject.toml` pins `[tool.pyink] line-length = 88`; pylint
+  uses the Google style rcfile (`~/.config/pylintrc`, `max-line-length=88`). Keep
+  `uvx pyink src tests` and `uvx pylint src tests` clean. Single quotes nested in
+  double-quoted f-strings are required on the 3.11 floor, so `inconsistent-quotes`
+  is disabled per-file where that pattern appears (not worked around).
+- **`paniolo setup` builds the native components from the source tree**, so it
+  must run from a clone — `make install` (which invokes the *installed* CLI)
+  resolves the checkout via `_paths.repo_root()` (`__file__` or cwd). Run from
+  outside a checkout, setup errors clearly instead of silently skipping.
 
 ## Remote control pattern
 

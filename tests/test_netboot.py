@@ -26,6 +26,8 @@ import subprocess
 
 from paniolo import _netboot
 
+# pylint: disable=protected-access
+
 
 def _raise(exc):
     def f(*a, **k):

@@ -14,6 +14,9 @@
 
 """Video capture helpers — delegates to the hdmicap daemon."""
 
+# Single quotes nested in double-quoted f-strings are required on Python 3.11.
+# pylint: disable=inconsistent-quotes
+
 from __future__ import annotations
 
 import dataclasses
@@ -94,7 +97,9 @@ def list_devices() -> list[dict]:
         for line in result.stdout.splitlines():
             m = _DEVICE_RE.match(line)
             if m:
-                devices.append({"index": int(m.group(1)), "name": m.group(2), "misc": m.group(3)})
+                devices.append(
+                    {"index": int(m.group(1)), "name": m.group(2), "misc": m.group(3)}
+                )
         return devices
     except FileNotFoundError:
         return []
@@ -173,6 +178,10 @@ def stop_daemon() -> bool:
     binary = hdmicap_binary()
     if not binary:
         return False
-    result = subprocess.run([binary, "stop"], check=False,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    result = subprocess.run(
+        [binary, "stop"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     return result.returncode == 0

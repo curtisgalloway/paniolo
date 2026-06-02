@@ -46,6 +46,7 @@ def make_rig(replies=None):
 
 # --- command construction ---------------------------------------------------
 
+
 @pytest.mark.parametrize(
     "call, expected",
     [
@@ -88,15 +89,16 @@ def test_close_delegates():
 
 # --- absolute-mouse scaling -------------------------------------------------
 
+
 @pytest.mark.parametrize(
     "px, screen, expected",
     [
         (0, 1920, 0),
         (1919, 1920, 32767),
         (960, 1920, 16392),
-        (-100, 1920, 0),        # clamp low
-        (99999, 1920, 32767),   # clamp high
-        (5, 1, 0),              # degenerate screen size
+        (-100, 1920, 0),  # clamp low
+        (99999, 1920, 32767),  # clamp high
+        (5, 1, 0),  # degenerate screen size
     ],
 )
 def test_scale_to_logical(px, screen, expected):
@@ -104,6 +106,7 @@ def test_scale_to_logical(px, screen, expected):
 
 
 # --- sequence parsing -------------------------------------------------------
+
 
 def test_parse_sequence_skips_blanks_and_comments():
     text = "\n# a comment\n  \nkey ENTER\n# another\ntype hi\n"
@@ -146,6 +149,7 @@ def test_repeat_key():
 
 # --- S3: newline injection guard -------------------------------------------
 
+
 def test_cmd_rejects_newline():
     rig, _ = make_rig()
     with pytest.raises(ValueError, match="newline"):
@@ -165,6 +169,7 @@ def test_type_rejects_embedded_newline():
 
 
 # --- C3: parse_sequence error messages -------------------------------------
+
 
 def test_parse_sequence_bad_delay_raises_friendly_error():
     with pytest.raises(ValueError, match="invalid delay value"):

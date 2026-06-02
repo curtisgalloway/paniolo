@@ -17,6 +17,8 @@ resolution, `_resolve_with_host` (env-slice precedence, lab lookup, legacy
 files), and the `@remote_capable` decorator (run-here vs dispatch-over-SSH).
 Lab/config/remote layers are stubbed; no SSH or filesystem is touched."""
 
+# pylint: disable=protected-access,unused-argument
+
 from __future__ import annotations
 
 import pytest
@@ -184,7 +186,7 @@ def test_remote_capable_dispatches_remote_and_exits_with_code(monkeypatch):
         cmd(target="fortune")
     assert ei.value.exit_code == 7
     assert seen["host"] is remote
-    assert ran == [], "the command body never runs locally for a remote target"
+    assert not ran, "the command body never runs locally for a remote target"
 
 
 def test_remote_capable_ssh_error_exits_1(monkeypatch):

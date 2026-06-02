@@ -35,6 +35,8 @@ from paniolo import _cli, _config, _remote, _ssh
 from paniolo._config import TargetConfig
 from paniolo._ssh import Host
 
+# pylint: disable=protected-access,redefined-outer-name,unused-argument
+
 # ── unit: argv rewriting ─────────────────────────────────────────────────────
 
 
@@ -171,6 +173,7 @@ def test_configure_discovers_over_ssh(tmp_path):
         capture_output=True,
         text=True,
         timeout=60,
+        check=False,
     )
     assert result.returncode == 0, result.stderr
     assert "[targets.newtgt]" in result.stdout
@@ -192,6 +195,7 @@ def test_full_cli_dispatch_runs_on_remote(host, tmp_path):
         capture_output=True,
         text=True,
         timeout=60,
+        check=False,
     )
     assert result.returncode == 0, result.stderr
     # The status text is produced by the *remote* paniolo and passed through.

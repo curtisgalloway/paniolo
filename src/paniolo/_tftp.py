@@ -90,7 +90,7 @@ log = logging.getLogger(__name__)
 def _inet_checksum(data: bytes) -> int:
     if len(data) % 2:
         data += b"\x00"
-    total = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    total = sum(struct.unpack(f"!{len(data) // 2}H", data))
     while total >> 16:
         total = (total & 0xFFFF) + (total >> 16)
     return ~total & 0xFFFF
@@ -138,7 +138,9 @@ def _build_udp_frame(
 def _get_if_mac(iface: str) -> bytes:
     if sys.platform != "darwin":
         # Linux: read directly from sysfs (no ifconfig needed).
-        addr = Path(f"/sys/class/net/{iface}/address").read_text().strip()
+        addr = (
+            Path(f"/sys/class/net/{iface}/address").read_text(encoding="utf-8").strip()
+        )
         return bytes(int(b, 16) for b in addr.split(":"))
     out = subprocess.check_output(
         ["ifconfig", iface], text=True, stderr=subprocess.DEVNULL
@@ -198,7 +200,7 @@ class BpfSender:
                     "add user to 'access_bpf' group",
                     iface,
                 )
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-exception-caught
             log.warning("BPF init failed: %s", exc)
 
     @property
@@ -207,9 +209,9 @@ class BpfSender:
 
     def _read_client_mac(self) -> bytes | None:
         try:
-            mac_str = _CLIENT_MAC_FILE.read_text().strip()
+            mac_str = _CLIENT_MAC_FILE.read_text(encoding="utf-8").strip()
             return bytes(int(b, 16) for b in mac_str.split(":"))
-        except Exception:
+        except Exception:  # pylint: disable=broad-exception-caught
             return None
 
     def send(self, sock: socket.socket, packet: bytes, peer: tuple) -> bool:
@@ -373,7 +375,7 @@ def _handle_rrq(
 ) -> None:
     try:
         _do_rrq(host_ip, root, data, peer, bpf)
-    except Exception:  # noqa: BLE001 - never let a transfer crash the server
+    except Exception:  # pylint: disable=broad-exception-caught  # noqa: BLE001
         log.exception("RRQ handler from %s:%d crashed", peer[0], peer[1])
 
 
@@ -497,7 +499,8 @@ def serve(
     except PermissionError:
         log.error(
             "Cannot bind to port %d (TFTP). On Linux, run paniolo as root or "
-            "grant CAP_NET_BIND_SERVICE.", port
+            "grant CAP_NET_BIND_SERVICE.",
+            port,
         )
         raise
     log.info(
@@ -528,7 +531,9 @@ def serve(
             err_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             try:
                 err_sock.bind((host_ip, 0))
-                _sendto(err_sock, _error_packet(_ERR_ACCESS, "read-only server"), peer, bpf)
+                _sendto(
+                    err_sock, _error_packet(_ERR_ACCESS, "read-only server"), peer, bpf
+                )
             except OSError as exc:
                 log.debug("WRQ error reply failed: %s", exc)
             finally:

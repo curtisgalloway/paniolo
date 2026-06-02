@@ -25,6 +25,8 @@ import pytest
 from paniolo import _netif
 from paniolo._config import TargetConfig
 
+# pylint: disable=protected-access,redefined-outer-name
+
 
 def _cfg(interface: str = "enx0") -> TargetConfig:
     return TargetConfig(name="fortune", interface=interface, host_ip="192.168.99.1")
@@ -73,7 +75,7 @@ def test_ipv6_peers_excludes_host_ll(monkeypatch):
 
 def test_ipv6_peers_empty_on_macos(monkeypatch):
     monkeypatch.setattr(_netif.sys, "platform", "darwin")
-    assert _netif.ipv6_peers("enx0") == []
+    assert not _netif.ipv6_peers("enx0")
 
 
 # ── mode resolution in get_status ───────────────────────────────────────────
