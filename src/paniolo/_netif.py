@@ -223,7 +223,7 @@ def _del_host_ip(interface: str, host_ip: str) -> None:
 # ── mode transitions ───────────────────────────────────────────────────────
 
 
-def mode_netboot(cfg: TargetConfig, engine: str = "python") -> None:
+def mode_netboot(cfg: TargetConfig, engine: str = "rust") -> None:
     """Put the link in netboot mode: tear down ffx, start DHCP+TFTP.
 
     Idempotent: if netboot is already running it is left as-is (the ffx

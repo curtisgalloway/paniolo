@@ -115,7 +115,7 @@ def calls(monkeypatch):
     monkeypatch.setattr(
         _netif._netboot,
         "start",
-        lambda cfg, engine="python": seq.append(f"start:{engine}"),
+        lambda cfg, engine="rust": seq.append(f"start:{engine}"),
     )
     monkeypatch.setattr(_netif._netboot, "stop", lambda name: seq.append("stop"))
     return seq
@@ -135,7 +135,8 @@ def test_mode_ffx_idempotent_readds_ll_when_not_running(monkeypatch, calls):
 
 def test_mode_netboot_clears_ll_then_starts(monkeypatch, calls):
     monkeypatch.setattr(_netif, "is_netboot_running", lambda name: False)
-    _netif.mode_netboot(_cfg(), engine="rust")
+    # No engine arg: the rust engine is the default.
+    _netif.mode_netboot(_cfg())
     assert calls == ["del_ll", "start:rust"]
 
 

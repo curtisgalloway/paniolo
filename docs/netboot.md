@@ -73,16 +73,17 @@ default route (a primary NIC). netboot reconfigures the interface to the static
 `host_ip`, which would break your real networking — the netboot link must be a
 dedicated USB-Ethernet adapter.
 
-### Experimental rust engine
+### Netboot engines (rust default, python legacy)
 
 ```bash
-paniolo netboot start --engine rust [target-machine]
+paniolo netboot start [target-machine]                  # rust netbootd (default)
+paniolo netboot start --engine python [target-machine]  # legacy DHCP+TFTP pair
 ```
 
-`--engine rust` launches a single `netbootd` binary (a Rust port of the two
-Python servers) instead of the `_dhcp`/`_tftp` subprocesses. The default stays
-`python`; the rust engine is **opt-in for validation** before any reconciliation.
-`stop`/`status`/`logs` follow whichever engine `start` recorded.
+`start` launches a single `netbootd` binary (Rust) by default, serving DHCP and
+TFTP from one process. `--engine python` selects the legacy implementation: the
+`_dhcp`/`_tftp` subprocess pair the Rust daemon was ported from, kept as a
+fallback. `stop`/`status`/`logs` follow whichever engine `start` recorded.
 
 On macOS, netbootd's raw-frame send path (the Sequoia delivery workaround) needs
 a `/dev/bpf` descriptor. Rather than run the daemon as root, `paniolo setup`

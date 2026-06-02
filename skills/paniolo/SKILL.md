@@ -52,8 +52,8 @@ paniolo target set <name> --interface <iface> \
 Boot a board over the direct USB-Ethernet link:
 
 ```
-paniolo netboot start [target]            # serve DHCP + TFTP on the interface (python engine)
-paniolo netboot start [target] --engine rust  # experimental single-binary netbootd
+paniolo netboot start [target]            # serve DHCP + TFTP (rust netbootd, default)
+paniolo netboot start [target] --engine python  # legacy pure-Python DHCP+TFTP pair
 paniolo netboot tftp-root [target]        # print where to drop boot files
 paniolo netboot status [target]
 paniolo netboot logs -f [target]          # follow the combined log
@@ -62,9 +62,9 @@ paniolo netboot stop [target]
 
 `start` refuses an interface that carries the system default route (a primary
 NIC) — the netboot link must be a dedicated USB-Ethernet adapter. The default
-engine is the pure-Python DHCP+TFTP pair; `--engine rust` runs the experimental
-`netbootd` binary (opt-in, for validation). On macOS the rust engine's BPF send
-path uses the setuid `netbootd-bpf-helper` installed by `paniolo setup`.
+engine is the single-binary `netbootd` (Rust); `--engine python` selects the
+legacy DHCP+TFTP subprocess pair it was ported from. On macOS the rust engine's
+BPF send path uses the setuid `netbootd-bpf-helper` installed by `paniolo setup`.
 
 Put boot files in the target's TFTP root (for a Raspberry Pi 5, the kernel goes
 in as `kernel_2712.img`). Needs passwordless `sudo` for `ifconfig` (it assigns
