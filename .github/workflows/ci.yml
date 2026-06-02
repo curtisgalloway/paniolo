@@ -105,7 +105,7 @@ jobs:
         run: cargo test
 
   hdmicap-linux:
-    name: hdmicap (Linux, V4L2 build)
+    name: hdmicap (Linux, fmt, clippy, V4L2 build)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -115,25 +115,39 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libclang-dev clang cmake nasm libturbojpeg0-dev
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: hdmicap
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
       - name: Build hdmicap (V4L2 path)
         run: cargo build
 
   macos:
     # Exercises the macOS-only stack the Linux jobs can't: hdmicap's AVFoundation
-    # capture path and the Apple Vision OCR helper. fmt/clippy aren't gated here —
-    # hdmicap predates this workflow and isn't yet rustfmt-clean / warning-free, so
-    # those run only against serialcap on Linux above.
+    # capture path and the Apple Vision OCR helper. fmt/clippy run on both Linux
+    # (V4L2 path) and here (AVFoundation path) so each per-OS cfg branch is gated
+    # on the platform that compiles it.
     name: macos (hdmicap, visionocr)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: hdmicap
+      - name: Format
+        working-directory: hdmicap
+        run: cargo fmt --check
+      - name: Clippy
+        working-directory: hdmicap
+        run: cargo clippy --all-targets -- -D warnings
       - name: Build + test hdmicap (AVFoundation capture path)
         working-directory: hdmicap
         run: cargo test
