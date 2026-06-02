@@ -27,8 +27,8 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use image::RgbImage;
 
-use nokhwa::utils::{ApiBackend, CameraIndex};
 use nokhwa::query;
+use nokhwa::utils::{ApiBackend, CameraIndex};
 
 #[derive(Clone, Debug)]
 pub struct DeviceInfo {
@@ -79,7 +79,6 @@ pub struct CapturedFrame {
 
 pub trait CaptureBackend {
     fn frame(&mut self) -> Result<CapturedFrame>;
-    fn dims(&self) -> (u32, u32);
 }
 
 pub fn enumerate() -> Result<Vec<DeviceInfo>> {
@@ -155,13 +154,13 @@ mod linux {
     use v4l::io::traits::CaptureStream;
     use v4l::video::Capture;
 
-    use super::{CaptureBackend, CapturedFrame, DeviceSpec, resolve};
+    use super::{resolve, CaptureBackend, CapturedFrame, DeviceSpec};
 
     const FORMATS: &[(u32, u32, &[u8; 4])] = &[
-        (1280, 720,  b"MJPG"),
+        (1280, 720, b"MJPG"),
         (1920, 1080, b"MJPG"),
-        (1280, 720,  b"YUYV"),
-        (640,  480,  b"YUYV"),
+        (1280, 720, b"YUYV"),
+        (640, 480, b"YUYV"),
     ];
 
     const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
@@ -194,7 +193,8 @@ mod linux {
                         let is_mjpeg = actual_fmt.fourcc == FourCC::new(b"MJPG");
                         tracing::info!(
                             "capture opened {}x{} {:?}",
-                            actual_fmt.width, actual_fmt.height,
+                            actual_fmt.width,
+                            actual_fmt.height,
                             if is_mjpeg { "MJPEG" } else { "YUYV" }
                         );
                         return Ok(LinuxV4LBackend {
@@ -234,7 +234,10 @@ mod linux {
                 let (w, h) = (rgb.width(), rgb.height());
                 self.dims = (w, h);
 
-                Ok(CapturedFrame { jpeg: Some(jpeg_bytes), rgb })
+                Ok(CapturedFrame {
+                    jpeg: Some(jpeg_bytes),
+                    rgb,
+                })
             } else {
                 // YUYV: no raw JPEG, decode to RGB for signal detection and storage.
                 let fmt = self.dev.format().ok();
@@ -243,12 +246,11 @@ mod linux {
                     .map(|f| (f.width, f.height))
                     .unwrap_or(self.dims);
                 self.dims = (w, h);
-                Ok(CapturedFrame { jpeg: None, rgb: yuyv_to_rgb(buf, w, h) })
+                Ok(CapturedFrame {
+                    jpeg: None,
+                    rgb: yuyv_to_rgb(buf, w, h),
+                })
             }
-        }
-
-        fn dims(&self) -> (u32, u32) {
-            self.dims
         }
     }
 
@@ -257,7 +259,9 @@ mod linux {
         let pairs = (w * h / 2) as usize;
         for i in 0..pairs {
             let base = i * 4;
-            if base + 3 >= buf.len() { break; }
+            if base + 3 >= buf.len() {
+                break;
+            }
             let y0 = buf[base] as f32;
             let cb = buf[base + 1] as f32 - 128.0;
             let y1 = buf[base + 2] as f32;
@@ -283,8 +287,6 @@ mod linux {
 
 #[cfg(not(target_os = "linux"))]
 mod macos {
-    use std::sync::Arc;
-
     use anyhow::{anyhow, Context, Result};
     use nokhwa::pixel_format::RgbFormat;
     use nokhwa::utils::{
@@ -292,7 +294,7 @@ mod macos {
     };
     use nokhwa::Camera;
 
-    use super::{CaptureBackend, CapturedFrame, DeviceSpec, resolve};
+    use super::{resolve, CaptureBackend, CapturedFrame, DeviceSpec};
 
     pub struct NokhwaBackend {
         cam: Camera,
@@ -323,8 +325,12 @@ mod macos {
                 }));
                 match result {
                     Ok(Ok(backend)) => return Ok(backend),
-                    Ok(Err(e)) => { last_err = e; }
-                    Err(_) => { last_err = anyhow!("format {:?} not supported", fmt_type); }
+                    Ok(Err(e)) => {
+                        last_err = e;
+                    }
+                    Err(_) => {
+                        last_err = anyhow!("format {:?} not supported", fmt_type);
+                    }
                 }
             }
             Err(last_err)
@@ -338,7 +344,10 @@ mod macos {
         cam.open_stream()
             .map_err(|e| anyhow!("failed to open capture device {idx}: {e}"))?;
         let res = cam.resolution();
-        Ok(NokhwaBackend { cam, dims: (res.width(), res.height()) })
+        Ok(NokhwaBackend {
+            cam,
+            dims: (res.width(), res.height()),
+        })
     }
 
     impl CaptureBackend for NokhwaBackend {
@@ -347,13 +356,9 @@ mod macos {
             let decoded = buf.decode_image::<RgbFormat>().context("decode failed")?;
             self.dims = (decoded.width(), decoded.height());
             Ok(CapturedFrame {
-                jpeg: None,  // nokhwa gives decoded pixels, not raw JPEG
+                jpeg: None, // nokhwa gives decoded pixels, not raw JPEG
                 rgb: decoded,
             })
-        }
-
-        fn dims(&self) -> (u32, u32) {
-            self.dims
         }
     }
 }

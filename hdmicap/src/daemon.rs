@@ -40,7 +40,7 @@ fn runtime_dir() -> Result<PathBuf> {
     let base = dirs
         .runtime_dir()
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::env::temp_dir());
+        .unwrap_or_else(std::env::temp_dir);
     let dir = base.join("hdmicap");
     fs::create_dir_all(&dir)?;
     Ok(dir)

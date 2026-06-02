@@ -30,10 +30,10 @@ use axum::{
 use bytes::Bytes;
 use image::codecs::jpeg::JpegEncoder;
 use image::{ImageBuffer, ImageEncoder, Rgb};
-#[cfg(target_os = "linux")]
-use turbojpeg;
 use serde::Deserialize;
 use tokio::sync::watch;
+#[cfg(target_os = "linux")]
+use turbojpeg;
 
 use crate::capture_thread::FrameRx;
 use crate::frame::{FrameState, Signal, StatusDto};
@@ -68,7 +68,10 @@ async fn index() -> impl IntoResponse {
 
 async fn xterm_js() -> impl IntoResponse {
     (
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
         include_str!("../assets/xterm.js"),
     )
 }
@@ -82,7 +85,10 @@ async fn xterm_css() -> impl IntoResponse {
 
 async fn xterm_fit_js() -> impl IntoResponse {
     (
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
         include_str!("../assets/xterm-addon-fit.js"),
     )
 }
@@ -178,7 +184,10 @@ fn png_response(f: &FrameState, timed_out: bool) -> Response {
     let bytes = match encode_png(f) {
         Some(b) => b,
         None => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "frame buffer size mismatch")
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "frame buffer size mismatch",
+            )
                 .into_response()
         }
     };
@@ -189,7 +198,10 @@ fn png_response(f: &FrameState, timed_out: bool) -> Response {
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "image/png".to_string()),
-            (header::HeaderName::from_static("x-signal"), signal_str.to_string()),
+            (
+                header::HeaderName::from_static("x-signal"),
+                signal_str.to_string(),
+            ),
             (
                 header::HeaderName::from_static("x-resolution-epoch"),
                 f.resolution_epoch.to_string(),
@@ -286,9 +298,7 @@ async fn ocr(State(s): State<AppState>) -> Response {
     }
     let png = match encode_png(&f) {
         Some(p) => p,
-        None => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "png encode failed").into_response()
-        }
+        None => return (StatusCode::INTERNAL_SERVER_ERROR, "png encode failed").into_response(),
     };
 
     let bin = std::env::var("PANIOLO_VISIONOCR").unwrap_or_else(|_| "visionocr".to_string());
@@ -330,7 +340,11 @@ async fn ocr(State(s): State<AppState>) -> Response {
             format!("visionocr failed: {}", String::from_utf8_lossy(&out.stderr)),
         )
             .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("visionocr wait: {e}")).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("visionocr wait: {e}"),
+        )
+            .into_response(),
     }
 }
 
@@ -372,9 +386,7 @@ async fn devices() -> Response {
     match crate::capture::enumerate() {
         Ok(list) => Json(
             list.into_iter()
-                .map(|d| {
-                    serde_json::json!({"index": d.index, "name": d.name, "misc": d.misc})
-                })
+                .map(|d| serde_json::json!({"index": d.index, "name": d.name, "misc": d.misc}))
                 .collect::<Vec<_>>(),
         )
         .into_response(),

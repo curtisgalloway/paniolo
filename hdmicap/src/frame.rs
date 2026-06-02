@@ -32,6 +32,9 @@ pub const STABLE_FRAMES: u32 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+// `NoSignal` is the correct domain term (HDMI "no signal"); the shared `Signal`
+// suffix is intentional, not the accidental redundancy this lint guards against.
+#[allow(clippy::enum_variant_names)]
 pub enum Signal {
     /// No capture device present / handle lost.
     NoDevice,
@@ -150,9 +153,7 @@ mod tests {
     use image::RgbImage;
 
     fn solid_image(r: u8, g: u8, b: u8, w: u32, h: u32) -> RgbImage {
-        let pixels: Vec<u8> = (0..w * h)
-            .flat_map(|_| [r, g, b])
-            .collect();
+        let pixels: Vec<u8> = (0..w * h).flat_map(|_| [r, g, b]).collect();
         RgbImage::from_raw(w, h, pixels).unwrap()
     }
 
