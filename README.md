@@ -47,19 +47,29 @@ design and the project requirements tracker are under [`docs/`](docs/README.md) 
 
 ```bash
 git clone https://github.com/curtisgalloway/paniolo ~/src/paniolo
-uv tool install ~/src/paniolo
-paniolo setup          # builds hdmicap + serialcap; installs the OCR helper
+cd ~/src/paniolo
+make install           # Python CLI + Rust daemons + OCR helper, in one step
 ```
 
-`paniolo setup` compiles and installs the Rust daemons (`hdmicap`, `serialcap`,
-`netbootd`) and the OCR helper (`visionocr` on macOS via `swiftc`, `linuxocr` on
-Linux) into `~/.cargo/bin`. Netboot defaults to the single-binary `netbootd`
-(Rust) engine; the legacy pure-Python DHCP/TFTP pair is still available via
-`--engine python`. (On macOS, `setup` also installs the legacy `tftp-now` via
-Homebrew, and installs `netbootd-bpf-helper` setuid-root — one sudo — for the
-`netbootd` raw-frame send path.)
+`make install` runs `uv tool install --reinstall .` for the Python CLI, then
+`paniolo setup`, which compiles and installs the Rust daemons (`hdmicap`,
+`serialcap`, `netbootd`) and the OCR helper (`visionocr` on macOS via `swiftc`,
+`linuxocr` on Linux) into `~/.cargo/bin`. Netboot defaults to the single-binary
+`netbootd` (Rust) engine; the legacy pure-Python DHCP/TFTP pair is still
+available via `--engine python`. (On macOS, `setup` also installs the legacy
+`tftp-now` via Homebrew, and installs `netbootd-bpf-helper` setuid-root — one
+sudo — for the `netbootd` raw-frame send path.)
 
-To pick up code changes after pulling or editing:
+To pick up code changes after pulling or editing, just re-run it:
+
+```bash
+make install           # rebuilds and reinstalls everything (idempotent)
+```
+
+Or target one layer while iterating: `make python` (CLI only), `make rust`
+(the Rust crates only, skipping OCR/setuid), `make native` (`paniolo setup`
+only). `make help` lists every target. The underlying commands still work
+directly if you prefer:
 
 ```bash
 uv tool install --reinstall ~/src/paniolo

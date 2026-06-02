@@ -9,6 +9,17 @@
 # will likely look very different (and much more reasonable).
 # See Cargo.toml.orig for the original contents.
 
+# Local fork: silence upstream's lints so this vendored patch doesn't fail
+# hdmicap's `cargo clippy -- -D warnings`. The crate uses the old cocoa/objc
+# bindings (deprecated in favor of objc2) and macros that emit the legacy
+# `cfg(cargo-clippy)`; that's upstream churn we don't maintain, not our code.
+[lints.rust]
+deprecated = "allow"
+unexpected_cfgs = "allow"
+
+[lints.clippy]
+all = "allow"
+
 [package]
 edition = "2021"
 name = "nokhwa-bindings-macos"

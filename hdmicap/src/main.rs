@@ -131,7 +131,7 @@ fn cmd_shot(stable: bool, changed_since: Option<String>, timeout: u64, out: &str
         .call()
         .context("GET /snapshot failed")?;
 
-    let timed_out = resp.header("x-timeout").map_or(false, |v| v == "1");
+    let timed_out = resp.header("x-timeout") == Some("1");
     let signal = resp.header("x-signal").unwrap_or("unknown").to_string();
     let hash = resp.header("x-frame-hash").unwrap_or("").to_string();
     eprintln!(
@@ -162,21 +162,21 @@ fn cmd_watch(timeout: u64) -> Result<()> {
         .context("GET /status failed")?
         .into_string()
         .context("reading /status body")?;
-    let status: serde_json::Value =
-        serde_json::from_str(&body).context("parsing /status JSON")?;
+    let status: serde_json::Value = serde_json::from_str(&body).context("parsing /status JSON")?;
     let hash = status["hash"]
         .as_str()
         .unwrap_or("0000000000000000")
         .to_string();
 
     // Block until the frame changes or we time out.
-    let resp =
-        ureq::get(&format!("{url}/snapshot?changed_since={hash}&timeout={timeout}"))
-            .call()
-            .context("GET /snapshot (changed_since) failed")?;
+    let resp = ureq::get(&format!(
+        "{url}/snapshot?changed_since={hash}&timeout={timeout}"
+    ))
+    .call()
+    .context("GET /snapshot (changed_since) failed")?;
 
     let new_hash = resp.header("x-frame-hash").unwrap_or("").to_string();
-    let timed_out = resp.header("x-timeout").map_or(false, |v| v == "1");
+    let timed_out = resp.header("x-timeout") == Some("1");
     if timed_out {
         anyhow::bail!("timed out waiting for screen change after {timeout}ms");
     }

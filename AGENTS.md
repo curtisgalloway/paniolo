@@ -665,6 +665,11 @@ Top-level commands:
   `~/.cargo/bin`. On macOS it then installs `netbootd-bpf-helper` **setuid-root**
   (the one-time sudo) so the rust netboot engine's BPF path works unprivileged.
 
+`make install` (repo root) is the one-step build-and-install: it runs
+`uv tool install --reinstall .` for the Python CLI, then `paniolo setup` for the
+native side. Re-run it after editing anything. Narrower targets: `make python`,
+`make rust` (crates only), `make native` (`paniolo setup` only); `make help` lists all.
+
 ## Runtime paths
 
 | Purpose | Path |
