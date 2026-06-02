@@ -31,7 +31,12 @@ def test_log_cmd_forwards_only_set_flags():
 
 def test_log_cmd_interface():
     assert _serial.log_cmd("serialcap", interface="bmc", tail=10) == [
-        "serialcap", "log", "--interface", "bmc", "--tail", "10",
+        "serialcap",
+        "log",
+        "--interface",
+        "bmc",
+        "--tail",
+        "10",
     ]
 
 
@@ -54,7 +59,10 @@ def test_input_url_zero_pace_omitted():
 
 
 def test_interface_arg():
-    assert _serial.interface_arg("console", "/dev/ttyUSB0", 115200) == "console=/dev/ttyUSB0@115200"
+    assert (
+        _serial.interface_arg("console", "/dev/ttyUSB0", 115200)
+        == "console=/dev/ttyUSB0@115200"
+    )
 
 
 def test_daemon_cmd_one_per_interface():
@@ -63,23 +71,39 @@ def test_daemon_cmd_one_per_interface():
         SerialInterface("bmc", "/dev/ttyUSB1", 9600),
     ]
     assert _serial.daemon_cmd("serialcap", ifaces, port=8724) == [
-        "serialcap", "daemon", "--port", "8724",
-        "--interface", "console=/dev/ttyUSB0@115200",
-        "--interface", "bmc=/dev/ttyUSB1@9600",
+        "serialcap",
+        "daemon",
+        "--port",
+        "8724",
+        "--interface",
+        "console=/dev/ttyUSB0@115200",
+        "--interface",
+        "bmc=/dev/ttyUSB1@9600",
     ]
 
 
 def test_daemon_cmd_buffer_lines():
     ifaces = [SerialInterface("console", "/dev/ttyUSB0", 115200)]
     assert _serial.daemon_cmd("serialcap", ifaces, port=9, buffer_lines=1000) == [
-        "serialcap", "daemon", "--port", "9", "--buffer-lines", "1000",
-        "--interface", "console=/dev/ttyUSB0@115200",
+        "serialcap",
+        "daemon",
+        "--port",
+        "9",
+        "--buffer-lines",
+        "1000",
+        "--interface",
+        "console=/dev/ttyUSB0@115200",
     ]
 
 
 def test_log_cmd_range_and_since():
     assert _serial.log_cmd("serialcap", from_seq=10, to_seq=20) == [
-        "serialcap", "log", "--from", "10", "--to", "20",
+        "serialcap",
+        "log",
+        "--from",
+        "10",
+        "--to",
+        "20",
     ]
     assert _serial.log_cmd("serialcap", since=7) == ["serialcap", "log", "--since", "7"]
 

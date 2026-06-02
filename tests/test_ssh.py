@@ -25,6 +25,8 @@ Two tiers:
   provisioned passphraseless key with no agent.
 """
 
+# pylint: disable=protected-access,redefined-outer-name
+
 from __future__ import annotations
 
 import os
@@ -122,7 +124,9 @@ _IDENT = os.environ.get("PANIOLO_SSH_IT_IDENTITY")
 
 integration = pytest.mark.skipif(
     not _DEST,
-    reason="set PANIOLO_SSH_IT=<ssh-dest> (e.g. localhost) to run SSH integration tests",
+    reason=(
+        "set PANIOLO_SSH_IT=<ssh-dest> (e.g. localhost)" " to run SSH integration tests"
+    ),
 )
 
 

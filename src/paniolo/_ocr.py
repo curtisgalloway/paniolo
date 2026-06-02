@@ -28,6 +28,13 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from ._paths import repo_root
+
+_NO_REPO = (
+    "paniolo source checkout not found; run `paniolo setup` from a clone "
+    "(e.g. `make install`) so the OCR helper can be built from source"
+)
+
 
 def visionocr_binary() -> Optional[str]:
     """Return the installed visionocr path: PATH, then ~/.cargo/bin. None if absent."""
@@ -38,14 +45,21 @@ def visionocr_binary() -> Optional[str]:
     return str(cargo_bin) if cargo_bin.exists() else None
 
 
-def visionocr_source() -> Path:
-    """Path to the visionocr Swift source in the repo (for `paniolo setup`)."""
-    return Path(__file__).parent.parent.parent / "ocr" / "visionocr.swift"
+def visionocr_source() -> Optional[Path]:
+    """Path to the visionocr Swift source in the repo (for `paniolo setup`).
+
+    None when no source checkout can be located (e.g. an installed CLI run from
+    outside a clone).
+    """
+    root = repo_root()
+    return root / "ocr" / "visionocr.swift" if root else None
 
 
 def build_visionocr(dest: Path) -> None:
     """Compile visionocr.swift to `dest` (used by `paniolo setup`). Raises on error."""
     source = visionocr_source()
+    if source is None:
+        raise FileNotFoundError(_NO_REPO)
     if not source.exists():
         raise FileNotFoundError(f"visionocr source not found: {source}")
     if not shutil.which("swiftc"):
@@ -63,19 +77,25 @@ def linuxocr_binary() -> Optional[str]:
     return str(cargo_bin) if cargo_bin.exists() else None
 
 
-def linuxocr_source() -> Path:
-    """Path to the linuxocr Python script in the repo (for `paniolo setup`)."""
-    return Path(__file__).parent.parent.parent / "ocr" / "linuxocr"
+def linuxocr_source() -> Optional[Path]:
+    """Path to the linuxocr Python script in the repo (for `paniolo setup`).
+
+    None when no source checkout can be located (e.g. an installed CLI run from
+    outside a clone).
+    """
+    root = repo_root()
+    return root / "ocr" / "linuxocr" if root else None
 
 
 def install_linuxocr(dest: Path) -> None:
     """Copy ocr/linuxocr to `dest` and make it executable (used by `paniolo setup`)."""
-    import shutil as _shutil
     source = linuxocr_source()
+    if source is None:
+        raise FileNotFoundError(_NO_REPO)
     if not source.exists():
         raise FileNotFoundError(f"linuxocr source not found: {source}")
     dest.parent.mkdir(parents=True, exist_ok=True)
-    _shutil.copy2(source, dest)
+    shutil.copy2(source, dest)
     dest.chmod(0o755)
 
 
@@ -96,7 +116,9 @@ def read_text(png: bytes, fast: bool = False, as_json: bool = False) -> str:
     if not binary:
         platform = "macOS" if sys.platform == "darwin" else "Linux"
         tool = "visionocr" if sys.platform == "darwin" else "linuxocr"
-        raise FileNotFoundError(f"{tool} not installed on {platform} — run: paniolo setup")
+        raise FileNotFoundError(
+            f"{tool} not installed on {platform} — run: paniolo setup"
+        )
     cmd = [binary]
     if sys.platform == "darwin":
         if fast:
@@ -104,7 +126,9 @@ def read_text(png: bytes, fast: bool = False, as_json: bool = False) -> str:
         if as_json:
             cmd.append("--json")
     cmd.append("-")
-    result = subprocess.run(cmd, input=png, capture_output=True)
+    result = subprocess.run(cmd, input=png, capture_output=True, check=False)
     if result.returncode != 0:
-        raise RuntimeError(result.stderr.decode(errors="replace").strip() or f"{binary} failed")
+        raise RuntimeError(
+            result.stderr.decode(errors="replace").strip() or f"{binary} failed"
+        )
     return result.stdout.decode(errors="replace")

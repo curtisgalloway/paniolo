@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""CLI entry points for the paniolo target-machine wrangler."""
+
+# Single quotes nested in double-quoted f-strings are required on Python 3.11.
+# pylint: disable=inconsistent-quotes
+
 from __future__ import annotations
 
 import functools
@@ -37,6 +42,7 @@ from . import (
     _netboot,
     _netif,
     _ocr,
+    _paths,
     _power,
     _remote,
     _serial,
@@ -101,7 +107,8 @@ def _require_single(name: Optional[str], names: list[str]) -> str:
         return names[0]
     if not names:
         err.print(
-            "[red]No targets configured.[/red] Run: paniolo target set <name> --interface <iface>"
+            "[red]No targets configured.[/red]"
+            " Run: paniolo target set <name> --interface <iface>"
         )
         raise typer.Exit(1)
     err.print(f"[red]Multiple targets ({', '.join(names)}) — specify one.[/red]")
@@ -138,9 +145,9 @@ def _resolve_with_host(name: Optional[str]) -> tuple[_config.TargetConfig, _ssh.
         name = _require_single(name, lab.target_names())
         try:
             return lab.resolve_target(name)
-        except KeyError:
+        except KeyError as exc:
             err.print(f"[red]Target '{name}' not found in lab.[/red]")
-            raise typer.Exit(1)
+            raise typer.Exit(1) from exc
         except _lab.LabError as exc:
             err.print(f"[red]{exc}[/red]")
             raise typer.Exit(1)
@@ -148,9 +155,9 @@ def _resolve_with_host(name: Optional[str]) -> tuple[_config.TargetConfig, _ssh.
     name = _require_single(name, _config.list_targets())
     try:
         return _config.load_target(name), _ssh.Host(name=_ssh.LOCAL, ssh=_ssh.LOCAL)
-    except FileNotFoundError:
+    except FileNotFoundError as exc:
         err.print(f"[red]Target '{name}' not found.[/red]")
-        raise typer.Exit(1)
+        raise typer.Exit(1) from exc
 
 
 def _resolve(name: Optional[str]) -> _config.TargetConfig:
@@ -191,11 +198,11 @@ def remote_capable(mode: str = _remote.REEXEC):
     def decorator(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
-            _cfg, host = _resolve_with_host(kwargs.get("target"))
+            cfg_for_host, host = _resolve_with_host(kwargs.get("target"))
             if host.is_local:
                 return fn(*args, **kwargs)
             try:
-                code = _remote.dispatch(host, _cfg, mode, sys.argv)
+                code = _remote.dispatch(host, cfg_for_host, mode, sys.argv)
             except _ssh.SSHError as exc:
                 err.print(f"[red]ssh: {exc}[/red]")
                 raise typer.Exit(1)
@@ -238,7 +245,8 @@ def target_set(
         Optional[str],
         typer.Option(
             "--power-serial",
-            help="Serial interface name used for DTR power cycling via J2 (e.g. console)",
+            help="Serial interface name used for DTR power cycling via J2"
+            " (e.g. console)",
         ),
     ] = None,
 ) -> None:
@@ -250,7 +258,8 @@ def target_set(
         candidates = _netboot.list_usb_ethernet_interfaces()
         if not candidates:
             err.print(
-                "[red]No USB-Ethernet interfaces found.[/red] Specify one with --interface."
+                "[red]No USB-Ethernet interfaces found.[/red]"
+                " Specify one with --interface."
             )
             raise typer.Exit(1)
         active = [c for c in candidates if c["active"]]
@@ -262,12 +271,14 @@ def target_set(
         elif len(candidates) == 1:
             interface = candidates[0]["device"]
             console.print(
-                f"[dim]Auto-detected interface:[/dim] {interface} ({candidates[0]['port']}) "
+                f"[dim]Auto-detected interface:[/dim] {interface}"
+                f" ({candidates[0]['port']}) "
                 "[dim](no cable detected)[/dim]"
             )
         else:
             console.print(
-                "[yellow]Multiple USB-Ethernet interfaces found — use --interface to choose:[/yellow]"
+                "[yellow]Multiple USB-Ethernet interfaces found"
+                " — use --interface to choose:[/yellow]"
             )
             for c in candidates:
                 status = (
@@ -442,13 +453,15 @@ def netboot_status(
         alive = "[green]alive[/green]" if s["netbootd_alive"] else "[red]dead[/red]"
         t.add_row("netbootd", f"pid {s['netbootd_pid']}  {alive}  (dhcp+tftp)")
     else:
+        dhcp_state = "[green]alive[/green]" if s["dhcp_alive"] else "[red]dead[/red]"
+        tftp_state = "[green]alive[/green]" if s["tftp_alive"] else "[red]dead[/red]"
         t.add_row(
             "dhcp",
-            f"pid {s['dhcp_pid']}  {'[green]alive[/green]' if s['dhcp_alive'] else '[red]dead[/red]'}",
+            f"pid {s['dhcp_pid']}  {dhcp_state}",
         )
         t.add_row(
             "tftp-now",
-            f"pid {s['tftp_pid']}  {'[green]alive[/green]' if s['tftp_alive'] else '[red]dead[/red]'}",
+            f"pid {s['tftp_pid']}  {tftp_state}",
         )
     t.add_row("tftp_root", s["tftp_root"])
     t.add_row("uptime", f"{h:02d}:{m:02d}:{sec:02d}")
@@ -583,7 +596,9 @@ def netboot_logs(
 def _link_state(interface: str) -> dict:
     """Read raw link state for an interface from sysfs (Linux) or ifconfig (macOS)."""
     if sys.platform == "darwin":
-        result = subprocess.run(["ifconfig", interface], capture_output=True, text=True)
+        result = subprocess.run(
+            ["ifconfig", interface], capture_output=True, text=True, check=False
+        )
         output = result.stdout
         up = "status: active" in output
         addrs = [
@@ -606,6 +621,7 @@ def _link_state(interface: str) -> dict:
         ["ip", "-brief", "addr", "show", "dev", interface],
         capture_output=True,
         text=True,
+        check=False,
     )
     addrs = result.stdout.split()[2:] if result.returncode == 0 else []
     return {
@@ -624,7 +640,9 @@ def netboot_link_up(
     """Bring the target's USB-Ethernet link up and assign the host IP."""
     cfg = _resolve(target)
     try:
+        # pylint: disable=protected-access
         _netboot._configure_interface(cfg.interface, cfg.host_ip)
+        # pylint: enable=protected-access
     except RuntimeError as exc:
         err.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)
@@ -640,7 +658,7 @@ def netboot_link_down(
 ) -> None:
     """Take the target's USB-Ethernet link down and release the host IP."""
     cfg = _resolve(target)
-    _netboot._restore_interface(cfg.interface)
+    _netboot._restore_interface(cfg.interface)  # pylint: disable=protected-access
     console.print(f"Link down  {cfg.interface}")
 
 
@@ -682,14 +700,16 @@ def _print_netif_status(cfg: _config.TargetConfig) -> None:
         t.add_row("dhcp+tftp", f"serving on {s['host_ip']}/24")
     if s["mode"] == "ffx":
         for peer in s["peers"]:
+            iface = s["interface"]
             t.add_row(
                 "peer",
-                f"{peer}%{s['interface']}  (try: ffx target add {peer}%{s['interface']})",
+                f"{peer}%{iface}  (try: ffx target add {peer}%{iface})",
             )
         if not s["peers"]:
             t.add_row(
                 "peer",
-                "[dim]none discovered yet — power-cycle the target and wait for SLAAC[/dim]",
+                "[dim]none discovered yet — power-cycle the target"
+                " and wait for SLAAC[/dim]",
             )
     console.print(t)
 
@@ -703,7 +723,8 @@ def netif_mode(
         str,
         typer.Option(
             "--engine",
-            help="Netboot engine for 'netboot' mode: 'rust' (default) or 'python' (legacy).",
+            help="Netboot engine for 'netboot' mode: 'rust' (default)"
+            " or 'python' (legacy).",
         ),
     ] = "rust",
 ) -> None:
@@ -847,7 +868,7 @@ def video_preview() -> None:
         err.print("[red]No daemon running.[/red] Start one with: paniolo video watch")
         raise typer.Exit(1)
 
-    import webbrowser
+    import webbrowser  # pylint: disable=import-outside-toplevel
 
     webbrowser.open(url)
     console.print(f"Opened {url}")
@@ -899,7 +920,7 @@ def video_read(
     shot_cmd = [binary, "shot", "--out", "-", "--timeout", str(timeout)]
     if stable:
         shot_cmd.append("--stable")
-    shot = subprocess.run(shot_cmd, capture_output=True)
+    shot = subprocess.run(shot_cmd, capture_output=True, check=False)
     if shot.returncode != 0:
         err.print(shot.stderr.decode(errors="replace").strip() or "snapshot failed")
         raise typer.Exit(1)
@@ -1012,7 +1033,7 @@ def _remote_console(
                 f"ws://127.0.0.1:{local_serial}/stream",
                 interface,
             )
-            import webbrowser
+            import webbrowser  # pylint: disable=import-outside-toplevel
 
             webbrowser.open(url)
             console.print(f"Opened {url}")
@@ -1040,9 +1061,9 @@ def open_dashboard(
     serial_port: Annotated[int, typer.Option("--serial-port")] = 8724,
 ) -> None:
     """Open the combined video+serial dashboard, starting daemons if needed."""
-    _cfg, _host = _resolve_with_host(target)
-    if not _host.is_local:
-        _remote_console(_host, _cfg, interface)
+    resolved_cfg, resolved_host = _resolve_with_host(target)
+    if not resolved_host.is_local:
+        _remote_console(resolved_host, resolved_cfg, interface)
         return
 
     # ── video daemon ──────────────────────────────────────────────────────────
@@ -1067,7 +1088,7 @@ def open_dashboard(
         if not video_url:
             err.print("[red]Video daemon did not start within 5 s.[/red]")
             raise typer.Exit(1)
-        console.print(f"[green]Video daemon started.[/green]")
+        console.print("[green]Video daemon started.[/green]")
 
     # ── serial daemon ─────────────────────────────────────────────────────────
     if not _serial.daemon_url():
@@ -1093,11 +1114,11 @@ def open_dashboard(
         if not serial_url:
             err.print("[red]Serial daemon did not start within 5 s.[/red]")
             raise typer.Exit(1)
-        console.print(f"[green]Serial daemon started.[/green]")
+        console.print("[green]Serial daemon started.[/green]")
 
     url = video_url if not interface else f"{video_url}?interface={interface}"
 
-    import webbrowser
+    import webbrowser  # pylint: disable=import-outside-toplevel
 
     webbrowser.open(url)
     console.print(f"Opened {url}")
@@ -1177,7 +1198,9 @@ def power_cycle(
 def power_state(
     target: Annotated[Optional[str], typer.Argument()] = None,
 ) -> None:
-    """Show whether the target is powered on (requires sense signal wired and daemon running)."""
+    """Show whether the target is powered on.
+
+    Requires sense signal wired and daemon running."""
     cfg = _resolve(target)
     if not cfg.power_serial_interface:
         err.print(
@@ -1189,15 +1212,17 @@ def power_state(
     daemon_url = _serial.daemon_url()
     if not daemon_url:
         err.print(
-            "[red]serialcap daemon is not running.[/red] Start it with: paniolo serial watch"
+            "[red]serialcap daemon is not running.[/red]"
+            " Start it with: paniolo serial watch"
         )
         raise typer.Exit(1)
 
     state = _serial.read_power_state(daemon_url, cfg.power_serial_interface)
     if state is None:
         err.print(
-            "[yellow]Power state unknown[/yellow] — sense signal may not be configured "
-            "on this interface. Run: paniolo serial setup --power-sense <cts|dsr|dcd|ri>"
+            "[yellow]Power state unknown[/yellow] — sense signal may not be"
+            " configured on this interface."
+            " Run: paniolo serial setup --power-sense <cts|dsr|dcd|ri>"
         )
         raise typer.Exit(1)
     if state:
@@ -1227,7 +1252,8 @@ def serial_setup(
             help=(
                 "FTDI modem-control input wired to the target 3.3 V rail "
                 "(cts | dsr | dcd | ri | none). "
-                "Enables power-state sensing in GET /status and smart power-cycle waits."
+                "Enables power-state sensing in GET /status and smart"
+                " power-cycle waits."
             ),
         ),
     ] = None,
@@ -1334,7 +1360,8 @@ def serial_dtr(
         typer.Option(
             "--interface",
             "-i",
-            help="Serial interface name (default: power_serial_interface or the only one)",
+            help="Serial interface name (default: power_serial_interface"
+            " or the only one)",
         ),
     ] = None,
 ) -> None:
@@ -1364,7 +1391,8 @@ def serial_reset(
         typer.Option(
             "--interface",
             "-i",
-            help="Serial interface name (default: power_serial_interface or the only one)",
+            help="Serial interface name (default: power_serial_interface"
+            " or the only one)",
         ),
     ] = None,
 ) -> None:
@@ -1420,7 +1448,8 @@ def serial_send(
     daemon_url = _serial.daemon_url()
     if not daemon_url:
         err.print(
-            "[red]serialcap daemon is not running.[/red] Start it with: paniolo serial watch"
+            "[red]serialcap daemon is not running.[/red]"
+            " Start it with: paniolo serial watch"
         )
         raise typer.Exit(1)
 
@@ -1492,9 +1521,8 @@ def serial_watch(
 
     _serial.start_daemon(cfg.serial_interfaces, port)
     names = ", ".join(i.name for i in cfg.serial_interfaces)
-    console.print(
-        f"[dim]Starting serial daemon for[/dim] {len(cfg.serial_interfaces)} interface(s): {names}…"
-    )
+    n = len(cfg.serial_interfaces)
+    console.print(f"[dim]Starting serial daemon for[/dim] {n} interface(s): {names}…")
 
     url = None
     for _ in range(50):
@@ -1608,7 +1636,8 @@ def serial_show(
     cfg = _resolve(target)
     if not cfg.serial_interfaces:
         console.print(
-            f"No serial interfaces configured for '{cfg.name}'. Run: paniolo serial setup"
+            f"No serial interfaces configured for '{cfg.name}'."
+            " Run: paniolo serial setup"
         )
         return
     url = _serial.daemon_url()
@@ -1809,13 +1838,13 @@ def _ensure_linux_groups() -> bool:
     Returns True if any group changes were made (meaning a re-login is needed
     for them to take effect).
     """
-    _REQUIRED_GROUPS = [
+    required_groups = [
         ("dialout", "serial port access (/dev/ttyUSB*, /dev/ttyACM*)"),
         ("video", "V4L2 capture device access (/dev/video*)"),
     ]
     username = pwd.getpwuid(os.getuid()).pw_name
     changed = False
-    for group, reason in _REQUIRED_GROUPS:
+    for group, reason in required_groups:
         try:
             grp.getgrnam(group)
         except KeyError:
@@ -1827,6 +1856,7 @@ def _ensure_linux_groups() -> bool:
                 ["sudo", "usermod", "-aG", group, username],
                 capture_output=True,
                 text=True,
+                check=False,
             )
             if result.returncode == 0:
                 console.print(f"  [green]✓[/green] {group:12s} added ({reason})")
@@ -1931,8 +1961,9 @@ def setup(
         Optional[str],
         typer.Option(
             "--host",
-            help="Provision this lab host over SSH (runs `paniolo setup` there) "
-            "instead of locally. Requires the paniolo CLI + source already on the host.",
+            help="Provision this lab host over SSH (runs `paniolo setup` there)"
+            " instead of locally."
+            " Requires the paniolo CLI + source already on the host.",
         ),
     ] = None,
 ) -> None:
@@ -1957,7 +1988,14 @@ def setup(
             )
         console.print(f"[dim]'{host}' is the local machine; setting up here.[/dim]")
 
-    repo = Path(__file__).parent.parent.parent
+    repo = _paths.repo_root()
+    if repo is None:
+        err.print(
+            "[red]paniolo source checkout not found.[/red] `paniolo setup` rebuilds "
+            "the Rust daemons and OCR helper from source, so it must run from a clone "
+            "(e.g. `make install`). cd into the paniolo repo and try again."
+        )
+        raise typer.Exit(1)
     cargo_bin = Path.home() / ".cargo" / "bin"
 
     # 1. macOS system tool: tftp-now via Homebrew.
@@ -1970,7 +2008,7 @@ def setup(
         tftp = shutil.which("tftp-now") or next(
             (
                 str(p)
-                for d in _netboot._BREW_PATHS
+                for d in _netboot._BREW_PATHS  # pylint: disable=protected-access
                 if (p := Path(d) / "tftp-now").exists()
             ),
             None,
@@ -1981,24 +2019,26 @@ def setup(
             console.print("  [dim]…[/dim] installing tftp-now via brew")
             try:
                 subprocess.run(["brew", "install", "tftp-now"], check=True)
-            except subprocess.CalledProcessError:
+            except subprocess.CalledProcessError as exc:
                 err.print(
                     "[yellow]tftp-now not in default tap.[/yellow] "
                     "Try: brew tap curl/curl && brew install tftp-now"
                 )
-                raise typer.Exit(1)
+                raise typer.Exit(1) from exc
     else:
         console.print(
             "  [dim]ℹ[/dim]  Linux: DHCP+TFTP are built-in. "
             "Before building, ensure system packages are installed:\n"
-            "    sudo apt-get install build-essential pkg-config libudev-dev libclang-dev"
+            "    sudo apt-get install build-essential pkg-config"
+            " libudev-dev libclang-dev"
         )
         console.print("\n[dim]Checking group membership…[/dim]")
         needs_relogin = _ensure_linux_groups()
         if needs_relogin:
             console.print(
-                "\n[yellow]Note:[/yellow] Group changes take effect after you log out and back in "
-                "(or run [bold]newgrp dialout[/bold] in the current shell)."
+                "\n[yellow]Note:[/yellow] Group changes take effect after you"
+                " log out and back in"
+                " (or run [bold]newgrp dialout[/bold] in the current shell)."
             )
 
     # 2. Rust daemons: cargo install into ~/.cargo/bin.
@@ -2013,20 +2053,22 @@ def setup(
             crate_dir = repo / crate
             if not (crate_dir / "Cargo.toml").exists():
                 console.print(
-                    f"  [yellow]…[/yellow] {crate}: source not found at {crate_dir}, skipping"
+                    f"  [yellow]…[/yellow] {crate}: source not found"
+                    f" at {crate_dir}, skipping"
                 )
                 continue
             console.print(
-                f"  [dim]building {crate} (cargo install — may take a few minutes)…[/dim]"
+                f"  [dim]building {crate}"
+                " (cargo install — may take a few minutes)…[/dim]"
             )
             try:
                 subprocess.run(
                     [cargo, "install", "--path", str(crate_dir), "--force"], check=True
                 )
                 console.print(f"  [green]✓[/green] {crate:12s} {cargo_bin / crate}")
-            except subprocess.CalledProcessError:
+            except subprocess.CalledProcessError as exc:
                 err.print(f"  [red]✗[/red] {crate}: cargo install failed")
-                raise typer.Exit(1)
+                raise typer.Exit(1) from exc
 
         # netbootd's macOS raw-frame send path needs a /dev/bpf descriptor, which
         # only root can open. Rather than run the whole daemon as root, install
@@ -2044,10 +2086,10 @@ def setup(
                     "(one-time sudo; the only root component)"
                 )
                 chown = subprocess.run(
-                    ["sudo", "chown", "root:wheel", str(helper)]
+                    ["sudo", "chown", "root:wheel", str(helper)], check=False
                 ).returncode
                 chmod = subprocess.run(
-                    ["sudo", "chmod", "4755", str(helper)]
+                    ["sudo", "chmod", "4755", str(helper)], check=False
                 ).returncode
                 if chown == 0 and chmod == 0:
                     console.print(
@@ -2062,7 +2104,8 @@ def setup(
                     )
             else:
                 console.print(
-                    "  [yellow]…[/yellow] netbootd-bpf-helper not found; skipping setuid install"
+                    "  [yellow]…[/yellow] netbootd-bpf-helper not found;"
+                    " skipping setuid install"
                 )
 
     # 3. OCR helper: visionocr on macOS, linuxocr on Linux.
@@ -2089,5 +2132,6 @@ def setup(
     console.print("\n[green]Setup complete.[/green]")
     if cargo and str(cargo_bin) not in os.environ.get("PATH", "").split(os.pathsep):
         console.print(
-            f"[yellow]Note:[/yellow] add {cargo_bin} to your PATH so the daemons resolve."
+            f"[yellow]Note:[/yellow] add {cargo_bin} to your PATH"
+            " so the daemons resolve."
         )

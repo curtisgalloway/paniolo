@@ -24,6 +24,8 @@ import types
 from paniolo import _video
 from paniolo._video import VideoConfig
 
+# pylint: disable=protected-access
+
 
 def _run(stdout: str = "", returncode: int = 0):
     return types.SimpleNamespace(stdout=stdout, returncode=returncode)
@@ -65,13 +67,13 @@ def test_list_devices_parses_indexed_lines(monkeypatch):
 
 def test_list_devices_empty_when_binary_missing(monkeypatch):
     monkeypatch.setattr(_video, "hdmicap_binary", lambda: None)
-    assert _video.list_devices() == []
+    assert not _video.list_devices()
 
 
 def test_list_devices_empty_on_nonzero_exit(monkeypatch):
     monkeypatch.setattr(_video, "hdmicap_binary", lambda: "/usr/bin/hdmicap")
     monkeypatch.setattr(_video.subprocess, "run", lambda *a, **k: _run("x", 1))
-    assert _video.list_devices() == []
+    assert not _video.list_devices()
 
 
 # ── capture-device heuristic ────────────────────────────────────────────────

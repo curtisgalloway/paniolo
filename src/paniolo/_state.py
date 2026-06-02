@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Persistent runtime state for paniolo — netboot PID records and liveness checks."""
+
 from __future__ import annotations
 
 import dataclasses
@@ -27,6 +29,8 @@ STATE_DIR = Path.home() / ".local" / "share" / "paniolo"
 
 @dataclasses.dataclass
 class NetbootState:
+    """Persisted record of an active netboot session for a single target."""
+
     target: str
     dhcp_pid: int
     tftp_pid: int
@@ -108,6 +112,7 @@ def _pid_cmdline(pid: int) -> str:
             ["ps", "-p", str(pid), "-o", "args="],
             capture_output=True,
             text=True,
+            check=False,
         )
         return result.stdout.strip()
     except Exception:  # pylint: disable=broad-except
@@ -137,7 +142,6 @@ def is_netboot_running(target: str) -> bool:
         return False
     if state.engine == "rust":
         return is_paniolo_child_alive(state.dhcp_pid, "netbootd")
-    return (
-        is_paniolo_child_alive(state.dhcp_pid, "paniolo._dhcp")
-        and is_paniolo_child_alive(state.tftp_pid, "paniolo._tftp")
-    )
+    return is_paniolo_child_alive(
+        state.dhcp_pid, "paniolo._dhcp"
+    ) and is_paniolo_child_alive(state.tftp_pid, "paniolo._tftp")

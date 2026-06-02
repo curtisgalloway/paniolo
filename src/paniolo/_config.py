@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Target configuration — load, save, and parse TOML config files for paniolo."""
+
 from __future__ import annotations
 
 import dataclasses
@@ -47,6 +49,8 @@ class SerialInterface:
 
 @dataclasses.dataclass
 class TargetConfig:
+    """Configuration record for a single paniolo-managed target machine."""
+
     name: str
     interface: str
     host_ip: str = "192.168.99.1"
@@ -157,11 +161,13 @@ def _from_dict(data: dict) -> TargetConfig:
             )
         )
 
-    _known = {f.name for f in dataclasses.fields(TargetConfig)} - {"serial_interfaces"}
-    unknown = set(data) - _known
+    known_fields = {f.name for f in dataclasses.fields(TargetConfig)} - {
+        "serial_interfaces"
+    }
+    unknown = set(data) - known_fields
     if unknown:
         log.warning("ignoring unknown config keys: %s", ", ".join(sorted(unknown)))
-    data = {k: v for k, v in data.items() if k in _known}
+    data = {k: v for k, v in data.items() if k in known_fields}
     return TargetConfig(serial_interfaces=interfaces, **data)
 
 

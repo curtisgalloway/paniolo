@@ -23,6 +23,8 @@ import pytest
 from paniolo import _config
 from paniolo._config import SerialInterface, TargetConfig
 
+# pylint: disable=protected-access
+
 
 def roundtrip(cfg: TargetConfig) -> TargetConfig:
     return _config._from_dict(tomllib.loads(_config._to_toml(cfg)))
@@ -48,21 +50,28 @@ def test_roundtrip_multiple_interfaces():
 
 def test_roundtrip_no_interfaces():
     got = roundtrip(TargetConfig(name="x", interface="en0"))
-    assert got.serial_interfaces == []
+    assert not got.serial_interfaces
 
 
 def test_legacy_single_serial_migrates():
     data = tomllib.loads(
-        'name = "x"\ninterface = "en0"\nserial_device = "/dev/ttyUSB0"\nserial_baud = 57600\n'
+        'name = "x"\ninterface = "en0"\n'
+        'serial_device = "/dev/ttyUSB0"\nserial_baud = 57600\n'
     )
     cfg = _config._from_dict(data)
     assert len(cfg.serial_interfaces) == 1
     iface = cfg.serial_interfaces[0]
-    assert (iface.name, iface.device, iface.baud) == (_config.DEFAULT_SERIAL_NAME, "/dev/ttyUSB0", 57600)
+    assert (iface.name, iface.device, iface.baud) == (
+        _config.DEFAULT_SERIAL_NAME,
+        "/dev/ttyUSB0",
+        57600,
+    )
 
 
 def test_legacy_default_baud():
-    data = tomllib.loads('name = "x"\ninterface = "en0"\nserial_device = "/dev/ttyUSB0"\n')
+    data = tomllib.loads(
+        'name = "x"\ninterface = "en0"\nserial_device = "/dev/ttyUSB0"\n'
+    )
     assert _config._from_dict(data).serial_interfaces[0].baud == 115200
 
 
@@ -70,7 +79,10 @@ def test_serial_interface_resolution():
     cfg = TargetConfig(
         name="x",
         interface="en0",
-        serial_interfaces=[SerialInterface("console", "/dev/a"), SerialInterface("bmc", "/dev/b")],
+        serial_interfaces=[
+            SerialInterface("console", "/dev/a"),
+            SerialInterface("bmc", "/dev/b"),
+        ],
     )
     assert cfg.serial_interface("bmc").device == "/dev/b"
     with pytest.raises(ValueError):
@@ -80,7 +92,11 @@ def test_serial_interface_resolution():
 
 
 def test_serial_interface_single_is_default():
-    cfg = TargetConfig(name="x", interface="en0", serial_interfaces=[SerialInterface("console", "/dev/a")])
+    cfg = TargetConfig(
+        name="x",
+        interface="en0",
+        serial_interfaces=[SerialInterface("console", "/dev/a")],
+    )
     assert cfg.serial_interface().name == "console"
 
 
@@ -94,14 +110,20 @@ def test_upsert_replaces_same_name():
     cfg.upsert_serial_interface(SerialInterface("console", "/dev/a", 115200))
     cfg.upsert_serial_interface(SerialInterface("console", "/dev/a2", 9600))
     assert len(cfg.serial_interfaces) == 1
-    assert (cfg.serial_interfaces[0].device, cfg.serial_interfaces[0].baud) == ("/dev/a2", 9600)
+    assert (cfg.serial_interfaces[0].device, cfg.serial_interfaces[0].baud) == (
+        "/dev/a2",
+        9600,
+    )
 
 
 def test_remove_interface():
     cfg = TargetConfig(
         name="x",
         interface="en0",
-        serial_interfaces=[SerialInterface("console", "/dev/a"), SerialInterface("bmc", "/dev/b")],
+        serial_interfaces=[
+            SerialInterface("console", "/dev/a"),
+            SerialInterface("bmc", "/dev/b"),
+        ],
     )
     assert cfg.remove_serial_interface("console") is True
     assert cfg.remove_serial_interface("console") is False
@@ -110,8 +132,10 @@ def test_remove_interface():
 
 # --- S2: TOML control-character escaping -----------------------------------
 
+
 def test_toml_roundtrip_newline_in_power_cycle_cmd():
-    """Newlines in string values must survive a TOML round-trip without breaking the file."""
+    """Newlines in string values must survive a TOML round-trip without
+    breaking the file."""
     cfg = TargetConfig(name="x", interface="en0", power_cycle_cmd="cmd1\ncmd2")
     got = roundtrip(cfg)
     assert got.power_cycle_cmd == "cmd1\ncmd2"
@@ -131,6 +155,7 @@ def test_toml_kv_escapes_backslash():
 
 
 # --- C2: unknown TOML keys are ignored gracefully --------------------------
+
 
 def test_unknown_keys_in_toml_are_silently_dropped():
     data = tomllib.loads('name = "x"\ninterface = "en0"\nunknown_future_key = "foo"\n')

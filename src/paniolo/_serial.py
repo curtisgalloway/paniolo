@@ -20,6 +20,9 @@ Two paths share this module:
   WebSocket for the combined video+serial dashboard (`paniolo serial watch`)
 """
 
+# Single quotes nested in double-quoted f-strings are required on Python 3.11.
+# pylint: disable=inconsistent-quotes
+
 from __future__ import annotations
 
 import glob
@@ -170,7 +173,9 @@ def daemon_url() -> Optional[str]:
     return f"http://127.0.0.1:{disc['port']}"
 
 
-def interface_arg(name: str, device: str, baud: int, power_sense_signal: Optional[str] = None) -> str:
+def interface_arg(
+    name: str, device: str, baud: int, power_sense_signal: Optional[str] = None
+) -> str:
     """Format one interface for the daemon's repeatable --interface flag.
 
     Format: NAME=DEVICE[@BAUD][:SENSE]
@@ -183,18 +188,20 @@ def interface_arg(name: str, device: str, baud: int, power_sense_signal: Optiona
     return arg
 
 
-def input_url(daemon_url: str, interface_name: str, pace_ms: int = 0) -> str:
+def input_url(base_url: str, interface_name: str, pace_ms: int = 0) -> str:
     """Build the POST /input URL for sending bytes through the running daemon.
 
     pace_ms > 0 drips the bytes one at a time that many ms apart, the substitute
     for hardware flow control on a slow polled console with no flow control."""
-    url = f"{daemon_url}/input?interface={interface_name}"
+    url = f"{base_url}/input?interface={interface_name}"
     if pace_ms:
         url += f"&pace_ms={pace_ms}"
     return url
 
 
-def send_input(daemon_url: str, interface_name: str, data: bytes, pace_ms: int = 0) -> int:
+def send_input(
+    base_url: str, interface_name: str, data: bytes, pace_ms: int = 0
+) -> int:
     """POST raw bytes to the serial port the daemon owns; return bytes written.
 
     Input coexists with live capture — the daemon writes to the port it already
@@ -205,14 +212,16 @@ def send_input(daemon_url: str, interface_name: str, data: bytes, pace_ms: int =
 
     Raises RuntimeError on HTTP error, OSError on network failure.
     """
-    url = input_url(daemon_url, interface_name, pace_ms)
+    url = input_url(base_url, interface_name, pace_ms)
     req = urllib.request.Request(url, method="POST", data=data)
     timeout = max(15.0, len(data) * pace_ms / 1000.0 + 10.0)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             resp.read()
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"serialcap /input returned {exc.code}: {exc.reason}") from exc
+        raise RuntimeError(
+            f"serialcap /input returned {exc.code}: {exc.reason}"
+        ) from exc
     return len(data)
 
 
@@ -229,12 +238,14 @@ def daemon_cmd(
     for iface in interfaces:
         cmd += [
             "--interface",
-            interface_arg(iface.name, iface.device, iface.baud, iface.power_sense_signal),
+            interface_arg(
+                iface.name, iface.device, iface.baud, iface.power_sense_signal
+            ),
         ]
     return cmd
 
 
-def wait_power_off(daemon_url: str, interface_name: str, timeout_s: float = 10.0) -> bool:
+def wait_power_off(base_url: str, interface_name: str, timeout_s: float = 10.0) -> bool:
     """Poll GET /status until power_on == False or timeout.
 
     Returns True if the power-off was confirmed by the sense signal before the
@@ -244,27 +255,27 @@ def wait_power_off(daemon_url: str, interface_name: str, timeout_s: float = 10.0
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         try:
-            url = f"{daemon_url}/status?interface={interface_name}"
+            url = f"{base_url}/status?interface={interface_name}"
             req = urllib.request.Request(url)
             with urllib.request.urlopen(req, timeout=2) as resp:
                 data = json.loads(resp.read())
                 if data.get("power_on") is False:
                     return True
-        except Exception:
+        except Exception:  # pylint: disable=broad-exception-caught
             pass
         time.sleep(0.5)
     return False
 
 
-def read_power_state(daemon_url: str, interface_name: str) -> Optional[bool]:
+def read_power_state(base_url: str, interface_name: str) -> Optional[bool]:
     """Return the current power state from the daemon status, or None if unknown."""
     try:
-        url = f"{daemon_url}/status?interface={interface_name}"
+        url = f"{base_url}/status?interface={interface_name}"
         req = urllib.request.Request(url)
         with urllib.request.urlopen(req, timeout=2) as resp:
             data = json.loads(resp.read())
             return data.get("power_on")
-    except Exception:
+    except Exception:  # pylint: disable=broad-exception-caught
         return None
 
 

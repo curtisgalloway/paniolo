@@ -31,8 +31,8 @@ from __future__ import annotations
 import json
 from typing import Optional
 
-from . import _config, _ssh
-from ._config import TargetConfig
+from . import _ssh
+from ._config import TargetConfig, _to_toml as _config_to_toml
 from ._ssh import Host
 
 TARGET_CONFIG_ENV = "PANIOLO_TARGET_CONFIG"
@@ -82,7 +82,7 @@ _SHIP_SCRIPT = (
 
 def ship_config(host: Host, cfg: TargetConfig) -> str:
     """Write ``cfg`` to a temp file on ``host`` and return its remote path."""
-    toml = _config._to_toml(cfg)
+    toml = _config_to_toml(cfg)
     result = _ssh.run(host, ["sh", "-c", _SHIP_SCRIPT], stdin=toml)
     path = result.stdout.strip()
     if result.returncode != 0 or not path:

@@ -17,6 +17,8 @@ back-compat `engine` default), PID liveness probes, and the per-engine
 `is_netboot_running` logic. No real processes or state dir are touched —
 STATE_DIR is redirected to a tmp dir and os/subprocess probes are stubbed."""
 
+# pylint: disable=redefined-outer-name,unused-argument
+
 from __future__ import annotations
 
 import json
@@ -156,7 +158,7 @@ def test_child_alive_short_circuits_when_pid_dead(monkeypatch):
     checked = []
     monkeypatch.setattr(_state, "_pid_cmdline", lambda pid: checked.append(pid) or "")
     assert _state.is_paniolo_child_alive(99, "anything") is False
-    assert checked == [], "cmdline must not be read once the PID is known dead"
+    assert not checked, "cmdline must not be read once the PID is known dead"
 
 
 # ── is_netboot_running (per-engine) ─────────────────────────────────────────

@@ -72,7 +72,9 @@ def iface_addresses(interface: str) -> dict:
     inet: list[str] = []
     inet6: list[str] = []
     if sys.platform == "darwin":
-        result = subprocess.run(["ifconfig", interface], capture_output=True, text=True)
+        result = subprocess.run(
+            ["ifconfig", interface], capture_output=True, text=True, check=False
+        )
         for line in result.stdout.splitlines():
             s = line.strip()
             if s.startswith("inet "):
@@ -85,6 +87,7 @@ def iface_addresses(interface: str) -> dict:
         ["ip", "-brief", "addr", "show", "dev", interface],
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode == 0:
         # `ip -brief` columns: <iface> <state> <addr> <addr> ...
@@ -111,6 +114,7 @@ def ipv6_peers(interface: str) -> list[str]:
         ["ip", "-6", "neigh", "show", "dev", interface],
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode != 0:
         return []
@@ -169,6 +173,7 @@ def _add_host_ll(interface: str) -> None:
         ],
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode != 0 and "exists" not in result.stderr.lower():
         raise RuntimeError(

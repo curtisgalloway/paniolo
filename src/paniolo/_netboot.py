@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Netboot lifecycle management: start, stop, status, and interface helpers."""
+
+# Single quotes nested in double-quoted f-strings are required on Python 3.11.
+# pylint: disable=inconsistent-quotes
+
 from __future__ import annotations
 
 import os
@@ -88,7 +93,11 @@ def _is_interface_active(device: str) -> bool:
             return False
     else:
         try:
-            carrier = Path(f"/sys/class/net/{device}/carrier").read_text().strip()
+            carrier = (
+                Path(f"/sys/class/net/{device}/carrier")
+                .read_text(encoding="utf-8")
+                .strip()
+            )
             return carrier == "1"
         except OSError:
             return False
@@ -162,8 +171,6 @@ def list_usb_ethernet_interfaces() -> list[dict]:
     return sorted(candidates, key=lambda x: (not x["active"], x["device"]))
 
 
-
-
 def _resolve_netbootd() -> str:
     """Locate the installed netbootd binary (rust netboot engine).
 
@@ -176,9 +183,7 @@ def _resolve_netbootd() -> str:
     cargo_bin = Path.home() / ".cargo" / "bin" / "netbootd"
     if cargo_bin.exists():
         return str(cargo_bin)
-    raise RuntimeError(
-        "netbootd not found. Build and install it with: paniolo setup"
-    )
+    raise RuntimeError("netbootd not found. Build and install it with: paniolo setup")
 
 
 def _spawn(
@@ -189,7 +194,7 @@ def _spawn(
 ) -> subprocess.Popen:
     if not append:
         log_path.unlink(missing_ok=True)
-    log_file = open(log_path, "a")
+    log_file = open(log_path, "a", encoding="utf-8")
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     if extra_env:
         env.update(extra_env)
@@ -225,8 +230,10 @@ def _sudo_prefix() -> list[str]:
 
 
 def _find_network_service(interface: str) -> str | None:
-    """Return the networksetup service name for a given device (e.g. 'en11' → 'USB 10/100/1000 LAN').
-    macOS only; returns None on Linux."""
+    """Return the networksetup service name for a given device.
+
+    Example: 'en11' -> 'USB 10/100/1000 LAN'. macOS only; returns None on Linux.
+    """
     if sys.platform != "darwin":
         return None
     try:
@@ -294,18 +301,27 @@ def _configure_interface(interface: str, host_ip: str) -> None:
         service = _find_network_service(interface)
         if service:
             subprocess.run(
-                ["sudo", "networksetup", "-setmanual", service, host_ip, "255.255.255.0"],
+                [
+                    "sudo",
+                    "networksetup",
+                    "-setmanual",
+                    service,
+                    host_ip,
+                    "255.255.255.0",
+                ],
                 check=False,
             )
         result = subprocess.run(
             ["sudo", "ifconfig", interface, host_ip, "netmask", "255.255.255.0", "up"],
             capture_output=True,
             text=True,
+            check=False,
         )
         if result.returncode != 0:
             raise RuntimeError(
                 f"ifconfig {interface} failed: {result.stderr.strip()}\n"
-                "Ensure passwordless sudo is configured (NOPASSWD) for the control machine."
+                "Ensure passwordless sudo is configured (NOPASSWD) for the"
+                " control machine."
             )
     else:
         # Remove any existing addresses on this interface, then assign ours.
@@ -319,11 +335,14 @@ def _configure_interface(interface: str, host_ip: str) -> None:
             ["sudo", "ip", "addr", "add", f"{host_ip}/24", "dev", interface],
             capture_output=True,
             text=True,
+            check=False,
         )
         if result.returncode != 0 and "already assigned" not in result.stderr:
             raise RuntimeError(
-                f"ip addr add {host_ip}/24 dev {interface} failed: {result.stderr.strip()}\n"
-                "Ensure passwordless sudo is configured (NOPASSWD) for the control machine."
+                f"ip addr add {host_ip}/24 dev {interface} failed:"
+                f" {result.stderr.strip()}\n"
+                "Ensure passwordless sudo is configured (NOPASSWD) for the"
+                " control machine."
             )
         subprocess.run(
             ["sudo", "ip", "link", "set", interface, "up"],
@@ -365,7 +384,12 @@ def _tune_arp_for_silent_client() -> None:
         ("net.link.ether.inet.arp_llreach_base", "0"),
         ("net.link.ether.inet.host_down_time", "0"),
     ):
-        subprocess.run(["sudo", "sysctl", "-w", f"{key}={val}"], capture_output=True, text=True)
+        subprocess.run(
+            ["sudo", "sysctl", "-w", f"{key}={val}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
 
 def _cleanup_stale(target: str) -> None:
@@ -403,9 +427,12 @@ def _start_rust(
     netbootd = _resolve_netbootd()
     args = [
         netbootd,
-        "--host-ip", cfg.host_ip,
-        "--tftp-root", str(tftp_root),
-        "--interface", cfg.interface,
+        "--host-ip",
+        cfg.host_ip,
+        "--tftp-root",
+        str(tftp_root),
+        "--interface",
+        cfg.interface,
     ]
     if sudo:
         # sudo resets the environment; inject NO_COLOR through the `env` in the
@@ -414,16 +441,18 @@ def _start_rust(
     else:
         proc = _spawn(args, log_path, extra_env={"NO_COLOR": "1"})
 
-    save_netboot_state(NetbootState(
-        target=cfg.name,
-        # Single process; both pid fields hold the netbootd PID (see NetbootState).
-        dhcp_pid=proc.pid,
-        tftp_pid=proc.pid,
-        started_at=time.time(),
-        interface=cfg.interface,
-        tftp_root=str(tftp_root),
-        engine="rust",
-    ))
+    save_netboot_state(
+        NetbootState(
+            target=cfg.name,
+            # Single process; both pid fields hold the netbootd PID (see NetbootState).
+            dhcp_pid=proc.pid,
+            tftp_pid=proc.pid,
+            started_at=time.time(),
+            interface=cfg.interface,
+            tftp_root=str(tftp_root),
+            engine="rust",
+        )
+    )
 
 
 def start(cfg: TargetConfig, engine: str = "rust") -> None:
@@ -435,12 +464,13 @@ def start(cfg: TargetConfig, engine: str = "rust") -> None:
     missing = check_deps()
     if missing:
         raise RuntimeError(
-            f"Missing required tools: {', '.join(missing)}\n"
-            "Run: paniolo setup"
+            f"Missing required tools: {', '.join(missing)}\n" "Run: paniolo setup"
         )
 
     if not cfg.tftp_root:
-        raise RuntimeError("No tftp_root configured. Run: paniolo target set <name> --tftp-root <path>")
+        raise RuntimeError(
+            "No tftp_root configured. Run: paniolo target set <name> --tftp-root <path>"
+        )
     tftp_root = Path(cfg.tftp_root)
     if not tftp_root.exists():
         raise RuntimeError(f"TFTP root does not exist: {tftp_root}")
@@ -466,7 +496,15 @@ def start(cfg: TargetConfig, engine: str = "rust") -> None:
         return
 
     dhcp = _spawn(
-        sudo + [sys.executable, "-m", "paniolo._dhcp", cfg.host_ip, "--interface", cfg.interface],
+        sudo
+        + [
+            sys.executable,
+            "-m",
+            "paniolo._dhcp",
+            cfg.host_ip,
+            "--interface",
+            cfg.interface,
+        ],
         log_path,
     )
     # Pure-Python TFTP server. Binds the listen socket on the wildcard so a
@@ -474,20 +512,30 @@ def start(cfg: TargetConfig, engine: str = "rust") -> None:
     # (see _sudo_prefix). Each reply socket is bound to cfg.host_ip so the
     # OS routes transfers out the correct secondary interface (see _tftp.py).
     tftp = _spawn(
-        sudo + [sys.executable, "-m", "paniolo._tftp", cfg.host_ip, str(tftp_root),
-                "--interface", cfg.interface],
+        sudo
+        + [
+            sys.executable,
+            "-m",
+            "paniolo._tftp",
+            cfg.host_ip,
+            str(tftp_root),
+            "--interface",
+            cfg.interface,
+        ],
         log_path,
         append=True,
     )
 
-    save_netboot_state(NetbootState(
-        target=cfg.name,
-        dhcp_pid=dhcp.pid,
-        tftp_pid=tftp.pid,
-        started_at=time.time(),
-        interface=cfg.interface,
-        tftp_root=str(tftp_root),
-    ))
+    save_netboot_state(
+        NetbootState(
+            target=cfg.name,
+            dhcp_pid=dhcp.pid,
+            tftp_pid=tftp.pid,
+            started_at=time.time(),
+            interface=cfg.interface,
+            tftp_root=str(tftp_root),
+        )
+    )
 
 
 def stop(target: str) -> None:
@@ -547,5 +595,7 @@ def get_status(target: str) -> dict:
         "interface": state.interface,
         "tftp_root": state.tftp_root,
         "started_at": state.started_at,
-        "uptime_seconds": time.time() - state.started_at if (dhcp_alive and tftp_alive) else None,
+        "uptime_seconds": time.time() - state.started_at
+        if (dhcp_alive and tftp_alive)
+        else None,
     }
