@@ -460,3 +460,155 @@ fn describe(t: &tokio_serial::SerialPortType) -> String {
         SerialPortType::Unknown => "unknown".into(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_serial::{SerialPortType, UsbPortInfo};
+
+    fn ring() -> Arc<Mutex<VecDeque<u8>>> {
+        Arc::new(Mutex::new(VecDeque::new()))
+    }
+
+    fn snapshot(r: &Arc<Mutex<VecDeque<u8>>>) -> Vec<u8> {
+        r.lock().unwrap().iter().copied().collect()
+    }
+
+    // ── push_ring: scrollback ring-buffer truncation ────────────────────────
+
+    #[test]
+    fn push_ring_accumulates_in_order() {
+        let r = ring();
+        push_ring(&r, b"hello ");
+        push_ring(&r, b"world");
+        assert_eq!(snapshot(&r), b"hello world");
+    }
+
+    #[test]
+    fn push_ring_truncates_to_capacity_keeping_newest() {
+        let r = ring();
+        push_ring(&r, &vec![b'A'; RING_BYTES]); // fill exactly to capacity
+        push_ring(&r, b"XYZ"); // 3 bytes over -> 3 oldest dropped
+        let snap = snapshot(&r);
+        assert_eq!(snap.len(), RING_BYTES, "never grows past RING_BYTES");
+        assert_eq!(&snap[snap.len() - 3..], b"XYZ", "newest bytes retained");
+        assert!(
+            snap[..RING_BYTES - 3].iter().all(|&b| b == b'A'),
+            "exactly the 3 oldest bytes were evicted"
+        );
+    }
+
+    #[test]
+    fn push_ring_single_oversized_chunk_keeps_tail() {
+        let r = ring();
+        let big: Vec<u8> = (0..(RING_BYTES as u32 + 100)).map(|i| i as u8).collect();
+        push_ring(&r, &big);
+        let snap = snapshot(&r);
+        assert_eq!(snap.len(), RING_BYTES);
+        assert_eq!(
+            snap,
+            big[big.len() - RING_BYTES..],
+            "keeps the most-recent window"
+        );
+    }
+
+    // ── describe: port-type formatting ──────────────────────────────────────
+
+    #[test]
+    fn describe_usb_with_full_info() {
+        let info = UsbPortInfo {
+            vid: 0x0403,
+            pid: 0x6001,
+            serial_number: Some("ABC123".into()),
+            manufacturer: Some("FTDI".into()),
+            product: Some("FT232R USB UART".into()),
+        };
+        assert_eq!(
+            describe(&SerialPortType::UsbPort(info)),
+            "USB 0403:6001 FTDI FT232R USB UART"
+        );
+    }
+
+    #[test]
+    fn describe_usb_trims_when_manufacturer_and_product_absent() {
+        let info = UsbPortInfo {
+            vid: 0x1234,
+            pid: 0x5678,
+            serial_number: None,
+            manufacturer: None,
+            product: None,
+        };
+        assert_eq!(describe(&SerialPortType::UsbPort(info)), "USB 1234:5678");
+    }
+
+    #[test]
+    fn describe_non_usb_variants() {
+        assert_eq!(describe(&SerialPortType::PciPort), "PCI");
+        assert_eq!(describe(&SerialPortType::BluetoothPort), "Bluetooth");
+        assert_eq!(describe(&SerialPortType::Unknown), "unknown");
+    }
+
+    // ── write_paced: the `serial send` pacing fan-out ───────────────────────
+
+    fn test_handle() -> (SerialHandle, mpsc::Receiver<Bytes>) {
+        let (to_clients, _) = broadcast::channel(16);
+        let (write_tx, write_rx) = mpsc::channel(WRITE_CAP);
+        let (dtr_tx, _dtr_rx) = mpsc::channel(1);
+        let status = Arc::new(Mutex::new(Status {
+            device: "test".into(),
+            baud: 115_200,
+            connected: false,
+            power_on: None,
+        }));
+        let handle = SerialHandle {
+            to_clients,
+            write_tx,
+            ring: ring(),
+            status,
+            dtr_tx,
+        };
+        // _dtr_rx is held by the caller's scope only long enough to build the
+        // handle; write_paced never touches the DTR path.
+        drop(_dtr_rx);
+        (handle, write_rx)
+    }
+
+    #[tokio::test]
+    async fn write_paced_zero_sends_whole_buffer_as_one_message() {
+        let (h, mut rx) = test_handle();
+        h.write_paced(Bytes::from_static(b"hello"), Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"hello"));
+        assert!(rx.try_recv().is_err(), "exactly one message at line rate");
+    }
+
+    #[tokio::test]
+    async fn write_paced_nonzero_drips_one_byte_per_message_in_order() {
+        let (h, mut rx) = test_handle();
+        h.write_paced(Bytes::from_static(b"abc"), Duration::from_millis(1))
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        while let Ok(b) = rx.try_recv() {
+            got.push(b);
+        }
+        assert_eq!(
+            got,
+            vec![
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+                Bytes::from_static(b"c"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn write_paced_empty_buffer_sends_nothing_when_paced() {
+        let (h, mut rx) = test_handle();
+        h.write_paced(Bytes::new(), Duration::from_millis(1))
+            .await
+            .unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+}
