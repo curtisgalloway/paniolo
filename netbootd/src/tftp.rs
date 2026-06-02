@@ -446,3 +446,474 @@ pub async fn serve(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A unique, freshly-created temp dir (mirrors the sibling crates' pattern —
+    /// no `tempfile` dependency).
+    fn tmp() -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let p = std::env::temp_dir().join(format!(
+            "netbootd-test-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// Build an RRQ payload: opcode + filename\0mode\0[opt\0val\0]...
+    fn rrq(filename: &str, mode: &str, opts: &[(&str, &str)]) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&OP_RRQ.to_be_bytes());
+        p.extend_from_slice(filename.as_bytes());
+        p.push(0);
+        p.extend_from_slice(mode.as_bytes());
+        p.push(0);
+        for (k, v) in opts {
+            p.extend_from_slice(k.as_bytes());
+            p.push(0);
+            p.extend_from_slice(v.as_bytes());
+            p.push(0);
+        }
+        p
+    }
+
+    #[test]
+    fn parse_rrq_basic() {
+        let r = parse_rrq(&rrq("kernel_2712.img", "octet", &[])).expect("parses");
+        assert_eq!(r.filename, "kernel_2712.img");
+        assert_eq!(r.mode, "octet");
+        assert_eq!(r.blksize, None);
+        assert!(!r.want_tsize);
+    }
+
+    #[test]
+    fn parse_rrq_lowercases_mode() {
+        // RFC 1350: the mode string is case-insensitive.
+        let r = parse_rrq(&rrq("f", "OCTET", &[])).unwrap();
+        assert_eq!(r.mode, "octet");
+    }
+
+    #[test]
+    fn parse_rrq_honors_blksize_and_tsize() {
+        let r = parse_rrq(&rrq("f", "octet", &[("blksize", "1024"), ("tsize", "0")])).unwrap();
+        assert_eq!(r.blksize, Some(1024));
+        assert!(r.want_tsize);
+    }
+
+    #[test]
+    fn parse_rrq_clamps_blksize() {
+        // Below the RFC 2348 floor (8) and above our ceiling (65464) are clamped.
+        assert_eq!(
+            parse_rrq(&rrq("f", "octet", &[("blksize", "1")]))
+                .unwrap()
+                .blksize,
+            Some(8)
+        );
+        assert_eq!(
+            parse_rrq(&rrq("f", "octet", &[("blksize", "70000")]))
+                .unwrap()
+                .blksize,
+            Some(65464)
+        );
+    }
+
+    #[test]
+    fn parse_rrq_ignores_unparseable_blksize() {
+        let r = parse_rrq(&rrq("f", "octet", &[("blksize", "huge")])).unwrap();
+        assert_eq!(
+            r.blksize, None,
+            "non-numeric blksize is dropped, not defaulted"
+        );
+    }
+
+    #[test]
+    fn parse_rrq_ignores_unknown_options() {
+        let r = parse_rrq(&rrq("f", "octet", &[("windowsize", "4"), ("tsize", "0")])).unwrap();
+        assert!(r.want_tsize);
+        assert_eq!(r.blksize, None);
+    }
+
+    #[test]
+    fn parse_rrq_rejects_missing_mode() {
+        // Only a filename, no NUL-terminated mode field.
+        let mut p = Vec::new();
+        p.extend_from_slice(&OP_RRQ.to_be_bytes());
+        p.extend_from_slice(b"file");
+        assert!(parse_rrq(&p).is_none());
+    }
+
+    #[test]
+    fn error_packet_layout() {
+        let p = error_packet(ERR_NOT_FOUND, "file not found");
+        assert_eq!(u16::from_be_bytes([p[0], p[1]]), OP_ERROR);
+        assert_eq!(u16::from_be_bytes([p[2], p[3]]), ERR_NOT_FOUND);
+        assert_eq!(&p[4..p.len() - 1], b"file not found");
+        assert_eq!(*p.last().unwrap(), 0, "error message is NUL-terminated");
+    }
+
+    #[test]
+    fn resolve_accepts_file_inside_root() {
+        let root = tmp();
+        fs::write(root.join("kernel.img"), b"x").unwrap();
+        let got = resolve(&root, "kernel.img").expect("file in root resolves");
+        assert!(got.ends_with("kernel.img"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_strips_leading_slash() {
+        let root = tmp();
+        fs::write(root.join("boot.img"), b"x").unwrap();
+        // An absolute-looking request is treated as relative to root, never as
+        // a host filesystem path.
+        assert!(resolve(&root, "/boot.img").is_some());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_rejects_traversal_outside_root() {
+        // Lay out  base/secret  and serve from  base/served . A "../secret"
+        // request must be rejected even though the target genuinely exists.
+        let base = tmp();
+        let served = base.join("served");
+        fs::create_dir_all(&served).unwrap();
+        fs::write(base.join("secret"), b"top secret").unwrap();
+
+        assert!(
+            resolve(&served, "../secret").is_none(),
+            "must not escape root"
+        );
+        assert!(resolve(&served, "../../etc/passwd").is_none());
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn resolve_rejects_missing_file() {
+        let root = tmp();
+        // canonicalize() fails for a nonexistent path -> None (no info leak about
+        // whether a sibling outside root exists).
+        assert!(resolve(&root, "nope.img").is_none());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // ── Loopback transfer tests ──────────────────────────────────────────────
+    //
+    // These drive the real async DATA/ACK engine (`handle_rrq` →
+    // `send_and_wait_ack` → `send_pkt`) over a 127.0.0.1 UDP pair. `BpfSender`
+    // is the inert `unavailable()` form on every platform, so `send_pkt` always
+    // takes the ordinary `send_to` path — no hardware, no raw frames, no root.
+
+    /// An `Xfer` that always uses the kernel `send_to` path (BPF unavailable).
+    fn loopback_xfer() -> Xfer {
+        Xfer {
+            host_ip: Ipv4Addr::LOCALHOST,
+            bpf: Arc::new(BpfSender::unavailable()),
+            client_mac: None,
+        }
+    }
+
+    fn ack(block: u16) -> [u8; 4] {
+        let mut a = [0u8; 4];
+        a[..2].copy_from_slice(&OP_ACK.to_be_bytes());
+        a[2..].copy_from_slice(&block.to_be_bytes());
+        a
+    }
+
+    /// Drive the read side of a transfer: ACK every OACK/DATA, accumulate the
+    /// payload and the block-number sequence. `blksize` is the negotiated size,
+    /// used to spot the final (short) block. Returns (bytes, blocks_seen).
+    async fn recv_transfer(sock: &UdpSocket, blksize: usize) -> (Vec<u8>, Vec<u16>) {
+        let mut data = Vec::new();
+        let mut blocks = Vec::new();
+        let mut buf = vec![0u8; 2048];
+        loop {
+            let (n, from) = sock.recv_from(&mut buf).await.unwrap();
+            match u16::from_be_bytes([buf[0], buf[1]]) {
+                OP_OACK => {
+                    sock.send_to(&ack(0), from).await.unwrap();
+                }
+                OP_DATA => {
+                    let blk = u16::from_be_bytes([buf[2], buf[3]]);
+                    blocks.push(blk);
+                    data.extend_from_slice(&buf[4..n]);
+                    sock.send_to(&ack(blk), from).await.unwrap();
+                    if n - 4 < blksize {
+                        break;
+                    }
+                }
+                other => panic!("unexpected opcode {other} during transfer"),
+            }
+        }
+        (data, blocks)
+    }
+
+    /// Bind a loopback client socket and return it with its address (the `peer`
+    /// the server sends to).
+    async fn client_socket() -> (UdpSocket, SocketAddr) {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        (sock, addr)
+    }
+
+    #[tokio::test]
+    async fn transfer_delivers_multi_block_file() {
+        let root = tmp();
+        // 1300 bytes over the default 512-byte blksize -> blocks 1(512),2(512),3(276).
+        let contents: Vec<u8> = (0..1300u32).map(|i| i as u8).collect();
+        fs::write(root.join("k.img"), &contents).unwrap();
+
+        let (sock, peer) = client_socket().await;
+        let server = handle_rrq(
+            root.clone(),
+            rrq("k.img", "octet", &[]),
+            peer,
+            None,
+            loopback_xfer(),
+        );
+        let (_, (got, blocks)) = tokio::join!(server, recv_transfer(&sock, DEFAULT_BLKSIZE));
+
+        assert_eq!(got, contents, "reassembled bytes must match the file");
+        assert_eq!(blocks, vec![1, 2, 3]);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn transfer_exact_multiple_sends_trailing_empty_block() {
+        let root = tmp();
+        // Exactly 2*512: the last data block is full, so RFC 1350 requires one
+        // more (empty) block to signal end-of-file.
+        let contents = vec![0xABu8; 1024];
+        fs::write(root.join("k.img"), &contents).unwrap();
+
+        let (sock, peer) = client_socket().await;
+        let server = handle_rrq(
+            root.clone(),
+            rrq("k.img", "octet", &[]),
+            peer,
+            None,
+            loopback_xfer(),
+        );
+        let (_, (got, blocks)) = tokio::join!(server, recv_transfer(&sock, DEFAULT_BLKSIZE));
+
+        assert_eq!(got, contents);
+        assert_eq!(blocks, vec![1, 2, 3], "trailing empty block 3 terminates");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn transfer_of_empty_file_is_one_empty_block() {
+        let root = tmp();
+        fs::write(root.join("empty"), b"").unwrap();
+
+        let (sock, peer) = client_socket().await;
+        let server = handle_rrq(
+            root.clone(),
+            rrq("empty", "octet", &[]),
+            peer,
+            None,
+            loopback_xfer(),
+        );
+        let (_, (got, blocks)) = tokio::join!(server, recv_transfer(&sock, DEFAULT_BLKSIZE));
+
+        assert!(got.is_empty());
+        assert_eq!(blocks, vec![1], "a single empty DATA block");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn transfer_with_oack_negotiates_blksize_and_tsize() {
+        let root = tmp();
+        let contents = vec![0x5Au8; 40];
+        fs::write(root.join("k.img"), &contents).unwrap();
+
+        let (sock, peer) = client_socket().await;
+        // Custom client: inspect the OACK before ACKing, then read the transfer.
+        let client = async {
+            let mut buf = vec![0u8; 2048];
+            let (n, from) = sock.recv_from(&mut buf).await.unwrap();
+            assert_eq!(u16::from_be_bytes([buf[0], buf[1]]), OP_OACK);
+            // OACK body: blksize\016\0tsize\040\0
+            let body = &buf[2..n];
+            let s = String::from_utf8_lossy(body);
+            let fields: Vec<&str> = s.split('\0').collect();
+            assert!(fields.contains(&"blksize") && fields.contains(&"16"));
+            assert!(fields.contains(&"tsize") && fields.contains(&"40"));
+            sock.send_to(&ack(0), from).await.unwrap();
+            // Now read DATA at the negotiated 16-byte blksize: 40 -> 16,16,8.
+            let mut data = Vec::new();
+            let mut blocks = Vec::new();
+            loop {
+                let (n, from) = sock.recv_from(&mut buf).await.unwrap();
+                assert_eq!(u16::from_be_bytes([buf[0], buf[1]]), OP_DATA);
+                let blk = u16::from_be_bytes([buf[2], buf[3]]);
+                blocks.push(blk);
+                data.extend_from_slice(&buf[4..n]);
+                sock.send_to(&ack(blk), from).await.unwrap();
+                if n - 4 < 16 {
+                    break;
+                }
+            }
+            (data, blocks)
+        };
+        let server = handle_rrq(
+            root.clone(),
+            rrq("k.img", "octet", &[("blksize", "16"), ("tsize", "0")]),
+            peer,
+            None,
+            loopback_xfer(),
+        );
+        let (_, (got, blocks)) = tokio::join!(server, client);
+
+        assert_eq!(got, contents);
+        assert_eq!(blocks, vec![1, 2, 3], "16-byte blocks: 16+16+8");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn retransmits_data_when_first_ack_is_dropped() {
+        let root = tmp();
+        let contents = vec![0x11u8; 100];
+        fs::write(root.join("k.img"), &contents).unwrap();
+
+        let (sock, peer) = client_socket().await;
+        // Client ignores the first copy of block 1, forcing an ACK_TIMEOUT-driven
+        // retransmit, then behaves normally. We expect to see block 1 twice.
+        let client = async {
+            let mut buf = vec![0u8; 2048];
+            let mut blocks = Vec::new();
+            let mut dropped_once = false;
+            let mut data = Vec::new();
+            loop {
+                let (n, from) = sock.recv_from(&mut buf).await.unwrap();
+                let blk = u16::from_be_bytes([buf[2], buf[3]]);
+                blocks.push(blk);
+                if blk == 1 && !dropped_once {
+                    dropped_once = true; // swallow this DATA; do NOT ACK
+                    continue;
+                }
+                data.extend_from_slice(&buf[4..n]);
+                sock.send_to(&ack(blk), from).await.unwrap();
+                if n - 4 < DEFAULT_BLKSIZE {
+                    break;
+                }
+            }
+            (data, blocks)
+        };
+        let server = handle_rrq(
+            root.clone(),
+            rrq("k.img", "octet", &[]),
+            peer,
+            None,
+            loopback_xfer(),
+        );
+        let (_, (got, blocks)) = tokio::join!(server, client);
+
+        assert_eq!(got, contents, "transfer still completes after a loss");
+        assert_eq!(
+            blocks.iter().filter(|&&b| b == 1).count(),
+            2,
+            "block 1 was retransmitted exactly once"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn missing_file_returns_error_packet() {
+        let root = tmp();
+        let (sock, peer) = client_socket().await;
+        let server = handle_rrq(
+            root.clone(),
+            rrq("nope.img", "octet", &[]),
+            peer,
+            None,
+            loopback_xfer(),
+        );
+        let client = async {
+            let mut buf = vec![0u8; 2048];
+            let (n, _) = sock.recv_from(&mut buf).await.unwrap();
+            (
+                u16::from_be_bytes([buf[0], buf[1]]),
+                u16::from_be_bytes([buf[2], buf[3]]),
+                n,
+            )
+        };
+        let (_, (opcode, code, _)) = tokio::join!(server, client);
+        assert_eq!(opcode, OP_ERROR);
+        assert_eq!(code, ERR_NOT_FOUND);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn non_octet_mode_returns_error_packet() {
+        let root = tmp();
+        fs::write(root.join("k.img"), b"hello").unwrap();
+        let (sock, peer) = client_socket().await;
+        let server = handle_rrq(
+            root.clone(),
+            rrq("k.img", "netascii", &[]),
+            peer,
+            None,
+            loopback_xfer(),
+        );
+        let client = async {
+            let mut buf = vec![0u8; 2048];
+            let _ = sock.recv_from(&mut buf).await.unwrap();
+            (
+                u16::from_be_bytes([buf[0], buf[1]]),
+                u16::from_be_bytes([buf[2], buf[3]]),
+            )
+        };
+        let (_, (opcode, code)) = tokio::join!(server, client);
+        assert_eq!(opcode, OP_ERROR);
+        assert_eq!(code, ERR_ILLEGAL);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // ~14 s: 65536 lock-step round trips are the only way to reach the wrap.
+    // Excluded from the default run; exercise with `cargo test -- --ignored`.
+    #[ignore = "stress test: 65k round trips (~14s); run with --ignored"]
+    #[tokio::test]
+    async fn block_number_wraps_past_0xffff() {
+        // The block counter is a u16 with `wrapping_add`. To exercise the wrap we
+        // must transfer more than 65535 blocks; an 8-byte blksize keeps the file
+        // small (~512 KiB) while still forcing 65536+ round trips. We assert the
+        // transfer completes AND that block 0 (only reachable by wrapping) appears.
+        let root = tmp();
+        let blksize = 8usize;
+        let n_full_blocks = 65536usize; // blocks 1..=65535, then 0
+        let contents = vec![0x7Eu8; n_full_blocks * blksize + 4]; // + a final short block
+        fs::write(root.join("big.img"), &contents).unwrap();
+
+        let (sock, peer) = client_socket().await;
+        let server = handle_rrq(
+            root.clone(),
+            rrq("big.img", "octet", &[("blksize", "8")]),
+            peer,
+            None,
+            loopback_xfer(),
+        );
+        let (_, (got, blocks)) = tokio::join!(server, recv_transfer(&sock, blksize));
+
+        assert_eq!(
+            got.len(),
+            contents.len(),
+            "all bytes delivered across the wrap"
+        );
+        assert_eq!(got, contents);
+        assert!(
+            blocks.contains(&0),
+            "block 0 must appear, proving the 0xFFFF->0 wrap"
+        );
+        // Sanity: the sequence starts 1,2,3 and contains the wrap boundary 65535,0.
+        assert_eq!(&blocks[..3], &[1, 2, 3]);
+        let wrap = blocks.windows(2).position(|w| w == [0xFFFF, 0]);
+        assert!(wrap.is_some(), "0xFFFF must be immediately followed by 0");
+        fs::remove_dir_all(&root).ok();
+    }
+}
