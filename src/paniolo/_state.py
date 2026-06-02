@@ -33,10 +33,12 @@ class NetbootState:
     started_at: float
     interface: str
     tftp_root: str
-    # Netboot engine: "python" (the default _dhcp.py + _tftp.py subprocesses) or
-    # "rust" (the single netbootd binary serving both). For the rust engine both
-    # *_pid fields hold the one netbootd PID. Defaulted so pre-existing state
-    # files (written before the field existed) still load.
+    # Netboot engine: "rust" (the default — single netbootd binary serving both)
+    # or "python" (the legacy _dhcp.py + _tftp.py subprocesses). For the rust
+    # engine both *_pid fields hold the one netbootd PID. The field default is
+    # "python" only so pre-existing state files (written before the field
+    # existed, when python was the sole engine) still deserialize correctly — it
+    # is NOT the current engine default, which `start()` sets to "rust".
     engine: str = "python"
 
 

@@ -328,9 +328,11 @@ truth).
 
 ## _netboot.py
 
-Manages paniolo's **pure-Python** DHCP and TFTP servers (`_dhcp.py`, `_tftp.py`)
-as backgrounded subprocesses. No external daemons (`dnsmasq`/`tftp-now`) are
-used at runtime — `check_deps()` returns `[]`.
+Manages the netboot lifecycle for a target. By default it launches the Rust
+`netbootd` engine; `--engine python` selects the legacy **pure-Python** DHCP and
+TFTP servers (`_dhcp.py`, `_tftp.py`) as backgrounded subprocesses. Either way,
+no external daemons (`dnsmasq`/`tftp-now`) are used at runtime — `check_deps()`
+returns `[]`.
 
 **`_find_bin(name)`** searches `PATH` via `shutil.which`, then falls back to
 `_BREW_PATHS` on macOS / `_LINUX_SBIN_PATHS` (`/usr/sbin`, `/sbin`) on Linux.
@@ -339,7 +341,7 @@ This is needed because SSH non-interactive shells often lack those dirs in PATH.
 **`_sudo_prefix()`** is empty on macOS (ports 67/69 bind rootless on 10.14+) and
 `["sudo", "env", "PYTHONUNBUFFERED=1"]` on Linux (privileged ports need root).
 
-**`start(cfg, engine="python")`** flow: validate engine → guard
+**`start(cfg, engine="rust")`** flow: validate engine → guard
 (`is_netboot_running`) → `check_deps` (no-op) → validate `tftp_root` →
 **refuse if `cfg.interface` is a primary NIC** (`_is_primary_interface`, see
 below) → clean up stale pids → configure interface (`ifconfig` on macOS /
@@ -347,14 +349,14 @@ below) → clean up stale pids → configure interface (`ifconfig` on macOS /
 save state. The DHCP server sets both `siaddr` and DHCP option 66 to `host_ip`;
 the RPi 5 EEPROM prefers option 66 but both are set for older firmware.
 
-- **`engine="python"`** (default): spawns `python -m paniolo._dhcp …` and
-  `python -m paniolo._tftp …` (with the sudo prefix on Linux), logging both to
-  `netboot.log`. State stores both PIDs.
-- **`engine="rust"`** (`_start_rust`): spawns the single installed `netbootd`
-  binary serving DHCP+TFTP (`NO_COLOR=1` so tracing output stays parseable).
-  Both `*_pid` fields hold the one netbootd PID; `NetbootState.engine="rust"`.
-  Resolved via `_resolve_netbootd()` (PATH then `~/.cargo/bin`). See the
-  **netbootd** section below.
+- **`engine="rust"`** (default, `_start_rust`): spawns the single installed
+  `netbootd` binary serving DHCP+TFTP (`NO_COLOR=1` so tracing output stays
+  parseable). Both `*_pid` fields hold the one netbootd PID;
+  `NetbootState.engine="rust"`. Resolved via `_resolve_netbootd()` (PATH then
+  `~/.cargo/bin`). See the **netbootd** section below.
+- **`engine="python"`** (legacy fallback): spawns `python -m paniolo._dhcp …`
+  and `python -m paniolo._tftp …` (with the sudo prefix on Linux), logging both
+  to `netboot.log`. State stores both PIDs.
 
 **Primary-NIC guard.** `_default_route_interface()` reads the default-route
 interface (`route -n get default` on macOS, `ip route show default` on Linux);
@@ -369,12 +371,18 @@ PermissionError), waits up to 3 s, then restores the interface and removes
 state. `_cleanup_stale` matches the process cmdline against `paniolo._dhcp`/
 `paniolo._tftp` (python) or `netbootd` (rust), per `state.engine`.
 
-## netbootd (Rust netboot engine, experimental)
+## netbootd (Rust netboot engine, default)
 
 `netbootd/` is a single-binary Rust port of `_dhcp.py` + `_tftp.py` — DHCP and
-read-only TFTP as tokio tasks in one process, selectable via
-`paniolo netboot start --engine rust`. The Python engine remains the default;
-this is opt-in for validation before any reconciliation.
+read-only TFTP as tokio tasks in one process. It is the **default** engine for
+`paniolo netboot start`; the Python `_dhcp`/`_tftp` pair it was ported from
+remains available as a fallback via `--engine python`.
+
+The pure protocol logic is unit-tested (`dhcp.rs` / `tftp.rs` `#[cfg(test)]`
+modules): packet parse/build, RRQ option negotiation, path-traversal rejection,
+and full loopback DATA/ACK transfers (multi-block, OACK, retransmit-on-loss,
+error packets). A 65 K-round-trip block-wraparound test is marked `#[ignore]` —
+run it with `cargo test -- --ignored`.
 
 Key differences from the Python servers:
 

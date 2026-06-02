@@ -235,3 +235,184 @@ pub async fn serve(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const XID: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];
+    const MAC6: [u8; 6] = [0xdc, 0xa6, 0x32, 0x01, 0x02, 0x03];
+
+    /// Build a minimal but well-formed BOOTREQUEST/DHCP packet with the given
+    /// message type. `trailing_opts` are appended (TLV bytes) before OPT_END.
+    fn request_packet(op: u8, msg_type: Option<u8>, trailing_opts: &[u8]) -> Vec<u8> {
+        let mut pkt = vec![0u8; 236];
+        pkt[0] = op;
+        pkt[1] = HTYPE_ETHERNET;
+        pkt[2] = 6; // hlen
+        pkt[4..8].copy_from_slice(&XID);
+        pkt[28..34].copy_from_slice(&MAC6); // chaddr (first 6 = MAC)
+        pkt.extend_from_slice(&MAGIC);
+        if let Some(mt) = msg_type {
+            pkt.extend_from_slice(&[OPT_MSG_TYPE, 1, mt]);
+        }
+        pkt.extend_from_slice(trailing_opts);
+        pkt.push(OPT_END);
+        pkt
+    }
+
+    /// Collect the options TLVs from a reply packet into (tag -> value) pairs,
+    /// in wire order (so duplicates would be visible).
+    fn reply_options(pkt: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        let opts = &pkt[236..];
+        assert_eq!(&opts[0..4], &MAGIC, "reply must start options with magic");
+        let mut out = Vec::new();
+        let mut i = 4;
+        while i < opts.len() {
+            let tag = opts[i];
+            if tag == OPT_END {
+                break;
+            }
+            let len = opts[i + 1] as usize;
+            out.push((tag, opts[i + 2..i + 2 + len].to_vec()));
+            i += 2 + len;
+        }
+        out
+    }
+
+    #[test]
+    fn parse_discover_extracts_xid_mac_and_type() {
+        let pkt = request_packet(BOOTREQUEST, Some(DHCP_DISCOVER), &[]);
+        let req = parse_request(&pkt).expect("valid DISCOVER should parse");
+        assert_eq!(req.xid, XID);
+        assert_eq!(&req.chaddr[..6], &MAC6);
+        assert_eq!(req.msg_type, DHCP_DISCOVER);
+    }
+
+    #[test]
+    fn parse_skips_pad_options_before_msg_type() {
+        // A leading run of pad (0) options must not derail the TLV walk: the
+        // msg_type option sits after them.
+        let mut p = vec![0u8; 236];
+        p[0] = BOOTREQUEST;
+        p[28..34].copy_from_slice(&MAC6);
+        p.extend_from_slice(&MAGIC);
+        p.extend_from_slice(&[0u8, 0, 0]); // three pad options
+        p.extend_from_slice(&[OPT_MSG_TYPE, 1, DHCP_REQUEST]);
+        p.push(OPT_END);
+        let req = parse_request(&p).expect("pad-prefixed packet parses");
+        assert_eq!(req.msg_type, DHCP_REQUEST);
+    }
+
+    #[test]
+    fn parse_rejects_too_short() {
+        assert!(parse_request(&[0u8; 239]).is_none(), "under 240 bytes");
+    }
+
+    #[test]
+    fn parse_rejects_non_bootrequest() {
+        let pkt = request_packet(BOOTREPLY, Some(DHCP_DISCOVER), &[]);
+        assert!(parse_request(&pkt).is_none(), "op must be BOOTREQUEST");
+    }
+
+    #[test]
+    fn parse_rejects_bad_magic() {
+        let mut pkt = request_packet(BOOTREQUEST, Some(DHCP_DISCOVER), &[]);
+        pkt[236] ^= 0xff; // corrupt the magic cookie
+        assert!(
+            parse_request(&pkt).is_none(),
+            "wrong magic must be rejected"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_missing_msg_type() {
+        let pkt = request_packet(BOOTREQUEST, None, &[]);
+        assert!(parse_request(&pkt).is_none(), "no option 53 -> reject");
+    }
+
+    #[test]
+    fn parse_stops_at_truncated_tlv() {
+        // A TLV whose length runs past the buffer must not panic or over-read;
+        // the walk breaks and (with no msg_type seen) the packet is rejected.
+        let bogus = [OPT_TFTP_SERVER, 200]; // claims 200 bytes, none follow
+        let mut p = vec![0u8; 236];
+        p[0] = BOOTREQUEST;
+        p[28..34].copy_from_slice(&MAC6);
+        p.extend_from_slice(&MAGIC);
+        p.extend_from_slice(&bogus);
+        // no OPT_END, no msg_type
+        assert!(parse_request(&p).is_none());
+    }
+
+    #[test]
+    fn build_offer_header_fields() {
+        let req = parse_request(&request_packet(BOOTREQUEST, Some(DHCP_DISCOVER), &[])).unwrap();
+        let server = Ipv4Addr::new(192, 168, 99, 1);
+        let reply = build_reply(&req, DHCP_OFFER, server, "kernel_2712.img");
+
+        assert_eq!(reply[0], BOOTREPLY, "op = BOOTREPLY");
+        assert_eq!(reply[1], HTYPE_ETHERNET);
+        assert_eq!(reply[2], 6, "hlen");
+        assert_eq!(&reply[4..8], &XID, "xid echoed back");
+        assert_eq!(&reply[10..12], &[0x80, 0x00], "broadcast flag set");
+        assert_eq!(&reply[16..20], &ASSIGNED_IP.octets(), "yiaddr = assigned");
+        assert_eq!(&reply[20..24], &server.octets(), "siaddr = next-server");
+        assert_eq!(&reply[28..34], &MAC6, "chaddr echoed");
+        // file field (offset 108, 128 bytes) carries the bootfile, null-padded.
+        assert_eq!(&reply[108..123], b"kernel_2712.img");
+        assert_eq!(reply[123], 0, "file field null-padded");
+    }
+
+    #[test]
+    fn build_offer_options_match_spec() {
+        let req = parse_request(&request_packet(BOOTREQUEST, Some(DHCP_DISCOVER), &[])).unwrap();
+        let server = Ipv4Addr::new(10, 0, 0, 5);
+        let reply = build_reply(&req, DHCP_OFFER, server, "boot.img");
+        let opts = reply_options(&reply);
+
+        let get = |tag: u8| opts.iter().find(|(t, _)| *t == tag).map(|(_, v)| v.clone());
+        assert_eq!(get(OPT_MSG_TYPE), Some(vec![DHCP_OFFER]));
+        assert_eq!(get(OPT_SERVER_ID), Some(server.octets().to_vec()));
+        assert_eq!(get(OPT_LEASE), Some(LEASE_SECONDS.to_be_bytes().to_vec()));
+        assert_eq!(get(OPT_SUBNET), Some(vec![255, 255, 255, 0]));
+        assert_eq!(get(OPT_ROUTER), Some(server.octets().to_vec()));
+        // Option 66 advertises the TFTP server as a dotted-quad STRING (not raw
+        // bytes) — the Pi bootloader expects the text form.
+        assert_eq!(get(OPT_TFTP_SERVER), Some(b"10.0.0.5".to_vec()));
+        assert_eq!(get(OPT_BOOTFILE), Some(b"boot.img".to_vec()));
+    }
+
+    #[test]
+    fn request_yields_ack_type() {
+        let req = parse_request(&request_packet(BOOTREQUEST, Some(DHCP_REQUEST), &[])).unwrap();
+        let reply = build_reply(&req, DHCP_ACK, Ipv4Addr::new(192, 168, 99, 1), "k.img");
+        let opts = reply_options(&reply);
+        let mt = opts.iter().find(|(t, _)| *t == OPT_MSG_TYPE).unwrap();
+        assert_eq!(mt.1, vec![DHCP_ACK]);
+    }
+
+    #[test]
+    fn build_reply_truncates_overlong_bootfile_in_file_field() {
+        let req = parse_request(&request_packet(BOOTREQUEST, Some(DHCP_DISCOVER), &[])).unwrap();
+        let long = "a".repeat(200);
+        let reply = build_reply(&req, DHCP_OFFER, Ipv4Addr::new(1, 2, 3, 4), &long);
+        // The fixed 128-byte file field holds at most 127 chars + a NUL terminator.
+        assert_eq!(reply[108..108 + 127], long.as_bytes()[..127]);
+        assert_eq!(reply[108 + 127], 0, "127th byte reserved for the NUL");
+    }
+
+    #[test]
+    fn mac_string_formats_first_six_octets() {
+        let mut chaddr = [0u8; 16];
+        chaddr[..6].copy_from_slice(&MAC6);
+        assert_eq!(mac_string(&chaddr), "dc:a6:32:01:02:03");
+    }
+
+    #[test]
+    fn encode_option_writes_tag_len_value() {
+        let mut buf = Vec::new();
+        encode_option(&mut buf, OPT_LEASE, &[0, 0, 0x0e, 0x10]);
+        assert_eq!(buf, vec![OPT_LEASE, 4, 0, 0, 0x0e, 0x10]);
+    }
+}

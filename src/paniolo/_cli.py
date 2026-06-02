@@ -370,10 +370,10 @@ def netboot_start(
         str,
         typer.Option(
             "--engine",
-            help="Netboot engine: 'python' (default) or 'rust' (experimental "
-            "single-binary netbootd).",
+            help="Netboot engine: 'rust' (default, single-binary netbootd) or "
+            "'python' (legacy DHCP+TFTP subprocess pair).",
         ),
-    ] = "python",
+    ] = "rust",
 ) -> None:
     """Start DHCP + TFTP netboot for a target."""
     cfg = _resolve(target)
@@ -703,9 +703,9 @@ def netif_mode(
         str,
         typer.Option(
             "--engine",
-            help="Netboot engine for 'netboot' mode: 'python' (default) or 'rust'.",
+            help="Netboot engine for 'netboot' mode: 'rust' (default) or 'python' (legacy).",
         ),
-    ] = "python",
+    ] = "rust",
 ) -> None:
     """Switch the link to netboot, ffx, or off.
 

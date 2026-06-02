@@ -426,7 +426,7 @@ def _start_rust(
     ))
 
 
-def start(cfg: TargetConfig, engine: str = "python") -> None:
+def start(cfg: TargetConfig, engine: str = "rust") -> None:
     if engine not in ("python", "rust"):
         raise RuntimeError(f"unknown netboot engine '{engine}' (use python or rust)")
     if is_netboot_running(cfg.name):

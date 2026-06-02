@@ -31,8 +31,8 @@ exists to remove both:
 ```bash
 # Switch to netboot (IPv4 + DHCP + TFTP). Same as `paniolo netboot start`,
 # but first removes any ffx-mode IPv6 link-local.
-paniolo netif mode netboot <target>
-paniolo netif mode netboot <target> --engine rust   # use the rust netbootd
+paniolo netif mode netboot <target>                  # rust netbootd (default)
+paniolo netif mode netboot <target> --engine python  # legacy python DHCP+TFTP
 
 # Switch to ffx: stop netboot, then add the host fe80::1/64.
 paniolo netif mode ffx <target>

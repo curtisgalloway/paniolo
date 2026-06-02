@@ -60,8 +60,8 @@ and persist between CLI invocations. State lives in plain files, not memory.
 | `paniolo` CLI | Python 3.11+ (Typer) | The single entry point; spawns/queries daemons, edits config, runs scripts. `typer` is the only core dependency; stdlib otherwise. |
 | `serialcap` | Rust (tokio/axum) | Daemon that **exclusively owns** a target's serial ports; fans output out to a WebSocket + a timestamped capture log; accepts keystrokes back. |
 | `hdmicap` | Rust (tokio/axum, nokhwa) | "Warm-stream" daemon that keeps the USB HDMI capture device open and serves frames + the combined dashboard over HTTP. |
-| `_dhcp` / `_tftp` | Python modules | The default netboot DHCP and TFTP servers, run as `python -m paniolo._dhcp` / `._tftp` subprocesses. |
-| `netbootd` | Rust (tokio) | Experimental single-binary DHCP+TFTP netboot engine (`--engine rust`). Privilege-separated `/dev/bpf` send path on macOS via a setuid `netbootd-bpf-helper`. Opt-in; the Python pair is still the default. |
+| `netbootd` | Rust (tokio) | The default single-binary DHCP+TFTP netboot engine. Privilege-separated `/dev/bpf` send path on macOS via a setuid `netbootd-bpf-helper`. |
+| `_dhcp` / `_tftp` | Python modules | Legacy netboot DHCP and TFTP servers (`--engine python`), run as `python -m paniolo._dhcp` / `._tftp` subprocesses. The implementation `netbootd` was ported from; kept as a fallback. |
 | `visionocr` / `linuxocr` | Swift / shell+Tesseract | On-device OCR helpers invoked by `hdmicap` and `paniolo video read`. |
 | HID rig firmware | CircuitPython | Two KB2040 boards that turn text commands into USB HID events (see [`hidrig/`](../hidrig/README.md)). |
 
@@ -121,11 +121,11 @@ them rootless). DHCP hands the target a fixed lease and points it at the TFTP ro
 NIC), since it reconfigures the interface to the static `host_ip` — the netboot link must be a
 dedicated secondary (USB-Ethernet) interface.
 
-**Experimental rust engine** (`--engine rust`): a single `netbootd` binary runs both servers as
-tokio tasks. On macOS its raw-frame send path (the Sequoia workaround) gets a `/dev/bpf`
-descriptor from a setuid-root `netbootd-bpf-helper` over `SCM_RIGHTS`, so the daemon itself stays
-unprivileged — the helper is the only root component, installed by `paniolo setup`. The Python
-pair remains the default; the rust engine is opt-in for validation before any reconciliation.
+**Netboot engine** (default): a single `netbootd` binary (Rust) runs both servers as tokio tasks.
+On macOS its raw-frame send path (the Sequoia workaround) gets a `/dev/bpf` descriptor from a
+setuid-root `netbootd-bpf-helper` over `SCM_RIGHTS`, so the daemon itself stays unprivileged — the
+helper is the only root component, installed by `paniolo setup`. `--engine python` selects the
+legacy `_dhcp`/`_tftp` subprocess pair the Rust daemon was ported from, kept as a fallback.
 
 ### Link mode: netboot ↔ ffx ([`netif.md`](netif.md))
 The same USB-Ethernet link serves two **mutually-exclusive** roles: netboot (IPv4 + DHCP + TFTP,

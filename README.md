@@ -53,10 +53,11 @@ paniolo setup          # builds hdmicap + serialcap; installs the OCR helper
 
 `paniolo setup` compiles and installs the Rust daemons (`hdmicap`, `serialcap`,
 `netbootd`) and the OCR helper (`visionocr` on macOS via `swiftc`, `linuxocr` on
-Linux) into `~/.cargo/bin`. The default DHCP and TFTP netboot servers are
-**pure-Python** — no external servers to install. (On macOS, `setup` also
-installs the legacy `tftp-now` via Homebrew, and installs `netbootd-bpf-helper`
-setuid-root — one sudo — for the experimental `--engine rust` netboot path.)
+Linux) into `~/.cargo/bin`. Netboot defaults to the single-binary `netbootd`
+(Rust) engine; the legacy pure-Python DHCP/TFTP pair is still available via
+`--engine python`. (On macOS, `setup` also installs the legacy `tftp-now` via
+Homebrew, and installs `netbootd-bpf-helper` setuid-root — one sudo — for the
+`netbootd` raw-frame send path.)
 
 To pick up code changes after pulling or editing:
 
