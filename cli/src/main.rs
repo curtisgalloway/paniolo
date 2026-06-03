@@ -20,6 +20,7 @@
 //! editor live in [`model`] and [`labfile`].
 
 mod daemons;
+mod discover;
 mod dispatch;
 mod doctor;
 mod labfile;
@@ -28,6 +29,7 @@ mod netboot;
 mod netif;
 mod power;
 mod serial;
+mod setup;
 mod ssh;
 mod state;
 mod video;
@@ -118,6 +120,27 @@ enum Command {
         /// Target to check (default: all).
         target: Option<String>,
         /// Only check channels on this host.
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// List this host's hardware for lab authoring (USB-Ethernet, serial, capture).
+    Discover {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Propose a `[targets.<name>]` lab block from hardware discovered on a host.
+    Configure {
+        /// Target name to propose a block for.
+        target: String,
+        /// Lab host the target is wired to ('local' or a declared host).
+        #[arg(long, short = 'H')]
+        host: String,
+    },
+    /// Build and install paniolo's binaries (daemons + CLI) from a source clone.
+    Setup {
+        /// Provision this lab host over SSH instead of locally (requires the
+        /// paniolo CLI + source already on the host).
         #[arg(long)]
         host: Option<String>,
     },
@@ -477,7 +500,158 @@ fn run(cli: Cli) -> Result<()> {
         Command::Doctor { target, host } => {
             cmd_doctor(lab_flag, target.as_deref(), host.as_deref())
         }
+        Command::Discover { json } => cmd_discover(json),
+        Command::Configure { target, host } => cmd_configure(lab_flag, &target, &host),
+        Command::Setup { host } => cmd_setup(lab_flag, host.as_deref()),
     }
+}
+
+// ── discover / configure / setup ────────────────────────────────────────────
+
+fn cmd_discover(json: bool) -> Result<()> {
+    let inv = discover::local_inventory();
+    if json {
+        println!("{}", serde_json::to_string(&inv)?);
+        return Ok(());
+    }
+    let eths: Vec<String> = inv["ethernet"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|e| {
+                    let dev = e["device"].as_str().unwrap_or("");
+                    let star = if e["active"].as_bool().unwrap_or(false) {
+                        "*"
+                    } else {
+                        ""
+                    };
+                    format!("{dev}{star}")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    println!(
+        "usb-ethernet\t{}",
+        if eths.is_empty() {
+            "(none)".to_string()
+        } else {
+            eths.join(" ")
+        }
+    );
+    let serials: Vec<&str> = inv["serial"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|s| s.as_str()).collect())
+        .unwrap_or_default();
+    println!(
+        "serial\t{}",
+        if serials.is_empty() {
+            "(none)".to_string()
+        } else {
+            serials.join("\n\t")
+        }
+    );
+    let captures: Vec<String> = inv["video"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|d| format!("{}: {}", d["index"], d["name"].as_str().unwrap_or("")))
+                .collect()
+        })
+        .unwrap_or_default();
+    println!(
+        "capture\t{}",
+        if captures.is_empty() {
+            "(none)".to_string()
+        } else {
+            captures.join("\n\t")
+        }
+    );
+    println!("(* = carrier up)");
+    Ok(())
+}
+
+/// Look up a control host for host-scoped commands ('local' = the dev machine).
+fn resolve_host(lab_flag: Option<&str>, name: &str) -> Result<model::Host> {
+    if name == model::LOCAL {
+        return Ok(model::Host {
+            ssh: model::LOCAL.to_string(),
+            ..Default::default()
+        });
+    }
+    let lab = load_for_read(lab_flag)?;
+    lab.hosts.get(name).cloned().ok_or_else(|| {
+        let have: Vec<&str> = lab.hosts.keys().map(String::as_str).collect();
+        anyhow!(
+            "host '{name}' not in lab (hosts: {})",
+            if have.is_empty() {
+                "(none)".to_string()
+            } else {
+                have.join(", ")
+            }
+        )
+    })
+}
+
+fn cmd_configure(lab_flag: Option<&str>, target: &str, host: &str) -> Result<()> {
+    let resolved = resolve_host(lab_flag, host)?;
+    let inv = if resolved.is_local(host) {
+        discover::local_inventory()
+    } else {
+        eprintln!("Discovering hardware on {host} ({})…", resolved.ssh);
+        let out = ssh::run(
+            &resolved,
+            &[
+                resolved.paniolo(),
+                "discover".to_string(),
+                "--json".to_string(),
+            ],
+            None,
+            &[],
+        )?;
+        if out.status != 0 {
+            bail!(
+                "discover failed on {host}: {}",
+                if out.stderr.trim().is_empty() {
+                    out.stdout.trim()
+                } else {
+                    out.stderr.trim()
+                }
+            );
+        }
+        serde_json::from_str(out.stdout.trim())
+            .map_err(|e| anyhow!("unparseable discover output from {host}: {e}"))?
+    };
+
+    let block = discover::propose_target_block(target, host, &inv);
+    println!("# Proposed lab block — review, add to your lab file, and commit.");
+    if let Ok(lab) = load_for_read(lab_flag) {
+        if lab.targets.contains_key(target) {
+            println!("# NOTE: target '{target}' already exists in the lab — reconcile by hand.");
+        }
+    }
+    println!("{block}");
+    Ok(())
+}
+
+fn cmd_setup(lab_flag: Option<&str>, host: Option<&str>) -> Result<()> {
+    if let Some(name) = host {
+        let resolved = resolve_host(lab_flag, name)?;
+        if !resolved.is_local(name) {
+            eprintln!("Running paniolo setup on {name} ({})…", resolved.ssh);
+            let code =
+                ssh::run_interactive(&resolved, &[resolved.paniolo(), "setup".to_string()], &[])?;
+            std::process::exit(code);
+        }
+        eprintln!("'{name}' is the local machine; setting up here.");
+    }
+    let repo = setup::find_repo_root().ok_or_else(|| {
+        anyhow!(
+            "paniolo source checkout not found. `paniolo setup` rebuilds the daemons \
+             and OCR helper from source, so it must run from inside a clone \
+             (e.g. `make install`). cd into the paniolo repo and try again."
+        )
+    })?;
+    setup::run(&repo)
 }
 
 /// Resolve a runtime command's target: the given name, or the sole target.
