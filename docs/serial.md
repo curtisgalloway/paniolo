@@ -11,24 +11,19 @@ WebSocket dashboard terminal).
 Add a serial interface to a target:
 
 ```bash
-paniolo serial setup target-machine \
-    --name console \
+paniolo serial add console -t target-machine \
     --device /dev/tty.usbserial-0001 \
     --baud 115200
 
 # Optional: also wire a power sense signal on this interface (see power.md)
-paniolo serial setup target-machine \
-    --name console \
-    --device /dev/tty.usbserial-0001 \
-    --baud 115200 \
-    --power-sense cts
+paniolo serial set console -t target-machine --sense cts
 ```
 
 A target can have several named interfaces (e.g. `console`, `bmc`). Remove
 one with:
 
 ```bash
-paniolo serial remove target-machine --name console
+paniolo serial rm console -t target-machine
 ```
 
 List detected serial devices:

@@ -5,7 +5,7 @@ description: Reference codebase for Paniolo. Use this skill when you need to und
 
 # Paniolo Codebase Reference
 
-101 files | 22636 lines | 307250 tokens
+123 files | 30094 lines | 372418 tokens
 
 ## Overview
 

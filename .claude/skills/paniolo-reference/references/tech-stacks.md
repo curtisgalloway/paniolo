@@ -11,6 +11,21 @@
 - .gitignore
 - pyproject.toml
 
+## Tech Stack: cli
+
+### Languages
+
+- Rust
+
+### Dependencies
+
+- clap
+
+### Configuration Files
+
+- .gitignore
+- Cargo.toml
+
 ## Tech Stack: hdmicap
 
 ### Languages

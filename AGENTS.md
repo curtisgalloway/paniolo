@@ -90,7 +90,56 @@ enabling inter-subsystem coordination (e.g., "stream serial output whenever
 a netboot attempt fires"). Will be implemented in Rust when the complexity
 of option A is no longer sufficient.
 
-## Module layout
+## Rust control plane (`cli/` — the current implementation)
+
+The CLI + orchestration + device glue is rewritten in Rust (the `cli/` crate),
+finishing the Python→Rust migration the daemons started. Design + status:
+[`docs/config-redesign.md`](docs/config-redesign.md). Key differences from the
+Python tree below:
+
+- **Config is one CLI-managed lab file** (`~/.config/paniolo/lab.toml`, or
+  `--lab`/`PANIOLO_LAB`): hosts + targets, each target's hardware as *channels*
+  (`netboot`, `serial[]`, `power`, `video`) with per-channel host binding.
+  Edited surgically via `toml_edit` (hand-comments survive); validated on load
+  and before every save. The legacy `~/.config/paniolo/targets/*.toml` files are
+  not used by the Rust CLI.
+- **Dispatch is per-channel**: a command resolves the host of the channel it
+  touches and re-execs there over SSH against a shipped one-target slice.
+  Composites (`console`) require co-located channels.
+- **Daemons bind OS-assigned ports** (port 0) and are found via their
+  `daemon.json` discovery files — fixed defaults collided with stale tunnels.
+- **Netboot is rust-engine only** (netbootd); the pure-Python DHCP/TFTP engine
+  exists only in the legacy tree.
+
+```
+cli/src/
+  main.rs       clap CLI — all command groups + runtime handler bodies
+  model.rs      typed lab (serde), validate(), resolved per-channel view, channel_host
+  labfile.rs    toml_edit comment-preserving lab editor (the write side)
+  dispatch.rs   per-channel re-exec: slice building/shipping, maybe_dispatch,
+                run_subcommand, remote_daemon_port
+  ssh.rs        SSH transport: ControlMaster run/passthrough/interactive, forward (tunnels)
+  daemons.rs    shared daemon contract: find_binary, daemon.json discovery, wait
+  serial.rs     serialcap orchestration + tio exec + /input + device listing
+  video.rs      hdmicap orchestration (daemon start/stop, client passthrough)
+  netboot.rs    netbootd lifecycle (spawn with log, stop, status)
+  netif.rs      interface discovery/config (sudo), netboot/ffx/off modes
+  power.rs      DTR via serialcap /button (+ direct-serial fallback), power_on sense
+  state.rs      netboot state files (JSON-compatible with the Python's)
+  doctor.rs     config-vs-reality probing (local + over SSH)
+  discover.rs   hardware inventory + the configure proposal block
+  setup.rs      installer: cargo install daemons + the paniolo CLI, bpf-helper
+                setuid, OCR helpers, Linux groups
+```
+
+Deferred (tracked in docs/config-redesign.md): OCR (`video read`), the
+Openterface CH9329 HID backend (clean-room spec at docs/ch9329-spec.md), legacy
+Python removal.
+
+## Module layout (legacy Python — being retired)
+
+The Python tree below remains the shipping CLI on `main` until the Rust CLI is
+cut over; its module docs are kept for that transition.
 
 ```
 src/paniolo/

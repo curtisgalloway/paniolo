@@ -34,26 +34,32 @@ cd ~/src/paniolo && uv tool install --reinstall .
 
 ## Configure a target
 
+Config lives in one CLI-managed **lab file** (`~/.config/paniolo/lab.toml`, or
+`--lab`/`PANIOLO_LAB`). A target's hardware is described as *channels*:
+
 ```
-paniolo target set <name> --interface <iface> \
-    [--tftp-root <dir>] \
-    [--host-ip <ip>] \
-    [--power-cycle-cmd <script>] \
-    [--power-serial <serial-iface>]
+paniolo target add <name> [--host <labhost>] [--note <text>]
+paniolo netboot set -t <name> --interface <iface> [--tftp-root <dir>] [--host-ip <ip>]
+paniolo serial add console -t <name> --device <path> [--baud 115200] [--sense cts]
+paniolo power set -t <name> [--cycle-cmd <script>] [--serial-interface console]
+paniolo video set -t <name> --device "<capture name>"
 ```
 
-- `--interface` auto-detects a USB-Ethernet adapter if omitted.
-- Serial consoles are configured separately with `paniolo serial setup` (a target
-  can have several named interfaces); they're preserved across `target set` runs.
-- Inspect or remove: `paniolo target show` / `paniolo target clear <name>`.
+- `paniolo netboot devices` lists candidate USB-Ethernet interfaces (the
+  primary NIC is excluded); `paniolo discover` lists all lab-relevant hardware;
+  `paniolo configure <name> -H <host>` proposes a whole block to paste in.
+- Inspect: `paniolo config show` (whole lab) / `paniolo target show <name>`.
+- Remove: `paniolo target rm <name>`, or per channel (`netboot rm`,
+  `serial rm <iface> -t <name>`, `power rm`, `video rm`).
+- `paniolo doctor` probes every configured channel against reality (devices
+  exist, over SSH for remote hosts).
 
 ## Netboot (DHCP + TFTP)
 
 Boot a board over the direct USB-Ethernet link:
 
 ```
-paniolo netboot start [target]            # serve DHCP + TFTP (rust netbootd, default)
-paniolo netboot start [target] --engine python  # legacy pure-Python DHCP+TFTP pair
+paniolo netboot start [target]            # serve DHCP + TFTP (netbootd)
 paniolo netboot tftp-root [target]        # print where to drop boot files
 paniolo netboot status [target]
 paniolo netboot logs -f [target]          # follow the combined log
@@ -101,7 +107,8 @@ passwordless `sudo` requirement as netboot (`ip` on Linux, `ifconfig` on macOS).
 ## Video — capture, preview, OCR
 
 ```
-paniolo video setup                   # detect + save the capture device
+paniolo video devices                 # list capture devices
+paniolo video set -t <target> --device "<name>"   # configure the video channel
 paniolo video watch                   # start the capture daemon (background)
 paniolo video preview                 # open the dashboard in a browser
 paniolo video shot [--stable] [--out frame.png]   # one lossless PNG
@@ -110,7 +117,8 @@ paniolo video show                    # device + daemon status
 paniolo video stop
 ```
 
-- The **dashboard** (default `http://127.0.0.1:8723/`) shows live video on top, a
+- The **dashboard** (the video daemon's URL — ports are OS-assigned, printed by
+  `video watch`/`console`) shows live video on top, a
   serial terminal below, and an **OCR button** that reads the current screen.
 - `--stable` waits for a steady frame before capturing (useful right after a mode
   switch or reboot).
@@ -125,10 +133,10 @@ a `bmc`). Each port is **exclusive** — only one consumer can hold it at a time
 but a single `watch` daemon owns *all* of them at once.
 
 ```
-paniolo serial setup [target] --name console   # add/update a named interface
-                                               #   (--device auto-detected if omitted)
-paniolo serial setup [target] --name bmc --device /dev/ttyUSB1 --baud 9600
-paniolo serial remove <name> [-t target]       # drop a named interface
+paniolo serial add console -t <target> --device <path>   # add a named interface
+paniolo serial add bmc -t <target> --device /dev/ttyUSB1 --baud 9600
+paniolo serial set console -t <target> --sense cts        # update fields
+paniolo serial rm <name> -t <target>                      # drop a named interface
 paniolo serial connect [target] [-i name]      # interactive terminal (tio) in your shell
 paniolo serial watch [target]                  # run the daemon for ALL interfaces;
                                                #   they appear in the dashboard pane
@@ -178,13 +186,13 @@ paniolo serial reset [target]          # soft reset via brief DTR pulse
 ```
 
 `power-cycle` runs the shell script set with
-`paniolo target set <name> --power-cycle-cmd <script>`.
+`paniolo power set -t <name> --cycle-cmd <script>`.
 The script is responsible for the full off→on sequence (HA API, PDU relay, GPIO, etc.).
 
 DTR commands drive the target's physical power button via an FTDI serial
 adapter wired to the Pi J2 header. A ≤500 ms pulse is a soft button event; ≥3000 ms
 is a hard PMIC power-off. Set the default interface with
-`paniolo target set <name> --power-serial console`.
+`paniolo power set -t <name> --serial-interface console`.
 
 ## Targets on a remote control host (a "lab")
 
@@ -227,13 +235,14 @@ paniolo console fortune            # dashboard tunnelled to your browser; Ctrl-C
 ```
 
 Notes:
-- With **no** `--lab`/`PANIOLO_LAB`, paniolo uses the legacy per-target files
-  (`paniolo target set …`) and everything runs locally — unchanged.
-- The lab file is **hand-edited** (it's your source of truth, in git). Config
-  authoring commands (`target set/show/clear`, `serial setup/remove`) still
-  operate on the local legacy config, not the lab, for now.
-- A target may currently live on only **one** host (multi-host targets are
-  designed-for but not yet supported).
+- With **no** `--lab`/`PANIOLO_LAB`, paniolo uses the default lab at
+  `~/.config/paniolo/lab.toml` (auto-created on first write).
+- The lab file is **CLI-managed and hand-edit friendly**: all the config
+  commands edit it surgically (your comments survive), and it stays your
+  git-tracked source of truth.
+- **Channels can live on different hosts** (per-channel `--host`): each command
+  runs on the host of the channel it touches. Composites (`console`) need
+  their channels co-located on one host.
 - Still over plain SSH if you prefer: `ssh bench1 "paniolo …"` works too, but the
   lab makes location transparent.
 

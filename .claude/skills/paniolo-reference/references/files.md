@@ -1,172 +1,1025 @@
 # Files
 
-## File: src/paniolo/_paths.py
-````python
-# Copyright 2026 Curtis Galloway
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Locating the paniolo source checkout.
-
-`paniolo setup` (and `make install`) rebuild the Rust daemons and the OCR helper
-*from source*, so they need the git clone — not the installed package tree. The
-old approach climbed a fixed number of parents from ``__file__``, which only
-points at the repo for a source checkout; from an installed uv tool it lands in
-``.../lib/python3.12`` and every source lookup silently fails. ``repo_root()``
-resolves the checkout robustly instead.
-"""
-
-from __future__ import annotations
-
-from pathlib import Path
-from typing import Optional
-
-
-def _is_repo_root(d: Path) -> bool:
-    """True if ``d`` looks like the paniolo source checkout root."""
-    return (
-        (d / "pyproject.toml").is_file()
-        and (d / "ocr").is_dir()
-        and (d / "hdmicap" / "Cargo.toml").is_file()
-    )
-
-
-def repo_root() -> Optional[Path]:
-    """Locate the paniolo source checkout, or ``None`` if not found.
-
-    Searches, in order:
-
-    1. The tree containing this file. This wins for a source checkout, an
-       editable install, or ``uv run``, where ``__file__`` lives under
-       ``<repo>/src/paniolo``.
-    2. The current working directory and its parents. This covers running an
-       *installed* ``paniolo setup`` from inside a clone — notably ``make
-       install``, which executes in the repo.
-
-    Returns ``None`` when no checkout can be found (e.g. an installed CLI invoked
-    from an unrelated directory); callers should surface a clear "run from a
-    clone" error rather than silently skipping the build.
-    """
-    starts = [Path(__file__).resolve().parent, Path.cwd().resolve()]
-    for start in starts:
-        for d in (start, *start.parents):
-            if _is_repo_root(d):
-                return d
-    return None
-````
-
-## File: tests/test_paths.py
-````python
-# Copyright 2026 Curtis Galloway
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Tests for source-checkout resolution.
-
-Regression coverage for the `make install` bug where `paniolo setup`, run from
-the *installed* uv tool, climbed a fixed number of parents from __file__ and
-landed in `.../lib/python3.12` — silently failing to find the OCR source and the
-Rust crates. `repo_root()` must instead find the checkout via __file__ OR the
-cwd, and return None (so callers error clearly) when neither points at one."""
-
-from __future__ import annotations
-
-import pytest
-
-from paniolo import _ocr, _paths
-
-
-def _make_fake_repo(root):
-    """Create the minimal marker layout `_is_repo_root` looks for."""
-    root.mkdir(parents=True, exist_ok=True)
-    (root / "pyproject.toml").write_text("[project]\nname = 'paniolo'\n")
-    (root / "ocr").mkdir()
-    (root / "ocr" / "visionocr.swift").write_text("// stub\n")
-    (root / "hdmicap").mkdir()
-    (root / "hdmicap" / "Cargo.toml").write_text("[package]\nname = 'hdmicap'\n")
-    return root
-
-
-def test_repo_root_finds_real_checkout():
-    """In the source tree, __file__ resolution locates this very repo."""
-    root = _paths.repo_root()
-    assert root is not None
-    assert (root / "ocr" / "visionocr.swift").exists()
-    assert (root / "hdmicap" / "Cargo.toml").exists()
-
-
-def test_repo_root_via_cwd_when_file_is_elsewhere(tmp_path, monkeypatch):
-    """An installed CLI (__file__ outside any clone) still resolves via cwd.
-
-    This is the `make install` case: the uv-tool copy runs from inside the repo.
-    """
-    fake_repo = _make_fake_repo(tmp_path / "clone")
-    monkeypatch.setattr(_paths, "__file__", "/opt/installed/paniolo/_paths.py")
-    monkeypatch.chdir(fake_repo)
-    assert _paths.repo_root() == fake_repo
-
-
-def test_repo_root_via_cwd_parent(tmp_path, monkeypatch):
-    """cwd resolution walks up to an ancestor checkout, not just cwd itself."""
-    fake_repo = _make_fake_repo(tmp_path / "clone")
-    sub = fake_repo / "deep" / "nested"
-    sub.mkdir(parents=True)
-    monkeypatch.setattr(_paths, "__file__", "/opt/installed/paniolo/_paths.py")
-    monkeypatch.chdir(sub)
-    assert _paths.repo_root() == fake_repo
-
-
-def test_repo_root_none_outside_checkout(tmp_path, monkeypatch):
-    """No checkout from __file__ or cwd -> None (callers surface a clear error)."""
-    monkeypatch.setattr(_paths, "__file__", "/opt/installed/paniolo/_paths.py")
-    monkeypatch.chdir(tmp_path)
-    assert _paths.repo_root() is None
-
-
-def test_ocr_sources_none_without_repo(monkeypatch):
-    """OCR source helpers degrade to None rather than a bogus path."""
-    monkeypatch.setattr(_ocr, "repo_root", lambda: None)
-    assert _ocr.visionocr_source() is None
-    assert _ocr.linuxocr_source() is None
-
-
-def test_build_visionocr_raises_without_repo(monkeypatch, tmp_path):
-    """build_visionocr raises a clear FileNotFoundError when no checkout exists."""
-    monkeypatch.setattr(_ocr, "repo_root", lambda: None)
-    with pytest.raises(FileNotFoundError, match="source checkout not found"):
-        _ocr.build_visionocr(tmp_path / "out")
-
-
-def test_install_linuxocr_raises_without_repo(monkeypatch, tmp_path):
-    """install_linuxocr raises a clear FileNotFoundError when no checkout exists."""
-    monkeypatch.setattr(_ocr, "repo_root", lambda: None)
-    with pytest.raises(FileNotFoundError, match="source checkout not found"):
-        _ocr.install_linuxocr(tmp_path / "out")
-````
-
 ## File: .claude/scheduled_tasks.lock
 ````
 {"sessionId":"f05aa849-67fb-4efd-89ae-da8900eb8c41","pid":88472,"procStart":"Wed May 27 22:29:02 2026","acquiredAt":1779925529556}
+````
+
+## File: cli/src/daemons.rs
+````rust
+// Copyright 2026 Curtis Galloway
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Shared plumbing for paniolo's per-subsystem daemons (serialcap, hdmicap).
+//!
+//! Every daemon follows the same contract: it is an installed binary (PATH or
+//! `~/.cargo/bin`), binds localhost (port 0 = OS-assigned), and writes a
+//! discovery file `<runtime>/<name>/daemon.json` containing `{pid, port, …}`
+//! where `<runtime>` is `$XDG_RUNTIME_DIR` (else the temp dir). Liveness is
+//! "the recorded pid still exists".
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+/// Find an installed binary: $PATH first, then ~/.cargo/bin (where
+/// `paniolo setup` installs the daemons). Never the in-repo build tree, so a
+/// running daemon can't point at an ephemeral build artifact.
+pub fn find_binary(name: &str) -> Option<PathBuf> {
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let p = dir.join(name);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    let cargo = dirs::home_dir()?.join(".cargo/bin").join(name);
+    cargo.is_file().then_some(cargo)
+}
+
+fn runtime_base() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+fn pid_alive(pid: i32) -> bool {
+    // Safe: kill(pid, 0) only probes for existence.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Base URL of the named running daemon, or None if it isn't running.
+pub fn daemon_url(name: &str) -> Option<String> {
+    let path = runtime_base().join(name).join("daemon.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let pid = v.get("pid")?.as_i64()? as i32;
+    let port = v.get("port")?.as_u64()?;
+    if !pid_alive(pid) {
+        return None;
+    }
+    Some(format!("http://127.0.0.1:{port}"))
+}
+
+/// Block until the named daemon answers discovery, or time out.
+pub fn wait_for_daemon(name: &str, timeout: Duration) -> Option<String> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if let Some(url) = daemon_url(name) {
+            return Some(url);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    None
+}
+````
+
+## File: cli/src/discover.rs
+````rust
+// Copyright 2026 Curtis Galloway
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Hardware discovery for lab authoring.
+//!
+//! `paniolo discover` lists this host's lab-relevant hardware (USB-Ethernet,
+//! serial, capture devices); `paniolo configure` runs it over SSH on a lab host
+//! and renders a proposed `[targets.<name>]` block for review. The proposal is
+//! never written — the human approves it by adding it to the lab and committing.
+
+use serde_json::{json, Value};
+
+use crate::{daemons, netif, serial, video};
+
+/// Capture-device names that are built-in cameras, not HDMI capture.
+const BUILTIN_CAPTURE: [&str; 5] = ["FaceTime", "Capture screen", "iSight", "iPhone", "iPad"];
+
+/// This host's lab-relevant hardware, in the same JSON shape the Python CLI
+/// emits (so mixed-version labs interoperate during the migration).
+pub fn local_inventory() -> Value {
+    let ethernet: Vec<Value> = netif::list_usb_ethernet_interfaces()
+        .iter()
+        .map(|e| json!({"port": e.port, "device": e.device, "active": e.active}))
+        .collect();
+    let serial: Vec<Value> = serial::list_devices()
+        .into_iter()
+        .map(Value::String)
+        .collect();
+    let video: Vec<Value> = list_capture_devices()
+        .into_iter()
+        .map(|d| json!({"index": d.0, "name": d.1, "misc": d.2}))
+        .collect();
+    json!({"ethernet": ethernet, "serial": serial, "video": video})
+}
+
+/// Parse `hdmicap devices` output: `  0  Name  [misc]` per line.
+fn list_capture_devices() -> Vec<(u64, String, String)> {
+    let Some(binary) = daemons::find_binary(video::DAEMON) else {
+        return Vec::new();
+    };
+    let Ok(out) = std::process::Command::new(binary).arg("devices").output() else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let mut devices = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let s = line.trim_start();
+        let Some((idx_str, rest)) = s.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(index) = idx_str.parse::<u64>() else {
+            continue;
+        };
+        let rest = rest.trim();
+        let (name, misc) = match rest.rfind('[') {
+            Some(i) => (
+                rest[..i].trim().to_string(),
+                rest[i + 1..].trim_end_matches(']').to_string(),
+            ),
+            None => (rest.to_string(), String::new()),
+        };
+        devices.push((index, name, misc));
+    }
+    devices
+}
+
+fn str_at<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    v.get(key).and_then(Value::as_str)
+}
+
+/// Render a proposed `[targets.<name>]` lab block from a host's inventory.
+/// Best-guesses one value per channel; alternatives become comments. Meant to
+/// be reviewed and pasted into the lab — paniolo never writes it.
+pub fn propose_target_block(name: &str, host: &str, inv: &Value) -> String {
+    let mut out: Vec<String> = Vec::new();
+    out.push(format!("[targets.{name}]"));
+    out.push(format!("host = \"{host}\""));
+    out.push(String::new());
+
+    // netboot: prefer the carrier-up interface (the list is sorted actives-first).
+    let eths: Vec<&Value> = inv
+        .get("ethernet")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    out.push(format!("[targets.{name}.netboot]"));
+    if let Some(first) = eths.first() {
+        let dev = str_at(first, "device").unwrap_or("");
+        let note = if first
+            .get("active")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            "  # carrier up"
+        } else {
+            ""
+        };
+        out.push(format!("interface = \"{dev}\"{note}"));
+        for e in &eths[1..] {
+            let dev = str_at(e, "device").unwrap_or("");
+            out.push(format!("# interface = \"{dev}\"  # alternative"));
+        }
+    } else {
+        out.push("# interface = \"\"  # no USB-Ethernet interface discovered".to_string());
+    }
+    out.push("# tftp_root = \"/path/to/tftp\"  # set to enable netboot".to_string());
+    out.push(String::new());
+
+    // serial: first device as the console; the rest as comments.
+    let serials: Vec<&str> = inv
+        .get("serial")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if let Some(first) = serials.first() {
+        out.push(format!("[[targets.{name}.serial]]"));
+        out.push("name = \"console\"".to_string());
+        out.push(format!("device = \"{first}\""));
+        out.push("baud = 115200".to_string());
+        for extra in &serials[1..] {
+            out.push(format!("# another serial device: {extra}"));
+        }
+    } else {
+        out.push(format!(
+            "# [[targets.{name}.serial]]  # no serial devices discovered"
+        ));
+    }
+    out.push(String::new());
+
+    // video: propose the one non-built-in capture device, if unambiguous.
+    let captures: Vec<&str> = inv
+        .get("video")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|d| str_at(d, "name"))
+                .filter(|n| !BUILTIN_CAPTURE.iter().any(|b| n.contains(b)))
+                .collect()
+        })
+        .unwrap_or_default();
+    if captures.len() == 1 {
+        out.push(format!("[targets.{name}.video]"));
+        out.push(format!("device = \"{}\"", captures[0]));
+    } else if captures.is_empty() {
+        out.push(format!(
+            "# [targets.{name}.video]  # no capture device discovered"
+        ));
+    } else {
+        out.push(format!(
+            "# [targets.{name}.video]  # multiple capture devices — pick one:"
+        ));
+        for c in &captures {
+            out.push(format!("# device = \"{c}\""));
+        }
+    }
+    out.push(String::new());
+    out.push(format!("# [targets.{name}.power]"));
+    out.push("# cycle_cmd = \"/path/to/power-cycle.sh\"  # not discoverable".to_string());
+
+    let mut s = out.join("\n");
+    s.push('\n');
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn propose_prefers_active_eth_and_first_serial() {
+        let inv = json!({
+            "ethernet": [
+                {"port": "AX88179A", "device": "en16", "active": true},
+                {"port": "Ethernet Adapter", "device": "en8", "active": false},
+            ],
+            "serial": ["/dev/tty.usbserial-A", "/dev/tty.usbserial-B"],
+            "video": [
+                {"index": 0, "name": "USB Video", "misc": ""},
+                {"index": 1, "name": "FaceTime HD Camera", "misc": ""},
+            ],
+        });
+        let block = propose_target_block("pi5", "bench1", &inv);
+        assert!(block.contains("[targets.pi5]"), "{block}");
+        assert!(block.contains("host = \"bench1\""), "{block}");
+        assert!(
+            block.contains("interface = \"en16\"  # carrier up"),
+            "{block}"
+        );
+        assert!(
+            block.contains("# interface = \"en8\"  # alternative"),
+            "{block}"
+        );
+        assert!(
+            block.contains("device = \"/dev/tty.usbserial-A\""),
+            "{block}"
+        );
+        assert!(
+            block.contains("# another serial device: /dev/tty.usbserial-B"),
+            "{block}"
+        );
+        // FaceTime filtered as built-in → USB Video is the unambiguous capture.
+        assert!(block.contains("[targets.pi5.video]"), "{block}");
+        assert!(block.contains("device = \"USB Video\""), "{block}");
+    }
+
+    #[test]
+    fn propose_with_empty_inventory_is_all_stubs() {
+        let inv = json!({"ethernet": [], "serial": [], "video": []});
+        let block = propose_target_block("t", "local", &inv);
+        assert!(block.contains("# interface = \"\""), "{block}");
+        assert!(block.contains("# [[targets.t.serial]]"), "{block}");
+        assert!(block.contains("# [targets.t.video]"), "{block}");
+    }
+}
+````
+
+## File: cli/src/netboot.rs
+````rust
+// Copyright 2026 Curtis Galloway
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Netboot lifecycle — start/stop/status of the `netbootd` daemon (DHCP + TFTP
+//! over the dedicated USB-Ethernet link).
+//!
+//! Ported from `_netboot.py`, rust engine only (the legacy pure-Python
+//! DHCP/TFTP engine stays behind in the Python tree). On macOS netbootd runs
+//! unprivileged (its raw-frame send path uses the setuid bpf-helper installed
+//! beside it); on Linux ports 67/69 need root so the spawn gets a sudo prefix.
+
+use std::path::Path;
+use std::process::{Command, Stdio};
+
+use anyhow::{anyhow, bail, Result};
+
+use crate::daemons;
+use crate::netif;
+use crate::state::{self, NetbootState};
+
+fn resolve_netbootd() -> Result<std::path::PathBuf> {
+    daemons::find_binary("netbootd")
+        .ok_or_else(|| anyhow!("netbootd not found — build and install it with `paniolo setup`"))
+}
+
+/// Kill any lingering netbootd from a previous crashed session for `target`.
+fn cleanup_stale(target: &str) {
+    if let Some(s) = state::load_netboot_state(target) {
+        if s.engine == "rust" && state::is_named_child_alive(s.dhcp_pid, "netbootd") {
+            unsafe { libc::kill(s.dhcp_pid, libc::SIGTERM) };
+        }
+    }
+    state::remove_netboot_state(target);
+}
+
+/// Start netbootd for `target` on `interface`, serving `tftp_root` at `host_ip`.
+pub fn start(target: &str, interface: &str, host_ip: &str, tftp_root: &str) -> Result<()> {
+    if state::is_netboot_running(target) {
+        bail!("netboot already running for '{target}'");
+    }
+    if tftp_root.is_empty() {
+        bail!("no tftp_root configured (paniolo netboot set -t {target} --tftp-root <path>)");
+    }
+    if !Path::new(tftp_root).exists() {
+        bail!("TFTP root does not exist: {tftp_root}");
+    }
+    if netif::is_primary_interface(interface) {
+        bail!(
+            "refusing to start netboot on '{interface}': it carries the system default \
+             route (your primary network interface). netboot reconfigures it to \
+             {host_ip} and would break host networking. Use a dedicated USB-Ethernet \
+             adapter for the netboot link."
+        );
+    }
+
+    cleanup_stale(target);
+    netif::configure_interface(interface, host_ip)?;
+    netif::tune_arp_for_silent_client();
+
+    state::ensure_target_dir(target)?;
+    let log_path = state::netboot_log_path(target);
+    let _ = std::fs::remove_file(&log_path);
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let log_err = log.try_clone()?;
+
+    let netbootd = resolve_netbootd()?;
+    // Linux needs root for ports 67/69; sudo resets the env, so NO_COLOR rides
+    // through `env` in the prefix. macOS runs unprivileged (bpf-helper).
+    let mut cmd = if cfg!(target_os = "macos") || unsafe { libc::getuid() } == 0 {
+        let mut c = Command::new(&netbootd);
+        c.env("NO_COLOR", "1");
+        c
+    } else {
+        let mut c = Command::new("sudo");
+        c.arg("env").arg("NO_COLOR=1").arg(&netbootd);
+        c
+    };
+    cmd.arg("--host-ip")
+        .arg(host_ip)
+        .arg("--tftp-root")
+        .arg(tftp_root)
+        .arg("--interface")
+        .arg(interface);
+    cmd.stdin(Stdio::null()).stdout(log).stderr(log_err);
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let child = cmd.spawn()?;
+
+    state::save_netboot_state(&NetbootState {
+        target: target.to_string(),
+        // Single process; both pid fields hold the netbootd PID (state-file compat).
+        dhcp_pid: child.id() as i32,
+        tftp_pid: child.id() as i32,
+        started_at: state::now_epoch(),
+        interface: interface.to_string(),
+        tftp_root: tftp_root.to_string(),
+        engine: "rust".to_string(),
+    })?;
+    Ok(())
+}
+
+/// Stop the netboot session for `target` and restore its interface.
+pub fn stop(target: &str) -> Result<()> {
+    let s = state::load_netboot_state(target)
+        .ok_or_else(|| anyhow!("no netboot state for '{target}'"))?;
+    for pid in [s.dhcp_pid, s.tftp_pid] {
+        if state::is_pid_alive(pid) {
+            let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+            if rc != 0 {
+                // Likely EPERM (started under sudo on Linux) — escalate.
+                let _ = Command::new("sudo")
+                    .args(["kill", "-TERM", &pid.to_string()])
+                    .status();
+            }
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if !state::is_pid_alive(s.dhcp_pid) && !state::is_pid_alive(s.tftp_pid) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    state::remove_netboot_state(target);
+    netif::restore_interface(&s.interface);
+    Ok(())
+}
+
+pub struct Status {
+    pub running: bool,
+    pub state: Option<NetbootState>,
+    pub uptime_seconds: Option<f64>,
+}
+
+pub fn status(target: &str) -> Status {
+    let Some(s) = state::load_netboot_state(target) else {
+        return Status {
+            running: false,
+            state: None,
+            uptime_seconds: None,
+        };
+    };
+    let alive = state::is_named_child_alive(s.dhcp_pid, "netbootd");
+    let uptime = alive.then(|| state::now_epoch() - s.started_at);
+    Status {
+        running: alive,
+        state: Some(s),
+        uptime_seconds: uptime,
+    }
+}
+````
+
+## File: cli/src/power.rs
+````rust
+// Copyright 2026 Curtis Galloway
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Power control: the FTDI DTR line (wired to the target's J2 power-button
+//! header) via the serialcap daemon, with a direct-serial fallback; plus
+//! power-state sensing from the daemon's `/status`.
+//!
+//! DTR pulse guidance (Raspberry Pi 5 / DA9091 PMIC): ≤500 ms is a power-button
+//! event the OS handles (graceful reboot/halt); ≥3000 ms is a hard PMIC
+//! power-off (pulse again to power back on).
+
+use std::time::Duration;
+
+use anyhow::{anyhow, Context, Result};
+
+/// Assert DTR for `ms` via the running serialcap daemon (it owns the port).
+pub fn dtr_press_daemon(base_url: &str, interface: &str, ms: u64) -> Result<()> {
+    let url = format!("{base_url}/button?interface={interface}&ms={ms}");
+    let timeout = std::cmp::max(15_000, ms + 5_000);
+    ureq::post(&url)
+        .timeout(Duration::from_millis(timeout))
+        .send_bytes(&[])
+        .map(|_| ())
+        .map_err(|e| anyhow!("serialcap /button failed: {e}"))
+}
+
+/// Assert DTR for `ms` directly (fallback when the daemon isn't running).
+pub fn dtr_press_direct(device: &str, ms: u64) -> Result<()> {
+    let mut port = serialport::new(device, 115200)
+        .timeout(Duration::from_millis(250))
+        .open()
+        .with_context(|| format!("opening {device} for DTR control"))?;
+    port.write_data_terminal_ready(false)?;
+    std::thread::sleep(Duration::from_millis(50)); // settle after open
+    port.write_data_terminal_ready(true)?;
+    std::thread::sleep(Duration::from_millis(ms));
+    port.write_data_terminal_ready(false)?;
+    Ok(())
+}
+
+/// Current power state from the daemon's sense line: Some(on) or None when the
+/// sense signal isn't configured (power_on is null) or the daemon is unreachable.
+pub fn read_power_state(base_url: &str, interface: &str) -> Option<bool> {
+    let resp = ureq::get(&format!("{base_url}/status?interface={interface}"))
+        .timeout(Duration::from_secs(2))
+        .call()
+        .ok()?;
+    let v: serde_json::Value = resp.into_json().ok()?;
+    v.get("power_on")?.as_bool()
+}
+````
+
+## File: cli/src/setup.rs
+````rust
+// Copyright 2026 Curtis Galloway
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! `paniolo setup` — build and install paniolo's binaries from a source clone.
+//!
+//! Installs the daemons (hdmicap, serialcap, netbootd) **and the paniolo CLI
+//! itself** via `cargo install` into `~/.cargo/bin`, so every control host runs
+//! from one stable installed path. On macOS it also setuid-installs the
+//! netbootd bpf-helper (the only root component) and compiles the visionocr OCR
+//! helper; on Linux it checks dialout/video group membership and installs
+//! linuxocr. The legacy `tftp-now` brew step is gone — netbootd serves TFTP.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use anyhow::{anyhow, bail, Result};
+
+/// The crates `setup` builds and installs, in order. `cli` is the paniolo
+/// binary itself — the single-binary deployment this rewrite exists for.
+const CRATES: [&str; 4] = ["hdmicap", "serialcap", "netbootd", "cli"];
+
+fn is_repo_root(d: &Path) -> bool {
+    d.join("pyproject.toml").is_file()
+        && d.join("ocr").is_dir()
+        && d.join("hdmicap/Cargo.toml").is_file()
+}
+
+/// Locate the paniolo source checkout: the current directory and its parents.
+/// (The installed binary has no `__file__` to climb from; `make install` and
+/// hand-run setups both execute inside the clone.)
+pub fn find_repo_root() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let mut d: Option<&Path> = Some(cwd.as_path());
+    while let Some(p) = d {
+        if is_repo_root(p) {
+            return Some(p.to_path_buf());
+        }
+        d = p.parent();
+    }
+    None
+}
+
+fn cargo_bin() -> PathBuf {
+    dirs::home_dir().unwrap_or_default().join(".cargo/bin")
+}
+
+fn user_in_group(group: &str) -> bool {
+    Command::new("id")
+        .arg("-nG")
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .any(|g| g == group)
+        })
+        .unwrap_or(false)
+}
+
+fn group_exists(group: &str) -> bool {
+    Command::new("getent")
+        .args(["group", group])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Add the user to dialout/video if needed (Linux). Returns true if anything
+/// changed (a re-login is needed for it to take effect).
+fn ensure_linux_groups() -> bool {
+    let user = std::env::var("USER").unwrap_or_default();
+    let mut changed = false;
+    for (group, reason) in [
+        ("dialout", "serial port access (/dev/ttyUSB*, /dev/ttyACM*)"),
+        ("video", "V4L2 capture device access (/dev/video*)"),
+    ] {
+        if !group_exists(group) {
+            continue;
+        }
+        if user_in_group(group) {
+            println!("  ✓ {group:12} already a member");
+        } else {
+            let ok = Command::new("sudo")
+                .args(["usermod", "-aG", group, &user])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if ok {
+                println!("  ✓ {group:12} added ({reason})");
+                changed = true;
+            } else {
+                eprintln!("  ✗ {group:12} could not add ({reason})");
+            }
+        }
+    }
+    changed
+}
+
+/// Run the local setup from a source checkout at `repo`.
+pub fn run(repo: &Path) -> Result<()> {
+    let bin_dir = cargo_bin();
+
+    if cfg!(target_os = "macos") {
+        println!("  ℹ macOS: netbootd serves DHCP+TFTP; no system TFTP tool needed.");
+    } else {
+        println!(
+            "  ℹ Linux: before building, ensure system packages are installed:\n\
+             \x20   sudo apt-get install build-essential pkg-config libudev-dev libclang-dev"
+        );
+        println!("\nChecking group membership…");
+        if ensure_linux_groups() {
+            println!(
+                "\nNote: group changes take effect after you log out and back in \
+                 (or run `newgrp dialout` in the current shell)."
+            );
+        }
+    }
+
+    let cargo = crate::daemons::find_binary("cargo")
+        .ok_or_else(|| anyhow!("cargo not found — install Rust (https://rustup.rs)"))?;
+
+    for crate_name in CRATES {
+        let crate_dir = repo.join(crate_name);
+        if !crate_dir.join("Cargo.toml").is_file() {
+            println!(
+                "  … {crate_name}: source not found at {}, skipping",
+                crate_dir.display()
+            );
+            continue;
+        }
+        println!("  building {crate_name} (cargo install — may take a few minutes)…");
+        let status = Command::new(&cargo)
+            .args(["install", "--path"])
+            .arg(&crate_dir)
+            .arg("--force")
+            .status()?;
+        if !status.success() {
+            bail!("{crate_name}: cargo install failed");
+        }
+        // The `cli` package installs a binary named `paniolo`.
+        let bin_name = if crate_name == "cli" {
+            "paniolo"
+        } else {
+            crate_name
+        };
+        println!("  ✓ {bin_name:12} {}", bin_dir.join(bin_name).display());
+    }
+
+    // netbootd's macOS raw-frame send path needs a /dev/bpf descriptor, which
+    // only root can open. The setuid bpf-helper is the ONLY root component; its
+    // sole job is opening /dev/bpf and handing the fd to the unprivileged
+    // netbootd. cargo install resets the mode, so the setuid bit is re-applied
+    // after every (re)install.
+    if cfg!(target_os = "macos") {
+        let helper = bin_dir.join("netbootd-bpf-helper");
+        if helper.is_file() {
+            println!("  … installing netbootd-bpf-helper setuid-root (one-time sudo)");
+            let chown = Command::new("sudo")
+                .args(["chown", "root:wheel"])
+                .arg(&helper)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            let chmod = Command::new("sudo")
+                .args(["chmod", "4755"])
+                .arg(&helper)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if chown && chmod {
+                println!("  ✓ {:12} setuid-root  {}", "bpf-helper", helper.display());
+            } else {
+                eprintln!(
+                    "  ! could not setuid netbootd-bpf-helper; the netboot send path \
+                     falls back to the kernel (broken on macOS 15+). Re-run \
+                     `paniolo setup` with sudo access to fix."
+                );
+            }
+        } else {
+            println!("  … netbootd-bpf-helper not found; skipping setuid install");
+        }
+    }
+
+    // OCR helper: visionocr (swiftc) on macOS, linuxocr copy on Linux.
+    if cfg!(target_os = "macos") {
+        let source = repo.join("ocr/visionocr.swift");
+        let dest = bin_dir.join("visionocr");
+        if !source.is_file() {
+            println!("  … visionocr: source not found, skipped");
+        } else if crate::daemons::find_binary("swiftc").is_none() {
+            println!("  … visionocr: swiftc not found (install Xcode CLT), skipped");
+        } else {
+            let ok = Command::new("swiftc")
+                .args(["-O", "-o"])
+                .arg(&dest)
+                .arg(&source)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if ok {
+                println!("  ✓ {:12} {}", "visionocr", dest.display());
+            } else {
+                println!("  … visionocr: build failed, skipped");
+            }
+        }
+    } else {
+        let source = repo.join("ocr/linuxocr");
+        let dest = bin_dir.join("linuxocr");
+        if source.is_file() {
+            std::fs::copy(&source, &dest)?;
+            let mut perms = std::fs::metadata(&dest)?.permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+            std::fs::set_permissions(&dest, perms)?;
+            println!("  ✓ {:12} {}", "linuxocr", dest.display());
+        } else {
+            println!("  … linuxocr: source not found, skipped");
+        }
+        if crate::daemons::find_binary("tesseract").is_none() {
+            println!(
+                "  ! tesseract not found — install it for OCR:\n\
+                 \x20   sudo apt-get install tesseract-ocr"
+            );
+        }
+    }
+
+    println!("\nSetup complete.");
+    let on_path = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d == bin_dir))
+        .unwrap_or(false);
+    if !on_path {
+        println!(
+            "Note: add {} to your PATH so the binaries resolve.",
+            bin_dir.display()
+        );
+    }
+    Ok(())
+}
+````
+
+## File: cli/src/state.rs
+````rust
+// Copyright 2026 Curtis Galloway
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Persistent runtime state — netboot PID records and liveness checks.
+//!
+//! The JSON shape matches the Python `_state.py` exactly so both CLIs can read
+//! each other's state during the migration: for the rust engine both `*_pid`
+//! fields hold the single netbootd PID.
+
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetbootState {
+    pub target: String,
+    pub dhcp_pid: i32,
+    pub tftp_pid: i32,
+    pub started_at: f64,
+    pub interface: String,
+    pub tftp_root: String,
+    #[serde(default = "default_engine")]
+    pub engine: String,
+}
+
+fn default_engine() -> String {
+    "python".to_string()
+}
+
+pub fn state_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".local/share/paniolo")
+}
+
+fn target_dir(target: &str) -> PathBuf {
+    state_dir().join(target)
+}
+
+pub fn netboot_state_path(target: &str) -> PathBuf {
+    target_dir(target).join("netboot.json")
+}
+
+pub fn netboot_log_path(target: &str) -> PathBuf {
+    target_dir(target).join("netboot.log")
+}
+
+pub fn ensure_target_dir(target: &str) -> std::io::Result<PathBuf> {
+    let d = target_dir(target);
+    std::fs::create_dir_all(&d)?;
+    Ok(d)
+}
+
+pub fn save_netboot_state(state: &NetbootState) -> anyhow::Result<()> {
+    ensure_target_dir(&state.target)?;
+    let json = serde_json::to_string_pretty(state)?;
+    std::fs::write(netboot_state_path(&state.target), json)?;
+    Ok(())
+}
+
+pub fn load_netboot_state(target: &str) -> Option<NetbootState> {
+    let text = std::fs::read_to_string(netboot_state_path(target)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+pub fn remove_netboot_state(target: &str) {
+    let _ = std::fs::remove_file(netboot_state_path(target));
+}
+
+/// True if any process with this PID exists (signal-0 probe; EPERM = alive).
+pub fn is_pid_alive(pid: i32) -> bool {
+    // Safe: kill(pid, 0) only probes for existence.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// The full command line of `pid`, or empty on failure.
+fn pid_cmdline(pid: i32) -> String {
+    if cfg!(target_os = "macos") {
+        std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "args="])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    } else {
+        std::fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|b| {
+                String::from_utf8_lossy(&b)
+                    .replace('\0', " ")
+                    .trim()
+                    .to_string()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// True only if `pid` is alive AND its command line mentions `needle` — guards
+/// against PID reuse by unrelated processes after a crash.
+pub fn is_named_child_alive(pid: i32, needle: &str) -> bool {
+    is_pid_alive(pid) && pid_cmdline(pid).contains(needle)
+}
+
+/// True only if the netboot process for `target` is alive (rust engine: the
+/// single netbootd; legacy python engine: both children).
+pub fn is_netboot_running(target: &str) -> bool {
+    let Some(state) = load_netboot_state(target) else {
+        return false;
+    };
+    if state.engine == "rust" {
+        is_named_child_alive(state.dhcp_pid, "netbootd")
+    } else {
+        is_named_child_alive(state.dhcp_pid, "paniolo._dhcp")
+            && is_named_child_alive(state.tftp_pid, "paniolo._tftp")
+    }
+}
+
+pub fn now_epoch() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+````
+
+## File: cli/src/video.rs
+````rust
+// Copyright 2026 Curtis Galloway
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Video capture runtime — delegates to the `hdmicap` warm-stream daemon.
+//!
+//! Ported from the Python `_video.py`, with one model change: the capture
+//! device comes from the lab's `video` channel (per target), not a separate
+//! `video.toml`. The daemon gets `PANIOLO_VISIONOCR` (for `/ocr`) and
+//! `PANIOLO_TARGET` (so the dashboard power-cycle button can call back into
+//! `paniolo power-cycle <target>`).
+
+use std::process::{Command, Stdio};
+
+use anyhow::{anyhow, Result};
+
+use crate::daemons;
+
+pub const DAEMON: &str = "hdmicap";
+
+/// Default daemon port: 0 = OS-assigned (discovery carries the real port;
+/// fixed defaults collide with stale dashboard tunnels).
+pub const DEFAULT_PORT: u16 = 0;
+
+pub fn daemon_url() -> Option<String> {
+    daemons::daemon_url(DAEMON)
+}
+
+/// Start the hdmicap daemon for `device`, detached; caller polls discovery.
+pub fn start_daemon(device: &str, port: u16, target_name: Option<&str>) -> Result<()> {
+    let binary = daemons::find_binary(DAEMON)
+        .ok_or_else(|| anyhow!("hdmicap not found (PATH or ~/.cargo/bin) — run `paniolo setup`"))?;
+    let mut cmd = Command::new(binary);
+    cmd.arg("daemon")
+        .arg("--device")
+        .arg(device)
+        .arg("--port")
+        .arg(port.to_string());
+    if let Some(ocr) = daemons::find_binary("visionocr") {
+        cmd.env("PANIOLO_VISIONOCR", ocr);
+    }
+    if let Some(name) = target_name {
+        cmd.env("PANIOLO_TARGET", name);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    cmd.spawn()?;
+    Ok(())
+}
+
+/// Stop the running daemon via `hdmicap stop`.
+pub fn stop_daemon() -> Result<i32> {
+    let binary = daemons::find_binary(DAEMON).ok_or_else(|| anyhow!("hdmicap not found"))?;
+    let status = Command::new(binary).arg("stop").status()?;
+    Ok(status.code().unwrap_or(1))
+}
+
+/// Run an `hdmicap` client subcommand (shot/devices/…) with stdio passed
+/// through; returns the exit code.
+pub fn passthrough(args: &[String]) -> Result<i32> {
+    let binary = daemons::find_binary(DAEMON).ok_or_else(|| anyhow!("hdmicap not found"))?;
+    let status = Command::new(binary).args(args).status()?;
+    Ok(status.code().unwrap_or(1))
+}
+````
+
+## File: cli/.gitignore
+````
+/target/
 ````
 
 ## File: docs/ci-integration/design.md
@@ -832,6 +1685,464 @@ labgrid is best treated as a **validation reference + passive wire-compat target
 priority. See [`related-work.md`](related-work.md) for the full paniolo-vs-labgrid comparison.
 ````
 
+## File: docs/ch9329-spec.md
+````markdown
+<!--
+Copyright 2026 Curtis Galloway
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
+# CH9329 USB-HID bridge — clean-room driver spec
+
+**Target:** the Rust serial driver at `cli/src/ch9329.rs` (paniolo's `hid` channel
+backend). **Device:** WCH CH9329 UART→USB-HID bridge, behind a CH340 USB-serial
+bridge in the Openterface Mini-KVM. The host sends framed serial commands; the
+CH9329 emulates a USB HID keyboard/mouse to the *target*.
+
+All facts below derive from the WCH **CH9329 Datasheet (DS1, V1.1)** and the WCH
+**"CH9329 serial communication protocol" (V1.0)** — restated in original words.
+No application/firmware source (incl. the GPL Openterface app) was reproduced.
+
+## 1. Frame format
+
+Same layout host→chip and chip→host: `HEAD(2)=57 AB` · `ADDR(1)=00` ·
+`CMD(1)` · `LEN(1)=#data` · `DATA(0..64)` · `SUM(1)`.
+`SUM = (57 + AB + ADDR + CMD + LEN + ΣDATA) & 0xFF`.
+Chip normal response CMD = `request | 0x80`; error response CMD = `request | 0xC0`.
+Master/slave: host is master, 500 ms response timeout; default 3 ms inter-byte
+gap ends a packet.
+
+Example — press 'A' (usage 0x04): `57 AB 00 02 08 00 00 04 00 00 00 00 00 10`.
+
+## 2. Baud / framing
+
+Power-on default **9600**; supported 1200…**115200**; framing **8N1**.
+115200 requires 5 V supply (not guaranteed at 3.3 V). A factory/unconfigured chip
+is at 9600 — do not assume 115200; detect it.
+
+## 3. GET_INFO — `0x01` → `0x81`, 8-byte response
+
+Request `57 AB 00 01 00 03`. Response payload: `[0]` chip version (`0x30+minor`);
+**`[1]` USB enumeration status: 0x01 = target enumerated the HID, 0x00 = not**;
+`[2]` lock LEDs (bit0 Num, bit1 Caps, bit2 Scroll); `[3..7]` reserved.
+
+## 4. Keyboard report — `0x02` → `0x82`
+
+`LEN=0x08`, DATA = USB boot-keyboard report: `[0]` modifier bitmask, `[1]`
+reserved (0x00), `[2..7]` up to 6 HID usage codes. Modifier bits: 0 L-Ctrl,
+1 L-Shift, 2 L-Alt, 3 L-GUI, 4 R-Ctrl, 5 R-Shift, 6 R-Alt, 7 R-GUI. Response =
+1 status byte (`0x00` = success). (Multimedia keys `0x03`/`0x83`; mouse abs
+`0x04`, rel `0x05`.)
+
+## 5. Parameter config — `0x08` (get) / `0x09` (set), 50-byte block
+
+`GET_PARA_CFG 0x08` → `0x88` + 50-byte block. `SET_PARA_CFG 0x09` (LEN 0x32) →
+`0x89` + status. Block offsets that matter:
+
+| Offset | Field | Notes |
+|---|---|---|
+| 0 | Working mode | set `0x00–0x03`; `0x00`=KB+mouse+HID, `0x02`=KB+mouse |
+| 1 | Serial comm mode | set `0x00`=protocol (required), `0x01`=ASCII, `0x02`=transparent |
+| 2 | Serial address | default `0x00` |
+| 3..6 | **Baud (big-endian)** | 9600=`00 00 25 80`; **115200=`00 01 C2 00`** |
+| 9..10 | Packet interval ms | default 3 |
+| 11..14 | USB VID/PID | default VID 0x1A86 |
+| … | (ASCII-mode/USB-string fields) | offsets >9 derived — verify by readback |
+
+**Procedure to set 115200:** `GET_PARA_CFG` → keep all 50 bytes → set offset 0=`0x00`,
+offset 1=`0x00`, offset 3..6=`00 01 C2 00` → recompute SUM → `SET_PARA_CFG`. Config
+**persists to flash** and **activates only after reset/power-cycle** — then reopen the
+host port at 115200.
+
+## 6. Reset
+
+- `CMD_RESET 0x0F` → `0x8F`: reset chip (re-open at configured baud).
+- `CMD_SET_DEFAULT_CFG 0x0C` → `0x8C`: restore factory defaults (baud→9600); follow
+  with `CMD_RESET`, reopen at 9600.
+- **Hardware factory reset = `DEF` pin (pin 10) low >3 s, release, ~200 ms → 9600.**
+  RTS→DEF is a *board wiring* possibility, **not** a chip fact — **verify on hardware**
+  (our RTS pulse did not recover a wedged chip; treat physical replug as the recovery).
+- `SET` pin (pin 11) low forces protocol mode regardless of config.
+
+## 7. Working modes
+
+Framed protocol works only in **serial comm mode 0 (protocol mode)** — the power-on
+default. ASCII/transparent modes type raw bytes instead of parsing frames.
+
+## Init + baud-upgrade sequence
+
+1. Open at current baud (try 9600, then 115200) and `GET_INFO`; a `0x81` reply
+   confirms the baud and reports USB-enumeration + version.
+2. If not already 115200: `GET_PARA_CFG`, set baud 3..6=`00 01 C2 00`, mode/serial=0,
+   `SET_PARA_CFG` (expect `0x89`/`0x00`), `CMD_RESET` (expect `0x8F`/`0x00`).
+3. Re-open at 115200, `GET_INFO` again; require enumeration byte `0x01` before typing.
+4. Per char: press frame then all-zero release frame; check each `0x82` status, small
+   inter-frame gap.
+
+## ACK / status codes
+
+`0x00` SUCCESS · `0xE1` TIMEOUT · `0xE2` HEAD · `0xE3` CMD · `0xE4` SUM · `0xE5` PARA
+· `0xE6` OPERATE.
+
+## Confidence
+
+High: frame/checksum, baud table, GET_INFO, keyboard report, command codes, config
+offsets 0–9, persistence/reset-to-activate, serial reset codes, DEF-pin reset, modes.
+Medium (verify on hardware): config offsets >9; baud-field readback. Low: RTS→reset
+mapping (board-specific, inferred).
+
+## Canonical references
+
+- **CH9329 Datasheet (DS1, V1.1)** — pinout, modes, baud, framing, DEF/RST/SET pins,
+  factory-reset timing, persistence. `https://www.wch-ic.com/downloads/CH9329DS1_PDF.html`
+  (English mirror: `https://akizukidenshi.com/goodsaffix/ch9329.pdf`).
+- **CH9329 serial communication protocol (V1.0)** — frame format, checksum, command/
+  response tables, payloads, status codes, key-code appendix. In WCH `CH9329EVT.ZIP`
+  (`https://www.wch.cn/downloads/CH9329EVT_ZIP.html`).
+- **CH9329 config tool** (field sanity-check): `https://ch9329.ayufan.dev/`.
+
+**Clean-room attestation:** no source code reproduced; vendor-datasheet facts only.
+````
+
+## File: docs/config-redesign.md
+````markdown
+<!--
+Copyright 2026 Curtis Galloway
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
+# Config redesign: a CLI-managed lab
+
+Status: **Rust control plane implemented through full command parity** (the `cli/`
+crate): config model + CRUD + doctor (R1), per-channel dispatch + SSH transport
+(R2), and the serial / video / power / netboot / netif runtimes plus `console`,
+`discover`, `configure`, `setup` (R3) — rig-verified against a live Pi 5 bench
+(serial round-trip, live HDMI capture, netbootd serving DHCP+TFTP, netif mode
+transitions). Remaining: live remote-host dispatch test (needs a second control
+host), a real TFTP boot, docs/cutover, and the deferred OCR + Openterface HID.
+The Python Stages 1–4 on this branch are the original tested reference; the
+Python tree is retired only after the Rust CLI has proven itself in daily use.
+
+## Why
+
+Paniolo's configuration today is split-brained:
+
+- **Legacy** per-target files (`~/.config/paniolo/targets/<name>.toml`) are
+  read *and* written — `target set`, `serial setup`, the video/HID setup
+  commands all call `_config.save_target()` through a hand-rolled `_to_toml()`
+  serializer. They always run on the local host.
+- **Lab** files (`--lab` / `PANIOLO_LAB`) describe all hosts and targets with
+  per-resource host binding, but are **read-only**: there is a parser and no
+  writer.
+
+The thing that prompted this redesign was noticing there's no command to *view*
+or *change* configuration — you hand-edit TOML. But you can't bolt a clean
+config CLI onto two config systems, one of which can't be written. So the
+decision is to collapse to **one** model:
+
+> The lab file is the single source of truth, fully CLI-managed, with no
+> backward-compatibility shim for the legacy per-target files.
+
+A config CLI is a forcing function on the data model: the verbs you want to type
+pin down the nouns. This document records the model, the surface, and the
+dispatch architecture the surface demands.
+
+## The data model
+
+A **channel** has two independent coordinates: where it physically *is* (a host)
+and what it logically *serves* (a target). The lab file is organized
+target-first (channels nested under the target they serve) because that keeps
+the common single-host case trivial; each channel carries an optional `host =`
+that names where it physically lives.
+
+```
+Lab
+ ├── hosts: { name -> Host }          # SSH reachability only
+ └── targets: { name -> Target }
+                    ├── host           # default host for this target's channels
+                    ├── note           # optional free-text, survives CLI rewrites
+                    └── channels
+                         ├── netboot   (singleton)
+                         ├── serial[]  (collection, named)
+                         ├── power     (singleton)
+                         └── video     (singleton)
+```
+
+- **Host** — a machine paniolo reaches over SSH. Fields: `ssh` (required;
+  `"local"` = dev machine), `identity`, `control_path`, `paniolo_cmd`. Hosts
+  carry **connection info only** — never device paths.
+- **Target** — a logical device. Has a default `host`, an optional `note`, and a
+  set of channels. A channel omitting `host` inherits the target's `host`, which
+  defaults to `local`.
+- **Channel** — one piece of a target's hardware. Each type keeps its own shape
+  (they always have): `netboot` (interface, host_ip, tftp_root), `serial`
+  (name, device, baud, power_sense_signal), `power` (cycle_cmd,
+  serial_interface), `video` (device). Every channel may carry `host =`.
+
+### Identity & uniqueness rules
+
+- Host names are unique within the lab.
+- Target names are unique within the lab.
+- Serial channel names are unique within a target.
+- `netboot`, `power`, `video` are **singletons** — at most one per target, so
+  their "name" is just the type.
+- Any channel's `host` must be `local` or a declared host. Validated on load
+  *and* after every mutation (one shared `validate()`).
+
+### What we are NOT building
+
+Channel→target is one-at-a-time (a cable goes to one place; rewiring is a config
+edit, not a runtime event). The genuinely simultaneous case — one host serving
+several targets at once — is already expressible (multiple targets reference the
+same host). So there is **no** first-class many-to-many channel entity and no
+runtime channel multiplexing.
+
+## File location & discovery
+
+Retiring legacy means the lab file needs a default — requiring `--lab` on every
+call would kill the "simple on one host" goal.
+
+Discovery order: `--lab PATH` > `$PANIOLO_LAB` > `~/.config/paniolo/lab.toml`.
+
+`paniolo init` creates an empty lab at the default path. Commands that need
+config but find none fail with a hint (`run paniolo target add ...`), not a
+stack trace.
+
+## Round-trip: tomlkit surgical edits
+
+The lab file is git-tracked and human-authored, so the CLI must edit it
+**politely**: preserve hand-written comments, ordering, and formatting anywhere
+in the file, touching only the tables it changes. This rules out
+parse-then-regenerate. We use **`tomlkit`** (new dependency) for surgical
+document edits.
+
+- The lab is parsed into typed dataclasses for *reading* (resolution,
+  validation, display).
+- Mutations go through a thin `tomlkit`-backed document layer that edits the
+  live `TOMLDocument` and writes it back, preserving trivia.
+- The machine-generated remote slice (`PANIOLO_TARGET_CONFIG`, shipped over SSH,
+  never hand-edited) keeps using a plain dump — no round-trip concern there.
+
+## Command surface
+
+The verb asymmetry is the singleton/collection split surfacing exactly where it
+belongs: collections get `add`/`rm` with a name; singletons get `set`/`rm`.
+
+```
+read    paniolo config show                whole lab as a tree
+        paniolo config path                print the active lab file path
+        paniolo config edit                open the raw lab file in $EDITOR
+        paniolo target list | show NAME    show = RESOLVED: each channel + host
+        paniolo host   list | show NAME    inverse index: channels here, targets served
+        paniolo doctor [TARGET|--host H]   probe reality vs config over SSH
+
+write   paniolo init
+        paniolo host   add  NAME --ssh ... [--identity] [--control-path] [--paniolo-cmd]
+        paniolo host   set  NAME [--ssh] [--identity] ...
+        paniolo host   rm   NAME
+        paniolo target add  NAME [--host H] [--note ...]
+        paniolo target set  NAME [--host H] [--note ...]
+        paniolo target rm   NAME
+        paniolo serial  add NAME -t TARGET --device ... [--host] [--baud] [--sense]
+        paniolo serial  set NAME -t TARGET [--device] [--baud] [--sense] [--host]
+        paniolo serial  rm  NAME -t TARGET
+        paniolo netboot set -t TARGET --interface ... [--host] [--host-ip] [--tftp-root]
+        paniolo netboot rm  -t TARGET
+        paniolo power   set -t TARGET [--cycle-cmd] [--serial-interface] [--host]
+        paniolo power   rm  -t TARGET
+        paniolo video   set -t TARGET --device ... [--host]
+        paniolo video   rm  -t TARGET
+```
+
+### Two read views, two purposes
+
+- `target show` renders the **resolved** target: inheritance applied, each
+  channel annotated with the host it lands on. This is the truth the runtime
+  acts on.
+- `config edit` / `config path` expose the **raw** file for hand-editing.
+
+### Config writes are local and pure
+
+A config command edits *your* lab file on *your* machine; it never SSHes. So
+config verbs are **not** `@remote_capable`. This keeps editing offline-capable
+and removes a whole class of failure. The corollary: the old `serial setup`
+conflated "record this channel" (local, pure) with "probe the `/dev`" (remote,
+impure). We split them — `serial add` only records; `doctor` does the probing.
+
+## Dispatch architecture (relax the single-host invariant)
+
+We are relaxing the single-host-per-target invariant in the same effort. Today
+dispatch is a **command-level** decision: `@remote_capable` resolves *the
+target's* one host and re-execs the whole command there. That cannot survive
+per-channel hosts, because "which host" is now a property of *the channel a
+command touches*, not the command. Dispatch moves down a level.
+
+### Single-channel commands
+
+Most commands touch exactly one channel (`serial connect` → a serial channel;
+`screenshot` → video; `netboot start` → netboot; `power-cycle` → power). The
+re-exec model survives: resolve *that channel's* host and re-exec the whole
+command there (whole-command re-exec is what gives the interactive serial PTY on
+the remote for free). The decorator just needs to know which channel each
+command operates on.
+
+### Per-host config slice
+
+`_remote.dispatch` currently ships the whole resolved target and the remote
+treats everything as local. With per-channel hosts that's wrong — bench2 must
+not see bench1's channels. The slice becomes **per-host**: ship only the
+channels that resolve to the destination host, with their `host` normalized to
+local, so the remote's "everything I see is local" assumption stays true.
+
+### Composite commands — staged
+
+A composite like `boot` (power-cycle + netboot + tail serial) cannot be carried
+by one re-exec if its channels span hosts; it must orchestrate locally and fan
+out per channel.
+
+**Decision: stage it.** First implement per-channel dispatch for single-channel
+commands (this delivers genuine multi-host targets for ~all of the surface).
+Composite commands **require their channels to be co-located on one host for
+now** and error with a clear message otherwise
+(`boot needs power, netboot, and serial on the same host; serial is on bench2`).
+Cross-host fan-out is deferred until a real target needs it — observation
+channels (video) are the ones that tend to wander, and observation is
+single-channel. The per-channel dispatch primitive is built so single-channel
+commands are the trivial one-channel case, leaving room to add fan-out later
+without reshaping it.
+
+## Staged implementation plan
+
+1. **Model + tomlkit foundation.** New lab dataclasses; default-path discovery
+   and `init`; `tomlkit`-backed surgical read/write; shared `validate()` on load
+   and after mutation. Add `tomlkit` dep.
+2. **Read surface.** `config show/path/edit`, `target list/show` (resolved with
+   per-channel host), `host list/show` (inverse index).
+3. **Write surface (CRUD).** Local, pure mutators for host/target/serial/
+   netboot/power/video, each validating before save.
+4. **`doctor`.** Probe reality vs config over SSH; absorb the probing that used
+   to live inside `setup` commands.
+5. **Per-channel dispatch.** Reusable primitive; per-host slice; composite
+   co-location guard; remove the multi-host rejection in resolution.
+6. **Retire legacy + docs/tests.** Delete the `~/.config/paniolo/targets` path
+   and the user-facing `_to_toml`; migrate tests; update `AGENTS.md`, the
+   `paniolo-reference` skill, `docs/`, and `README`.
+
+## Dispatch design (Stage 5 — specified, to be built in Rust)
+
+This is the per-channel dispatch design worked out before the Rust pivot. It was
+*not* implemented in Python; it is the spec the Rust version implements. The
+read model needed for it (`resolved_target`, `host_slice`) was built and tested
+in Python and ports directly.
+
+**Command → channel.** Each location-transparent command touches exactly one
+channel kind:
+
+| command(s)                                              | channel | selector            |
+|--------------------------------------------------------|---------|---------------------|
+| `netboot start/stop/status/tftp-root/logs/link-*`      | netboot | —                   |
+| `netif mode/status`                                     | netboot | — (the USB-Eth link)|
+| `power-cycle`, `power-state`                            | power   | —                   |
+| `serial connect/watch/dtr/reset/show`                   | serial  | `--interface` name  |
+| `console` (dashboard)                                   | *composite* (serial + video) |
+
+**Host resolution** — `channel_host(target, kind, serial_name)`:
+- singleton kinds (netboot/power/video): the channel's `host`, else target default;
+- serial *with* a name: that interface's `host`, else target default;
+- serial *without* a name: the common host of all serial interfaces — **error** if
+  they span hosts (the `serial watch` case: the daemon owns every interface, so they
+  must be co-located);
+- channel absent entirely: the target's default host (the body then reports the
+  missing channel).
+
+**Slice** — `host_slice(target, host)`: the channels resolving to `host`, flattened
+to a single-host `TargetConfig`, channels on other hosts omitted. This is both what
+runs locally (`host == local`) and what is shipped to a control host. Because the
+slice is single-host with `host` normalized to local, the remote sees everything as
+local and never re-dispatches.
+
+**Dispatch flow** per command:
+1. If invoked with an injected slice (the `PANIOLO_TARGET_CONFIG` env, set by the
+   dispatcher) → run the body locally; it reads the shipped slice.
+2. Else resolve the channel's host. If `local` → run the body locally against
+   `host_slice(target, local)`. Otherwise ship `host_slice(target, host)` to that
+   host and re-exec the *same* command there, passing stdio + exit code through
+   (`serial connect` uses an `ssh -t` PTY).
+
+**Composite commands** (today `console`; a future `boot`) require their channels
+**co-located on one host** and error clearly otherwise
+(`boot needs power, netboot, serial on one host; serial is on bench2`). Single-channel
+commands are the trivial one-host case of the same mechanism. Cross-host fan-out is
+deferred until a real target needs it.
+
+**Transport** stays as today: shell out to `ssh` with ControlMaster multiplexing
+(one handshake per host), `ssh -t` for interactive serial.
+
+## Pivot to Rust
+
+The repo is already mid-migration from Python to Rust: `netbootd` replaced the
+Python `_dhcp`/`_tftp` engines, `hdmicap` replaced the Python video path, `serialcap`
+is the Rust serial daemon. The CLI + orchestration + device glue is the last large
+Python holdout. Two forces make finishing it in Rust the right call: deploying *both*
+a Python env and Rust binaries to every control host is the friction the re-exec model
+keeps fighting (`paniolo_cmd`, PATH notes in AGENTS.md), and a single static binary
+deployed beside the daemons removes it; and the dispatch logic gains real safety from
+Rust's enums/exhaustive matching exactly where it felt brittle in Python.
+
+Decision: **do not finish Stages 5–6 in Python.** The dispatch design above plus the
+Python Stages 1–4 (config model, CRUD, `doctor`) are the reference. Build the control
+plane once, in Rust, to parity — then retire the Python tree (including the already-
+superseded `_dhcp`/`_tftp`).
+
+### Rust port plan
+
+- **R1 — crate + config model.** New `paniolo` CLI crate (`clap` derive). Lab data
+  model with `serde` for the typed/read side; **`toml_edit`** for comment-preserving
+  lab editing (the `cargo`-grade analog of `tomlkit`). `validate()` shared by load and
+  save. Port `init` + the read surface (`config show`, `target/host list/show`) and the
+  write surface (host/target/serial/netboot/power CRUD) from Stages 1–3.
+- **R2 — doctor + dispatch.** Port `doctor`; implement the dispatch design above:
+  `ChannelKind` enum, `channel_host`, `host_slice`, `ssh` module (shell out with
+  ControlMaster), per-host slice shipping, composite co-location guard.
+- **R3 — runtime glue.** Port the command bodies that drive the daemons and the link
+  (`netboot`, `netif`, `serial`, `video`, `power`, `ocr`, `state`). Drop legacy
+  `_dhcp`/`_tftp`.
+- **R4 — HID, polish, cutover.** Port `_hid` (or keep short-term), finish docs
+  (`AGENTS.md`, `paniolo-reference` skill, `docs/`, `README`), retire the Python tree.
+
+### Open structural decisions (R1)
+
+- **Workspace vs standalone.** The three daemon crates currently build standalone and
+  CI gates them individually; converting the repo to a Cargo workspace changes the
+  shared `target/` layout and could disrupt `make install`/CI. R1 starts the `paniolo`
+  crate **standalone** to avoid touching working infrastructure; a workspace (to share
+  types with the daemons via a `paniolo-core` crate) is a deliberate later step, not a
+  prerequisite.
+- **Binary name.** The crate produces the `paniolo` binary, same UX as today.
+````
+
 ## File: docs/dashboard.md
 ````markdown
 # Combined dashboard
@@ -1055,14 +2366,13 @@ target. The DTR and sense signals share the same USB serial port.
 
 ```bash
 # Add a serial interface with power sense
-paniolo serial setup target-machine \
-    --name console \
+paniolo serial add console -t target-machine \
     --device /dev/tty.usbserial-0001 \
     --baud 115200 \
-    --power-sense cts       # whichever modem-control input is wired
+    --sense cts             # whichever modem-control input is wired
 
 # Tell the target which interface to use as the default for power commands
-paniolo target set target-machine --power-serial console
+paniolo power set -t target-machine --serial-interface console
 ```
 
 ### DTR commands
@@ -1106,8 +2416,8 @@ For cases where DTR isn't wired (or where you want full mains control), set a
 shell script on the target:
 
 ```bash
-paniolo target set target-machine \
-    --power-cycle-cmd /Users/you/.config/paniolo/scripts/power-cycle-target-machine.sh
+paniolo power set -t target-machine \
+    --cycle-cmd /Users/you/.config/paniolo/scripts/power-cycle-target-machine.sh
 ```
 
 The script can do anything — call a Home Assistant API, drive a PDU relay, toggle
@@ -1190,15 +2500,13 @@ Connect the target's HDMI output to the capture card, then the card to the Mac.
 # Detect available capture devices
 paniolo video devices
 
-# Save which device to use
-paniolo video setup
-# or specify explicitly:
-paniolo video setup --device "USB Video"
+# Configure the target's video channel
+paniolo video set -t target-machine --device "USB Video"
 ```
 
-The device name is saved to `~/.config/paniolo/video.toml` and used by
-subsequent commands. When only one non-built-in camera is present, `setup`
-auto-selects it.
+The device lives on the target's `video` channel in the lab file (see
+[config-redesign.md](config-redesign.md)); `paniolo configure` proposes it
+automatically when one non-built-in capture device is present.
 
 ---
 
@@ -5734,7 +7042,7 @@ lto = "thin"
 # limitations under the License.
 ````
 
-## File: src/paniolo/_power.py
+## File: src/paniolo/_labfile.py
 ````python
 # Copyright 2026 Curtis Galloway
 #
@@ -5750,219 +7058,413 @@ lto = "thin"
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Power control helpers: FTDI DTR line via the serialcap daemon or pyserial fallback."""  # pylint: disable=line-too-long
+"""The editable lab document: surgical, comment-preserving writes via tomlkit.
 
-from __future__ import annotations
+The lab file is the single, git-tracked source of truth for paniolo's
+configuration (see docs/config-redesign.md). It is human-authored, so the CLI
+must edit it *politely* — preserving hand-written comments, key ordering, and
+formatting, touching only the tables it changes. That rules out
+parse-then-regenerate; this module wraps a live ``tomlkit`` document and mutates
+it in place.
 
-import time
-import urllib.error
-import urllib.request
-
-
-def dtr_button_press(daemon_url: str, interface_name: str, duration_ms: int) -> None:
-    """Assert DTR (J2 power button) for duration_ms ms via the serialcap daemon.
-
-    The daemon owns the serial port exclusively and drives the DTR line on its
-    supervisor task.  This call blocks until the press completes.
-
-    duration_ms guidance (Raspberry Pi 5 / DA9091 PMIC):
-      ≤500 ms  — soft reset signal; OS handles it (graceful reboot or halt)
-      ≥3000 ms — hard power-off; follow with another call to power the board on
-
-    Raises RuntimeError on HTTP error, OSError on network failure.
-    """
-    url = f"{daemon_url}/button?interface={interface_name}&ms={duration_ms}"
-    req = urllib.request.Request(url, method="POST", data=b"")
-    try:
-        with urllib.request.urlopen(
-            req, timeout=max(15, duration_ms // 1000 + 5)
-        ) as resp:
-            resp.read()
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(
-            f"serialcap /button returned {exc.code}: {exc.reason}"
-        ) from exc
-
-
-def dtr_direct_button_press(device: str, duration_ms: int) -> None:
-    """Assert DTR (J2 power button) for duration_ms milliseconds directly via pyserial.
-
-    Fallback for when the serialcap daemon is not running.  Opens the serial
-    port, asserts DTR for the requested duration, then releases and closes.
-
-    Raises RuntimeError if pyserial is not installed or on serial errors.
-    """
-    try:
-        import serial as _serial  # pylint: disable=import-outside-toplevel
-    except ImportError as exc:
-        raise RuntimeError(
-            "pyserial is required for direct DTR control. "
-            "Install it with: uv add pyserial"
-        ) from exc
-
-    port = _serial.Serial()
-    port.port = device
-    port.baudrate = 115200
-    port.open()
-    try:
-        port.dtr = False
-        time.sleep(0.05)  # brief settle after open
-        port.dtr = True
-        time.sleep(duration_ms / 1000.0)
-        port.dtr = False
-    finally:
-        port.close()
-````
-
-## File: src/paniolo/_remote.py
-````python
-# Copyright 2026 Curtis Galloway
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Transparent re-exec of a command on a target's remote control host.
-
-When a command targets a host other than the dev machine, paniolo re-runs the
-*same* invocation on that host over SSH (see docs/distributed-control.md). The
-control host is stateless, so the resolved TargetConfig is shipped to it as a
-temp file and pointed at with PANIOLO_TARGET_CONFIG; the remote paniolo then
-runs against that slice locally. stdin/stdout/stderr and the exit code pass
-through, so the command behaves as if it ran here.
-
-This module holds the transport-shaped helpers (pure where possible, for
-testing); the ``@remote_capable`` decorator that calls them lives in _cli.py
-next to the command definitions and target resolution.
+Reading/resolution and the typed model live in :mod:`paniolo._lab`; this module
+is purely the write side plus the shared :func:`validate` (run on load and after
+every mutation). The machine-generated remote slice
+(``PANIOLO_TARGET_CONFIG``) does *not* go through here — it is ephemeral and
+never hand-edited, so it keeps using a plain dump.
 """
 
 from __future__ import annotations
 
-import json
+import os
+from collections.abc import Mapping
+from pathlib import Path
 from typing import Optional
 
-from . import _ssh
-from ._config import TargetConfig, _to_toml as _config_to_toml
-from ._ssh import Host
+import tomlkit
 
-TARGET_CONFIG_ENV = "PANIOLO_TARGET_CONFIG"
+from ._config import VALID_SENSE_SIGNALS
+from ._lab import LabError
+from ._ssh import LOCAL
 
-# Re-exec dispatch modes.
-REEXEC = "reexec"  # non-interactive: stdio passed through (run_passthrough)
-INTERACTIVE = "interactive"  # PTY over ssh -t (e.g. tio)
+# Singleton channel types: at most one per target, so the type *is* the name.
+SINGLETON_CHANNELS = ("netboot", "power", "video")
+
+_HEADER = "paniolo lab — managed by the `paniolo` CLI; hand-edits are preserved"
 
 
-def strip_lab_option(args: list[str]) -> list[str]:
-    """Drop the global ``--lab PATH`` / ``--lab=PATH`` option from an argv tail.
+def _is_table(value: object) -> bool:
+    """True for a TOML table (mapping), False for an array-of-tables or scalar."""
+    return isinstance(value, Mapping)
 
-    The dev machine's lab path is meaningless on the control host — it gets the
-    config via PANIOLO_TARGET_CONFIG instead — so it must not travel with the
-    re-exec'd command.
+
+def _check_host_ref(host: str, declared: set[str], where: str) -> None:
+    if host not in declared:
+        known = ", ".join(sorted(declared)) or "(none)"
+        raise LabError(f"{where} references unknown host '{host}' (declared: {known})")
+
+
+def validate(data: Mapping) -> None:
+    """Raise :class:`LabError` if ``data`` is not a structurally valid lab.
+
+    Works on either a ``tomlkit`` document or a plain dict (from ``tomllib``),
+    so the loader and the writer share one rulebook. Checks: every host has an
+    ``ssh`` destination; every host reference (target default and per-channel)
+    points at ``local`` or a declared host; serial names are unique within a
+    target; the singleton channels are single tables, not arrays.
     """
-    out: list[str] = []
-    skip = False
-    for arg in args:
-        if skip:
-            skip = False
-            continue
-        if arg == "--lab":
-            skip = True
-            continue
-        if arg.startswith("--lab="):
-            continue
-        out.append(arg)
-    return out
+    hosts = data.get("hosts") or {}
+    if not _is_table(hosts):
+        raise LabError("'hosts' must be a table")
+    declared: set[str] = set(hosts) | {LOCAL}
+    for hname, h in hosts.items():
+        if not _is_table(h) or not h.get("ssh"):
+            raise LabError(f"host '{hname}': missing required 'ssh' field")
+
+    targets = data.get("targets") or {}
+    if not _is_table(targets):
+        raise LabError("'targets' must be a table")
+    for tname, t in targets.items():
+        if not _is_table(t):
+            raise LabError(f"target '{tname}': must be a table")
+        default_host = t.get("host", LOCAL)
+        _check_host_ref(default_host, declared, f"target '{tname}'")
+
+        for ch in SINGLETON_CHANNELS:
+            c = t.get(ch)
+            if c is None:
+                continue
+            if not _is_table(c):
+                raise LabError(
+                    f"target '{tname}': [{ch}] must be a single table, not an array"
+                )
+            _check_host_ref(
+                c.get("host", default_host), declared, f"target '{tname}' {ch}"
+            )
+
+        serial = t.get("serial")
+        if serial is not None:
+            if _is_table(serial):
+                raise LabError(
+                    f"target '{tname}': serial must be [[serial]] array entries"
+                )
+            seen: set[str] = set()
+            for s in serial:
+                name = s.get("name")
+                if not name or not s.get("device"):
+                    raise LabError(
+                        f"target '{tname}': each [[serial]] needs name + device"
+                    )
+                if name in seen:
+                    raise LabError(f"target '{tname}': duplicate serial name '{name}'")
+                seen.add(name)
+                sense = s.get("power_sense_signal")
+                if sense is not None and sense not in VALID_SENSE_SIGNALS:
+                    raise LabError(
+                        f"target '{tname}' serial '{name}': invalid "
+                        f"power_sense_signal '{sense}' "
+                        f"(valid: {', '.join(VALID_SENSE_SIGNALS)})"
+                    )
+                _check_host_ref(
+                    s.get("host", default_host),
+                    declared,
+                    f"target '{tname}' serial '{name}'",
+                )
 
 
-def remote_argv(argv: list[str], paniolo_cmd: str = "paniolo") -> list[str]:
-    """Build the command to run on the host from this process's ``sys.argv``.
+class LabFile:
+    """A lab file open for editing, backed by a live ``tomlkit`` document.
 
-    argv[0] (the local launcher path) becomes the host's paniolo command (bare
-    ``paniolo`` by default, or a path the host pins); the ``--lab`` option is
-    stripped.
+    Load with :meth:`load` (validates) or :meth:`create` (a fresh empty lab).
+    Mutators change the in-memory document; :meth:`save` validates and writes it
+    back, preserving all surrounding comments and formatting.
     """
-    return [paniolo_cmd] + strip_lab_option(argv[1:])
 
+    def __init__(self, path: str, doc: tomlkit.TOMLDocument):
+        self.path = path
+        self.doc = doc
 
-# A POSIX-sh one-liner: make a temp file, write stdin into it, print its path.
-_SHIP_SCRIPT = (
-    'f=$(mktemp "${TMPDIR:-/tmp}/paniolo-cfg.XXXXXX") && cat > "$f" && printf %s "$f"'
-)
+    # ── lifecycle ──────────────────────────────────────────────────────────
 
+    @classmethod
+    def load(cls, path: str) -> "LabFile":
+        full = os.path.expanduser(path)
+        with open(full, encoding="utf-8") as f:
+            doc = tomlkit.parse(f.read())
+        validate(doc)
+        return cls(path, doc)
 
-def ship_config(host: Host, cfg: TargetConfig) -> str:
-    """Write ``cfg`` to a temp file on ``host`` and return its remote path."""
-    toml = _config_to_toml(cfg)
-    result = _ssh.run(host, ["sh", "-c", _SHIP_SCRIPT], stdin=toml)
-    path = result.stdout.strip()
-    if result.returncode != 0 or not path:
-        raise _ssh.SSHError(
-            f"failed to ship target config to {host.name}: {result.stderr.strip()}"
+    @classmethod
+    def create(cls, path: str) -> "LabFile":
+        """A new empty lab document (not yet written; call :meth:`save`)."""
+        doc = tomlkit.document()
+        doc.add(tomlkit.comment(_HEADER))
+        return cls(path, doc)
+
+    def save(self) -> None:
+        validate(self.doc)
+        full = Path(os.path.expanduser(self.path))
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text(tomlkit.dumps(self.doc), encoding="utf-8")
+
+    # ── internal helpers ───────────────────────────────────────────────────
+
+    def _super(self, key: str):
+        if key not in self.doc:
+            self.doc[key] = tomlkit.table(is_super_table=True)
+        return self.doc[key]
+
+    def _target(self, name: str):
+        targets = self.doc.get("targets") or {}
+        if name not in targets:
+            raise LabError(f"no target '{name}'")
+        return targets[name]
+
+    def _host_references(self, host: str) -> list[str]:
+        """Targets/channels that bind to ``host`` (blocks host removal)."""
+        refs: list[str] = []
+        for tname, t in (self.doc.get("targets") or {}).items():
+            default_host = t.get("host", LOCAL)
+            if default_host == host:
+                refs.append(tname)
+                continue
+            bound = [t.get(ch, {}).get("host") for ch in SINGLETON_CHANNELS]
+            bound += [s.get("host") for s in (t.get("serial") or [])]
+            if host in bound:
+                refs.append(tname)
+        return refs
+
+    # ── hosts ──────────────────────────────────────────────────────────────
+
+    def add_host(
+        self,
+        name: str,
+        ssh: str,
+        *,
+        identity: Optional[str] = None,
+        control_path: Optional[str] = None,
+        paniolo_cmd: Optional[str] = None,
+    ) -> None:
+        hosts = self._super("hosts")
+        if name in hosts:
+            raise LabError(f"host '{name}' already exists")
+        t = tomlkit.table()
+        t["ssh"] = ssh
+        if identity is not None:
+            t["identity"] = identity
+        if control_path is not None:
+            t["control_path"] = control_path
+        if paniolo_cmd is not None:
+            t["paniolo_cmd"] = paniolo_cmd
+        hosts[name] = t
+
+    def update_host(
+        self,
+        name: str,
+        *,
+        ssh: Optional[str] = None,
+        identity: Optional[str] = None,
+        control_path: Optional[str] = None,
+        paniolo_cmd: Optional[str] = None,
+    ) -> None:
+        hosts = self.doc.get("hosts") or {}
+        if name not in hosts:
+            raise LabError(f"no host '{name}'")
+        t = hosts[name]
+        for key, val in (
+            ("ssh", ssh),
+            ("identity", identity),
+            ("control_path", control_path),
+            ("paniolo_cmd", paniolo_cmd),
+        ):
+            if val is not None:
+                t[key] = val
+
+    def remove_host(self, name: str) -> None:
+        hosts = self.doc.get("hosts") or {}
+        if name not in hosts:
+            raise LabError(f"no host '{name}'")
+        refs = self._host_references(name)
+        if refs:
+            raise LabError(f"host '{name}' is still used by: {', '.join(sorted(refs))}")
+        del hosts[name]
+
+    # ── targets ────────────────────────────────────────────────────────────
+
+    def add_target(
+        self, name: str, *, host: Optional[str] = None, note: Optional[str] = None
+    ) -> None:
+        targets = self._super("targets")
+        if name in targets:
+            raise LabError(f"target '{name}' already exists")
+        t = tomlkit.table()
+        if host is not None:
+            t["host"] = host
+        if note is not None:
+            t["note"] = note
+        targets[name] = t
+
+    def update_target(
+        self, name: str, *, host: Optional[str] = None, note: Optional[str] = None
+    ) -> None:
+        t = self._target(name)
+        if host is not None:
+            t["host"] = host
+        if note is not None:
+            t["note"] = note
+
+    def remove_target(self, name: str) -> None:
+        targets = self.doc.get("targets") or {}
+        if name not in targets:
+            raise LabError(f"no target '{name}'")
+        del targets[name]
+
+    # ── serial channels (collection) ───────────────────────────────────────
+
+    def _find_serial(self, arr, name: str) -> Optional[int]:
+        for i, s in enumerate(arr):
+            if s.get("name") == name:
+                return i
+        return None
+
+    def add_serial(
+        self,
+        target: str,
+        name: str,
+        device: str,
+        *,
+        baud: int = 115200,
+        power_sense_signal: Optional[str] = None,
+        host: Optional[str] = None,
+    ) -> None:
+        t = self._target(target)
+        arr = t.get("serial")
+        if arr is None:
+            arr = tomlkit.aot()
+            t["serial"] = arr
+        if self._find_serial(arr, name) is not None:
+            raise LabError(f"target '{target}': serial '{name}' already exists")
+        s = tomlkit.table()
+        s["name"] = name
+        s["device"] = device
+        s["baud"] = baud
+        if power_sense_signal is not None:
+            s["power_sense_signal"] = power_sense_signal
+        if host is not None:
+            s["host"] = host
+        arr.append(s)
+
+    def update_serial(
+        self,
+        target: str,
+        name: str,
+        *,
+        device: Optional[str] = None,
+        baud: Optional[int] = None,
+        power_sense_signal: Optional[str] = None,
+        host: Optional[str] = None,
+    ) -> None:
+        t = self._target(target)
+        arr = t.get("serial") or []
+        idx = self._find_serial(arr, name)
+        if idx is None:
+            raise LabError(f"target '{target}': no serial '{name}'")
+        s = arr[idx]
+        for key, val in (
+            ("device", device),
+            ("baud", baud),
+            ("power_sense_signal", power_sense_signal),
+            ("host", host),
+        ):
+            if val is not None:
+                s[key] = val
+
+    def remove_serial(self, target: str, name: str) -> None:
+        t = self._target(target)
+        arr = t.get("serial") or []
+        idx = self._find_serial(arr, name)
+        if idx is None:
+            raise LabError(f"target '{target}': no serial '{name}'")
+        del arr[idx]
+        if len(arr) == 0:
+            del t["serial"]
+
+    # ── singleton channels (netboot / power / video) ───────────────────────
+
+    def _set_singleton(self, target: str, kind: str, fields: dict) -> None:
+        t = self._target(target)
+        c = t.get(kind)
+        if c is None:
+            c = tomlkit.table()
+            t[kind] = c
+        for key, val in fields.items():
+            if val is not None:
+                c[key] = val
+
+    def _remove_singleton(self, target: str, kind: str) -> None:
+        t = self._target(target)
+        if kind not in t:
+            raise LabError(f"target '{target}': no {kind} channel")
+        del t[kind]
+
+    def set_netboot(
+        self,
+        target: str,
+        *,
+        interface: Optional[str] = None,
+        host_ip: Optional[str] = None,
+        tftp_root: Optional[str] = None,
+        host: Optional[str] = None,
+    ) -> None:
+        self._set_singleton(
+            target,
+            "netboot",
+            {
+                "interface": interface,
+                "host_ip": host_ip,
+                "tftp_root": tftp_root,
+                "host": host,
+            },
         )
-    return path
 
+    def remove_netboot(self, target: str) -> None:
+        self._remove_singleton(target, "netboot")
 
-def dispatch(host: Host, cfg: TargetConfig, mode: str, argv: list[str]) -> int:
-    """Run this invocation on ``host`` over SSH; return the remote exit code.
+    def set_power(
+        self,
+        target: str,
+        *,
+        cycle_cmd: Optional[str] = None,
+        serial_interface: Optional[str] = None,
+        host: Optional[str] = None,
+    ) -> None:
+        self._set_singleton(
+            target,
+            "power",
+            {
+                "cycle_cmd": cycle_cmd,
+                "serial_interface": serial_interface,
+                "host": host,
+            },
+        )
 
-    Ships ``cfg`` as the remote's PANIOLO_TARGET_CONFIG slice, re-execs the
-    (lab-stripped) command, and removes the slice afterward.
-    """
-    remote_path = ship_config(host, cfg)
-    env = {TARGET_CONFIG_ENV: remote_path}
-    cmd = remote_argv(argv, host.paniolo)
-    try:
-        if mode == INTERACTIVE:
-            return _ssh.run_interactive(host, cmd, env=env)
-        return _ssh.run_passthrough(host, cmd, env=env)
-    finally:
-        _ssh.run(host, ["rm", "-f", remote_path])
+    def remove_power(self, target: str) -> None:
+        self._remove_singleton(target, "power")
 
+    def set_video(
+        self,
+        target: str,
+        *,
+        device: Optional[str] = None,
+        host: Optional[str] = None,
+    ) -> None:
+        self._set_singleton(target, "video", {"device": device, "host": host})
 
-def run_subcommand(host: Host, cfg: TargetConfig, subargs: list[str]):
-    """Run ``paniolo <subargs>`` on ``host`` against a shipped config slice.
-
-    Captured (returns a CompletedProcess); used to drive helper commands on the
-    host, e.g. starting the streaming daemons before tunnelling to them.
-    """
-    remote_path = ship_config(host, cfg)
-    env = {TARGET_CONFIG_ENV: remote_path}
-    try:
-        return _ssh.run(host, [host.paniolo, *subargs], env=env)
-    finally:
-        _ssh.run(host, ["rm", "-f", remote_path])
-
-
-# Resolve the daemon discovery dir the same way the daemons do (see
-# _video/_serial._discovery_path): $XDG_RUNTIME_DIR, else $TMPDIR, else /tmp.
-_REMOTE_RUNTIME = "${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
-
-
-def remote_daemon_port(host: Host, subdir: str) -> Optional[int]:
-    """Read the TCP port of a daemon's discovery file on ``host``, or None.
-
-    ``subdir`` is the daemon's runtime subdir ("hdmicap" / "serialcap"). The
-    path is resolved by a remote shell so the host's own XDG_RUNTIME_DIR applies.
-    """
-    script = f'cat "{_REMOTE_RUNTIME}/{subdir}/daemon.json" 2>/dev/null'
-    result = _ssh.run(host, ["sh", "-c", script])
-    if result.returncode != 0 or not result.stdout.strip():
-        return None
-    try:
-        return int(json.loads(result.stdout)["port"])
-    except (ValueError, KeyError, json.JSONDecodeError):
-        return None
+    def remove_video(self, target: str) -> None:
+        self._remove_singleton(target, "video")
 ````
 
-## File: src/paniolo/_ssh.py
+## File: src/paniolo/_paths.py
 ````python
 # Copyright 2026 Curtis Galloway
 #
@@ -5978,277 +7480,56 @@ def remote_daemon_port(host: Host, subdir: str) -> Optional[int]:
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SSH transport for driving a target on a remote control host.
+"""Locating the paniolo source checkout.
 
-This is the foundation of paniolo's distributed-control model (see
-docs/distributed-control.md): the dev machine is the hub, and every command
-against a remote target reaches its control host over SSH. There is no agent or
-RPC server — SSH is the whole transport, which is why auth, encryption, and
-identity come for free.
-
-Three things are provided over a per-host **ControlMaster** connection (so only
-the first call to a host pays the SSH handshake):
-
-- ``run`` / ``run_passthrough`` — run a command on the host (captured, or with
-  the local terminal's stdio passed through for transparent re-exec);
-- ``run_interactive`` — run a command over an ``ssh -t`` PTY (for ``tio``);
-- ``forward`` — hold an ``ssh -L`` tunnel to a remote port (for the dashboard);
-- ``read_remote_file`` — read a remote file (e.g. a daemon discovery file).
-
-A ``Host`` whose ``ssh`` destination is the literal ``"local"`` represents the
-dev machine itself; the SSH functions reject it (callers run those commands
-directly instead), but it lets the lab model express "no SSH" uniformly.
+`paniolo setup` (and `make install`) rebuild the Rust daemons and the OCR helper
+*from source*, so they need the git clone — not the installed package tree. The
+old approach climbed a fixed number of parents from ``__file__``, which only
+points at the repo for a source checkout; from an installed uv tool it lands in
+``.../lib/python3.12`` and every source lookup silently fails. ``repo_root()``
+resolves the checkout robustly instead.
 """
 
 from __future__ import annotations
 
-import dataclasses
-import os
-import shlex
-import socket
-import subprocess
-import time
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Optional
-
-# ssh destination meaning "the dev machine itself — no SSH".
-LOCAL = "local"
-
-# How long the shared master connection lingers after the last use.
-_CONTROL_PERSIST = "300"
-_CONNECT_TIMEOUT = "10"
+from typing import Optional
 
 
-@dataclasses.dataclass
-class Host:
-    """A control host paniolo reaches over SSH.
-
-    ``ssh`` is the destination passed to ssh(1) (``user@host``, an ssh_config
-    alias, or the sentinel ``"local"``). ``identity`` is an optional private-key
-    path; ``control_path`` overrides the ControlMaster socket path (ssh %-tokens
-    are allowed, e.g. ``~/.ssh/cm-%C``).
-    """
-
-    name: str
-    ssh: str
-    identity: Optional[str] = None
-    control_path: Optional[str] = None
-    # How to invoke paniolo on this host. Defaults to bare "paniolo"; set it to
-    # an absolute path when paniolo isn't on the host's non-interactive ssh PATH
-    # (e.g. installed under ~/.local/bin, which login-only PATHs miss).
-    paniolo_cmd: Optional[str] = None
-
-    @property
-    def is_local(self) -> bool:
-        return self.ssh == LOCAL or self.name == LOCAL
-
-    @property
-    def paniolo(self) -> str:
-        return self.paniolo_cmd or "paniolo"
-
-
-class SSHError(RuntimeError):
-    """An SSH operation failed to establish (connect/forward), as opposed to a
-    remote command merely exiting non-zero."""
-
-
-def _control_dir() -> Path:
-    """Short directory holding paniolo's default ControlMaster sockets.
-
-    Kept deliberately short: a Unix-domain socket path has a hard limit
-    (~104 chars on macOS, ~108 on Linux), and ssh appends a 40-char %C hash to
-    it. XDG_RUNTIME_DIR is short on Linux; elsewhere fall back to /tmp rather
-    than tempfile.gettempdir(), which on macOS is the long per-session $TMPDIR
-    and overflows the limit.
-    """
-    base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
-    d = Path(base) / f"paniolo-{os.getuid()}"
-    d.mkdir(parents=True, exist_ok=True)
-    os.chmod(d, 0o700)
-    return d
-
-
-def _control_args(host: Host) -> list[str]:
-    if host.control_path:
-        cp = os.path.expanduser(host.control_path)
-        # Best-effort: create the parent dir unless it contains an ssh %-token.
-        parent = os.path.dirname(cp)
-        if parent and "%" not in parent:
-            Path(parent).mkdir(parents=True, exist_ok=True)
-    else:
-        cp = str(_control_dir() / "cm-%C")
-    return [
-        "-o",
-        "ControlMaster=auto",
-        "-o",
-        f"ControlPath={cp}",
-        "-o",
-        f"ControlPersist={_CONTROL_PERSIST}",
-    ]
-
-
-def _base_args(
-    host: Host, *, interactive: bool = False, multiplex: bool = True
-) -> list[str]:
-    if host.is_local:
-        raise ValueError(f"_ssh called for local host '{host.name}'")
-    args = ["ssh"]
-    if not interactive:
-        # Fail rather than block on a password prompt for non-interactive use.
-        args += ["-o", "BatchMode=yes"]
-    args += ["-o", f"ConnectTimeout={_CONNECT_TIMEOUT}"]
-    if host.identity:
-        args += ["-i", os.path.expanduser(host.identity), "-o", "IdentitiesOnly=yes"]
-    if multiplex:
-        args += _control_args(host)
-    else:
-        # A standalone connection that owns its own channel. Port forwards must
-        # NOT multiplex: an `ssh -N -L` client that attaches to a ControlMaster
-        # hands the forward to the master and then exits, so the process no
-        # longer represents (or can tear down) the tunnel.
-        args += ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
-    return args
-
-
-def _remote_command(argv: list[str], env: Optional[dict[str, str]]) -> str:
-    """Quote argv (and optional env assignments) into one remote shell command.
-
-    Quoting each token preserves argument boundaries through the remote shell, so
-    paths with spaces or globbing characters survive intact.
-    """
-    parts: list[str] = []
-    if env:
-        for key, val in env.items():
-            parts.append(f"{key}={shlex.quote(val)}")
-    parts.extend(shlex.quote(a) for a in argv)
-    return " ".join(parts)
-
-
-def run(
-    host: Host,
-    argv: list[str],
-    *,
-    stdin: Optional[str] = None,
-    env: Optional[dict[str, str]] = None,
-    timeout: Optional[float] = None,
-) -> subprocess.CompletedProcess:
-    """Run ``argv`` on ``host`` and capture its output.
-
-    Returns the CompletedProcess (text mode); never raises on a non-zero remote
-    exit. Use for programmatic calls — reading a discovery file, probing state.
-    """
-    full = _base_args(host) + [host.ssh, _remote_command(argv, env)]
-    return subprocess.run(
-        full, input=stdin, capture_output=True, text=True, timeout=timeout, check=False
+def _is_repo_root(d: Path) -> bool:
+    """True if ``d`` looks like the paniolo source checkout root."""
+    return (
+        (d / "pyproject.toml").is_file()
+        and (d / "ocr").is_dir()
+        and (d / "hdmicap" / "Cargo.toml").is_file()
     )
 
 
-def run_passthrough(
-    host: Host, argv: list[str], *, env: Optional[dict[str, str]] = None
-) -> int:
-    """Run ``argv`` on ``host`` with the local terminal's stdio passed through.
+def repo_root() -> Optional[Path]:
+    """Locate the paniolo source checkout, or ``None`` if not found.
 
-    No PTY is allocated, so pipes and non-interactive semantics are preserved.
-    This is the transparent re-exec path: the remote command's stdin/stdout/
-    stderr *are* the local ones. Returns the exit code.
+    Searches, in order:
+
+    1. The tree containing this file. This wins for a source checkout, an
+       editable install, or ``uv run``, where ``__file__`` lives under
+       ``<repo>/src/paniolo``.
+    2. The current working directory and its parents. This covers running an
+       *installed* ``paniolo setup`` from inside a clone — notably ``make
+       install``, which executes in the repo.
+
+    Returns ``None`` when no checkout can be found (e.g. an installed CLI invoked
+    from an unrelated directory); callers should surface a clear "run from a
+    clone" error rather than silently skipping the build.
     """
-    full = _base_args(host) + [host.ssh, _remote_command(argv, env)]
-    return subprocess.run(full, check=False).returncode
-
-
-def run_interactive(
-    host: Host, argv: list[str], *, env: Optional[dict[str, str]] = None
-) -> int:
-    """Run ``argv`` on ``host`` over an ``ssh -t`` PTY (for interactive tools).
-
-    Used for ``serial connect`` (tio) — SSH's own pseudo-terminal is the
-    transport, so no tunnel is needed. Returns the exit code.
-    """
-    full = _base_args(host, interactive=True)
-    full += ["-t", host.ssh, _remote_command(argv, env)]
-    return subprocess.run(full, check=False).returncode
-
-
-def read_remote_file(host: Host, path: str) -> Optional[str]:
-    """Return the contents of a remote file, or None if it doesn't exist."""
-    result = run(host, ["cat", path])
-    if result.returncode != 0:
-        return None
-    return result.stdout
-
-
-def _free_local_port() -> int:
-    """Pick a currently-free local TCP port (small TOCTOU window is acceptable)."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-def _wait_for_port(port: int, proc: subprocess.Popen, timeout: float) -> None:
-    """Block until 127.0.0.1:port accepts a connection, or raise.
-
-    Fails fast if the ssh forwarder process exits early (e.g. auth failure).
-    """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            stderr = proc.stderr.read() if proc.stderr else ""
-            raise SSHError(
-                f"ssh forward exited early (rc={proc.returncode}): {stderr.strip()}"
-            )
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-                return
-        except OSError:
-            time.sleep(0.1)
-    raise SSHError(f"timed out waiting for forwarded port {port}")
-
-
-@contextmanager
-def forward(
-    host: Host,
-    remote_port: int,
-    *,
-    remote_bind: str = "127.0.0.1",
-    timeout: float = 10.0,
-) -> Iterator[int]:
-    """Hold an ``ssh -L`` tunnel to ``remote_bind:remote_port`` on ``host``.
-
-    Yields the local port the tunnel listens on (127.0.0.1). The forwarder
-    process is torn down on exit. It attaches to the shared ControlMaster
-    connection, so it doesn't pay a second handshake.
-    """
-    local_port = _free_local_port()
-    spec = f"{local_port}:{remote_bind}:{remote_port}"
-    args = _base_args(host, multiplex=False) + ["-N", "-L", spec, host.ssh]
-    proc = subprocess.Popen(
-        args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
-    )
-    try:
-        _wait_for_port(local_port, proc, timeout)
-        yield local_port
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-
-
-def close_master(host: Host) -> None:
-    """Tear down the shared ControlMaster connection to ``host`` if one is open."""
-    if host.is_local:
-        return
-    subprocess.run(
-        _base_args(host) + ["-O", "exit", host.ssh],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    starts = [Path(__file__).resolve().parent, Path.cwd().resolve()]
+    for start in starts:
+        for d in (start, *start.parents):
+            if _is_repo_root(d):
+                return d
+    return None
 ````
 
-## File: tests/test_cli.py
+## File: tests/test_config_cli.py
 ````python
 # Copyright 2026 Curtis Galloway
 #
@@ -6264,785 +7545,143 @@ def close_master(host: Host) -> None:
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the CLI's location-transparent routing core: single-target
-resolution, `_resolve_with_host` (env-slice precedence, lab lookup, legacy
-files), and the `@remote_capable` decorator (run-here vs dispatch-over-SSH).
-Lab/config/remote layers are stubbed; no SSH or filesystem is touched."""
+"""End-to-end tests for the config CRUD CLI (init/host/target/channel writes).
 
-# pylint: disable=protected-access,unused-argument
+Drives the real Typer app against a temp lab file via CliRunner; no SSH or
+hardware is touched (config writes are local and pure)."""
 
-from __future__ import annotations
+import tomllib
 
 import pytest
-import typer
+from typer.testing import CliRunner
 
-from paniolo import _cli, _ssh
-from paniolo._config import TargetConfig
+from paniolo import _lab
+from paniolo._cli import app
 
-
-def _cfg(name: str = "fortune") -> TargetConfig:
-    return TargetConfig(name=name, interface="enx0", host_ip="192.168.99.1")
-
-
-class _FakeLab:
-    """Minimal stand-in for a loaded lab file."""
-
-    def __init__(self, names, result=None, raise_exc=None):
-        self._names = names
-        self._result = result
-        self._raise = raise_exc
-
-    def target_names(self):
-        return self._names
-
-    def resolve_target(self, name):
-        if self._raise is not None:
-            raise self._raise
-        return self._result
+runner = CliRunner()
 
 
 @pytest.fixture(autouse=True)
-def _no_slice_env(monkeypatch):
-    """Most tests exercise the lab/legacy paths; ensure the slice env that would
-    short-circuit them is unset unless a test sets it explicitly."""
-    monkeypatch.delenv("PANIOLO_TARGET_CONFIG", raising=False)
+def _isolate_lab(monkeypatch, tmp_path):
+    monkeypatch.setattr(_lab, "_override_path", None)
+    monkeypatch.delenv("PANIOLO_LAB", raising=False)
+    monkeypatch.setattr(_lab, "DEFAULT_LAB_PATH", str(tmp_path / "absent.toml"))
 
 
-# ── _require_single ─────────────────────────────────────────────────────────
+def _run(lab, *args):
+    return runner.invoke(app, ["--lab", str(lab), *args])
 
 
-def test_require_single_passes_through_explicit_name():
-    assert _cli._require_single("bar", ["foo"]) == "bar"
+def _load(lab):
+    with open(lab, "rb") as f:
+        return tomllib.load(f)
 
 
-def test_require_single_resolves_sole_target():
-    assert _cli._require_single(None, ["only"]) == "only"
-
-
-def test_require_single_exits_when_none_configured():
-    with pytest.raises(typer.Exit):
-        _cli._require_single(None, [])
-
-
-def test_require_single_exits_when_ambiguous():
-    with pytest.raises(typer.Exit):
-        _cli._require_single(None, ["a", "b"])
-
-
-# ── _resolve_with_host: slice-env precedence ────────────────────────────────
-
-
-def test_resolve_uses_slice_env_and_runs_local(monkeypatch):
-    cfg = _cfg()
-    monkeypatch.setenv("PANIOLO_TARGET_CONFIG", "/run/paniolo/slice.toml")
-    monkeypatch.setattr(_cli._config, "load_target_file", lambda path: cfg)
-    got_cfg, host = _cli._resolve_with_host(None)
-    assert got_cfg is cfg
-    assert host.is_local, "a shipped config slice always runs on the local host"
-
-
-def test_resolve_slice_env_load_failure_exits(monkeypatch):
-    monkeypatch.setenv("PANIOLO_TARGET_CONFIG", "/run/paniolo/slice.toml")
-
-    def boom(path):
-        raise OSError("unreadable")
-
-    monkeypatch.setattr(_cli._config, "load_target_file", boom)
-    with pytest.raises(typer.Exit):
-        _cli._resolve_with_host(None)
-
-
-# ── _resolve_with_host: lab lookup ──────────────────────────────────────────
-
-
-def test_resolve_via_lab_returns_target_and_host(monkeypatch):
-    cfg = _cfg()
-    host = _ssh.Host(name="ctrl", ssh="user@ctrl")
-    monkeypatch.setattr(_cli._lab, "load", lambda: _FakeLab(["fortune"], (cfg, host)))
-    got_cfg, got_host = _cli._resolve_with_host(None)
-    assert got_cfg is cfg
-    assert got_host is host
-
-
-def test_resolve_via_lab_unknown_target_exits(monkeypatch):
-    monkeypatch.setattr(
-        _cli._lab,
-        "load",
-        lambda: _FakeLab(["fortune"], raise_exc=KeyError("missing")),
-    )
-    with pytest.raises(typer.Exit):
-        _cli._resolve_with_host("missing")
-
-
-# ── _resolve_with_host: legacy per-target files (no lab) ─────────────────────
-
-
-def test_resolve_legacy_returns_local_host(monkeypatch):
-    cfg = _cfg()
-    monkeypatch.setattr(_cli._lab, "load", lambda: None)
-    monkeypatch.setattr(_cli._config, "list_targets", lambda: ["fortune"])
-    monkeypatch.setattr(_cli._config, "load_target", lambda name: cfg)
-    got_cfg, host = _cli._resolve_with_host(None)
-    assert got_cfg is cfg
-    assert host.is_local
-
-
-def test_resolve_legacy_missing_target_exits(monkeypatch):
-    monkeypatch.setattr(_cli._lab, "load", lambda: None)
-    monkeypatch.setattr(_cli._config, "list_targets", lambda: ["fortune"])
-
-    def missing(name):
-        raise FileNotFoundError(name)
-
-    monkeypatch.setattr(_cli._config, "load_target", missing)
-    with pytest.raises(typer.Exit):
-        _cli._resolve_with_host("fortune")
-
-
-# ── remote_capable decorator ────────────────────────────────────────────────
-
-
-def test_remote_capable_runs_body_for_local_host(monkeypatch):
-    cfg = _cfg()
-    local = _ssh.Host(name=_ssh.LOCAL, ssh=_ssh.LOCAL)
-    monkeypatch.setattr(_cli, "_resolve_with_host", lambda name: (cfg, local))
-    ran = []
-
-    @_cli.remote_capable()
-    def cmd(target=None):
-        ran.append(target)
-        return "local-result"
-
-    assert cmd(target="fortune") == "local-result"
-    assert ran == ["fortune"]
-
-
-def test_remote_capable_dispatches_remote_and_exits_with_code(monkeypatch):
-    cfg = _cfg()
-    remote = _ssh.Host(name="ctrl", ssh="user@ctrl")
-    monkeypatch.setattr(_cli, "_resolve_with_host", lambda name: (cfg, remote))
-    seen = {}
-
-    def fake_dispatch(host, c, mode, argv):
-        seen["host"] = host
-        return 7
-
-    monkeypatch.setattr(_cli._remote, "dispatch", fake_dispatch)
-    ran = []
-
-    @_cli.remote_capable()
-    def cmd(target=None):
-        ran.append(target)
-
-    with pytest.raises(typer.Exit) as ei:
-        cmd(target="fortune")
-    assert ei.value.exit_code == 7
-    assert seen["host"] is remote
-    assert not ran, "the command body never runs locally for a remote target"
-
-
-def test_remote_capable_ssh_error_exits_1(monkeypatch):
-    cfg = _cfg()
-    remote = _ssh.Host(name="ctrl", ssh="user@ctrl")
-    monkeypatch.setattr(_cli, "_resolve_with_host", lambda name: (cfg, remote))
-
-    def boom(host, c, mode, argv):
-        raise _ssh.SSHError("connection refused")
-
-    monkeypatch.setattr(_cli._remote, "dispatch", boom)
-
-    @_cli.remote_capable()
-    def cmd(target=None):
-        pass
-
-    with pytest.raises(typer.Exit) as ei:
-        cmd(target="fortune")
-    assert ei.value.exit_code == 1
-````
-
-## File: tests/test_netboot.py
-````python
-# Copyright 2026 Curtis Galloway
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Tests for _netboot.py's pure parsing + the safety-critical primary-NIC guard.
-
-The guard (`_is_primary_interface`) is what refuses to reconfigure the host's
-main NIC to the static netboot IP. We exercise the default-route parsing on both
-macOS (`route -n get default`) and Linux (`ip route show default`), and the
-USB-Ethernet listing's exclusion/sort logic — all with subprocess stubbed, so
-the same suite runs identically on either platform's CI."""
-
-from __future__ import annotations
-
-import subprocess
-
-from paniolo import _netboot
-
-# pylint: disable=protected-access
-
-
-def _raise(exc):
-    def f(*a, **k):
-        raise exc
-
-    return f
-
-
-# ── default-route interface parsing ─────────────────────────────────────────
-
-
-def test_default_route_macos_parses_interface_line(monkeypatch):
-    monkeypatch.setattr(_netboot.sys, "platform", "darwin")
-    out = "   route to: default\n  gateway: 192.168.1.1\n  interface: en0\n  flags: \n"
-    monkeypatch.setattr(_netboot.subprocess, "check_output", lambda *a, **k: out)
-    assert _netboot._default_route_interface() == "en0"
-
-
-def test_default_route_macos_none_when_no_interface_line(monkeypatch):
-    monkeypatch.setattr(_netboot.sys, "platform", "darwin")
-    monkeypatch.setattr(
-        _netboot.subprocess, "check_output", lambda *a, **k: "  gateway: 1.2.3.4\n"
-    )
-    assert _netboot._default_route_interface() is None
-
-
-def test_default_route_macos_none_on_command_failure(monkeypatch):
-    monkeypatch.setattr(_netboot.sys, "platform", "darwin")
-    monkeypatch.setattr(
-        _netboot.subprocess, "check_output", _raise(FileNotFoundError())
-    )
-    assert _netboot._default_route_interface() is None
-
-
-def test_default_route_linux_parses_dev_token(monkeypatch):
-    monkeypatch.setattr(_netboot.sys, "platform", "linux")
-    out = "default via 192.168.1.1 dev eth0 proto dhcp src 192.168.1.50 metric 100"
-    monkeypatch.setattr(_netboot.subprocess, "check_output", lambda *a, **k: out)
-    assert _netboot._default_route_interface() == "eth0"
-
-
-def test_default_route_linux_none_without_dev(monkeypatch):
-    monkeypatch.setattr(_netboot.sys, "platform", "linux")
-    monkeypatch.setattr(_netboot.subprocess, "check_output", lambda *a, **k: "")
-    assert _netboot._default_route_interface() is None
-
-
-def test_default_route_linux_none_on_command_failure(monkeypatch):
-    monkeypatch.setattr(_netboot.sys, "platform", "linux")
-    monkeypatch.setattr(
-        _netboot.subprocess,
-        "check_output",
-        _raise(subprocess.CalledProcessError(1, "ip")),
-    )
-    assert _netboot._default_route_interface() is None
-
-
-# ── primary-NIC guard ───────────────────────────────────────────────────────
-
-
-def test_primary_interface_true_for_default_route_nic(monkeypatch):
-    monkeypatch.setattr(_netboot, "_default_route_interface", lambda: "en0")
-    assert _netboot._is_primary_interface("en0") is True
-
-
-def test_primary_interface_false_for_secondary_nic(monkeypatch):
-    monkeypatch.setattr(_netboot, "_default_route_interface", lambda: "en0")
-    assert _netboot._is_primary_interface("enx_usb_dongle") is False
-
-
-def test_primary_interface_false_when_no_default_route(monkeypatch):
-    monkeypatch.setattr(_netboot, "_default_route_interface", lambda: None)
-    assert _netboot._is_primary_interface("enx_usb_dongle") is False
-
-
-# ── USB-Ethernet listing (macOS branch: exclusions + active-first sort) ──────
-
-
-_NETWORKSETUP = """Hardware Port: Wi-Fi
-Device: en0
-Ethernet Address: aa:bb:cc:dd:ee:ff
-
-Hardware Port: USB 10/100/1000 LAN
-Device: en7
-Ethernet Address: 11:22:33:44:55:66
-
-Hardware Port: Thunderbolt Bridge
-Device: bridge0
-Ethernet Address: N/A
-
-Hardware Port: AX88179A
-Device: en10
-Ethernet Address: 77:88:99:aa:bb:cc
-"""
-
-
-def test_list_usb_ethernet_macos_excludes_and_sorts_active_first(monkeypatch):
-    monkeypatch.setattr(_netboot.sys, "platform", "darwin")
-    monkeypatch.setattr(
-        _netboot.subprocess, "check_output", lambda *a, **k: _NETWORKSETUP
-    )
-    # en10 active, en7 inactive -> active sorts first.
-    active = {"en10": True, "en7": False}
-    monkeypatch.setattr(
-        _netboot, "_is_interface_active", lambda dev: active.get(dev, False)
-    )
-    result = _netboot.list_usb_ethernet_interfaces()
-    devices = [r["device"] for r in result]
-
-    assert "en0" not in devices, "Wi-Fi port excluded"
-    assert "bridge0" not in devices, "Thunderbolt Bridge / bridge0 excluded"
-    assert devices == ["en10", "en7"], "active interface listed before inactive"
-    assert result[0]["port"] == "AX88179A"
-
-
-def test_list_usb_ethernet_macos_empty_on_command_failure(monkeypatch):
-    monkeypatch.setattr(_netboot.sys, "platform", "darwin")
-    monkeypatch.setattr(
-        _netboot.subprocess, "check_output", _raise(FileNotFoundError())
-    )
-    assert _netboot.list_usb_ethernet_interfaces() == []
-
-
-def test_list_usb_ethernet_linux_delegates_to_sysfs(monkeypatch):
-    monkeypatch.setattr(_netboot.sys, "platform", "linux")
-    sentinel = [{"port": "eth0", "device": "eth0", "active": True}]
-    monkeypatch.setattr(_netboot, "_list_linux_ethernet_interfaces", lambda: sentinel)
-    assert _netboot.list_usb_ethernet_interfaces() is sentinel
-````
-
-## File: tests/test_ssh.py
-````python
-# Copyright 2026 Curtis Galloway
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Tests for the SSH transport (_ssh.py).
-
-Two tiers:
-
-- **Unit** (always run): argument construction, quoting, and the local-host
-  guard — no SSH process is spawned.
-- **Integration** (opt-in): real ssh against a destination given in
-  ``PANIOLO_SSH_IT`` (e.g. ``localhost``), with an optional identity in
-  ``PANIOLO_SSH_IT_IDENTITY``. Skipped otherwise, so the suite never triggers an
-  ssh-agent (e.g. 1Password) confirmation on a dev box. CI sets these against a
-  provisioned passphraseless key with no agent.
-"""
-
-# pylint: disable=protected-access,redefined-outer-name
-
-from __future__ import annotations
-
-import os
-import socket
-import threading
-
-import pytest
-
-from paniolo import _ssh
-from paniolo._ssh import Host
-
-# ── unit: no SSH spawned ─────────────────────────────────────────────────────
-
-
-def test_is_local():
-    assert Host(name="local", ssh="local").is_local
-    assert Host(name="x", ssh="local").is_local
-    assert not Host(name="bench1", ssh="curtisg@bench1").is_local
-
-
-def test_local_host_is_rejected_before_spawning():
-    local = Host(name="local", ssh="local")
-    with pytest.raises(ValueError):
-        _ssh.run(local, ["true"])
-    with pytest.raises(ValueError):
-        with _ssh.forward(local, 8723):
-            pass
-
-
-def test_close_master_is_noop_for_local():
-    # Must not raise or spawn anything.
-    _ssh.close_master(Host(name="local", ssh="local"))
-
-
-def test_remote_command_quotes_each_arg():
-    cmd = _ssh._remote_command(["echo", "a b", "c;d"], None)
-    assert cmd == "echo 'a b' 'c;d'"
-
-
-def test_remote_command_prepends_env_assignments():
-    cmd = _ssh._remote_command(
-        ["paniolo", "netboot", "status"], {"PANIOLO_TARGET_CONFIG": "/t/f f.toml"}
-    )
-    assert cmd.startswith("PANIOLO_TARGET_CONFIG='/t/f f.toml' ")
-    assert cmd.endswith("paniolo netboot status")
-
-
-def test_base_args_non_interactive_has_batchmode_and_controlmaster():
-    args = _ssh._base_args(Host(name="b", ssh="u@b"))
-    assert "BatchMode=yes" in args
-    assert "ControlMaster=auto" in args
-    assert any(a.startswith("ControlPath=") for a in args)
-    assert f"ControlPersist={_ssh._CONTROL_PERSIST}" in args
-
-
-def test_base_args_interactive_drops_batchmode():
-    args = _ssh._base_args(Host(name="b", ssh="u@b"), interactive=True)
-    assert "BatchMode=yes" not in args
-
-
-def test_base_args_identity_uses_identities_only():
-    args = _ssh._base_args(Host(name="b", ssh="u@b", identity="~/.ssh/id_lab"))
-    assert "-i" in args
-    assert "IdentitiesOnly=yes" in args
-    # ~ is expanded so ssh resolves the path.
-    idx = args.index("-i")
-    assert not args[idx + 1].startswith("~")
-
-
-def test_forward_args_disable_multiplexing():
-    # A port forward must own a standalone connection, not attach to the master.
-    args = _ssh._base_args(Host(name="b", ssh="u@b"), multiplex=False)
-    assert "ControlMaster=no" in args
-    assert "ControlPath=none" in args
-    assert "ControlMaster=auto" not in args
-
-
-def test_custom_control_path_is_honored():
-    args = _ssh._base_args(Host(name="b", ssh="u@b", control_path="/tmp/cm-test"))
-    assert "ControlPath=/tmp/cm-test" in args
-
-
-def test_free_local_port_is_usable():
-    port = _ssh._free_local_port()
-    assert 1024 < port < 65536
-    # Re-bindable, i.e. actually free.
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", port))
-
-
-# ── integration: real ssh, opt-in ───────────────────────────────────────────
-
-_DEST = os.environ.get("PANIOLO_SSH_IT")
-_IDENT = os.environ.get("PANIOLO_SSH_IT_IDENTITY")
-
-integration = pytest.mark.skipif(
-    not _DEST,
-    reason=(
-        "set PANIOLO_SSH_IT=<ssh-dest> (e.g. localhost)" " to run SSH integration tests"
-    ),
-)
-
-
-@pytest.fixture
-def host():
-    # A short control path: a deep tmp_path overflows the ~104-char Unix-socket
-    # limit once ssh appends the %C hash. Unique per process; torn down below.
-    h = Host(
-        name="it",
-        ssh=_DEST,
-        identity=_IDENT,
-        control_path=f"/tmp/pcm-{os.getpid()}-%C",
-    )
-    yield h
-    _ssh.close_master(h)
-
-
-@integration
-def test_run_roundtrip(host):
-    r = _ssh.run(host, ["echo", "hello world"])
-    assert r.returncode == 0
-    assert r.stdout.strip() == "hello world"
-
-
-@integration
-def test_run_env(host):
-    r = _ssh.run(host, ["sh", "-c", "echo $FOO"], env={"FOO": "bar baz"})
-    assert r.stdout.strip() == "bar baz"
-
-
-@integration
-def test_run_nonzero_exit(host):
-    assert _ssh.run(host, ["false"]).returncode != 0
-
-
-@integration
-def test_run_passthrough_returns_exit_code(host):
-    assert _ssh.run_passthrough(host, ["true"]) == 0
-    assert _ssh.run_passthrough(host, ["false"]) != 0
-
-
-@integration
-def test_read_remote_file_present_and_absent(host, tmp_path):
-    f = tmp_path / "probe.txt"
-    f.write_text("contents-123\n")
-    assert _ssh.read_remote_file(host, str(f)) == "contents-123\n"
-    assert _ssh.read_remote_file(host, str(tmp_path / "nope.txt")) is None
-
-
-@integration
-def test_forward_reaches_a_local_listener(host):
-    # A throwaway server bound on 127.0.0.1; forward() tunnels to it via ssh.
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("127.0.0.1", 0))
-    server.listen(1)
-    remote_port = server.getsockname()[1]
-
-    def serve():
-        # Accept repeatedly: forward()'s readiness probe opens (and drops) a
-        # connection through the tunnel before the test's real one, so a
-        # single-accept server would be consumed by the probe. Real daemons
-        # serve many connections, so this matches production behaviour.
-        while True:
-            try:
-                conn, _ = server.accept()
-            except OSError:
-                return
-            conn.sendall(b"BANNER-OK")
-            conn.close()
-
-    t = threading.Thread(target=serve, daemon=True)
-    t.start()
-    try:
-        with _ssh.forward(host, remote_port) as local_port:
-            with socket.create_connection(("127.0.0.1", local_port), timeout=5) as c:
-                assert c.recv(16) == b"BANNER-OK"
-    finally:
-        server.close()
-        t.join(timeout=2)
-````
-
-## File: tests/test_state.py
-````python
-# Copyright 2026 Curtis Galloway
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Tests for netboot state: path construction, JSON round-trip (including the
-back-compat `engine` default), PID liveness probes, and the per-engine
-`is_netboot_running` logic. No real processes or state dir are touched —
-STATE_DIR is redirected to a tmp dir and os/subprocess probes are stubbed."""
-
-# pylint: disable=redefined-outer-name,unused-argument
-
-from __future__ import annotations
-
-import json
-
-import pytest
-
-from paniolo import _state
-from paniolo._state import NetbootState
-
-
-@pytest.fixture
-def state_dir(tmp_path, monkeypatch):
-    """Redirect the on-disk state dir into a throwaway tmp path."""
-    monkeypatch.setattr(_state, "STATE_DIR", tmp_path)
-    return tmp_path
-
-
-def _state_obj(**over) -> NetbootState:
-    base = dict(
-        target="fortune",
-        dhcp_pid=111,
-        tftp_pid=222,
-        started_at=1234.5,
-        interface="enx0",
-        tftp_root="/srv/tftp",
-        engine="rust",
-    )
-    base.update(over)
-    return NetbootState(**base)
-
-
-# ── path construction ───────────────────────────────────────────────────────
-
-
-def test_paths_are_under_state_dir(state_dir):
+def test_build_lab_via_cli(tmp_path):
+    lab = tmp_path / "lab.toml"
+    assert _run(lab, "host", "add", "bench1", "--ssh", "u@bench1").exit_code == 0
+    assert _run(lab, "target", "add", "fortune", "--host", "bench1").exit_code == 0
     assert (
-        _state.netboot_state_path("fortune") == state_dir / "fortune" / "netboot.json"
+        _run(lab, "netboot", "set", "-t", "fortune", "--interface", "en0").exit_code
+        == 0
     )
-    assert _state.netboot_log_path("fortune") == state_dir / "fortune" / "netboot.log"
-
-
-def test_ensure_target_dir_creates_it(state_dir):
-    d = _state.ensure_target_dir("fortune")
-    assert d == state_dir / "fortune"
-    assert d.is_dir()
-
-
-# ── save / load round-trip ──────────────────────────────────────────────────
-
-
-def test_save_load_round_trip_preserves_all_fields(state_dir):
-    original = _state_obj()
-    _state.save_netboot_state(original)
-    assert _state.load_netboot_state("fortune") == original
-
-
-def test_load_missing_state_returns_none(state_dir):
-    assert _state.load_netboot_state("ghost") is None
-
-
-def test_load_corrupt_json_returns_none(state_dir):
-    p = _state.netboot_state_path("broken")
-    p.parent.mkdir(parents=True)
-    p.write_text("{not valid json")
-    assert _state.load_netboot_state("broken") is None
-
-
-def test_load_rejects_unknown_keys(state_dir):
-    # An extra key makes NetbootState(**data) raise TypeError -> None, rather
-    # than silently constructing a partial object.
-    p = _state.netboot_state_path("weird")
-    p.parent.mkdir(parents=True)
-    p.write_text(json.dumps({"target": "weird", "bogus": 1}))
-    assert _state.load_netboot_state("weird") is None
-
-
-def test_load_without_engine_field_defaults_to_python(state_dir):
-    # A state file written before the `engine` field existed must deserialize to
-    # the legacy engine ("python"), since that was the sole engine then. The
-    # field default exists ONLY for this back-compat path (see _state.py).
-    p = _state.netboot_state_path("legacy")
-    p.parent.mkdir(parents=True)
-    p.write_text(
-        json.dumps(
-            {
-                "target": "legacy",
-                "dhcp_pid": 1,
-                "tftp_pid": 2,
-                "started_at": 0.0,
-                "interface": "enx0",
-                "tftp_root": "/srv",
-            }
-        )
+    assert (
+        _run(
+            lab, "serial", "add", "console", "-t", "fortune", "--device", "/dev/ttyUSB0"
+        ).exit_code
+        == 0
     )
-    st = _state.load_netboot_state("legacy")
-    assert st is not None
-    assert st.engine == "python"
+    data = _load(lab)
+    assert data["hosts"]["bench1"]["ssh"] == "u@bench1"
+    assert data["targets"]["fortune"]["host"] == "bench1"
+    assert data["targets"]["fortune"]["netboot"]["interface"] == "en0"
+    assert data["targets"]["fortune"]["serial"][0]["device"] == "/dev/ttyUSB0"
 
 
-def test_fresh_rust_state_round_trips_as_rust(state_dir):
-    _state.save_netboot_state(_state_obj(engine="rust"))
-    assert _state.load_netboot_state("fortune").engine == "rust"
+def test_validation_error_leaves_file_unwritten(tmp_path):
+    lab = tmp_path / "lab.toml"
+    _run(lab, "target", "add", "fortune")
+    before = lab.read_text()
+    # Binding a channel to an undeclared host must fail and not persist.
+    result = _run(lab, "netboot", "set", "-t", "fortune", "--host", "ghost")
+    assert result.exit_code == 1
+    assert lab.read_text() == before
 
 
-# ── PID liveness ────────────────────────────────────────────────────────────
+def test_host_rm_refused_while_referenced(tmp_path):
+    lab = tmp_path / "lab.toml"
+    _run(lab, "host", "add", "bench1", "--ssh", "u@bench1")
+    _run(lab, "target", "add", "fortune", "--host", "bench1")
+    result = _run(lab, "host", "rm", "bench1")
+    assert result.exit_code == 1
+    assert "bench1" in _load(lab)["hosts"]
 
 
-def test_is_pid_alive_branches(monkeypatch):
-    monkeypatch.setattr(_state.os, "kill", lambda pid, sig: None)
-    assert _state.is_pid_alive(123) is True
-
-    def gone(pid, sig):
-        raise ProcessLookupError
-
-    monkeypatch.setattr(_state.os, "kill", gone)
-    assert _state.is_pid_alive(123) is False
-
-    def denied(pid, sig):
-        # PID exists but we cannot signal it — still alive.
-        raise PermissionError
-
-    monkeypatch.setattr(_state.os, "kill", denied)
-    assert _state.is_pid_alive(123) is True
+def test_serial_rm_and_set(tmp_path):
+    lab = tmp_path / "lab.toml"
+    _run(lab, "target", "add", "fortune")
+    _run(lab, "serial", "add", "console", "-t", "fortune", "--device", "/dev/a")
+    _run(lab, "serial", "set", "console", "-t", "fortune", "--baud", "230400")
+    assert _load(lab)["targets"]["fortune"]["serial"][0]["baud"] == 230400
+    _run(lab, "serial", "rm", "console", "-t", "fortune")
+    assert "serial" not in _load(lab)["targets"]["fortune"]
 
 
-def test_child_alive_requires_module_in_cmdline(monkeypatch):
-    monkeypatch.setattr(_state, "is_pid_alive", lambda pid: True)
-    monkeypatch.setattr(
-        _state, "_pid_cmdline", lambda pid: "python -m paniolo._tftp 192.168.99.1"
+def test_init_refuses_existing(tmp_path):
+    lab = tmp_path / "lab.toml"
+    assert _run(lab, "init").exit_code == 0
+    assert _run(lab, "init").exit_code == 1
+
+
+# ── doctor: _check_channel (local host, deterministic) ──────────────────────────
+
+
+def _local():
+    from paniolo import _ssh
+
+    return _ssh.Host(name=_ssh.LOCAL, ssh=_ssh.LOCAL)
+
+
+def test_check_channel_serial_present_and_missing():
+    from paniolo import _cli
+
+    rt = _lab.ResolvedTarget("t", "local", None, [])
+    ok = _cli._check_channel(
+        _local(),
+        _lab.ResolvedChannel("serial", "c", "local", {"device": "/dev/null"}),
+        rt,
     )
-    assert _state.is_paniolo_child_alive(99, "paniolo._tftp") is True
-    assert _state.is_paniolo_child_alive(99, "netbootd") is False
-
-
-def test_child_alive_short_circuits_when_pid_dead(monkeypatch):
-    monkeypatch.setattr(_state, "is_pid_alive", lambda pid: False)
-    checked = []
-    monkeypatch.setattr(_state, "_pid_cmdline", lambda pid: checked.append(pid) or "")
-    assert _state.is_paniolo_child_alive(99, "anything") is False
-    assert not checked, "cmdline must not be read once the PID is known dead"
-
-
-# ── is_netboot_running (per-engine) ─────────────────────────────────────────
-
-
-def test_running_false_when_no_state(state_dir):
-    assert _state.is_netboot_running("ghost") is False
-
-
-def test_running_rust_checks_single_netbootd_pid(state_dir, monkeypatch):
-    _state.save_netboot_state(
-        _state_obj(target="r", engine="rust", dhcp_pid=500, tftp_pid=500)
+    assert ok[0] == "ok"
+    bad = _cli._check_channel(
+        _local(),
+        _lab.ResolvedChannel("serial", "c", "local", {"device": "/dev/nope-xyz"}),
+        rt,
     )
-    seen = []
-    monkeypatch.setattr(
-        _state,
-        "is_paniolo_child_alive",
-        lambda pid, module: seen.append((pid, module)) or True,
-    )
-    assert _state.is_netboot_running("r") is True
-    assert seen == [(500, "netbootd")], "rust engine probes one netbootd PID"
+    assert bad[0] == "missing"
 
 
-def test_running_python_requires_both_children(state_dir, monkeypatch):
-    _state.save_netboot_state(
-        _state_obj(target="p", engine="python", dhcp_pid=10, tftp_pid=20)
-    )
-    # tftp child reports dead -> overall not running.
-    monkeypatch.setattr(
-        _state,
-        "is_paniolo_child_alive",
-        lambda pid, module: module == "paniolo._dhcp",
-    )
-    assert _state.is_netboot_running("p") is False
+def test_check_channel_power_serial_ref():
+    from paniolo import _cli
 
-
-def test_running_python_true_when_both_alive(state_dir, monkeypatch):
-    _state.save_netboot_state(
-        _state_obj(target="p", engine="python", dhcp_pid=10, tftp_pid=20)
+    serial = _lab.ResolvedChannel("serial", "console", "local", {"device": "/dev/null"})
+    rt = _lab.ResolvedTarget("t", "local", None, [serial])
+    good = _cli._check_channel(
+        _local(),
+        _lab.ResolvedChannel(
+            "power", "power", "local", {"serial_interface": "console"}
+        ),
+        rt,
     )
-    monkeypatch.setattr(_state, "is_paniolo_child_alive", lambda pid, module: True)
-    assert _state.is_netboot_running("p") is True
+    assert good[0] == "ok"
+    bad = _cli._check_channel(
+        _local(),
+        _lab.ResolvedChannel("power", "power", "local", {"serial_interface": "nope"}),
+        rt,
+    )
+    assert bad[0] == "missing"
 ````
 
-## File: tests/test_video.py
+## File: tests/test_labfile.py
 ````python
 # Copyright 2026 Curtis Galloway
 #
@@ -7058,138 +7697,241 @@ def test_running_python_true_when_both_alive(state_dir, monkeypatch):
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for _video.py: TOML config round-trip, `hdmicap devices` parsing, the
-capture-device heuristic, and discovery-file / daemon-URL resolution. The
-hdmicap binary, subprocess, and filesystem are all stubbed."""
+"""Tests for the tomlkit-backed editable lab document (paniolo._labfile)."""
+
+import tomllib
+
+import pytest
+
+from paniolo import _labfile
+from paniolo._lab import LabError
+
+
+def _reparse(path):
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def test_create_and_build_round_trips(tmp_path):
+    p = str(tmp_path / "lab.toml")
+    lf = _labfile.LabFile.create(p)
+    lf.add_host("bench1", "curtisg@bench1.local", identity="~/.ssh/id_lab")
+    lf.add_target("fortune", host="bench1", note="left adapter is console")
+    lf.set_netboot("fortune", interface="enx00", tftp_root="/srv/tftp/fortune")
+    lf.add_serial("fortune", "console", "/dev/ttyUSB0")
+    lf.add_serial("fortune", "bmc", "/dev/ttyUSB1", baud=9600)
+    lf.set_power("fortune", cycle_cmd="/bin/cycle.sh", serial_interface="console")
+    lf.save()
+
+    data = _reparse(p)
+    assert data["hosts"]["bench1"]["ssh"] == "curtisg@bench1.local"
+    assert data["hosts"]["bench1"]["identity"] == "~/.ssh/id_lab"
+    t = data["targets"]["fortune"]
+    assert t["host"] == "bench1"
+    assert t["note"] == "left adapter is console"
+    assert t["netboot"]["interface"] == "enx00"
+    assert [s["name"] for s in t["serial"]] == ["console", "bmc"]
+    assert t["serial"][1]["baud"] == 9600
+    assert t["power"]["cycle_cmd"] == "/bin/cycle.sh"
+
+
+def test_comments_and_formatting_preserved(tmp_path):
+    p = tmp_path / "lab.toml"
+    p.write_text(
+        "# my hand-written lab\n"
+        "[hosts.bench1]\n"
+        'ssh = "curtisg@bench1.local"  # the noisy one\n\n'
+        "[targets.fortune]\n"
+        'host = "bench1"\n'
+        "# reminder: console is on the LEFT adapter\n"
+        "[[targets.fortune.serial]]\n"
+        'name = "console"\n'
+        'device = "/dev/ttyUSB0"\n'
+        "baud = 115200\n"
+    )
+    lf = _labfile.LabFile.load(str(p))
+    lf.add_serial("fortune", "bmc", "/dev/ttyUSB1", baud=9600)
+    lf.update_host("bench1", identity="~/.ssh/id_lab")
+    lf.save()
+
+    text = p.read_text()
+    assert "# my hand-written lab" in text
+    assert "# the noisy one" in text
+    assert "# reminder: console is on the LEFT adapter" in text
+    data = _reparse(str(p))
+    assert data["hosts"]["bench1"]["identity"] == "~/.ssh/id_lab"
+    assert [s["name"] for s in data["targets"]["fortune"]["serial"]] == [
+        "console",
+        "bmc",
+    ]
+
+
+def test_remove_last_serial_drops_array(tmp_path):
+    p = str(tmp_path / "lab.toml")
+    lf = _labfile.LabFile.create(p)
+    lf.add_target("fortune")
+    lf.add_serial("fortune", "console", "/dev/ttyUSB0")
+    lf.remove_serial("fortune", "console")
+    lf.save()
+    assert "serial" not in _reparse(p)["targets"]["fortune"]
+
+
+def test_duplicate_serial_rejected(tmp_path):
+    lf = _labfile.LabFile.create(str(tmp_path / "lab.toml"))
+    lf.add_target("fortune")
+    lf.add_serial("fortune", "console", "/dev/ttyUSB0")
+    with pytest.raises(LabError, match="already exists"):
+        lf.add_serial("fortune", "console", "/dev/ttyUSB1")
+
+
+def test_remove_host_blocked_while_referenced(tmp_path):
+    lf = _labfile.LabFile.create(str(tmp_path / "lab.toml"))
+    lf.add_host("bench1", "curtisg@bench1.local")
+    lf.add_target("fortune", host="bench1")
+    with pytest.raises(LabError, match="still used by: fortune"):
+        lf.remove_host("bench1")
+
+
+def test_validate_rejects_unknown_host_ref(tmp_path):
+    lf = _labfile.LabFile.create(str(tmp_path / "lab.toml"))
+    lf.add_target("fortune", host="ghost")
+    with pytest.raises(LabError, match="unknown host 'ghost'"):
+        lf.save()
+
+
+def test_validate_rejects_missing_ssh():
+    with pytest.raises(LabError, match="missing required 'ssh'"):
+        _labfile.validate({"hosts": {"bench1": {}}})
+
+
+def test_validate_rejects_singleton_as_array():
+    data = {"targets": {"fortune": {"netboot": [{"interface": "en0"}]}}}
+    with pytest.raises(LabError, match="must be a single table"):
+        _labfile.validate(data)
+
+
+def test_validate_rejects_bad_sense_signal():
+    data = {
+        "targets": {
+            "fortune": {
+                "serial": [
+                    {"name": "c", "device": "/dev/x", "power_sense_signal": "bogus"}
+                ]
+            }
+        }
+    }
+    with pytest.raises(LabError, match="invalid power_sense_signal"):
+        _labfile.validate(data)
+
+
+def test_per_channel_host_validates(tmp_path):
+    lf = _labfile.LabFile.create(str(tmp_path / "lab.toml"))
+    lf.add_host("bench1", "u@bench1")
+    lf.add_host("bench2", "u@bench2")
+    lf.add_target("fortune", host="bench1")
+    lf.set_video("fortune", device="/dev/video0", host="bench2")
+    lf.save()  # cross-host target is now valid at the file layer
+    data = _reparse(str(tmp_path / "lab.toml"))
+    assert data["targets"]["fortune"]["video"]["host"] == "bench2"
+````
+
+## File: tests/test_paths.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for source-checkout resolution.
+
+Regression coverage for the `make install` bug where `paniolo setup`, run from
+the *installed* uv tool, climbed a fixed number of parents from __file__ and
+landed in `.../lib/python3.12` — silently failing to find the OCR source and the
+Rust crates. `repo_root()` must instead find the checkout via __file__ OR the
+cwd, and return None (so callers error clearly) when neither points at one."""
 
 from __future__ import annotations
 
-import json
-import types
+import pytest
 
-from paniolo import _video
-from paniolo._video import VideoConfig
-
-# pylint: disable=protected-access
+from paniolo import _ocr, _paths
 
 
-def _run(stdout: str = "", returncode: int = 0):
-    return types.SimpleNamespace(stdout=stdout, returncode=returncode)
+def _make_fake_repo(root):
+    """Create the minimal marker layout `_is_repo_root` looks for."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "pyproject.toml").write_text("[project]\nname = 'paniolo'\n")
+    (root / "ocr").mkdir()
+    (root / "ocr" / "visionocr.swift").write_text("// stub\n")
+    (root / "hdmicap").mkdir()
+    (root / "hdmicap" / "Cargo.toml").write_text("[package]\nname = 'hdmicap'\n")
+    return root
 
 
-# ── TOML serialization / round-trip ─────────────────────────────────────────
+def test_repo_root_finds_real_checkout():
+    """In the source tree, __file__ resolution locates this very repo."""
+    root = _paths.repo_root()
+    assert root is not None
+    assert (root / "ocr" / "visionocr.swift").exists()
+    assert (root / "hdmicap" / "Cargo.toml").exists()
 
 
-def test_to_toml_emits_string_kv_and_drops_none():
-    assert _video._to_toml({"device": "HDMI Cap"}) == 'device = "HDMI Cap"\n'
-    assert _video._to_toml({"device": "Cam0", "extra": None}) == 'device = "Cam0"\n'
+def test_repo_root_via_cwd_when_file_is_elsewhere(tmp_path, monkeypatch):
+    """An installed CLI (__file__ outside any clone) still resolves via cwd.
+
+    This is the `make install` case: the uv-tool copy runs from inside the repo.
+    """
+    fake_repo = _make_fake_repo(tmp_path / "clone")
+    monkeypatch.setattr(_paths, "__file__", "/opt/installed/paniolo/_paths.py")
+    monkeypatch.chdir(fake_repo)
+    assert _paths.repo_root() == fake_repo
 
 
-def test_save_load_round_trip(tmp_path, monkeypatch):
-    monkeypatch.setattr(_video._config, "CONFIG_DIR", tmp_path)
-    monkeypatch.setattr(_video, "VIDEO_CONFIG_PATH", tmp_path / "video.toml")
-    _video.save_video_config(VideoConfig(device="USB Capture HDMI"))
-    assert _video.load_video_config() == VideoConfig(device="USB Capture HDMI")
+def test_repo_root_via_cwd_parent(tmp_path, monkeypatch):
+    """cwd resolution walks up to an ancestor checkout, not just cwd itself."""
+    fake_repo = _make_fake_repo(tmp_path / "clone")
+    sub = fake_repo / "deep" / "nested"
+    sub.mkdir(parents=True)
+    monkeypatch.setattr(_paths, "__file__", "/opt/installed/paniolo/_paths.py")
+    monkeypatch.chdir(sub)
+    assert _paths.repo_root() == fake_repo
 
 
-def test_load_returns_none_when_absent(tmp_path, monkeypatch):
-    monkeypatch.setattr(_video, "VIDEO_CONFIG_PATH", tmp_path / "video.toml")
-    assert _video.load_video_config() is None
+def test_repo_root_none_outside_checkout(tmp_path, monkeypatch):
+    """No checkout from __file__ or cwd -> None (callers surface a clear error)."""
+    monkeypatch.setattr(_paths, "__file__", "/opt/installed/paniolo/_paths.py")
+    monkeypatch.chdir(tmp_path)
+    assert _paths.repo_root() is None
 
 
-# ── `hdmicap devices` parsing ───────────────────────────────────────────────
+def test_ocr_sources_none_without_repo(monkeypatch):
+    """OCR source helpers degrade to None rather than a bogus path."""
+    monkeypatch.setattr(_ocr, "repo_root", lambda: None)
+    assert _ocr.visionocr_source() is None
+    assert _ocr.linuxocr_source() is None
 
 
-def test_list_devices_parses_indexed_lines(monkeypatch):
-    monkeypatch.setattr(_video, "hdmicap_binary", lambda: "/usr/bin/hdmicap")
-    out = "0  FaceTime HD Camera [builtin]\n1  USB Capture HDMI [0x1234]\n"
-    monkeypatch.setattr(_video.subprocess, "run", lambda *a, **k: _run(out))
-    devices = _video.list_devices()
-    assert devices == [
-        {"index": 0, "name": "FaceTime HD Camera", "misc": "builtin"},
-        {"index": 1, "name": "USB Capture HDMI", "misc": "0x1234"},
-    ]
+def test_build_visionocr_raises_without_repo(monkeypatch, tmp_path):
+    """build_visionocr raises a clear FileNotFoundError when no checkout exists."""
+    monkeypatch.setattr(_ocr, "repo_root", lambda: None)
+    with pytest.raises(FileNotFoundError, match="source checkout not found"):
+        _ocr.build_visionocr(tmp_path / "out")
 
 
-def test_list_devices_empty_when_binary_missing(monkeypatch):
-    monkeypatch.setattr(_video, "hdmicap_binary", lambda: None)
-    assert not _video.list_devices()
-
-
-def test_list_devices_empty_on_nonzero_exit(monkeypatch):
-    monkeypatch.setattr(_video, "hdmicap_binary", lambda: "/usr/bin/hdmicap")
-    monkeypatch.setattr(_video.subprocess, "run", lambda *a, **k: _run("x", 1))
-    assert not _video.list_devices()
-
-
-# ── capture-device heuristic ────────────────────────────────────────────────
-
-
-def test_guess_capture_device_picks_sole_non_builtin():
-    devices = [
-        {"index": 0, "name": "FaceTime HD Camera", "misc": ""},
-        {"index": 1, "name": "USB Capture HDMI", "misc": ""},
-    ]
-    assert _video.guess_capture_device(devices) == devices[1]
-
-
-def test_guess_capture_device_none_when_ambiguous():
-    devices = [
-        {"index": 0, "name": "USB Capture HDMI", "misc": ""},
-        {"index": 1, "name": "Elgato HD60", "misc": ""},
-    ]
-    assert _video.guess_capture_device(devices) is None
-
-
-def test_guess_capture_device_none_when_only_builtins():
-    devices = [
-        {"index": 0, "name": "FaceTime HD Camera", "misc": ""},
-        {"index": 1, "name": "iPhone Camera", "misc": ""},
-    ]
-    assert _video.guess_capture_device(devices) is None
-
-
-# ── discovery file / daemon URL ─────────────────────────────────────────────
-
-
-def test_read_discovery_parses_json(tmp_path, monkeypatch):
-    disc = tmp_path / "daemon.json"
-    disc.write_text(json.dumps({"pid": 4321, "port": 8723}))
-    monkeypatch.setattr(_video, "_discovery_path", lambda: disc)
-    assert _video.read_discovery() == {"pid": 4321, "port": 8723}
-
-
-def test_read_discovery_none_when_missing(tmp_path, monkeypatch):
-    monkeypatch.setattr(_video, "_discovery_path", lambda: tmp_path / "nope.json")
-    assert _video.read_discovery() is None
-
-
-def test_read_discovery_none_when_corrupt(tmp_path, monkeypatch):
-    disc = tmp_path / "daemon.json"
-    disc.write_text("{not json")
-    monkeypatch.setattr(_video, "_discovery_path", lambda: disc)
-    assert _video.read_discovery() is None
-
-
-def test_daemon_url_when_pid_alive(monkeypatch):
-    monkeypatch.setattr(_video, "read_discovery", lambda: {"pid": 10, "port": 8723})
-    monkeypatch.setattr(_video.os, "kill", lambda pid, sig: None)
-    assert _video.daemon_url() == "http://127.0.0.1:8723"
-
-
-def test_daemon_url_none_when_pid_dead(monkeypatch):
-    monkeypatch.setattr(_video, "read_discovery", lambda: {"pid": 10, "port": 8723})
-
-    def gone(pid, sig):
-        raise ProcessLookupError
-
-    monkeypatch.setattr(_video.os, "kill", gone)
-    assert _video.daemon_url() is None
-
-
-def test_daemon_url_none_when_no_discovery(monkeypatch):
-    monkeypatch.setattr(_video, "read_discovery", lambda: None)
-    assert _video.daemon_url() is None
+def test_install_linuxocr_raises_without_repo(monkeypatch, tmp_path):
+    """install_linuxocr raises a clear FileNotFoundError when no checkout exists."""
+    monkeypatch.setattr(_ocr, "repo_root", lambda: None)
+    with pytest.raises(FileNotFoundError, match="source checkout not found"):
+        _ocr.install_linuxocr(tmp_path / "out")
 ````
 
 ## File: .gitignore
@@ -7491,43 +8233,734 @@ clean:
 	done
 ````
 
-## File: pyproject.toml
-````toml
-[project]
-name = "paniolo"
-version = "0.1.0"
-description = "Agent-controlled target machine wrangler for low-level software development"
-requires-python = ">=3.11"
-license = { text = "Apache-2.0" }
-dependencies = [
-    "typer>=0.12",
-]
+## File: cli/src/netif.rs
+````rust
+// Copyright 2026 Curtis Galloway
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-[project.scripts]
-paniolo = "paniolo._cli:app"
+//! USB-Ethernet link plumbing for the netboot/ffx modes.
+//!
+//! Ported from `_netboot.py` (interface helpers) + `_netif.py` (modes). The two
+//! link modes share one physical point-to-point link and are mutually
+//! exclusive: **netboot** = IPv4 host_ip/24 + DHCP/TFTP; **ffx** = host IPv6
+//! link-local `fe80::1/64`, no daemons. The active mode is probed from the
+//! running daemon + the interface's addresses, never stored.
 
-[project.optional-dependencies]
-hid = [
-    "pyserial>=3.5",
-]
+use std::process::Command;
 
-[tool.uv]
-package = true
+use anyhow::{bail, Result};
 
-[tool.pyink]
-line-length = 88
+/// The host-side IPv6 link-local that ffx talks through.
+pub const FFX_HOST_LL: &str = "fe80::1";
+pub const FFX_PREFIX: u8 = 64;
 
-[build-system]
-requires = ["setuptools>=69"]
-build-backend = "setuptools.build_meta"
+const SUDO_HINT: &str =
+    "Ensure passwordless sudo is configured (NOPASSWD) for the control machine.";
 
-[dependency-groups]
-dev = [
-    "pytest>=9.0.3",
-]
+fn run(cmd: &[&str]) -> std::io::Result<std::process::Output> {
+    Command::new(cmd[0]).args(&cmd[1..]).output()
+}
 
-[tool.setuptools.packages.find]
-where = ["src"]
+fn macos() -> bool {
+    cfg!(target_os = "macos")
+}
+
+// ── interface discovery / probing ───────────────────────────────────────────
+
+pub struct EthInterface {
+    pub port: String,
+    pub device: String,
+    pub active: bool,
+}
+
+pub fn is_interface_active(device: &str) -> bool {
+    if macos() {
+        run(&["ifconfig", device])
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("status: active"))
+            .unwrap_or(false)
+    } else {
+        std::fs::read_to_string(format!("/sys/class/net/{device}/carrier"))
+            .map(|s| s.trim() == "1")
+            .unwrap_or(false)
+    }
+}
+
+const MAC_EXCLUDE_PORTS: [&str; 6] = [
+    "Wi-Fi",
+    "Thunderbolt",
+    "Bluetooth",
+    "FireWire",
+    "iPhone",
+    "iPad",
+];
+const LINUX_SKIP_PREFIXES: [&str; 8] = [
+    "lo", "docker", "veth", "br", "virbr", "vlan", "bond", "dummy",
+];
+
+/// External (non-built-in) Ethernet interfaces, active ones first. The
+/// interface carrying the system default route is excluded — it can never be a
+/// netboot link (the start guard refuses to reconfigure the primary NIC), so
+/// surfacing it in discovery only invites a misconfiguration.
+pub fn list_usb_ethernet_interfaces() -> Vec<EthInterface> {
+    let primary = default_route_interface();
+    let mut out: Vec<EthInterface> = Vec::new();
+    if macos() {
+        let Ok(o) = run(&["networksetup", "-listallhardwareports"]) else {
+            return out;
+        };
+        let text = String::from_utf8_lossy(&o.stdout).into_owned();
+        let mut port: Option<String> = None;
+        for line in text.lines() {
+            if let Some(p) = line.strip_prefix("Hardware Port:") {
+                port = Some(p.trim().to_string());
+            } else if let Some(d) = line.strip_prefix("Device:") {
+                if let Some(p) = port.take() {
+                    let device = d.trim().to_string();
+                    let excluded = device == "bridge0"
+                        || device == "lo0"
+                        || primary.as_deref() == Some(device.as_str())
+                        || MAC_EXCLUDE_PORTS.iter().any(|x| p.starts_with(x));
+                    if !excluded {
+                        let active = is_interface_active(&device);
+                        out.push(EthInterface {
+                            port: p,
+                            device,
+                            active,
+                        });
+                    }
+                }
+            }
+        }
+    } else if let Ok(rd) = std::fs::read_dir("/sys/class/net") {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if LINUX_SKIP_PREFIXES.iter().any(|p| name.starts_with(p))
+                || primary.as_deref() == Some(name.as_str())
+            {
+                continue;
+            }
+            // Type 1 = Ethernet (ARPHRD_ETHER).
+            let is_ether = std::fs::read_to_string(e.path().join("type"))
+                .map(|t| t.trim() == "1")
+                .unwrap_or(false);
+            if !is_ether {
+                continue;
+            }
+            let active = is_interface_active(&name);
+            out.push(EthInterface {
+                port: name.clone(),
+                device: name,
+                active,
+            });
+        }
+    }
+    out.sort_by(|a, b| (!a.active, &a.device).cmp(&(!b.active, &b.device)));
+    out
+}
+
+/// The networksetup service name for a device (macOS only).
+fn find_network_service(interface: &str) -> Option<String> {
+    if !macos() {
+        return None;
+    }
+    let o = run(&["networksetup", "-listallhardwareports"]).ok()?;
+    let text = String::from_utf8_lossy(&o.stdout).into_owned();
+    let mut service: Option<String> = None;
+    for line in text.lines() {
+        if let Some(p) = line.strip_prefix("Hardware Port:") {
+            service = Some(p.trim().to_string());
+        } else if let Some(d) = line.strip_prefix("Device:") {
+            if d.trim() == interface {
+                return service;
+            }
+        }
+    }
+    None
+}
+
+/// The interface carrying the system default route, or None.
+fn default_route_interface() -> Option<String> {
+    if macos() {
+        let o = run(&["route", "-n", "get", "default"]).ok()?;
+        let text = String::from_utf8_lossy(&o.stdout).into_owned();
+        for line in text.lines() {
+            if let Some(i) = line.trim().strip_prefix("interface:") {
+                return Some(i.trim().to_string());
+            }
+        }
+        None
+    } else {
+        let o = run(&["ip", "route", "show", "default"]).ok()?;
+        let text = String::from_utf8_lossy(&o.stdout).into_owned();
+        let toks: Vec<&str> = text.split_whitespace().collect();
+        toks.iter()
+            .position(|&t| t == "dev")
+            .and_then(|i| toks.get(i + 1))
+            .map(|s| s.to_string())
+    }
+}
+
+/// True if `interface` carries the system default route — netboot must never
+/// reconfigure the primary NIC.
+pub fn is_primary_interface(interface: &str) -> bool {
+    default_route_interface().as_deref() == Some(interface)
+}
+
+/// The interface's addresses: (inet, inet6) with IPv6 scope suffixes stripped.
+pub fn iface_addresses(interface: &str) -> (Vec<String>, Vec<String>) {
+    let mut inet = Vec::new();
+    let mut inet6 = Vec::new();
+    if macos() {
+        if let Ok(o) = run(&["ifconfig", interface]) {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                let s = line.trim();
+                if let Some(rest) = s.strip_prefix("inet ") {
+                    if let Some(a) = rest.split_whitespace().next() {
+                        inet.push(a.to_string());
+                    }
+                } else if let Some(rest) = s.strip_prefix("inet6 ") {
+                    if let Some(a) = rest.split_whitespace().next() {
+                        inet6.push(a.split('%').next().unwrap_or(a).to_string());
+                    }
+                }
+            }
+        }
+    } else if let Ok(o) = run(&["ip", "-brief", "addr", "show", "dev", interface]) {
+        if o.status.success() {
+            let text = String::from_utf8_lossy(&o.stdout).into_owned();
+            for addr in text.split_whitespace().skip(2) {
+                if addr.contains(':') {
+                    inet6.push(addr.to_string());
+                } else {
+                    inet.push(addr.to_string());
+                }
+            }
+        }
+    }
+    (inet, inet6)
+}
+
+fn has_host_ll(inet6: &[String]) -> bool {
+    inet6
+        .iter()
+        .any(|a| a.split('/').next().unwrap_or(a) == FFX_HOST_LL)
+}
+
+/// Link-local IPv6 neighbours on the interface (Linux only; excludes our LL).
+pub fn ipv6_peers(interface: &str) -> Vec<String> {
+    if macos() {
+        return Vec::new();
+    }
+    let Ok(o) = run(&["ip", "-6", "neigh", "show", "dev", interface]) else {
+        return Vec::new();
+    };
+    if !o.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|t| t.starts_with("fe80:") && *t != FFX_HOST_LL)
+        .map(String::from)
+        .collect()
+}
+
+// ── privileged interface mutation ───────────────────────────────────────────
+
+/// Assign the static netboot host IP to the interface (sudo).
+pub fn configure_interface(interface: &str, host_ip: &str) -> Result<()> {
+    if macos() {
+        if let Some(service) = find_network_service(interface) {
+            let _ = run(&[
+                "sudo",
+                "networksetup",
+                "-setmanual",
+                &service,
+                host_ip,
+                "255.255.255.0",
+            ]);
+        }
+        let o = run(&[
+            "sudo",
+            "ifconfig",
+            interface,
+            host_ip,
+            "netmask",
+            "255.255.255.0",
+            "up",
+        ])?;
+        if !o.status.success() {
+            bail!(
+                "ifconfig {interface} failed: {}\n{SUDO_HINT}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+        }
+    } else {
+        let _ = run(&["sudo", "ip", "addr", "flush", "dev", interface]);
+        let cidr = format!("{host_ip}/24");
+        let o = run(&["sudo", "ip", "addr", "add", &cidr, "dev", interface])?;
+        let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+        if !o.status.success() && !stderr.contains("already assigned") {
+            bail!(
+                "ip addr add {cidr} dev {interface} failed: {}\n{SUDO_HINT}",
+                stderr.trim()
+            );
+        }
+        let _ = run(&["sudo", "ip", "link", "set", interface, "up"]);
+    }
+    Ok(())
+}
+
+/// Release the static IP and return the interface to OS-managed networking.
+pub fn restore_interface(interface: &str) {
+    if macos() {
+        if let Some(service) = find_network_service(interface) {
+            let _ = run(&["sudo", "networksetup", "-setdhcp", &service]);
+        }
+    } else {
+        let _ = run(&["sudo", "ip", "addr", "flush", "dev", interface]);
+    }
+}
+
+/// macOS: stop neighbour-unreachability detection from blocking sends to the
+/// Pi's bootloader (it never answers ARP probes). No-op on Linux.
+pub fn tune_arp_for_silent_client() {
+    if !macos() {
+        return;
+    }
+    for kv in [
+        "net.link.ether.inet.arp_llreach_base=0",
+        "net.link.ether.inet.host_down_time=0",
+    ] {
+        let _ = run(&["sudo", "sysctl", "-w", kv]);
+    }
+}
+
+fn add_host_ll(interface: &str) -> Result<()> {
+    if macos() {
+        let _ = run(&[
+            "sudo",
+            "ifconfig",
+            interface,
+            "inet6",
+            FFX_HOST_LL,
+            "prefixlen",
+            "64",
+            "up",
+        ]);
+        return Ok(());
+    }
+    let sysctl_key = format!("net/ipv6/conf/{interface}/disable_ipv6=0");
+    let _ = run(&["sudo", "sysctl", "-w", &sysctl_key]);
+    let _ = run(&["sudo", "ip", "link", "set", interface, "up"]);
+    let cidr = format!("{FFX_HOST_LL}/{FFX_PREFIX}");
+    let o = run(&["sudo", "ip", "-6", "addr", "add", &cidr, "dev", interface])?;
+    let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+    if !o.status.success() && !stderr.to_lowercase().contains("exists") {
+        bail!(
+            "ip -6 addr add {cidr} dev {interface} failed: {}\n{SUDO_HINT}",
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+fn del_host_ll(interface: &str) {
+    if macos() {
+        let _ = run(&[
+            "sudo",
+            "ifconfig",
+            interface,
+            "inet6",
+            FFX_HOST_LL,
+            "-alias",
+        ]);
+    } else {
+        let cidr = format!("{FFX_HOST_LL}/{FFX_PREFIX}");
+        let _ = run(&["sudo", "ip", "-6", "addr", "del", &cidr, "dev", interface]);
+    }
+}
+
+fn del_host_ip(interface: &str, host_ip: &str) {
+    if macos() {
+        return; // macOS teardown goes through networksetup -setdhcp.
+    }
+    let cidr = format!("{host_ip}/24");
+    let _ = run(&["sudo", "ip", "addr", "del", &cidr, "dev", interface]);
+}
+
+// ── modes ───────────────────────────────────────────────────────────────────
+
+pub const MODES: [&str; 3] = ["netboot", "ffx", "off"];
+
+/// netboot mode: tear down ffx, start DHCP+TFTP (idempotent).
+pub fn mode_netboot(target: &str, interface: &str, host_ip: &str, tftp_root: &str) -> Result<()> {
+    del_host_ll(interface);
+    if crate::state::is_netboot_running(target) {
+        return Ok(());
+    }
+    crate::netboot::start(target, interface, host_ip, tftp_root)
+}
+
+/// ffx mode: stop netboot first, then add the host IPv6 link-local.
+pub fn mode_ffx(target: &str, interface: &str) -> Result<()> {
+    if crate::state::is_netboot_running(target) {
+        crate::netboot::stop(target)?;
+    }
+    add_host_ll(interface)
+}
+
+/// off: stop netboot, remove the ffx LL and any stale IPv4.
+pub fn mode_off(target: &str, interface: &str, host_ip: &str) -> Result<()> {
+    if crate::state::is_netboot_running(target) {
+        crate::netboot::stop(target)?;
+    }
+    del_host_ll(interface);
+    del_host_ip(interface, host_ip);
+    Ok(())
+}
+
+pub struct NetifStatus {
+    pub mode: &'static str,
+    pub inet: Vec<String>,
+    pub inet6: Vec<String>,
+    pub peers: Vec<String>,
+}
+
+/// Probe the active mode (never stored): daemons running → netboot; host LL
+/// present → ffx; else off.
+pub fn get_status(target: &str, interface: &str) -> NetifStatus {
+    let netboot_running = crate::state::is_netboot_running(target);
+    let (inet, inet6) = iface_addresses(interface);
+    let has_ll = has_host_ll(&inet6);
+    let mode = if netboot_running {
+        "netboot"
+    } else if has_ll {
+        "ffx"
+    } else {
+        "off"
+    };
+    let peers = if mode == "ffx" {
+        ipv6_peers(interface)
+    } else {
+        Vec::new()
+    };
+    NetifStatus {
+        mode,
+        inet,
+        inet6,
+        peers,
+    }
+}
+````
+
+## File: cli/src/ssh.rs
+````rust
+// Copyright 2026 Curtis Galloway
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! SSH transport for driving a target on a remote control host.
+//!
+//! Ported from the Python `_ssh.py`. The dev machine is the hub; every command
+//! against a remote target reaches its control host over SSH. There is no agent
+//! or RPC server — `ssh` is the whole transport. A per-host **ControlMaster**
+//! connection means only the first call to a host pays the handshake.
+//!
+//! A [`Host`] whose `ssh` destination is `"local"` is the dev machine itself;
+//! the SSH functions must not be called for it (callers run those commands
+//! directly).
+
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+
+use crate::model::{expand_tilde, Host, LOCAL};
+
+const CONTROL_PERSIST: &str = "300";
+const CONNECT_TIMEOUT: &str = "10";
+
+fn uid() -> u32 {
+    // Safe: getuid() has no preconditions and cannot fail.
+    unsafe { libc::getuid() }
+}
+
+/// Short directory holding paniolo's default ControlMaster sockets. Kept short
+/// because a Unix-domain socket path is length-limited and ssh appends a 40-char
+/// `%C` hash; `$XDG_RUNTIME_DIR` is short on Linux, else `/tmp`.
+fn control_dir() -> PathBuf {
+    let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    let d = PathBuf::from(base).join(format!("paniolo-{}", uid()));
+    let _ = std::fs::create_dir_all(&d);
+    d
+}
+
+fn control_args(host: &Host) -> Vec<String> {
+    let cp = match &host.control_path {
+        Some(p) => expand_tilde(p).to_string_lossy().into_owned(),
+        None => control_dir().join("cm-%C").to_string_lossy().into_owned(),
+    };
+    vec![
+        "-o".into(),
+        "ControlMaster=auto".into(),
+        "-o".into(),
+        format!("ControlPath={cp}"),
+        "-o".into(),
+        format!("ControlPersist={CONTROL_PERSIST}"),
+    ]
+}
+
+/// Base `ssh` argv (program + options) for a non-local host. `multiplex=false`
+/// gives a standalone connection — a port forward must own its channel: an
+/// `ssh -N -L` attached to a ControlMaster hands the forward to the master and
+/// exits, so the process no longer represents (or can tear down) the tunnel.
+fn base_args(host: &Host, interactive: bool, multiplex: bool) -> Vec<String> {
+    debug_assert!(host.ssh != LOCAL, "ssh called for the local host");
+    let mut a = vec!["ssh".to_string()];
+    if !interactive {
+        // Fail rather than block on a password prompt for non-interactive use.
+        a.push("-o".into());
+        a.push("BatchMode=yes".into());
+    }
+    a.push("-o".into());
+    a.push(format!("ConnectTimeout={CONNECT_TIMEOUT}"));
+    if let Some(id) = &host.identity {
+        a.push("-i".into());
+        a.push(expand_tilde(id).to_string_lossy().into_owned());
+        a.push("-o".into());
+        a.push("IdentitiesOnly=yes".into());
+    }
+    if multiplex {
+        a.extend(control_args(host));
+    } else {
+        a.extend(
+            ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
+                .iter()
+                .map(|s| s.to_string()),
+        );
+    }
+    a
+}
+
+/// Quote a single token for a POSIX shell.
+pub fn shell_quote(s: &str) -> String {
+    let safe = !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"@%_+=:,./-".contains(&b));
+    if safe {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+/// Quote argv (and optional `KEY=val` env assignments) into one remote command,
+/// preserving argument boundaries through the remote shell.
+pub fn remote_command(argv: &[String], env: &[(String, String)]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for (k, v) in env {
+        parts.push(format!("{k}={}", shell_quote(v)));
+    }
+    parts.extend(argv.iter().map(|a| shell_quote(a)));
+    parts.join(" ")
+}
+
+/// Result of a captured remote command.
+pub struct Output {
+    pub status: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Run `argv` on `host` and capture its output (never errors on non-zero exit).
+pub fn run(
+    host: &Host,
+    argv: &[String],
+    stdin: Option<&str>,
+    env: &[(String, String)],
+) -> std::io::Result<Output> {
+    let mut cmd = Command::new("ssh");
+    cmd.args(&base_args(host, false, true)[1..]);
+    cmd.arg(&host.ssh);
+    cmd.arg(remote_command(argv, env));
+    cmd.stdin(if stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    if let Some(data) = stdin {
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(data.as_bytes())?;
+    }
+    let out = child.wait_with_output()?;
+    Ok(Output {
+        status: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    })
+}
+
+/// Run `argv` on `host` with the local terminal's stdio passed through (no PTY).
+/// This is the transparent re-exec path. Returns the exit code.
+pub fn run_passthrough(
+    host: &Host,
+    argv: &[String],
+    env: &[(String, String)],
+) -> std::io::Result<i32> {
+    let status = Command::new("ssh")
+        .args(&base_args(host, false, true)[1..])
+        .arg(&host.ssh)
+        .arg(remote_command(argv, env))
+        .status()?;
+    Ok(status.code().unwrap_or(-1))
+}
+
+/// Run `argv` on `host` over an `ssh -t` PTY (for interactive tools like tio).
+pub fn run_interactive(
+    host: &Host,
+    argv: &[String],
+    env: &[(String, String)],
+) -> std::io::Result<i32> {
+    let status = Command::new("ssh")
+        .args(&base_args(host, true, true)[1..])
+        .arg("-t")
+        .arg(&host.ssh)
+        .arg(remote_command(argv, env))
+        .status()?;
+    Ok(status.code().unwrap_or(-1))
+}
+
+/// A held `ssh -L` tunnel to a port on `host`; killed on drop.
+pub struct Forward {
+    pub local_port: u16,
+    child: std::process::Child,
+}
+
+impl Drop for Forward {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn free_local_port() -> std::io::Result<u16> {
+    // Small TOCTOU window is acceptable.
+    let l = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    Ok(l.local_addr()?.port())
+}
+
+/// Open an `ssh -L` tunnel to `127.0.0.1:remote_port` on `host`, returning once
+/// the local end accepts connections. The forwarder is standalone (not
+/// multiplexed) so killing it reliably tears the tunnel down.
+pub fn forward(host: &Host, remote_port: u16) -> anyhow::Result<Forward> {
+    use anyhow::bail;
+    let local_port = free_local_port()?;
+    let spec = format!("{local_port}:127.0.0.1:{remote_port}");
+    let mut child = Command::new("ssh")
+        .args(&base_args(host, false, false)[1..])
+        .arg("-N")
+        .arg("-L")
+        .arg(&spec)
+        .arg(&host.ssh)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            bail!(
+                "ssh forward to {}:{remote_port} exited early ({status})",
+                host.ssh
+            );
+        }
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], local_port));
+        if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500))
+            .is_ok()
+        {
+            return Ok(Forward { local_port, child });
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            bail!("timed out waiting for forwarded port {local_port}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_quote_leaves_safe_tokens_bare() {
+        assert_eq!(shell_quote("/dev/ttyUSB0"), "/dev/ttyUSB0");
+        assert_eq!(shell_quote("user@host"), "user@host");
+    }
+
+    #[test]
+    fn shell_quote_wraps_specials() {
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn remote_command_prepends_env() {
+        let argv = vec![
+            "paniolo".to_string(),
+            "netboot".to_string(),
+            "start".to_string(),
+        ];
+        let env = vec![("PANIOLO_LAB".to_string(), "/tmp/s lice".to_string())];
+        assert_eq!(
+            remote_command(&argv, &env),
+            "PANIOLO_LAB='/tmp/s lice' paniolo netboot start"
+        );
+    }
+
+    #[test]
+    fn base_args_include_batch_and_control_master() {
+        let host = Host {
+            ssh: "u@bench1".into(),
+            identity: Some("~/.ssh/id".into()),
+            ..Default::default()
+        };
+        let a = base_args(&host, false, true).join(" ");
+        assert!(a.contains("BatchMode=yes"), "{a}");
+        assert!(a.contains("ControlMaster=auto"), "{a}");
+        assert!(a.contains("IdentitiesOnly=yes"), "{a}");
+        // Interactive variant drops BatchMode (so a PTY/password can work).
+        assert!(!base_args(&host, true, true).join(" ").contains("BatchMode"));
+    }
+}
 ````
 
 ## File: docs/ci-integration/related-work.md
@@ -8036,24 +9469,19 @@ WebSocket dashboard terminal).
 Add a serial interface to a target:
 
 ```bash
-paniolo serial setup target-machine \
-    --name console \
+paniolo serial add console -t target-machine \
     --device /dev/tty.usbserial-0001 \
     --baud 115200
 
 # Optional: also wire a power sense signal on this interface (see power.md)
-paniolo serial setup target-machine \
-    --name console \
-    --device /dev/tty.usbserial-0001 \
-    --baud 115200 \
-    --power-sense cts
+paniolo serial set console -t target-machine --sense cts
 ```
 
 A target can have several named interfaces (e.g. `console`, `bmc`). Remove
 one with:
 
 ```bash
-paniolo serial remove target-machine --name console
+paniolo serial rm console -t target-machine
 ```
 
 List detected serial devices:
@@ -11039,7 +12467,7 @@ async fn handle_ws(socket: WebSocket, serial: SerialHandle) {
 }
 ````
 
-## File: src/paniolo/_hid.py
+## File: src/paniolo/_power.py
 ````python
 # Copyright 2026 Curtis Galloway
 #
@@ -11055,231 +12483,219 @@ async fn handle_ws(socket: WebSocket, serial: SerialHandle) {
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Host control client for the KB2040 HID rig (see hidrig/).
+"""Power control helpers: FTDI DTR line via the serialcap daemon or pyserial fallback."""  # pylint: disable=line-too-long
 
-Sends line-based text commands to the control board over its USB CDC *data*
-port; the control board parses them and relays HID keyboard/mouse events to the
-target board, which injects them into the Pi over USB. The board owns the wire
-protocol — `hidrig/control/code.py` and `hidrig/README.md` are the source of
-truth. This module is a thin text-command client plus host-side sequencing.
+from __future__ import annotations
+
+import time
+import urllib.error
+import urllib.request
+
+
+def dtr_button_press(daemon_url: str, interface_name: str, duration_ms: int) -> None:
+    """Assert DTR (J2 power button) for duration_ms ms via the serialcap daemon.
+
+    The daemon owns the serial port exclusively and drives the DTR line on its
+    supervisor task.  This call blocks until the press completes.
+
+    duration_ms guidance (Raspberry Pi 5 / DA9091 PMIC):
+      ≤500 ms  — soft reset signal; OS handles it (graceful reboot or halt)
+      ≥3000 ms — hard power-off; follow with another call to power the board on
+
+    Raises RuntimeError on HTTP error, OSError on network failure.
+    """
+    url = f"{daemon_url}/button?interface={interface_name}&ms={duration_ms}"
+    req = urllib.request.Request(url, method="POST", data=b"")
+    try:
+        with urllib.request.urlopen(
+            req, timeout=max(15, duration_ms // 1000 + 5)
+        ) as resp:
+            resp.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(
+            f"serialcap /button returned {exc.code}: {exc.reason}"
+        ) from exc
+
+
+def dtr_direct_button_press(device: str, duration_ms: int) -> None:
+    """Assert DTR (J2 power button) for duration_ms milliseconds directly via pyserial.
+
+    Fallback for when the serialcap daemon is not running.  Opens the serial
+    port, asserts DTR for the requested duration, then releases and closes.
+
+    Raises RuntimeError if pyserial is not installed or on serial errors.
+    """
+    try:
+        import serial as _serial  # pylint: disable=import-outside-toplevel
+    except ImportError as exc:
+        raise RuntimeError(
+            "pyserial is required for direct DTR control. "
+            "Install it with: uv add pyserial"
+        ) from exc
+
+    port = _serial.Serial()
+    port.port = device
+    port.baudrate = 115200
+    port.open()
+    try:
+        port.dtr = False
+        time.sleep(0.05)  # brief settle after open
+        port.dtr = True
+        time.sleep(duration_ms / 1000.0)
+        port.dtr = False
+    finally:
+        port.close()
+````
+
+## File: src/paniolo/_remote.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Transparent re-exec of a command on a target's remote control host.
+
+When a command targets a host other than the dev machine, paniolo re-runs the
+*same* invocation on that host over SSH (see docs/distributed-control.md). The
+control host is stateless, so the resolved TargetConfig is shipped to it as a
+temp file and pointed at with PANIOLO_TARGET_CONFIG; the remote paniolo then
+runs against that slice locally. stdin/stdout/stderr and the exit code pass
+through, so the command behaves as if it ran here.
+
+This module holds the transport-shaped helpers (pure where possible, for
+testing); the ``@remote_capable`` decorator that calls them lives in _cli.py
+next to the command definitions and target resolution.
 """
 
 from __future__ import annotations
 
-import dataclasses
-import glob
-import sys
-import time
-import tomllib
-from typing import Callable, Optional
+import json
+from typing import Optional
 
-from . import _config
-from ._config import _toml_kv
+from . import _ssh
+from ._config import TargetConfig, _to_toml as _config_to_toml
+from ._ssh import Host
 
-HID_CONFIG_PATH = _config.CONFIG_DIR / "hid.toml"
+TARGET_CONFIG_ENV = "PANIOLO_TARGET_CONFIG"
 
-DEFAULT_BAUD = 115200  # irrelevant over USB CDC, but pyserial requires a value
-
-# Absolute-mouse logical range the OS spreads across the screen (HID convention).
-ABS_MAX = 32767
+# Re-exec dispatch modes.
+REEXEC = "reexec"  # non-interactive: stdio passed through (run_passthrough)
+INTERACTIVE = "interactive"  # PTY over ssh -t (e.g. tio)
 
 
-@dataclasses.dataclass
-class HidConfig:
-    """Saved configuration for the HID control board."""
+def strip_lab_option(args: list[str]) -> list[str]:
+    """Drop the global ``--lab PATH`` / ``--lab=PATH`` option from an argv tail.
 
-    port: str
-
-
-def _to_toml(data: dict) -> str:
-    lines = [_toml_kv(k, v) for k, v in data.items() if v is not None]
-    return "\n".join(lines) + "\n"
-
-
-def save_hid_config(cfg: HidConfig) -> None:
-    _config.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    HID_CONFIG_PATH.write_text(_to_toml(dataclasses.asdict(cfg)))
-
-
-def load_hid_config() -> Optional[HidConfig]:
-    if not HID_CONFIG_PATH.exists():
-        return None
-    with open(HID_CONFIG_PATH, "rb") as f:
-        data = tomllib.load(f)
-    return HidConfig(port=data["port"])
-
-
-def list_serial_ports() -> list[str]:
-    """Candidate USB CDC ports for the control board."""
-    if sys.platform == "darwin":
-        return sorted(glob.glob("/dev/cu.usbmodem*"))
-    return sorted(glob.glob("/dev/ttyACM*"))
-
-
-def guess_data_port() -> Optional[str]:
-    """Best guess at the control board's *data* CDC port.
-
-    The board exposes two CDC ports (console + data); the data port is
-    conventionally the higher-numbered node. Returns None if no candidates.
+    The dev machine's lab path is meaningless on the control host — it gets the
+    config via PANIOLO_TARGET_CONFIG instead — so it must not travel with the
+    re-exec'd command.
     """
-    ports = list_serial_ports()
-    return ports[-1] if ports else None
-
-
-def scale_to_logical(px: int, screen_px: int) -> int:
-    """Map a pixel coordinate to the 0..32767 absolute-mouse logical range.
-
-    The host OS maps that range across the full screen dimension, so callers
-    scale each pixel axis against the screen's size in that axis. Clamped.
-    """
-    if screen_px <= 1:
-        return 0
-    v = round(px * ABS_MAX / (screen_px - 1))
-    return max(0, min(ABS_MAX, v))
-
-
-class HidRig:
-    """Text-command client for the control board over USB serial.
-
-    Pass `transport` (any object with `write(bytes)`, `readline() -> bytes`,
-    `close()`) to drive it without real hardware (used by tests). Otherwise a
-    `pyserial` Serial port is opened lazily on the given `port`.
-    """
-
-    def __init__(
-        self,
-        port: Optional[str] = None,
-        baud: int = DEFAULT_BAUD,
-        timeout: float = 1.0,
-        transport=None,
-    ):
-        if transport is not None:
-            self._transport = transport
-            return
-        try:
-            import serial  # pylint: disable=import-outside-toplevel
-        except ImportError as exc:
-            raise RuntimeError(
-                "pyserial not installed — install the hid extra: "
-                "uv sync --extra hid  (or: pip install 'paniolo[hid]')"
-            ) from exc
-        if not port:
-            raise ValueError("no serial port given")
-        self._transport = serial.Serial(port, baud, timeout=timeout)
-        time.sleep(0.2)
-        self._transport.reset_input_buffer()
-
-    def cmd(self, text: str) -> str:
-        """Send one command line; return the board's reply, raise on ERR."""
-        if "\n" in text or "\r" in text:
-            raise ValueError(f"command contains newline: {text!r}")
-        self._transport.write((text + "\n").encode("utf-8"))
-        reply = self._transport.readline().decode("utf-8", "replace").strip()
-        if reply.startswith("ERR"):
-            raise RuntimeError(f"control board rejected '{text}': {reply}")
-        return reply
-
-    # Command wrappers — mirror hidrig/control/code.py's text protocol.
-    def type(self, text: str) -> str:
-        return self.cmd(f"type {text}")
-
-    def key(self, name: str) -> str:
-        return self.cmd(f"key {name}")
-
-    def combo(self, *names: str) -> str:
-        return self.cmd("combo " + " ".join(names))
-
-    def down(self, name: str) -> str:
-        return self.cmd(f"down {name}")
-
-    def up(self, name: str) -> str:
-        return self.cmd(f"up {name}")
-
-    def releaseall(self) -> str:
-        return self.cmd("releaseall")
-
-    def move(self, dx: int, dy: int) -> str:
-        return self.cmd(f"move {dx} {dy}")
-
-    def click(self, button: str = "left") -> str:
-        return self.cmd(f"click {button}")
-
-    def mdown(self, button: str = "left") -> str:
-        return self.cmd(f"mdown {button}")
-
-    def mup(self, button: str = "left") -> str:
-        return self.cmd(f"mup {button}")
-
-    def scroll(self, amount: int) -> str:
-        return self.cmd(f"scroll {amount}")
-
-    def close(self) -> None:
-        self._transport.close()
-
-
-# --- Host-side sequencing / timing (the board firmware stays dumb) ----------
-
-
-def parse_sequence(text: str) -> list[tuple[str, object]]:
-    """Parse a command file into steps.
-
-    Each non-blank, non-`#`-comment line is either a command or a timing
-    directive: `delay <ms>` or `sleep <seconds>`. Returns a list of
-    `("cmd", line)` / `("delay", seconds)` tuples.
-    """
-    steps: list[tuple[str, object]] = []
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
+    out: list[str] = []
+    skip = False
+    for arg in args:
+        if skip:
+            skip = False
             continue
-        head, _, rest = line.partition(" ")
-        low = head.lower()
-        if low == "delay":
-            try:
-                steps.append(("delay", float(rest) / 1000.0))
-            except ValueError as exc:
-                raise ValueError(f"invalid delay value: {rest!r}") from exc
-        elif low == "sleep":
-            try:
-                steps.append(("delay", float(rest)))
-            except ValueError as exc:
-                raise ValueError(f"invalid sleep value: {rest!r}") from exc
-        else:
-            steps.append(("cmd", line))
-    return steps
+        if arg == "--lab":
+            skip = True
+            continue
+        if arg.startswith("--lab="):
+            continue
+        out.append(arg)
+    return out
 
 
-def run_sequence(
-    rig: HidRig,
-    steps: list[tuple[str, object]],
-    default_delay: float = 0.0,
-    sleep: Callable[[float], None] = time.sleep,
-) -> None:
-    """Execute parsed steps against `rig`. `sleep` is injectable for tests."""
-    for kind, value in steps:
-        if kind == "delay":
-            sleep(float(value))
-        else:
-            rig.cmd(str(value))
-            if default_delay:
-                sleep(default_delay)
+def remote_argv(argv: list[str], paniolo_cmd: str = "paniolo") -> list[str]:
+    """Build the command to run on the host from this process's ``sys.argv``.
+
+    argv[0] (the local launcher path) becomes the host's paniolo command (bare
+    ``paniolo`` by default, or a path the host pins); the ``--lab`` option is
+    stripped.
+    """
+    return [paniolo_cmd] + strip_lab_option(argv[1:])
 
 
-def repeat_key(
-    rig: HidRig,
-    name: str,
-    count: int,
-    delay: float = 0.0,
-    sleep: Callable[[float], None] = time.sleep,
-) -> None:
-    """Tap a key `count` times with an inter-tap delay (auto-repeat)."""
-    for i in range(count):
-        rig.key(name)
-        if delay and i < count - 1:
-            sleep(delay)
+# A POSIX-sh one-liner: make a temp file, write stdin into it, print its path.
+_SHIP_SCRIPT = (
+    'f=$(mktemp "${TMPDIR:-/tmp}/paniolo-cfg.XXXXXX") && cat > "$f" && printf %s "$f"'
+)
+
+
+def ship_config(host: Host, cfg: TargetConfig) -> str:
+    """Write ``cfg`` to a temp file on ``host`` and return its remote path."""
+    toml = _config_to_toml(cfg)
+    result = _ssh.run(host, ["sh", "-c", _SHIP_SCRIPT], stdin=toml)
+    path = result.stdout.strip()
+    if result.returncode != 0 or not path:
+        raise _ssh.SSHError(
+            f"failed to ship target config to {host.name}: {result.stderr.strip()}"
+        )
+    return path
+
+
+def dispatch(host: Host, cfg: TargetConfig, mode: str, argv: list[str]) -> int:
+    """Run this invocation on ``host`` over SSH; return the remote exit code.
+
+    Ships ``cfg`` as the remote's PANIOLO_TARGET_CONFIG slice, re-execs the
+    (lab-stripped) command, and removes the slice afterward.
+    """
+    remote_path = ship_config(host, cfg)
+    env = {TARGET_CONFIG_ENV: remote_path}
+    cmd = remote_argv(argv, host.paniolo)
+    try:
+        if mode == INTERACTIVE:
+            return _ssh.run_interactive(host, cmd, env=env)
+        return _ssh.run_passthrough(host, cmd, env=env)
+    finally:
+        _ssh.run(host, ["rm", "-f", remote_path])
+
+
+def run_subcommand(host: Host, cfg: TargetConfig, subargs: list[str]):
+    """Run ``paniolo <subargs>`` on ``host`` against a shipped config slice.
+
+    Captured (returns a CompletedProcess); used to drive helper commands on the
+    host, e.g. starting the streaming daemons before tunnelling to them.
+    """
+    remote_path = ship_config(host, cfg)
+    env = {TARGET_CONFIG_ENV: remote_path}
+    try:
+        return _ssh.run(host, [host.paniolo, *subargs], env=env)
+    finally:
+        _ssh.run(host, ["rm", "-f", remote_path])
+
+
+# Resolve the daemon discovery dir the same way the daemons do (see
+# _video/_serial._discovery_path): $XDG_RUNTIME_DIR, else $TMPDIR, else /tmp.
+_REMOTE_RUNTIME = "${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
+
+
+def remote_daemon_port(host: Host, subdir: str) -> Optional[int]:
+    """Read the TCP port of a daemon's discovery file on ``host``, or None.
+
+    ``subdir`` is the daemon's runtime subdir ("hdmicap" / "serialcap"). The
+    path is resolved by a remote shell so the host's own XDG_RUNTIME_DIR applies.
+    """
+    script = f'cat "{_REMOTE_RUNTIME}/{subdir}/daemon.json" 2>/dev/null'
+    result = _ssh.run(host, ["sh", "-c", script])
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        return int(json.loads(result.stdout)["port"])
+    except (ValueError, KeyError, json.JSONDecodeError):
+        return None
 ````
 
-## File: src/paniolo/_lab.py
+## File: src/paniolo/_ssh.py
 ````python
 # Copyright 2026 Curtis Galloway
 #
@@ -11295,227 +12711,277 @@ def repeat_key(
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The lab model: one git-tracked file describing all hosts and targets.
+"""SSH transport for driving a target on a remote control host.
 
-A *lab* is a single TOML file (pointed at by ``--lab`` / ``PANIOLO_LAB``) that
-declares every control **host** paniolo reaches over SSH and every **target**,
-with each piece of a target's hardware bound to a host. See
-docs/distributed-control.md.
+This is the foundation of paniolo's distributed-control model (see
+docs/distributed-control.md): the dev machine is the hub, and every command
+against a remote target reaches its control host over SSH. There is no agent or
+RPC server — SSH is the whole transport, which is why auth, encryption, and
+identity come for free.
 
-```toml
-[hosts.bench1]
-ssh = "curtisg@bench1.local"     # required; "local" means the dev machine
-# identity = "~/.ssh/id_lab"     # optional
-# control_path = "~/.ssh/cm-%C"  # optional
+Three things are provided over a per-host **ControlMaster** connection (so only
+the first call to a host pays the SSH handshake):
 
-[targets.fortune]
-host = "bench1"                   # default host for this target's resources
+- ``run`` / ``run_passthrough`` — run a command on the host (captured, or with
+  the local terminal's stdio passed through for transparent re-exec);
+- ``run_interactive`` — run a command over an ``ssh -t`` PTY (for ``tio``);
+- ``forward`` — hold an ``ssh -L`` tunnel to a remote port (for the dashboard);
+- ``read_remote_file`` — read a remote file (e.g. a daemon discovery file).
 
-[targets.fortune.netboot]
-interface = "enx00e04c08d9a0"
-host_ip   = "192.168.99.1"
-tftp_root = "/home/curtisg/tftp/fortune"
-
-[[targets.fortune.serial]]
-name   = "console"
-device = "/dev/serial/by-id/usb-…"
-baud   = 115200
-
-[targets.fortune.power]
-cycle_cmd = "/path/cycle.sh"
-```
-
-**Per-resource host binding** (``host`` on any resource, defaulting to the
-target's ``host``, defaulting to ``local``) is parsed so the schema is ready for
-targets that span control hosts — but this first implementation **enforces that
-a target's resources all resolve to one host** and rejects cross-host targets.
-Resolution flattens a target down to the existing :class:`TargetConfig` plus the
-single :class:`~paniolo._ssh.Host` it lives on, so command bodies are unchanged.
+A ``Host`` whose ``ssh`` destination is the literal ``"local"`` represents the
+dev machine itself; the SSH functions reject it (callers run those commands
+directly instead), but it lets the lab model express "no SSH" uniformly.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import os
-import tomllib
+import shlex
+import socket
+import subprocess
+import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
-from ._config import SerialInterface, TargetConfig
-from ._ssh import LOCAL, Host
+# ssh destination meaning "the dev machine itself — no SSH".
+LOCAL = "local"
 
-# Default host name when neither a resource nor its target names one.
-DEFAULT_HOST = LOCAL
-DEFAULT_HOST_IP = "192.168.99.1"
-
-
-class LabError(RuntimeError):
-    """The lab file is malformed or describes something unsupported."""
+# How long the shared master connection lingers after the last use.
+_CONTROL_PERSIST = "300"
+_CONNECT_TIMEOUT = "10"
 
 
 @dataclasses.dataclass
-class Lab:
-    """A parsed lab: named hosts plus raw target tables (resolved on demand)."""
+class Host:
+    """A control host paniolo reaches over SSH.
 
-    hosts: dict[str, Host]
-    targets: dict[str, dict]
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "Lab":
-        hosts: dict[str, Host] = {}
-        for name, h in (data.get("hosts") or {}).items():
-            if "ssh" not in h:
-                raise LabError(f"host '{name}': missing required 'ssh' field")
-            hosts[name] = Host(
-                name=name,
-                ssh=h["ssh"],
-                identity=h.get("identity"),
-                control_path=h.get("control_path"),
-                paniolo_cmd=h.get("paniolo_cmd"),
-            )
-        targets = data.get("targets") or {}
-        return cls(hosts=hosts, targets=targets)
-
-    def target_names(self) -> list[str]:
-        return sorted(self.targets)
-
-    def _host(self, name: str) -> Host:
-        if name == LOCAL:
-            # The dev machine is implicit; an explicit [hosts.local] may override.
-            return self.hosts.get(LOCAL, Host(name=LOCAL, ssh=LOCAL))
-        if name not in self.hosts:
-            raise LabError(f"reference to unknown host '{name}'")
-        return self.hosts[name]
-
-    def resolve_target(self, name: str) -> tuple[TargetConfig, Host]:
-        """Flatten a target to a (TargetConfig, Host), enforcing one host.
-
-        Raises KeyError if the target is unknown, LabError if its resources span
-        more than one host (not yet supported) or reference an unknown host.
-        """
-        if name not in self.targets:
-            raise KeyError(name)
-        t = self.targets[name]
-        default_host = t.get("host", DEFAULT_HOST)
-        used: set[str] = set()
-
-        netboot = t.get("netboot") or {}
-        if netboot:
-            used.add(netboot.get("host", default_host))
-
-        serial_interfaces: list[SerialInterface] = []
-        for s in t.get("serial") or []:
-            if "name" not in s or "device" not in s:
-                raise LabError(f"target '{name}': each [[serial]] needs name + device")
-            serial_interfaces.append(
-                SerialInterface(
-                    name=s["name"],
-                    device=s["device"],
-                    baud=int(s.get("baud", 115200)),
-                    power_sense_signal=s.get("power_sense_signal"),
-                )
-            )
-            used.add(s.get("host", default_host))
-
-        power = t.get("power") or {}
-        if power:
-            used.add(power.get("host", default_host))
-
-        # No resources named a host → the target falls on its default host.
-        if not used:
-            used.add(default_host)
-        if len(used) > 1:
-            raise LabError(
-                f"target '{name}' spans multiple hosts {sorted(used)}; "
-                "multi-host targets are not yet supported"
-            )
-
-        cfg = TargetConfig(
-            name=name,
-            interface=netboot.get("interface", ""),
-            host_ip=netboot.get("host_ip", DEFAULT_HOST_IP),
-            tftp_root=netboot.get("tftp_root"),
-            power_cycle_cmd=power.get("cycle_cmd"),
-            power_serial_interface=power.get("serial_interface"),
-            serial_interfaces=serial_interfaces,
-        )
-        return cfg, self._host(next(iter(used)))
-
-
-def propose_target_block(name: str, host: str, inventory: dict) -> str:
-    """Render a proposed ``[targets.<name>]`` lab block from a host's hardware.
-
-    ``inventory`` is the shape emitted by ``paniolo discover --json``:
-    ``{"ethernet": [{device, active, ...}], "serial": [path, ...], ...}``. One
-    value is best-guessed per field (a carrier-up interface, the first serial as
-    ``console``); other candidates are listed as comments. Power and tftp_root
-    aren't discoverable, so they're left as commented stubs. The result is meant
-    to be reviewed, pasted into the lab file, and committed — paniolo never
-    writes it for you.
+    ``ssh`` is the destination passed to ssh(1) (``user@host``, an ssh_config
+    alias, or the sentinel ``"local"``). ``identity`` is an optional private-key
+    path; ``control_path`` overrides the ControlMaster socket path (ssh %-tokens
+    are allowed, e.g. ``~/.ssh/cm-%C``).
     """
-    eths = sorted(inventory.get("ethernet") or [], key=lambda e: (not e.get("active"),))
-    serials = inventory.get("serial") or []
-    out = [f"[targets.{name}]", f'host = "{host}"', ""]
 
-    out.append(f"[targets.{name}.netboot]")
-    if eths:
-        note = "  # carrier up" if eths[0].get("active") else ""
-        out.append(f'interface = "{eths[0]["device"]}"{note}')
-        for e in eths[1:]:
-            out.append(f'# interface = "{e["device"]}"  # alternative')
+    name: str
+    ssh: str
+    identity: Optional[str] = None
+    control_path: Optional[str] = None
+    # How to invoke paniolo on this host. Defaults to bare "paniolo"; set it to
+    # an absolute path when paniolo isn't on the host's non-interactive ssh PATH
+    # (e.g. installed under ~/.local/bin, which login-only PATHs miss).
+    paniolo_cmd: Optional[str] = None
+
+    @property
+    def is_local(self) -> bool:
+        return self.ssh == LOCAL or self.name == LOCAL
+
+    @property
+    def paniolo(self) -> str:
+        return self.paniolo_cmd or "paniolo"
+
+
+class SSHError(RuntimeError):
+    """An SSH operation failed to establish (connect/forward), as opposed to a
+    remote command merely exiting non-zero."""
+
+
+def _control_dir() -> Path:
+    """Short directory holding paniolo's default ControlMaster sockets.
+
+    Kept deliberately short: a Unix-domain socket path has a hard limit
+    (~104 chars on macOS, ~108 on Linux), and ssh appends a 40-char %C hash to
+    it. XDG_RUNTIME_DIR is short on Linux; elsewhere fall back to /tmp rather
+    than tempfile.gettempdir(), which on macOS is the long per-session $TMPDIR
+    and overflows the limit.
+    """
+    base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+    d = Path(base) / f"paniolo-{os.getuid()}"
+    d.mkdir(parents=True, exist_ok=True)
+    os.chmod(d, 0o700)
+    return d
+
+
+def _control_args(host: Host) -> list[str]:
+    if host.control_path:
+        cp = os.path.expanduser(host.control_path)
+        # Best-effort: create the parent dir unless it contains an ssh %-token.
+        parent = os.path.dirname(cp)
+        if parent and "%" not in parent:
+            Path(parent).mkdir(parents=True, exist_ok=True)
     else:
-        out.append('# interface = ""  # no USB-Ethernet interface discovered')
-    out.append('# tftp_root = "/path/to/tftp"  # set to enable netboot')
-    out.append("")
+        cp = str(_control_dir() / "cm-%C")
+    return [
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        f"ControlPath={cp}",
+        "-o",
+        f"ControlPersist={_CONTROL_PERSIST}",
+    ]
 
-    if serials:
-        out.append(f"[[targets.{name}.serial]]")
-        out.append('name = "console"')
-        out.append(f'device = "{serials[0]}"')
-        out.append("baud = 115200")
-        for extra in serials[1:]:
-            out.append(f"# another serial device: {extra}")
+
+def _base_args(
+    host: Host, *, interactive: bool = False, multiplex: bool = True
+) -> list[str]:
+    if host.is_local:
+        raise ValueError(f"_ssh called for local host '{host.name}'")
+    args = ["ssh"]
+    if not interactive:
+        # Fail rather than block on a password prompt for non-interactive use.
+        args += ["-o", "BatchMode=yes"]
+    args += ["-o", f"ConnectTimeout={_CONNECT_TIMEOUT}"]
+    if host.identity:
+        args += ["-i", os.path.expanduser(host.identity), "-o", "IdentitiesOnly=yes"]
+    if multiplex:
+        args += _control_args(host)
     else:
-        out.append(f"# [[targets.{name}.serial]]  # no serial devices discovered")
-    out.append("")
-    out.append(f"# [targets.{name}.power]")
-    out.append('# cycle_cmd = "/path/to/power-cycle.sh"  # not discoverable')
-    return "\n".join(out).rstrip() + "\n"
+        # A standalone connection that owns its own channel. Port forwards must
+        # NOT multiplex: an `ssh -N -L` client that attaches to a ControlMaster
+        # hands the forward to the master and then exits, so the process no
+        # longer represents (or can tear down) the tunnel.
+        args += ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
+    return args
 
 
-def load_lab(path: str) -> Lab:
-    with open(os.path.expanduser(path), "rb") as f:
-        data = tomllib.load(f)
-    return Lab.from_dict(data)
+def _remote_command(argv: list[str], env: Optional[dict[str, str]]) -> str:
+    """Quote argv (and optional env assignments) into one remote shell command.
+
+    Quoting each token preserves argument boundaries through the remote shell, so
+    paths with spaces or globbing characters survive intact.
+    """
+    parts: list[str] = []
+    if env:
+        for key, val in env.items():
+            parts.append(f"{key}={shlex.quote(val)}")
+    parts.extend(shlex.quote(a) for a in argv)
+    return " ".join(parts)
 
 
-# ── "which lab" resolution ───────────────────────────────────────────────────
+def run(
+    host: Host,
+    argv: list[str],
+    *,
+    stdin: Optional[str] = None,
+    env: Optional[dict[str, str]] = None,
+    timeout: Optional[float] = None,
+) -> subprocess.CompletedProcess:
+    """Run ``argv`` on ``host`` and capture its output.
 
-_override_path: Optional[str] = None
+    Returns the CompletedProcess (text mode); never raises on a non-zero remote
+    exit. Use for programmatic calls — reading a discovery file, probing state.
+    """
+    full = _base_args(host) + [host.ssh, _remote_command(argv, env)]
+    return subprocess.run(
+        full, input=stdin, capture_output=True, text=True, timeout=timeout, check=False
+    )
 
 
-def set_lab_path(path: Optional[str]) -> None:
-    """Record a lab path from the CLI (--lab), overriding PANIOLO_LAB."""
-    global _override_path
-    _override_path = path
+def run_passthrough(
+    host: Host, argv: list[str], *, env: Optional[dict[str, str]] = None
+) -> int:
+    """Run ``argv`` on ``host`` with the local terminal's stdio passed through.
+
+    No PTY is allocated, so pipes and non-interactive semantics are preserved.
+    This is the transparent re-exec path: the remote command's stdin/stdout/
+    stderr *are* the local ones. Returns the exit code.
+    """
+    full = _base_args(host) + [host.ssh, _remote_command(argv, env)]
+    return subprocess.run(full, check=False).returncode
 
 
-def lab_path() -> Optional[str]:
-    """The active lab file path: --lab if given, else $PANIOLO_LAB, else None."""
-    return _override_path or os.environ.get("PANIOLO_LAB")
+def run_interactive(
+    host: Host, argv: list[str], *, env: Optional[dict[str, str]] = None
+) -> int:
+    """Run ``argv`` on ``host`` over an ``ssh -t`` PTY (for interactive tools).
+
+    Used for ``serial connect`` (tio) — SSH's own pseudo-terminal is the
+    transport, so no tunnel is needed. Returns the exit code.
+    """
+    full = _base_args(host, interactive=True)
+    full += ["-t", host.ssh, _remote_command(argv, env)]
+    return subprocess.run(full, check=False).returncode
 
 
-def load() -> Optional[Lab]:
-    """Load the active lab, or None when none is configured (legacy mode)."""
-    path = lab_path()
-    if not path:
+def read_remote_file(host: Host, path: str) -> Optional[str]:
+    """Return the contents of a remote file, or None if it doesn't exist."""
+    result = run(host, ["cat", path])
+    if result.returncode != 0:
         return None
-    if not Path(os.path.expanduser(path)).exists():
-        raise LabError(f"lab file not found: {path}")
-    return load_lab(path)
+    return result.stdout
+
+
+def _free_local_port() -> int:
+    """Pick a currently-free local TCP port (small TOCTOU window is acceptable)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _wait_for_port(port: int, proc: subprocess.Popen, timeout: float) -> None:
+    """Block until 127.0.0.1:port accepts a connection, or raise.
+
+    Fails fast if the ssh forwarder process exits early (e.g. auth failure).
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            stderr = proc.stderr.read() if proc.stderr else ""
+            raise SSHError(
+                f"ssh forward exited early (rc={proc.returncode}): {stderr.strip()}"
+            )
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return
+        except OSError:
+            time.sleep(0.1)
+    raise SSHError(f"timed out waiting for forwarded port {port}")
+
+
+@contextmanager
+def forward(
+    host: Host,
+    remote_port: int,
+    *,
+    remote_bind: str = "127.0.0.1",
+    timeout: float = 10.0,
+) -> Iterator[int]:
+    """Hold an ``ssh -L`` tunnel to ``remote_bind:remote_port`` on ``host``.
+
+    Yields the local port the tunnel listens on (127.0.0.1). The forwarder
+    process is torn down on exit. It attaches to the shared ControlMaster
+    connection, so it doesn't pay a second handshake.
+    """
+    local_port = _free_local_port()
+    spec = f"{local_port}:{remote_bind}:{remote_port}"
+    args = _base_args(host, multiplex=False) + ["-N", "-L", spec, host.ssh]
+    proc = subprocess.Popen(
+        args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
+    )
+    try:
+        _wait_for_port(local_port, proc, timeout)
+        yield local_port
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def close_master(host: Host) -> None:
+    """Tear down the shared ControlMaster connection to ``host`` if one is open."""
+    if host.is_local:
+        return
+    subprocess.run(
+        _base_args(host) + ["-O", "exit", host.ssh],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 ````
 
-## File: src/paniolo/_netif.py
+## File: tests/test_cli.py
 ````python
 # Copyright 2026 Curtis Galloway
 #
@@ -11531,596 +12997,365 @@ def load() -> Optional[Lab]:
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Switch the target's USB-Ethernet link between netboot and ffx modes.
+"""Tests for the CLI's location-transparent routing core: single-target
+resolution, `_resolve_with_host` (env-slice precedence, lab lookup, legacy
+files), and the `@remote_capable` decorator (run-here vs dispatch-over-SSH).
+Lab/config/remote layers are stubbed; no SSH or filesystem is touched."""
 
-Both modes share one physical point-to-point link (the USB-Ethernet dongle to
-the Pi's RP1 GEM). They are mutually exclusive:
-
-  netboot — IPv4 ``host_ip``/24 + DHCP + TFTP (the daemons managed by
-            ``_netboot``). The Pi TFTP-boots a kernel + ramdisk.
-
-  ffx     — IPv6 link-local (``fe80::1``/64) on the host interface, with **no**
-            DHCP/TFTP. The Pi boots from its SD card and is reached over ffx at
-            ``fe80::<dev-slaac>%<iface>``.
-
-``netif mode`` makes the transition atomic and removes the two highest-cost
-seams of doing it by hand:
-
-  1. Switching to ``ffx`` stops netboot *first*, so the next power-cycle falls
-     through to the SD card instead of silently TFTP-booting a stale image.
-  2. Switching to ``ffx`` adds the host-side ``fe80::1``/64 that ffx needs and
-     that nothing else sets up — no manual ``sudo ip -6 addr add``.
-
-Every mode is idempotent and re-runnable. The IPv6 link-local is ephemeral
-(lost on a control-host reboot), so ``mode ffx`` simply re-adds it when absent.
-The active mode is *probed* (from the running daemons and the interface's
-addresses), not stored, so it stays correct even after a reboot clears things.
-"""
+# pylint: disable=protected-access,unused-argument
 
 from __future__ import annotations
-
-import subprocess
-import sys
-
-from ._config import TargetConfig
-from . import _netboot
-from ._state import is_netboot_running
-
-# The host-side IPv6 link-local that ffx talks through. Any LL works on a
-# point-to-point link; ::1 is the conventional, easy-to-type choice and matches
-# the manual recipe (`sudo ip -6 addr add fe80::1/64 dev <iface>`).
-FFX_HOST_LL = "fe80::1"
-FFX_PREFIX = 64
-
-MODES = ("netboot", "ffx", "off")
-
-_SUDO_HINT = (
-    "Ensure passwordless sudo is configured (NOPASSWD) for the control machine."
-)
-
-
-# ── interface address probing ──────────────────────────────────────────────
-
-
-def iface_addresses(interface: str) -> dict:
-    """Return the interface's assigned addresses as {"inet": [...], "inet6": [...]}.
-
-    IPv6 addresses keep their scope suffix stripped (``fe80::1%enx0`` → ``fe80::1``)
-    but retain any prefix length (``fe80::1/64``) so callers can match exactly.
-    """
-    inet: list[str] = []
-    inet6: list[str] = []
-    if sys.platform == "darwin":
-        result = subprocess.run(
-            ["ifconfig", interface], capture_output=True, text=True, check=False
-        )
-        for line in result.stdout.splitlines():
-            s = line.strip()
-            if s.startswith("inet "):
-                inet.append(s.split()[1])
-            elif s.startswith("inet6 "):
-                inet6.append(s.split()[1].split("%", 1)[0])
-        return {"inet": inet, "inet6": inet6}
-
-    result = subprocess.run(
-        ["ip", "-brief", "addr", "show", "dev", interface],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode == 0:
-        # `ip -brief` columns: <iface> <state> <addr> <addr> ...
-        for addr in result.stdout.split()[2:]:
-            (inet6 if ":" in addr else inet).append(addr)
-    return {"inet": inet, "inet6": inet6}
-
-
-def _has_host_ll(addrs: dict) -> bool:
-    """True if the ffx host link-local is currently assigned to the interface."""
-    return any(a.split("/", 1)[0] == FFX_HOST_LL for a in addrs["inet6"])
-
-
-def ipv6_peers(interface: str) -> list[str]:
-    """Link-local IPv6 neighbours discovered on the interface (Linux only).
-
-    Surfaces the device's own ``fe80::…`` address for a ready-to-paste
-    ``ffx target add fe80::…%<iface>`` without scraping the serial log. Excludes
-    our own host LL. Returns [] on macOS or when nothing has been discovered.
-    """
-    if sys.platform == "darwin":
-        return []
-    result = subprocess.run(
-        ["ip", "-6", "neigh", "show", "dev", interface],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        return []
-    peers: list[str] = []
-    for line in result.stdout.splitlines():
-        toks = line.split()
-        if toks and toks[0].startswith("fe80:") and toks[0] != FFX_HOST_LL:
-            peers.append(toks[0])
-    return peers
-
-
-# ── privileged interface mutation ──────────────────────────────────────────
-
-
-def _add_host_ll(interface: str) -> None:
-    """Add the ffx host link-local to the interface (idempotent)."""
-    if sys.platform == "darwin":
-        # macOS auto-assigns a link-local already; aliasing in fe80::1 is
-        # best-effort and harmless if it already exists.
-        subprocess.run(
-            [
-                "sudo",
-                "ifconfig",
-                interface,
-                "inet6",
-                FFX_HOST_LL,
-                "prefixlen",
-                str(FFX_PREFIX),
-                "up",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        return
-
-    # IPv6 may be disabled on a fresh secondary interface; enable it. Use the
-    # '/'-separated sysctl key form so interface names are passed literally.
-    subprocess.run(
-        ["sudo", "sysctl", "-w", f"net/ipv6/conf/{interface}/disable_ipv6=0"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    subprocess.run(["sudo", "ip", "link", "set", interface, "up"], check=False)
-    result = subprocess.run(
-        [
-            "sudo",
-            "ip",
-            "-6",
-            "addr",
-            "add",
-            f"{FFX_HOST_LL}/{FFX_PREFIX}",
-            "dev",
-            interface,
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0 and "exists" not in result.stderr.lower():
-        raise RuntimeError(
-            f"ip -6 addr add {FFX_HOST_LL}/{FFX_PREFIX} dev {interface} failed: "
-            f"{result.stderr.strip()}\n{_SUDO_HINT}"
-        )
-
-
-def _del_host_ll(interface: str) -> None:
-    """Remove the ffx host link-local from the interface (best-effort)."""
-    if sys.platform == "darwin":
-        subprocess.run(
-            ["sudo", "ifconfig", interface, "inet6", FFX_HOST_LL, "-alias"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        return
-    subprocess.run(
-        [
-            "sudo",
-            "ip",
-            "-6",
-            "addr",
-            "del",
-            f"{FFX_HOST_LL}/{FFX_PREFIX}",
-            "dev",
-            interface,
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-
-def _del_host_ip(interface: str, host_ip: str) -> None:
-    """Remove a lingering netboot IPv4 from the interface (Linux, best-effort).
-
-    Targets only ``host_ip``/24 so we never touch an unrelated address. macOS
-    teardown goes through ``networksetup -setdhcp`` in ``_netboot`` instead.
-    """
-    if sys.platform == "darwin":
-        return
-    subprocess.run(
-        ["sudo", "ip", "addr", "del", f"{host_ip}/24", "dev", interface],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-
-# ── mode transitions ───────────────────────────────────────────────────────
-
-
-def mode_netboot(cfg: TargetConfig, engine: str = "rust") -> None:
-    """Put the link in netboot mode: tear down ffx, start DHCP+TFTP.
-
-    Idempotent: if netboot is already running it is left as-is (the ffx
-    link-local is still cleared). ``_netboot.start`` itself enforces the
-    primary-NIC guard and configures the IPv4 host address.
-    """
-    _del_host_ll(cfg.interface)
-    if is_netboot_running(cfg.name):
-        return
-    _netboot.start(cfg, engine=engine)
-
-
-def mode_ffx(cfg: TargetConfig) -> None:
-    """Put the link in ffx mode: stop netboot, add the host IPv6 link-local.
-
-    Stopping netboot first is the point of this command — it means the next
-    power-cycle boots from SD instead of TFTP. Re-running re-adds the ephemeral
-    link-local if a control-host reboot cleared it.
-    """
-    if is_netboot_running(cfg.name):
-        _netboot.stop(cfg.name)
-    _add_host_ll(cfg.interface)
-
-
-def mode_off(cfg: TargetConfig) -> None:
-    """Drop both configs: stop netboot, remove the ffx LL and any stale IPv4."""
-    if is_netboot_running(cfg.name):
-        # _netboot.stop restores the interface (flushes the IPv4 host address).
-        _netboot.stop(cfg.name)
-    _del_host_ll(cfg.interface)
-    _del_host_ip(cfg.interface, cfg.host_ip)
-
-
-# ── status ─────────────────────────────────────────────────────────────────
-
-
-def get_status(cfg: TargetConfig) -> dict:
-    """Probe and report the active mode plus the interface's addresses.
-
-    ``mode`` is derived, not stored: netboot daemons running → ``netboot``; else
-    the ffx host LL present → ``ffx``; else ``off``.
-    """
-    netboot_running = is_netboot_running(cfg.name)
-    addrs = iface_addresses(cfg.interface)
-    has_ll = _has_host_ll(addrs)
-
-    if netboot_running:
-        mode = "netboot"
-    elif has_ll:
-        mode = "ffx"
-    else:
-        mode = "off"
-
-    return {
-        "target": cfg.name,
-        "interface": cfg.interface,
-        "mode": mode,
-        "netboot_running": netboot_running,
-        "host_ip": cfg.host_ip,
-        "host_ll": FFX_HOST_LL if has_ll else None,
-        "inet": addrs["inet"],
-        "inet6": addrs["inet6"],
-        "peers": ipv6_peers(cfg.interface) if mode == "ffx" else [],
-    }
-````
-
-## File: src/paniolo/_ocr.py
-````python
-# Copyright 2026 Curtis Galloway
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""OCR helpers — wraps platform OCR tools.
-
-- macOS: `visionocr` (Apple Vision framework, compiled from ocr/visionocr.swift)
-- Linux: `linuxocr` (Tesseract-backed, from ocr/linuxocr)
-
-Both tools share the same interface: read PNG on stdin, print text on stdout.
-"""
-
-from __future__ import annotations
-
-import shutil
-import subprocess
-import sys
-from pathlib import Path
-from typing import Optional
-
-from ._paths import repo_root
-
-_NO_REPO = (
-    "paniolo source checkout not found; run `paniolo setup` from a clone "
-    "(e.g. `make install`) so the OCR helper can be built from source"
-)
-
-
-def visionocr_binary() -> Optional[str]:
-    """Return the installed visionocr path: PATH, then ~/.cargo/bin. None if absent."""
-    found = shutil.which("visionocr")
-    if found:
-        return found
-    cargo_bin = Path.home() / ".cargo" / "bin" / "visionocr"
-    return str(cargo_bin) if cargo_bin.exists() else None
-
-
-def visionocr_source() -> Optional[Path]:
-    """Path to the visionocr Swift source in the repo (for `paniolo setup`).
-
-    None when no source checkout can be located (e.g. an installed CLI run from
-    outside a clone).
-    """
-    root = repo_root()
-    return root / "ocr" / "visionocr.swift" if root else None
-
-
-def build_visionocr(dest: Path) -> None:
-    """Compile visionocr.swift to `dest` (used by `paniolo setup`). Raises on error."""
-    source = visionocr_source()
-    if source is None:
-        raise FileNotFoundError(_NO_REPO)
-    if not source.exists():
-        raise FileNotFoundError(f"visionocr source not found: {source}")
-    if not shutil.which("swiftc"):
-        raise FileNotFoundError("swiftc not found (install Xcode command line tools)")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["swiftc", "-O", "-o", str(dest), str(source)], check=True)
-
-
-def linuxocr_binary() -> Optional[str]:
-    """Return the installed linuxocr path: PATH, then ~/.cargo/bin. None if absent."""
-    found = shutil.which("linuxocr")
-    if found:
-        return found
-    cargo_bin = Path.home() / ".cargo" / "bin" / "linuxocr"
-    return str(cargo_bin) if cargo_bin.exists() else None
-
-
-def linuxocr_source() -> Optional[Path]:
-    """Path to the linuxocr Python script in the repo (for `paniolo setup`).
-
-    None when no source checkout can be located (e.g. an installed CLI run from
-    outside a clone).
-    """
-    root = repo_root()
-    return root / "ocr" / "linuxocr" if root else None
-
-
-def install_linuxocr(dest: Path) -> None:
-    """Copy ocr/linuxocr to `dest` and make it executable (used by `paniolo setup`)."""
-    source = linuxocr_source()
-    if source is None:
-        raise FileNotFoundError(_NO_REPO)
-    if not source.exists():
-        raise FileNotFoundError(f"linuxocr source not found: {source}")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, dest)
-    dest.chmod(0o755)
-
-
-def ocr_binary() -> Optional[str]:
-    """Return the platform OCR binary: visionocr on macOS, linuxocr on Linux."""
-    if sys.platform == "darwin":
-        return visionocr_binary()
-    return linuxocr_binary()
-
-
-def read_text(png: bytes, fast: bool = False, as_json: bool = False) -> str:
-    """OCR PNG bytes and return recognized text (or JSON with bboxes).
-
-    `fast` is only meaningful on macOS (visionocr --fast); ignored on Linux.
-    `as_json` requests bounding-box JSON output; not yet supported on Linux.
-    """
-    binary = ocr_binary()
-    if not binary:
-        platform = "macOS" if sys.platform == "darwin" else "Linux"
-        tool = "visionocr" if sys.platform == "darwin" else "linuxocr"
-        raise FileNotFoundError(
-            f"{tool} not installed on {platform} — run: paniolo setup"
-        )
-    cmd = [binary]
-    if sys.platform == "darwin":
-        if fast:
-            cmd.append("--fast")
-        if as_json:
-            cmd.append("--json")
-    cmd.append("-")
-    result = subprocess.run(cmd, input=png, capture_output=True, check=False)
-    if result.returncode != 0:
-        raise RuntimeError(
-            result.stderr.decode(errors="replace").strip() or f"{binary} failed"
-        )
-    return result.stdout.decode(errors="replace")
-````
-
-## File: tests/test_config.py
-````python
-# Copyright 2026 Curtis Galloway
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Tests for target config (de)serialization and serial-interface helpers."""
-
-from __future__ import annotations
-
-import tomllib
 
 import pytest
+import typer
 
-from paniolo import _config
-from paniolo._config import SerialInterface, TargetConfig
+from paniolo import _cli, _ssh
+from paniolo._config import TargetConfig
+
+
+def _cfg(name: str = "fortune") -> TargetConfig:
+    return TargetConfig(name=name, interface="enx0", host_ip="192.168.99.1")
+
+
+class _FakeLab:
+    """Minimal stand-in for a loaded lab file."""
+
+    def __init__(self, names, result=None, raise_exc=None):
+        self._names = names
+        self._result = result
+        self._raise = raise_exc
+
+    def target_names(self):
+        return self._names
+
+    def resolve_target(self, name):
+        if self._raise is not None:
+            raise self._raise
+        return self._result
+
+
+@pytest.fixture(autouse=True)
+def _no_slice_env(monkeypatch):
+    """Most tests exercise the lab/legacy paths; ensure the slice env that would
+    short-circuit them is unset unless a test sets it explicitly."""
+    monkeypatch.delenv("PANIOLO_TARGET_CONFIG", raising=False)
+
+
+# ── _require_single ─────────────────────────────────────────────────────────
+
+
+def test_require_single_passes_through_explicit_name():
+    assert _cli._require_single("bar", ["foo"]) == "bar"
+
+
+def test_require_single_resolves_sole_target():
+    assert _cli._require_single(None, ["only"]) == "only"
+
+
+def test_require_single_exits_when_none_configured():
+    with pytest.raises(typer.Exit):
+        _cli._require_single(None, [])
+
+
+def test_require_single_exits_when_ambiguous():
+    with pytest.raises(typer.Exit):
+        _cli._require_single(None, ["a", "b"])
+
+
+# ── _resolve_with_host: slice-env precedence ────────────────────────────────
+
+
+def test_resolve_uses_slice_env_and_runs_local(monkeypatch):
+    cfg = _cfg()
+    monkeypatch.setenv("PANIOLO_TARGET_CONFIG", "/run/paniolo/slice.toml")
+    monkeypatch.setattr(_cli._config, "load_target_file", lambda path: cfg)
+    got_cfg, host = _cli._resolve_with_host(None)
+    assert got_cfg is cfg
+    assert host.is_local, "a shipped config slice always runs on the local host"
+
+
+def test_resolve_slice_env_load_failure_exits(monkeypatch):
+    monkeypatch.setenv("PANIOLO_TARGET_CONFIG", "/run/paniolo/slice.toml")
+
+    def boom(path):
+        raise OSError("unreadable")
+
+    monkeypatch.setattr(_cli._config, "load_target_file", boom)
+    with pytest.raises(typer.Exit):
+        _cli._resolve_with_host(None)
+
+
+# ── _resolve_with_host: lab lookup ──────────────────────────────────────────
+
+
+def test_resolve_via_lab_returns_target_and_host(monkeypatch):
+    cfg = _cfg()
+    host = _ssh.Host(name="ctrl", ssh="user@ctrl")
+    monkeypatch.setattr(_cli._lab, "load", lambda: _FakeLab(["fortune"], (cfg, host)))
+    got_cfg, got_host = _cli._resolve_with_host(None)
+    assert got_cfg is cfg
+    assert got_host is host
+
+
+def test_resolve_via_lab_unknown_target_exits(monkeypatch):
+    monkeypatch.setattr(
+        _cli._lab,
+        "load",
+        lambda: _FakeLab(["fortune"], raise_exc=KeyError("missing")),
+    )
+    with pytest.raises(typer.Exit):
+        _cli._resolve_with_host("missing")
+
+
+# ── _resolve_with_host: legacy per-target files (no lab) ─────────────────────
+
+
+def test_resolve_legacy_returns_local_host(monkeypatch):
+    cfg = _cfg()
+    monkeypatch.setattr(_cli._lab, "load", lambda: None)
+    monkeypatch.setattr(_cli._config, "list_targets", lambda: ["fortune"])
+    monkeypatch.setattr(_cli._config, "load_target", lambda name: cfg)
+    got_cfg, host = _cli._resolve_with_host(None)
+    assert got_cfg is cfg
+    assert host.is_local
+
+
+def test_resolve_legacy_missing_target_exits(monkeypatch):
+    monkeypatch.setattr(_cli._lab, "load", lambda: None)
+    monkeypatch.setattr(_cli._config, "list_targets", lambda: ["fortune"])
+
+    def missing(name):
+        raise FileNotFoundError(name)
+
+    monkeypatch.setattr(_cli._config, "load_target", missing)
+    with pytest.raises(typer.Exit):
+        _cli._resolve_with_host("fortune")
+
+
+# ── remote_capable decorator ────────────────────────────────────────────────
+
+
+def test_remote_capable_runs_body_for_local_host(monkeypatch):
+    cfg = _cfg()
+    local = _ssh.Host(name=_ssh.LOCAL, ssh=_ssh.LOCAL)
+    monkeypatch.setattr(_cli, "_resolve_with_host", lambda name: (cfg, local))
+    ran = []
+
+    @_cli.remote_capable()
+    def cmd(target=None):
+        ran.append(target)
+        return "local-result"
+
+    assert cmd(target="fortune") == "local-result"
+    assert ran == ["fortune"]
+
+
+def test_remote_capable_dispatches_remote_and_exits_with_code(monkeypatch):
+    cfg = _cfg()
+    remote = _ssh.Host(name="ctrl", ssh="user@ctrl")
+    monkeypatch.setattr(_cli, "_resolve_with_host", lambda name: (cfg, remote))
+    seen = {}
+
+    def fake_dispatch(host, c, mode, argv):
+        seen["host"] = host
+        return 7
+
+    monkeypatch.setattr(_cli._remote, "dispatch", fake_dispatch)
+    ran = []
+
+    @_cli.remote_capable()
+    def cmd(target=None):
+        ran.append(target)
+
+    with pytest.raises(typer.Exit) as ei:
+        cmd(target="fortune")
+    assert ei.value.exit_code == 7
+    assert seen["host"] is remote
+    assert not ran, "the command body never runs locally for a remote target"
+
+
+def test_remote_capable_ssh_error_exits_1(monkeypatch):
+    cfg = _cfg()
+    remote = _ssh.Host(name="ctrl", ssh="user@ctrl")
+    monkeypatch.setattr(_cli, "_resolve_with_host", lambda name: (cfg, remote))
+
+    def boom(host, c, mode, argv):
+        raise _ssh.SSHError("connection refused")
+
+    monkeypatch.setattr(_cli._remote, "dispatch", boom)
+
+    @_cli.remote_capable()
+    def cmd(target=None):
+        pass
+
+    with pytest.raises(typer.Exit) as ei:
+        cmd(target="fortune")
+    assert ei.value.exit_code == 1
+````
+
+## File: tests/test_netboot.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for _netboot.py's pure parsing + the safety-critical primary-NIC guard.
+
+The guard (`_is_primary_interface`) is what refuses to reconfigure the host's
+main NIC to the static netboot IP. We exercise the default-route parsing on both
+macOS (`route -n get default`) and Linux (`ip route show default`), and the
+USB-Ethernet listing's exclusion/sort logic — all with subprocess stubbed, so
+the same suite runs identically on either platform's CI."""
+
+from __future__ import annotations
+
+import subprocess
+
+from paniolo import _netboot
 
 # pylint: disable=protected-access
 
 
-def roundtrip(cfg: TargetConfig) -> TargetConfig:
-    return _config._from_dict(tomllib.loads(_config._to_toml(cfg)))
+def _raise(exc):
+    def f(*a, **k):
+        raise exc
+
+    return f
 
 
-def test_roundtrip_multiple_interfaces():
-    cfg = TargetConfig(
-        name="fortune",
-        interface="en3",
-        tftp_root="/pxe",
-        serial_interfaces=[
-            SerialInterface("console", "/dev/ttyUSB0", 115200),
-            SerialInterface("bmc", "/dev/ttyUSB1", 9600),
-        ],
+# ── default-route interface parsing ─────────────────────────────────────────
+
+
+def test_default_route_macos_parses_interface_line(monkeypatch):
+    monkeypatch.setattr(_netboot.sys, "platform", "darwin")
+    out = "   route to: default\n  gateway: 192.168.1.1\n  interface: en0\n  flags: \n"
+    monkeypatch.setattr(_netboot.subprocess, "check_output", lambda *a, **k: out)
+    assert _netboot._default_route_interface() == "en0"
+
+
+def test_default_route_macos_none_when_no_interface_line(monkeypatch):
+    monkeypatch.setattr(_netboot.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        _netboot.subprocess, "check_output", lambda *a, **k: "  gateway: 1.2.3.4\n"
     )
-    got = roundtrip(cfg)
-    assert (got.name, got.interface, got.tftp_root) == ("fortune", "en3", "/pxe")
-    assert [(i.name, i.device, i.baud) for i in got.serial_interfaces] == [
-        ("console", "/dev/ttyUSB0", 115200),
-        ("bmc", "/dev/ttyUSB1", 9600),
-    ]
+    assert _netboot._default_route_interface() is None
 
 
-def test_roundtrip_no_interfaces():
-    got = roundtrip(TargetConfig(name="x", interface="en0"))
-    assert not got.serial_interfaces
-
-
-def test_legacy_single_serial_migrates():
-    data = tomllib.loads(
-        'name = "x"\ninterface = "en0"\n'
-        'serial_device = "/dev/ttyUSB0"\nserial_baud = 57600\n'
+def test_default_route_macos_none_on_command_failure(monkeypatch):
+    monkeypatch.setattr(_netboot.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        _netboot.subprocess, "check_output", _raise(FileNotFoundError())
     )
-    cfg = _config._from_dict(data)
-    assert len(cfg.serial_interfaces) == 1
-    iface = cfg.serial_interfaces[0]
-    assert (iface.name, iface.device, iface.baud) == (
-        _config.DEFAULT_SERIAL_NAME,
-        "/dev/ttyUSB0",
-        57600,
+    assert _netboot._default_route_interface() is None
+
+
+def test_default_route_linux_parses_dev_token(monkeypatch):
+    monkeypatch.setattr(_netboot.sys, "platform", "linux")
+    out = "default via 192.168.1.1 dev eth0 proto dhcp src 192.168.1.50 metric 100"
+    monkeypatch.setattr(_netboot.subprocess, "check_output", lambda *a, **k: out)
+    assert _netboot._default_route_interface() == "eth0"
+
+
+def test_default_route_linux_none_without_dev(monkeypatch):
+    monkeypatch.setattr(_netboot.sys, "platform", "linux")
+    monkeypatch.setattr(_netboot.subprocess, "check_output", lambda *a, **k: "")
+    assert _netboot._default_route_interface() is None
+
+
+def test_default_route_linux_none_on_command_failure(monkeypatch):
+    monkeypatch.setattr(_netboot.sys, "platform", "linux")
+    monkeypatch.setattr(
+        _netboot.subprocess,
+        "check_output",
+        _raise(subprocess.CalledProcessError(1, "ip")),
     )
+    assert _netboot._default_route_interface() is None
 
 
-def test_legacy_default_baud():
-    data = tomllib.loads(
-        'name = "x"\ninterface = "en0"\nserial_device = "/dev/ttyUSB0"\n'
+# ── primary-NIC guard ───────────────────────────────────────────────────────
+
+
+def test_primary_interface_true_for_default_route_nic(monkeypatch):
+    monkeypatch.setattr(_netboot, "_default_route_interface", lambda: "en0")
+    assert _netboot._is_primary_interface("en0") is True
+
+
+def test_primary_interface_false_for_secondary_nic(monkeypatch):
+    monkeypatch.setattr(_netboot, "_default_route_interface", lambda: "en0")
+    assert _netboot._is_primary_interface("enx_usb_dongle") is False
+
+
+def test_primary_interface_false_when_no_default_route(monkeypatch):
+    monkeypatch.setattr(_netboot, "_default_route_interface", lambda: None)
+    assert _netboot._is_primary_interface("enx_usb_dongle") is False
+
+
+# ── USB-Ethernet listing (macOS branch: exclusions + active-first sort) ──────
+
+
+_NETWORKSETUP = """Hardware Port: Wi-Fi
+Device: en0
+Ethernet Address: aa:bb:cc:dd:ee:ff
+
+Hardware Port: USB 10/100/1000 LAN
+Device: en7
+Ethernet Address: 11:22:33:44:55:66
+
+Hardware Port: Thunderbolt Bridge
+Device: bridge0
+Ethernet Address: N/A
+
+Hardware Port: AX88179A
+Device: en10
+Ethernet Address: 77:88:99:aa:bb:cc
+"""
+
+
+def test_list_usb_ethernet_macos_excludes_and_sorts_active_first(monkeypatch):
+    monkeypatch.setattr(_netboot.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        _netboot.subprocess, "check_output", lambda *a, **k: _NETWORKSETUP
     )
-    assert _config._from_dict(data).serial_interfaces[0].baud == 115200
-
-
-def test_serial_interface_resolution():
-    cfg = TargetConfig(
-        name="x",
-        interface="en0",
-        serial_interfaces=[
-            SerialInterface("console", "/dev/a"),
-            SerialInterface("bmc", "/dev/b"),
-        ],
+    # en10 active, en7 inactive -> active sorts first.
+    active = {"en10": True, "en7": False}
+    monkeypatch.setattr(
+        _netboot, "_is_interface_active", lambda dev: active.get(dev, False)
     )
-    assert cfg.serial_interface("bmc").device == "/dev/b"
-    with pytest.raises(ValueError):
-        cfg.serial_interface()  # ambiguous
-    with pytest.raises(ValueError):
-        cfg.serial_interface("nope")  # unknown
+    result = _netboot.list_usb_ethernet_interfaces()
+    devices = [r["device"] for r in result]
+
+    assert "en0" not in devices, "Wi-Fi port excluded"
+    assert "bridge0" not in devices, "Thunderbolt Bridge / bridge0 excluded"
+    assert devices == ["en10", "en7"], "active interface listed before inactive"
+    assert result[0]["port"] == "AX88179A"
 
 
-def test_serial_interface_single_is_default():
-    cfg = TargetConfig(
-        name="x",
-        interface="en0",
-        serial_interfaces=[SerialInterface("console", "/dev/a")],
+def test_list_usb_ethernet_macos_empty_on_command_failure(monkeypatch):
+    monkeypatch.setattr(_netboot.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        _netboot.subprocess, "check_output", _raise(FileNotFoundError())
     )
-    assert cfg.serial_interface().name == "console"
+    assert _netboot.list_usb_ethernet_interfaces() == []
 
 
-def test_serial_interface_none_configured():
-    with pytest.raises(ValueError):
-        TargetConfig(name="x", interface="en0").serial_interface()
-
-
-def test_upsert_replaces_same_name():
-    cfg = TargetConfig(name="x", interface="en0")
-    cfg.upsert_serial_interface(SerialInterface("console", "/dev/a", 115200))
-    cfg.upsert_serial_interface(SerialInterface("console", "/dev/a2", 9600))
-    assert len(cfg.serial_interfaces) == 1
-    assert (cfg.serial_interfaces[0].device, cfg.serial_interfaces[0].baud) == (
-        "/dev/a2",
-        9600,
-    )
-
-
-def test_remove_interface():
-    cfg = TargetConfig(
-        name="x",
-        interface="en0",
-        serial_interfaces=[
-            SerialInterface("console", "/dev/a"),
-            SerialInterface("bmc", "/dev/b"),
-        ],
-    )
-    assert cfg.remove_serial_interface("console") is True
-    assert cfg.remove_serial_interface("console") is False
-    assert [i.name for i in cfg.serial_interfaces] == ["bmc"]
-
-
-# --- S2: TOML control-character escaping -----------------------------------
-
-
-def test_toml_roundtrip_newline_in_power_cycle_cmd():
-    """Newlines in string values must survive a TOML round-trip without
-    breaking the file."""
-    cfg = TargetConfig(name="x", interface="en0", power_cycle_cmd="cmd1\ncmd2")
-    got = roundtrip(cfg)
-    assert got.power_cycle_cmd == "cmd1\ncmd2"
-
-
-def test_toml_roundtrip_tab_and_cr():
-    cfg = TargetConfig(name="x", interface="en0", power_cycle_cmd="a\tb\rc")
-    got = roundtrip(cfg)
-    assert got.power_cycle_cmd == "a\tb\rc"
-
-
-def test_toml_kv_escapes_backslash():
-    line = _config._toml_kv("k", "a\\b")
-    assert line == 'k = "a\\\\b"'
-    parsed = tomllib.loads(line)
-    assert parsed["k"] == "a\\b"
-
-
-# --- C2: unknown TOML keys are ignored gracefully --------------------------
-
-
-def test_unknown_keys_in_toml_are_silently_dropped():
-    data = tomllib.loads('name = "x"\ninterface = "en0"\nunknown_future_key = "foo"\n')
-    cfg = _config._from_dict(data)
-    assert cfg.name == "x"
-    assert not hasattr(cfg, "unknown_future_key")
+def test_list_usb_ethernet_linux_delegates_to_sysfs(monkeypatch):
+    monkeypatch.setattr(_netboot.sys, "platform", "linux")
+    sentinel = [{"port": "eth0", "device": "eth0", "active": True}]
+    monkeypatch.setattr(_netboot, "_list_linux_ethernet_interfaces", lambda: sentinel)
+    assert _netboot.list_usb_ethernet_interfaces() is sentinel
 ````
 
-## File: tests/test_hid.py
+## File: tests/test_ssh.py
 ````python
 # Copyright 2026 Curtis Galloway
 #
@@ -12136,751 +13371,204 @@ def test_unknown_keys_in_toml_are_silently_dropped():
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Host-side tests for the HID rig client — no hardware, no pyserial."""
-
-from __future__ import annotations
-
-import pytest
-
-from paniolo import _hid
-
-
-class FakeTransport:
-    """Stand-in for a pyserial port: records writes, replies from a queue."""
-
-    def __init__(self, replies=None):
-        self.writes: list[bytes] = []
-        self._replies = list(replies) if replies else []
-        self.closed = False
-
-    def write(self, data: bytes) -> None:
-        self.writes.append(data)
-
-    def readline(self) -> bytes:
-        return self._replies.pop(0) if self._replies else b"OK\n"
-
-    def close(self) -> None:
-        self.closed = True
-
-
-def make_rig(replies=None):
-    t = FakeTransport(replies)
-    return _hid.HidRig(transport=t), t
-
-
-# --- command construction ---------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "call, expected",
-    [
-        (lambda r: r.type("hello world"), b"type hello world\n"),
-        (lambda r: r.key("ENTER"), b"key ENTER\n"),
-        (lambda r: r.combo("LEFT_CONTROL", "C"), b"combo LEFT_CONTROL C\n"),
-        (lambda r: r.down("LEFT_SHIFT"), b"down LEFT_SHIFT\n"),
-        (lambda r: r.up("LEFT_SHIFT"), b"up LEFT_SHIFT\n"),
-        (lambda r: r.releaseall(), b"releaseall\n"),
-        (lambda r: r.move(300, -50), b"move 300 -50\n"),
-        (lambda r: r.click(), b"click left\n"),
-        (lambda r: r.click("right"), b"click right\n"),
-        (lambda r: r.mdown("middle"), b"mdown middle\n"),
-        (lambda r: r.mup("middle"), b"mup middle\n"),
-        (lambda r: r.scroll(-3), b"scroll -3\n"),
-    ],
-)
-def test_command_construction(call, expected):
-    rig, t = make_rig()
-    call(rig)
-    assert t.writes == [expected]
-
-
-def test_cmd_returns_reply():
-    rig, _ = make_rig(replies=[b"OK\n"])
-    assert rig.cmd("releaseall") == "OK"
-
-
-def test_cmd_raises_on_err():
-    rig, _ = make_rig(replies=[b"ERR unknown command: frob\n"])
-    with pytest.raises(RuntimeError, match="control board rejected"):
-        rig.cmd("frob")
-
-
-def test_close_delegates():
-    rig, t = make_rig()
-    rig.close()
-    assert t.closed
-
-
-# --- absolute-mouse scaling -------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "px, screen, expected",
-    [
-        (0, 1920, 0),
-        (1919, 1920, 32767),
-        (960, 1920, 16392),
-        (-100, 1920, 0),  # clamp low
-        (99999, 1920, 32767),  # clamp high
-        (5, 1, 0),  # degenerate screen size
-    ],
-)
-def test_scale_to_logical(px, screen, expected):
-    assert _hid.scale_to_logical(px, screen) == expected
-
-
-# --- sequence parsing -------------------------------------------------------
-
-
-def test_parse_sequence_skips_blanks_and_comments():
-    text = "\n# a comment\n  \nkey ENTER\n# another\ntype hi\n"
-    assert _hid.parse_sequence(text) == [("cmd", "key ENTER"), ("cmd", "type hi")]
-
-
-def test_parse_sequence_timing_directives():
-    text = "delay 250\nkey A\nsleep 2\n"
-    assert _hid.parse_sequence(text) == [
-        ("delay", 0.25),
-        ("cmd", "key A"),
-        ("delay", 2.0),
-    ]
-
-
-def test_run_sequence_executes_in_order_with_delays():
-    rig, t = make_rig(replies=[b"OK\n", b"OK\n"])
-    slept: list[float] = []
-    steps = [("cmd", "key A"), ("delay", 0.5), ("cmd", "type hi")]
-    _hid.run_sequence(rig, steps, default_delay=0.0, sleep=slept.append)
-    assert t.writes == [b"key A\n", b"type hi\n"]
-    assert slept == [0.5]
-
-
-def test_run_sequence_default_delay_between_commands():
-    rig, _ = make_rig(replies=[b"OK\n", b"OK\n"])
-    slept: list[float] = []
-    steps = [("cmd", "key A"), ("cmd", "key B")]
-    _hid.run_sequence(rig, steps, default_delay=0.1, sleep=slept.append)
-    assert slept == [0.1, 0.1]
-
-
-def test_repeat_key():
-    rig, t = make_rig(replies=[b"OK\n"] * 3)
-    slept: list[float] = []
-    _hid.repeat_key(rig, "TAB", 3, delay=0.2, sleep=slept.append)
-    assert t.writes == [b"key TAB\n"] * 3
-    assert slept == [0.2, 0.2]  # no trailing delay after the last tap
-
-
-# --- S3: newline injection guard -------------------------------------------
-
-
-def test_cmd_rejects_newline():
-    rig, _ = make_rig()
-    with pytest.raises(ValueError, match="newline"):
-        rig.cmd("type hello\nkey ENTER")
-
-
-def test_cmd_rejects_carriage_return():
-    rig, _ = make_rig()
-    with pytest.raises(ValueError, match="newline"):
-        rig.cmd("type hello\rworld")
-
-
-def test_type_rejects_embedded_newline():
-    rig, _ = make_rig()
-    with pytest.raises(ValueError, match="newline"):
-        rig.type("line1\nline2")
-
-
-# --- C3: parse_sequence error messages -------------------------------------
-
-
-def test_parse_sequence_bad_delay_raises_friendly_error():
-    with pytest.raises(ValueError, match="invalid delay value"):
-        _hid.parse_sequence("delay abc\nkey A\n")
-
-
-def test_parse_sequence_bad_sleep_raises_friendly_error():
-    with pytest.raises(ValueError, match="invalid sleep value"):
-        _hid.parse_sequence("sleep xyz\n")
-````
-
-## File: tests/test_lab.py
-````python
-# Copyright 2026 Curtis Galloway
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Tests for the lab-file model (_lab.py): parsing, host resolution, the
-single-host (multi-host-rejecting) constraint, and lab-path selection."""
-
-from __future__ import annotations
-
-import tomllib
-
-import pytest
-
-from paniolo import _lab
-from paniolo._lab import Lab, LabError
-
-# A representative single-host lab spanning every resource kind.
-_LAB = {
-    "hosts": {
-        "bench1": {"ssh": "curtisg@bench1.local", "identity": "~/.ssh/id_lab"},
-        "bench2": {"ssh": "curtisg@bench2.local"},
-    },
-    "targets": {
-        "fortune": {
-            "host": "bench1",
-            "netboot": {
-                "interface": "enx00e04c08d9a0",
-                "tftp_root": "/srv/tftp/fortune",
-            },
-            "serial": [
-                {"name": "console", "device": "/dev/ttyUSB0", "baud": 115200},
-                {"name": "bmc", "device": "/dev/ttyUSB1", "baud": 9600},
-            ],
-            "power": {"cycle_cmd": "/bin/cycle.sh", "serial_interface": "console"},
-        },
-        "apple": {"host": "bench2", "netboot": {"interface": "en5"}},
-    },
-}
-
-
-def test_resolve_single_host_target_flattens_to_config_and_host():
-    lab = Lab.from_dict(_LAB)
-    cfg, host = lab.resolve_target("fortune")
-    assert cfg.name == "fortune"
-    assert cfg.interface == "enx00e04c08d9a0"
-    assert cfg.tftp_root == "/srv/tftp/fortune"
-    assert cfg.host_ip == "192.168.99.1"  # default applied
-    assert cfg.power_cycle_cmd == "/bin/cycle.sh"
-    assert cfg.power_serial_interface == "console"
-    assert [(s.name, s.device, s.baud) for s in cfg.serial_interfaces] == [
-        ("console", "/dev/ttyUSB0", 115200),
-        ("bmc", "/dev/ttyUSB1", 9600),
-    ]
-    assert host.name == "bench1"
-    assert host.ssh == "curtisg@bench1.local"
-    assert host.identity == "~/.ssh/id_lab"
-    assert not host.is_local
-
-
-def test_target_names_sorted():
-    assert Lab.from_dict(_LAB).target_names() == ["apple", "fortune"]
-
-
-def test_resource_inherits_target_default_host():
-    # serial has no explicit host → inherits target host bench1; still single-host.
-    _, host = Lab.from_dict(_LAB).resolve_target("fortune")
-    assert host.name == "bench1"
-
-
-def test_target_without_host_resolves_to_local():
-    lab = Lab.from_dict({"targets": {"t": {"netboot": {"interface": "en0"}}}})
-    _, host = lab.resolve_target("t")
-    assert host.is_local
-
-
-def test_empty_target_resolves_to_local():
-    lab = Lab.from_dict({"targets": {"t": {}}})
-    cfg, host = lab.resolve_target("t")
-    assert host.is_local
-    assert cfg.interface == ""  # no netboot section
-
-
-def test_unknown_target_raises_keyerror():
-    with pytest.raises(KeyError):
-        Lab.from_dict(_LAB).resolve_target("ghost")
-
-
-def test_unknown_host_reference_raises():
-    lab = Lab.from_dict(
-        {"targets": {"t": {"host": "nope", "power": {"cycle_cmd": "x"}}}}
-    )
-    with pytest.raises(LabError, match="unknown host 'nope'"):
-        lab.resolve_target("t")
-
-
-def test_multi_host_target_is_rejected():
-    lab = Lab.from_dict(
-        {
-            "hosts": {"a": {"ssh": "u@a"}, "b": {"ssh": "u@b"}},
-            "targets": {
-                "split": {
-                    "netboot": {"interface": "en0", "host": "a"},
-                    "serial": [{"name": "c", "device": "/dev/x", "host": "b"}],
-                }
-            },
-        }
-    )
-    with pytest.raises(LabError, match="multiple hosts"):
-        lab.resolve_target("split")
-
-
-def test_host_missing_ssh_raises():
-    with pytest.raises(LabError, match="missing required 'ssh'"):
-        Lab.from_dict({"hosts": {"bad": {"identity": "k"}}})
-
-
-def test_serial_missing_fields_raises():
-    lab = Lab.from_dict({"targets": {"t": {"serial": [{"name": "c"}]}}})
-    with pytest.raises(LabError, match="name . device"):
-        lab.resolve_target("t")
-
-
-def test_propose_target_block_picks_carrier_up_and_first_serial():
-    inv = {
-        "ethernet": [
-            {"device": "eth0", "active": True},
-            {"device": "enx00e0", "active": True},
-        ],
-        "serial": ["/dev/ttyUSB0", "/dev/ttyUSB1"],
-    }
-    block = _lab.propose_target_block("fortune", "bench1", inv)
-    # Parses as valid TOML with the expected structure (one value chosen per
-    # field; the other interface + serial are commented out, not parsed).
-    t = tomllib.loads(block)["targets"]["fortune"]
-    assert t["host"] == "bench1"
-    assert t["netboot"]["interface"] in ("eth0", "enx00e0")
-    assert t["serial"][0] == {
-        "name": "console",
-        "device": "/dev/ttyUSB0",
-        "baud": 115200,
-    }
-    assert len(t["serial"]) == 1  # the second device is a comment, not an entry
-    assert "# another serial device: /dev/ttyUSB1" in block
-    assert "cycle_cmd" in block  # commented power stub
-
-
-def test_propose_target_block_handles_empty_inventory():
-    block = _lab.propose_target_block("t", "h", {"ethernet": [], "serial": []})
-    assert "no USB-Ethernet interface discovered" in block
-    assert "no serial devices discovered" in block
-    tomllib.loads(block)  # still valid TOML (commented-out resource sections)
-
-
-def test_load_lab_parses_a_real_toml_file(tmp_path):
-    f = tmp_path / "lab.toml"
-    f.write_text(
-        '[hosts.bench1]\nssh = "u@bench1"\n\n'
-        '[targets.fortune]\nhost = "bench1"\n\n'
-        '[targets.fortune.netboot]\ninterface = "en0"\n'
-    )
-    lab = _lab.load_lab(str(f))
-    cfg, host = lab.resolve_target("fortune")
-    assert cfg.interface == "en0"
-    assert host.ssh == "u@bench1"
-
-
-# ── lab-path selection ───────────────────────────────────────────────────────
-
-
-@pytest.fixture(autouse=True)
-def _reset_override(monkeypatch):
-    monkeypatch.setattr(_lab, "_override_path", None)
-    monkeypatch.delenv("PANIOLO_LAB", raising=False)
-
-
-def test_load_is_none_without_a_configured_lab():
-    assert _lab.load() is None
-
-
-def test_lab_path_prefers_override_then_env(monkeypatch):
-    monkeypatch.setenv("PANIOLO_LAB", "/from/env.toml")
-    assert _lab.lab_path() == "/from/env.toml"
-    _lab.set_lab_path("/from/flag.toml")
-    assert _lab.lab_path() == "/from/flag.toml"
-
-
-def test_load_raises_on_missing_file():
-    _lab.set_lab_path("/no/such/lab.toml")
-    with pytest.raises(LabError, match="not found"):
-        _lab.load()
-````
-
-## File: tests/test_netif.py
-````python
-# Copyright 2026 Curtis Galloway
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Tests for netif mode switching: address probing, mode resolution, and the
-order/teardown of mode transitions. No privileged subprocess actually runs —
-subprocess and the netboot hooks are stubbed."""
-
-from __future__ import annotations
-
-import types
-
-import pytest
-
-from paniolo import _netif
-from paniolo._config import TargetConfig
+"""Tests for the SSH transport (_ssh.py).
+
+Two tiers:
+
+- **Unit** (always run): argument construction, quoting, and the local-host
+  guard — no SSH process is spawned.
+- **Integration** (opt-in): real ssh against a destination given in
+  ``PANIOLO_SSH_IT`` (e.g. ``localhost``), with an optional identity in
+  ``PANIOLO_SSH_IT_IDENTITY``. Skipped otherwise, so the suite never triggers an
+  ssh-agent (e.g. 1Password) confirmation on a dev box. CI sets these against a
+  provisioned passphraseless key with no agent.
+"""
 
 # pylint: disable=protected-access,redefined-outer-name
-
-
-def _cfg(interface: str = "enx0") -> TargetConfig:
-    return TargetConfig(name="fortune", interface=interface, host_ip="192.168.99.1")
-
-
-def _completed(stdout: str = "", returncode: int = 0, stderr: str = ""):
-    return types.SimpleNamespace(stdout=stdout, returncode=returncode, stderr=stderr)
-
-
-# ── address / peer parsing (Linux `ip` output) ─────────────────────────────
-
-
-def test_iface_addresses_parses_brief_output(monkeypatch):
-    monkeypatch.setattr(_netif.sys, "platform", "linux")
-    out = "enx0             UP             192.168.99.1/24 fe80::1/64 fe80::abcd/64"
-    monkeypatch.setattr(_netif.subprocess, "run", lambda *a, **k: _completed(out))
-    addrs = _netif.iface_addresses("enx0")
-    assert addrs["inet"] == ["192.168.99.1/24"]
-    assert addrs["inet6"] == ["fe80::1/64", "fe80::abcd/64"]
-
-
-def test_iface_addresses_empty_when_command_fails(monkeypatch):
-    monkeypatch.setattr(_netif.sys, "platform", "linux")
-    monkeypatch.setattr(
-        _netif.subprocess, "run", lambda *a, **k: _completed(returncode=1)
-    )
-    assert _netif.iface_addresses("enx0") == {"inet": [], "inet6": []}
-
-
-def test_has_host_ll_matches_with_and_without_prefix():
-    assert _netif._has_host_ll({"inet6": ["fe80::1/64"]})
-    assert _netif._has_host_ll({"inet6": ["fe80::1"]})
-    assert not _netif._has_host_ll({"inet6": ["fe80::abcd/64"]})
-    assert not _netif._has_host_ll({"inet6": []})
-
-
-def test_ipv6_peers_excludes_host_ll(monkeypatch):
-    monkeypatch.setattr(_netif.sys, "platform", "linux")
-    out = (
-        "fe80::1 lladdr aa:bb:cc:dd:ee:ff router STALE\n"
-        "fe80::fc33:fca2:96e0:6dbe lladdr 11:22:33:44:55:66 REACHABLE\n"
-    )
-    monkeypatch.setattr(_netif.subprocess, "run", lambda *a, **k: _completed(out))
-    assert _netif.ipv6_peers("enx0") == ["fe80::fc33:fca2:96e0:6dbe"]
-
-
-def test_ipv6_peers_empty_on_macos(monkeypatch):
-    monkeypatch.setattr(_netif.sys, "platform", "darwin")
-    assert not _netif.ipv6_peers("enx0")
-
-
-# ── mode resolution in get_status ───────────────────────────────────────────
-
-
-@pytest.mark.parametrize(
-    "running, inet6, expected",
-    [
-        (True, ["fe80::1/64"], "netboot"),  # daemons win even if LL present
-        (True, [], "netboot"),
-        (False, ["fe80::1/64"], "ffx"),
-        (False, ["fe80::abcd/64"], "off"),  # some other LL, not ours
-        (False, [], "off"),
-    ],
-)
-def test_get_status_mode_resolution(monkeypatch, running, inet6, expected):
-    monkeypatch.setattr(_netif, "is_netboot_running", lambda name: running)
-    monkeypatch.setattr(
-        _netif, "iface_addresses", lambda iface: {"inet": [], "inet6": inet6}
-    )
-    monkeypatch.setattr(_netif, "ipv6_peers", lambda iface: ["fe80::dead"])
-    s = _netif.get_status(_cfg())
-    assert s["mode"] == expected
-    # peers are only probed in ffx mode.
-    assert s["peers"] == (["fe80::dead"] if expected == "ffx" else [])
-    assert s["host_ll"] == ("fe80::1" if "fe80::1/64" in inet6 else None)
-
-
-# ── mode transitions: order and teardown ────────────────────────────────────
-
-
-@pytest.fixture
-def calls(monkeypatch):
-    """Record the sequence of side-effecting hooks each transition invokes."""
-    seq: list[str] = []
-    monkeypatch.setattr(_netif, "_add_host_ll", lambda i: seq.append("add_ll"))
-    monkeypatch.setattr(_netif, "_del_host_ll", lambda i: seq.append("del_ll"))
-    monkeypatch.setattr(_netif, "_del_host_ip", lambda i, ip: seq.append("del_ip"))
-    monkeypatch.setattr(
-        _netif._netboot,
-        "start",
-        lambda cfg, engine="rust": seq.append(f"start:{engine}"),
-    )
-    monkeypatch.setattr(_netif._netboot, "stop", lambda name: seq.append("stop"))
-    return seq
-
-
-def test_mode_ffx_stops_netboot_then_adds_ll(monkeypatch, calls):
-    monkeypatch.setattr(_netif, "is_netboot_running", lambda name: True)
-    _netif.mode_ffx(_cfg())
-    assert calls == ["stop", "add_ll"]
-
-
-def test_mode_ffx_idempotent_readds_ll_when_not_running(monkeypatch, calls):
-    monkeypatch.setattr(_netif, "is_netboot_running", lambda name: False)
-    _netif.mode_ffx(_cfg())
-    assert calls == ["add_ll"]
-
-
-def test_mode_netboot_clears_ll_then_starts(monkeypatch, calls):
-    monkeypatch.setattr(_netif, "is_netboot_running", lambda name: False)
-    # No engine arg: the rust engine is the default.
-    _netif.mode_netboot(_cfg())
-    assert calls == ["del_ll", "start:rust"]
-
-
-def test_mode_netboot_idempotent_when_already_running(monkeypatch, calls):
-    monkeypatch.setattr(_netif, "is_netboot_running", lambda name: True)
-    _netif.mode_netboot(_cfg())
-    # clears the ffx LL but does not try to start a second netboot.
-    assert calls == ["del_ll"]
-
-
-def test_mode_off_tears_down_everything(monkeypatch, calls):
-    monkeypatch.setattr(_netif, "is_netboot_running", lambda name: True)
-    _netif.mode_off(_cfg())
-    assert calls == ["stop", "del_ll", "del_ip"]
-
-
-def test_mode_off_when_not_running_skips_stop(monkeypatch, calls):
-    monkeypatch.setattr(_netif, "is_netboot_running", lambda name: False)
-    _netif.mode_off(_cfg())
-    assert calls == ["del_ll", "del_ip"]
-````
-
-## File: tests/test_remote.py
-````python
-# Copyright 2026 Curtis Galloway
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Tests for transparent remote re-exec (_remote.py).
-
-Unit tests cover argv rewriting (always run). Integration tests cover the real
-ship-config + re-exec round-trip and a full CLI dispatch; they are gated on
-PANIOLO_SSH_IT (see test_ssh.py) so the suite never needs an ssh-agent.
-"""
 
 from __future__ import annotations
 
 import os
-import shutil
-import subprocess
-import sys
-import tomllib
-import types
-from pathlib import Path
+import socket
+import threading
 
 import pytest
 
-from paniolo import _cli, _config, _remote, _ssh
-from paniolo._config import TargetConfig
+from paniolo import _ssh
 from paniolo._ssh import Host
 
-# pylint: disable=protected-access,redefined-outer-name,unused-argument
-
-# ── unit: argv rewriting ─────────────────────────────────────────────────────
+# ── unit: no SSH spawned ─────────────────────────────────────────────────────
 
 
-def test_strip_lab_option_spaced_and_equals_forms():
-    assert _remote.strip_lab_option(["--lab", "/x.toml", "netboot", "status"]) == [
-        "netboot",
-        "status",
-    ]
-    assert _remote.strip_lab_option(["--lab=/x.toml", "power-cycle", "t"]) == [
-        "power-cycle",
-        "t",
-    ]
+def test_is_local():
+    assert Host(name="local", ssh="local").is_local
+    assert Host(name="x", ssh="local").is_local
+    assert not Host(name="bench1", ssh="curtisg@bench1").is_local
 
 
-def test_strip_lab_option_noop_without_lab():
-    assert _remote.strip_lab_option(["serial", "log", "-i", "console"]) == [
-        "serial",
-        "log",
-        "-i",
-        "console",
-    ]
+def test_local_host_is_rejected_before_spawning():
+    local = Host(name="local", ssh="local")
+    with pytest.raises(ValueError):
+        _ssh.run(local, ["true"])
+    with pytest.raises(ValueError):
+        with _ssh.forward(local, 8723):
+            pass
 
 
-def test_remote_argv_replaces_launcher_and_defaults_to_paniolo():
-    argv = ["/usr/local/bin/paniolo", "--lab", "/x.toml", "netboot", "status", "t"]
-    assert _remote.remote_argv(argv) == ["paniolo", "netboot", "status", "t"]
+def test_close_master_is_noop_for_local():
+    # Must not raise or spawn anything.
+    _ssh.close_master(Host(name="local", ssh="local"))
 
 
-def test_remote_argv_honors_host_paniolo_cmd():
-    argv = ["/local/paniolo", "netif", "status", "t"]
-    assert _remote.remote_argv(argv, "/opt/paniolo/bin/paniolo") == [
-        "/opt/paniolo/bin/paniolo",
-        "netif",
-        "status",
-        "t",
-    ]
+def test_remote_command_quotes_each_arg():
+    cmd = _ssh._remote_command(["echo", "a b", "c;d"], None)
+    assert cmd == "echo 'a b' 'c;d'"
 
 
-def test_host_paniolo_property_default_and_override():
-    assert Host(name="h", ssh="u@h").paniolo == "paniolo"
-    assert Host(name="h", ssh="u@h", paniolo_cmd="/x/paniolo").paniolo == "/x/paniolo"
-
-
-# ── unit: remote console plumbing ────────────────────────────────────────────
-
-
-def _completed(stdout="", returncode=0, stderr=""):
-    return types.SimpleNamespace(stdout=stdout, returncode=returncode, stderr=stderr)
-
-
-def test_remote_daemon_port_parses_discovery_json(monkeypatch):
-    monkeypatch.setattr(
-        _remote._ssh, "run", lambda *a, **k: _completed('{"pid": 5, "port": 8723}')
+def test_remote_command_prepends_env_assignments():
+    cmd = _ssh._remote_command(
+        ["paniolo", "netboot", "status"], {"PANIOLO_TARGET_CONFIG": "/t/f f.toml"}
     )
-    assert _remote.remote_daemon_port(Host(name="h", ssh="u@h"), "hdmicap") == 8723
+    assert cmd.startswith("PANIOLO_TARGET_CONFIG='/t/f f.toml' ")
+    assert cmd.endswith("paniolo netboot status")
 
 
-def test_remote_daemon_port_none_when_absent_or_bad(monkeypatch):
-    h = Host(name="h", ssh="u@h")
-    monkeypatch.setattr(_remote._ssh, "run", lambda *a, **k: _completed("", 1))
-    assert _remote.remote_daemon_port(h, "hdmicap") is None
-    monkeypatch.setattr(_remote._ssh, "run", lambda *a, **k: _completed("not json"))
-    assert _remote.remote_daemon_port(h, "hdmicap") is None
+def test_base_args_non_interactive_has_batchmode_and_controlmaster():
+    args = _ssh._base_args(Host(name="b", ssh="u@b"))
+    assert "BatchMode=yes" in args
+    assert "ControlMaster=auto" in args
+    assert any(a.startswith("ControlPath=") for a in args)
+    assert f"ControlPersist={_ssh._CONTROL_PERSIST}" in args
 
 
-def test_dashboard_url_builds_query():
-    base = "http://127.0.0.1:9001"
-    assert _cli._dashboard_url(base, None, None) == base
-    assert (
-        _cli._dashboard_url(base, "ws://127.0.0.1:9002/stream", None)
-        == f"{base}/?serialws=ws://127.0.0.1:9002/stream"
-    )
-    assert (
-        _cli._dashboard_url(base, "ws://127.0.0.1:9002/stream", "console")
-        == f"{base}/?serialws=ws://127.0.0.1:9002/stream&interface=console"
-    )
+def test_base_args_interactive_drops_batchmode():
+    args = _ssh._base_args(Host(name="b", ssh="u@b"), interactive=True)
+    assert "BatchMode=yes" not in args
 
 
-# ── integration: real ssh re-exec, opt-in ───────────────────────────────────
+def test_base_args_identity_uses_identities_only():
+    args = _ssh._base_args(Host(name="b", ssh="u@b", identity="~/.ssh/id_lab"))
+    assert "-i" in args
+    assert "IdentitiesOnly=yes" in args
+    # ~ is expanded so ssh resolves the path.
+    idx = args.index("-i")
+    assert not args[idx + 1].startswith("~")
+
+
+def test_forward_args_disable_multiplexing():
+    # A port forward must own a standalone connection, not attach to the master.
+    args = _ssh._base_args(Host(name="b", ssh="u@b"), multiplex=False)
+    assert "ControlMaster=no" in args
+    assert "ControlPath=none" in args
+    assert "ControlMaster=auto" not in args
+
+
+def test_custom_control_path_is_honored():
+    args = _ssh._base_args(Host(name="b", ssh="u@b", control_path="/tmp/cm-test"))
+    assert "ControlPath=/tmp/cm-test" in args
+
+
+def test_free_local_port_is_usable():
+    port = _ssh._free_local_port()
+    assert 1024 < port < 65536
+    # Re-bindable, i.e. actually free.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", port))
+
+
+# ── integration: real ssh, opt-in ───────────────────────────────────────────
 
 _DEST = os.environ.get("PANIOLO_SSH_IT")
 _IDENT = os.environ.get("PANIOLO_SSH_IT_IDENTITY")
-# The paniolo matching the code under test — the console script next to the
-# running interpreter (the venv), not whatever happens to be first on PATH.
-_colocated = Path(sys.executable).parent / "paniolo"
-_PANIOLO = str(_colocated) if _colocated.exists() else shutil.which("paniolo")
 
 integration = pytest.mark.skipif(
-    not _DEST, reason="set PANIOLO_SSH_IT to run remote re-exec integration tests"
+    not _DEST,
+    reason=(
+        "set PANIOLO_SSH_IT=<ssh-dest> (e.g. localhost)" " to run SSH integration tests"
+    ),
 )
 
 
 @pytest.fixture
 def host():
+    # A short control path: a deep tmp_path overflows the ~104-char Unix-socket
+    # limit once ssh appends the %C hash. Unique per process; torn down below.
     h = Host(
         name="it",
         ssh=_DEST,
         identity=_IDENT,
-        control_path=f"/tmp/pcm-remote-{os.getpid()}-%C",
-        paniolo_cmd=_PANIOLO,
+        control_path=f"/tmp/pcm-{os.getpid()}-%C",
     )
     yield h
     _ssh.close_master(h)
 
 
-def _cfg() -> TargetConfig:
-    return TargetConfig(name="t", interface="lo", tftp_root="/tmp/tftp-t")
+@integration
+def test_run_roundtrip(host):
+    r = _ssh.run(host, ["echo", "hello world"])
+    assert r.returncode == 0
+    assert r.stdout.strip() == "hello world"
 
 
 @integration
-def test_ship_config_round_trips(host):
-    remote_path = _remote.ship_config(host, _cfg())
+def test_run_env(host):
+    r = _ssh.run(host, ["sh", "-c", "echo $FOO"], env={"FOO": "bar baz"})
+    assert r.stdout.strip() == "bar baz"
+
+
+@integration
+def test_run_nonzero_exit(host):
+    assert _ssh.run(host, ["false"]).returncode != 0
+
+
+@integration
+def test_run_passthrough_returns_exit_code(host):
+    assert _ssh.run_passthrough(host, ["true"]) == 0
+    assert _ssh.run_passthrough(host, ["false"]) != 0
+
+
+@integration
+def test_read_remote_file_present_and_absent(host, tmp_path):
+    f = tmp_path / "probe.txt"
+    f.write_text("contents-123\n")
+    assert _ssh.read_remote_file(host, str(f)) == "contents-123\n"
+    assert _ssh.read_remote_file(host, str(tmp_path / "nope.txt")) is None
+
+
+@integration
+def test_forward_reaches_a_local_listener(host):
+    # A throwaway server bound on 127.0.0.1; forward() tunnels to it via ssh.
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    remote_port = server.getsockname()[1]
+
+    def serve():
+        # Accept repeatedly: forward()'s readiness probe opens (and drops) a
+        # connection through the tunnel before the test's real one, so a
+        # single-accept server would be consumed by the probe. Real daemons
+        # serve many connections, so this matches production behaviour.
+        while True:
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            conn.sendall(b"BANNER-OK")
+            conn.close()
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
     try:
-        text = _ssh.read_remote_file(host, remote_path)
-        assert text is not None
-        back = _config._from_dict(tomllib.loads(text))
-        assert back.name == "t"
-        assert back.interface == "lo"
-        assert back.tftp_root == "/tmp/tftp-t"
+        with _ssh.forward(host, remote_port) as local_port:
+            with socket.create_connection(("127.0.0.1", local_port), timeout=5) as c:
+                assert c.recv(16) == b"BANNER-OK"
     finally:
-        _ssh.run(host, ["rm", "-f", remote_path])
-
-
-@integration
-@pytest.mark.skipif(not _PANIOLO, reason="paniolo not installed on PATH")
-def test_configure_discovers_over_ssh(tmp_path):
-    # `configure --host h` runs `paniolo discover --json` on h over ssh and
-    # prints a proposed [targets.<name>] block built from the result.
-    ident = f'identity = "{_IDENT}"\n' if _IDENT else ""
-    lab = tmp_path / "lab.toml"
-    lab.write_text(f'[hosts.h]\nssh = "{_DEST}"\n{ident}paniolo_cmd = "{_PANIOLO}"\n')
-    result = subprocess.run(
-        [_PANIOLO, "--lab", str(lab), "configure", "newtgt", "--host", "h"],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr
-    assert "[targets.newtgt]" in result.stdout
-    assert 'host = "h"' in result.stdout
-
-
-@integration
-@pytest.mark.skipif(not _PANIOLO, reason="paniolo not installed on PATH")
-def test_full_cli_dispatch_runs_on_remote(host, tmp_path):
-    # A lab whose single target lives on the (remote) integration host.
-    ident = f'identity = "{_IDENT}"\n' if _IDENT else ""
-    lab = tmp_path / "lab.toml"
-    lab.write_text(
-        f'[hosts.h]\nssh = "{_DEST}"\n{ident}paniolo_cmd = "{_PANIOLO}"\n\n'
-        f'[targets.t]\nhost = "h"\n\n[targets.t.netboot]\ninterface = "lo"\n'
-    )
-    result = subprocess.run(
-        [_PANIOLO, "--lab", str(lab), "netboot", "status", "t"],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr
-    # The status text is produced by the *remote* paniolo and passed through.
-    assert "stopped" in result.stdout or "running" in result.stdout
+        server.close()
+        t.join(timeout=2)
 ````
 
-## File: tests/test_serial.py
+## File: tests/test_state.py
 ````python
 # Copyright 2026 Curtis Galloway
 #
@@ -12896,107 +13584,1041 @@ def test_full_cli_dispatch_runs_on_remote(host, tmp_path):
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Host-side tests for serial helpers — no hardware, no serialcap binary."""
+"""Tests for netboot state: path construction, JSON round-trip (including the
+back-compat `engine` default), PID liveness probes, and the per-engine
+`is_netboot_running` logic. No real processes or state dir are touched —
+STATE_DIR is redirected to a tmp dir and os/subprocess probes are stubbed."""
+
+# pylint: disable=redefined-outer-name,unused-argument
 
 from __future__ import annotations
 
-from paniolo import _serial
-from paniolo._config import SerialInterface
+import json
+
+import pytest
+
+from paniolo import _state
+from paniolo._state import NetbootState
 
 
-def test_log_cmd_defaults_to_bare_subcommand():
-    assert _serial.log_cmd("serialcap") == ["serialcap", "log"]
+@pytest.fixture
+def state_dir(tmp_path, monkeypatch):
+    """Redirect the on-disk state dir into a throwaway tmp path."""
+    monkeypatch.setattr(_state, "STATE_DIR", tmp_path)
+    return tmp_path
 
 
-def test_log_cmd_forwards_only_set_flags():
-    cmd = _serial.log_cmd("serialcap", tail=50)
-    assert cmd == ["serialcap", "log", "--tail", "50"]
-
-
-def test_log_cmd_interface():
-    assert _serial.log_cmd("serialcap", interface="bmc", tail=10) == [
-        "serialcap",
-        "log",
-        "--interface",
-        "bmc",
-        "--tail",
-        "10",
-    ]
-
-
-def test_input_url_no_pace():
-    assert (
-        _serial.input_url("http://127.0.0.1:8724", "console")
-        == "http://127.0.0.1:8724/input?interface=console"
+def _state_obj(**over) -> NetbootState:
+    base = dict(
+        target="fortune",
+        dhcp_pid=111,
+        tftp_pid=222,
+        started_at=1234.5,
+        interface="enx0",
+        tftp_root="/srv/tftp",
+        engine="rust",
     )
+    base.update(over)
+    return NetbootState(**base)
 
 
-def test_input_url_with_pace():
+# ── path construction ───────────────────────────────────────────────────────
+
+
+def test_paths_are_under_state_dir(state_dir):
     assert (
-        _serial.input_url("http://127.0.0.1:8724", "console", pace_ms=8)
-        == "http://127.0.0.1:8724/input?interface=console&pace_ms=8"
+        _state.netboot_state_path("fortune") == state_dir / "fortune" / "netboot.json"
     )
+    assert _state.netboot_log_path("fortune") == state_dir / "fortune" / "netboot.log"
 
 
-def test_input_url_zero_pace_omitted():
-    assert "pace_ms" not in _serial.input_url("http://x", "bmc", pace_ms=0)
+def test_ensure_target_dir_creates_it(state_dir):
+    d = _state.ensure_target_dir("fortune")
+    assert d == state_dir / "fortune"
+    assert d.is_dir()
 
 
-def test_interface_arg():
-    assert (
-        _serial.interface_arg("console", "/dev/ttyUSB0", 115200)
-        == "console=/dev/ttyUSB0@115200"
+# ── save / load round-trip ──────────────────────────────────────────────────
+
+
+def test_save_load_round_trip_preserves_all_fields(state_dir):
+    original = _state_obj()
+    _state.save_netboot_state(original)
+    assert _state.load_netboot_state("fortune") == original
+
+
+def test_load_missing_state_returns_none(state_dir):
+    assert _state.load_netboot_state("ghost") is None
+
+
+def test_load_corrupt_json_returns_none(state_dir):
+    p = _state.netboot_state_path("broken")
+    p.parent.mkdir(parents=True)
+    p.write_text("{not valid json")
+    assert _state.load_netboot_state("broken") is None
+
+
+def test_load_rejects_unknown_keys(state_dir):
+    # An extra key makes NetbootState(**data) raise TypeError -> None, rather
+    # than silently constructing a partial object.
+    p = _state.netboot_state_path("weird")
+    p.parent.mkdir(parents=True)
+    p.write_text(json.dumps({"target": "weird", "bogus": 1}))
+    assert _state.load_netboot_state("weird") is None
+
+
+def test_load_without_engine_field_defaults_to_python(state_dir):
+    # A state file written before the `engine` field existed must deserialize to
+    # the legacy engine ("python"), since that was the sole engine then. The
+    # field default exists ONLY for this back-compat path (see _state.py).
+    p = _state.netboot_state_path("legacy")
+    p.parent.mkdir(parents=True)
+    p.write_text(
+        json.dumps(
+            {
+                "target": "legacy",
+                "dhcp_pid": 1,
+                "tftp_pid": 2,
+                "started_at": 0.0,
+                "interface": "enx0",
+                "tftp_root": "/srv",
+            }
+        )
     )
+    st = _state.load_netboot_state("legacy")
+    assert st is not None
+    assert st.engine == "python"
 
 
-def test_daemon_cmd_one_per_interface():
-    ifaces = [
-        SerialInterface("console", "/dev/ttyUSB0", 115200),
-        SerialInterface("bmc", "/dev/ttyUSB1", 9600),
+def test_fresh_rust_state_round_trips_as_rust(state_dir):
+    _state.save_netboot_state(_state_obj(engine="rust"))
+    assert _state.load_netboot_state("fortune").engine == "rust"
+
+
+# ── PID liveness ────────────────────────────────────────────────────────────
+
+
+def test_is_pid_alive_branches(monkeypatch):
+    monkeypatch.setattr(_state.os, "kill", lambda pid, sig: None)
+    assert _state.is_pid_alive(123) is True
+
+    def gone(pid, sig):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(_state.os, "kill", gone)
+    assert _state.is_pid_alive(123) is False
+
+    def denied(pid, sig):
+        # PID exists but we cannot signal it — still alive.
+        raise PermissionError
+
+    monkeypatch.setattr(_state.os, "kill", denied)
+    assert _state.is_pid_alive(123) is True
+
+
+def test_child_alive_requires_module_in_cmdline(monkeypatch):
+    monkeypatch.setattr(_state, "is_pid_alive", lambda pid: True)
+    monkeypatch.setattr(
+        _state, "_pid_cmdline", lambda pid: "python -m paniolo._tftp 192.168.99.1"
+    )
+    assert _state.is_paniolo_child_alive(99, "paniolo._tftp") is True
+    assert _state.is_paniolo_child_alive(99, "netbootd") is False
+
+
+def test_child_alive_short_circuits_when_pid_dead(monkeypatch):
+    monkeypatch.setattr(_state, "is_pid_alive", lambda pid: False)
+    checked = []
+    monkeypatch.setattr(_state, "_pid_cmdline", lambda pid: checked.append(pid) or "")
+    assert _state.is_paniolo_child_alive(99, "anything") is False
+    assert not checked, "cmdline must not be read once the PID is known dead"
+
+
+# ── is_netboot_running (per-engine) ─────────────────────────────────────────
+
+
+def test_running_false_when_no_state(state_dir):
+    assert _state.is_netboot_running("ghost") is False
+
+
+def test_running_rust_checks_single_netbootd_pid(state_dir, monkeypatch):
+    _state.save_netboot_state(
+        _state_obj(target="r", engine="rust", dhcp_pid=500, tftp_pid=500)
+    )
+    seen = []
+    monkeypatch.setattr(
+        _state,
+        "is_paniolo_child_alive",
+        lambda pid, module: seen.append((pid, module)) or True,
+    )
+    assert _state.is_netboot_running("r") is True
+    assert seen == [(500, "netbootd")], "rust engine probes one netbootd PID"
+
+
+def test_running_python_requires_both_children(state_dir, monkeypatch):
+    _state.save_netboot_state(
+        _state_obj(target="p", engine="python", dhcp_pid=10, tftp_pid=20)
+    )
+    # tftp child reports dead -> overall not running.
+    monkeypatch.setattr(
+        _state,
+        "is_paniolo_child_alive",
+        lambda pid, module: module == "paniolo._dhcp",
+    )
+    assert _state.is_netboot_running("p") is False
+
+
+def test_running_python_true_when_both_alive(state_dir, monkeypatch):
+    _state.save_netboot_state(
+        _state_obj(target="p", engine="python", dhcp_pid=10, tftp_pid=20)
+    )
+    monkeypatch.setattr(_state, "is_paniolo_child_alive", lambda pid, module: True)
+    assert _state.is_netboot_running("p") is True
+````
+
+## File: tests/test_video.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for _video.py: TOML config round-trip, `hdmicap devices` parsing, the
+capture-device heuristic, and discovery-file / daemon-URL resolution. The
+hdmicap binary, subprocess, and filesystem are all stubbed."""
+
+from __future__ import annotations
+
+import json
+import types
+
+from paniolo import _video
+from paniolo._video import VideoConfig
+
+# pylint: disable=protected-access
+
+
+def _run(stdout: str = "", returncode: int = 0):
+    return types.SimpleNamespace(stdout=stdout, returncode=returncode)
+
+
+# ── TOML serialization / round-trip ─────────────────────────────────────────
+
+
+def test_to_toml_emits_string_kv_and_drops_none():
+    assert _video._to_toml({"device": "HDMI Cap"}) == 'device = "HDMI Cap"\n'
+    assert _video._to_toml({"device": "Cam0", "extra": None}) == 'device = "Cam0"\n'
+
+
+def test_save_load_round_trip(tmp_path, monkeypatch):
+    monkeypatch.setattr(_video._config, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(_video, "VIDEO_CONFIG_PATH", tmp_path / "video.toml")
+    _video.save_video_config(VideoConfig(device="USB Capture HDMI"))
+    assert _video.load_video_config() == VideoConfig(device="USB Capture HDMI")
+
+
+def test_load_returns_none_when_absent(tmp_path, monkeypatch):
+    monkeypatch.setattr(_video, "VIDEO_CONFIG_PATH", tmp_path / "video.toml")
+    assert _video.load_video_config() is None
+
+
+# ── `hdmicap devices` parsing ───────────────────────────────────────────────
+
+
+def test_list_devices_parses_indexed_lines(monkeypatch):
+    monkeypatch.setattr(_video, "hdmicap_binary", lambda: "/usr/bin/hdmicap")
+    out = "0  FaceTime HD Camera [builtin]\n1  USB Capture HDMI [0x1234]\n"
+    monkeypatch.setattr(_video.subprocess, "run", lambda *a, **k: _run(out))
+    devices = _video.list_devices()
+    assert devices == [
+        {"index": 0, "name": "FaceTime HD Camera", "misc": "builtin"},
+        {"index": 1, "name": "USB Capture HDMI", "misc": "0x1234"},
     ]
-    assert _serial.daemon_cmd("serialcap", ifaces, port=8724) == [
-        "serialcap",
-        "daemon",
-        "--port",
-        "8724",
-        "--interface",
-        "console=/dev/ttyUSB0@115200",
-        "--interface",
-        "bmc=/dev/ttyUSB1@9600",
+
+
+def test_list_devices_empty_when_binary_missing(monkeypatch):
+    monkeypatch.setattr(_video, "hdmicap_binary", lambda: None)
+    assert not _video.list_devices()
+
+
+def test_list_devices_empty_on_nonzero_exit(monkeypatch):
+    monkeypatch.setattr(_video, "hdmicap_binary", lambda: "/usr/bin/hdmicap")
+    monkeypatch.setattr(_video.subprocess, "run", lambda *a, **k: _run("x", 1))
+    assert not _video.list_devices()
+
+
+# ── capture-device heuristic ────────────────────────────────────────────────
+
+
+def test_guess_capture_device_picks_sole_non_builtin():
+    devices = [
+        {"index": 0, "name": "FaceTime HD Camera", "misc": ""},
+        {"index": 1, "name": "USB Capture HDMI", "misc": ""},
     ]
+    assert _video.guess_capture_device(devices) == devices[1]
 
 
-def test_daemon_cmd_buffer_lines():
-    ifaces = [SerialInterface("console", "/dev/ttyUSB0", 115200)]
-    assert _serial.daemon_cmd("serialcap", ifaces, port=9, buffer_lines=1000) == [
-        "serialcap",
-        "daemon",
-        "--port",
-        "9",
-        "--buffer-lines",
-        "1000",
-        "--interface",
-        "console=/dev/ttyUSB0@115200",
+def test_guess_capture_device_none_when_ambiguous():
+    devices = [
+        {"index": 0, "name": "USB Capture HDMI", "misc": ""},
+        {"index": 1, "name": "Elgato HD60", "misc": ""},
     ]
+    assert _video.guess_capture_device(devices) is None
 
 
-def test_log_cmd_range_and_since():
-    assert _serial.log_cmd("serialcap", from_seq=10, to_seq=20) == [
-        "serialcap",
-        "log",
-        "--from",
-        "10",
-        "--to",
-        "20",
+def test_guess_capture_device_none_when_only_builtins():
+    devices = [
+        {"index": 0, "name": "FaceTime HD Camera", "misc": ""},
+        {"index": 1, "name": "iPhone Camera", "misc": ""},
     ]
-    assert _serial.log_cmd("serialcap", since=7) == ["serialcap", "log", "--since", "7"]
+    assert _video.guess_capture_device(devices) is None
 
 
-def test_log_cmd_boolean_flags():
-    cmd = _serial.log_cmd("serialcap", raw=True, as_json=True, no_pending=True)
-    assert cmd == ["serialcap", "log", "--raw", "--json", "--no-pending"]
-    # Defaults stay off.
-    assert "--raw" not in _serial.log_cmd("serialcap", tail=1)
+# ── discovery file / daemon URL ─────────────────────────────────────────────
+
+
+def test_read_discovery_parses_json(tmp_path, monkeypatch):
+    disc = tmp_path / "daemon.json"
+    disc.write_text(json.dumps({"pid": 4321, "port": 8723}))
+    monkeypatch.setattr(_video, "_discovery_path", lambda: disc)
+    assert _video.read_discovery() == {"pid": 4321, "port": 8723}
+
+
+def test_read_discovery_none_when_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(_video, "_discovery_path", lambda: tmp_path / "nope.json")
+    assert _video.read_discovery() is None
+
+
+def test_read_discovery_none_when_corrupt(tmp_path, monkeypatch):
+    disc = tmp_path / "daemon.json"
+    disc.write_text("{not json")
+    monkeypatch.setattr(_video, "_discovery_path", lambda: disc)
+    assert _video.read_discovery() is None
+
+
+def test_daemon_url_when_pid_alive(monkeypatch):
+    monkeypatch.setattr(_video, "read_discovery", lambda: {"pid": 10, "port": 8723})
+    monkeypatch.setattr(_video.os, "kill", lambda pid, sig: None)
+    assert _video.daemon_url() == "http://127.0.0.1:8723"
+
+
+def test_daemon_url_none_when_pid_dead(monkeypatch):
+    monkeypatch.setattr(_video, "read_discovery", lambda: {"pid": 10, "port": 8723})
+
+    def gone(pid, sig):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(_video.os, "kill", gone)
+    assert _video.daemon_url() is None
+
+
+def test_daemon_url_none_when_no_discovery(monkeypatch):
+    monkeypatch.setattr(_video, "read_discovery", lambda: None)
+    assert _video.daemon_url() is None
+````
+
+## File: cli/src/labfile.rs
+````rust
+// Copyright 2026 Curtis Galloway
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! The editable lab document: surgical, comment-preserving writes via `toml_edit`.
+//!
+//! The lab file is human-authored, so the CLI edits it *politely* — preserving
+//! hand-written comments, key ordering, and formatting, touching only the tables
+//! it changes. Reads/resolution live in [`crate::model`]; this is the write side
+//! plus a re-run of the shared [`model::validate`] before every save.
+
+use std::path::{Path, PathBuf};
+
+use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
+
+use crate::model::{self, Lab, LabError};
+
+const HEADER: &str = "paniolo lab — managed by the `paniolo` CLI; hand-edits are preserved";
+
+fn lab_err<T>(msg: impl Into<String>) -> Result<T, LabError> {
+    Err(LabError(msg.into()))
+}
+
+/// A lab file open for editing, backed by a live `toml_edit` document.
+pub struct LabFile {
+    pub path: PathBuf,
+    pub doc: DocumentMut,
+    /// A top-of-file header to write for a freshly created lab (None when the
+    /// file already existed — its own leading comments are preserved as-is).
+    header: Option<&'static str>,
+}
+
+impl LabFile {
+    pub fn load(path: &Path) -> Result<Self, LabError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| LabError(format!("{}: {e}", path.display())))?;
+        let doc = text
+            .parse::<DocumentMut>()
+            .map_err(|e| LabError(e.to_string()))?;
+        validate_doc(&doc)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            doc,
+            header: None,
+        })
+    }
+
+    pub fn create(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            doc: DocumentMut::new(),
+            header: Some(HEADER),
+        }
+    }
+
+    pub fn save(&self) -> Result<(), LabError> {
+        validate_doc(&self.doc)?;
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| LabError(format!("{}: {e}", parent.display())))?;
+        }
+        // toml_edit stores a leading comment as the first item's prefix, which
+        // doesn't exist for a fresh document — so prepend the header to the
+        // rendered text rather than into the (item-less) document.
+        let mut out = self.doc.to_string();
+        if let Some(h) = self.header {
+            if !out.trim_start().starts_with('#') {
+                out = format!("# {h}\n\n{out}");
+            }
+        }
+        std::fs::write(&self.path, out)
+            .map_err(|e| LabError(format!("{}: {e}", self.path.display())))
+    }
+
+    // ── hosts ───────────────────────────────────────────────────────────────
+
+    pub fn add_host(
+        &mut self,
+        name: &str,
+        ssh: &str,
+        identity: Option<&str>,
+        control_path: Option<&str>,
+        paniolo_cmd: Option<&str>,
+    ) -> Result<(), LabError> {
+        let hosts = super_table(&mut self.doc, "hosts");
+        if hosts.contains_key(name) {
+            return lab_err(format!("host '{name}' already exists"));
+        }
+        let mut t = Table::new();
+        t.insert("ssh", value(ssh));
+        set_opt(&mut t, "identity", identity);
+        set_opt(&mut t, "control_path", control_path);
+        set_opt(&mut t, "paniolo_cmd", paniolo_cmd);
+        hosts.insert(name, Item::Table(t));
+        Ok(())
+    }
+
+    pub fn update_host(
+        &mut self,
+        name: &str,
+        ssh: Option<&str>,
+        identity: Option<&str>,
+        control_path: Option<&str>,
+        paniolo_cmd: Option<&str>,
+    ) -> Result<(), LabError> {
+        let t = self
+            .doc
+            .get_mut("hosts")
+            .and_then(|i| i.as_table_mut())
+            .and_then(|h| h.get_mut(name))
+            .and_then(|i| i.as_table_mut())
+            .ok_or_else(|| LabError(format!("no host '{name}'")))?;
+        set_opt(t, "ssh", ssh);
+        set_opt(t, "identity", identity);
+        set_opt(t, "control_path", control_path);
+        set_opt(t, "paniolo_cmd", paniolo_cmd);
+        Ok(())
+    }
+
+    pub fn remove_host(&mut self, name: &str) -> Result<(), LabError> {
+        let hosts = self
+            .doc
+            .get_mut("hosts")
+            .and_then(|i| i.as_table_mut())
+            .ok_or_else(|| LabError(format!("no host '{name}'")))?;
+        if !hosts.contains_key(name) {
+            return lab_err(format!("no host '{name}'"));
+        }
+        let refs = self.host_references(name);
+        if !refs.is_empty() {
+            return lab_err(format!(
+                "host '{name}' is still used by: {}",
+                refs.join(", ")
+            ));
+        }
+        self.doc["hosts"].as_table_mut().unwrap().remove(name);
+        Ok(())
+    }
+
+    fn host_references(&self, host: &str) -> Vec<String> {
+        let lab: Lab = toml::from_str(&self.doc.to_string()).unwrap_or_default();
+        let mut refs = Vec::new();
+        for name in lab.targets.keys() {
+            if let Some(rt) = lab.resolved_target(name) {
+                if rt.default_host == host || rt.channels.iter().any(|c| c.host == host) {
+                    refs.push(name.clone());
+                }
+            }
+        }
+        refs
+    }
+
+    // ── targets ───────────────────────────────────────────────────────────────
+
+    pub fn add_target(
+        &mut self,
+        name: &str,
+        host: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<(), LabError> {
+        let targets = super_table(&mut self.doc, "targets");
+        if targets.contains_key(name) {
+            return lab_err(format!("target '{name}' already exists"));
+        }
+        let mut t = Table::new();
+        set_opt(&mut t, "host", host);
+        set_opt(&mut t, "note", note);
+        targets.insert(name, Item::Table(t));
+        Ok(())
+    }
+
+    pub fn update_target(
+        &mut self,
+        name: &str,
+        host: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<(), LabError> {
+        let t = self.target_mut(name)?;
+        set_opt(t, "host", host);
+        set_opt(t, "note", note);
+        Ok(())
+    }
+
+    pub fn remove_target(&mut self, name: &str) -> Result<(), LabError> {
+        let targets = self
+            .doc
+            .get_mut("targets")
+            .and_then(|i| i.as_table_mut())
+            .ok_or_else(|| LabError(format!("no target '{name}'")))?;
+        if targets.remove(name).is_none() {
+            return lab_err(format!("no target '{name}'"));
+        }
+        Ok(())
+    }
+
+    // ── serial channels (collection) ─────────────────────────────────────────
+
+    pub fn add_serial(
+        &mut self,
+        target: &str,
+        name: &str,
+        device: &str,
+        baud: i64,
+        sense: Option<&str>,
+        host: Option<&str>,
+    ) -> Result<(), LabError> {
+        let t = self.target_mut(target)?;
+        if !t.contains_key("serial") {
+            t.insert("serial", Item::ArrayOfTables(ArrayOfTables::new()));
+        }
+        let aot = t
+            .get_mut("serial")
+            .and_then(|i| i.as_array_of_tables_mut())
+            .ok_or_else(|| LabError(format!("target '{target}': serial is not [[serial]]")))?;
+        if aot
+            .iter()
+            .any(|s| s.get("name").and_then(|v| v.as_str()) == Some(name))
+        {
+            return lab_err(format!("target '{target}': serial '{name}' already exists"));
+        }
+        let mut s = Table::new();
+        s.insert("name", value(name));
+        s.insert("device", value(device));
+        s.insert("baud", value(baud));
+        set_opt(&mut s, "power_sense_signal", sense);
+        set_opt(&mut s, "host", host);
+        aot.push(s);
+        Ok(())
+    }
+
+    pub fn update_serial(
+        &mut self,
+        target: &str,
+        name: &str,
+        device: Option<&str>,
+        baud: Option<i64>,
+        sense: Option<&str>,
+        host: Option<&str>,
+    ) -> Result<(), LabError> {
+        let t = self.target_mut(target)?;
+        let aot = t
+            .get_mut("serial")
+            .and_then(|i| i.as_array_of_tables_mut())
+            .ok_or_else(|| LabError(format!("target '{target}': no serial '{name}'")))?;
+        let s = aot
+            .iter_mut()
+            .find(|s| s.get("name").and_then(|v| v.as_str()) == Some(name))
+            .ok_or_else(|| LabError(format!("target '{target}': no serial '{name}'")))?;
+        set_opt(s, "device", device);
+        if let Some(b) = baud {
+            s.insert("baud", value(b));
+        }
+        set_opt(s, "power_sense_signal", sense);
+        set_opt(s, "host", host);
+        Ok(())
+    }
+
+    pub fn remove_serial(&mut self, target: &str, name: &str) -> Result<(), LabError> {
+        let t = self.target_mut(target)?;
+        let aot = t
+            .get_mut("serial")
+            .and_then(|i| i.as_array_of_tables_mut())
+            .ok_or_else(|| LabError(format!("target '{target}': no serial '{name}'")))?;
+        let idx = aot
+            .iter()
+            .position(|s| s.get("name").and_then(|v| v.as_str()) == Some(name))
+            .ok_or_else(|| LabError(format!("target '{target}': no serial '{name}'")))?;
+        aot.remove(idx);
+        if aot.is_empty() {
+            t.remove("serial");
+        }
+        Ok(())
+    }
+
+    // ── singleton channels (netboot / power / video) ─────────────────────────
+
+    fn set_singleton(
+        &mut self,
+        target: &str,
+        kind: &str,
+        fields: &[(&str, Option<&str>)],
+    ) -> Result<(), LabError> {
+        let t = self.target_mut(target)?;
+        if !t.contains_key(kind) {
+            t.insert(kind, Item::Table(Table::new()));
+        }
+        let c = t
+            .get_mut(kind)
+            .and_then(|i| i.as_table_mut())
+            .ok_or_else(|| LabError(format!("target '{target}': {kind} is not a table")))?;
+        for (k, v) in fields {
+            set_opt(c, k, *v);
+        }
+        Ok(())
+    }
+
+    fn remove_singleton(&mut self, target: &str, kind: &str) -> Result<(), LabError> {
+        let t = self.target_mut(target)?;
+        if t.remove(kind).is_none() {
+            return lab_err(format!("target '{target}': no {kind} channel"));
+        }
+        Ok(())
+    }
+
+    pub fn set_netboot(
+        &mut self,
+        target: &str,
+        interface: Option<&str>,
+        host_ip: Option<&str>,
+        tftp_root: Option<&str>,
+        host: Option<&str>,
+    ) -> Result<(), LabError> {
+        self.set_singleton(
+            target,
+            "netboot",
+            &[
+                ("interface", interface),
+                ("host_ip", host_ip),
+                ("tftp_root", tftp_root),
+                ("host", host),
+            ],
+        )
+    }
+
+    pub fn remove_netboot(&mut self, target: &str) -> Result<(), LabError> {
+        self.remove_singleton(target, "netboot")
+    }
+
+    pub fn set_power(
+        &mut self,
+        target: &str,
+        cycle_cmd: Option<&str>,
+        serial_interface: Option<&str>,
+        host: Option<&str>,
+    ) -> Result<(), LabError> {
+        self.set_singleton(
+            target,
+            "power",
+            &[
+                ("cycle_cmd", cycle_cmd),
+                ("serial_interface", serial_interface),
+                ("host", host),
+            ],
+        )
+    }
+
+    pub fn remove_power(&mut self, target: &str) -> Result<(), LabError> {
+        self.remove_singleton(target, "power")
+    }
+
+    pub fn set_video(
+        &mut self,
+        target: &str,
+        device: Option<&str>,
+        host: Option<&str>,
+    ) -> Result<(), LabError> {
+        self.set_singleton(target, "video", &[("device", device), ("host", host)])
+    }
+
+    pub fn remove_video(&mut self, target: &str) -> Result<(), LabError> {
+        self.remove_singleton(target, "video")
+    }
+
+    fn target_mut(&mut self, name: &str) -> Result<&mut Table, LabError> {
+        self.doc
+            .get_mut("targets")
+            .and_then(|i| i.as_table_mut())
+            .and_then(|t| t.get_mut(name))
+            .and_then(|i| i.as_table_mut())
+            .ok_or_else(|| LabError(format!("no target '{name}'")))
+    }
+}
+
+/// Get or create an implicit super-table so children render as `[key.child]`.
+fn super_table<'a>(doc: &'a mut DocumentMut, key: &str) -> &'a mut Table {
+    if doc.get(key).is_none() {
+        let mut t = Table::new();
+        t.set_implicit(true);
+        doc.insert(key, Item::Table(t));
+    }
+    doc[key].as_table_mut().expect("super table")
+}
+
+/// Set a key when the value is present; leave it untouched otherwise.
+fn set_opt(t: &mut Table, key: &str, v: Option<&str>) {
+    if let Some(val) = v {
+        t.insert(key, value(val));
+    }
+}
+
+/// Validate by deserializing the live document and running the shared rulebook.
+fn validate_doc(doc: &DocumentMut) -> Result<(), LabError> {
+    let lab: Lab = toml::from_str(&doc.to_string()).map_err(|e| LabError(e.to_string()))?;
+    model::validate(&lab)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lab.toml");
+        (dir, path)
+    }
+
+    #[test]
+    fn build_round_trips() {
+        let (_d, path) = tmp();
+        let mut lf = LabFile::create(&path);
+        lf.add_host("bench1", "u@bench1", Some("~/.ssh/id"), None, None)
+            .unwrap();
+        lf.add_target("fortune", Some("bench1"), Some("note"))
+            .unwrap();
+        lf.set_netboot("fortune", Some("en0"), None, Some("/srv/tftp"), None)
+            .unwrap();
+        lf.add_serial("fortune", "console", "/dev/ttyUSB0", 115200, None, None)
+            .unwrap();
+        lf.add_serial("fortune", "bmc", "/dev/ttyUSB1", 9600, Some("cts"), None)
+            .unwrap();
+        lf.save().unwrap();
+
+        let lab = model::load(&path).unwrap();
+        let t = &lab.targets["fortune"];
+        assert_eq!(t.host.as_deref(), Some("bench1"));
+        assert_eq!(
+            t.netboot.as_ref().unwrap().interface.as_deref(),
+            Some("en0")
+        );
+        assert_eq!(t.serial.len(), 2);
+        assert_eq!(t.serial[1].baud, 9600);
+    }
+
+    #[test]
+    fn comments_preserved_across_edit() {
+        let (_d, path) = tmp();
+        std::fs::write(
+            &path,
+            "# hand-written\n[hosts.bench1]\nssh = \"u@b1\"  # noisy\n",
+        )
+        .unwrap();
+        let mut lf = LabFile::load(&path).unwrap();
+        lf.update_host("bench1", None, Some("~/.ssh/id"), None, None)
+            .unwrap();
+        lf.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# hand-written"), "{text}");
+        assert!(text.contains("# noisy"), "{text}");
+        assert!(text.contains("identity"), "{text}");
+    }
+
+    #[test]
+    fn remove_host_blocked_while_referenced() {
+        let (_d, path) = tmp();
+        let mut lf = LabFile::create(&path);
+        lf.add_host("bench1", "u@b1", None, None, None).unwrap();
+        lf.add_target("fortune", Some("bench1"), None).unwrap();
+        let e = lf.remove_host("bench1").unwrap_err();
+        assert!(e.0.contains("still used by: fortune"), "{}", e.0);
+    }
+
+    #[test]
+    fn duplicate_serial_rejected() {
+        let (_d, path) = tmp();
+        let mut lf = LabFile::create(&path);
+        lf.add_target("t", None, None).unwrap();
+        lf.add_serial("t", "console", "/dev/a", 115200, None, None)
+            .unwrap();
+        let e = lf
+            .add_serial("t", "console", "/dev/b", 115200, None, None)
+            .unwrap_err();
+        assert!(e.0.contains("already exists"), "{}", e.0);
+    }
+
+    #[test]
+    fn unknown_host_ref_fails_on_save() {
+        let (_d, path) = tmp();
+        let mut lf = LabFile::create(&path);
+        lf.add_target("t", Some("ghost"), None).unwrap();
+        assert!(lf.save().is_err());
+    }
+
+    #[test]
+    fn remove_last_serial_drops_array() {
+        let (_d, path) = tmp();
+        let mut lf = LabFile::create(&path);
+        lf.add_target("t", None, None).unwrap();
+        lf.add_serial("t", "console", "/dev/a", 115200, None, None)
+            .unwrap();
+        lf.remove_serial("t", "console").unwrap();
+        lf.save().unwrap();
+        let lab = model::load(&path).unwrap();
+        assert!(lab.targets["t"].serial.is_empty());
+    }
+}
+````
+
+## File: cli/src/serial.rs
+````rust
+// Copyright 2026 Curtis Galloway
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Serial console runtime: `tio` for an interactive terminal, and the
+//! `serialcap` daemon (which owns the port, captures a timestamped log, and
+//! accepts input over localhost HTTP so input coexists with capture).
+//!
+//! Ported from the Python `_serial.py`. serialcap's discovery file is
+//! `$XDG_RUNTIME_DIR/serialcap/daemon.json` (else the temp dir), holding
+//! `{pid, port, …}`; an interface is passed to the daemon as
+//! `NAME=DEVICE@BAUD[:SENSE]`.
+
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+use anyhow::{anyhow, bail, Result};
+
+use crate::daemons;
+use crate::model::SerialChannel;
+
+pub const DAEMON: &str = "serialcap";
+
+/// Default daemon port: 0 = OS-assigned. The discovery file carries the actual
+/// port and every consumer reads it, so a fixed default buys nothing and
+/// collides with stale `ssh -L` dashboard tunnels squatting the old 8724.
+pub const DEFAULT_PORT: u16 = 0;
+
+/// Base URL of the running serialcap daemon, or None if it isn't running.
+pub fn daemon_url() -> Option<String> {
+    daemons::daemon_url(DAEMON)
+}
+
+// ── daemon control ──────────────────────────────────────────────────────────
+
+/// Format one interface for the daemon's repeatable `--interface` flag:
+/// `NAME=DEVICE@BAUD[:SENSE]`.
+pub fn interface_arg(ch: &SerialChannel) -> String {
+    let mut arg = format!("{}={}@{}", ch.name, ch.device, ch.baud);
+    if let Some(sense) = &ch.power_sense_signal {
+        arg.push(':');
+        arg.push_str(sense);
+    }
+    arg
+}
+
+/// Start the serialcap daemon (owning every given interface), detached.
+/// The caller polls [`daemon_url`] for readiness.
+pub fn start_daemon(ifaces: &[SerialChannel], port: u16) -> Result<()> {
+    let binary = daemons::find_binary(DAEMON).ok_or_else(|| {
+        anyhow!("serialcap not found (PATH or ~/.cargo/bin) — run `paniolo setup`")
+    })?;
+    let mut cmd = Command::new(binary);
+    cmd.arg("daemon").arg("--port").arg(port.to_string());
+    for ch in ifaces {
+        cmd.arg("--interface").arg(interface_arg(ch));
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // Detach into its own process group so it survives this CLI exiting.
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    cmd.spawn()?;
+    Ok(())
+}
+
+/// Stop the running daemon via `serialcap stop` (it owns the clean shutdown).
+pub fn stop_daemon() -> Result<i32> {
+    let binary = daemons::find_binary(DAEMON).ok_or_else(|| anyhow!("serialcap not found"))?;
+    let status = Command::new(binary).arg("stop").status()?;
+    Ok(status.code().unwrap_or(1))
+}
+
+// ── input ───────────────────────────────────────────────────────────────────
+
+/// POST raw bytes to the serial port the daemon owns; input coexists with
+/// capture. `pace_ms > 0` drips bytes one at a time (the substitute for flow
+/// control on slow polled consoles), so the timeout is scaled to match.
+pub fn send_input(base_url: &str, interface: &str, data: &[u8], pace_ms: u32) -> Result<()> {
+    let mut url = format!("{base_url}/input?interface={interface}");
+    if pace_ms > 0 {
+        url.push_str(&format!("&pace_ms={pace_ms}"));
+    }
+    let timeout_ms = std::cmp::max(15_000, data.len() as u64 * pace_ms as u64 + 10_000);
+    ureq::post(&url)
+        .timeout(Duration::from_millis(timeout_ms))
+        .send_bytes(data)
+        .map(|_| ())
+        .map_err(|e| anyhow!("serialcap /input failed: {e}"))
+}
+
+// ── interactive console ─────────────────────────────────────────────────────
+
+/// Replace this process with `tio` on the given device (never returns on
+/// success).
+pub fn exec_tio(device: &str, baud: i64) -> Result<()> {
+    let tio = daemons::find_binary("tio")
+        .ok_or_else(|| anyhow!("tio not found in PATH — install it (e.g. brew install tio)"))?;
+    let err = std::os::unix::process::CommandExt::exec(
+        Command::new(tio)
+            .arg("--baudrate")
+            .arg(baud.to_string())
+            .arg(device),
+    );
+    bail!("exec tio failed: {err}")
+}
+
+// ── device listing ──────────────────────────────────────────────────────────
+
+/// Available serial device paths on this platform. On Linux, prefers the
+/// stable /dev/serial/by-path symlinks.
+pub fn list_devices() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if cfg!(target_os = "macos") {
+        if let Ok(rd) = std::fs::read_dir("/dev") {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if n.starts_with("tty.usbserial-") || n.starts_with("tty.usbmodem") {
+                    out.push(format!("/dev/{n}"));
+                }
+            }
+        }
+    } else {
+        if let Ok(rd) = std::fs::read_dir("/dev/serial/by-path") {
+            for e in rd.flatten() {
+                out.push(e.path().display().to_string());
+            }
+        }
+        if out.is_empty() {
+            if let Ok(rd) = std::fs::read_dir("/dev") {
+                for e in rd.flatten() {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    if n.starts_with("ttyUSB") || n.starts_with("ttyACM") {
+                        out.push(format!("/dev/{n}"));
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ch(name: &str, sense: Option<&str>) -> SerialChannel {
+        SerialChannel {
+            name: name.into(),
+            device: "/dev/ttyUSB0".into(),
+            baud: 115200,
+            power_sense_signal: sense.map(String::from),
+            host: None,
+        }
+    }
+
+    #[test]
+    fn interface_arg_formats_name_device_baud() {
+        assert_eq!(
+            interface_arg(&ch("console", None)),
+            "console=/dev/ttyUSB0@115200"
+        );
+    }
+
+    #[test]
+    fn interface_arg_appends_sense() {
+        assert_eq!(
+            interface_arg(&ch("console", Some("cts"))),
+            "console=/dev/ttyUSB0@115200:cts"
+        );
+    }
+}
 ````
 
 ## File: docs/distributed-control.md
@@ -14968,6 +16590,3827 @@ mod tests {
 }
 ````
 
+## File: src/paniolo/_hid.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Host control client for the KB2040 HID rig (see hidrig/).
+
+Sends line-based text commands to the control board over its USB CDC *data*
+port; the control board parses them and relays HID keyboard/mouse events to the
+target board, which injects them into the Pi over USB. The board owns the wire
+protocol — `hidrig/control/code.py` and `hidrig/README.md` are the source of
+truth. This module is a thin text-command client plus host-side sequencing.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import glob
+import sys
+import time
+import tomllib
+from typing import Callable, Optional
+
+from . import _config
+from ._config import _toml_kv
+
+HID_CONFIG_PATH = _config.CONFIG_DIR / "hid.toml"
+
+DEFAULT_BAUD = 115200  # irrelevant over USB CDC, but pyserial requires a value
+
+# Absolute-mouse logical range the OS spreads across the screen (HID convention).
+ABS_MAX = 32767
+
+
+@dataclasses.dataclass
+class HidConfig:
+    """Saved configuration for the HID control board."""
+
+    port: str
+
+
+def _to_toml(data: dict) -> str:
+    lines = [_toml_kv(k, v) for k, v in data.items() if v is not None]
+    return "\n".join(lines) + "\n"
+
+
+def save_hid_config(cfg: HidConfig) -> None:
+    _config.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    HID_CONFIG_PATH.write_text(_to_toml(dataclasses.asdict(cfg)))
+
+
+def load_hid_config() -> Optional[HidConfig]:
+    if not HID_CONFIG_PATH.exists():
+        return None
+    with open(HID_CONFIG_PATH, "rb") as f:
+        data = tomllib.load(f)
+    return HidConfig(port=data["port"])
+
+
+def list_serial_ports() -> list[str]:
+    """Candidate USB CDC ports for the control board."""
+    if sys.platform == "darwin":
+        return sorted(glob.glob("/dev/cu.usbmodem*"))
+    return sorted(glob.glob("/dev/ttyACM*"))
+
+
+def guess_data_port() -> Optional[str]:
+    """Best guess at the control board's *data* CDC port.
+
+    The board exposes two CDC ports (console + data); the data port is
+    conventionally the higher-numbered node. Returns None if no candidates.
+    """
+    ports = list_serial_ports()
+    return ports[-1] if ports else None
+
+
+def scale_to_logical(px: int, screen_px: int) -> int:
+    """Map a pixel coordinate to the 0..32767 absolute-mouse logical range.
+
+    The host OS maps that range across the full screen dimension, so callers
+    scale each pixel axis against the screen's size in that axis. Clamped.
+    """
+    if screen_px <= 1:
+        return 0
+    v = round(px * ABS_MAX / (screen_px - 1))
+    return max(0, min(ABS_MAX, v))
+
+
+class HidRig:
+    """Text-command client for the control board over USB serial.
+
+    Pass `transport` (any object with `write(bytes)`, `readline() -> bytes`,
+    `close()`) to drive it without real hardware (used by tests). Otherwise a
+    `pyserial` Serial port is opened lazily on the given `port`.
+    """
+
+    def __init__(
+        self,
+        port: Optional[str] = None,
+        baud: int = DEFAULT_BAUD,
+        timeout: float = 1.0,
+        transport=None,
+    ):
+        if transport is not None:
+            self._transport = transport
+            return
+        try:
+            import serial  # pylint: disable=import-outside-toplevel
+        except ImportError as exc:
+            raise RuntimeError(
+                "pyserial not installed — install the hid extra: "
+                "uv sync --extra hid  (or: pip install 'paniolo[hid]')"
+            ) from exc
+        if not port:
+            raise ValueError("no serial port given")
+        self._transport = serial.Serial(port, baud, timeout=timeout)
+        time.sleep(0.2)
+        self._transport.reset_input_buffer()
+
+    def cmd(self, text: str) -> str:
+        """Send one command line; return the board's reply, raise on ERR."""
+        if "\n" in text or "\r" in text:
+            raise ValueError(f"command contains newline: {text!r}")
+        self._transport.write((text + "\n").encode("utf-8"))
+        reply = self._transport.readline().decode("utf-8", "replace").strip()
+        if reply.startswith("ERR"):
+            raise RuntimeError(f"control board rejected '{text}': {reply}")
+        return reply
+
+    # Command wrappers — mirror hidrig/control/code.py's text protocol.
+    def type(self, text: str) -> str:
+        return self.cmd(f"type {text}")
+
+    def key(self, name: str) -> str:
+        return self.cmd(f"key {name}")
+
+    def combo(self, *names: str) -> str:
+        return self.cmd("combo " + " ".join(names))
+
+    def down(self, name: str) -> str:
+        return self.cmd(f"down {name}")
+
+    def up(self, name: str) -> str:
+        return self.cmd(f"up {name}")
+
+    def releaseall(self) -> str:
+        return self.cmd("releaseall")
+
+    def move(self, dx: int, dy: int) -> str:
+        return self.cmd(f"move {dx} {dy}")
+
+    def click(self, button: str = "left") -> str:
+        return self.cmd(f"click {button}")
+
+    def mdown(self, button: str = "left") -> str:
+        return self.cmd(f"mdown {button}")
+
+    def mup(self, button: str = "left") -> str:
+        return self.cmd(f"mup {button}")
+
+    def scroll(self, amount: int) -> str:
+        return self.cmd(f"scroll {amount}")
+
+    def close(self) -> None:
+        self._transport.close()
+
+
+# --- Host-side sequencing / timing (the board firmware stays dumb) ----------
+
+
+def parse_sequence(text: str) -> list[tuple[str, object]]:
+    """Parse a command file into steps.
+
+    Each non-blank, non-`#`-comment line is either a command or a timing
+    directive: `delay <ms>` or `sleep <seconds>`. Returns a list of
+    `("cmd", line)` / `("delay", seconds)` tuples.
+    """
+    steps: list[tuple[str, object]] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        head, _, rest = line.partition(" ")
+        low = head.lower()
+        if low == "delay":
+            try:
+                steps.append(("delay", float(rest) / 1000.0))
+            except ValueError as exc:
+                raise ValueError(f"invalid delay value: {rest!r}") from exc
+        elif low == "sleep":
+            try:
+                steps.append(("delay", float(rest)))
+            except ValueError as exc:
+                raise ValueError(f"invalid sleep value: {rest!r}") from exc
+        else:
+            steps.append(("cmd", line))
+    return steps
+
+
+def run_sequence(
+    rig: HidRig,
+    steps: list[tuple[str, object]],
+    default_delay: float = 0.0,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Execute parsed steps against `rig`. `sleep` is injectable for tests."""
+    for kind, value in steps:
+        if kind == "delay":
+            sleep(float(value))
+        else:
+            rig.cmd(str(value))
+            if default_delay:
+                sleep(default_delay)
+
+
+def repeat_key(
+    rig: HidRig,
+    name: str,
+    count: int,
+    delay: float = 0.0,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Tap a key `count` times with an inter-tap delay (auto-repeat)."""
+    for i in range(count):
+        rig.key(name)
+        if delay and i < count - 1:
+            sleep(delay)
+````
+
+## File: src/paniolo/_lab.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""The lab model: one git-tracked file describing all hosts and targets.
+
+A *lab* is a single TOML file (pointed at by ``--lab`` / ``PANIOLO_LAB``) that
+declares every control **host** paniolo reaches over SSH and every **target**,
+with each piece of a target's hardware bound to a host. See
+docs/distributed-control.md.
+
+```toml
+[hosts.bench1]
+ssh = "curtisg@bench1.local"     # required; "local" means the dev machine
+# identity = "~/.ssh/id_lab"     # optional
+# control_path = "~/.ssh/cm-%C"  # optional
+
+[targets.fortune]
+host = "bench1"                   # default host for this target's resources
+
+[targets.fortune.netboot]
+interface = "enx00e04c08d9a0"
+host_ip   = "192.168.99.1"
+tftp_root = "/home/curtisg/tftp/fortune"
+
+[[targets.fortune.serial]]
+name   = "console"
+device = "/dev/serial/by-id/usb-…"
+baud   = 115200
+
+[targets.fortune.power]
+cycle_cmd = "/path/cycle.sh"
+```
+
+**Per-resource host binding** (``host`` on any resource, defaulting to the
+target's ``host``, defaulting to ``local``) is parsed so the schema is ready for
+targets that span control hosts — but this first implementation **enforces that
+a target's resources all resolve to one host** and rejects cross-host targets.
+Resolution flattens a target down to the existing :class:`TargetConfig` plus the
+single :class:`~paniolo._ssh.Host` it lives on, so command bodies are unchanged.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import os
+import tomllib
+from pathlib import Path
+from typing import Optional
+
+from ._config import CONFIG_DIR, SerialInterface, TargetConfig
+from ._ssh import LOCAL, Host
+
+# Default host name when neither a resource nor its target names one.
+DEFAULT_HOST = LOCAL
+DEFAULT_HOST_IP = "192.168.99.1"
+
+# The lab file used when neither --lab nor PANIOLO_LAB is given.
+DEFAULT_LAB_PATH = str(CONFIG_DIR / "lab.toml")
+
+
+class LabError(RuntimeError):
+    """The lab file is malformed or describes something unsupported."""
+
+
+def _without_host(d: dict, drop: tuple[str, ...] = ()) -> dict:
+    """A channel's scalar fields, minus ``host`` and any explicitly dropped keys."""
+    skip = {"host", *drop}
+    return {k: v for k, v in d.items() if k not in skip}
+
+
+@dataclasses.dataclass
+class ResolvedChannel:
+    """One channel of a target, with its physical host resolved.
+
+    ``kind`` is the channel type ("netboot" | "serial" | "power" | "video");
+    ``name`` is the serial interface name, or the kind for singleton channels.
+    ``host`` is the host the channel resolves to (its own ``host``, else the
+    target's default). ``fields`` holds the remaining scalar config.
+    """
+
+    kind: str
+    name: str
+    host: str
+    fields: dict
+
+
+@dataclasses.dataclass
+class ResolvedTarget:
+    """A target's channels with per-channel hosts resolved (no single-host rule)."""
+
+    name: str
+    default_host: str
+    note: Optional[str]
+    channels: list[ResolvedChannel]
+
+    def hosts(self) -> list[str]:
+        """The distinct hosts this target's channels live on."""
+        return sorted({c.host for c in self.channels} or {self.default_host})
+
+
+@dataclasses.dataclass
+class Lab:
+    """A parsed lab: named hosts plus raw target tables (resolved on demand)."""
+
+    hosts: dict[str, Host]
+    targets: dict[str, dict]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Lab":
+        hosts: dict[str, Host] = {}
+        for name, h in (data.get("hosts") or {}).items():
+            if "ssh" not in h:
+                raise LabError(f"host '{name}': missing required 'ssh' field")
+            hosts[name] = Host(
+                name=name,
+                ssh=h["ssh"],
+                identity=h.get("identity"),
+                control_path=h.get("control_path"),
+                paniolo_cmd=h.get("paniolo_cmd"),
+            )
+        targets = data.get("targets") or {}
+        return cls(hosts=hosts, targets=targets)
+
+    def target_names(self) -> list[str]:
+        return sorted(self.targets)
+
+    def _host(self, name: str) -> Host:
+        if name == LOCAL:
+            # The dev machine is implicit; an explicit [hosts.local] may override.
+            return self.hosts.get(LOCAL, Host(name=LOCAL, ssh=LOCAL))
+        if name not in self.hosts:
+            raise LabError(f"reference to unknown host '{name}'")
+        return self.hosts[name]
+
+    def resolve_target(self, name: str) -> tuple[TargetConfig, Host]:
+        """Flatten a target to a (TargetConfig, Host), enforcing one host.
+
+        Raises KeyError if the target is unknown, LabError if its resources span
+        more than one host (not yet supported) or reference an unknown host.
+        """
+        if name not in self.targets:
+            raise KeyError(name)
+        t = self.targets[name]
+        default_host = t.get("host", DEFAULT_HOST)
+        used: set[str] = set()
+
+        netboot = t.get("netboot") or {}
+        if netboot:
+            used.add(netboot.get("host", default_host))
+
+        serial_interfaces: list[SerialInterface] = []
+        for s in t.get("serial") or []:
+            if "name" not in s or "device" not in s:
+                raise LabError(f"target '{name}': each [[serial]] needs name + device")
+            serial_interfaces.append(
+                SerialInterface(
+                    name=s["name"],
+                    device=s["device"],
+                    baud=int(s.get("baud", 115200)),
+                    power_sense_signal=s.get("power_sense_signal"),
+                )
+            )
+            used.add(s.get("host", default_host))
+
+        power = t.get("power") or {}
+        if power:
+            used.add(power.get("host", default_host))
+
+        if not used:
+            used.add(default_host)
+        if len(used) > 1:
+            raise LabError(
+                f"target '{name}' spans multiple hosts {sorted(used)}; "
+                "multi-host targets are not yet supported"
+            )
+
+        cfg = TargetConfig(
+            name=name,
+            interface=netboot.get("interface", ""),
+            host_ip=netboot.get("host_ip", DEFAULT_HOST_IP),
+            tftp_root=netboot.get("tftp_root"),
+            power_cycle_cmd=power.get("cycle_cmd"),
+            power_serial_interface=power.get("serial_interface"),
+            serial_interfaces=serial_interfaces,
+        )
+        return cfg, self._host(next(iter(used)))
+
+    def host_slice(self, name: str, host_name: str) -> TargetConfig:
+        """Flatten the channels of ``name`` that live on ``host_name`` to a config.
+
+        This is the slice a single host sees — what runs locally on the dev
+        machine (``host_name == "local"``) and what is shipped to a control host
+        for remote re-exec. Channels on *other* hosts are omitted, so the result
+        is always single-host. Raises KeyError if the target is unknown.
+        """
+        rt = self.resolved_target(name)
+        serial_interfaces: list[SerialInterface] = []
+        netboot: dict = {}
+        power: dict = {}
+        for ch in rt.channels:
+            if ch.host != host_name:
+                continue
+            if ch.kind == "serial":
+                serial_interfaces.append(
+                    SerialInterface(
+                        name=ch.name,
+                        device=ch.fields.get("device", ""),
+                        baud=int(ch.fields.get("baud", 115200)),
+                        power_sense_signal=ch.fields.get("power_sense_signal"),
+                    )
+                )
+            elif ch.kind == "netboot":
+                netboot = ch.fields
+            elif ch.kind == "power":
+                power = ch.fields
+        return TargetConfig(
+            name=name,
+            interface=netboot.get("interface", ""),
+            host_ip=netboot.get("host_ip", DEFAULT_HOST_IP),
+            tftp_root=netboot.get("tftp_root"),
+            power_cycle_cmd=power.get("cycle_cmd"),
+            power_serial_interface=power.get("serial_interface"),
+            serial_interfaces=serial_interfaces,
+        )
+
+    def resolved_target(self, name: str) -> ResolvedTarget:
+        """Flatten a target to its channels with per-channel hosts resolved.
+
+        Unlike :meth:`resolve_target`, this imposes no single-host rule — it is
+        the read view, and the basis for per-channel dispatch. Raises KeyError
+        if the target is unknown.
+        """
+        if name not in self.targets:
+            raise KeyError(name)
+        t = self.targets[name]
+        default_host = t.get("host", DEFAULT_HOST)
+        channels: list[ResolvedChannel] = []
+
+        nb = t.get("netboot")
+        if nb:
+            channels.append(
+                ResolvedChannel(
+                    "netboot",
+                    "netboot",
+                    nb.get("host", default_host),
+                    _without_host(nb),
+                )
+            )
+        for s in t.get("serial") or []:
+            channels.append(
+                ResolvedChannel(
+                    "serial",
+                    s.get("name", ""),
+                    s.get("host", default_host),
+                    _without_host(s, drop=("name",)),
+                )
+            )
+        for kind in ("power", "video"):
+            c = t.get(kind)
+            if c:
+                channels.append(
+                    ResolvedChannel(
+                        kind, kind, c.get("host", default_host), _without_host(c)
+                    )
+                )
+        return ResolvedTarget(name, default_host, t.get("note"), channels)
+
+    def channels_on_host(self, host: str) -> list[tuple[str, ResolvedChannel]]:
+        """Every (target, channel) pair whose channel resolves to ``host``."""
+        out: list[tuple[str, ResolvedChannel]] = []
+        for tname in self.target_names():
+            for ch in self.resolved_target(tname).channels:
+                if ch.host == host:
+                    out.append((tname, ch))
+        return out
+
+
+def propose_target_block(name: str, host: str, inventory: dict) -> str:
+    """Render a proposed ``[targets.<name>]`` lab block from a host's hardware.
+
+    ``inventory`` is the shape emitted by ``paniolo discover --json``:
+    ``{"ethernet": [{device, active, ...}], "serial": [path, ...], ...}``. One
+    value is best-guessed per field (a carrier-up interface, the first serial as
+    ``console``); other candidates are listed as comments. Power and tftp_root
+    aren't discoverable, so they're left as commented stubs. The result is meant
+    to be reviewed, pasted into the lab file, and committed — paniolo never
+    writes it for you.
+    """
+    eths = sorted(inventory.get("ethernet") or [], key=lambda e: (not e.get("active"),))
+    serials = inventory.get("serial") or []
+    out = [f"[targets.{name}]", f'host = "{host}"', ""]
+
+    out.append(f"[targets.{name}.netboot]")
+    if eths:
+        note = "  # carrier up" if eths[0].get("active") else ""
+        out.append(f'interface = "{eths[0]["device"]}"{note}')
+        for e in eths[1:]:
+            out.append(f'# interface = "{e["device"]}"  # alternative')
+    else:
+        out.append('# interface = ""  # no USB-Ethernet interface discovered')
+    out.append('# tftp_root = "/path/to/tftp"  # set to enable netboot')
+    out.append("")
+
+    if serials:
+        out.append(f"[[targets.{name}.serial]]")
+        out.append('name = "console"')
+        out.append(f'device = "{serials[0]}"')
+        out.append("baud = 115200")
+        for extra in serials[1:]:
+            out.append(f"# another serial device: {extra}")
+    else:
+        out.append(f"# [[targets.{name}.serial]]  # no serial devices discovered")
+    out.append("")
+    out.append(f"# [targets.{name}.power]")
+    out.append('# cycle_cmd = "/path/to/power-cycle.sh"  # not discoverable')
+    return "\n".join(out).rstrip() + "\n"
+
+
+def load_lab(path: str) -> Lab:
+    with open(os.path.expanduser(path), "rb") as f:
+        data = tomllib.load(f)
+    return Lab.from_dict(data)
+
+
+# ── "which lab" resolution ───────────────────────────────────────────────────
+
+_override_path: Optional[str] = None
+
+
+def set_lab_path(path: Optional[str]) -> None:
+    """Record a lab path from the CLI (--lab), overriding PANIOLO_LAB."""
+    global _override_path
+    _override_path = path
+
+
+def lab_path() -> Optional[str]:
+    """The active lab file path.
+
+    Resolution order: ``--lab`` (recorded via :func:`set_lab_path`), then
+    ``$PANIOLO_LAB``, then the default ``~/.config/paniolo/lab.toml`` *if it
+    exists*. Returns None when none of those resolve, leaving the legacy
+    per-target files in play until they are retired.
+    """
+    explicit = _override_path or os.environ.get("PANIOLO_LAB")
+    if explicit:
+        return explicit
+    if Path(os.path.expanduser(DEFAULT_LAB_PATH)).exists():
+        return DEFAULT_LAB_PATH
+    return None
+
+
+def load() -> Optional[Lab]:
+    """Load the active lab, or None when none is configured (legacy mode)."""
+    path = lab_path()
+    if not path:
+        return None
+    if not Path(os.path.expanduser(path)).exists():
+        raise LabError(f"lab file not found: {path}")
+    return load_lab(path)
+````
+
+## File: src/paniolo/_netif.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Switch the target's USB-Ethernet link between netboot and ffx modes.
+
+Both modes share one physical point-to-point link (the USB-Ethernet dongle to
+the Pi's RP1 GEM). They are mutually exclusive:
+
+  netboot — IPv4 ``host_ip``/24 + DHCP + TFTP (the daemons managed by
+            ``_netboot``). The Pi TFTP-boots a kernel + ramdisk.
+
+  ffx     — IPv6 link-local (``fe80::1``/64) on the host interface, with **no**
+            DHCP/TFTP. The Pi boots from its SD card and is reached over ffx at
+            ``fe80::<dev-slaac>%<iface>``.
+
+``netif mode`` makes the transition atomic and removes the two highest-cost
+seams of doing it by hand:
+
+  1. Switching to ``ffx`` stops netboot *first*, so the next power-cycle falls
+     through to the SD card instead of silently TFTP-booting a stale image.
+  2. Switching to ``ffx`` adds the host-side ``fe80::1``/64 that ffx needs and
+     that nothing else sets up — no manual ``sudo ip -6 addr add``.
+
+Every mode is idempotent and re-runnable. The IPv6 link-local is ephemeral
+(lost on a control-host reboot), so ``mode ffx`` simply re-adds it when absent.
+The active mode is *probed* (from the running daemons and the interface's
+addresses), not stored, so it stays correct even after a reboot clears things.
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+
+from ._config import TargetConfig
+from . import _netboot
+from ._state import is_netboot_running
+
+# The host-side IPv6 link-local that ffx talks through. Any LL works on a
+# point-to-point link; ::1 is the conventional, easy-to-type choice and matches
+# the manual recipe (`sudo ip -6 addr add fe80::1/64 dev <iface>`).
+FFX_HOST_LL = "fe80::1"
+FFX_PREFIX = 64
+
+MODES = ("netboot", "ffx", "off")
+
+_SUDO_HINT = (
+    "Ensure passwordless sudo is configured (NOPASSWD) for the control machine."
+)
+
+
+# ── interface address probing ──────────────────────────────────────────────
+
+
+def iface_addresses(interface: str) -> dict:
+    """Return the interface's assigned addresses as {"inet": [...], "inet6": [...]}.
+
+    IPv6 addresses keep their scope suffix stripped (``fe80::1%enx0`` → ``fe80::1``)
+    but retain any prefix length (``fe80::1/64``) so callers can match exactly.
+    """
+    inet: list[str] = []
+    inet6: list[str] = []
+    if sys.platform == "darwin":
+        result = subprocess.run(
+            ["ifconfig", interface], capture_output=True, text=True, check=False
+        )
+        for line in result.stdout.splitlines():
+            s = line.strip()
+            if s.startswith("inet "):
+                inet.append(s.split()[1])
+            elif s.startswith("inet6 "):
+                inet6.append(s.split()[1].split("%", 1)[0])
+        return {"inet": inet, "inet6": inet6}
+
+    result = subprocess.run(
+        ["ip", "-brief", "addr", "show", "dev", interface],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        # `ip -brief` columns: <iface> <state> <addr> <addr> ...
+        for addr in result.stdout.split()[2:]:
+            (inet6 if ":" in addr else inet).append(addr)
+    return {"inet": inet, "inet6": inet6}
+
+
+def _has_host_ll(addrs: dict) -> bool:
+    """True if the ffx host link-local is currently assigned to the interface."""
+    return any(a.split("/", 1)[0] == FFX_HOST_LL for a in addrs["inet6"])
+
+
+def ipv6_peers(interface: str) -> list[str]:
+    """Link-local IPv6 neighbours discovered on the interface (Linux only).
+
+    Surfaces the device's own ``fe80::…`` address for a ready-to-paste
+    ``ffx target add fe80::…%<iface>`` without scraping the serial log. Excludes
+    our own host LL. Returns [] on macOS or when nothing has been discovered.
+    """
+    if sys.platform == "darwin":
+        return []
+    result = subprocess.run(
+        ["ip", "-6", "neigh", "show", "dev", interface],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    peers: list[str] = []
+    for line in result.stdout.splitlines():
+        toks = line.split()
+        if toks and toks[0].startswith("fe80:") and toks[0] != FFX_HOST_LL:
+            peers.append(toks[0])
+    return peers
+
+
+# ── privileged interface mutation ──────────────────────────────────────────
+
+
+def _add_host_ll(interface: str) -> None:
+    """Add the ffx host link-local to the interface (idempotent)."""
+    if sys.platform == "darwin":
+        # macOS auto-assigns a link-local already; aliasing in fe80::1 is
+        # best-effort and harmless if it already exists.
+        subprocess.run(
+            [
+                "sudo",
+                "ifconfig",
+                interface,
+                "inet6",
+                FFX_HOST_LL,
+                "prefixlen",
+                str(FFX_PREFIX),
+                "up",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return
+
+    # IPv6 may be disabled on a fresh secondary interface; enable it. Use the
+    # '/'-separated sysctl key form so interface names are passed literally.
+    subprocess.run(
+        ["sudo", "sysctl", "-w", f"net/ipv6/conf/{interface}/disable_ipv6=0"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    subprocess.run(["sudo", "ip", "link", "set", interface, "up"], check=False)
+    result = subprocess.run(
+        [
+            "sudo",
+            "ip",
+            "-6",
+            "addr",
+            "add",
+            f"{FFX_HOST_LL}/{FFX_PREFIX}",
+            "dev",
+            interface,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0 and "exists" not in result.stderr.lower():
+        raise RuntimeError(
+            f"ip -6 addr add {FFX_HOST_LL}/{FFX_PREFIX} dev {interface} failed: "
+            f"{result.stderr.strip()}\n{_SUDO_HINT}"
+        )
+
+
+def _del_host_ll(interface: str) -> None:
+    """Remove the ffx host link-local from the interface (best-effort)."""
+    if sys.platform == "darwin":
+        subprocess.run(
+            ["sudo", "ifconfig", interface, "inet6", FFX_HOST_LL, "-alias"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return
+    subprocess.run(
+        [
+            "sudo",
+            "ip",
+            "-6",
+            "addr",
+            "del",
+            f"{FFX_HOST_LL}/{FFX_PREFIX}",
+            "dev",
+            interface,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _del_host_ip(interface: str, host_ip: str) -> None:
+    """Remove a lingering netboot IPv4 from the interface (Linux, best-effort).
+
+    Targets only ``host_ip``/24 so we never touch an unrelated address. macOS
+    teardown goes through ``networksetup -setdhcp`` in ``_netboot`` instead.
+    """
+    if sys.platform == "darwin":
+        return
+    subprocess.run(
+        ["sudo", "ip", "addr", "del", f"{host_ip}/24", "dev", interface],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+# ── mode transitions ───────────────────────────────────────────────────────
+
+
+def mode_netboot(cfg: TargetConfig, engine: str = "rust") -> None:
+    """Put the link in netboot mode: tear down ffx, start DHCP+TFTP.
+
+    Idempotent: if netboot is already running it is left as-is (the ffx
+    link-local is still cleared). ``_netboot.start`` itself enforces the
+    primary-NIC guard and configures the IPv4 host address.
+    """
+    _del_host_ll(cfg.interface)
+    if is_netboot_running(cfg.name):
+        return
+    _netboot.start(cfg, engine=engine)
+
+
+def mode_ffx(cfg: TargetConfig) -> None:
+    """Put the link in ffx mode: stop netboot, add the host IPv6 link-local.
+
+    Stopping netboot first is the point of this command — it means the next
+    power-cycle boots from SD instead of TFTP. Re-running re-adds the ephemeral
+    link-local if a control-host reboot cleared it.
+    """
+    if is_netboot_running(cfg.name):
+        _netboot.stop(cfg.name)
+    _add_host_ll(cfg.interface)
+
+
+def mode_off(cfg: TargetConfig) -> None:
+    """Drop both configs: stop netboot, remove the ffx LL and any stale IPv4."""
+    if is_netboot_running(cfg.name):
+        # _netboot.stop restores the interface (flushes the IPv4 host address).
+        _netboot.stop(cfg.name)
+    _del_host_ll(cfg.interface)
+    _del_host_ip(cfg.interface, cfg.host_ip)
+
+
+# ── status ─────────────────────────────────────────────────────────────────
+
+
+def get_status(cfg: TargetConfig) -> dict:
+    """Probe and report the active mode plus the interface's addresses.
+
+    ``mode`` is derived, not stored: netboot daemons running → ``netboot``; else
+    the ffx host LL present → ``ffx``; else ``off``.
+    """
+    netboot_running = is_netboot_running(cfg.name)
+    addrs = iface_addresses(cfg.interface)
+    has_ll = _has_host_ll(addrs)
+
+    if netboot_running:
+        mode = "netboot"
+    elif has_ll:
+        mode = "ffx"
+    else:
+        mode = "off"
+
+    return {
+        "target": cfg.name,
+        "interface": cfg.interface,
+        "mode": mode,
+        "netboot_running": netboot_running,
+        "host_ip": cfg.host_ip,
+        "host_ll": FFX_HOST_LL if has_ll else None,
+        "inet": addrs["inet"],
+        "inet6": addrs["inet6"],
+        "peers": ipv6_peers(cfg.interface) if mode == "ffx" else [],
+    }
+````
+
+## File: src/paniolo/_ocr.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""OCR helpers — wraps platform OCR tools.
+
+- macOS: `visionocr` (Apple Vision framework, compiled from ocr/visionocr.swift)
+- Linux: `linuxocr` (Tesseract-backed, from ocr/linuxocr)
+
+Both tools share the same interface: read PNG on stdin, print text on stdout.
+"""
+
+from __future__ import annotations
+
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Optional
+
+from ._paths import repo_root
+
+_NO_REPO = (
+    "paniolo source checkout not found; run `paniolo setup` from a clone "
+    "(e.g. `make install`) so the OCR helper can be built from source"
+)
+
+
+def visionocr_binary() -> Optional[str]:
+    """Return the installed visionocr path: PATH, then ~/.cargo/bin. None if absent."""
+    found = shutil.which("visionocr")
+    if found:
+        return found
+    cargo_bin = Path.home() / ".cargo" / "bin" / "visionocr"
+    return str(cargo_bin) if cargo_bin.exists() else None
+
+
+def visionocr_source() -> Optional[Path]:
+    """Path to the visionocr Swift source in the repo (for `paniolo setup`).
+
+    None when no source checkout can be located (e.g. an installed CLI run from
+    outside a clone).
+    """
+    root = repo_root()
+    return root / "ocr" / "visionocr.swift" if root else None
+
+
+def build_visionocr(dest: Path) -> None:
+    """Compile visionocr.swift to `dest` (used by `paniolo setup`). Raises on error."""
+    source = visionocr_source()
+    if source is None:
+        raise FileNotFoundError(_NO_REPO)
+    if not source.exists():
+        raise FileNotFoundError(f"visionocr source not found: {source}")
+    if not shutil.which("swiftc"):
+        raise FileNotFoundError("swiftc not found (install Xcode command line tools)")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["swiftc", "-O", "-o", str(dest), str(source)], check=True)
+
+
+def linuxocr_binary() -> Optional[str]:
+    """Return the installed linuxocr path: PATH, then ~/.cargo/bin. None if absent."""
+    found = shutil.which("linuxocr")
+    if found:
+        return found
+    cargo_bin = Path.home() / ".cargo" / "bin" / "linuxocr"
+    return str(cargo_bin) if cargo_bin.exists() else None
+
+
+def linuxocr_source() -> Optional[Path]:
+    """Path to the linuxocr Python script in the repo (for `paniolo setup`).
+
+    None when no source checkout can be located (e.g. an installed CLI run from
+    outside a clone).
+    """
+    root = repo_root()
+    return root / "ocr" / "linuxocr" if root else None
+
+
+def install_linuxocr(dest: Path) -> None:
+    """Copy ocr/linuxocr to `dest` and make it executable (used by `paniolo setup`)."""
+    source = linuxocr_source()
+    if source is None:
+        raise FileNotFoundError(_NO_REPO)
+    if not source.exists():
+        raise FileNotFoundError(f"linuxocr source not found: {source}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, dest)
+    dest.chmod(0o755)
+
+
+def ocr_binary() -> Optional[str]:
+    """Return the platform OCR binary: visionocr on macOS, linuxocr on Linux."""
+    if sys.platform == "darwin":
+        return visionocr_binary()
+    return linuxocr_binary()
+
+
+def read_text(png: bytes, fast: bool = False, as_json: bool = False) -> str:
+    """OCR PNG bytes and return recognized text (or JSON with bboxes).
+
+    `fast` is only meaningful on macOS (visionocr --fast); ignored on Linux.
+    `as_json` requests bounding-box JSON output; not yet supported on Linux.
+    """
+    binary = ocr_binary()
+    if not binary:
+        platform = "macOS" if sys.platform == "darwin" else "Linux"
+        tool = "visionocr" if sys.platform == "darwin" else "linuxocr"
+        raise FileNotFoundError(
+            f"{tool} not installed on {platform} — run: paniolo setup"
+        )
+    cmd = [binary]
+    if sys.platform == "darwin":
+        if fast:
+            cmd.append("--fast")
+        if as_json:
+            cmd.append("--json")
+    cmd.append("-")
+    result = subprocess.run(cmd, input=png, capture_output=True, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(
+            result.stderr.decode(errors="replace").strip() or f"{binary} failed"
+        )
+    return result.stdout.decode(errors="replace")
+````
+
+## File: tests/test_config.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for target config (de)serialization and serial-interface helpers."""
+
+from __future__ import annotations
+
+import tomllib
+
+import pytest
+
+from paniolo import _config
+from paniolo._config import SerialInterface, TargetConfig
+
+# pylint: disable=protected-access
+
+
+def roundtrip(cfg: TargetConfig) -> TargetConfig:
+    return _config._from_dict(tomllib.loads(_config._to_toml(cfg)))
+
+
+def test_roundtrip_multiple_interfaces():
+    cfg = TargetConfig(
+        name="fortune",
+        interface="en3",
+        tftp_root="/pxe",
+        serial_interfaces=[
+            SerialInterface("console", "/dev/ttyUSB0", 115200),
+            SerialInterface("bmc", "/dev/ttyUSB1", 9600),
+        ],
+    )
+    got = roundtrip(cfg)
+    assert (got.name, got.interface, got.tftp_root) == ("fortune", "en3", "/pxe")
+    assert [(i.name, i.device, i.baud) for i in got.serial_interfaces] == [
+        ("console", "/dev/ttyUSB0", 115200),
+        ("bmc", "/dev/ttyUSB1", 9600),
+    ]
+
+
+def test_roundtrip_no_interfaces():
+    got = roundtrip(TargetConfig(name="x", interface="en0"))
+    assert not got.serial_interfaces
+
+
+def test_legacy_single_serial_migrates():
+    data = tomllib.loads(
+        'name = "x"\ninterface = "en0"\n'
+        'serial_device = "/dev/ttyUSB0"\nserial_baud = 57600\n'
+    )
+    cfg = _config._from_dict(data)
+    assert len(cfg.serial_interfaces) == 1
+    iface = cfg.serial_interfaces[0]
+    assert (iface.name, iface.device, iface.baud) == (
+        _config.DEFAULT_SERIAL_NAME,
+        "/dev/ttyUSB0",
+        57600,
+    )
+
+
+def test_legacy_default_baud():
+    data = tomllib.loads(
+        'name = "x"\ninterface = "en0"\nserial_device = "/dev/ttyUSB0"\n'
+    )
+    assert _config._from_dict(data).serial_interfaces[0].baud == 115200
+
+
+def test_serial_interface_resolution():
+    cfg = TargetConfig(
+        name="x",
+        interface="en0",
+        serial_interfaces=[
+            SerialInterface("console", "/dev/a"),
+            SerialInterface("bmc", "/dev/b"),
+        ],
+    )
+    assert cfg.serial_interface("bmc").device == "/dev/b"
+    with pytest.raises(ValueError):
+        cfg.serial_interface()  # ambiguous
+    with pytest.raises(ValueError):
+        cfg.serial_interface("nope")  # unknown
+
+
+def test_serial_interface_single_is_default():
+    cfg = TargetConfig(
+        name="x",
+        interface="en0",
+        serial_interfaces=[SerialInterface("console", "/dev/a")],
+    )
+    assert cfg.serial_interface().name == "console"
+
+
+def test_serial_interface_none_configured():
+    with pytest.raises(ValueError):
+        TargetConfig(name="x", interface="en0").serial_interface()
+
+
+def test_upsert_replaces_same_name():
+    cfg = TargetConfig(name="x", interface="en0")
+    cfg.upsert_serial_interface(SerialInterface("console", "/dev/a", 115200))
+    cfg.upsert_serial_interface(SerialInterface("console", "/dev/a2", 9600))
+    assert len(cfg.serial_interfaces) == 1
+    assert (cfg.serial_interfaces[0].device, cfg.serial_interfaces[0].baud) == (
+        "/dev/a2",
+        9600,
+    )
+
+
+def test_remove_interface():
+    cfg = TargetConfig(
+        name="x",
+        interface="en0",
+        serial_interfaces=[
+            SerialInterface("console", "/dev/a"),
+            SerialInterface("bmc", "/dev/b"),
+        ],
+    )
+    assert cfg.remove_serial_interface("console") is True
+    assert cfg.remove_serial_interface("console") is False
+    assert [i.name for i in cfg.serial_interfaces] == ["bmc"]
+
+
+# --- S2: TOML control-character escaping -----------------------------------
+
+
+def test_toml_roundtrip_newline_in_power_cycle_cmd():
+    """Newlines in string values must survive a TOML round-trip without
+    breaking the file."""
+    cfg = TargetConfig(name="x", interface="en0", power_cycle_cmd="cmd1\ncmd2")
+    got = roundtrip(cfg)
+    assert got.power_cycle_cmd == "cmd1\ncmd2"
+
+
+def test_toml_roundtrip_tab_and_cr():
+    cfg = TargetConfig(name="x", interface="en0", power_cycle_cmd="a\tb\rc")
+    got = roundtrip(cfg)
+    assert got.power_cycle_cmd == "a\tb\rc"
+
+
+def test_toml_kv_escapes_backslash():
+    line = _config._toml_kv("k", "a\\b")
+    assert line == 'k = "a\\\\b"'
+    parsed = tomllib.loads(line)
+    assert parsed["k"] == "a\\b"
+
+
+# --- C2: unknown TOML keys are ignored gracefully --------------------------
+
+
+def test_unknown_keys_in_toml_are_silently_dropped():
+    data = tomllib.loads('name = "x"\ninterface = "en0"\nunknown_future_key = "foo"\n')
+    cfg = _config._from_dict(data)
+    assert cfg.name == "x"
+    assert not hasattr(cfg, "unknown_future_key")
+````
+
+## File: tests/test_hid.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Host-side tests for the HID rig client — no hardware, no pyserial."""
+
+from __future__ import annotations
+
+import pytest
+
+from paniolo import _hid
+
+
+class FakeTransport:
+    """Stand-in for a pyserial port: records writes, replies from a queue."""
+
+    def __init__(self, replies=None):
+        self.writes: list[bytes] = []
+        self._replies = list(replies) if replies else []
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        self.writes.append(data)
+
+    def readline(self) -> bytes:
+        return self._replies.pop(0) if self._replies else b"OK\n"
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def make_rig(replies=None):
+    t = FakeTransport(replies)
+    return _hid.HidRig(transport=t), t
+
+
+# --- command construction ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "call, expected",
+    [
+        (lambda r: r.type("hello world"), b"type hello world\n"),
+        (lambda r: r.key("ENTER"), b"key ENTER\n"),
+        (lambda r: r.combo("LEFT_CONTROL", "C"), b"combo LEFT_CONTROL C\n"),
+        (lambda r: r.down("LEFT_SHIFT"), b"down LEFT_SHIFT\n"),
+        (lambda r: r.up("LEFT_SHIFT"), b"up LEFT_SHIFT\n"),
+        (lambda r: r.releaseall(), b"releaseall\n"),
+        (lambda r: r.move(300, -50), b"move 300 -50\n"),
+        (lambda r: r.click(), b"click left\n"),
+        (lambda r: r.click("right"), b"click right\n"),
+        (lambda r: r.mdown("middle"), b"mdown middle\n"),
+        (lambda r: r.mup("middle"), b"mup middle\n"),
+        (lambda r: r.scroll(-3), b"scroll -3\n"),
+    ],
+)
+def test_command_construction(call, expected):
+    rig, t = make_rig()
+    call(rig)
+    assert t.writes == [expected]
+
+
+def test_cmd_returns_reply():
+    rig, _ = make_rig(replies=[b"OK\n"])
+    assert rig.cmd("releaseall") == "OK"
+
+
+def test_cmd_raises_on_err():
+    rig, _ = make_rig(replies=[b"ERR unknown command: frob\n"])
+    with pytest.raises(RuntimeError, match="control board rejected"):
+        rig.cmd("frob")
+
+
+def test_close_delegates():
+    rig, t = make_rig()
+    rig.close()
+    assert t.closed
+
+
+# --- absolute-mouse scaling -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "px, screen, expected",
+    [
+        (0, 1920, 0),
+        (1919, 1920, 32767),
+        (960, 1920, 16392),
+        (-100, 1920, 0),  # clamp low
+        (99999, 1920, 32767),  # clamp high
+        (5, 1, 0),  # degenerate screen size
+    ],
+)
+def test_scale_to_logical(px, screen, expected):
+    assert _hid.scale_to_logical(px, screen) == expected
+
+
+# --- sequence parsing -------------------------------------------------------
+
+
+def test_parse_sequence_skips_blanks_and_comments():
+    text = "\n# a comment\n  \nkey ENTER\n# another\ntype hi\n"
+    assert _hid.parse_sequence(text) == [("cmd", "key ENTER"), ("cmd", "type hi")]
+
+
+def test_parse_sequence_timing_directives():
+    text = "delay 250\nkey A\nsleep 2\n"
+    assert _hid.parse_sequence(text) == [
+        ("delay", 0.25),
+        ("cmd", "key A"),
+        ("delay", 2.0),
+    ]
+
+
+def test_run_sequence_executes_in_order_with_delays():
+    rig, t = make_rig(replies=[b"OK\n", b"OK\n"])
+    slept: list[float] = []
+    steps = [("cmd", "key A"), ("delay", 0.5), ("cmd", "type hi")]
+    _hid.run_sequence(rig, steps, default_delay=0.0, sleep=slept.append)
+    assert t.writes == [b"key A\n", b"type hi\n"]
+    assert slept == [0.5]
+
+
+def test_run_sequence_default_delay_between_commands():
+    rig, _ = make_rig(replies=[b"OK\n", b"OK\n"])
+    slept: list[float] = []
+    steps = [("cmd", "key A"), ("cmd", "key B")]
+    _hid.run_sequence(rig, steps, default_delay=0.1, sleep=slept.append)
+    assert slept == [0.1, 0.1]
+
+
+def test_repeat_key():
+    rig, t = make_rig(replies=[b"OK\n"] * 3)
+    slept: list[float] = []
+    _hid.repeat_key(rig, "TAB", 3, delay=0.2, sleep=slept.append)
+    assert t.writes == [b"key TAB\n"] * 3
+    assert slept == [0.2, 0.2]  # no trailing delay after the last tap
+
+
+# --- S3: newline injection guard -------------------------------------------
+
+
+def test_cmd_rejects_newline():
+    rig, _ = make_rig()
+    with pytest.raises(ValueError, match="newline"):
+        rig.cmd("type hello\nkey ENTER")
+
+
+def test_cmd_rejects_carriage_return():
+    rig, _ = make_rig()
+    with pytest.raises(ValueError, match="newline"):
+        rig.cmd("type hello\rworld")
+
+
+def test_type_rejects_embedded_newline():
+    rig, _ = make_rig()
+    with pytest.raises(ValueError, match="newline"):
+        rig.type("line1\nline2")
+
+
+# --- C3: parse_sequence error messages -------------------------------------
+
+
+def test_parse_sequence_bad_delay_raises_friendly_error():
+    with pytest.raises(ValueError, match="invalid delay value"):
+        _hid.parse_sequence("delay abc\nkey A\n")
+
+
+def test_parse_sequence_bad_sleep_raises_friendly_error():
+    with pytest.raises(ValueError, match="invalid sleep value"):
+        _hid.parse_sequence("sleep xyz\n")
+````
+
+## File: tests/test_lab.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for the lab-file model (_lab.py): parsing, host resolution, the
+single-host (multi-host-rejecting) constraint, and lab-path selection."""
+
+from __future__ import annotations
+
+import tomllib
+
+import pytest
+
+from paniolo import _lab
+from paniolo._lab import Lab, LabError
+
+# A representative single-host lab spanning every resource kind.
+_LAB = {
+    "hosts": {
+        "bench1": {"ssh": "curtisg@bench1.local", "identity": "~/.ssh/id_lab"},
+        "bench2": {"ssh": "curtisg@bench2.local"},
+    },
+    "targets": {
+        "fortune": {
+            "host": "bench1",
+            "netboot": {
+                "interface": "enx00e04c08d9a0",
+                "tftp_root": "/srv/tftp/fortune",
+            },
+            "serial": [
+                {"name": "console", "device": "/dev/ttyUSB0", "baud": 115200},
+                {"name": "bmc", "device": "/dev/ttyUSB1", "baud": 9600},
+            ],
+            "power": {"cycle_cmd": "/bin/cycle.sh", "serial_interface": "console"},
+        },
+        "apple": {"host": "bench2", "netboot": {"interface": "en5"}},
+    },
+}
+
+
+def test_resolve_single_host_target_flattens_to_config_and_host():
+    lab = Lab.from_dict(_LAB)
+    cfg, host = lab.resolve_target("fortune")
+    assert cfg.name == "fortune"
+    assert cfg.interface == "enx00e04c08d9a0"
+    assert cfg.tftp_root == "/srv/tftp/fortune"
+    assert cfg.host_ip == "192.168.99.1"  # default applied
+    assert cfg.power_cycle_cmd == "/bin/cycle.sh"
+    assert cfg.power_serial_interface == "console"
+    assert [(s.name, s.device, s.baud) for s in cfg.serial_interfaces] == [
+        ("console", "/dev/ttyUSB0", 115200),
+        ("bmc", "/dev/ttyUSB1", 9600),
+    ]
+    assert host.name == "bench1"
+    assert host.ssh == "curtisg@bench1.local"
+    assert host.identity == "~/.ssh/id_lab"
+    assert not host.is_local
+
+
+def test_target_names_sorted():
+    assert Lab.from_dict(_LAB).target_names() == ["apple", "fortune"]
+
+
+def test_resource_inherits_target_default_host():
+    # serial has no explicit host → inherits target host bench1; still single-host.
+    _, host = Lab.from_dict(_LAB).resolve_target("fortune")
+    assert host.name == "bench1"
+
+
+def test_target_without_host_resolves_to_local():
+    lab = Lab.from_dict({"targets": {"t": {"netboot": {"interface": "en0"}}}})
+    _, host = lab.resolve_target("t")
+    assert host.is_local
+
+
+def test_empty_target_resolves_to_local():
+    lab = Lab.from_dict({"targets": {"t": {}}})
+    cfg, host = lab.resolve_target("t")
+    assert host.is_local
+    assert cfg.interface == ""  # no netboot section
+
+
+def test_unknown_target_raises_keyerror():
+    with pytest.raises(KeyError):
+        Lab.from_dict(_LAB).resolve_target("ghost")
+
+
+def test_unknown_host_reference_raises():
+    lab = Lab.from_dict(
+        {"targets": {"t": {"host": "nope", "power": {"cycle_cmd": "x"}}}}
+    )
+    with pytest.raises(LabError, match="unknown host 'nope'"):
+        lab.resolve_target("t")
+
+
+def test_multi_host_target_is_rejected():
+    lab = Lab.from_dict(
+        {
+            "hosts": {"a": {"ssh": "u@a"}, "b": {"ssh": "u@b"}},
+            "targets": {
+                "split": {
+                    "netboot": {"interface": "en0", "host": "a"},
+                    "serial": [{"name": "c", "device": "/dev/x", "host": "b"}],
+                }
+            },
+        }
+    )
+    with pytest.raises(LabError, match="multiple hosts"):
+        lab.resolve_target("split")
+
+
+def test_host_missing_ssh_raises():
+    with pytest.raises(LabError, match="missing required 'ssh'"):
+        Lab.from_dict({"hosts": {"bad": {"identity": "k"}}})
+
+
+def test_serial_missing_fields_raises():
+    lab = Lab.from_dict({"targets": {"t": {"serial": [{"name": "c"}]}}})
+    with pytest.raises(LabError, match="name . device"):
+        lab.resolve_target("t")
+
+
+def test_propose_target_block_picks_carrier_up_and_first_serial():
+    inv = {
+        "ethernet": [
+            {"device": "eth0", "active": True},
+            {"device": "enx00e0", "active": True},
+        ],
+        "serial": ["/dev/ttyUSB0", "/dev/ttyUSB1"],
+    }
+    block = _lab.propose_target_block("fortune", "bench1", inv)
+    # Parses as valid TOML with the expected structure (one value chosen per
+    # field; the other interface + serial are commented out, not parsed).
+    t = tomllib.loads(block)["targets"]["fortune"]
+    assert t["host"] == "bench1"
+    assert t["netboot"]["interface"] in ("eth0", "enx00e0")
+    assert t["serial"][0] == {
+        "name": "console",
+        "device": "/dev/ttyUSB0",
+        "baud": 115200,
+    }
+    assert len(t["serial"]) == 1  # the second device is a comment, not an entry
+    assert "# another serial device: /dev/ttyUSB1" in block
+    assert "cycle_cmd" in block  # commented power stub
+
+
+def test_propose_target_block_handles_empty_inventory():
+    block = _lab.propose_target_block("t", "h", {"ethernet": [], "serial": []})
+    assert "no USB-Ethernet interface discovered" in block
+    assert "no serial devices discovered" in block
+    tomllib.loads(block)  # still valid TOML (commented-out resource sections)
+
+
+def test_load_lab_parses_a_real_toml_file(tmp_path):
+    f = tmp_path / "lab.toml"
+    f.write_text(
+        '[hosts.bench1]\nssh = "u@bench1"\n\n'
+        '[targets.fortune]\nhost = "bench1"\n\n'
+        '[targets.fortune.netboot]\ninterface = "en0"\n'
+    )
+    lab = _lab.load_lab(str(f))
+    cfg, host = lab.resolve_target("fortune")
+    assert cfg.interface == "en0"
+    assert host.ssh == "u@bench1"
+
+
+# ── lab-path selection ───────────────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _reset_override(monkeypatch, tmp_path):
+    monkeypatch.setattr(_lab, "_override_path", None)
+    monkeypatch.delenv("PANIOLO_LAB", raising=False)
+    # Isolate from the real ~/.config/paniolo/lab.toml default during tests.
+    monkeypatch.setattr(_lab, "DEFAULT_LAB_PATH", str(tmp_path / "absent.toml"))
+
+
+def test_load_is_none_without_a_configured_lab():
+    assert _lab.load() is None
+
+
+def test_lab_path_prefers_override_then_env(monkeypatch):
+    monkeypatch.setenv("PANIOLO_LAB", "/from/env.toml")
+    assert _lab.lab_path() == "/from/env.toml"
+    _lab.set_lab_path("/from/flag.toml")
+    assert _lab.lab_path() == "/from/flag.toml"
+
+
+def test_lab_path_falls_back_to_default_when_it_exists(monkeypatch, tmp_path):
+    default = tmp_path / "lab.toml"
+    default.write_text("")
+    monkeypatch.setattr(_lab, "DEFAULT_LAB_PATH", str(default))
+    assert _lab.lab_path() == str(default)
+
+
+def test_load_raises_on_missing_file():
+    _lab.set_lab_path("/no/such/lab.toml")
+    with pytest.raises(LabError, match="not found"):
+        _lab.load()
+
+
+# ── resolved read view (per-channel hosts) ─────────────────────────────────────
+
+
+def _multihost_lab():
+    data = {
+        "hosts": {"bench1": {"ssh": "u@bench1"}, "bench2": {"ssh": "u@bench2"}},
+        "targets": {
+            "fortune": {
+                "host": "bench1",
+                "note": "n",
+                "netboot": {"interface": "en0"},
+                "serial": [{"name": "console", "device": "/dev/ttyUSB0"}],
+                "video": {"device": "/dev/video0", "host": "bench2"},
+            }
+        },
+    }
+    return _lab.Lab.from_dict(data)
+
+
+def test_resolved_target_resolves_per_channel_host():
+    rt = _multihost_lab().resolved_target("fortune")
+    by_name = {(c.kind, c.name): c for c in rt.channels}
+    assert by_name[("netboot", "netboot")].host == "bench1"  # inherits default
+    assert by_name[("serial", "console")].host == "bench1"
+    assert by_name[("video", "video")].host == "bench2"  # explicit override
+    assert rt.hosts() == ["bench1", "bench2"]
+    assert by_name[("serial", "console")].fields == {
+        "device": "/dev/ttyUSB0"
+    }  # name + host stripped
+
+
+def test_channels_on_host_inverse_index():
+    lab = _multihost_lab()
+    assert [(t, c.kind) for t, c in lab.channels_on_host("bench2")] == [
+        ("fortune", "video")
+    ]
+    on1 = {c.kind for _, c in lab.channels_on_host("bench1")}
+    assert on1 == {"netboot", "serial"}
+````
+
+## File: tests/test_netif.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for netif mode switching: address probing, mode resolution, and the
+order/teardown of mode transitions. No privileged subprocess actually runs —
+subprocess and the netboot hooks are stubbed."""
+
+from __future__ import annotations
+
+import types
+
+import pytest
+
+from paniolo import _netif
+from paniolo._config import TargetConfig
+
+# pylint: disable=protected-access,redefined-outer-name
+
+
+def _cfg(interface: str = "enx0") -> TargetConfig:
+    return TargetConfig(name="fortune", interface=interface, host_ip="192.168.99.1")
+
+
+def _completed(stdout: str = "", returncode: int = 0, stderr: str = ""):
+    return types.SimpleNamespace(stdout=stdout, returncode=returncode, stderr=stderr)
+
+
+# ── address / peer parsing (Linux `ip` output) ─────────────────────────────
+
+
+def test_iface_addresses_parses_brief_output(monkeypatch):
+    monkeypatch.setattr(_netif.sys, "platform", "linux")
+    out = "enx0             UP             192.168.99.1/24 fe80::1/64 fe80::abcd/64"
+    monkeypatch.setattr(_netif.subprocess, "run", lambda *a, **k: _completed(out))
+    addrs = _netif.iface_addresses("enx0")
+    assert addrs["inet"] == ["192.168.99.1/24"]
+    assert addrs["inet6"] == ["fe80::1/64", "fe80::abcd/64"]
+
+
+def test_iface_addresses_empty_when_command_fails(monkeypatch):
+    monkeypatch.setattr(_netif.sys, "platform", "linux")
+    monkeypatch.setattr(
+        _netif.subprocess, "run", lambda *a, **k: _completed(returncode=1)
+    )
+    assert _netif.iface_addresses("enx0") == {"inet": [], "inet6": []}
+
+
+def test_has_host_ll_matches_with_and_without_prefix():
+    assert _netif._has_host_ll({"inet6": ["fe80::1/64"]})
+    assert _netif._has_host_ll({"inet6": ["fe80::1"]})
+    assert not _netif._has_host_ll({"inet6": ["fe80::abcd/64"]})
+    assert not _netif._has_host_ll({"inet6": []})
+
+
+def test_ipv6_peers_excludes_host_ll(monkeypatch):
+    monkeypatch.setattr(_netif.sys, "platform", "linux")
+    out = (
+        "fe80::1 lladdr aa:bb:cc:dd:ee:ff router STALE\n"
+        "fe80::fc33:fca2:96e0:6dbe lladdr 11:22:33:44:55:66 REACHABLE\n"
+    )
+    monkeypatch.setattr(_netif.subprocess, "run", lambda *a, **k: _completed(out))
+    assert _netif.ipv6_peers("enx0") == ["fe80::fc33:fca2:96e0:6dbe"]
+
+
+def test_ipv6_peers_empty_on_macos(monkeypatch):
+    monkeypatch.setattr(_netif.sys, "platform", "darwin")
+    assert not _netif.ipv6_peers("enx0")
+
+
+# ── mode resolution in get_status ───────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "running, inet6, expected",
+    [
+        (True, ["fe80::1/64"], "netboot"),  # daemons win even if LL present
+        (True, [], "netboot"),
+        (False, ["fe80::1/64"], "ffx"),
+        (False, ["fe80::abcd/64"], "off"),  # some other LL, not ours
+        (False, [], "off"),
+    ],
+)
+def test_get_status_mode_resolution(monkeypatch, running, inet6, expected):
+    monkeypatch.setattr(_netif, "is_netboot_running", lambda name: running)
+    monkeypatch.setattr(
+        _netif, "iface_addresses", lambda iface: {"inet": [], "inet6": inet6}
+    )
+    monkeypatch.setattr(_netif, "ipv6_peers", lambda iface: ["fe80::dead"])
+    s = _netif.get_status(_cfg())
+    assert s["mode"] == expected
+    # peers are only probed in ffx mode.
+    assert s["peers"] == (["fe80::dead"] if expected == "ffx" else [])
+    assert s["host_ll"] == ("fe80::1" if "fe80::1/64" in inet6 else None)
+
+
+# ── mode transitions: order and teardown ────────────────────────────────────
+
+
+@pytest.fixture
+def calls(monkeypatch):
+    """Record the sequence of side-effecting hooks each transition invokes."""
+    seq: list[str] = []
+    monkeypatch.setattr(_netif, "_add_host_ll", lambda i: seq.append("add_ll"))
+    monkeypatch.setattr(_netif, "_del_host_ll", lambda i: seq.append("del_ll"))
+    monkeypatch.setattr(_netif, "_del_host_ip", lambda i, ip: seq.append("del_ip"))
+    monkeypatch.setattr(
+        _netif._netboot,
+        "start",
+        lambda cfg, engine="rust": seq.append(f"start:{engine}"),
+    )
+    monkeypatch.setattr(_netif._netboot, "stop", lambda name: seq.append("stop"))
+    return seq
+
+
+def test_mode_ffx_stops_netboot_then_adds_ll(monkeypatch, calls):
+    monkeypatch.setattr(_netif, "is_netboot_running", lambda name: True)
+    _netif.mode_ffx(_cfg())
+    assert calls == ["stop", "add_ll"]
+
+
+def test_mode_ffx_idempotent_readds_ll_when_not_running(monkeypatch, calls):
+    monkeypatch.setattr(_netif, "is_netboot_running", lambda name: False)
+    _netif.mode_ffx(_cfg())
+    assert calls == ["add_ll"]
+
+
+def test_mode_netboot_clears_ll_then_starts(monkeypatch, calls):
+    monkeypatch.setattr(_netif, "is_netboot_running", lambda name: False)
+    # No engine arg: the rust engine is the default.
+    _netif.mode_netboot(_cfg())
+    assert calls == ["del_ll", "start:rust"]
+
+
+def test_mode_netboot_idempotent_when_already_running(monkeypatch, calls):
+    monkeypatch.setattr(_netif, "is_netboot_running", lambda name: True)
+    _netif.mode_netboot(_cfg())
+    # clears the ffx LL but does not try to start a second netboot.
+    assert calls == ["del_ll"]
+
+
+def test_mode_off_tears_down_everything(monkeypatch, calls):
+    monkeypatch.setattr(_netif, "is_netboot_running", lambda name: True)
+    _netif.mode_off(_cfg())
+    assert calls == ["stop", "del_ll", "del_ip"]
+
+
+def test_mode_off_when_not_running_skips_stop(monkeypatch, calls):
+    monkeypatch.setattr(_netif, "is_netboot_running", lambda name: False)
+    _netif.mode_off(_cfg())
+    assert calls == ["del_ll", "del_ip"]
+````
+
+## File: tests/test_remote.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for transparent remote re-exec (_remote.py).
+
+Unit tests cover argv rewriting (always run). Integration tests cover the real
+ship-config + re-exec round-trip and a full CLI dispatch; they are gated on
+PANIOLO_SSH_IT (see test_ssh.py) so the suite never needs an ssh-agent.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+import tomllib
+import types
+from pathlib import Path
+
+import pytest
+
+from paniolo import _cli, _config, _remote, _ssh
+from paniolo._config import TargetConfig
+from paniolo._ssh import Host
+
+# pylint: disable=protected-access,redefined-outer-name,unused-argument
+
+# ── unit: argv rewriting ─────────────────────────────────────────────────────
+
+
+def test_strip_lab_option_spaced_and_equals_forms():
+    assert _remote.strip_lab_option(["--lab", "/x.toml", "netboot", "status"]) == [
+        "netboot",
+        "status",
+    ]
+    assert _remote.strip_lab_option(["--lab=/x.toml", "power-cycle", "t"]) == [
+        "power-cycle",
+        "t",
+    ]
+
+
+def test_strip_lab_option_noop_without_lab():
+    assert _remote.strip_lab_option(["serial", "log", "-i", "console"]) == [
+        "serial",
+        "log",
+        "-i",
+        "console",
+    ]
+
+
+def test_remote_argv_replaces_launcher_and_defaults_to_paniolo():
+    argv = ["/usr/local/bin/paniolo", "--lab", "/x.toml", "netboot", "status", "t"]
+    assert _remote.remote_argv(argv) == ["paniolo", "netboot", "status", "t"]
+
+
+def test_remote_argv_honors_host_paniolo_cmd():
+    argv = ["/local/paniolo", "netif", "status", "t"]
+    assert _remote.remote_argv(argv, "/opt/paniolo/bin/paniolo") == [
+        "/opt/paniolo/bin/paniolo",
+        "netif",
+        "status",
+        "t",
+    ]
+
+
+def test_host_paniolo_property_default_and_override():
+    assert Host(name="h", ssh="u@h").paniolo == "paniolo"
+    assert Host(name="h", ssh="u@h", paniolo_cmd="/x/paniolo").paniolo == "/x/paniolo"
+
+
+# ── unit: remote console plumbing ────────────────────────────────────────────
+
+
+def _completed(stdout="", returncode=0, stderr=""):
+    return types.SimpleNamespace(stdout=stdout, returncode=returncode, stderr=stderr)
+
+
+def test_remote_daemon_port_parses_discovery_json(monkeypatch):
+    monkeypatch.setattr(
+        _remote._ssh, "run", lambda *a, **k: _completed('{"pid": 5, "port": 8723}')
+    )
+    assert _remote.remote_daemon_port(Host(name="h", ssh="u@h"), "hdmicap") == 8723
+
+
+def test_remote_daemon_port_none_when_absent_or_bad(monkeypatch):
+    h = Host(name="h", ssh="u@h")
+    monkeypatch.setattr(_remote._ssh, "run", lambda *a, **k: _completed("", 1))
+    assert _remote.remote_daemon_port(h, "hdmicap") is None
+    monkeypatch.setattr(_remote._ssh, "run", lambda *a, **k: _completed("not json"))
+    assert _remote.remote_daemon_port(h, "hdmicap") is None
+
+
+def test_dashboard_url_builds_query():
+    base = "http://127.0.0.1:9001"
+    assert _cli._dashboard_url(base, None, None) == base
+    assert (
+        _cli._dashboard_url(base, "ws://127.0.0.1:9002/stream", None)
+        == f"{base}/?serialws=ws://127.0.0.1:9002/stream"
+    )
+    assert (
+        _cli._dashboard_url(base, "ws://127.0.0.1:9002/stream", "console")
+        == f"{base}/?serialws=ws://127.0.0.1:9002/stream&interface=console"
+    )
+
+
+# ── integration: real ssh re-exec, opt-in ───────────────────────────────────
+
+_DEST = os.environ.get("PANIOLO_SSH_IT")
+_IDENT = os.environ.get("PANIOLO_SSH_IT_IDENTITY")
+# The paniolo matching the code under test — the console script next to the
+# running interpreter (the venv), not whatever happens to be first on PATH.
+_colocated = Path(sys.executable).parent / "paniolo"
+_PANIOLO = str(_colocated) if _colocated.exists() else shutil.which("paniolo")
+
+integration = pytest.mark.skipif(
+    not _DEST, reason="set PANIOLO_SSH_IT to run remote re-exec integration tests"
+)
+
+
+@pytest.fixture
+def host():
+    h = Host(
+        name="it",
+        ssh=_DEST,
+        identity=_IDENT,
+        control_path=f"/tmp/pcm-remote-{os.getpid()}-%C",
+        paniolo_cmd=_PANIOLO,
+    )
+    yield h
+    _ssh.close_master(h)
+
+
+def _cfg() -> TargetConfig:
+    return TargetConfig(name="t", interface="lo", tftp_root="/tmp/tftp-t")
+
+
+@integration
+def test_ship_config_round_trips(host):
+    remote_path = _remote.ship_config(host, _cfg())
+    try:
+        text = _ssh.read_remote_file(host, remote_path)
+        assert text is not None
+        back = _config._from_dict(tomllib.loads(text))
+        assert back.name == "t"
+        assert back.interface == "lo"
+        assert back.tftp_root == "/tmp/tftp-t"
+    finally:
+        _ssh.run(host, ["rm", "-f", remote_path])
+
+
+@integration
+@pytest.mark.skipif(not _PANIOLO, reason="paniolo not installed on PATH")
+def test_configure_discovers_over_ssh(tmp_path):
+    # `configure --host h` runs `paniolo discover --json` on h over ssh and
+    # prints a proposed [targets.<name>] block built from the result.
+    ident = f'identity = "{_IDENT}"\n' if _IDENT else ""
+    lab = tmp_path / "lab.toml"
+    lab.write_text(f'[hosts.h]\nssh = "{_DEST}"\n{ident}paniolo_cmd = "{_PANIOLO}"\n')
+    result = subprocess.run(
+        [_PANIOLO, "--lab", str(lab), "configure", "newtgt", "--host", "h"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "[targets.newtgt]" in result.stdout
+    assert 'host = "h"' in result.stdout
+
+
+@integration
+@pytest.mark.skipif(not _PANIOLO, reason="paniolo not installed on PATH")
+def test_full_cli_dispatch_runs_on_remote(host, tmp_path):
+    # A lab whose single target lives on the (remote) integration host.
+    ident = f'identity = "{_IDENT}"\n' if _IDENT else ""
+    lab = tmp_path / "lab.toml"
+    lab.write_text(
+        f'[hosts.h]\nssh = "{_DEST}"\n{ident}paniolo_cmd = "{_PANIOLO}"\n\n'
+        f'[targets.t]\nhost = "h"\n\n[targets.t.netboot]\ninterface = "lo"\n'
+    )
+    result = subprocess.run(
+        [_PANIOLO, "--lab", str(lab), "netboot", "status", "t"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    # The status text is produced by the *remote* paniolo and passed through.
+    assert "stopped" in result.stdout or "running" in result.stdout
+````
+
+## File: tests/test_serial.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Host-side tests for serial helpers — no hardware, no serialcap binary."""
+
+from __future__ import annotations
+
+from paniolo import _serial
+from paniolo._config import SerialInterface
+
+
+def test_log_cmd_defaults_to_bare_subcommand():
+    assert _serial.log_cmd("serialcap") == ["serialcap", "log"]
+
+
+def test_log_cmd_forwards_only_set_flags():
+    cmd = _serial.log_cmd("serialcap", tail=50)
+    assert cmd == ["serialcap", "log", "--tail", "50"]
+
+
+def test_log_cmd_interface():
+    assert _serial.log_cmd("serialcap", interface="bmc", tail=10) == [
+        "serialcap",
+        "log",
+        "--interface",
+        "bmc",
+        "--tail",
+        "10",
+    ]
+
+
+def test_input_url_no_pace():
+    assert (
+        _serial.input_url("http://127.0.0.1:8724", "console")
+        == "http://127.0.0.1:8724/input?interface=console"
+    )
+
+
+def test_input_url_with_pace():
+    assert (
+        _serial.input_url("http://127.0.0.1:8724", "console", pace_ms=8)
+        == "http://127.0.0.1:8724/input?interface=console&pace_ms=8"
+    )
+
+
+def test_input_url_zero_pace_omitted():
+    assert "pace_ms" not in _serial.input_url("http://x", "bmc", pace_ms=0)
+
+
+def test_interface_arg():
+    assert (
+        _serial.interface_arg("console", "/dev/ttyUSB0", 115200)
+        == "console=/dev/ttyUSB0@115200"
+    )
+
+
+def test_daemon_cmd_one_per_interface():
+    ifaces = [
+        SerialInterface("console", "/dev/ttyUSB0", 115200),
+        SerialInterface("bmc", "/dev/ttyUSB1", 9600),
+    ]
+    assert _serial.daemon_cmd("serialcap", ifaces, port=8724) == [
+        "serialcap",
+        "daemon",
+        "--port",
+        "8724",
+        "--interface",
+        "console=/dev/ttyUSB0@115200",
+        "--interface",
+        "bmc=/dev/ttyUSB1@9600",
+    ]
+
+
+def test_daemon_cmd_buffer_lines():
+    ifaces = [SerialInterface("console", "/dev/ttyUSB0", 115200)]
+    assert _serial.daemon_cmd("serialcap", ifaces, port=9, buffer_lines=1000) == [
+        "serialcap",
+        "daemon",
+        "--port",
+        "9",
+        "--buffer-lines",
+        "1000",
+        "--interface",
+        "console=/dev/ttyUSB0@115200",
+    ]
+
+
+def test_log_cmd_range_and_since():
+    assert _serial.log_cmd("serialcap", from_seq=10, to_seq=20) == [
+        "serialcap",
+        "log",
+        "--from",
+        "10",
+        "--to",
+        "20",
+    ]
+    assert _serial.log_cmd("serialcap", since=7) == ["serialcap", "log", "--since", "7"]
+
+
+def test_log_cmd_boolean_flags():
+    cmd = _serial.log_cmd("serialcap", raw=True, as_json=True, no_pending=True)
+    assert cmd == ["serialcap", "log", "--raw", "--json", "--no-pending"]
+    # Defaults stay off.
+    assert "--raw" not in _serial.log_cmd("serialcap", tail=1)
+````
+
+## File: pyproject.toml
+````toml
+[project]
+name = "paniolo"
+version = "0.1.0"
+description = "Agent-controlled target machine wrangler for low-level software development"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "typer>=0.12",
+    "tomlkit>=0.13",
+]
+
+[project.scripts]
+paniolo = "paniolo._cli:app"
+
+[project.optional-dependencies]
+hid = [
+    "pyserial>=3.5",
+]
+
+[tool.uv]
+package = true
+
+[tool.pyink]
+line-length = 88
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+````
+
+## File: cli/src/dispatch.rs
+````rust
+// Copyright 2026 Curtis Galloway
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Per-channel transparent dispatch (see docs/config-redesign.md "Dispatch
+//! design"). A location-transparent command resolves the host of the channel it
+//! touches; if that's the dev machine it runs locally, otherwise paniolo re-execs
+//! the same command on the control host over SSH against a shipped single-host
+//! **slice** of the lab. Because the slice's channels carry no `host`, the remote
+//! resolves them as local and never re-dispatches.
+
+use std::path::Path;
+
+use crate::labfile::LabFile;
+use crate::model::{ChannelKind, Lab, LabError};
+use crate::ssh;
+
+/// Re-exec transport mode.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Non-interactive: stdio passed through.
+    Reexec,
+    /// PTY over `ssh -t` (e.g. tio serial console).
+    Interactive,
+}
+
+/// Build a one-target lab containing only `target`'s channels that live on
+/// `host`, with their `host` fields stripped so the remote treats them as local.
+/// This is the slice shipped for remote re-exec (and the shape a host sees).
+pub fn build_slice(lab: &Lab, target: &str, host: &str) -> Result<String, LabError> {
+    let t = lab
+        .targets
+        .get(target)
+        .ok_or_else(|| LabError(format!("no target '{target}'")))?;
+    let default_host = t.default_host();
+    let on = |h: &Option<String>| h.as_deref().unwrap_or(default_host) == host;
+
+    let mut lf = LabFile::create(Path::new("slice.toml"));
+    lf.add_target(target, None, t.note.as_deref())?;
+    if let Some(nb) = &t.netboot {
+        if on(&nb.host) {
+            lf.set_netboot(
+                target,
+                nb.interface.as_deref(),
+                nb.host_ip.as_deref(),
+                nb.tftp_root.as_deref(),
+                None,
+            )?;
+        }
+    }
+    for s in &t.serial {
+        if on(&s.host) {
+            lf.add_serial(
+                target,
+                &s.name,
+                &s.device,
+                s.baud,
+                s.power_sense_signal.as_deref(),
+                None,
+            )?;
+        }
+    }
+    if let Some(p) = &t.power {
+        if on(&p.host) {
+            lf.set_power(
+                target,
+                p.cycle_cmd.as_deref(),
+                p.serial_interface.as_deref(),
+                None,
+            )?;
+        }
+    }
+    if let Some(v) = &t.video {
+        if on(&v.host) {
+            lf.set_video(target, v.device.as_deref(), None)?;
+        }
+    }
+    Ok(lf.doc.to_string())
+}
+
+/// Drop the global `--lab PATH` / `--lab=PATH` option from an argv tail; the
+/// dev machine's lab path is meaningless on the control host (it gets a slice).
+pub fn strip_lab_option(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut skip = false;
+    for a in args {
+        if skip {
+            skip = false;
+            continue;
+        }
+        if a == "--lab" {
+            skip = true;
+            continue;
+        }
+        if a.starts_with("--lab=") {
+            continue;
+        }
+        out.push(a.clone());
+    }
+    out
+}
+
+/// The subcommand argv to re-exec on the remote: this process's args minus the
+/// program name and the global `--lab` option.
+pub fn subcommand_args() -> Vec<String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    strip_lab_option(&args)
+}
+
+const SHIP_SCRIPT: &str =
+    r#"f=$(mktemp "${TMPDIR:-/tmp}/paniolo-lab.XXXXXX") && cat > "$f" && printf %s "$f""#;
+
+/// Write `slice_toml` to a temp file on `host` over SSH and return its path.
+pub fn ship_slice(host: &crate::model::Host, slice_toml: &str) -> std::io::Result<String> {
+    let argv = vec!["sh".to_string(), "-c".to_string(), SHIP_SCRIPT.to_string()];
+    let out = ssh::run(host, &argv, Some(slice_toml), &[])?;
+    let path = out.stdout.trim().to_string();
+    if out.status != 0 || path.is_empty() {
+        return Err(std::io::Error::other(format!(
+            "failed to ship lab slice to {}: {}",
+            host.ssh,
+            out.stderr.trim()
+        )));
+    }
+    Ok(path)
+}
+
+/// Re-exec `sub_argv` on `host` against a shipped slice; return the remote exit
+/// code. Cleans up the slice file afterward.
+pub fn dispatch(
+    lab: &Lab,
+    target: &str,
+    host_name: &str,
+    mode: Mode,
+    sub_argv: &[String],
+) -> anyhow::Result<i32> {
+    let host = lab.host(host_name);
+    let slice = build_slice(lab, target, host_name)?;
+    let remote_path = ship_slice(&host, &slice)?;
+
+    let mut argv = vec![host.paniolo(), "--lab".to_string(), remote_path.clone()];
+    argv.extend(sub_argv.iter().cloned());
+
+    let code = match mode {
+        Mode::Interactive => ssh::run_interactive(&host, &argv, &[]),
+        Mode::Reexec => ssh::run_passthrough(&host, &argv, &[]),
+    }?;
+
+    // Best-effort cleanup of the shipped slice.
+    let _ = ssh::run(
+        &host,
+        &["rm".to_string(), "-f".to_string(), remote_path],
+        None,
+        &[],
+    );
+    Ok(code)
+}
+
+/// Run a paniolo subcommand on `host_name` against a shipped slice, captured.
+/// Used by composite commands (e.g. `console`) to drive helper commands on the
+/// host before tunnelling to its daemons.
+pub fn run_subcommand(
+    lab: &Lab,
+    target: &str,
+    host_name: &str,
+    subargs: &[&str],
+) -> anyhow::Result<ssh::Output> {
+    let host = lab.host(host_name);
+    let slice = build_slice(lab, target, host_name)?;
+    let remote_path = ship_slice(&host, &slice)?;
+    let mut argv = vec![host.paniolo(), "--lab".to_string(), remote_path.clone()];
+    argv.extend(subargs.iter().map(|s| s.to_string()));
+    let out = ssh::run(&host, &argv, None, &[]);
+    let _ = ssh::run(
+        &host,
+        &["rm".to_string(), "-f".to_string(), remote_path],
+        None,
+        &[],
+    );
+    Ok(out?)
+}
+
+/// Read the TCP port from a daemon's discovery file on `host`, or None.
+/// The path is resolved by a remote shell so the host's own runtime dir applies.
+pub fn remote_daemon_port(host: &crate::model::Host, subdir: &str) -> Option<u16> {
+    let script =
+        format!("cat \"${{XDG_RUNTIME_DIR:-${{TMPDIR:-/tmp}}}}/{subdir}/daemon.json\" 2>/dev/null");
+    let out = ssh::run(
+        host,
+        &["sh".to_string(), "-c".to_string(), script],
+        None,
+        &[],
+    )
+    .ok()?;
+    if out.status != 0 || out.stdout.trim().is_empty() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(out.stdout.trim()).ok()?;
+    v.get("port")?.as_u64().map(|p| p as u16)
+}
+
+/// Resolve where a command should run and dispatch if remote.
+///
+/// Returns `Some(exit_code)` when the command was dispatched to a control host
+/// (the caller should exit with it), or `None` when it should run locally.
+pub fn maybe_dispatch(
+    lab: &Lab,
+    target: &str,
+    kind: ChannelKind,
+    serial_name: Option<&str>,
+    mode: Mode,
+) -> anyhow::Result<Option<i32>> {
+    let rt = lab
+        .resolved_target(target)
+        .ok_or_else(|| LabError(format!("target '{target}' not found in lab")))?;
+    let host_name = crate::model::channel_host(&rt, kind, serial_name)?;
+    let host = lab.host(&host_name);
+    if host.is_local(&host_name) {
+        return Ok(None);
+    }
+    let code = dispatch(lab, target, &host_name, mode, &subcommand_args())?;
+    Ok(Some(code))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model;
+
+    fn lab() -> Lab {
+        model::parse(
+            r#"
+            [hosts.bench1]
+            ssh = "u@bench1"
+            [hosts.bench2]
+            ssh = "u@bench2"
+            [targets.fortune]
+            host = "bench1"
+            [targets.fortune.netboot]
+            interface = "en0"
+            [[targets.fortune.serial]]
+            name = "console"
+            device = "/dev/ttyUSB0"
+            [targets.fortune.video]
+            device = "/dev/video0"
+            host = "bench2"
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn slice_keeps_only_that_hosts_channels_host_stripped() {
+        let s = build_slice(&lab(), "fortune", "bench1").unwrap();
+        let reparsed = model::parse(&s).unwrap();
+        let t = &reparsed.targets["fortune"];
+        // bench1 has netboot + the console serial; video (bench2) is excluded.
+        assert!(t.netboot.is_some());
+        assert_eq!(t.serial.len(), 1);
+        assert!(t.video.is_none());
+        // Host fields are stripped so the remote resolves them as local.
+        assert!(t.host.is_none());
+        assert!(t.serial[0].host.is_none());
+    }
+
+    #[test]
+    fn strip_lab_handles_both_forms() {
+        let a: Vec<String> = ["--lab", "/x", "serial", "connect", "fortune"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(strip_lab_option(&a), vec!["serial", "connect", "fortune"]);
+        let b: Vec<String> = ["--lab=/x", "netboot", "start"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(strip_lab_option(&b), vec!["netboot", "start"]);
+    }
+}
+````
+
+## File: cli/src/doctor.rs
+````rust
+// Copyright 2026 Curtis Galloway
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! `paniolo doctor` — probe configured channels against reality.
+//!
+//! Read-only health check: for each channel it SSHes to the control host the
+//! channel lives on (or runs locally) and tests that the configured device or
+//! interface actually exists. This is the probing that used to be baked into the
+//! Python `setup` commands, separated so config edits stay local and offline.
+
+use std::process::Command;
+
+use crate::model::{ChannelKind, Lab, ResolvedChannel, ResolvedTarget};
+use crate::ssh;
+
+#[derive(PartialEq, Eq)]
+enum Status {
+    Ok,
+    Missing,
+    Unreachable,
+    Incomplete,
+}
+
+impl Status {
+    fn label(&self) -> &'static str {
+        match self {
+            Status::Ok => "ok",
+            Status::Missing => "MISSING",
+            Status::Unreachable => "unreachable",
+            Status::Incomplete => "incomplete",
+        }
+    }
+    fn is_problem(&self) -> bool {
+        matches!(self, Status::Missing | Status::Unreachable)
+    }
+}
+
+/// Run a POSIX-sh probe on a host (locally or over SSH); None == unreachable.
+fn probe(lab: &Lab, host_name: &str, script: &str) -> Option<i32> {
+    let host = lab.host(host_name);
+    if host.is_local(host_name) {
+        return Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .status()
+            .ok()
+            .map(|s| s.code().unwrap_or(-1));
+    }
+    match ssh::run(
+        &host,
+        &["sh".to_string(), "-c".to_string(), script.to_string()],
+        None,
+        &[],
+    ) {
+        Ok(o) => Some(o.status),
+        Err(_) => None,
+    }
+}
+
+fn interpret(rc: Option<i32>, what: &str) -> (Status, String) {
+    match rc {
+        None | Some(255) => (Status::Unreachable, "host unreachable".to_string()),
+        Some(0) => (Status::Ok, what.to_string()),
+        Some(_) => (Status::Missing, what.to_string()),
+    }
+}
+
+fn field<'a>(ch: &'a ResolvedChannel, key: &str) -> Option<&'a str> {
+    ch.fields
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v.as_str())
+}
+
+fn check_channel(lab: &Lab, ch: &ResolvedChannel, rt: &ResolvedTarget) -> (Status, String) {
+    match ch.kind {
+        ChannelKind::Serial | ChannelKind::Video => match field(ch, "device") {
+            None => (Status::Incomplete, "no device set".to_string()),
+            Some(dev) => interpret(
+                probe(lab, &ch.host, &format!("test -e {}", ssh::shell_quote(dev))),
+                dev,
+            ),
+        },
+        ChannelKind::Netboot => match field(ch, "interface") {
+            None => (Status::Incomplete, "no interface set".to_string()),
+            Some(iface) => {
+                let q = ssh::shell_quote(iface);
+                let script = format!("test -e /sys/class/net/{q} || ifconfig {q} >/dev/null 2>&1");
+                interpret(probe(lab, &ch.host, &script), iface)
+            }
+        },
+        ChannelKind::Power => {
+            if let Some(si) = field(ch, "serial_interface") {
+                let have = rt
+                    .channels
+                    .iter()
+                    .any(|c| c.kind == ChannelKind::Serial && c.name == si);
+                if !have {
+                    return (
+                        Status::Missing,
+                        format!("serial_interface '{si}' has no matching serial"),
+                    );
+                }
+            }
+            if let Some(cmd) = field(ch, "cycle_cmd") {
+                let prog = cmd.split_whitespace().next().unwrap_or("");
+                if prog.starts_with('/') {
+                    return interpret(
+                        probe(
+                            lab,
+                            &ch.host,
+                            &format!("test -e {}", ssh::shell_quote(prog)),
+                        ),
+                        prog,
+                    );
+                }
+                return (Status::Ok, format!("cmd={cmd}"));
+            }
+            (Status::Ok, "configured".to_string())
+        }
+    }
+}
+
+fn channel_name(ch: &ResolvedChannel) -> String {
+    if ch.name == ch.kind.as_str() {
+        ch.kind.as_str().to_string()
+    } else {
+        format!("{} {}", ch.kind.as_str(), ch.name)
+    }
+}
+
+/// Probe `target` (or all targets), optionally limited to `host_filter`.
+/// Prints a report and returns the number of problems found.
+pub fn run(lab: &Lab, target: Option<&str>, host_filter: Option<&str>) -> i32 {
+    let names: Vec<String> = match target {
+        Some(n) => vec![n.to_string()],
+        None => lab.targets.keys().cloned().collect(),
+    };
+    if names.is_empty() {
+        println!("No targets configured.");
+        return 0;
+    }
+    let mut problems = 0;
+    for tname in names {
+        let Some(rt) = lab.resolved_target(&tname) else {
+            eprintln!("Target '{tname}' not found in lab.");
+            problems += 1;
+            continue;
+        };
+        for ch in &rt.channels {
+            if let Some(h) = host_filter {
+                if ch.host != h {
+                    continue;
+                }
+            }
+            let (status, detail) = check_channel(lab, ch, &rt);
+            if status.is_problem() {
+                problems += 1;
+            }
+            println!(
+                "{tname}\t{}\t@{}\t{}\t{}",
+                channel_name(ch),
+                ch.host,
+                status.label(),
+                detail
+            );
+        }
+    }
+    if problems == 0 {
+        println!("All configured channels present.");
+    }
+    problems
+}
+````
+
+## File: cli/src/model.rs
+````rust
+// Copyright 2026 Curtis Galloway
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! The lab model: one git-tracked file describing all hosts and targets.
+//!
+//! A *lab* is a single TOML file (default `~/.config/paniolo/lab.toml`, override
+//! with `--lab` / `$PANIOLO_LAB`) that declares every control host paniolo
+//! reaches over SSH and every target, with each channel of a target's hardware
+//! bound to a host (its own `host`, else the target's `host`, else `local`).
+//!
+//! This module is the typed/read side: `serde` structs, [`validate`], the
+//! resolved per-channel view ([`Lab::resolved_target`]), the inverse index
+//! ([`Lab::channels_on_host`]), and [`Lab::host_slice`] (the single-host
+//! flattening that runs locally or is shipped to a control host). Editing lives
+//! in [`crate::labfile`].
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+
+/// ssh destination meaning "the dev machine itself — no SSH".
+pub const LOCAL: &str = "local";
+pub const DEFAULT_HOST_IP: &str = "192.168.99.1";
+pub const VALID_SENSE_SIGNALS: [&str; 4] = ["cts", "dsr", "dcd", "ri"];
+
+/// The lab file is malformed or a mutation would make it invalid.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct LabError(pub String);
+
+fn lab_err<T>(msg: impl Into<String>) -> Result<T, LabError> {
+    Err(LabError(msg.into()))
+}
+
+fn default_baud() -> i64 {
+    115200
+}
+
+// ── typed schema (serde) ────────────────────────────────────────────────────
+
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct Host {
+    pub ssh: String,
+    pub identity: Option<String>,
+    pub control_path: Option<String>,
+    pub paniolo_cmd: Option<String>,
+}
+
+impl Host {
+    pub fn is_local(&self, name: &str) -> bool {
+        self.ssh == LOCAL || name == LOCAL
+    }
+
+    /// How to invoke paniolo on this host (bare `paniolo` unless pinned).
+    pub fn paniolo(&self) -> String {
+        self.paniolo_cmd
+            .clone()
+            .unwrap_or_else(|| "paniolo".to_string())
+    }
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct NetbootChannel {
+    pub interface: Option<String>,
+    pub host_ip: Option<String>,
+    pub tftp_root: Option<String>,
+    pub host: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct SerialChannel {
+    pub name: String,
+    pub device: String,
+    #[serde(default = "default_baud")]
+    pub baud: i64,
+    pub power_sense_signal: Option<String>,
+    pub host: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct PowerChannel {
+    pub cycle_cmd: Option<String>,
+    pub serial_interface: Option<String>,
+    pub host: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct VideoChannel {
+    pub device: Option<String>,
+    pub host: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct Target {
+    pub host: Option<String>,
+    pub note: Option<String>,
+    pub netboot: Option<NetbootChannel>,
+    #[serde(default)]
+    pub serial: Vec<SerialChannel>,
+    pub power: Option<PowerChannel>,
+    pub video: Option<VideoChannel>,
+}
+
+impl Target {
+    pub fn default_host(&self) -> &str {
+        self.host.as_deref().unwrap_or(LOCAL)
+    }
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct Lab {
+    #[serde(default)]
+    pub hosts: BTreeMap<String, Host>,
+    #[serde(default)]
+    pub targets: BTreeMap<String, Target>,
+}
+
+// ── resolved (read) view ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelKind {
+    Netboot,
+    Serial,
+    Power,
+    Video,
+}
+
+impl ChannelKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChannelKind::Netboot => "netboot",
+            ChannelKind::Serial => "serial",
+            ChannelKind::Power => "power",
+            ChannelKind::Video => "video",
+        }
+    }
+}
+
+/// One channel of a target with its physical host resolved.
+#[derive(Debug, Clone)]
+pub struct ResolvedChannel {
+    pub kind: ChannelKind,
+    /// Serial interface name, or the kind name for singleton channels.
+    pub name: String,
+    pub host: String,
+    /// Remaining scalar config, in display order (host and name excluded).
+    pub fields: Vec<(&'static str, String)>,
+}
+
+/// A target's channels with per-channel hosts resolved (no single-host rule).
+#[derive(Debug, Clone)]
+pub struct ResolvedTarget {
+    pub name: String,
+    pub default_host: String,
+    pub note: Option<String>,
+    pub channels: Vec<ResolvedChannel>,
+}
+
+impl ResolvedTarget {
+    /// The distinct hosts this target's channels live on.
+    pub fn hosts(&self) -> Vec<String> {
+        let mut s: BTreeSet<String> = self.channels.iter().map(|c| c.host.clone()).collect();
+        if s.is_empty() {
+            s.insert(self.default_host.clone());
+        }
+        s.into_iter().collect()
+    }
+}
+
+impl Lab {
+    pub fn target_names(&self) -> Vec<&str> {
+        self.targets.keys().map(String::as_str).collect()
+    }
+
+    /// Look up a control host by name. `local` (and any undeclared name, which
+    /// validation forbids) resolves to a synthetic local host.
+    pub fn host(&self, name: &str) -> Host {
+        if let Some(h) = self.hosts.get(name) {
+            return h.clone();
+        }
+        Host {
+            ssh: LOCAL.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Flatten a target to its channels with per-channel hosts resolved.
+    pub fn resolved_target(&self, name: &str) -> Option<ResolvedTarget> {
+        let t = self.targets.get(name)?;
+        let default_host = t.default_host().to_string();
+        let host_of = |h: &Option<String>| h.clone().unwrap_or_else(|| default_host.clone());
+        let mut channels = Vec::new();
+
+        if let Some(nb) = &t.netboot {
+            let mut f = Vec::new();
+            push_opt(&mut f, "interface", &nb.interface);
+            push_opt(&mut f, "host_ip", &nb.host_ip);
+            push_opt(&mut f, "tftp_root", &nb.tftp_root);
+            channels.push(ResolvedChannel {
+                kind: ChannelKind::Netboot,
+                name: "netboot".into(),
+                host: host_of(&nb.host),
+                fields: f,
+            });
+        }
+        for s in &t.serial {
+            let mut f = vec![("device", s.device.clone()), ("baud", s.baud.to_string())];
+            push_opt(&mut f, "power_sense_signal", &s.power_sense_signal);
+            channels.push(ResolvedChannel {
+                kind: ChannelKind::Serial,
+                name: s.name.clone(),
+                host: host_of(&s.host),
+                fields: f,
+            });
+        }
+        if let Some(p) = &t.power {
+            let mut f = Vec::new();
+            push_opt(&mut f, "cycle_cmd", &p.cycle_cmd);
+            push_opt(&mut f, "serial_interface", &p.serial_interface);
+            channels.push(ResolvedChannel {
+                kind: ChannelKind::Power,
+                name: "power".into(),
+                host: host_of(&p.host),
+                fields: f,
+            });
+        }
+        if let Some(v) = &t.video {
+            let mut f = Vec::new();
+            push_opt(&mut f, "device", &v.device);
+            channels.push(ResolvedChannel {
+                kind: ChannelKind::Video,
+                name: "video".into(),
+                host: host_of(&v.host),
+                fields: f,
+            });
+        }
+        Some(ResolvedTarget {
+            name: name.to_string(),
+            default_host,
+            note: t.note.clone(),
+            channels,
+        })
+    }
+
+    /// Every (target, channel) pair whose channel resolves to `host`.
+    pub fn channels_on_host(&self, host: &str) -> Vec<(String, ResolvedChannel)> {
+        let mut out = Vec::new();
+        for name in self.targets.keys() {
+            if let Some(rt) = self.resolved_target(name) {
+                for ch in rt.channels {
+                    if ch.host == host {
+                        out.push((name.clone(), ch));
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+fn push_opt(fields: &mut Vec<(&'static str, String)>, key: &'static str, v: &Option<String>) {
+    if let Some(val) = v {
+        fields.push((key, val.clone()));
+    }
+}
+
+/// Resolve the host a command should run on, given the channel it touches.
+///
+/// Singleton kinds use that channel's host (else the target default). Serial
+/// with a name uses that interface's host; serial without a name uses the common
+/// host of all interfaces, erroring if they span hosts (the `serial watch` case,
+/// where the daemon owns every interface). A missing channel falls back to the
+/// target's default host so the body can report it.
+pub fn channel_host(
+    rt: &ResolvedTarget,
+    kind: ChannelKind,
+    serial_name: Option<&str>,
+) -> Result<String, LabError> {
+    if kind == ChannelKind::Serial {
+        let serials: Vec<&ResolvedChannel> = rt
+            .channels
+            .iter()
+            .filter(|c| c.kind == ChannelKind::Serial)
+            .collect();
+        if let Some(n) = serial_name {
+            return Ok(serials
+                .iter()
+                .find(|c| c.name == n)
+                .map(|c| c.host.clone())
+                .unwrap_or_else(|| rt.default_host.clone()));
+        }
+        if serials.is_empty() {
+            return Ok(rt.default_host.clone());
+        }
+        let hosts: BTreeSet<&str> = serials.iter().map(|c| c.host.as_str()).collect();
+        if hosts.len() > 1 {
+            let list: Vec<&str> = hosts.into_iter().collect();
+            return lab_err(format!(
+                "target '{}' has serial interfaces on multiple hosts ({}); \
+                 specify one with --interface",
+                rt.name,
+                list.join(", ")
+            ));
+        }
+        return Ok(serials[0].host.clone());
+    }
+    for c in &rt.channels {
+        if c.kind == kind {
+            return Ok(c.host.clone());
+        }
+    }
+    Ok(rt.default_host.clone())
+}
+
+// ── validation (shared by load and the editor's save) ───────────────────────
+
+fn check_host_ref(host: &str, declared: &BTreeSet<&str>, ctx: &str) -> Result<(), LabError> {
+    if !declared.contains(host) {
+        let mut known: Vec<&str> = declared.iter().copied().collect();
+        known.sort_unstable();
+        return lab_err(format!(
+            "{ctx} references unknown host '{host}' (declared: {})",
+            known.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// Raise [`LabError`] if `lab` is not a structurally valid lab.
+pub fn validate(lab: &Lab) -> Result<(), LabError> {
+    let mut declared: BTreeSet<&str> = lab.hosts.keys().map(String::as_str).collect();
+    declared.insert(LOCAL);
+    for (name, h) in &lab.hosts {
+        if h.ssh.trim().is_empty() {
+            return lab_err(format!("host '{name}': missing required 'ssh' field"));
+        }
+    }
+    for (name, t) in &lab.targets {
+        let default_host = t.default_host();
+        check_host_ref(default_host, &declared, &format!("target '{name}'"))?;
+        if let Some(nb) = &t.netboot {
+            let h = nb.host.as_deref().unwrap_or(default_host);
+            check_host_ref(h, &declared, &format!("target '{name}' netboot"))?;
+        }
+        if let Some(p) = &t.power {
+            let h = p.host.as_deref().unwrap_or(default_host);
+            check_host_ref(h, &declared, &format!("target '{name}' power"))?;
+        }
+        if let Some(v) = &t.video {
+            let h = v.host.as_deref().unwrap_or(default_host);
+            check_host_ref(h, &declared, &format!("target '{name}' video"))?;
+        }
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for s in &t.serial {
+            if s.name.is_empty() || s.device.is_empty() {
+                return lab_err(format!(
+                    "target '{name}': each [[serial]] needs name + device"
+                ));
+            }
+            if !seen.insert(s.name.as_str()) {
+                return lab_err(format!(
+                    "target '{name}': duplicate serial name '{}'",
+                    s.name
+                ));
+            }
+            if let Some(sense) = &s.power_sense_signal {
+                if !VALID_SENSE_SIGNALS.contains(&sense.as_str()) {
+                    return lab_err(format!(
+                        "target '{name}' serial '{}': invalid power_sense_signal '{sense}' \
+                         (valid: {})",
+                        s.name,
+                        VALID_SENSE_SIGNALS.join(", ")
+                    ));
+                }
+            }
+            let h = s.host.as_deref().unwrap_or(default_host);
+            check_host_ref(
+                h,
+                &declared,
+                &format!("target '{name}' serial '{}'", s.name),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+// ── parsing & path discovery ────────────────────────────────────────────────
+
+/// Parse and validate a lab from TOML text.
+pub fn parse(text: &str) -> Result<Lab, LabError> {
+    let lab: Lab = toml::from_str(text).map_err(|e| LabError(e.to_string()))?;
+    validate(&lab)?;
+    Ok(lab)
+}
+
+/// Read and validate the lab at `path`.
+pub fn load(path: &Path) -> Result<Lab, LabError> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| LabError(format!("{}: {e}", path.display())))?;
+    parse(&text)
+}
+
+/// Expand a leading `~/` to the user's home directory.
+pub fn expand_tilde(p: &str) -> PathBuf {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(p)
+}
+
+/// The lab file used when neither `--lab` nor `$PANIOLO_LAB` is given.
+pub fn default_lab_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".config/paniolo/lab.toml")
+}
+
+/// Resolve the active lab path: `--lab`, then `$PANIOLO_LAB`, then the default
+/// path if it exists. Returns None when none resolve.
+pub fn resolve_lab_path(flag: Option<&str>) -> Option<PathBuf> {
+    if let Some(p) = flag {
+        return Some(expand_tilde(p));
+    }
+    if let Ok(p) = std::env::var("PANIOLO_LAB") {
+        if !p.is_empty() {
+            return Some(expand_tilde(&p));
+        }
+    }
+    let d = default_lab_path();
+    if d.exists() {
+        Some(d)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn multihost() -> Lab {
+        parse(
+            r#"
+            [hosts.bench1]
+            ssh = "u@bench1"
+            [hosts.bench2]
+            ssh = "u@bench2"
+            [targets.fortune]
+            host = "bench1"
+            note = "n"
+            [targets.fortune.netboot]
+            interface = "en0"
+            [[targets.fortune.serial]]
+            name = "console"
+            device = "/dev/ttyUSB0"
+            [targets.fortune.video]
+            device = "/dev/video0"
+            host = "bench2"
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn resolves_per_channel_host() {
+        let rt = multihost().resolved_target("fortune").unwrap();
+        let by: BTreeMap<_, _> = rt
+            .channels
+            .iter()
+            .map(|c| ((c.kind.as_str(), c.name.clone()), c.host.clone()))
+            .collect();
+        assert_eq!(by[&("netboot", "netboot".into())], "bench1");
+        assert_eq!(by[&("serial", "console".into())], "bench1");
+        assert_eq!(by[&("video", "video".into())], "bench2");
+        assert_eq!(rt.hosts(), vec!["bench1", "bench2"]);
+    }
+
+    #[test]
+    fn channels_on_host_is_the_inverse_index() {
+        let lab = multihost();
+        let on2 = lab.channels_on_host("bench2");
+        assert_eq!(on2.len(), 1);
+        assert_eq!(on2[0].0, "fortune");
+        assert_eq!(on2[0].1.kind, ChannelKind::Video);
+    }
+
+    #[test]
+    fn validate_rejects_unknown_host() {
+        let e = parse("[targets.t]\nhost = \"ghost\"\n").unwrap_err();
+        assert!(e.0.contains("unknown host 'ghost'"), "{}", e.0);
+    }
+
+    #[test]
+    fn validate_rejects_bad_sense() {
+        let toml = "[targets.t]\n[[targets.t.serial]]\nname=\"c\"\ndevice=\"/d\"\npower_sense_signal=\"bogus\"\n";
+        let e = parse(toml).unwrap_err();
+        assert!(e.0.contains("invalid power_sense_signal"), "{}", e.0);
+    }
+
+    #[test]
+    fn validate_rejects_missing_ssh() {
+        // ssh is a required field, so this fails at deserialize time.
+        assert!(parse("[hosts.bench1]\n").is_err());
+    }
+}
+````
+
+## File: docs/requirements.md
+````markdown
+# Paniolo — Requirements & progress tracker
+
+> Project-wide requirements for **paniolo**, an agent-controlled target-machine wrangler for
+> low-level software development (bootloaders, firmware, OS bring-up). This is the single
+> source of truth for *what paniolo must do* and *how far along each capability is* — covering
+> both shipped capabilities and planned work.
+>
+> Scope note: paniolo is a **device-control / "wrangling" layer** (power, serial, deploy/netboot,
+> video, HID). It deliberately does **not** own test orchestration or result production — when
+> integrated with hardware-CI ecosystems, those stay above paniolo (see §9).
+>
+> Companion design docs live under [`docs/ci-integration/`](ci-integration/) (gap analysis +
+> integration design) and per-feature docs under [`docs/`](.). **Update the Status column as
+> work lands.**
+>
+> Last updated: 2026-05-29.
+
+## Status legend
+
+| Symbol | Meaning |
+|---|---|
+| ☑ | Done / shipped |
+| ◐ | In progress |
+| ☐ | Not started |
+| ⤵ | Deferred (planned, later) |
+| ⊘ | Out of scope (recorded, not planned) |
+
+**Pri** = M(ust) / S(hould) / C(ould). **Source/Notes** cites the driving need or contract.
+
+---
+
+## 1. Foundations / platform
+
+| ID | Requirement | Pri | Status | Notes |
+|---|---|---|---|---|
+| CORE-1 | Per-target config in `~/.config/paniolo/targets/<name>.toml`; one file per target, no daemon required | M | ☑ | `_config.py`; single target is the default |
+| CORE-2 | CLI (`paniolo`) over subcommands; SSH-drivable from a dev machine into the control host | M | ☑ | Remote-control pattern (README) |
+| CORE-3 | Run on macOS 10.14+ and Linux (x86-64/arm64) | M | ☑ | `paniolo setup` installs daemons/tools |
+| CORE-4 | Rust daemons (`hdmicap`, `serialcap`) + Swift `visionocr` helper build & install | M | ☑ | `paniolo setup` |
+| CORE-5 | Predictable runtime paths (configs, daemon discovery, capture logs) | M | ☑ | README "Runtime paths" |
+| CORE-6 | Agent-oriented guidance kept current (`AGENTS.md`) as the surface changes | M | ◐ | Must track power/serial changes in §9 |
+| CORE-7 | One-file **lab** model (`--lab`/`PANIOLO_LAB`): hosts + targets, per-resource host binding; legacy targets dir as fallback | S | ☑ | `_lab.py`; [distributed-control](distributed-control.md) |
+| CORE-8 | Transparent re-exec of host-operating commands on a target's **remote control host** over SSH | S | ☑ | `_remote.py`, `@remote_capable`; `_ssh.py` transport |
+| CORE-9 | Tunnelled `console` for a remote target (dashboard reachable locally) | S | ☑ | `_cli._remote_console`; `?serialws=` stitch |
+| CORE-10 | Multi-host targets (one target spanning control hosts) | C | ☐ | schema ready (per-resource host); single-host enforced for now |
+| CORE-11 | Remote `setup --host` + discovery-assisted `configure` (Phases 4–5) | C | ☐ | [plan](distributed-control-plan.md) |
+
+## 2. Netboot / deploy
+
+| ID | Requirement | Pri | Status | Notes |
+|---|---|---|---|---|
+| NET-1 | Built-in DHCP + TFTP over a direct USB-Ethernet link | M | ☑ | `_dhcp.py`, `_tftp.py`; `192.168.99.1/24` |
+| NET-2 | `netboot start/stop/status`, `tftp-root`, `logs` (filterable, followable) | M | ☑ | `_cli.py`; `_netboot.py` |
+| NET-3 | `netboot link-up/down/status` for interface configuration | M | ☑ | |
+| NET-4 | TFTP root configurable per target (`--tftp-root`) | M | ☑ | required for `netboot start` |
+| NET-5 | `netif mode netboot\|ffx\|off` — atomic, idempotent link-mode switch; stops netboot before SD boot, sets up host `fe80::1`/64 for ffx; `netif status` probes the active mode | S | ☑ | `_netif.py`; from rpi5-bringup ffx-over-network bring-up |
+
+## 3. Serial console
+
+| ID | Requirement | Pri | Status | Notes |
+|---|---|---|---|---|
+| SER-A | `serialcap` daemon owns the port exclusively; supervisor fans out reads | M | ☑ | `serialcap/`; lockfile |
+| SER-B | Timestamped rolling JSONL capture log, addressable by seq; rotation | M | ☑ | `capture.rs`; `serial log` |
+| SER-C | Interactive terminal via `tio` (`serial connect`) | M | ☑ | |
+| SER-D | Bidirectional live `/stream` (WebSocket) — read + write-back | M | ☑ | `server.rs` (used by dashboard) |
+| SER-E | `serial add/set/rm/devices/show`, multi-interface per target | M | ☑ | |
+| SER-F | DTR control: `serial dtr`, `serial reset` (soft-reset semantics) | M | ☑ | `_power.py` |
+| SER-G | Power-sense read via modem-control input (`--power-sense cts\|dsr\|dcd\|ri`) | S | ☑ | `/status` → `power_on` |
+
+## 4. Power control
+
+| ID | Requirement | Pri | Status | Notes |
+|---|---|---|---|---|
+| PWR-A | `power-cycle` via configurable script (`--power-cycle-cmd`) | M | ☑ | *to be superseded by `[power]` block — PWR-5 in §9* |
+| PWR-B | `power-state` (read-only on/off via sense signal) | M | ☑ | `power-state` |
+| PWR-C | DTR-based hardware power-button toggling (J2 header): ≤500ms soft / ≥3s hard | M | ☑ | `_power.py` |
+
+## 5. Video / OCR
+
+| ID | Requirement | Pri | Status | Notes |
+|---|---|---|---|---|
+| VID-1 | HDMI/USB capture via warm-stream `hdmicap` daemon | M | ☑ | `hdmicap/`; Linux V4L2 + macOS |
+| VID-2 | `video watch/preview/shot/read/devices/show/stop`; stable & changed-since capture | M | ☑ | |
+| VID-3 | On-device OCR (`video read`): Apple Vision (macOS), Tesseract (Linux); `--json` | S | ☑ | `_ocr.py` |
+
+## 6. HID injection
+
+| ID | Requirement | Pri | Status | Notes |
+|---|---|---|---|---|
+| HID-1 | USB keyboard/mouse injection via two-board KB2040 rig | S | ☑ | `hidrig/`; needs `pyserial` extra |
+| HID-2 | `hid type/key/combo/releaseall/click/move/scroll/run/setup/show` | S | ☑ | `_cli.py` |
+
+## 7. Dashboard
+
+| ID | Requirement | Pri | Status | Notes |
+|---|---|---|---|---|
+| DASH-1 | Combined video + serial web UI (`paniolo console`); auto-starts daemons | S | ☑ | preselect serial via `-i` |
+| DASH-2 | Dashboard power-cycle control | S | ☑ | |
+
+## 8. Cross-cutting / non-functional
+
+| ID | Requirement | Pri | Status | Notes |
+|---|---|---|---|---|
+| NF-1 | Interactive/agent bring-up workflow (dashboard, OCR, HID, `tio`, JSONL) never regresses | M | ◐ | Regression guard on every change, esp. §9 serial work |
+| NF-2 | Changes land as smallest reversible steps, each with tests | M | ◐ | |
+| NF-3 | Core power/serial path stays functional on both macOS and Linux | M | ☑ | CI-only features may be Linux-only (see §9) |
+| NF-4 | External contracts re-verified against upstream before relying on them | M | ◐ | re-check Fuchsia `device.go` (FX-4) |
+
+---
+
+## 9. Hardware-CI integration (KernelCI/LAVA + Fuchsia/botanist)
+
+> Goal: make paniolo's primitives **consumable by** LAVA (under KernelCI's Maestro) and
+> `botanist`+`testrunner` (under Fuchsia/LUCI) — *without* paniolo owning orchestration or
+> results. Full analysis: [`ci-integration/gap-analysis.md`](ci-integration/gap-analysis.md);
+> design: [`ci-integration/design.md`](ci-integration/design.md).
+>
+> **Current focus:** the owner is doing a **Fuchsia port** with an agent — single user, no
+> existing users, breaking changes are free. M1 leads with the Fuchsia-critical path (PTY +
+> power); the botanist adapter is sequenced before LAVA.
+
+### 9.0 Decisions (locked 2026-05-29)
+
+| ID | Decision | Resolution |
+|---|---|---|
+| D-1 | KCIDB results path | ⊘ Out of scope — LAVA-lab path only for KernelCI |
+| D-2 | Fuchsia serial ownership | PTY proxy; paniolo keeps the physical port (JSONL/dashboard stay live) |
+| D-3 | Serial write arbitration | Cooperative last-writer-wins + advisory lock in `/status` + opt-in `--exclusive`, **auto-released on client disconnect** (+ optional `--lock-timeout`) |
+| D-4 | JTAG in v1 | Extension point only (schema + verb stubs); OpenOCD backend deferred |
+| D-5 | CI control-host OS | Linux-only for CI; macOS stays first-class for interactive bring-up |
+| D-6 | Deploy ownership in CI | Orchestrator owns deploy (LAVA TFTP / botanist pave); paniolo netboot stands down |
+| D-7 | Serial TCP endpoint | Native Rust TCP listener in serialcap; ser2net-on-PTY as LAVA fallback |
+| D-8 | `[power]` config | Breaking change accepted — clean `[power]` block, no `power_cycle_cmd` alias; update `AGENTS.md` |
+
+### 9.1 Agnostic device-control API — Power
+
+| ID | Requirement | Source | Pri | Status | Notes |
+|---|---|---|---|---|---|
+| PWR-1 | `paniolo power on` — applies power; DUT begins booting unattended | LAVA | M | ☐ | Maps to `power_on_command` (hard requirement) |
+| PWR-2 | `paniolo power off` — cuts power | LAVA | M | ☐ | DTR long-press or PDU script |
+| PWR-3 | `paniolo power reset` — off+delay+on (hard reset) | LAVA | M | ☐ | Supersedes `power-cycle` (PWR-A) |
+| PWR-4 | `paniolo power state` — read on/off | BOTH | M | ☑ | exists as `power-state` (PWR-B); rename only |
+| PWR-5 | `[power]` config block w/ `backend = script\|dtr\|pdu\|jtag` + on/off/reset cmds | BOTH | M | ☐ | **Breaking**: replaces flat `power_cycle_cmd` (no alias) |
+| PWR-6 | Power commands usable as plain shell cmds (string or list) from a generator | LAVA | M | ☐ | LAVA fields accept string OR list |
+| PWR-7 | Update `AGENTS.md` for the new `[power]` config + verbs | OWNER | M | ☐ | Agent reconfigures targets on redeploy |
+
+### 9.2 Agnostic device-control API — Serial (core gap)
+
+| ID | Requirement | Source | Pri | Status | Notes |
+|---|---|---|---|---|---|
+| SER-1 | serialcap exposes a **raw bidirectional TCP listener** (ser2net-equivalent) | LAVA | M | ☐ | backs `connection_command = telnet host port` |
+| SER-2 | serialcap exposes a **PTY** whose slave path is a real device file | FX | M | ☐ | handed to botanist as `DeviceConfig.serial` |
+| SER-3 | New endpoints **tee off the existing supervisor** (JSONL/WS/dashboard unaffected) | OWNER | M | ☐ | preserves NF-1 |
+| SER-4 | `paniolo serial send <bytes\|->` one-shot write (agent feature) | OWNER | M | ☐ | same `write_tx` channel; `--enter`/`--hex`/stdin |
+| SER-5 | Write arbitration per D-3 (lock, `/status` holder, `--exclusive`, auto-release) | OWNER | M | ☐ | |
+| SER-6 | Stable socket/PTY paths under `$XDG_RUNTIME_DIR/paniolo/<target>/` | BOTH | S | ☐ | predictable for adapters |
+| SER-7 | Existing JSONL log, `/stream`, `tio`, `serial log/dtr/reset` unchanged | OWNER | M | ☐ | regression guard / tests |
+
+### 9.3 Agnostic device-control API — Deploy / boot / debug
+
+| ID | Requirement | Source | Pri | Status | Notes |
+|---|---|---|---|---|---|
+| DEP-1 | netboot **stands down** under CI; no DHCP/TFTP contention | BOTH | M | ☐ | guard `netboot start` when CI attach active |
+| DEP-2 | netboot remains available for interactive/non-CI use | OWNER | M | ☑ | exists (NET-1..4); just not the CI path |
+| DEP-3 | (Full) paniolo-serves-images as a non-standard LAVA deploy method | LAVA | C | ⤵ | only if a board can't use LAVA TFTP |
+| BOOT-1 | `paniolo serial wait --match <regex> [--timeout]` boot-detect helper | OWNER | S | ⤵ | not required by either orchestrator; ergonomics |
+| JTAG-1 | `[jtag]`/`[debug]` config schema + `paniolo debug {halt\|resume\|reset\|gdb}` stubs | OWNER | C | ☐ | extension point only per D-4 |
+| JTAG-2 | OpenOCD backend: reset, flash-deploy, GDB `:3333` / Tcl `:6666` sockets | OWNER | C | ⤵ | deferred |
+
+### 9.4 Adapter A — LAVA lab
+
+| ID | Requirement | Source | Pri | Status | Notes |
+|---|---|---|---|---|---|
+| LAVA-1 | Device-dictionary + device-type template generator (`paniolo lava device-dict`) | LAVA | M | ☐ | power_* → `paniolo power …`; connection → telnet |
+| LAVA-2 | Generator supports list-valued power commands | LAVA | S | ☐ | |
+| LAVA-3 | "First device" onboarding doc (Debian worker, ser2net/TCP wiring, tokens) | LAVA | S | ☐ | internet-reachable lab; tokens to KernelCI admins |
+| LAVA-4 | Verified on a Debian LAVA worker against a real board | LAVA | S | ☐ | macOS unsupported (D-5) |
+
+### 9.5 Adapter B — Fuchsia / botanist
+
+| ID | Requirement | Source | Pri | Status | Notes |
+|---|---|---|---|---|---|
+| FX-1 | botanist device-config emitter (`paniolo botanist device-config`) → PTY path | FX | M | ☐ | `{network,keys,serial}`; serial = PTY (SER-2) |
+| FX-2 | Bot-host/recipe **power wrapper** calling `paniolo power {on\|reset\|off}` | FX | M | ☐ | power is NOT a device-config field |
+| FX-3 | `bot_config.py` `get_dimensions()` snippet advertising `device_type:<board>` | FX | S | ☐ | + `bots.cfg`, `platforms.gni` (upstream coord) |
+| FX-4 | Verify `DeviceConfig`/power plumbing against a real Fuchsia checkout | FX | M | ☐ | confirm `tools/botanist/target/device.go` |
+| FX-5 | Document RFC-0130 Experimental tier (self-hosted CI) | FX | C | ☐ | community board is not "Supported" tier |
+
+---
+
+### 9.6 Adapter C — Redfish provider
+
+> **Decision (D-9, 2026-05-29):** Redfish interop = **provider** direction (paniolo exposes a
+> Redfish API in front of BMC-less boards), **not client**. Higher-leverage than per-ecosystem
+> adapters because Redfish is the bare-metal lingua franca (Ironic/Metal3 primary control plane;
+> LAVA can `curl` it). Sequenced **after** M1 — consumes the power verbs (PWR-1..6) and the raw
+> serial socket (SER-1). Design sketch: [`ci-integration/redfish-provider.md`](ci-integration/redfish-provider.md).
+> Verified against DMTF canonical CSDL (DSP0266 v1.22.0, DSP8010 2025.2), OpenBMC, Ironic/sushy.
+
+| ID | Requirement | Source | Pri | Status | Notes |
+|---|---|---|---|---|---|
+| RF-1 | Redfish provider service: `ServiceRoot` → `ComputerSystem` → `Manager` (→ `VirtualMedia`) resource tree | OWNER | S | ⤵ | deferred after M1; provider, not client |
+| RF-2 | `#ComputerSystem.Reset` → power verbs (On→on, ForceOff→off, PowerCycle/ForceRestart→reset); `PowerState` → power-state | OWNER | S | ⤵ | depends on PWR-1..6 |
+| RF-3 | `Boot.BootSourceOverrideTarget=Pxe` + `BootSourceOverrideEnabled=Once` → netboot | OWNER | S | ⤵ | maps to existing netboot |
+| RF-4 | `VirtualMedia` `InsertMedia`/`EjectMedia` → image deploy | OWNER | C | ⤵ | open: needed vs. Pxe-once sufficient? |
+| RF-5 | `SerialConsole` advertises out-of-band SSH/console endpoint pointing at paniolo raw-serial socket (metadata only) | OWNER | S | ⤵ | depends on SER-1; Redfish carries no serial bytes |
+| RF-6 | Honest per-node `ResetType@Redfish.AllowableValues` / `ActionInfo` for the supported subset | OWNER | S | ⤵ | relay/DTR boards can't do every `ResetType` |
+| RF-7 | Implement via a sushy-tools-style emulator + paniolo backend driver (not a hand-rolled OData service) | OWNER | S | ⤵ | open: dependency footprint (core = `typer` only) |
+| RF-8 | Document/decide whether Redfish provider replaces or complements LAVA/botanist adapters | OWNER | S | ⤵ | botanist PTY serial seam still needs the direct path → not a full replacement |
+
+## 10. Security
+
+> **TODO — owner to populate.** This section needs dedicated attention and is intentionally
+> unfinished. Paniolo grants an agent physical-equivalent control of a target (power, raw
+> serial read/write, netboot/TFTP, HID injection) and, with the §9 work, opens **network-facing
+> serial endpoints** and is **SSH-driven from a dev machine into the control host** — so the
+> threat model and controls deserve first-class requirements, not afterthoughts.
+
+| ID | Requirement | Pri | Status | Notes |
+|---|---|---|---|---|
+| SEC-0 | Define paniolo's threat model and security requirements | M | ☐ | **Placeholder — to be written.** |
+
+Prompts to resolve when populating (not yet requirements — discussion seeds):
+
+- **Serial endpoint exposure (§9):** the raw TCP listener (SER-1) currently mirrors serialcap's
+  loopback-only bind (`127.0.0.1`). For a LAVA worker / Swarming bot, who may connect? Auth,
+  bind address, TLS, or rely on SSH-tunnel/localhost-only + network isolation?
+- **Write arbitration as a safety control (SER-5/D-3):** is `--exclusive` purely cooperative, or
+  also a guard against an unexpected writer driving the target?
+- **Netboot/DHCP/TFTP:** read-only TFTP, single-client; any spoofing/rogue-DHCP concerns on a
+  shared lab network vs. the assumed direct USB-Ethernet link?
+- **Power/HID authority:** anyone who can reach the control host can power-cycle and inject HID —
+  what bounds that (host access model, per-target ACLs)?
+- **Secrets:** LAVA submission tokens, `$FUCHSIA_SSH_KEY`, CIPD/Swarming creds — storage and
+  handling.
+- **Supply chain:** `paniolo setup` builds/install Rust + Swift + Homebrew components.
+
+---
+
+## 11. Milestones
+
+| Milestone | Contents | Status |
+|---|---|---|
+| M0 — Analysis & design | gap-analysis, design, this tracker, decisions | ☑ |
+| Shipped baseline | §1–§7 capabilities (netboot, serial, power, video, HID, dashboard) | ☑ |
+| M1 — Agnostic device-control core | SER-2, SER-4, PWR-1..7, SER-5, SER-1, DEP-1, JTAG-1 (Fuchsia path first) | ☐ (awaiting go-ahead) |
+| M2 — Adapters | FX-1..4 (first), then LAVA-1..3 | ☐ |
+| M3 — Verify on hardware | FX-3/FX-5, LAVA-4, BOOT-1 | ☐ |
+| Security | §10 (SEC-*) | ☐ (to be defined) |
+| M4 — Full (deferred) | DEP-3, JTAG-2 | ⤵ |
+
+## 12. Open implementation questions
+
+| ID | Question | Status |
+|---|---|---|
+| SER-Q1 | Native TCP listener vs. ser2net-on-PTY | ✓ Resolved (D-7): native listener; ser2net fallback |
+| SER-Q2 | Write-lock lifetime | ✓ Resolved (D-3): auto-release on disconnect + optional `--lock-timeout` |
+| PWR-Q1 | `[power]` shape + `power_cycle_cmd` migration | ✓ Resolved (D-8): clean breaking block, no alias |
+````
+
+## File: hdmicap/src/capture.rs
+````rust
+// Copyright 2026 Curtis Galloway
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Capture backend abstraction.
+//!
+//! On Linux we bypass nokhwa and use the `v4l` crate directly so we can:
+//!   - Call `stream.set_timeout()` to avoid an indefinite VIDIOC_DQBUF block
+//!   - Keep raw MJPEG bytes for zero-cost preview serving
+//!   - Use turbojpeg (libjpeg-turbo) for fast RGB decode when signal detection
+//!     or OCR needs pixel data
+//!
+//! On macOS the nokhwa + AVFoundation path is kept as-is.
+
+use std::sync::Arc;
+
+use anyhow::{anyhow, Context, Result};
+use image::RgbImage;
+
+use nokhwa::query;
+use nokhwa::utils::{ApiBackend, CameraIndex};
+
+#[derive(Clone, Debug)]
+pub struct DeviceInfo {
+    pub index: u32,
+    pub name: String,
+    pub misc: String,
+}
+
+/// How the user asked us to pick a device.
+#[derive(Clone, Debug)]
+pub enum DeviceSpec {
+    Auto,
+    Index(u32),
+    Name(String),
+}
+
+impl DeviceSpec {
+    pub fn parse(s: &str) -> Self {
+        let s = s.trim();
+        if s.is_empty() || s.eq_ignore_ascii_case("auto") {
+            DeviceSpec::Auto
+        } else if let Ok(i) = s.parse::<u32>() {
+            DeviceSpec::Index(i)
+        } else if let Some(idx) = s
+            .strip_prefix("/dev/video")
+            .and_then(|n| n.parse::<u32>().ok())
+        {
+            DeviceSpec::Index(idx)
+        } else {
+            DeviceSpec::Name(s.to_string())
+        }
+    }
+}
+
+const BUILTIN_HINTS: &[&str] = &["facetime", "built-in", "integrated", "isight"];
+
+/// One captured frame. `jpeg` carries raw MJPEG bytes when available (Linux
+/// MJPEG path); the preview endpoint serves these directly with zero server
+/// decode/re-encode. `rgb` is always populated for signal detection (ahash,
+/// is_no_signal); on the Linux path it comes from turbojpeg (fast).
+pub struct CapturedFrame {
+    /// Raw MJPEG bytes from the device. Present on the Linux v4l path when the
+    /// device is in MJPEG mode; None on macOS or YUYV sources.
+    pub jpeg: Option<Arc<[u8]>>,
+    /// Decoded RGB8 pixels for signal detection. Always populated.
+    pub rgb: RgbImage,
+}
+
+pub trait CaptureBackend {
+    fn frame(&mut self) -> Result<CapturedFrame>;
+}
+
+pub fn enumerate() -> Result<Vec<DeviceInfo>> {
+    let cams = query(ApiBackend::Auto).context("nokhwa device query failed")?;
+    Ok(cams
+        .into_iter()
+        .map(|c| DeviceInfo {
+            index: match c.index() {
+                CameraIndex::Index(i) => *i,
+                CameraIndex::String(_) => u32::MAX,
+            },
+            name: c.human_name(),
+            misc: c.description().to_string(),
+        })
+        .collect())
+}
+
+pub fn resolve(spec: &DeviceSpec) -> Result<u32> {
+    match spec {
+        DeviceSpec::Index(i) => Ok(*i),
+        _ => {
+            let devices = enumerate()?;
+            if devices.is_empty() {
+                return Err(anyhow!("no capture devices found"));
+            }
+            match spec {
+                DeviceSpec::Index(i) => Ok(*i),
+                DeviceSpec::Name(sub) => {
+                    let sub = sub.to_lowercase();
+                    devices
+                        .iter()
+                        .find(|d| d.name.to_lowercase().contains(&sub))
+                        .map(|d| d.index)
+                        .ok_or_else(|| anyhow!("no device matching name {:?}", sub))
+                }
+                DeviceSpec::Auto => {
+                    let external = devices.iter().find(|d| {
+                        let n = d.name.to_lowercase();
+                        !BUILTIN_HINTS.iter().any(|h| n.contains(h))
+                    });
+                    Ok(external.unwrap_or(&devices[0]).index)
+                }
+            }
+        }
+    }
+}
+
+pub fn open_backend(spec: &DeviceSpec) -> Result<Box<dyn CaptureBackend>> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::LinuxV4LBackend::open(spec).map(|b| Box::new(b) as Box<dyn CaptureBackend>)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        macos::NokhwaBackend::open(spec).map(|b| Box::new(b) as Box<dyn CaptureBackend>)
+    }
+}
+
+// ── Linux backend ─────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::io;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use anyhow::{anyhow, Context, Result};
+    use image::RgbImage;
+    use v4l::buffer::Type;
+    use v4l::device::Device;
+    use v4l::format::{Format, FourCC};
+    use v4l::io::mmap::Stream;
+    use v4l::io::traits::CaptureStream;
+    use v4l::video::Capture;
+
+    use super::{resolve, CaptureBackend, CapturedFrame, DeviceSpec};
+
+    const FORMATS: &[(u32, u32, &[u8; 4])] = &[
+        (1280, 720, b"MJPG"),
+        (1920, 1080, b"MJPG"),
+        (1280, 720, b"YUYV"),
+        (640, 480, b"YUYV"),
+    ];
+
+    const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+
+    pub struct LinuxV4LBackend {
+        stream: Stream<'static>,
+        dev: Box<Device>,
+        dims: (u32, u32),
+        is_mjpeg: bool,
+    }
+
+    impl LinuxV4LBackend {
+        pub fn open(spec: &DeviceSpec) -> Result<Self> {
+            let idx = resolve(spec)?;
+            let dev = Box::new(
+                Device::new(idx as usize).map_err(|e| anyhow!("open /dev/video{idx}: {e}"))?,
+            );
+
+            let mut last_err = anyhow!("no formats succeeded");
+            for &(w, h, fourcc) in FORMATS {
+                let fmt = Format::new(w, h, FourCC::new(fourcc));
+                if dev.set_format(&fmt).is_err() {
+                    continue;
+                }
+                let dev_ref: &'static Device = unsafe { &*(dev.as_ref() as *const Device) };
+                match Stream::with_buffers(dev_ref, Type::VideoCapture, 4) {
+                    Ok(mut stream) => {
+                        stream.set_timeout(FRAME_TIMEOUT);
+                        let actual_fmt = dev.format().unwrap_or(fmt);
+                        let is_mjpeg = actual_fmt.fourcc == FourCC::new(b"MJPG");
+                        tracing::info!(
+                            "capture opened {}x{} {:?}",
+                            actual_fmt.width,
+                            actual_fmt.height,
+                            if is_mjpeg { "MJPEG" } else { "YUYV" }
+                        );
+                        return Ok(LinuxV4LBackend {
+                            stream,
+                            dev,
+                            dims: (actual_fmt.width, actual_fmt.height),
+                            is_mjpeg,
+                        });
+                    }
+                    Err(e) => {
+                        last_err = anyhow!("stream init {w}x{h}: {e}");
+                    }
+                }
+            }
+            Err(last_err)
+        }
+    }
+
+    impl CaptureBackend for LinuxV4LBackend {
+        fn frame(&mut self) -> Result<CapturedFrame> {
+            let (buf, _meta) = self.stream.next().map_err(|e| {
+                if e.kind() == io::ErrorKind::TimedOut {
+                    anyhow!("frame timeout (device stalled)")
+                } else {
+                    anyhow!("VIDIOC_DQBUF: {e}")
+                }
+            })?;
+
+            if self.is_mjpeg {
+                // Keep a copy of the raw JPEG bytes for zero-cost preview serving.
+                let jpeg_bytes: Arc<[u8]> = Arc::from(buf.to_vec().into_boxed_slice());
+
+                // Decode with turbojpeg (libjpeg-turbo) for signal detection.
+                // ~5ms at 720p vs ~50ms with the pure-Rust image crate.
+                let rgb = turbojpeg::decompress_image::<image::Rgb<u8>>(buf)
+                    .context("turbojpeg MJPEG decode failed")?;
+                let (w, h) = (rgb.width(), rgb.height());
+                self.dims = (w, h);
+
+                Ok(CapturedFrame {
+                    jpeg: Some(jpeg_bytes),
+                    rgb,
+                })
+            } else {
+                // YUYV: no raw JPEG, decode to RGB for signal detection and storage.
+                let fmt = self.dev.format().ok();
+                let (w, h) = fmt
+                    .as_ref()
+                    .map(|f| (f.width, f.height))
+                    .unwrap_or(self.dims);
+                self.dims = (w, h);
+                Ok(CapturedFrame {
+                    jpeg: None,
+                    rgb: yuyv_to_rgb(buf, w, h),
+                })
+            }
+        }
+    }
+
+    fn yuyv_to_rgb(buf: &[u8], w: u32, h: u32) -> RgbImage {
+        let mut rgb = RgbImage::new(w, h);
+        let pairs = (w * h / 2) as usize;
+        for i in 0..pairs {
+            let base = i * 4;
+            if base + 3 >= buf.len() {
+                break;
+            }
+            let y0 = buf[base] as f32;
+            let cb = buf[base + 1] as f32 - 128.0;
+            let y1 = buf[base + 2] as f32;
+            let cr = buf[base + 3] as f32 - 128.0;
+            let to_u8 = |v: f32| v.clamp(0.0, 255.0) as u8;
+            let r = |y: f32| to_u8(y + 1.402 * cr);
+            let g = |y: f32| to_u8(y - 0.344 * cb - 0.714 * cr);
+            let b = |y: f32| to_u8(y + 1.772 * cb);
+            let x0 = ((i * 2) % w as usize) as u32;
+            let y_row = ((i * 2) / w as usize) as u32;
+            if x0 < w && y_row < h {
+                rgb.put_pixel(x0, y_row, image::Rgb([r(y0), g(y0), b(y0)]));
+            }
+            if x0 + 1 < w && y_row < h {
+                rgb.put_pixel(x0 + 1, y_row, image::Rgb([r(y1), g(y1), b(y1)]));
+            }
+        }
+        rgb
+    }
+}
+
+// ── macOS backend ─────────────────────────────────────────────────────────────
+
+#[cfg(not(target_os = "linux"))]
+mod macos {
+    use anyhow::{anyhow, Context, Result};
+    use nokhwa::pixel_format::RgbFormat;
+    use nokhwa::utils::{
+        CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution,
+    };
+    use nokhwa::Camera;
+
+    use super::{resolve, CaptureBackend, CapturedFrame, DeviceSpec};
+
+    pub struct NokhwaBackend {
+        cam: Camera,
+        dims: (u32, u32),
+    }
+
+    impl NokhwaBackend {
+        pub fn open(spec: &DeviceSpec) -> Result<Self> {
+            let idx = resolve(spec)?;
+            let format_types: &[RequestedFormatType] = &[
+                RequestedFormatType::Closest(CameraFormat::new(
+                    Resolution::new(1280, 720),
+                    FrameFormat::MJPEG,
+                    30,
+                )),
+                RequestedFormatType::Closest(CameraFormat::new(
+                    Resolution::new(1920, 1080),
+                    FrameFormat::MJPEG,
+                    30,
+                )),
+                RequestedFormatType::AbsoluteHighestResolution,
+            ];
+
+            let mut last_err: anyhow::Error = anyhow!("no formats to try");
+            for &fmt_type in format_types {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    try_open(idx, fmt_type)
+                }));
+                match result {
+                    Ok(Ok(backend)) => return Ok(backend),
+                    Ok(Err(e)) => {
+                        last_err = e;
+                    }
+                    Err(_) => {
+                        last_err = anyhow!("format {:?} not supported", fmt_type);
+                    }
+                }
+            }
+            Err(last_err)
+        }
+    }
+
+    fn try_open(idx: u32, fmt_type: RequestedFormatType) -> Result<NokhwaBackend> {
+        let requested = RequestedFormat::new::<RgbFormat>(fmt_type);
+        let mut cam = Camera::new(CameraIndex::Index(idx), requested)
+            .map_err(|e| anyhow!("failed to open capture device {idx}: {e}"))?;
+        cam.open_stream()
+            .map_err(|e| anyhow!("failed to open capture device {idx}: {e}"))?;
+        let res = cam.resolution();
+        Ok(NokhwaBackend {
+            cam,
+            dims: (res.width(), res.height()),
+        })
+    }
+
+    impl CaptureBackend for NokhwaBackend {
+        fn frame(&mut self) -> Result<CapturedFrame> {
+            let buf = self.cam.frame().context("frame grab failed")?;
+            let decoded = buf.decode_image::<RgbFormat>().context("decode failed")?;
+            self.dims = (decoded.width(), decoded.height());
+            Ok(CapturedFrame {
+                jpeg: None, // nokhwa gives decoded pixels, not raw JPEG
+                rgb: decoded,
+            })
+        }
+    }
+}
+````
+
 ## File: src/paniolo/_config.py
 ````python
 # Copyright 2026 Curtis Galloway
@@ -16105,1103 +21548,6 @@ if __name__ == "__main__":
     main()
 ````
 
-## File: docs/requirements.md
-````markdown
-# Paniolo — Requirements & progress tracker
-
-> Project-wide requirements for **paniolo**, an agent-controlled target-machine wrangler for
-> low-level software development (bootloaders, firmware, OS bring-up). This is the single
-> source of truth for *what paniolo must do* and *how far along each capability is* — covering
-> both shipped capabilities and planned work.
->
-> Scope note: paniolo is a **device-control / "wrangling" layer** (power, serial, deploy/netboot,
-> video, HID). It deliberately does **not** own test orchestration or result production — when
-> integrated with hardware-CI ecosystems, those stay above paniolo (see §9).
->
-> Companion design docs live under [`docs/ci-integration/`](ci-integration/) (gap analysis +
-> integration design) and per-feature docs under [`docs/`](.). **Update the Status column as
-> work lands.**
->
-> Last updated: 2026-05-29.
-
-## Status legend
-
-| Symbol | Meaning |
-|---|---|
-| ☑ | Done / shipped |
-| ◐ | In progress |
-| ☐ | Not started |
-| ⤵ | Deferred (planned, later) |
-| ⊘ | Out of scope (recorded, not planned) |
-
-**Pri** = M(ust) / S(hould) / C(ould). **Source/Notes** cites the driving need or contract.
-
----
-
-## 1. Foundations / platform
-
-| ID | Requirement | Pri | Status | Notes |
-|---|---|---|---|---|
-| CORE-1 | Per-target config in `~/.config/paniolo/targets/<name>.toml`; one file per target, no daemon required | M | ☑ | `_config.py`; single target is the default |
-| CORE-2 | CLI (`paniolo`) over subcommands; SSH-drivable from a dev machine into the control host | M | ☑ | Remote-control pattern (README) |
-| CORE-3 | Run on macOS 10.14+ and Linux (x86-64/arm64) | M | ☑ | `paniolo setup` installs daemons/tools |
-| CORE-4 | Rust daemons (`hdmicap`, `serialcap`) + Swift `visionocr` helper build & install | M | ☑ | `paniolo setup` |
-| CORE-5 | Predictable runtime paths (configs, daemon discovery, capture logs) | M | ☑ | README "Runtime paths" |
-| CORE-6 | Agent-oriented guidance kept current (`AGENTS.md`) as the surface changes | M | ◐ | Must track power/serial changes in §9 |
-| CORE-7 | One-file **lab** model (`--lab`/`PANIOLO_LAB`): hosts + targets, per-resource host binding; legacy targets dir as fallback | S | ☑ | `_lab.py`; [distributed-control](distributed-control.md) |
-| CORE-8 | Transparent re-exec of host-operating commands on a target's **remote control host** over SSH | S | ☑ | `_remote.py`, `@remote_capable`; `_ssh.py` transport |
-| CORE-9 | Tunnelled `console` for a remote target (dashboard reachable locally) | S | ☑ | `_cli._remote_console`; `?serialws=` stitch |
-| CORE-10 | Multi-host targets (one target spanning control hosts) | C | ☐ | schema ready (per-resource host); single-host enforced for now |
-| CORE-11 | Remote `setup --host` + discovery-assisted `configure` (Phases 4–5) | C | ☐ | [plan](distributed-control-plan.md) |
-
-## 2. Netboot / deploy
-
-| ID | Requirement | Pri | Status | Notes |
-|---|---|---|---|---|
-| NET-1 | Built-in DHCP + TFTP over a direct USB-Ethernet link | M | ☑ | `_dhcp.py`, `_tftp.py`; `192.168.99.1/24` |
-| NET-2 | `netboot start/stop/status`, `tftp-root`, `logs` (filterable, followable) | M | ☑ | `_cli.py`; `_netboot.py` |
-| NET-3 | `netboot link-up/down/status` for interface configuration | M | ☑ | |
-| NET-4 | TFTP root configurable per target (`--tftp-root`) | M | ☑ | required for `netboot start` |
-| NET-5 | `netif mode netboot\|ffx\|off` — atomic, idempotent link-mode switch; stops netboot before SD boot, sets up host `fe80::1`/64 for ffx; `netif status` probes the active mode | S | ☑ | `_netif.py`; from rpi5-bringup ffx-over-network bring-up |
-
-## 3. Serial console
-
-| ID | Requirement | Pri | Status | Notes |
-|---|---|---|---|---|
-| SER-A | `serialcap` daemon owns the port exclusively; supervisor fans out reads | M | ☑ | `serialcap/`; lockfile |
-| SER-B | Timestamped rolling JSONL capture log, addressable by seq; rotation | M | ☑ | `capture.rs`; `serial log` |
-| SER-C | Interactive terminal via `tio` (`serial connect`) | M | ☑ | |
-| SER-D | Bidirectional live `/stream` (WebSocket) — read + write-back | M | ☑ | `server.rs` (used by dashboard) |
-| SER-E | `serial setup/remove/devices/show`, multi-interface per target | M | ☑ | |
-| SER-F | DTR control: `serial dtr`, `serial reset` (soft-reset semantics) | M | ☑ | `_power.py` |
-| SER-G | Power-sense read via modem-control input (`--power-sense cts\|dsr\|dcd\|ri`) | S | ☑ | `/status` → `power_on` |
-
-## 4. Power control
-
-| ID | Requirement | Pri | Status | Notes |
-|---|---|---|---|---|
-| PWR-A | `power-cycle` via configurable script (`--power-cycle-cmd`) | M | ☑ | *to be superseded by `[power]` block — PWR-5 in §9* |
-| PWR-B | `power-state` (read-only on/off via sense signal) | M | ☑ | `power-state` |
-| PWR-C | DTR-based hardware power-button toggling (J2 header): ≤500ms soft / ≥3s hard | M | ☑ | `_power.py` |
-
-## 5. Video / OCR
-
-| ID | Requirement | Pri | Status | Notes |
-|---|---|---|---|---|
-| VID-1 | HDMI/USB capture via warm-stream `hdmicap` daemon | M | ☑ | `hdmicap/`; Linux V4L2 + macOS |
-| VID-2 | `video watch/preview/shot/read/devices/show/stop`; stable & changed-since capture | M | ☑ | |
-| VID-3 | On-device OCR (`video read`): Apple Vision (macOS), Tesseract (Linux); `--json` | S | ☑ | `_ocr.py` |
-
-## 6. HID injection
-
-| ID | Requirement | Pri | Status | Notes |
-|---|---|---|---|---|
-| HID-1 | USB keyboard/mouse injection via two-board KB2040 rig | S | ☑ | `hidrig/`; needs `pyserial` extra |
-| HID-2 | `hid type/key/combo/releaseall/click/move/scroll/run/setup/show` | S | ☑ | `_cli.py` |
-
-## 7. Dashboard
-
-| ID | Requirement | Pri | Status | Notes |
-|---|---|---|---|---|
-| DASH-1 | Combined video + serial web UI (`paniolo console`); auto-starts daemons | S | ☑ | preselect serial via `-i` |
-| DASH-2 | Dashboard power-cycle control | S | ☑ | |
-
-## 8. Cross-cutting / non-functional
-
-| ID | Requirement | Pri | Status | Notes |
-|---|---|---|---|---|
-| NF-1 | Interactive/agent bring-up workflow (dashboard, OCR, HID, `tio`, JSONL) never regresses | M | ◐ | Regression guard on every change, esp. §9 serial work |
-| NF-2 | Changes land as smallest reversible steps, each with tests | M | ◐ | |
-| NF-3 | Core power/serial path stays functional on both macOS and Linux | M | ☑ | CI-only features may be Linux-only (see §9) |
-| NF-4 | External contracts re-verified against upstream before relying on them | M | ◐ | re-check Fuchsia `device.go` (FX-4) |
-
----
-
-## 9. Hardware-CI integration (KernelCI/LAVA + Fuchsia/botanist)
-
-> Goal: make paniolo's primitives **consumable by** LAVA (under KernelCI's Maestro) and
-> `botanist`+`testrunner` (under Fuchsia/LUCI) — *without* paniolo owning orchestration or
-> results. Full analysis: [`ci-integration/gap-analysis.md`](ci-integration/gap-analysis.md);
-> design: [`ci-integration/design.md`](ci-integration/design.md).
->
-> **Current focus:** the owner is doing a **Fuchsia port** with an agent — single user, no
-> existing users, breaking changes are free. M1 leads with the Fuchsia-critical path (PTY +
-> power); the botanist adapter is sequenced before LAVA.
-
-### 9.0 Decisions (locked 2026-05-29)
-
-| ID | Decision | Resolution |
-|---|---|---|
-| D-1 | KCIDB results path | ⊘ Out of scope — LAVA-lab path only for KernelCI |
-| D-2 | Fuchsia serial ownership | PTY proxy; paniolo keeps the physical port (JSONL/dashboard stay live) |
-| D-3 | Serial write arbitration | Cooperative last-writer-wins + advisory lock in `/status` + opt-in `--exclusive`, **auto-released on client disconnect** (+ optional `--lock-timeout`) |
-| D-4 | JTAG in v1 | Extension point only (schema + verb stubs); OpenOCD backend deferred |
-| D-5 | CI control-host OS | Linux-only for CI; macOS stays first-class for interactive bring-up |
-| D-6 | Deploy ownership in CI | Orchestrator owns deploy (LAVA TFTP / botanist pave); paniolo netboot stands down |
-| D-7 | Serial TCP endpoint | Native Rust TCP listener in serialcap; ser2net-on-PTY as LAVA fallback |
-| D-8 | `[power]` config | Breaking change accepted — clean `[power]` block, no `power_cycle_cmd` alias; update `AGENTS.md` |
-
-### 9.1 Agnostic device-control API — Power
-
-| ID | Requirement | Source | Pri | Status | Notes |
-|---|---|---|---|---|---|
-| PWR-1 | `paniolo power on` — applies power; DUT begins booting unattended | LAVA | M | ☐ | Maps to `power_on_command` (hard requirement) |
-| PWR-2 | `paniolo power off` — cuts power | LAVA | M | ☐ | DTR long-press or PDU script |
-| PWR-3 | `paniolo power reset` — off+delay+on (hard reset) | LAVA | M | ☐ | Supersedes `power-cycle` (PWR-A) |
-| PWR-4 | `paniolo power state` — read on/off | BOTH | M | ☑ | exists as `power-state` (PWR-B); rename only |
-| PWR-5 | `[power]` config block w/ `backend = script\|dtr\|pdu\|jtag` + on/off/reset cmds | BOTH | M | ☐ | **Breaking**: replaces flat `power_cycle_cmd` (no alias) |
-| PWR-6 | Power commands usable as plain shell cmds (string or list) from a generator | LAVA | M | ☐ | LAVA fields accept string OR list |
-| PWR-7 | Update `AGENTS.md` for the new `[power]` config + verbs | OWNER | M | ☐ | Agent reconfigures targets on redeploy |
-
-### 9.2 Agnostic device-control API — Serial (core gap)
-
-| ID | Requirement | Source | Pri | Status | Notes |
-|---|---|---|---|---|---|
-| SER-1 | serialcap exposes a **raw bidirectional TCP listener** (ser2net-equivalent) | LAVA | M | ☐ | backs `connection_command = telnet host port` |
-| SER-2 | serialcap exposes a **PTY** whose slave path is a real device file | FX | M | ☐ | handed to botanist as `DeviceConfig.serial` |
-| SER-3 | New endpoints **tee off the existing supervisor** (JSONL/WS/dashboard unaffected) | OWNER | M | ☐ | preserves NF-1 |
-| SER-4 | `paniolo serial send <bytes\|->` one-shot write (agent feature) | OWNER | M | ☐ | same `write_tx` channel; `--enter`/`--hex`/stdin |
-| SER-5 | Write arbitration per D-3 (lock, `/status` holder, `--exclusive`, auto-release) | OWNER | M | ☐ | |
-| SER-6 | Stable socket/PTY paths under `$XDG_RUNTIME_DIR/paniolo/<target>/` | BOTH | S | ☐ | predictable for adapters |
-| SER-7 | Existing JSONL log, `/stream`, `tio`, `serial log/dtr/reset` unchanged | OWNER | M | ☐ | regression guard / tests |
-
-### 9.3 Agnostic device-control API — Deploy / boot / debug
-
-| ID | Requirement | Source | Pri | Status | Notes |
-|---|---|---|---|---|---|
-| DEP-1 | netboot **stands down** under CI; no DHCP/TFTP contention | BOTH | M | ☐ | guard `netboot start` when CI attach active |
-| DEP-2 | netboot remains available for interactive/non-CI use | OWNER | M | ☑ | exists (NET-1..4); just not the CI path |
-| DEP-3 | (Full) paniolo-serves-images as a non-standard LAVA deploy method | LAVA | C | ⤵ | only if a board can't use LAVA TFTP |
-| BOOT-1 | `paniolo serial wait --match <regex> [--timeout]` boot-detect helper | OWNER | S | ⤵ | not required by either orchestrator; ergonomics |
-| JTAG-1 | `[jtag]`/`[debug]` config schema + `paniolo debug {halt\|resume\|reset\|gdb}` stubs | OWNER | C | ☐ | extension point only per D-4 |
-| JTAG-2 | OpenOCD backend: reset, flash-deploy, GDB `:3333` / Tcl `:6666` sockets | OWNER | C | ⤵ | deferred |
-
-### 9.4 Adapter A — LAVA lab
-
-| ID | Requirement | Source | Pri | Status | Notes |
-|---|---|---|---|---|---|
-| LAVA-1 | Device-dictionary + device-type template generator (`paniolo lava device-dict`) | LAVA | M | ☐ | power_* → `paniolo power …`; connection → telnet |
-| LAVA-2 | Generator supports list-valued power commands | LAVA | S | ☐ | |
-| LAVA-3 | "First device" onboarding doc (Debian worker, ser2net/TCP wiring, tokens) | LAVA | S | ☐ | internet-reachable lab; tokens to KernelCI admins |
-| LAVA-4 | Verified on a Debian LAVA worker against a real board | LAVA | S | ☐ | macOS unsupported (D-5) |
-
-### 9.5 Adapter B — Fuchsia / botanist
-
-| ID | Requirement | Source | Pri | Status | Notes |
-|---|---|---|---|---|---|
-| FX-1 | botanist device-config emitter (`paniolo botanist device-config`) → PTY path | FX | M | ☐ | `{network,keys,serial}`; serial = PTY (SER-2) |
-| FX-2 | Bot-host/recipe **power wrapper** calling `paniolo power {on\|reset\|off}` | FX | M | ☐ | power is NOT a device-config field |
-| FX-3 | `bot_config.py` `get_dimensions()` snippet advertising `device_type:<board>` | FX | S | ☐ | + `bots.cfg`, `platforms.gni` (upstream coord) |
-| FX-4 | Verify `DeviceConfig`/power plumbing against a real Fuchsia checkout | FX | M | ☐ | confirm `tools/botanist/target/device.go` |
-| FX-5 | Document RFC-0130 Experimental tier (self-hosted CI) | FX | C | ☐ | community board is not "Supported" tier |
-
----
-
-### 9.6 Adapter C — Redfish provider
-
-> **Decision (D-9, 2026-05-29):** Redfish interop = **provider** direction (paniolo exposes a
-> Redfish API in front of BMC-less boards), **not client**. Higher-leverage than per-ecosystem
-> adapters because Redfish is the bare-metal lingua franca (Ironic/Metal3 primary control plane;
-> LAVA can `curl` it). Sequenced **after** M1 — consumes the power verbs (PWR-1..6) and the raw
-> serial socket (SER-1). Design sketch: [`ci-integration/redfish-provider.md`](ci-integration/redfish-provider.md).
-> Verified against DMTF canonical CSDL (DSP0266 v1.22.0, DSP8010 2025.2), OpenBMC, Ironic/sushy.
-
-| ID | Requirement | Source | Pri | Status | Notes |
-|---|---|---|---|---|---|
-| RF-1 | Redfish provider service: `ServiceRoot` → `ComputerSystem` → `Manager` (→ `VirtualMedia`) resource tree | OWNER | S | ⤵ | deferred after M1; provider, not client |
-| RF-2 | `#ComputerSystem.Reset` → power verbs (On→on, ForceOff→off, PowerCycle/ForceRestart→reset); `PowerState` → power-state | OWNER | S | ⤵ | depends on PWR-1..6 |
-| RF-3 | `Boot.BootSourceOverrideTarget=Pxe` + `BootSourceOverrideEnabled=Once` → netboot | OWNER | S | ⤵ | maps to existing netboot |
-| RF-4 | `VirtualMedia` `InsertMedia`/`EjectMedia` → image deploy | OWNER | C | ⤵ | open: needed vs. Pxe-once sufficient? |
-| RF-5 | `SerialConsole` advertises out-of-band SSH/console endpoint pointing at paniolo raw-serial socket (metadata only) | OWNER | S | ⤵ | depends on SER-1; Redfish carries no serial bytes |
-| RF-6 | Honest per-node `ResetType@Redfish.AllowableValues` / `ActionInfo` for the supported subset | OWNER | S | ⤵ | relay/DTR boards can't do every `ResetType` |
-| RF-7 | Implement via a sushy-tools-style emulator + paniolo backend driver (not a hand-rolled OData service) | OWNER | S | ⤵ | open: dependency footprint (core = `typer` only) |
-| RF-8 | Document/decide whether Redfish provider replaces or complements LAVA/botanist adapters | OWNER | S | ⤵ | botanist PTY serial seam still needs the direct path → not a full replacement |
-
-## 10. Security
-
-> **TODO — owner to populate.** This section needs dedicated attention and is intentionally
-> unfinished. Paniolo grants an agent physical-equivalent control of a target (power, raw
-> serial read/write, netboot/TFTP, HID injection) and, with the §9 work, opens **network-facing
-> serial endpoints** and is **SSH-driven from a dev machine into the control host** — so the
-> threat model and controls deserve first-class requirements, not afterthoughts.
-
-| ID | Requirement | Pri | Status | Notes |
-|---|---|---|---|---|
-| SEC-0 | Define paniolo's threat model and security requirements | M | ☐ | **Placeholder — to be written.** |
-
-Prompts to resolve when populating (not yet requirements — discussion seeds):
-
-- **Serial endpoint exposure (§9):** the raw TCP listener (SER-1) currently mirrors serialcap's
-  loopback-only bind (`127.0.0.1`). For a LAVA worker / Swarming bot, who may connect? Auth,
-  bind address, TLS, or rely on SSH-tunnel/localhost-only + network isolation?
-- **Write arbitration as a safety control (SER-5/D-3):** is `--exclusive` purely cooperative, or
-  also a guard against an unexpected writer driving the target?
-- **Netboot/DHCP/TFTP:** read-only TFTP, single-client; any spoofing/rogue-DHCP concerns on a
-  shared lab network vs. the assumed direct USB-Ethernet link?
-- **Power/HID authority:** anyone who can reach the control host can power-cycle and inject HID —
-  what bounds that (host access model, per-target ACLs)?
-- **Secrets:** LAVA submission tokens, `$FUCHSIA_SSH_KEY`, CIPD/Swarming creds — storage and
-  handling.
-- **Supply chain:** `paniolo setup` builds/install Rust + Swift + Homebrew components.
-
----
-
-## 11. Milestones
-
-| Milestone | Contents | Status |
-|---|---|---|
-| M0 — Analysis & design | gap-analysis, design, this tracker, decisions | ☑ |
-| Shipped baseline | §1–§7 capabilities (netboot, serial, power, video, HID, dashboard) | ☑ |
-| M1 — Agnostic device-control core | SER-2, SER-4, PWR-1..7, SER-5, SER-1, DEP-1, JTAG-1 (Fuchsia path first) | ☐ (awaiting go-ahead) |
-| M2 — Adapters | FX-1..4 (first), then LAVA-1..3 | ☐ |
-| M3 — Verify on hardware | FX-3/FX-5, LAVA-4, BOOT-1 | ☐ |
-| Security | §10 (SEC-*) | ☐ (to be defined) |
-| M4 — Full (deferred) | DEP-3, JTAG-2 | ⤵ |
-
-## 12. Open implementation questions
-
-| ID | Question | Status |
-|---|---|---|
-| SER-Q1 | Native TCP listener vs. ser2net-on-PTY | ✓ Resolved (D-7): native listener; ser2net fallback |
-| SER-Q2 | Write-lock lifetime | ✓ Resolved (D-3): auto-release on disconnect + optional `--lock-timeout` |
-| PWR-Q1 | `[power]` shape + `power_cycle_cmd` migration | ✓ Resolved (D-8): clean breaking block, no alias |
-````
-
-## File: hdmicap/src/capture.rs
-````rust
-// Copyright 2026 Curtis Galloway
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-//! Capture backend abstraction.
-//!
-//! On Linux we bypass nokhwa and use the `v4l` crate directly so we can:
-//!   - Call `stream.set_timeout()` to avoid an indefinite VIDIOC_DQBUF block
-//!   - Keep raw MJPEG bytes for zero-cost preview serving
-//!   - Use turbojpeg (libjpeg-turbo) for fast RGB decode when signal detection
-//!     or OCR needs pixel data
-//!
-//! On macOS the nokhwa + AVFoundation path is kept as-is.
-
-use std::sync::Arc;
-
-use anyhow::{anyhow, Context, Result};
-use image::RgbImage;
-
-use nokhwa::query;
-use nokhwa::utils::{ApiBackend, CameraIndex};
-
-#[derive(Clone, Debug)]
-pub struct DeviceInfo {
-    pub index: u32,
-    pub name: String,
-    pub misc: String,
-}
-
-/// How the user asked us to pick a device.
-#[derive(Clone, Debug)]
-pub enum DeviceSpec {
-    Auto,
-    Index(u32),
-    Name(String),
-}
-
-impl DeviceSpec {
-    pub fn parse(s: &str) -> Self {
-        let s = s.trim();
-        if s.is_empty() || s.eq_ignore_ascii_case("auto") {
-            DeviceSpec::Auto
-        } else if let Ok(i) = s.parse::<u32>() {
-            DeviceSpec::Index(i)
-        } else if let Some(idx) = s
-            .strip_prefix("/dev/video")
-            .and_then(|n| n.parse::<u32>().ok())
-        {
-            DeviceSpec::Index(idx)
-        } else {
-            DeviceSpec::Name(s.to_string())
-        }
-    }
-}
-
-const BUILTIN_HINTS: &[&str] = &["facetime", "built-in", "integrated", "isight"];
-
-/// One captured frame. `jpeg` carries raw MJPEG bytes when available (Linux
-/// MJPEG path); the preview endpoint serves these directly with zero server
-/// decode/re-encode. `rgb` is always populated for signal detection (ahash,
-/// is_no_signal); on the Linux path it comes from turbojpeg (fast).
-pub struct CapturedFrame {
-    /// Raw MJPEG bytes from the device. Present on the Linux v4l path when the
-    /// device is in MJPEG mode; None on macOS or YUYV sources.
-    pub jpeg: Option<Arc<[u8]>>,
-    /// Decoded RGB8 pixels for signal detection. Always populated.
-    pub rgb: RgbImage,
-}
-
-pub trait CaptureBackend {
-    fn frame(&mut self) -> Result<CapturedFrame>;
-}
-
-pub fn enumerate() -> Result<Vec<DeviceInfo>> {
-    let cams = query(ApiBackend::Auto).context("nokhwa device query failed")?;
-    Ok(cams
-        .into_iter()
-        .map(|c| DeviceInfo {
-            index: match c.index() {
-                CameraIndex::Index(i) => *i,
-                CameraIndex::String(_) => u32::MAX,
-            },
-            name: c.human_name(),
-            misc: c.description().to_string(),
-        })
-        .collect())
-}
-
-pub fn resolve(spec: &DeviceSpec) -> Result<u32> {
-    match spec {
-        DeviceSpec::Index(i) => Ok(*i),
-        _ => {
-            let devices = enumerate()?;
-            if devices.is_empty() {
-                return Err(anyhow!("no capture devices found"));
-            }
-            match spec {
-                DeviceSpec::Index(i) => Ok(*i),
-                DeviceSpec::Name(sub) => {
-                    let sub = sub.to_lowercase();
-                    devices
-                        .iter()
-                        .find(|d| d.name.to_lowercase().contains(&sub))
-                        .map(|d| d.index)
-                        .ok_or_else(|| anyhow!("no device matching name {:?}", sub))
-                }
-                DeviceSpec::Auto => {
-                    let external = devices.iter().find(|d| {
-                        let n = d.name.to_lowercase();
-                        !BUILTIN_HINTS.iter().any(|h| n.contains(h))
-                    });
-                    Ok(external.unwrap_or(&devices[0]).index)
-                }
-            }
-        }
-    }
-}
-
-pub fn open_backend(spec: &DeviceSpec) -> Result<Box<dyn CaptureBackend>> {
-    #[cfg(target_os = "linux")]
-    {
-        linux::LinuxV4LBackend::open(spec).map(|b| Box::new(b) as Box<dyn CaptureBackend>)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        macos::NokhwaBackend::open(spec).map(|b| Box::new(b) as Box<dyn CaptureBackend>)
-    }
-}
-
-// ── Linux backend ─────────────────────────────────────────────────────────────
-
-#[cfg(target_os = "linux")]
-mod linux {
-    use std::io;
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use anyhow::{anyhow, Context, Result};
-    use image::RgbImage;
-    use v4l::buffer::Type;
-    use v4l::device::Device;
-    use v4l::format::{Format, FourCC};
-    use v4l::io::mmap::Stream;
-    use v4l::io::traits::CaptureStream;
-    use v4l::video::Capture;
-
-    use super::{resolve, CaptureBackend, CapturedFrame, DeviceSpec};
-
-    const FORMATS: &[(u32, u32, &[u8; 4])] = &[
-        (1280, 720, b"MJPG"),
-        (1920, 1080, b"MJPG"),
-        (1280, 720, b"YUYV"),
-        (640, 480, b"YUYV"),
-    ];
-
-    const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
-
-    pub struct LinuxV4LBackend {
-        stream: Stream<'static>,
-        dev: Box<Device>,
-        dims: (u32, u32),
-        is_mjpeg: bool,
-    }
-
-    impl LinuxV4LBackend {
-        pub fn open(spec: &DeviceSpec) -> Result<Self> {
-            let idx = resolve(spec)?;
-            let dev = Box::new(
-                Device::new(idx as usize).map_err(|e| anyhow!("open /dev/video{idx}: {e}"))?,
-            );
-
-            let mut last_err = anyhow!("no formats succeeded");
-            for &(w, h, fourcc) in FORMATS {
-                let fmt = Format::new(w, h, FourCC::new(fourcc));
-                if dev.set_format(&fmt).is_err() {
-                    continue;
-                }
-                let dev_ref: &'static Device = unsafe { &*(dev.as_ref() as *const Device) };
-                match Stream::with_buffers(dev_ref, Type::VideoCapture, 4) {
-                    Ok(mut stream) => {
-                        stream.set_timeout(FRAME_TIMEOUT);
-                        let actual_fmt = dev.format().unwrap_or(fmt);
-                        let is_mjpeg = actual_fmt.fourcc == FourCC::new(b"MJPG");
-                        tracing::info!(
-                            "capture opened {}x{} {:?}",
-                            actual_fmt.width,
-                            actual_fmt.height,
-                            if is_mjpeg { "MJPEG" } else { "YUYV" }
-                        );
-                        return Ok(LinuxV4LBackend {
-                            stream,
-                            dev,
-                            dims: (actual_fmt.width, actual_fmt.height),
-                            is_mjpeg,
-                        });
-                    }
-                    Err(e) => {
-                        last_err = anyhow!("stream init {w}x{h}: {e}");
-                    }
-                }
-            }
-            Err(last_err)
-        }
-    }
-
-    impl CaptureBackend for LinuxV4LBackend {
-        fn frame(&mut self) -> Result<CapturedFrame> {
-            let (buf, _meta) = self.stream.next().map_err(|e| {
-                if e.kind() == io::ErrorKind::TimedOut {
-                    anyhow!("frame timeout (device stalled)")
-                } else {
-                    anyhow!("VIDIOC_DQBUF: {e}")
-                }
-            })?;
-
-            if self.is_mjpeg {
-                // Keep a copy of the raw JPEG bytes for zero-cost preview serving.
-                let jpeg_bytes: Arc<[u8]> = Arc::from(buf.to_vec().into_boxed_slice());
-
-                // Decode with turbojpeg (libjpeg-turbo) for signal detection.
-                // ~5ms at 720p vs ~50ms with the pure-Rust image crate.
-                let rgb = turbojpeg::decompress_image::<image::Rgb<u8>>(buf)
-                    .context("turbojpeg MJPEG decode failed")?;
-                let (w, h) = (rgb.width(), rgb.height());
-                self.dims = (w, h);
-
-                Ok(CapturedFrame {
-                    jpeg: Some(jpeg_bytes),
-                    rgb,
-                })
-            } else {
-                // YUYV: no raw JPEG, decode to RGB for signal detection and storage.
-                let fmt = self.dev.format().ok();
-                let (w, h) = fmt
-                    .as_ref()
-                    .map(|f| (f.width, f.height))
-                    .unwrap_or(self.dims);
-                self.dims = (w, h);
-                Ok(CapturedFrame {
-                    jpeg: None,
-                    rgb: yuyv_to_rgb(buf, w, h),
-                })
-            }
-        }
-    }
-
-    fn yuyv_to_rgb(buf: &[u8], w: u32, h: u32) -> RgbImage {
-        let mut rgb = RgbImage::new(w, h);
-        let pairs = (w * h / 2) as usize;
-        for i in 0..pairs {
-            let base = i * 4;
-            if base + 3 >= buf.len() {
-                break;
-            }
-            let y0 = buf[base] as f32;
-            let cb = buf[base + 1] as f32 - 128.0;
-            let y1 = buf[base + 2] as f32;
-            let cr = buf[base + 3] as f32 - 128.0;
-            let to_u8 = |v: f32| v.clamp(0.0, 255.0) as u8;
-            let r = |y: f32| to_u8(y + 1.402 * cr);
-            let g = |y: f32| to_u8(y - 0.344 * cb - 0.714 * cr);
-            let b = |y: f32| to_u8(y + 1.772 * cb);
-            let x0 = ((i * 2) % w as usize) as u32;
-            let y_row = ((i * 2) / w as usize) as u32;
-            if x0 < w && y_row < h {
-                rgb.put_pixel(x0, y_row, image::Rgb([r(y0), g(y0), b(y0)]));
-            }
-            if x0 + 1 < w && y_row < h {
-                rgb.put_pixel(x0 + 1, y_row, image::Rgb([r(y1), g(y1), b(y1)]));
-            }
-        }
-        rgb
-    }
-}
-
-// ── macOS backend ─────────────────────────────────────────────────────────────
-
-#[cfg(not(target_os = "linux"))]
-mod macos {
-    use anyhow::{anyhow, Context, Result};
-    use nokhwa::pixel_format::RgbFormat;
-    use nokhwa::utils::{
-        CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution,
-    };
-    use nokhwa::Camera;
-
-    use super::{resolve, CaptureBackend, CapturedFrame, DeviceSpec};
-
-    pub struct NokhwaBackend {
-        cam: Camera,
-        dims: (u32, u32),
-    }
-
-    impl NokhwaBackend {
-        pub fn open(spec: &DeviceSpec) -> Result<Self> {
-            let idx = resolve(spec)?;
-            let format_types: &[RequestedFormatType] = &[
-                RequestedFormatType::Closest(CameraFormat::new(
-                    Resolution::new(1280, 720),
-                    FrameFormat::MJPEG,
-                    30,
-                )),
-                RequestedFormatType::Closest(CameraFormat::new(
-                    Resolution::new(1920, 1080),
-                    FrameFormat::MJPEG,
-                    30,
-                )),
-                RequestedFormatType::AbsoluteHighestResolution,
-            ];
-
-            let mut last_err: anyhow::Error = anyhow!("no formats to try");
-            for &fmt_type in format_types {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    try_open(idx, fmt_type)
-                }));
-                match result {
-                    Ok(Ok(backend)) => return Ok(backend),
-                    Ok(Err(e)) => {
-                        last_err = e;
-                    }
-                    Err(_) => {
-                        last_err = anyhow!("format {:?} not supported", fmt_type);
-                    }
-                }
-            }
-            Err(last_err)
-        }
-    }
-
-    fn try_open(idx: u32, fmt_type: RequestedFormatType) -> Result<NokhwaBackend> {
-        let requested = RequestedFormat::new::<RgbFormat>(fmt_type);
-        let mut cam = Camera::new(CameraIndex::Index(idx), requested)
-            .map_err(|e| anyhow!("failed to open capture device {idx}: {e}"))?;
-        cam.open_stream()
-            .map_err(|e| anyhow!("failed to open capture device {idx}: {e}"))?;
-        let res = cam.resolution();
-        Ok(NokhwaBackend {
-            cam,
-            dims: (res.width(), res.height()),
-        })
-    }
-
-    impl CaptureBackend for NokhwaBackend {
-        fn frame(&mut self) -> Result<CapturedFrame> {
-            let buf = self.cam.frame().context("frame grab failed")?;
-            let decoded = buf.decode_image::<RgbFormat>().context("decode failed")?;
-            self.dims = (decoded.width(), decoded.height());
-            Ok(CapturedFrame {
-                jpeg: None, // nokhwa gives decoded pixels, not raw JPEG
-                rgb: decoded,
-            })
-        }
-    }
-}
-````
-
-## File: src/paniolo/_serial.py
-````python
-# Copyright 2026 Curtis Galloway
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Serial console helpers for paniolo targets.
-
-Two paths share this module:
-- `tio` for an interactive terminal in the current shell (`paniolo serial connect`)
-- the `serialcap` daemon, which owns the port and fans it out over a localhost
-  WebSocket for the combined video+serial dashboard (`paniolo serial watch`)
-"""
-
-# Single quotes nested in double-quoted f-strings are required on Python 3.11.
-# pylint: disable=inconsistent-quotes
-
-from __future__ import annotations
-
-import glob
-import json
-import os
-import shutil
-import subprocess
-import sys
-import tempfile
-import time
-import urllib.error
-import urllib.request
-from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Sequence
-
-if TYPE_CHECKING:
-    from ._config import SerialInterface
-
-
-def list_serial_devices() -> list[str]:
-    """Return available serial device paths on this platform.
-
-    On Linux, returns /dev/serial/by-path/ symlinks when available so the paths
-    are stable across USB re-enumeration. Falls back to raw /dev/ttyUSB* paths.
-    """
-    if sys.platform == "darwin":
-        paths = glob.glob("/dev/tty.usbserial-*") + glob.glob("/dev/tty.usbmodem*")
-        return sorted(paths)
-    by_path = sorted(glob.glob("/dev/serial/by-path/*"))
-    if by_path:
-        return by_path
-    return sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
-
-
-def canonical_device_path(device: str) -> str:
-    """Return the stable /dev/serial/by-path symlink for a raw device path.
-
-    If device already contains '/dev/serial/', it is returned unchanged.
-    On macOS, returns device unchanged. Returns device unchanged if no
-    matching by-path symlink is found.
-    """
-    if sys.platform == "darwin" or "/dev/serial/" in device:
-        return device
-    try:
-        target = Path(device).resolve()
-        for link in sorted(Path("/dev/serial/by-path").glob("*")):
-            if link.resolve() == target:
-                return str(link)
-    except OSError:
-        pass
-    return device
-
-
-def tio_binary() -> str | None:
-    """Return the path to tio, or None if not found."""
-    return shutil.which("tio")
-
-
-def connect_cmd(device: str, baud: int = 115200) -> list[str]:
-    """Build the tio command to open an interactive serial terminal."""
-    binary = tio_binary()
-    if not binary:
-        raise FileNotFoundError("tio not found in PATH")
-    return [binary, "--baudrate", str(baud), device]
-
-
-def log_cmd(
-    binary: str,
-    *,
-    interface: Optional[str] = None,
-    tail: Optional[int] = None,
-    from_seq: Optional[int] = None,
-    to_seq: Optional[int] = None,
-    since: Optional[int] = None,
-    raw: bool = False,
-    as_json: bool = False,
-    no_pending: bool = False,
-) -> list[str]:
-    """Build the `serialcap log` argv for the captured-output reader.
-
-    serialcap reads its own on-disk capture log, so this works whether or not the
-    daemon is running. `interface` selects which interface's log to read (optional
-    when only one was captured). Only set flags are forwarded; the binary applies
-    its own defaults (most recent lines, ANSI-stripped, pending line included)."""
-    cmd = [binary, "log"]
-    if interface is not None:
-        cmd += ["--interface", interface]
-    if tail is not None:
-        cmd += ["--tail", str(tail)]
-    if from_seq is not None:
-        cmd += ["--from", str(from_seq)]
-    if to_seq is not None:
-        cmd += ["--to", str(to_seq)]
-    if since is not None:
-        cmd += ["--since", str(since)]
-    if raw:
-        cmd.append("--raw")
-    if as_json:
-        cmd.append("--json")
-    if no_pending:
-        cmd.append("--no-pending")
-    return cmd
-
-
-def serialcap_binary() -> Optional[str]:
-    """Return the installed serialcap path: PATH, then ~/.cargo/bin. None if absent.
-
-    Installed by `paniolo setup` (cargo install). Never resolved from the in-repo
-    build tree, so a running daemon can't point at an ephemeral build artifact.
-    """
-    found = shutil.which("serialcap")
-    if found:
-        return found
-    cargo_bin = Path.home() / ".cargo" / "bin" / "serialcap"
-    return str(cargo_bin) if cargo_bin.exists() else None
-
-
-def _discovery_path() -> Path:
-    """Path where serialcap writes its daemon.json discovery file.
-
-    Mirrors serialcap/src/daemon.rs::runtime_dir(): prefer $XDG_RUNTIME_DIR
-    (set by systemd on Linux), fall back to tempfile.gettempdir().
-    """
-    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
-    return Path(base) / "serialcap" / "daemon.json"
-
-
-def read_discovery() -> Optional[dict]:
-    """Read serialcap's discovery file, returning {pid, port, device, baud} or None."""
-    path = _discovery_path()
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
-def daemon_url() -> Optional[str]:
-    """Return the base URL of the running serialcap daemon, or None if stopped."""
-    disc = read_discovery()
-    if disc is None:
-        return None
-    try:
-        os.kill(int(disc["pid"]), 0)
-    except (ProcessLookupError, PermissionError, KeyError):
-        return None
-    return f"http://127.0.0.1:{disc['port']}"
-
-
-def interface_arg(
-    name: str, device: str, baud: int, power_sense_signal: Optional[str] = None
-) -> str:
-    """Format one interface for the daemon's repeatable --interface flag.
-
-    Format: NAME=DEVICE[@BAUD][:SENSE]
-    SENSE is one of cts, dsr, dcd, ri — the FTDI modem-control input wired to
-    the target's 3.3 V rail for power-state sensing.
-    """
-    arg = f"{name}={device}@{baud}"
-    if power_sense_signal:
-        arg += f":{power_sense_signal}"
-    return arg
-
-
-def input_url(base_url: str, interface_name: str, pace_ms: int = 0) -> str:
-    """Build the POST /input URL for sending bytes through the running daemon.
-
-    pace_ms > 0 drips the bytes one at a time that many ms apart, the substitute
-    for hardware flow control on a slow polled console with no flow control."""
-    url = f"{base_url}/input?interface={interface_name}"
-    if pace_ms:
-        url += f"&pace_ms={pace_ms}"
-    return url
-
-
-def send_input(
-    base_url: str, interface_name: str, data: bytes, pace_ms: int = 0
-) -> int:
-    """POST raw bytes to the serial port the daemon owns; return bytes written.
-
-    Input coexists with live capture — the daemon writes to the port it already
-    holds, so there's no stop/restart and output keeps flowing to `serial log`.
-
-    A paced send blocks the daemon for about len(data) * pace_ms ms, so the
-    request timeout is scaled to match (plus headroom).
-
-    Raises RuntimeError on HTTP error, OSError on network failure.
-    """
-    url = input_url(base_url, interface_name, pace_ms)
-    req = urllib.request.Request(url, method="POST", data=data)
-    timeout = max(15.0, len(data) * pace_ms / 1000.0 + 10.0)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            resp.read()
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(
-            f"serialcap /input returned {exc.code}: {exc.reason}"
-        ) from exc
-    return len(data)
-
-
-def daemon_cmd(
-    binary: str,
-    interfaces: "Sequence[SerialInterface]",
-    port: int = 8724,
-    buffer_lines: Optional[int] = None,
-) -> list[str]:
-    """Build the `serialcap daemon` argv owning every given interface."""
-    cmd = [binary, "daemon", "--port", str(port)]
-    if buffer_lines is not None:
-        cmd += ["--buffer-lines", str(buffer_lines)]
-    for iface in interfaces:
-        cmd += [
-            "--interface",
-            interface_arg(
-                iface.name, iface.device, iface.baud, iface.power_sense_signal
-            ),
-        ]
-    return cmd
-
-
-def wait_power_off(base_url: str, interface_name: str, timeout_s: float = 10.0) -> bool:
-    """Poll GET /status until power_on == False or timeout.
-
-    Returns True if the power-off was confirmed by the sense signal before the
-    timeout.  Returns False if the sense signal is not configured for this
-    interface (power_on is null in the response) or if the timeout expires.
-    """
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        try:
-            url = f"{base_url}/status?interface={interface_name}"
-            req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=2) as resp:
-                data = json.loads(resp.read())
-                if data.get("power_on") is False:
-                    return True
-        except Exception:  # pylint: disable=broad-exception-caught
-            pass
-        time.sleep(0.5)
-    return False
-
-
-def read_power_state(base_url: str, interface_name: str) -> Optional[bool]:
-    """Return the current power state from the daemon status, or None if unknown."""
-    try:
-        url = f"{base_url}/status?interface={interface_name}"
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=2) as resp:
-            data = json.loads(resp.read())
-            return data.get("power_on")
-    except Exception:  # pylint: disable=broad-exception-caught
-        return None
-
-
-def start_daemon(
-    interfaces: "Sequence[SerialInterface]",
-    port: int = 8724,
-    buffer_lines: Optional[int] = None,
-) -> subprocess.Popen:
-    """Start the serialcap daemon (owning all interfaces) detached; caller should
-    poll daemon_url()."""
-    binary = serialcap_binary()
-    if not binary:
-        raise FileNotFoundError("serialcap not found in PATH or project build dir")
-    return subprocess.Popen(
-        daemon_cmd(binary, interfaces, port, buffer_lines),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-````
-
-## File: docs/netboot.md
-````markdown
-# Netboot
-
-paniolo netboots a target by running a minimal DHCP + TFTP server over a
-direct USB-Ethernet link. No router, switch, or upstream DHCP server is involved.
-
----
-
-## Hardware setup
-
-1. Plug a USB-to-Ethernet adapter into your Mac.
-2. Connect an Ethernet cable from the adapter directly to the target's Ethernet
-   port (no switch needed — modern adapters handle MDI/MDIX automatically).
-3. Find the macOS interface name:
-
-```bash
-networksetup -listallhardwareports
-```
-
----
-
-## Target configuration
-
-```bash
-# Create or update a target
-paniolo target set target-machine \
-    --interface en3 \
-    --tftp-root ~/src/fuchsia/pxe/tftp-root
-
-# Show all configured targets
-paniolo target show
-
-# Show a specific target
-paniolo target show target-machine
-
-# Remove a target
-paniolo target clear target-machine
-```
-
-Target config fields:
-
-| Field | Default | Description |
-|---|---|---|
-| `--interface` | (required) | USB-Ethernet interface name (e.g. `en3`) |
-| `--host-ip` | `192.168.99.1` | Static IP assigned to the interface; also the TFTP server address |
-| `--tftp-root` | (none) | Directory whose contents are served over TFTP |
-| `--power-cycle-cmd` | (none) | Shell command run by `paniolo power-cycle` |
-| `--power-serial` | (none) | Serial interface name used for DTR power control |
-
----
-
-## Starting and stopping
-
-```bash
-paniolo netboot start [target-machine]
-paniolo netboot stop  [target-machine]
-```
-
-`start` assigns the static `host_ip` to the interface, then launches paniolo's
-own **pure-Python DHCP and TFTP servers** as background subprocesses
-(`python -m paniolo._dhcp` and `python -m paniolo._tftp`). No external daemons
-(`dnsmasq`, `tftp-now`) are required at runtime. `stop` sends SIGTERM to both
-and clears the state file.
-
-**Privileged ports (67/69):** macOS 10.14+ allows binding `0.0.0.0` on
-privileged ports without root, so on macOS the only step needing sudo is
-assigning the static IP. On **Linux**, ports 67/69 require root, so `start`
-auto-prepends `sudo` when spawning the two servers, and interface configuration
-(`ip addr add`) uses sudo as well. Configure **NOPASSWD sudo** on the control
-host for unattended agent use.
-
-**Interface safety:** `start` **refuses** an interface that carries your system
-default route (a primary NIC). netboot reconfigures the interface to the static
-`host_ip`, which would break your real networking — the netboot link must be a
-dedicated USB-Ethernet adapter.
-
-### Netboot engines (rust default, python legacy)
-
-```bash
-paniolo netboot start [target-machine]                  # rust netbootd (default)
-paniolo netboot start --engine python [target-machine]  # legacy DHCP+TFTP pair
-```
-
-`start` launches a single `netbootd` binary (Rust) by default, serving DHCP and
-TFTP from one process. `--engine python` selects the legacy implementation: the
-`_dhcp`/`_tftp` subprocess pair the Rust daemon was ported from, kept as a
-fallback. `stop`/`status`/`logs` follow whichever engine `start` recorded.
-
-On macOS, netbootd's raw-frame send path (the Sequoia delivery workaround) needs
-a `/dev/bpf` descriptor. Rather than run the daemon as root, `paniolo setup`
-installs a tiny **setuid-root** helper, `netbootd-bpf-helper`, whose only job is
-to open `/dev/bpf`, bind the interface, and hand the descriptor to the
-unprivileged `netbootd`. It is the only paniolo component that runs as root. If
-it is missing or not setuid, the rust engine logs a warning and falls back to
-the kernel send path (which is unreliable on macOS 15+). Run `paniolo setup`
-(one sudo) to install it.
-
----
-
-## Status and logs
-
-```bash
-paniolo netboot status [target-machine]      # running? interface? uptime?
-paniolo netboot logs   [target-machine]      # tail the combined DHCP + TFTP log
-paniolo netboot logs -f [target-machine]     # follow
-```
-
----
-
-## Getting the TFTP root path
-
-```bash
-paniolo netboot tftp-root [target-machine]
-```
-
-Prints the bare TFTP root path, designed for shell substitution:
-
-```bash
-TFTP_ROOT=$(ssh control-mac "paniolo netboot tftp-root target-machine")
-scp kernel_2712.img control-mac:"${TFTP_ROOT}/kernel_2712.img"
-```
-
----
-
-## Expected TFTP sequence for Raspberry Pi 5
-
-When the Pi 5 EEPROM PXE client boots it walks this file request sequence.
-The 404s are normal:
-
-```
-404  <serial>/<mac>/start.elf    ← Pi 5 doesn't need it; 404 expected
-200  config.txt
-200  bcm2712-rpi-5-b.dtb
-200  kernel_2712.img              ← your boot shim or kernel
-```
-
-The TFTP root must contain at minimum `config.txt`, `bcm2712-rpi-5-b.dtb`,
-and `kernel_2712.img`.
-
----
-
-## DHCP / TFTP behavior notes
-
-The DHCP server hands the target a fixed lease and sets **both** `siaddr` (the
-BOOTP next-server) and **DHCP option 66** (TFTP server name) to `host_ip`. The
-Pi 5 EEPROM reads option 66 preferentially, but setting both ensures
-compatibility with older EEPROM firmware. The TFTP server is **read-only**
-(RFC 1350) and negotiates `blksize`/`tsize` options. Both servers log to the
-combined log at `~/.local/share/paniolo/<name>/netboot.log`.
-
-> **Switching to ffx-over-network?** With NET-first boot order, leaving netboot
-> running means the next power-cycle TFTP-boots instead of falling through to
-> the SD card. Use [`paniolo netif mode ffx`](netif.md) to stop netboot and
-> ready the host IPv6 side in one atomic, idempotent step.
-
----
-
-## Runtime paths
-
-| Purpose | Path |
-|---|---|
-| Daemon state (DHCP/TFTP PIDs, uptime) | `~/.local/share/paniolo/<name>/netboot.json` |
-| Combined log | `~/.local/share/paniolo/<name>/netboot.log` |
-````
-
 ## File: hdmicap/src/server.rs
 ````rust
 // Copyright 2026 Curtis Galloway
@@ -18229,6 +22575,987 @@ mod tests {
 }
 ````
 
+## File: src/paniolo/_serial.py
+````python
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Serial console helpers for paniolo targets.
+
+Two paths share this module:
+- `tio` for an interactive terminal in the current shell (`paniolo serial connect`)
+- the `serialcap` daemon, which owns the port and fans it out over a localhost
+  WebSocket for the combined video+serial dashboard (`paniolo serial watch`)
+"""
+
+# Single quotes nested in double-quoted f-strings are required on Python 3.11.
+# pylint: disable=inconsistent-quotes
+
+from __future__ import annotations
+
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import TYPE_CHECKING, Optional, Sequence
+
+if TYPE_CHECKING:
+    from ._config import SerialInterface
+
+
+def list_serial_devices() -> list[str]:
+    """Return available serial device paths on this platform.
+
+    On Linux, returns /dev/serial/by-path/ symlinks when available so the paths
+    are stable across USB re-enumeration. Falls back to raw /dev/ttyUSB* paths.
+    """
+    if sys.platform == "darwin":
+        paths = glob.glob("/dev/tty.usbserial-*") + glob.glob("/dev/tty.usbmodem*")
+        return sorted(paths)
+    by_path = sorted(glob.glob("/dev/serial/by-path/*"))
+    if by_path:
+        return by_path
+    return sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
+
+
+def canonical_device_path(device: str) -> str:
+    """Return the stable /dev/serial/by-path symlink for a raw device path.
+
+    If device already contains '/dev/serial/', it is returned unchanged.
+    On macOS, returns device unchanged. Returns device unchanged if no
+    matching by-path symlink is found.
+    """
+    if sys.platform == "darwin" or "/dev/serial/" in device:
+        return device
+    try:
+        target = Path(device).resolve()
+        for link in sorted(Path("/dev/serial/by-path").glob("*")):
+            if link.resolve() == target:
+                return str(link)
+    except OSError:
+        pass
+    return device
+
+
+def tio_binary() -> str | None:
+    """Return the path to tio, or None if not found."""
+    return shutil.which("tio")
+
+
+def connect_cmd(device: str, baud: int = 115200) -> list[str]:
+    """Build the tio command to open an interactive serial terminal."""
+    binary = tio_binary()
+    if not binary:
+        raise FileNotFoundError("tio not found in PATH")
+    return [binary, "--baudrate", str(baud), device]
+
+
+def log_cmd(
+    binary: str,
+    *,
+    interface: Optional[str] = None,
+    tail: Optional[int] = None,
+    from_seq: Optional[int] = None,
+    to_seq: Optional[int] = None,
+    since: Optional[int] = None,
+    raw: bool = False,
+    as_json: bool = False,
+    no_pending: bool = False,
+) -> list[str]:
+    """Build the `serialcap log` argv for the captured-output reader.
+
+    serialcap reads its own on-disk capture log, so this works whether or not the
+    daemon is running. `interface` selects which interface's log to read (optional
+    when only one was captured). Only set flags are forwarded; the binary applies
+    its own defaults (most recent lines, ANSI-stripped, pending line included)."""
+    cmd = [binary, "log"]
+    if interface is not None:
+        cmd += ["--interface", interface]
+    if tail is not None:
+        cmd += ["--tail", str(tail)]
+    if from_seq is not None:
+        cmd += ["--from", str(from_seq)]
+    if to_seq is not None:
+        cmd += ["--to", str(to_seq)]
+    if since is not None:
+        cmd += ["--since", str(since)]
+    if raw:
+        cmd.append("--raw")
+    if as_json:
+        cmd.append("--json")
+    if no_pending:
+        cmd.append("--no-pending")
+    return cmd
+
+
+def serialcap_binary() -> Optional[str]:
+    """Return the installed serialcap path: PATH, then ~/.cargo/bin. None if absent.
+
+    Installed by `paniolo setup` (cargo install). Never resolved from the in-repo
+    build tree, so a running daemon can't point at an ephemeral build artifact.
+    """
+    found = shutil.which("serialcap")
+    if found:
+        return found
+    cargo_bin = Path.home() / ".cargo" / "bin" / "serialcap"
+    return str(cargo_bin) if cargo_bin.exists() else None
+
+
+def _discovery_path() -> Path:
+    """Path where serialcap writes its daemon.json discovery file.
+
+    Mirrors serialcap/src/daemon.rs::runtime_dir(): prefer $XDG_RUNTIME_DIR
+    (set by systemd on Linux), fall back to tempfile.gettempdir().
+    """
+    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    return Path(base) / "serialcap" / "daemon.json"
+
+
+def read_discovery() -> Optional[dict]:
+    """Read serialcap's discovery file, returning {pid, port, device, baud} or None."""
+    path = _discovery_path()
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def daemon_url() -> Optional[str]:
+    """Return the base URL of the running serialcap daemon, or None if stopped."""
+    disc = read_discovery()
+    if disc is None:
+        return None
+    try:
+        os.kill(int(disc["pid"]), 0)
+    except (ProcessLookupError, PermissionError, KeyError):
+        return None
+    return f"http://127.0.0.1:{disc['port']}"
+
+
+def interface_arg(
+    name: str, device: str, baud: int, power_sense_signal: Optional[str] = None
+) -> str:
+    """Format one interface for the daemon's repeatable --interface flag.
+
+    Format: NAME=DEVICE[@BAUD][:SENSE]
+    SENSE is one of cts, dsr, dcd, ri — the FTDI modem-control input wired to
+    the target's 3.3 V rail for power-state sensing.
+    """
+    arg = f"{name}={device}@{baud}"
+    if power_sense_signal:
+        arg += f":{power_sense_signal}"
+    return arg
+
+
+def input_url(base_url: str, interface_name: str, pace_ms: int = 0) -> str:
+    """Build the POST /input URL for sending bytes through the running daemon.
+
+    pace_ms > 0 drips the bytes one at a time that many ms apart, the substitute
+    for hardware flow control on a slow polled console with no flow control."""
+    url = f"{base_url}/input?interface={interface_name}"
+    if pace_ms:
+        url += f"&pace_ms={pace_ms}"
+    return url
+
+
+def send_input(
+    base_url: str, interface_name: str, data: bytes, pace_ms: int = 0
+) -> int:
+    """POST raw bytes to the serial port the daemon owns; return bytes written.
+
+    Input coexists with live capture — the daemon writes to the port it already
+    holds, so there's no stop/restart and output keeps flowing to `serial log`.
+
+    A paced send blocks the daemon for about len(data) * pace_ms ms, so the
+    request timeout is scaled to match (plus headroom).
+
+    Raises RuntimeError on HTTP error, OSError on network failure.
+    """
+    url = input_url(base_url, interface_name, pace_ms)
+    req = urllib.request.Request(url, method="POST", data=data)
+    timeout = max(15.0, len(data) * pace_ms / 1000.0 + 10.0)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(
+            f"serialcap /input returned {exc.code}: {exc.reason}"
+        ) from exc
+    return len(data)
+
+
+def daemon_cmd(
+    binary: str,
+    interfaces: "Sequence[SerialInterface]",
+    port: int = 8724,
+    buffer_lines: Optional[int] = None,
+) -> list[str]:
+    """Build the `serialcap daemon` argv owning every given interface."""
+    cmd = [binary, "daemon", "--port", str(port)]
+    if buffer_lines is not None:
+        cmd += ["--buffer-lines", str(buffer_lines)]
+    for iface in interfaces:
+        cmd += [
+            "--interface",
+            interface_arg(
+                iface.name, iface.device, iface.baud, iface.power_sense_signal
+            ),
+        ]
+    return cmd
+
+
+def wait_power_off(base_url: str, interface_name: str, timeout_s: float = 10.0) -> bool:
+    """Poll GET /status until power_on == False or timeout.
+
+    Returns True if the power-off was confirmed by the sense signal before the
+    timeout.  Returns False if the sense signal is not configured for this
+    interface (power_on is null in the response) or if the timeout expires.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            url = f"{base_url}/status?interface={interface_name}"
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                data = json.loads(resp.read())
+                if data.get("power_on") is False:
+                    return True
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def read_power_state(base_url: str, interface_name: str) -> Optional[bool]:
+    """Return the current power state from the daemon status, or None if unknown."""
+    try:
+        url = f"{base_url}/status?interface={interface_name}"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            data = json.loads(resp.read())
+            return data.get("power_on")
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+
+
+def start_daemon(
+    interfaces: "Sequence[SerialInterface]",
+    port: int = 8724,
+    buffer_lines: Optional[int] = None,
+) -> subprocess.Popen:
+    """Start the serialcap daemon (owning all interfaces) detached; caller should
+    poll daemon_url()."""
+    binary = serialcap_binary()
+    if not binary:
+        raise FileNotFoundError("serialcap not found in PATH or project build dir")
+    return subprocess.Popen(
+        daemon_cmd(binary, interfaces, port, buffer_lines),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+````
+
+## File: .github/workflows/ci.yml
+````yaml
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref (e.g. rapid pushes to a PR).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: python (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.11"
+      - name: Sync dependencies
+        run: uv sync
+      - name: Set up passwordless SSH to localhost (transport integration tests)
+        # Lets _ssh.py's integration tier (gated on PANIOLO_SSH_IT) exercise the
+        # real ssh path — run/forward/read_remote_file — against localhost using a
+        # dedicated key and no ssh-agent.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+          sudo systemctl enable --now ssh || sudo service ssh start
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          ssh-keygen -t ed25519 -f ~/.ssh/ci_ssh -N "" -q
+          cat ~/.ssh/ci_ssh.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          ssh-keyscan -H localhost >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh -i ~/.ssh/ci_ssh -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=accept-new localhost true
+          echo "PANIOLO_SSH_IT=localhost" >> "$GITHUB_ENV"
+          echo "PANIOLO_SSH_IT_IDENTITY=$HOME/.ssh/ci_ssh" >> "$GITHUB_ENV"
+      - name: Run tests
+        run: uv run pytest -q
+
+  serialcap:
+    name: serialcap (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: serialcap
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: serialcap
+      - name: Format check
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+
+  netbootd:
+    name: netbootd (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: netbootd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: netbootd
+      - name: Format check
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+
+  hdmicap-linux:
+    name: hdmicap (Linux, fmt, clippy, V4L2 build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hdmicap
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libclang-dev clang cmake nasm libturbojpeg0-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hdmicap
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build hdmicap (V4L2 path)
+        run: cargo build
+
+  macos:
+    # Exercises the macOS-only stack the Linux jobs can't: hdmicap's AVFoundation
+    # capture path and the Apple Vision OCR helper. fmt/clippy run on both Linux
+    # (V4L2 path) and here (AVFoundation path) so each per-OS cfg branch is gated
+    # on the platform that compiles it.
+    name: macos (hdmicap, visionocr)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hdmicap
+      - name: Format
+        working-directory: hdmicap
+        run: cargo fmt --check
+      - name: Clippy
+        working-directory: hdmicap
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build + test hdmicap (AVFoundation capture path)
+        working-directory: hdmicap
+        run: cargo test
+      - name: Compile visionocr (Apple Vision OCR helper)
+        run: swiftc -O -o "$RUNNER_TEMP/visionocr" ocr/visionocr.swift
+````
+
+## File: cli/Cargo.toml
+````toml
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "paniolo"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Agent-controlled target machine wrangler — distributed bring-up control over SSH"
+
+[[bin]]
+name = "paniolo"
+path = "src/main.rs"
+
+[dependencies]
+# --- CLI -----------------------------------------------------------------
+clap = { version = "4", features = ["derive"] }
+
+# --- Config: typed read model (serde/toml) + comment-preserving edits ----
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+toml_edit = "0.22"
+
+# --- Errors --------------------------------------------------------------
+anyhow = "1"
+thiserror = "2"
+
+# --- Paths ---------------------------------------------------------------
+dirs = "5"
+
+# --- uid for the per-user ControlMaster socket dir; daemon pid checks ----
+libc = "0.2"
+
+# --- talking to the serialcap/hdmicap daemons (localhost HTTP) -----------
+ureq = { version = "2", features = ["json"] }
+serde_json = "1"
+
+# --- direct DTR control fallback when serialcap isn't running ------------
+serialport = "4"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+````
+
+## File: docs/architecture.md
+````markdown
+# Paniolo — System architecture
+
+> The whole design of paniolo in its **current state**. Start here for the big picture, then
+> drop into a [subsystem guide](README.md) for command-level detail. Internal module-by-module
+> notes for contributors/agents live in [`AGENTS.md`](../AGENTS.md); the forward-looking
+> hardware-CI design lives under [`ci-integration/`](ci-integration/).
+>
+> Keep this in sync as the system changes.
+
+---
+
+## 1. What paniolo is
+
+Paniolo is an **agent-controlled target-machine wrangler** for low-level software development
+(bootloaders, firmware, OS bring-up). It gives an AI agent (or a human, or a script) the
+physical controls of a target board: **netboot it, watch its output, send it input, power-cycle
+it** — without a person at the bench each iteration.
+
+It is deliberately a **device-control / "wrangling" layer**, not a test orchestrator. It owns
+power, serial, deploy (netboot), video, and HID. It does *not* decide what tests to run or
+produce verdicts — when integrated with hardware-CI ecosystems those concerns sit *above* it
+(see [`ci-integration/`](ci-integration/)).
+
+## 2. Deployment model
+
+```
+  ┌─────────────────────┐         ┌──────────────────────── control host ────────────────────────┐
+  │  dev machine / agent │  SSH    │  paniolo CLI  +  per-subsystem daemons                        │
+  │  (you, or an agent)  │ ──────► │                                                               │
+  └─────────────────────┘         │   USB-Ethernet ─────────────────┐                             │
+                                   │   USB serial (FTDI) ────────────┤                             │
+                                   │   USB HDMI capture ─────────────┤                             │
+                                   │   USB HID rig (KB2040) ─────────┤                             │
+                                   └─────────────────────────────────┼─────────────────────────────┘
+                                                                      ▼
+                                                          ┌──────────────────────┐
+                                                          │   target board (DUT) │
+                                                          └──────────────────────┘
+```
+
+- The **control host** is physically wired to one or more **targets** and runs paniolo.
+- The simplest driver is an **agent or script that SSHes into the control host** and runs
+  `paniolo …` commands (the remote-control pattern in the root [`README.md`](../README.md)).
+- **Or point paniolo at a [lab file](distributed-control.md)** (`--lab` / `PANIOLO_LAB`): the dev
+  machine then drives a target on its control host *transparently* — commands re-exec over SSH and
+  `console` tunnels the dashboard back — so you don't SSH by hand. The dev machine is the data-plane
+  hub; control hosts hold only runtime state. See §5 "Distributed control".
+- Runs on **macOS 10.14+** and **Linux** (x86-64/arm64). Platform differences are isolated to a
+  handful of spots (§8).
+
+## 3. Process architecture
+
+Paniolo today is **"one daemon per subsystem, no central server"** (called *Option A* in
+`AGENTS.md`). There is no long-running parent process; the `paniolo` binary runs, does its work,
+and exits. Per-subsystem **daemons** are backgrounded subprocesses that own a piece of hardware
+and persist between CLI invocations. State lives in plain files, not memory.
+
+| Component | Language | Role |
+|---|---|---|
+| `paniolo` CLI | Python 3.11+ (Typer) | The single entry point; spawns/queries daemons, edits config, runs scripts. `typer` is the only core dependency; stdlib otherwise. |
+| `serialcap` | Rust (tokio/axum) | Daemon that **exclusively owns** a target's serial ports; fans output out to a WebSocket + a timestamped capture log; accepts keystrokes back. |
+| `hdmicap` | Rust (tokio/axum, nokhwa) | "Warm-stream" daemon that keeps the USB HDMI capture device open and serves frames + the combined dashboard over HTTP. |
+| `netbootd` | Rust (tokio) | The default single-binary DHCP+TFTP netboot engine. Privilege-separated `/dev/bpf` send path on macOS via a setuid `netbootd-bpf-helper`. |
+| `_dhcp` / `_tftp` | Python modules | Legacy netboot DHCP and TFTP servers (`--engine python`), run as `python -m paniolo._dhcp` / `._tftp` subprocesses. The implementation `netbootd` was ported from; kept as a fallback. |
+| `visionocr` / `linuxocr` | Swift / shell+Tesseract | On-device OCR helpers invoked by `hdmicap` and `paniolo video read`. |
+| HID rig firmware | CircuitPython | Two KB2040 boards that turn text commands into USB HID events (see [`hidrig/`](../hidrig/README.md)). |
+
+A future *Option B* — a single long-running Rust server with socket RPC for inter-subsystem
+coordination — is noted in `AGENTS.md` but **not** implemented; the dashboard's hdmicap→serialcap
+link (§7) is the only cross-subsystem coupling today.
+
+## 4. Configuration & state model
+
+**Per-target config** is one TOML file per target at `~/.config/paniolo/targets/<name>.toml`.
+No daemon is needed to read it; if exactly one target is configured it is the default and may be
+omitted from every command. The current schema (`src/paniolo/_config.py`):
+
+```toml
+name = "target-machine"          # required
+interface = "en3"                # required — USB-Ethernet interface for netboot
+host_ip = "192.168.99.1"         # static IP on that interface; also the TFTP server address
+tftp_root = "/path/to/pxe"       # optional; required to start netboot
+power_cycle_cmd = "/path/cycle.sh"      # optional; shell command run by `paniolo power-cycle`
+power_serial_interface = "console"      # optional; default interface for DTR power commands
+
+[[serial]]                       # repeatable — a target may have several named consoles
+name = "console"
+device = "/dev/serial/by-path/…" # stable by-path symlink preferred (Linux)
+baud = 115200
+power_sense_signal = "cts"       # optional; cts|dsr|dcd|ri — modem-control input wired to the rail
+```
+
+> Legacy note: older single-serial fields (`serial_device`/`serial_baud`) are auto-migrated into
+> a `[[serial]]` named `console`; a removed `ha_power_entity` field is silently dropped.
+
+**Runtime state, discovery, and capture** live outside the config tree. Each daemon writes a
+**discovery file** (pid + port) and holds an **advisory lock** so only one runs per host:
+
+| Purpose | Path |
+|---|---|
+| Target / video / HID configs | `~/.config/paniolo/{targets/<name>.toml, video.toml, hid.toml}` |
+| Netboot state (pids, uptime) | `~/.local/share/paniolo/<name>/netboot.json` |
+| Netboot combined log | `~/.local/share/paniolo/<name>/netboot.log` |
+| hdmicap discovery / lock | `$XDG_RUNTIME_DIR/hdmicap/{daemon.json, daemon.lock}` (macOS: `$TMPDIR`) |
+| serialcap discovery / lock | `$XDG_RUNTIME_DIR/serialcap/{daemon.json, daemon.lock}` (macOS: `$TMPDIR`) |
+| serialcap capture log (per interface) | `$XDG_RUNTIME_DIR/serialcap/capture/<name>/serial.jsonl(.1..)` |
+| serialcap pending (unterminated) line | `$XDG_RUNTIME_DIR/serialcap/capture/<name>/pending.json` |
+
+## 5. Subsystems
+
+### Netboot / deploy ([`netboot.md`](netboot.md))
+A minimal **pure-Python DHCP + TFTP** pair (`_dhcp.py`, `_tftp.py`) over a **direct
+USB-Ethernet link** — no router, switch, or upstream DHCP. `paniolo netboot start` assigns the
+static `host_ip` to the interface, then spawns the two servers (`python -m paniolo._dhcp` /
+`._tftp`); on Linux these are prefixed with `sudo` (ports 67/69 need root; macOS 10.14+ allows
+them rootless). DHCP hands the target a fixed lease and points it at the TFTP root via BOOTP
+`siaddr` + DHCP option 66; TFTP is read-only (RFC 1350 + blksize/tsize). No external daemons
+(`dnsmasq`/`tftp-now`) are required at runtime.
+
+`paniolo netboot start` refuses an interface that carries the system default route (a primary
+NIC), since it reconfigures the interface to the static `host_ip` — the netboot link must be a
+dedicated secondary (USB-Ethernet) interface.
+
+**Netboot engine** (default): a single `netbootd` binary (Rust) runs both servers as tokio tasks.
+On macOS its raw-frame send path (the Sequoia workaround) gets a `/dev/bpf` descriptor from a
+setuid-root `netbootd-bpf-helper` over `SCM_RIGHTS`, so the daemon itself stays unprivileged — the
+helper is the only root component, installed by `paniolo setup`. `--engine python` selects the
+legacy `_dhcp`/`_tftp` subprocess pair the Rust daemon was ported from, kept as a fallback.
+
+### Link mode: netboot ↔ ffx ([`netif.md`](netif.md))
+The same USB-Ethernet link serves two **mutually-exclusive** roles: netboot (IPv4 + DHCP + TFTP,
+the target TFTP-boots) and ffx (host IPv6 link-local `fe80::1`/64, the target boots from SD and is
+reached over `ffx` at `fe80::…%<iface>`). `paniolo netif mode <netboot|ffx|off>` (`_netif.py`)
+makes the switch atomic: `ffx` runs `netboot stop` first (so a power-cycle falls through to SD
+rather than TFTP-booting a stale image) and adds the host `fe80::1` that ffx needs but nothing else
+sets up. Each mode is idempotent — the ephemeral IPv6 LL is re-added on demand. The active mode is
+**probed** (running daemons + interface addresses), not stored, so `paniolo netif status` stays
+correct across control-host reboots; in ffx mode it also reports the device's discovered
+link-local peer (`ip -6 neigh`) as a paste-ready `ffx target add`. Privileged steps reuse the same
+`sudo` path as netboot — no new privilege model.
+
+### Serial console ([`serial.md`](serial.md))
+The `serialcap` daemon is the heart of the design. One daemon **exclusively owns all of a
+target's serial interfaces**; per interface a *supervisor* task owns the port (with a reconnect
+loop) and **fans every byte out three ways**: (1) broadcast to live WebSocket clients
+(`/stream`), (2) a 64 KB scrollback ring for instant replay, and (3) a tee to a capture thread
+that assembles **timestamped, sequence-numbered JSONL** lines on disk (rotating, survives
+restarts). Writes flow the other way — WebSocket clients send bytes that the supervisor injects
+into the port. `paniolo serial log` reads the on-disk JSONL **directly** (no daemon round-trip),
+so it works whether or not the daemon is running. A separate, dependency-light **interactive**
+path (`paniolo serial connect`) execs `tio` for a foreground terminal — it holds the port
+exclusively and so conflicts with the daemon.
+
+### Power control ([`power.md`](power.md))
+Two mechanisms, both driven through serial/config: **DTR via FTDI** (the serial adapter's DTR
+line wired to the board's J2 power-button header — `serial dtr`/`serial reset`, ≤500 ms soft /
+≥3 s hard PMIC off), and **`power_cycle_cmd`**, an arbitrary shell script (`paniolo power-cycle`)
+for HA switches / PDUs / GPIO. `paniolo power-state` reads an optional **power-sense** signal (a
+modem-control input wired to the target rail) via the serialcap daemon's `/status`.
+
+### Video + OCR ([`video.md`](video.md))
+`hdmicap` keeps a UVC HDMI capture device open continuously (avoiding multi-second per-capture
+reopen latency) and serves the current frame as PNG/MJPEG plus the dashboard over HTTP.
+`paniolo video read` and the dashboard OCR button run **on-device OCR** on the warm frame —
+Apple Vision (`visionocr`) on macOS, Tesseract (`linuxocr`) on Linux — tuned for thin console
+fonts (2× upscale, black-pad, `.fast`/lowered min text height).
+
+### HID injection ([`hid.md`](hid.md))
+A two-board KB2040 rig injects USB keyboard/mouse events. `paniolo hid` is a **thin text-command
+client** over the control board's USB-CDC data port; the board owns the wire protocol and relays
+events over I2C to the target board, which presents as a USB HID device to the DUT. Requires the
+optional `pyserial` extra.
+
+### Dashboard ([`dashboard.md`](dashboard.md))
+`paniolo console` opens hdmicap's `GET /` — a two-pane web UI (live video on top, xterm.js
+terminal(s) below). See §7 for how the two daemons connect.
+
+### Distributed control ([`distributed-control.md`](distributed-control.md))
+Drives targets on **remote control hosts** from the dev machine, over SSH only — no agent or
+coordinator daemon. A single git-tracked **lab file** (`--lab` / `PANIOLO_LAB`) names the hosts and
+binds each target's resources to one (`_lab.py`); `_ssh.py` is the transport (per-host ControlMaster,
+`run`/`forward`/`run_interactive`). One-shot commands **re-exec** on the target's host
+(`@remote_capable` ships the config slice via `PANIOLO_TARGET_CONFIG`, `_remote.py`); `console`
+**tunnels** both daemon ports back and stitches them with the dashboard's `?serialws=` override.
+`setup --host` provisions a host; `discover`/`configure` propose a lab block from discovered
+hardware for the human to review and commit. With no lab, everything runs locally exactly as before.
+Shipped Phases 0–5; multi-host targets, `console --detach`, and locking remain design-only (see
+[`distributed-control-plan.md`](distributed-control-plan.md)).
+
+## 6. Representative data flows
+
+- **Boot-and-watch:** agent `scp`s an image into `tftp_root` → `netboot start` → target PXE-boots
+  over the USB-Ethernet link → boot output streams through `serialcap` to the JSONL log → agent
+  polls `serial log --since` (or watches the dashboard / OCRs the screen).
+- **Serial round-trip:** UART bytes → supervisor → {WebSocket clients, scrollback, JSONL capture
+  thread}; dashboard keystrokes → WebSocket → supervisor → UART.
+- **Power-cycle from the dashboard:** browser → hdmicap `POST /power-cycle` → `paniolo
+  power-cycle <target>` (target from `PANIOLO_TARGET`) → `power_cycle_cmd`.
+
+## 7. Cross-subsystem coupling (the dashboard)
+
+The dashboard is the **only** place two subsystems interlock, and they stay decoupled: hdmicap
+**serves the page** but references serialcap **only by URL** (`ws://<host>:8724/stream` by
+default; override via `?serial=` / `?serialws=`). The page fetches serialcap's `/interfaces` and
+builds one xterm.js terminal per interface. xterm.js is **vendored, not CDN**, so the dashboard
+works on an isolated lab network. The amber power-cycle button appears only when hdmicap was
+started with a target (so it is safe on shared dashboards).
+
+## 8. Host-OS differences (macOS vs Linux)
+
+Core power/serial/netboot works on both; the platform-specific spots are contained:
+
+| Area | macOS | Linux |
+|---|---|---|
+| Netboot ports 67/69 | rootless (10.14+) | `sudo` (auto-prepended) |
+| Interface config | `networksetup` / `ifconfig` | `ip addr`/`ip link` (iproute2) |
+| ARP pinning | `arp -s` | `ip neigh replace … nud permanent` |
+| TFTP egress workaround | BPF raw frames (`/dev/bpf*`) for Sequoia routing | normal `sendto()` |
+| BPF descriptor access (rust engine) | setuid `netbootd-bpf-helper` passes the fd (daemon stays unprivileged) | n/a (kernel send path) |
+| OCR backend | Apple Vision (`visionocr`, `swiftc`) | Tesseract (`linuxocr`, `tesseract-ocr` pkg) |
+| Serial device discovery | `/dev/tty.usb*` | `/dev/serial/by-path/*` → `/dev/ttyUSB*`/`ACM*` |
+| `paniolo setup` extras | installs `tftp-now` (Homebrew, legacy) + visionocr | none beyond the Rust build deps |
+
+For headless CI the relevant takeaway (see `ci-integration/`): the core path is clean on Linux,
+and the macOS-only bits (Vision OCR, BPF, `tftp-now`) are irrelevant there.
+
+## 9. Lifecycle & exclusivity notes
+
+- **Serial ports are exclusive** — only one of `serialcap` / `tio` / `screen` can hold a port.
+  `serial watch` and `serial connect` conflict on the same device.
+- **Daemons hard-exit on SIGTERM** — both serve infinite responses (`/preview` MJPEG, `/stream`
+  WebSocket), so each removes its discovery file, waits ~300 ms, then `exit(0)`; the OS releases
+  the device.
+- **Interface configuration needs root** — NOPASSWD sudo is the practical setup for unattended
+  agent use.
+- **netboot and ffx are mutually exclusive on the link** — they want incompatible host addressing
+  (IPv4 + DHCP/TFTP vs. IPv6 link-local). `paniolo netif mode` enforces the exclusivity: entering
+  one mode tears down the other.
+
+## 10. Where this is going
+
+Paniolo is **already in day-to-day use** — driving an agent through real low-level hardware
+bring-up, where the agent iterates on bootloader/firmware/OS code and uses paniolo to deploy,
+boot, observe, and power-cycle the target without a human at the bench each cycle. The active
+line of work builds on that: making paniolo's primitives consumable by hardware-CI orchestrators
+(KernelCI/LAVA, Fuchsia/botanist) — a stable, ecosystem-agnostic device-control API (discrete
+power verbs, raw serial passthrough as a TCP socket + PTY, agent write-to-serial, a JTAG
+extension point) plus thin adapters. That design and its rationale are in
+[`ci-integration/design.md`](ci-integration/design.md) and
+[`ci-integration/gap-analysis.md`](ci-integration/gap-analysis.md); progress is tracked in
+[`requirements.md`](requirements.md).
+
+## 11. Prior art & why paniolo
+
+The closest existing tool is **labgrid** (Pengutronix) — like paniolo, a Python device-control
+layer that sits *under* a test framework and produces no verdicts of its own. labgrid is the
+mature, broad, **distributed** board-farm standard (coordinator/exporter/client over gRPC, a
+large driver catalog, multi-user reservations/locking) and is **Linux-only**. Paniolo
+deliberately occupies a different niche: a **single control host, zero-infrastructure,
+agent-in-the-loop** tool that adds capabilities labgrid lacks — on-device **OCR** of the screen,
+a **USB-HID injection** rig, and a combined video+serial dashboard — and runs first-class on
+**macOS** as well as Linux. Where the two overlap (raw-socket serial, discrete power verbs, a
+driver/protocol abstraction), labgrid's design independently *validates* the direction of
+paniolo's CI-integration work. For a multi-board, multi-user farm, labgrid is the right tool;
+paniolo targets the single-target bring-up loop it under-serves. Full comparison:
+[`ci-integration/related-work.md`](ci-integration/related-work.md).
+````
+
+## File: docs/netboot.md
+````markdown
+# Netboot
+
+paniolo netboots a target by running a minimal DHCP + TFTP server over a
+direct USB-Ethernet link. No router, switch, or upstream DHCP server is involved.
+
+---
+
+## Hardware setup
+
+1. Plug a USB-to-Ethernet adapter into your Mac.
+2. Connect an Ethernet cable from the adapter directly to the target's Ethernet
+   port (no switch needed — modern adapters handle MDI/MDIX automatically).
+3. Find the macOS interface name:
+
+```bash
+networksetup -listallhardwareports
+```
+
+---
+
+## Target configuration
+
+Config lives in the lab file (see [config-redesign.md](config-redesign.md));
+the netboot link is a per-target `netboot` channel:
+
+```bash
+# Create the target, then configure its netboot channel
+paniolo target add target-machine
+paniolo netboot set -t target-machine \
+    --interface en3 \
+    --tftp-root ~/src/fuchsia/pxe/tftp-root
+
+# List candidate USB-Ethernet interfaces (primary NIC excluded)
+paniolo netboot devices
+
+# Show all configured targets / a specific one
+paniolo target show
+paniolo target show target-machine
+
+# Remove the netboot channel, or the whole target
+paniolo netboot rm -t target-machine
+paniolo target rm target-machine
+```
+
+netboot channel fields:
+
+| Field | Default | Description |
+|---|---|---|
+| `--interface` | (required) | USB-Ethernet interface name (e.g. `en3`) |
+| `--host-ip` | `192.168.99.1` | Static IP assigned to the interface; also the TFTP server address |
+| `--tftp-root` | (none) | Directory whose contents are served over TFTP |
+| `--host` | target default | Lab host the channel lives on |
+
+Power-cycle and DTR control are configured on the `power` channel
+(`paniolo power set …` — see [power.md](power.md)).
+
+---
+
+## Starting and stopping
+
+```bash
+paniolo netboot start [target-machine]
+paniolo netboot stop  [target-machine]
+```
+
+`start` assigns the static `host_ip` to the interface, then launches paniolo's
+own **pure-Python DHCP and TFTP servers** as background subprocesses
+(`python -m paniolo._dhcp` and `python -m paniolo._tftp`). No external daemons
+(`dnsmasq`, `tftp-now`) are required at runtime. `stop` sends SIGTERM to both
+and clears the state file.
+
+**Privileged ports (67/69):** macOS 10.14+ allows binding `0.0.0.0` on
+privileged ports without root, so on macOS the only step needing sudo is
+assigning the static IP. On **Linux**, ports 67/69 require root, so `start`
+auto-prepends `sudo` when spawning the two servers, and interface configuration
+(`ip addr add`) uses sudo as well. Configure **NOPASSWD sudo** on the control
+host for unattended agent use.
+
+**Interface safety:** `start` **refuses** an interface that carries your system
+default route (a primary NIC). netboot reconfigures the interface to the static
+`host_ip`, which would break your real networking — the netboot link must be a
+dedicated USB-Ethernet adapter.
+
+### Netboot engines (rust default, python legacy)
+
+```bash
+paniolo netboot start [target-machine]                  # rust netbootd (default)
+paniolo netboot start --engine python [target-machine]  # legacy DHCP+TFTP pair
+```
+
+`start` launches a single `netbootd` binary (Rust) by default, serving DHCP and
+TFTP from one process. `--engine python` selects the legacy implementation: the
+`_dhcp`/`_tftp` subprocess pair the Rust daemon was ported from, kept as a
+fallback. `stop`/`status`/`logs` follow whichever engine `start` recorded.
+
+On macOS, netbootd's raw-frame send path (the Sequoia delivery workaround) needs
+a `/dev/bpf` descriptor. Rather than run the daemon as root, `paniolo setup`
+installs a tiny **setuid-root** helper, `netbootd-bpf-helper`, whose only job is
+to open `/dev/bpf`, bind the interface, and hand the descriptor to the
+unprivileged `netbootd`. It is the only paniolo component that runs as root. If
+it is missing or not setuid, the rust engine logs a warning and falls back to
+the kernel send path (which is unreliable on macOS 15+). Run `paniolo setup`
+(one sudo) to install it.
+
+---
+
+## Status and logs
+
+```bash
+paniolo netboot status [target-machine]      # running? interface? uptime?
+paniolo netboot logs   [target-machine]      # tail the combined DHCP + TFTP log
+paniolo netboot logs -f [target-machine]     # follow
+```
+
+---
+
+## Getting the TFTP root path
+
+```bash
+paniolo netboot tftp-root [target-machine]
+```
+
+Prints the bare TFTP root path, designed for shell substitution:
+
+```bash
+TFTP_ROOT=$(ssh control-mac "paniolo netboot tftp-root target-machine")
+scp kernel_2712.img control-mac:"${TFTP_ROOT}/kernel_2712.img"
+```
+
+---
+
+## Expected TFTP sequence for Raspberry Pi 5
+
+When the Pi 5 EEPROM PXE client boots it walks this file request sequence.
+The 404s are normal:
+
+```
+404  <serial>/<mac>/start.elf    ← Pi 5 doesn't need it; 404 expected
+200  config.txt
+200  bcm2712-rpi-5-b.dtb
+200  kernel_2712.img              ← your boot shim or kernel
+```
+
+The TFTP root must contain at minimum `config.txt`, `bcm2712-rpi-5-b.dtb`,
+and `kernel_2712.img`.
+
+---
+
+## DHCP / TFTP behavior notes
+
+The DHCP server hands the target a fixed lease and sets **both** `siaddr` (the
+BOOTP next-server) and **DHCP option 66** (TFTP server name) to `host_ip`. The
+Pi 5 EEPROM reads option 66 preferentially, but setting both ensures
+compatibility with older EEPROM firmware. The TFTP server is **read-only**
+(RFC 1350) and negotiates `blksize`/`tsize` options. Both servers log to the
+combined log at `~/.local/share/paniolo/<name>/netboot.log`.
+
+> **Switching to ffx-over-network?** With NET-first boot order, leaving netboot
+> running means the next power-cycle TFTP-boots instead of falling through to
+> the SD card. Use [`paniolo netif mode ffx`](netif.md) to stop netboot and
+> ready the host IPv6 side in one atomic, idempotent step.
+
+---
+
+## Runtime paths
+
+| Purpose | Path |
+|---|---|
+| Daemon state (DHCP/TFTP PIDs, uptime) | `~/.local/share/paniolo/<name>/netboot.json` |
+| Combined log | `~/.local/share/paniolo/<name>/netboot.log` |
+
+---
+
+## Known issue: TFTP responsiveness under host load
+
+On a heavily loaded control host the **Python** legacy TFTP server has been
+observed to starve — it doesn't service requests quickly enough and the
+client (e.g. the Pi 5 EEPROM) times out the transfer. A stopgap is to raise the
+server's scheduling priority (`renice` to a negative nice value).
+
+Future work for the **Rust `netbootd`** default engine: make TFTP serving
+robust to host load by design rather than relying on `renice` — e.g. run the
+send path on a dedicated/elevated-priority thread, set socket priority, and keep
+the per-request hot path allocation-free so latency stays bounded when the
+machine is busy. (Tracked from a real starvation incident; netbootd is already
+the default, so this is the right place to fix it permanently.)
+````
+
 ## File: src/paniolo/_state.py
 ````python
 # Copyright 2026 Curtis Galloway
@@ -18569,494 +23896,6 @@ def stop_daemon() -> bool:
         stderr=subprocess.DEVNULL,
     )
     return result.returncode == 0
-````
-
-## File: .github/workflows/ci.yml
-````yaml
-# Copyright 2026 Curtis Galloway
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-name: CI
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-
-# Cancel superseded runs on the same ref (e.g. rapid pushes to a PR).
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
-
-permissions:
-  contents: read
-
-jobs:
-  python:
-    name: python (pytest)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-          python-version: "3.11"
-      - name: Sync dependencies
-        run: uv sync
-      - name: Set up passwordless SSH to localhost (transport integration tests)
-        # Lets _ssh.py's integration tier (gated on PANIOLO_SSH_IT) exercise the
-        # real ssh path — run/forward/read_remote_file — against localhost using a
-        # dedicated key and no ssh-agent.
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y openssh-server
-          sudo systemctl enable --now ssh || sudo service ssh start
-          mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          ssh-keygen -t ed25519 -f ~/.ssh/ci_ssh -N "" -q
-          cat ~/.ssh/ci_ssh.pub >> ~/.ssh/authorized_keys
-          chmod 600 ~/.ssh/authorized_keys
-          ssh-keyscan -H localhost >> ~/.ssh/known_hosts 2>/dev/null || true
-          ssh -i ~/.ssh/ci_ssh -o IdentitiesOnly=yes -o BatchMode=yes \
-            -o StrictHostKeyChecking=accept-new localhost true
-          echo "PANIOLO_SSH_IT=localhost" >> "$GITHUB_ENV"
-          echo "PANIOLO_SSH_IT_IDENTITY=$HOME/.ssh/ci_ssh" >> "$GITHUB_ENV"
-      - name: Run tests
-        run: uv run pytest -q
-
-  serialcap:
-    name: serialcap (fmt, clippy, test)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: serialcap
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: serialcap
-      - name: Format check
-        run: cargo fmt --check
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Test
-        run: cargo test
-
-  netbootd:
-    name: netbootd (fmt, clippy, test)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: netbootd
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: netbootd
-      - name: Format check
-        run: cargo fmt --check
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Test
-        run: cargo test
-
-  hdmicap-linux:
-    name: hdmicap (Linux, fmt, clippy, V4L2 build)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: hdmicap
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libclang-dev clang cmake nasm libturbojpeg0-dev
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: hdmicap
-      - name: Format
-        run: cargo fmt --check
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Build hdmicap (V4L2 path)
-        run: cargo build
-
-  macos:
-    # Exercises the macOS-only stack the Linux jobs can't: hdmicap's AVFoundation
-    # capture path and the Apple Vision OCR helper. fmt/clippy run on both Linux
-    # (V4L2 path) and here (AVFoundation path) so each per-OS cfg branch is gated
-    # on the platform that compiles it.
-    name: macos (hdmicap, visionocr)
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: hdmicap
-      - name: Format
-        working-directory: hdmicap
-        run: cargo fmt --check
-      - name: Clippy
-        working-directory: hdmicap
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Build + test hdmicap (AVFoundation capture path)
-        working-directory: hdmicap
-        run: cargo test
-      - name: Compile visionocr (Apple Vision OCR helper)
-        run: swiftc -O -o "$RUNNER_TEMP/visionocr" ocr/visionocr.swift
-````
-
-## File: docs/architecture.md
-````markdown
-# Paniolo — System architecture
-
-> The whole design of paniolo in its **current state**. Start here for the big picture, then
-> drop into a [subsystem guide](README.md) for command-level detail. Internal module-by-module
-> notes for contributors/agents live in [`AGENTS.md`](../AGENTS.md); the forward-looking
-> hardware-CI design lives under [`ci-integration/`](ci-integration/).
->
-> Keep this in sync as the system changes.
-
----
-
-## 1. What paniolo is
-
-Paniolo is an **agent-controlled target-machine wrangler** for low-level software development
-(bootloaders, firmware, OS bring-up). It gives an AI agent (or a human, or a script) the
-physical controls of a target board: **netboot it, watch its output, send it input, power-cycle
-it** — without a person at the bench each iteration.
-
-It is deliberately a **device-control / "wrangling" layer**, not a test orchestrator. It owns
-power, serial, deploy (netboot), video, and HID. It does *not* decide what tests to run or
-produce verdicts — when integrated with hardware-CI ecosystems those concerns sit *above* it
-(see [`ci-integration/`](ci-integration/)).
-
-## 2. Deployment model
-
-```
-  ┌─────────────────────┐         ┌──────────────────────── control host ────────────────────────┐
-  │  dev machine / agent │  SSH    │  paniolo CLI  +  per-subsystem daemons                        │
-  │  (you, or an agent)  │ ──────► │                                                               │
-  └─────────────────────┘         │   USB-Ethernet ─────────────────┐                             │
-                                   │   USB serial (FTDI) ────────────┤                             │
-                                   │   USB HDMI capture ─────────────┤                             │
-                                   │   USB HID rig (KB2040) ─────────┤                             │
-                                   └─────────────────────────────────┼─────────────────────────────┘
-                                                                      ▼
-                                                          ┌──────────────────────┐
-                                                          │   target board (DUT) │
-                                                          └──────────────────────┘
-```
-
-- The **control host** is physically wired to one or more **targets** and runs paniolo.
-- The simplest driver is an **agent or script that SSHes into the control host** and runs
-  `paniolo …` commands (the remote-control pattern in the root [`README.md`](../README.md)).
-- **Or point paniolo at a [lab file](distributed-control.md)** (`--lab` / `PANIOLO_LAB`): the dev
-  machine then drives a target on its control host *transparently* — commands re-exec over SSH and
-  `console` tunnels the dashboard back — so you don't SSH by hand. The dev machine is the data-plane
-  hub; control hosts hold only runtime state. See §5 "Distributed control".
-- Runs on **macOS 10.14+** and **Linux** (x86-64/arm64). Platform differences are isolated to a
-  handful of spots (§8).
-
-## 3. Process architecture
-
-Paniolo today is **"one daemon per subsystem, no central server"** (called *Option A* in
-`AGENTS.md`). There is no long-running parent process; the `paniolo` binary runs, does its work,
-and exits. Per-subsystem **daemons** are backgrounded subprocesses that own a piece of hardware
-and persist between CLI invocations. State lives in plain files, not memory.
-
-| Component | Language | Role |
-|---|---|---|
-| `paniolo` CLI | Python 3.11+ (Typer) | The single entry point; spawns/queries daemons, edits config, runs scripts. `typer` is the only core dependency; stdlib otherwise. |
-| `serialcap` | Rust (tokio/axum) | Daemon that **exclusively owns** a target's serial ports; fans output out to a WebSocket + a timestamped capture log; accepts keystrokes back. |
-| `hdmicap` | Rust (tokio/axum, nokhwa) | "Warm-stream" daemon that keeps the USB HDMI capture device open and serves frames + the combined dashboard over HTTP. |
-| `netbootd` | Rust (tokio) | The default single-binary DHCP+TFTP netboot engine. Privilege-separated `/dev/bpf` send path on macOS via a setuid `netbootd-bpf-helper`. |
-| `_dhcp` / `_tftp` | Python modules | Legacy netboot DHCP and TFTP servers (`--engine python`), run as `python -m paniolo._dhcp` / `._tftp` subprocesses. The implementation `netbootd` was ported from; kept as a fallback. |
-| `visionocr` / `linuxocr` | Swift / shell+Tesseract | On-device OCR helpers invoked by `hdmicap` and `paniolo video read`. |
-| HID rig firmware | CircuitPython | Two KB2040 boards that turn text commands into USB HID events (see [`hidrig/`](../hidrig/README.md)). |
-
-A future *Option B* — a single long-running Rust server with socket RPC for inter-subsystem
-coordination — is noted in `AGENTS.md` but **not** implemented; the dashboard's hdmicap→serialcap
-link (§7) is the only cross-subsystem coupling today.
-
-## 4. Configuration & state model
-
-**Per-target config** is one TOML file per target at `~/.config/paniolo/targets/<name>.toml`.
-No daemon is needed to read it; if exactly one target is configured it is the default and may be
-omitted from every command. The current schema (`src/paniolo/_config.py`):
-
-```toml
-name = "target-machine"          # required
-interface = "en3"                # required — USB-Ethernet interface for netboot
-host_ip = "192.168.99.1"         # static IP on that interface; also the TFTP server address
-tftp_root = "/path/to/pxe"       # optional; required to start netboot
-power_cycle_cmd = "/path/cycle.sh"      # optional; shell command run by `paniolo power-cycle`
-power_serial_interface = "console"      # optional; default interface for DTR power commands
-
-[[serial]]                       # repeatable — a target may have several named consoles
-name = "console"
-device = "/dev/serial/by-path/…" # stable by-path symlink preferred (Linux)
-baud = 115200
-power_sense_signal = "cts"       # optional; cts|dsr|dcd|ri — modem-control input wired to the rail
-```
-
-> Legacy note: older single-serial fields (`serial_device`/`serial_baud`) are auto-migrated into
-> a `[[serial]]` named `console`; a removed `ha_power_entity` field is silently dropped.
-
-**Runtime state, discovery, and capture** live outside the config tree. Each daemon writes a
-**discovery file** (pid + port) and holds an **advisory lock** so only one runs per host:
-
-| Purpose | Path |
-|---|---|
-| Target / video / HID configs | `~/.config/paniolo/{targets/<name>.toml, video.toml, hid.toml}` |
-| Netboot state (pids, uptime) | `~/.local/share/paniolo/<name>/netboot.json` |
-| Netboot combined log | `~/.local/share/paniolo/<name>/netboot.log` |
-| hdmicap discovery / lock | `$XDG_RUNTIME_DIR/hdmicap/{daemon.json, daemon.lock}` (macOS: `$TMPDIR`) |
-| serialcap discovery / lock | `$XDG_RUNTIME_DIR/serialcap/{daemon.json, daemon.lock}` (macOS: `$TMPDIR`) |
-| serialcap capture log (per interface) | `$XDG_RUNTIME_DIR/serialcap/capture/<name>/serial.jsonl(.1..)` |
-| serialcap pending (unterminated) line | `$XDG_RUNTIME_DIR/serialcap/capture/<name>/pending.json` |
-
-## 5. Subsystems
-
-### Netboot / deploy ([`netboot.md`](netboot.md))
-A minimal **pure-Python DHCP + TFTP** pair (`_dhcp.py`, `_tftp.py`) over a **direct
-USB-Ethernet link** — no router, switch, or upstream DHCP. `paniolo netboot start` assigns the
-static `host_ip` to the interface, then spawns the two servers (`python -m paniolo._dhcp` /
-`._tftp`); on Linux these are prefixed with `sudo` (ports 67/69 need root; macOS 10.14+ allows
-them rootless). DHCP hands the target a fixed lease and points it at the TFTP root via BOOTP
-`siaddr` + DHCP option 66; TFTP is read-only (RFC 1350 + blksize/tsize). No external daemons
-(`dnsmasq`/`tftp-now`) are required at runtime.
-
-`paniolo netboot start` refuses an interface that carries the system default route (a primary
-NIC), since it reconfigures the interface to the static `host_ip` — the netboot link must be a
-dedicated secondary (USB-Ethernet) interface.
-
-**Netboot engine** (default): a single `netbootd` binary (Rust) runs both servers as tokio tasks.
-On macOS its raw-frame send path (the Sequoia workaround) gets a `/dev/bpf` descriptor from a
-setuid-root `netbootd-bpf-helper` over `SCM_RIGHTS`, so the daemon itself stays unprivileged — the
-helper is the only root component, installed by `paniolo setup`. `--engine python` selects the
-legacy `_dhcp`/`_tftp` subprocess pair the Rust daemon was ported from, kept as a fallback.
-
-### Link mode: netboot ↔ ffx ([`netif.md`](netif.md))
-The same USB-Ethernet link serves two **mutually-exclusive** roles: netboot (IPv4 + DHCP + TFTP,
-the target TFTP-boots) and ffx (host IPv6 link-local `fe80::1`/64, the target boots from SD and is
-reached over `ffx` at `fe80::…%<iface>`). `paniolo netif mode <netboot|ffx|off>` (`_netif.py`)
-makes the switch atomic: `ffx` runs `netboot stop` first (so a power-cycle falls through to SD
-rather than TFTP-booting a stale image) and adds the host `fe80::1` that ffx needs but nothing else
-sets up. Each mode is idempotent — the ephemeral IPv6 LL is re-added on demand. The active mode is
-**probed** (running daemons + interface addresses), not stored, so `paniolo netif status` stays
-correct across control-host reboots; in ffx mode it also reports the device's discovered
-link-local peer (`ip -6 neigh`) as a paste-ready `ffx target add`. Privileged steps reuse the same
-`sudo` path as netboot — no new privilege model.
-
-### Serial console ([`serial.md`](serial.md))
-The `serialcap` daemon is the heart of the design. One daemon **exclusively owns all of a
-target's serial interfaces**; per interface a *supervisor* task owns the port (with a reconnect
-loop) and **fans every byte out three ways**: (1) broadcast to live WebSocket clients
-(`/stream`), (2) a 64 KB scrollback ring for instant replay, and (3) a tee to a capture thread
-that assembles **timestamped, sequence-numbered JSONL** lines on disk (rotating, survives
-restarts). Writes flow the other way — WebSocket clients send bytes that the supervisor injects
-into the port. `paniolo serial log` reads the on-disk JSONL **directly** (no daemon round-trip),
-so it works whether or not the daemon is running. A separate, dependency-light **interactive**
-path (`paniolo serial connect`) execs `tio` for a foreground terminal — it holds the port
-exclusively and so conflicts with the daemon.
-
-### Power control ([`power.md`](power.md))
-Two mechanisms, both driven through serial/config: **DTR via FTDI** (the serial adapter's DTR
-line wired to the board's J2 power-button header — `serial dtr`/`serial reset`, ≤500 ms soft /
-≥3 s hard PMIC off), and **`power_cycle_cmd`**, an arbitrary shell script (`paniolo power-cycle`)
-for HA switches / PDUs / GPIO. `paniolo power-state` reads an optional **power-sense** signal (a
-modem-control input wired to the target rail) via the serialcap daemon's `/status`.
-
-### Video + OCR ([`video.md`](video.md))
-`hdmicap` keeps a UVC HDMI capture device open continuously (avoiding multi-second per-capture
-reopen latency) and serves the current frame as PNG/MJPEG plus the dashboard over HTTP.
-`paniolo video read` and the dashboard OCR button run **on-device OCR** on the warm frame —
-Apple Vision (`visionocr`) on macOS, Tesseract (`linuxocr`) on Linux — tuned for thin console
-fonts (2× upscale, black-pad, `.fast`/lowered min text height).
-
-### HID injection ([`hid.md`](hid.md))
-A two-board KB2040 rig injects USB keyboard/mouse events. `paniolo hid` is a **thin text-command
-client** over the control board's USB-CDC data port; the board owns the wire protocol and relays
-events over I2C to the target board, which presents as a USB HID device to the DUT. Requires the
-optional `pyserial` extra.
-
-### Dashboard ([`dashboard.md`](dashboard.md))
-`paniolo console` opens hdmicap's `GET /` — a two-pane web UI (live video on top, xterm.js
-terminal(s) below). See §7 for how the two daemons connect.
-
-### Distributed control ([`distributed-control.md`](distributed-control.md))
-Drives targets on **remote control hosts** from the dev machine, over SSH only — no agent or
-coordinator daemon. A single git-tracked **lab file** (`--lab` / `PANIOLO_LAB`) names the hosts and
-binds each target's resources to one (`_lab.py`); `_ssh.py` is the transport (per-host ControlMaster,
-`run`/`forward`/`run_interactive`). One-shot commands **re-exec** on the target's host
-(`@remote_capable` ships the config slice via `PANIOLO_TARGET_CONFIG`, `_remote.py`); `console`
-**tunnels** both daemon ports back and stitches them with the dashboard's `?serialws=` override.
-`setup --host` provisions a host; `discover`/`configure` propose a lab block from discovered
-hardware for the human to review and commit. With no lab, everything runs locally exactly as before.
-Shipped Phases 0–5; multi-host targets, `console --detach`, and locking remain design-only (see
-[`distributed-control-plan.md`](distributed-control-plan.md)).
-
-## 6. Representative data flows
-
-- **Boot-and-watch:** agent `scp`s an image into `tftp_root` → `netboot start` → target PXE-boots
-  over the USB-Ethernet link → boot output streams through `serialcap` to the JSONL log → agent
-  polls `serial log --since` (or watches the dashboard / OCRs the screen).
-- **Serial round-trip:** UART bytes → supervisor → {WebSocket clients, scrollback, JSONL capture
-  thread}; dashboard keystrokes → WebSocket → supervisor → UART.
-- **Power-cycle from the dashboard:** browser → hdmicap `POST /power-cycle` → `paniolo
-  power-cycle <target>` (target from `PANIOLO_TARGET`) → `power_cycle_cmd`.
-
-## 7. Cross-subsystem coupling (the dashboard)
-
-The dashboard is the **only** place two subsystems interlock, and they stay decoupled: hdmicap
-**serves the page** but references serialcap **only by URL** (`ws://<host>:8724/stream` by
-default; override via `?serial=` / `?serialws=`). The page fetches serialcap's `/interfaces` and
-builds one xterm.js terminal per interface. xterm.js is **vendored, not CDN**, so the dashboard
-works on an isolated lab network. The amber power-cycle button appears only when hdmicap was
-started with a target (so it is safe on shared dashboards).
-
-## 8. Host-OS differences (macOS vs Linux)
-
-Core power/serial/netboot works on both; the platform-specific spots are contained:
-
-| Area | macOS | Linux |
-|---|---|---|
-| Netboot ports 67/69 | rootless (10.14+) | `sudo` (auto-prepended) |
-| Interface config | `networksetup` / `ifconfig` | `ip addr`/`ip link` (iproute2) |
-| ARP pinning | `arp -s` | `ip neigh replace … nud permanent` |
-| TFTP egress workaround | BPF raw frames (`/dev/bpf*`) for Sequoia routing | normal `sendto()` |
-| BPF descriptor access (rust engine) | setuid `netbootd-bpf-helper` passes the fd (daemon stays unprivileged) | n/a (kernel send path) |
-| OCR backend | Apple Vision (`visionocr`, `swiftc`) | Tesseract (`linuxocr`, `tesseract-ocr` pkg) |
-| Serial device discovery | `/dev/tty.usb*` | `/dev/serial/by-path/*` → `/dev/ttyUSB*`/`ACM*` |
-| `paniolo setup` extras | installs `tftp-now` (Homebrew, legacy) + visionocr | none beyond the Rust build deps |
-
-For headless CI the relevant takeaway (see `ci-integration/`): the core path is clean on Linux,
-and the macOS-only bits (Vision OCR, BPF, `tftp-now`) are irrelevant there.
-
-## 9. Lifecycle & exclusivity notes
-
-- **Serial ports are exclusive** — only one of `serialcap` / `tio` / `screen` can hold a port.
-  `serial watch` and `serial connect` conflict on the same device.
-- **Daemons hard-exit on SIGTERM** — both serve infinite responses (`/preview` MJPEG, `/stream`
-  WebSocket), so each removes its discovery file, waits ~300 ms, then `exit(0)`; the OS releases
-  the device.
-- **Interface configuration needs root** — NOPASSWD sudo is the practical setup for unattended
-  agent use.
-- **netboot and ffx are mutually exclusive on the link** — they want incompatible host addressing
-  (IPv4 + DHCP/TFTP vs. IPv6 link-local). `paniolo netif mode` enforces the exclusivity: entering
-  one mode tears down the other.
-
-## 10. Where this is going
-
-Paniolo is **already in day-to-day use** — driving an agent through real low-level hardware
-bring-up, where the agent iterates on bootloader/firmware/OS code and uses paniolo to deploy,
-boot, observe, and power-cycle the target without a human at the bench each cycle. The active
-line of work builds on that: making paniolo's primitives consumable by hardware-CI orchestrators
-(KernelCI/LAVA, Fuchsia/botanist) — a stable, ecosystem-agnostic device-control API (discrete
-power verbs, raw serial passthrough as a TCP socket + PTY, agent write-to-serial, a JTAG
-extension point) plus thin adapters. That design and its rationale are in
-[`ci-integration/design.md`](ci-integration/design.md) and
-[`ci-integration/gap-analysis.md`](ci-integration/gap-analysis.md); progress is tracked in
-[`requirements.md`](requirements.md).
-
-## 11. Prior art & why paniolo
-
-The closest existing tool is **labgrid** (Pengutronix) — like paniolo, a Python device-control
-layer that sits *under* a test framework and produces no verdicts of its own. labgrid is the
-mature, broad, **distributed** board-farm standard (coordinator/exporter/client over gRPC, a
-large driver catalog, multi-user reservations/locking) and is **Linux-only**. Paniolo
-deliberately occupies a different niche: a **single control host, zero-infrastructure,
-agent-in-the-loop** tool that adds capabilities labgrid lacks — on-device **OCR** of the screen,
-a **USB-HID injection** rig, and a combined video+serial dashboard — and runs first-class on
-**macOS** as well as Linux. Where the two overlap (raw-socket serial, discrete power verbs, a
-driver/protocol abstraction), labgrid's design independently *validates* the direction of
-paniolo's CI-integration work. For a multi-board, multi-user farm, labgrid is the right tool;
-paniolo targets the single-target bring-up loop it under-serves. Full comparison:
-[`ci-integration/related-work.md`](ci-integration/related-work.md).
-````
-
-## File: docs/README.md
-````markdown
-# Paniolo documentation
-
-Paniolo is an **agent-controlled target-machine wrangler** for low-level software development —
-it gives an AI agent (or you) the controls to netboot a target, watch its output, send it input,
-and power-cycle it without a person at the bench each iteration. See the root
-[`README.md`](../README.md) for install and the quick remote-control pattern.
-
-## Start here
-
-| Doc | What it covers |
-|---|---|
-| [**Architecture**](architecture.md) | The whole system in its current state: deployment model, the CLI + per-subsystem daemons, config/state model, data flows, host-OS differences. **Read this first.** |
-| [Requirements & progress](requirements.md) | Project-wide requirements tracker (shipped capabilities + planned work + decisions), with status per item. |
-
-## Subsystem guides
-
-| Guide | Commands | Summary |
-|---|---|---|
-| [Netboot](netboot.md) | `paniolo netboot` | Pure-Python DHCP + TFTP over a direct USB-Ethernet link. |
-| [Link mode](netif.md) | `paniolo netif` | Atomically switch the link between netboot and ffx-over-IPv6 modes (stops netboot, sets up the host `fe80::1`). |
-| [Serial](serial.md) | `paniolo serial` | `serialcap` daemon (timestamped JSONL log + WebSocket terminal) and interactive `tio`. |
-| [Power](power.md) | `paniolo power-cycle`, `power-state`, `serial dtr/reset` | DTR power-button wiring (J2) and script-based power cycling. |
-| [Video](video.md) | `paniolo video` | `hdmicap` warm-stream HDMI capture + on-device OCR. |
-| [Dashboard](dashboard.md) | `paniolo console` | Combined video + serial web UI. |
-| [HID injection](hid.md) | `paniolo hid` | USB keyboard/mouse injection via the KB2040 rig. |
-
-## Distributed control (Phases 0–3 shipped)
-
-| Doc | What it covers |
-|---|---|
-| [Distributed control: one lab, one file](distributed-control.md) | Driving targets on remote control hosts: a single git-tracked lab file describing hosts + targets, SSH transport with the dev machine as the data-plane hub, per-resource host binding (multi-host-ready), and a discovery-proposes/human-approves config flow. Shipped: `--lab`, transparent re-exec, tunnelled `console`. |
-| [Implementation plan](distributed-control-plan.md) | Phased build sequence — Phases 0–3 shipped (SSH transport, lab model, re-exec, console); Phases 4–5 (remote `setup`, discovery-assisted `configure`) and multi-host pending. |
-
-## Hardware-CI integration (in design)
-
-Making paniolo's primitives consumable by hardware-CI orchestrators, without paniolo owning test
-orchestration or results.
-
-| Doc | What it covers |
-|---|---|
-| [Gap analysis](ci-integration/gap-analysis.md) | Per-primitive (power/serial/deploy/boot) × per-ecosystem (KernelCI/LAVA, Fuchsia/botanist) deltas, with the verified contract corrections. |
-| [Integration design](ci-integration/design.md) | The ecosystem-agnostic device-control API + LAVA and botanist adapters; minimum-viable vs full paths; verdict. |
-| [Related work: paniolo vs. labgrid](ci-integration/related-work.md) | How paniolo compares to the closest existing tool (labgrid) and to Redfish, and why paniolo exists alongside them. |
-| [Redfish provider (design sketch)](ci-integration/redfish-provider.md) | Exposing a Redfish API in front of BMC-less boards so Ironic/Metal3/LAVA can drive a paniolo target as a managed server. |
-
-## For contributors / agents
-
-- [`AGENTS.md`](../AGENTS.md) — module-by-module internals, source constraints, and how to add a subsystem.
-- [`hidrig/README.md`](../hidrig/README.md) — HID rig wiring, firmware, and wire protocol.
-
----
-
-*These docs describe paniolo's current state and are kept up to date as it changes. When you
-change a subsystem, update its guide here and the [architecture overview](architecture.md); when
-you change requirements/scope, update the [tracker](requirements.md).*
 ````
 
 ## File: src/paniolo/_netboot.py
@@ -19664,6 +24503,77 @@ def get_status(target: str) -> dict:
     }
 ````
 
+## File: docs/README.md
+````markdown
+# Paniolo documentation
+
+Paniolo is an **agent-controlled target-machine wrangler** for low-level software development —
+it gives an AI agent (or you) the controls to netboot a target, watch its output, send it input,
+and power-cycle it without a person at the bench each iteration. See the root
+[`README.md`](../README.md) for install and the quick remote-control pattern.
+
+## Start here
+
+| Doc | What it covers |
+|---|---|
+| [**Architecture**](architecture.md) | The whole system in its current state: deployment model, the CLI + per-subsystem daemons, config/state model, data flows, host-OS differences. **Read this first.** |
+| [Requirements & progress](requirements.md) | Project-wide requirements tracker (shipped capabilities + planned work + decisions), with status per item. |
+
+## Subsystem guides
+
+| Guide | Commands | Summary |
+|---|---|---|
+| [Netboot](netboot.md) | `paniolo netboot` | Pure-Python DHCP + TFTP over a direct USB-Ethernet link. |
+| [Link mode](netif.md) | `paniolo netif` | Atomically switch the link between netboot and ffx-over-IPv6 modes (stops netboot, sets up the host `fe80::1`). |
+| [Serial](serial.md) | `paniolo serial` | `serialcap` daemon (timestamped JSONL log + WebSocket terminal) and interactive `tio`. |
+| [Power](power.md) | `paniolo power-cycle`, `power-state`, `serial dtr/reset` | DTR power-button wiring (J2) and script-based power cycling. |
+| [Video](video.md) | `paniolo video` | `hdmicap` warm-stream HDMI capture + on-device OCR. |
+| [Dashboard](dashboard.md) | `paniolo console` | Combined video + serial web UI. |
+| [HID injection](hid.md) | `paniolo hid` | USB keyboard/mouse injection via the KB2040 rig. |
+
+## Distributed control (Phases 0–3 shipped)
+
+| Doc | What it covers |
+|---|---|
+| [Distributed control: one lab, one file](distributed-control.md) | Driving targets on remote control hosts: a single git-tracked lab file describing hosts + targets, SSH transport with the dev machine as the data-plane hub, per-resource host binding (multi-host-ready), and a discovery-proposes/human-approves config flow. Shipped: `--lab`, transparent re-exec, tunnelled `console`. |
+| [Implementation plan](distributed-control-plan.md) | Phased build sequence — Phases 0–3 shipped (SSH transport, lab model, re-exec, console); Phases 4–5 (remote `setup`, discovery-assisted `configure`) and multi-host pending. |
+
+## Rust control-plane rewrite (at command parity)
+
+The CLI + orchestration + device glue is rewritten Python→Rust (the `cli/` crate),
+finishing the migration the daemons started. The lab file is the single, CLI-managed
+source of truth. All commands are ported and rig-verified locally; remote-host
+dispatch and the Python-tree retirement are the remaining steps.
+
+| Doc | What it covers |
+|---|---|
+| [Config redesign: a CLI-managed lab](config-redesign.md) | The lab data model (hosts/targets/per-channel hosts), the CRUD command surface, per-channel dispatch design, and the Python→Rust pivot + staged plan. |
+| [CH9329 driver spec (clean-room)](ch9329-spec.md) | **Deferred** (Openterface HID backend, to revisit): WCH CH9329 serial protocol — frame format, GET_INFO, keyboard report, parameter-config/baud, reset, ACK codes. Reference for when the `hid` channel is reintroduced. |
+
+## Hardware-CI integration (in design)
+
+Making paniolo's primitives consumable by hardware-CI orchestrators, without paniolo owning test
+orchestration or results.
+
+| Doc | What it covers |
+|---|---|
+| [Gap analysis](ci-integration/gap-analysis.md) | Per-primitive (power/serial/deploy/boot) × per-ecosystem (KernelCI/LAVA, Fuchsia/botanist) deltas, with the verified contract corrections. |
+| [Integration design](ci-integration/design.md) | The ecosystem-agnostic device-control API + LAVA and botanist adapters; minimum-viable vs full paths; verdict. |
+| [Related work: paniolo vs. labgrid](ci-integration/related-work.md) | How paniolo compares to the closest existing tool (labgrid) and to Redfish, and why paniolo exists alongside them. |
+| [Redfish provider (design sketch)](ci-integration/redfish-provider.md) | Exposing a Redfish API in front of BMC-less boards so Ironic/Metal3/LAVA can drive a paniolo target as a managed server. |
+
+## For contributors / agents
+
+- [`AGENTS.md`](../AGENTS.md) — module-by-module internals, source constraints, and how to add a subsystem.
+- [`hidrig/README.md`](../hidrig/README.md) — HID rig wiring, firmware, and wire protocol.
+
+---
+
+*These docs describe paniolo's current state and are kept up to date as it changes. When you
+change a subsystem, update its guide here and the [architecture overview](architecture.md); when
+you change requirements/scope, update the [tracker](requirements.md).*
+````
+
 ## File: skills/paniolo/SKILL.md
 ````markdown
 ---
@@ -19702,26 +24612,32 @@ cd ~/src/paniolo && uv tool install --reinstall .
 
 ## Configure a target
 
+Config lives in one CLI-managed **lab file** (`~/.config/paniolo/lab.toml`, or
+`--lab`/`PANIOLO_LAB`). A target's hardware is described as *channels*:
+
 ```
-paniolo target set <name> --interface <iface> \
-    [--tftp-root <dir>] \
-    [--host-ip <ip>] \
-    [--power-cycle-cmd <script>] \
-    [--power-serial <serial-iface>]
+paniolo target add <name> [--host <labhost>] [--note <text>]
+paniolo netboot set -t <name> --interface <iface> [--tftp-root <dir>] [--host-ip <ip>]
+paniolo serial add console -t <name> --device <path> [--baud 115200] [--sense cts]
+paniolo power set -t <name> [--cycle-cmd <script>] [--serial-interface console]
+paniolo video set -t <name> --device "<capture name>"
 ```
 
-- `--interface` auto-detects a USB-Ethernet adapter if omitted.
-- Serial consoles are configured separately with `paniolo serial setup` (a target
-  can have several named interfaces); they're preserved across `target set` runs.
-- Inspect or remove: `paniolo target show` / `paniolo target clear <name>`.
+- `paniolo netboot devices` lists candidate USB-Ethernet interfaces (the
+  primary NIC is excluded); `paniolo discover` lists all lab-relevant hardware;
+  `paniolo configure <name> -H <host>` proposes a whole block to paste in.
+- Inspect: `paniolo config show` (whole lab) / `paniolo target show <name>`.
+- Remove: `paniolo target rm <name>`, or per channel (`netboot rm`,
+  `serial rm <iface> -t <name>`, `power rm`, `video rm`).
+- `paniolo doctor` probes every configured channel against reality (devices
+  exist, over SSH for remote hosts).
 
 ## Netboot (DHCP + TFTP)
 
 Boot a board over the direct USB-Ethernet link:
 
 ```
-paniolo netboot start [target]            # serve DHCP + TFTP (rust netbootd, default)
-paniolo netboot start [target] --engine python  # legacy pure-Python DHCP+TFTP pair
+paniolo netboot start [target]            # serve DHCP + TFTP (netbootd)
 paniolo netboot tftp-root [target]        # print where to drop boot files
 paniolo netboot status [target]
 paniolo netboot logs -f [target]          # follow the combined log
@@ -19769,7 +24685,8 @@ passwordless `sudo` requirement as netboot (`ip` on Linux, `ifconfig` on macOS).
 ## Video — capture, preview, OCR
 
 ```
-paniolo video setup                   # detect + save the capture device
+paniolo video devices                 # list capture devices
+paniolo video set -t <target> --device "<name>"   # configure the video channel
 paniolo video watch                   # start the capture daemon (background)
 paniolo video preview                 # open the dashboard in a browser
 paniolo video shot [--stable] [--out frame.png]   # one lossless PNG
@@ -19778,7 +24695,8 @@ paniolo video show                    # device + daemon status
 paniolo video stop
 ```
 
-- The **dashboard** (default `http://127.0.0.1:8723/`) shows live video on top, a
+- The **dashboard** (the video daemon's URL — ports are OS-assigned, printed by
+  `video watch`/`console`) shows live video on top, a
   serial terminal below, and an **OCR button** that reads the current screen.
 - `--stable` waits for a steady frame before capturing (useful right after a mode
   switch or reboot).
@@ -19793,10 +24711,10 @@ a `bmc`). Each port is **exclusive** — only one consumer can hold it at a time
 but a single `watch` daemon owns *all* of them at once.
 
 ```
-paniolo serial setup [target] --name console   # add/update a named interface
-                                               #   (--device auto-detected if omitted)
-paniolo serial setup [target] --name bmc --device /dev/ttyUSB1 --baud 9600
-paniolo serial remove <name> [-t target]       # drop a named interface
+paniolo serial add console -t <target> --device <path>   # add a named interface
+paniolo serial add bmc -t <target> --device /dev/ttyUSB1 --baud 9600
+paniolo serial set console -t <target> --sense cts        # update fields
+paniolo serial rm <name> -t <target>                      # drop a named interface
 paniolo serial connect [target] [-i name]      # interactive terminal (tio) in your shell
 paniolo serial watch [target]                  # run the daemon for ALL interfaces;
                                                #   they appear in the dashboard pane
@@ -19846,13 +24764,13 @@ paniolo serial reset [target]          # soft reset via brief DTR pulse
 ```
 
 `power-cycle` runs the shell script set with
-`paniolo target set <name> --power-cycle-cmd <script>`.
+`paniolo power set -t <name> --cycle-cmd <script>`.
 The script is responsible for the full off→on sequence (HA API, PDU relay, GPIO, etc.).
 
 DTR commands drive the target's physical power button via an FTDI serial
 adapter wired to the Pi J2 header. A ≤500 ms pulse is a soft button event; ≥3000 ms
 is a hard PMIC power-off. Set the default interface with
-`paniolo target set <name> --power-serial console`.
+`paniolo power set -t <name> --serial-interface console`.
 
 ## Targets on a remote control host (a "lab")
 
@@ -19895,13 +24813,14 @@ paniolo console fortune            # dashboard tunnelled to your browser; Ctrl-C
 ```
 
 Notes:
-- With **no** `--lab`/`PANIOLO_LAB`, paniolo uses the legacy per-target files
-  (`paniolo target set …`) and everything runs locally — unchanged.
-- The lab file is **hand-edited** (it's your source of truth, in git). Config
-  authoring commands (`target set/show/clear`, `serial setup/remove`) still
-  operate on the local legacy config, not the lab, for now.
-- A target may currently live on only **one** host (multi-host targets are
-  designed-for but not yet supported).
+- With **no** `--lab`/`PANIOLO_LAB`, paniolo uses the default lab at
+  `~/.config/paniolo/lab.toml` (auto-created on first write).
+- The lab file is **CLI-managed and hand-edit friendly**: all the config
+  commands edit it surgically (your comments survive), and it stays your
+  git-tracked source of truth.
+- **Channels can live on different hosts** (per-channel `--host`): each command
+  runs on the host of the channel it touches. Composites (`console`) need
+  their channels co-located on one host.
 - Still over plain SSH if you prefer: `ssh bench1 "paniolo …"` works too, but the
   lab makes location transparent.
 
@@ -20006,11 +24925,17 @@ make install           # Python CLI + Rust daemons + OCR helper, in one step
 `make install` runs `uv tool install --reinstall .` for the Python CLI, then
 `paniolo setup`, which compiles and installs the Rust daemons (`hdmicap`,
 `serialcap`, `netbootd`) and the OCR helper (`visionocr` on macOS via `swiftc`,
-`linuxocr` on Linux) into `~/.cargo/bin`. Netboot defaults to the single-binary
-`netbootd` (Rust) engine; the legacy pure-Python DHCP/TFTP pair is still
-available via `--engine python`. (On macOS, `setup` also installs the legacy
-`tftp-now` via Homebrew, and installs `netbootd-bpf-helper` setuid-root — one
-sudo — for the `netbootd` raw-frame send path.)
+`linuxocr` on Linux) into `~/.cargo/bin`. Netboot is served by the
+single-binary `netbootd` (Rust) engine. (On macOS, `setup` also installs
+`netbootd-bpf-helper` setuid-root — one sudo — for the `netbootd` raw-frame
+send path.)
+
+> **Rust control plane:** the CLI itself is being rewritten in Rust (the
+> `cli/` crate; see [docs/config-redesign.md](docs/config-redesign.md)).
+> `paniolo setup` from the Rust CLI installs the daemons *and* the Rust
+> `paniolo` binary into `~/.cargo/bin` — a single static binary per control
+> host, no Python environment needed. Configuration moves to one CLI-managed
+> lab file (`~/.config/paniolo/lab.toml`).
 
 To pick up code changes after pulling or editing, just re-run it:
 
@@ -20045,10 +24970,9 @@ control Mac to drive the target:
 
 ```bash
 # Configure target once
-ssh control-mac "paniolo target set target-machine \
-    --interface en3 \
-    --tftp-root ~/pxe \
-    --power-cycle-cmd /path/to/power-cycle.sh"
+ssh control-mac "paniolo target add target-machine"
+ssh control-mac "paniolo netboot set -t target-machine --interface en3 --tftp-root ~/pxe"
+ssh control-mac "paniolo power set -t target-machine --cycle-cmd /path/to/power-cycle.sh"
 
 # Deploy a new kernel and boot
 TFTP_ROOT=$(ssh control-mac "paniolo netboot tftp-root target-machine")
@@ -20069,12 +24993,15 @@ ssh control-mac "paniolo power-cycle target-machine"
 
 ### Target
 
-A *target* is a named machine you want to control. Its configuration lives in
-`~/.config/paniolo/targets/<name>.toml`. One config file per target; no daemon
-required. If exactly one target is configured it is the default and can be
-omitted from every command.
+A *target* is a named machine you want to control. Configuration lives in a
+single CLI-managed **lab file** (`~/.config/paniolo/lab.toml`, or `--lab` /
+`PANIOLO_LAB`): hosts plus targets, each target's hardware described as
+*channels* (`netboot`, `serial`, `power`, `video`) bound to the host they're
+physically attached to. No daemon required. If exactly one target is
+configured it is the default and can be omitted from every command.
 
-See [`paniolo target set --help`](docs/netboot.md#target-configuration) for all fields.
+See [docs/config-redesign.md](docs/config-redesign.md) for the model and
+[Target configuration](docs/netboot.md#target-configuration) for the fields.
 
 ### Runtime paths
 
@@ -20093,6 +25020,2113 @@ See [`paniolo target set --help`](docs/netboot.md#target-configuration) for all 
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).
+````
+
+## File: cli/src/main.rs
+````rust
+// Copyright 2026 Curtis Galloway
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! paniolo — agent-controlled target machine wrangler.
+//!
+//! Rust rewrite of the control plane (see docs/config-redesign.md). The lab
+//! file is the single, CLI-managed source of truth for hosts, targets, and the
+//! channels that connect them. This module is the CLI surface; the model and
+//! editor live in [`model`] and [`labfile`].
+
+mod daemons;
+mod discover;
+mod dispatch;
+mod doctor;
+mod labfile;
+mod model;
+mod netboot;
+mod netif;
+mod power;
+mod serial;
+mod setup;
+mod ssh;
+mod state;
+mod video;
+
+use std::path::PathBuf;
+
+use anyhow::{anyhow, bail, Result};
+use clap::{Parser, Subcommand};
+
+use labfile::LabFile;
+use model::{Lab, ResolvedChannel, ResolvedTarget};
+
+#[derive(Parser)]
+#[command(
+    name = "paniolo",
+    version,
+    about = "Agent-controlled target machine wrangler."
+)]
+struct Cli {
+    /// Path to the lab config file (default: $PANIOLO_LAB or ~/.config/paniolo/lab.toml).
+    #[arg(long, global = true)]
+    lab: Option<String>,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Create an empty lab file.
+    Init {
+        /// Where to create it (default: --lab path or ~/.config/paniolo/lab.toml).
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// Inspect and edit the lab configuration file.
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
+    /// Manage control hosts declared in the lab.
+    Host {
+        #[command(subcommand)]
+        cmd: HostCmd,
+    },
+    /// Manage targets.
+    Target {
+        #[command(subcommand)]
+        cmd: TargetCmd,
+    },
+    /// Manage a target's serial channels.
+    Serial {
+        #[command(subcommand)]
+        cmd: SerialCmd,
+    },
+    /// Configure a target's netboot channel and run DHCP+TFTP netboot.
+    Netboot {
+        #[command(subcommand)]
+        cmd: NetbootCmd,
+    },
+    /// Switch the USB-Ethernet link between netboot and ffx modes.
+    Netif {
+        #[command(subcommand)]
+        cmd: NetifCmd,
+    },
+    /// Configure a target's power channel.
+    Power {
+        #[command(subcommand)]
+        cmd: PowerCmd,
+    },
+    /// Configure and drive a target's HDMI-capture (video) channel.
+    Video {
+        #[command(subcommand)]
+        cmd: VideoCmd,
+    },
+    /// Open the combined video+serial dashboard, starting daemons if needed.
+    Console {
+        target: Option<String>,
+        /// Serial interface name to preselect in the dashboard terminal.
+        #[arg(long, short)]
+        interface: Option<String>,
+    },
+    /// Run the target's configured power-cycle command.
+    PowerCycle { target: Option<String> },
+    /// Show whether the target is powered on (via the serial sense line).
+    PowerState { target: Option<String> },
+    /// Probe configured channels against reality over SSH (config vs hardware).
+    Doctor {
+        /// Target to check (default: all).
+        target: Option<String>,
+        /// Only check channels on this host.
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// List this host's hardware for lab authoring (USB-Ethernet, serial, capture).
+    Discover {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Propose a `[targets.<name>]` lab block from hardware discovered on a host.
+    Configure {
+        /// Target name to propose a block for.
+        target: String,
+        /// Lab host the target is wired to ('local' or a declared host).
+        #[arg(long, short = 'H')]
+        host: String,
+    },
+    /// Build and install paniolo's binaries (daemons + CLI) from a source clone.
+    Setup {
+        /// Provision this lab host over SSH instead of locally (requires the
+        /// paniolo CLI + source already on the host).
+        #[arg(long)]
+        host: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Show the whole lab: hosts and targets, each channel with its host.
+    Show,
+    /// Print the active lab file path.
+    Path,
+    /// Open the raw lab file in $EDITOR.
+    Edit,
+}
+
+#[derive(Subcommand)]
+enum HostCmd {
+    /// List control hosts.
+    List,
+    /// Show a host and the channels that live on it.
+    Show { name: String },
+    /// Declare a control host.
+    Add {
+        name: String,
+        /// ssh destination: user@host, an ssh_config alias, or 'local'.
+        #[arg(long)]
+        ssh: String,
+        #[arg(long)]
+        identity: Option<String>,
+        #[arg(long)]
+        control_path: Option<String>,
+        #[arg(long)]
+        paniolo_cmd: Option<String>,
+    },
+    /// Update an existing host (only the options you pass change).
+    Set {
+        name: String,
+        #[arg(long)]
+        ssh: Option<String>,
+        #[arg(long)]
+        identity: Option<String>,
+        #[arg(long)]
+        control_path: Option<String>,
+        #[arg(long)]
+        paniolo_cmd: Option<String>,
+    },
+    /// Remove a host (refused if any target still binds to it).
+    Rm { name: String },
+}
+
+#[derive(Subcommand)]
+enum TargetCmd {
+    /// List targets with their host(s) and channels.
+    List,
+    /// Show target configuration(s), each channel with its resolved host.
+    Show { name: Option<String> },
+    /// Create a target.
+    Add {
+        name: String,
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Update a target's default host or note.
+    Set {
+        name: String,
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Remove a target and all its channels.
+    Rm { name: String },
+}
+
+#[derive(Subcommand)]
+enum SerialCmd {
+    /// Add a named serial console to a target.
+    Add {
+        name: String,
+        #[arg(long, short)]
+        target: String,
+        #[arg(long, short)]
+        device: String,
+        #[arg(long, default_value_t = 115200)]
+        baud: i64,
+        #[arg(long)]
+        sense: Option<String>,
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Update an existing serial interface (only the options you pass change).
+    Set {
+        name: String,
+        #[arg(long, short)]
+        target: String,
+        #[arg(long, short)]
+        device: Option<String>,
+        #[arg(long)]
+        baud: Option<i64>,
+        #[arg(long)]
+        sense: Option<String>,
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Remove a named serial interface from a target.
+    Rm {
+        name: String,
+        #[arg(long, short)]
+        target: String,
+    },
+    /// Open an interactive serial console (via tio) on the channel's host.
+    Connect {
+        target: Option<String>,
+        /// Interface name (default: the only one).
+        #[arg(long, short)]
+        interface: Option<String>,
+    },
+    /// Start the serialcap daemon (owning every configured interface).
+    Watch {
+        target: Option<String>,
+        #[arg(long, default_value_t = serial::DEFAULT_PORT)]
+        port: u16,
+    },
+    /// Stop the running serialcap daemon.
+    Stop,
+    /// Send a line of input to the console through the running daemon.
+    Send {
+        /// Text to send.
+        text: String,
+        #[arg(long, short)]
+        target: Option<String>,
+        #[arg(long, short)]
+        interface: Option<String>,
+        /// Per-byte pacing in ms for slow polled consoles (0 = full rate).
+        #[arg(long, default_value_t = 0)]
+        pace_ms: u32,
+        /// Don't append a carriage return after the text.
+        #[arg(long)]
+        no_newline: bool,
+    },
+    /// Print captured serial output (reads serialcap's on-disk log).
+    Log {
+        #[arg(long, short)]
+        target: Option<String>,
+        #[arg(long, short)]
+        interface: Option<String>,
+        /// Show only the most recent N lines.
+        #[arg(long, short = 'n')]
+        tail: Option<u64>,
+        /// Lowest line sequence number (inclusive).
+        #[arg(long)]
+        from: Option<u64>,
+        /// Highest line sequence number (inclusive).
+        #[arg(long)]
+        to: Option<u64>,
+        /// Only lines newer than this sequence number.
+        #[arg(long)]
+        since: Option<u64>,
+        /// Keep raw bytes (ANSI/control) instead of cleaning.
+        #[arg(long)]
+        raw: bool,
+        /// Emit JSON Lines instead of formatted text.
+        #[arg(long)]
+        json: bool,
+        /// Exclude the current unterminated line.
+        #[arg(long)]
+        no_pending: bool,
+    },
+    /// List available serial devices on this machine.
+    Devices,
+    /// Show a target's serial interfaces and the daemon status.
+    Show { target: Option<String> },
+    /// Pulse the DTR line (J2 power-button header) on a serial interface.
+    Dtr {
+        target: Option<String>,
+        /// Pulse duration in ms (≤500 = soft power-button event, ≥3000 = hard off).
+        #[arg(long, default_value_t = 200)]
+        ms: u64,
+        /// Interface name (default: the power channel's serial_interface, or the
+        /// only one).
+        #[arg(long, short)]
+        interface: Option<String>,
+    },
+    /// Send a soft-reset signal via a brief J2 power-button press.
+    Reset {
+        target: Option<String>,
+        #[arg(long, default_value_t = 200)]
+        ms: u64,
+        #[arg(long, short)]
+        interface: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum NetbootCmd {
+    /// Configure the target's netboot channel (one per target).
+    Set {
+        #[arg(long, short)]
+        target: String,
+        #[arg(long, short)]
+        interface: Option<String>,
+        #[arg(long)]
+        host_ip: Option<String>,
+        #[arg(long, short = 'r')]
+        tftp_root: Option<String>,
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Remove the target's netboot channel.
+    Rm {
+        #[arg(long, short)]
+        target: String,
+    },
+    /// Start DHCP+TFTP netboot (the netbootd daemon) for a target.
+    Start { target: Option<String> },
+    /// Stop netboot and restore the interface.
+    Stop { target: Option<String> },
+    /// Show netboot daemon status.
+    Status { target: Option<String> },
+    /// Show the netboot log (combined DHCP+TFTP).
+    Logs {
+        target: Option<String>,
+        /// Show only the most recent N lines.
+        #[arg(long, short = 'n', default_value_t = 50)]
+        tail: usize,
+        /// Keep printing new lines as they arrive.
+        #[arg(long, short)]
+        follow: bool,
+    },
+    /// Print the target's TFTP root path.
+    TftpRoot { target: Option<String> },
+    /// List candidate USB-Ethernet interfaces on this machine.
+    Devices,
+    /// Bring the USB-Ethernet link up with the host IP assigned.
+    LinkUp { target: Option<String> },
+    /// Take the link down and release the host IP.
+    LinkDown { target: Option<String> },
+    /// Show the current state of the USB-Ethernet link.
+    LinkStatus { target: Option<String> },
+}
+
+#[derive(Subcommand)]
+enum NetifCmd {
+    /// Switch the link mode: netboot | ffx | off (idempotent).
+    Mode {
+        /// netboot | ffx | off.
+        mode: String,
+        target: Option<String>,
+    },
+    /// Show which mode the link is in and its addresses.
+    Status { target: Option<String> },
+}
+
+#[derive(Subcommand)]
+enum PowerCmd {
+    /// Configure the target's power channel (one per target).
+    Set {
+        #[arg(long, short)]
+        target: String,
+        #[arg(long)]
+        cycle_cmd: Option<String>,
+        #[arg(long)]
+        serial_interface: Option<String>,
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Remove the target's power channel.
+    Rm {
+        #[arg(long, short)]
+        target: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum VideoCmd {
+    /// Configure the target's video channel (one per target).
+    Set {
+        #[arg(long, short)]
+        target: String,
+        /// Capture device: an hdmicap device name substring, index, or /dev path.
+        #[arg(long, short)]
+        device: String,
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Remove the target's video channel.
+    Rm {
+        #[arg(long, short)]
+        target: String,
+    },
+    /// Start the hdmicap warm-stream daemon for the target's capture device.
+    Watch {
+        target: Option<String>,
+        #[arg(long, default_value_t = video::DEFAULT_PORT)]
+        port: u16,
+        /// Force-restart a running (possibly stalled) daemon.
+        #[arg(long)]
+        restart: bool,
+    },
+    /// Stop the running hdmicap daemon.
+    Stop,
+    /// Fetch one PNG screenshot from the running daemon.
+    Shot {
+        target: Option<String>,
+        /// Wait until the signal is stable before capturing.
+        #[arg(long)]
+        stable: bool,
+        /// Only return once the frame differs from this hex hash.
+        #[arg(long)]
+        changed_since: Option<String>,
+        /// Timeout in ms.
+        #[arg(long, default_value_t = 2000)]
+        timeout: u64,
+        /// Output path; "-" for stdout.
+        #[arg(long, short, default_value = "-")]
+        out: String,
+    },
+    /// Print the live-preview URL of the running daemon.
+    Preview,
+    /// List available capture devices.
+    Devices,
+    /// Show the target's video channel and daemon status.
+    Show { target: Option<String> },
+}
+
+fn main() {
+    let cli = Cli::parse();
+    if let Err(e) = run(cli) {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
+    let lab_flag = cli.lab.as_deref();
+    match cli.command {
+        Command::Init { path } => cmd_init(lab_flag, path.as_deref()),
+        Command::Config { cmd } => match cmd {
+            ConfigCmd::Show => config_show(lab_flag),
+            ConfigCmd::Path => config_path(lab_flag),
+            ConfigCmd::Edit => config_edit(lab_flag),
+        },
+        Command::Host { cmd } => host_cmd(lab_flag, cmd),
+        Command::Target { cmd } => target_cmd(lab_flag, cmd),
+        Command::Serial { cmd } => serial_cmd(lab_flag, cmd),
+        Command::Netboot { cmd } => netboot_cmd(lab_flag, cmd),
+        Command::Netif { cmd } => netif_cmd(lab_flag, cmd),
+        Command::Power { cmd } => power_cmd(lab_flag, cmd),
+        Command::Video { cmd } => video_cmd(lab_flag, cmd),
+        Command::Console { target, interface } => {
+            cmd_console(lab_flag, target.as_deref(), interface.as_deref())
+        }
+        Command::PowerCycle { target } => cmd_power_cycle(lab_flag, target.as_deref()),
+        Command::PowerState { target } => cmd_power_state(lab_flag, target.as_deref()),
+        Command::Doctor { target, host } => {
+            cmd_doctor(lab_flag, target.as_deref(), host.as_deref())
+        }
+        Command::Discover { json } => cmd_discover(json),
+        Command::Configure { target, host } => cmd_configure(lab_flag, &target, &host),
+        Command::Setup { host } => cmd_setup(lab_flag, host.as_deref()),
+    }
+}
+
+// ── discover / configure / setup ────────────────────────────────────────────
+
+fn cmd_discover(json: bool) -> Result<()> {
+    let inv = discover::local_inventory();
+    if json {
+        println!("{}", serde_json::to_string(&inv)?);
+        return Ok(());
+    }
+    let eths: Vec<String> = inv["ethernet"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|e| {
+                    let dev = e["device"].as_str().unwrap_or("");
+                    let star = if e["active"].as_bool().unwrap_or(false) {
+                        "*"
+                    } else {
+                        ""
+                    };
+                    format!("{dev}{star}")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    println!(
+        "usb-ethernet\t{}",
+        if eths.is_empty() {
+            "(none)".to_string()
+        } else {
+            eths.join(" ")
+        }
+    );
+    let serials: Vec<&str> = inv["serial"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|s| s.as_str()).collect())
+        .unwrap_or_default();
+    println!(
+        "serial\t{}",
+        if serials.is_empty() {
+            "(none)".to_string()
+        } else {
+            serials.join("\n\t")
+        }
+    );
+    let captures: Vec<String> = inv["video"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|d| format!("{}: {}", d["index"], d["name"].as_str().unwrap_or("")))
+                .collect()
+        })
+        .unwrap_or_default();
+    println!(
+        "capture\t{}",
+        if captures.is_empty() {
+            "(none)".to_string()
+        } else {
+            captures.join("\n\t")
+        }
+    );
+    println!("(* = carrier up)");
+    Ok(())
+}
+
+/// Look up a control host for host-scoped commands ('local' = the dev machine).
+fn resolve_host(lab_flag: Option<&str>, name: &str) -> Result<model::Host> {
+    if name == model::LOCAL {
+        return Ok(model::Host {
+            ssh: model::LOCAL.to_string(),
+            ..Default::default()
+        });
+    }
+    let lab = load_for_read(lab_flag)?;
+    lab.hosts.get(name).cloned().ok_or_else(|| {
+        let have: Vec<&str> = lab.hosts.keys().map(String::as_str).collect();
+        anyhow!(
+            "host '{name}' not in lab (hosts: {})",
+            if have.is_empty() {
+                "(none)".to_string()
+            } else {
+                have.join(", ")
+            }
+        )
+    })
+}
+
+fn cmd_configure(lab_flag: Option<&str>, target: &str, host: &str) -> Result<()> {
+    let resolved = resolve_host(lab_flag, host)?;
+    let inv = if resolved.is_local(host) {
+        discover::local_inventory()
+    } else {
+        eprintln!("Discovering hardware on {host} ({})…", resolved.ssh);
+        let out = ssh::run(
+            &resolved,
+            &[
+                resolved.paniolo(),
+                "discover".to_string(),
+                "--json".to_string(),
+            ],
+            None,
+            &[],
+        )?;
+        if out.status != 0 {
+            bail!(
+                "discover failed on {host}: {}",
+                if out.stderr.trim().is_empty() {
+                    out.stdout.trim()
+                } else {
+                    out.stderr.trim()
+                }
+            );
+        }
+        serde_json::from_str(out.stdout.trim())
+            .map_err(|e| anyhow!("unparseable discover output from {host}: {e}"))?
+    };
+
+    let block = discover::propose_target_block(target, host, &inv);
+    println!("# Proposed lab block — review, add to your lab file, and commit.");
+    if let Ok(lab) = load_for_read(lab_flag) {
+        if lab.targets.contains_key(target) {
+            println!("# NOTE: target '{target}' already exists in the lab — reconcile by hand.");
+        }
+    }
+    println!("{block}");
+    Ok(())
+}
+
+fn cmd_setup(lab_flag: Option<&str>, host: Option<&str>) -> Result<()> {
+    if let Some(name) = host {
+        let resolved = resolve_host(lab_flag, name)?;
+        if !resolved.is_local(name) {
+            eprintln!("Running paniolo setup on {name} ({})…", resolved.ssh);
+            let code =
+                ssh::run_interactive(&resolved, &[resolved.paniolo(), "setup".to_string()], &[])?;
+            std::process::exit(code);
+        }
+        eprintln!("'{name}' is the local machine; setting up here.");
+    }
+    let repo = setup::find_repo_root().ok_or_else(|| {
+        anyhow!(
+            "paniolo source checkout not found. `paniolo setup` rebuilds the daemons \
+             and OCR helper from source, so it must run from inside a clone \
+             (e.g. `make install`). cd into the paniolo repo and try again."
+        )
+    })?;
+    setup::run(&repo)
+}
+
+/// Resolve a runtime command's target: the given name, or the sole target.
+fn resolve_single_target(lab: &Lab, name: Option<&str>) -> Result<String> {
+    if let Some(n) = name {
+        return Ok(n.to_string());
+    }
+    let names = lab.target_names();
+    match names.len() {
+        1 => Ok(names[0].to_string()),
+        0 => bail!("No targets configured."),
+        _ => bail!(
+            "Multiple targets ({}) — specify one with -t.",
+            names.join(", ")
+        ),
+    }
+}
+
+fn cmd_doctor(lab_flag: Option<&str>, target: Option<&str>, host: Option<&str>) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    let problems = doctor::run(&lab, target, host);
+    if problems > 0 {
+        eprintln!("{problems} problem(s) found.");
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+// ── lab open helpers ────────────────────────────────────────────────────────
+
+fn load_for_read(lab_flag: Option<&str>) -> Result<Lab> {
+    let path = model::resolve_lab_path(lab_flag).ok_or_else(|| {
+        anyhow!(
+            "No lab configured. Create one with `paniolo init`, or point at one \
+             with --lab / PANIOLO_LAB."
+        )
+    })?;
+    Ok(model::load(&path)?)
+}
+
+/// Open the lab for editing (creating it if absent), apply `mutate`, save.
+/// Config writes are always local and pure — they never touch a target or SSH.
+fn edit_lab<F>(lab_flag: Option<&str>, mutate: F) -> Result<()>
+where
+    F: FnOnce(&mut LabFile) -> Result<(), model::LabError>,
+{
+    let path = model::resolve_lab_path(lab_flag).unwrap_or_else(model::default_lab_path);
+    let created = !path.exists();
+    let mut lf = if created {
+        LabFile::create(&path)
+    } else {
+        LabFile::load(&path)?
+    };
+    mutate(&mut lf)?;
+    lf.save()?;
+    if created {
+        eprintln!("Created new lab: {}", path.display());
+    }
+    Ok(())
+}
+
+// ── init / config ───────────────────────────────────────────────────────────
+
+fn cmd_init(lab_flag: Option<&str>, path_opt: Option<&str>) -> Result<()> {
+    let path: PathBuf = path_opt
+        .map(model::expand_tilde)
+        .or_else(|| model::resolve_lab_path(lab_flag))
+        .unwrap_or_else(model::default_lab_path);
+    if path.exists() {
+        bail!("Lab file already exists: {}", path.display());
+    }
+    LabFile::create(&path).save()?;
+    println!("Created lab: {}", path.display());
+    println!("  Add a host:   paniolo host add <name> --ssh user@host");
+    println!("  Add a target: paniolo target add <name>");
+    Ok(())
+}
+
+fn config_path(lab_flag: Option<&str>) -> Result<()> {
+    match model::resolve_lab_path(lab_flag) {
+        Some(p) => println!("{}", p.display()),
+        None => {
+            println!("{}", model::default_lab_path().display());
+            eprintln!("(does not exist yet — create it with `paniolo init`)");
+        }
+    }
+    Ok(())
+}
+
+fn config_edit(lab_flag: Option<&str>) -> Result<()> {
+    let path = model::resolve_lab_path(lab_flag)
+        .ok_or_else(|| anyhow!("No lab to edit. Create one with `paniolo init`."))?;
+    let editor = std::env::var("EDITOR")
+        .or_else(|_| std::env::var("VISUAL"))
+        .unwrap_or_else(|_| "vi".to_string());
+    let mut parts = editor.split_whitespace();
+    let prog = parts.next().unwrap_or("vi");
+    let status = std::process::Command::new(prog)
+        .args(parts)
+        .arg(&path)
+        .status()?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+fn config_show(lab_flag: Option<&str>) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    let path = model::resolve_lab_path(lab_flag).unwrap_or_default();
+    println!("Lab {}", path.display());
+
+    println!("  Hosts");
+    if lab.hosts.is_empty() {
+        println!("    (none — everything runs on the local dev machine)");
+    } else {
+        for (name, h) in &lab.hosts {
+            let id = h
+                .identity
+                .as_deref()
+                .map(|i| format!("  identity={i}"))
+                .unwrap_or_default();
+            println!("    {name}  {}{id}", h.ssh);
+        }
+    }
+
+    println!("  Targets");
+    if lab.targets.is_empty() {
+        println!("    (none)");
+    } else {
+        for name in lab.targets.keys() {
+            let rt = lab.resolved_target(name).unwrap();
+            println!("    {}", target_headline(&rt));
+            if let Some(note) = &rt.note {
+                println!("      note: {note}");
+            }
+            for ch in &rt.channels {
+                println!("      {}", channel_label(ch));
+            }
+            if rt.channels.is_empty() {
+                println!("      (no channels)");
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── host ────────────────────────────────────────────────────────────────────
+
+fn host_cmd(lab_flag: Option<&str>, cmd: HostCmd) -> Result<()> {
+    match cmd {
+        HostCmd::List => host_list(lab_flag),
+        HostCmd::Show { name } => host_show(lab_flag, &name),
+        HostCmd::Add {
+            name,
+            ssh,
+            identity,
+            control_path,
+            paniolo_cmd,
+        } => {
+            edit_lab(lab_flag, |lf| {
+                lf.add_host(
+                    &name,
+                    &ssh,
+                    identity.as_deref(),
+                    control_path.as_deref(),
+                    paniolo_cmd.as_deref(),
+                )
+            })?;
+            println!("Host '{name}' added. ({ssh})");
+            Ok(())
+        }
+        HostCmd::Set {
+            name,
+            ssh,
+            identity,
+            control_path,
+            paniolo_cmd,
+        } => {
+            edit_lab(lab_flag, |lf| {
+                lf.update_host(
+                    &name,
+                    ssh.as_deref(),
+                    identity.as_deref(),
+                    control_path.as_deref(),
+                    paniolo_cmd.as_deref(),
+                )
+            })?;
+            println!("Host '{name}' updated.");
+            Ok(())
+        }
+        HostCmd::Rm { name } => {
+            edit_lab(lab_flag, |lf| lf.remove_host(&name))?;
+            println!("Host '{name}' removed.");
+            Ok(())
+        }
+    }
+}
+
+fn host_list(lab_flag: Option<&str>) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    if lab.hosts.is_empty() {
+        println!("No hosts declared. (everything runs locally)");
+        return Ok(());
+    }
+    for (name, h) in &lab.hosts {
+        println!("{name}\t{}\t{}", h.ssh, h.identity.as_deref().unwrap_or(""));
+    }
+    Ok(())
+}
+
+fn host_show(lab_flag: Option<&str>, name: &str) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    if name != model::LOCAL && !lab.hosts.contains_key(name) {
+        let have: Vec<&str> = lab.hosts.keys().map(String::as_str).collect();
+        bail!(
+            "Host '{name}' not in lab. Hosts: {}",
+            if have.is_empty() {
+                "(none)".into()
+            } else {
+                have.join(", ")
+            }
+        );
+    }
+    match lab.hosts.get(name) {
+        Some(h) => {
+            println!("Host: {name}");
+            println!("  ssh           {}", h.ssh);
+            if let Some(v) = &h.identity {
+                println!("  identity      {v}");
+            }
+            if let Some(v) = &h.control_path {
+                println!("  control_path  {v}");
+            }
+            if let Some(v) = &h.paniolo_cmd {
+                println!("  paniolo_cmd   {v}");
+            }
+        }
+        None => println!("Host: local  (the dev machine)"),
+    }
+    let pairs = lab.channels_on_host(name);
+    if pairs.is_empty() {
+        println!("  (no channels bound to this host)");
+        return Ok(());
+    }
+    for (tname, ch) in pairs {
+        println!(
+            "  {tname}\t{}\t{}",
+            channel_name(&ch),
+            fields_str(&ch.fields)
+        );
+    }
+    Ok(())
+}
+
+// ── target ────────────────────────────────────────────────────────────────────
+
+fn target_cmd(lab_flag: Option<&str>, cmd: TargetCmd) -> Result<()> {
+    match cmd {
+        TargetCmd::List => target_list(lab_flag),
+        TargetCmd::Show { name } => target_show(lab_flag, name.as_deref()),
+        TargetCmd::Add { name, host, note } => {
+            edit_lab(lab_flag, |lf| {
+                lf.add_target(&name, host.as_deref(), note.as_deref())
+            })?;
+            println!("Target '{name}' added.");
+            Ok(())
+        }
+        TargetCmd::Set { name, host, note } => {
+            edit_lab(lab_flag, |lf| {
+                lf.update_target(&name, host.as_deref(), note.as_deref())
+            })?;
+            println!("Target '{name}' updated.");
+            Ok(())
+        }
+        TargetCmd::Rm { name } => {
+            edit_lab(lab_flag, |lf| lf.remove_target(&name))?;
+            println!("Target '{name}' removed.");
+            Ok(())
+        }
+    }
+}
+
+fn target_list(lab_flag: Option<&str>) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    if lab.targets.is_empty() {
+        println!("No targets configured. (paniolo target add <name>)");
+        return Ok(());
+    }
+    for name in lab.targets.keys() {
+        let rt = lab.resolved_target(name).unwrap();
+        let chans: Vec<String> = rt
+            .channels
+            .iter()
+            .map(|c| {
+                if c.name == c.kind.as_str() {
+                    c.kind.as_str().to_string()
+                } else {
+                    format!("{}:{}", c.kind.as_str(), c.name)
+                }
+            })
+            .collect();
+        println!("{name}\t{}\t{}", rt.hosts().join(", "), chans.join(", "));
+    }
+    Ok(())
+}
+
+fn target_show(lab_flag: Option<&str>, name: Option<&str>) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    let names: Vec<String> = match name {
+        Some(n) => vec![n.to_string()],
+        None => lab.targets.keys().cloned().collect(),
+    };
+    if names.is_empty() {
+        println!("No targets configured.");
+        return Ok(());
+    }
+    for tname in names {
+        match lab.resolved_target(&tname) {
+            Some(rt) => print_resolved_target(&rt),
+            None => eprintln!("Target '{tname}' not found in lab."),
+        }
+    }
+    Ok(())
+}
+
+// ── serial / netboot / power (config) ───────────────────────────────────────
+
+fn serial_cmd(lab_flag: Option<&str>, cmd: SerialCmd) -> Result<()> {
+    match cmd {
+        SerialCmd::Add {
+            name,
+            target,
+            device,
+            baud,
+            sense,
+            host,
+        } => {
+            let sense = normalize_sense(sense.as_deref())?;
+            edit_lab(lab_flag, |lf| {
+                lf.add_serial(
+                    &target,
+                    &name,
+                    &device,
+                    baud,
+                    sense.as_deref(),
+                    host.as_deref(),
+                )
+            })?;
+            println!("Serial '{name}' added to '{target}': {device} @ {baud}");
+            Ok(())
+        }
+        SerialCmd::Set {
+            name,
+            target,
+            device,
+            baud,
+            sense,
+            host,
+        } => {
+            let sense = match sense.as_deref() {
+                None => None,
+                Some(s) => match normalize_sense(Some(s))? {
+                    Some(v) => Some(v),
+                    None => bail!(
+                        "`set` can't clear a sense signal. Remove and re-add the \
+                         interface to clear it."
+                    ),
+                },
+            };
+            edit_lab(lab_flag, |lf| {
+                lf.update_serial(
+                    &target,
+                    &name,
+                    device.as_deref(),
+                    baud,
+                    sense.as_deref(),
+                    host.as_deref(),
+                )
+            })?;
+            println!("Serial '{name}' updated on '{target}'.");
+            Ok(())
+        }
+        SerialCmd::Rm { name, target } => {
+            edit_lab(lab_flag, |lf| lf.remove_serial(&target, &name))?;
+            println!("Serial '{name}' removed from '{target}'.");
+            Ok(())
+        }
+        SerialCmd::Connect { target, interface } => {
+            cmd_serial_connect(lab_flag, target.as_deref(), interface.as_deref())
+        }
+        SerialCmd::Watch { target, port } => cmd_serial_watch(lab_flag, target.as_deref(), port),
+        SerialCmd::Stop => {
+            let code = serial::stop_daemon()?;
+            if code == 0 {
+                println!("Serial daemon stopped.");
+                Ok(())
+            } else {
+                std::process::exit(code);
+            }
+        }
+        SerialCmd::Send {
+            text,
+            target,
+            interface,
+            pace_ms,
+            no_newline,
+        } => cmd_serial_send(
+            lab_flag,
+            target.as_deref(),
+            interface.as_deref(),
+            &text,
+            pace_ms,
+            !no_newline,
+        ),
+        SerialCmd::Log {
+            target,
+            interface,
+            tail,
+            from,
+            to,
+            since,
+            raw,
+            json,
+            no_pending,
+        } => cmd_serial_log(
+            lab_flag,
+            target.as_deref(),
+            interface.as_deref(),
+            tail,
+            from,
+            to,
+            since,
+            raw,
+            json,
+            no_pending,
+        ),
+        SerialCmd::Devices => {
+            let devices = serial::list_devices();
+            if devices.is_empty() {
+                println!("No serial devices found.");
+            }
+            for d in devices {
+                println!("  {d}");
+            }
+            Ok(())
+        }
+        SerialCmd::Show { target } => cmd_serial_show(lab_flag, target.as_deref()),
+        SerialCmd::Dtr {
+            target,
+            ms,
+            interface,
+        } => cmd_serial_dtr(
+            lab_flag,
+            target.as_deref(),
+            ms,
+            interface.as_deref(),
+            "DTR pulse",
+        ),
+        SerialCmd::Reset {
+            target,
+            ms,
+            interface,
+        } => cmd_serial_dtr(
+            lab_flag,
+            target.as_deref(),
+            ms,
+            interface.as_deref(),
+            "Soft reset",
+        ),
+    }
+}
+
+/// Pulse DTR on a target's serial interface — via the serialcap daemon when it
+/// is running (it owns the port), else directly.
+fn cmd_serial_dtr(
+    lab_flag: Option<&str>,
+    target: Option<&str>,
+    ms: u64,
+    interface: Option<&str>,
+    label: &str,
+) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    let target = resolve_single_target(&lab, target)?;
+    // Default interface: the power channel's serial_interface (if configured).
+    let default_iface = lab
+        .targets
+        .get(&target)
+        .and_then(|t| t.power.as_ref())
+        .and_then(|p| p.serial_interface.clone());
+    let iface = interface.map(String::from).or(default_iface);
+    if let Some(code) = dispatch::maybe_dispatch(
+        &lab,
+        &target,
+        model::ChannelKind::Serial,
+        iface.as_deref(),
+        dispatch::Mode::Reexec,
+    )? {
+        std::process::exit(code);
+    }
+    let serials = local_serials(&lab, &target)?;
+    let ch = pick_serial(&serials, iface.as_deref())?;
+    if let Some(url) = serial::daemon_url() {
+        eprintln!("{label} on '{target}' ({ms} ms via serialcap daemon)");
+        power::dtr_press_daemon(&url, &ch.name, ms)?;
+    } else {
+        eprintln!("{label} on '{target}' ({ms} ms via {} directly)", ch.device);
+        power::dtr_press_direct(&ch.device, ms)?;
+    }
+    println!("Done.");
+    Ok(())
+}
+
+// ── console (composite: video + serial dashboard) ───────────────────────────
+
+fn dashboard_url(video_base: &str, serial_ws: Option<&str>, interface: Option<&str>) -> String {
+    let mut params: Vec<String> = Vec::new();
+    if let Some(ws) = serial_ws {
+        params.push(format!("serialws={ws}"));
+    }
+    if let Some(i) = interface {
+        params.push(format!("interface={i}"));
+    }
+    if params.is_empty() {
+        video_base.to_string()
+    } else {
+        format!("{video_base}/?{}", params.join("&"))
+    }
+}
+
+fn open_in_browser(url: &str) {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(opener)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// The combined dashboard is a composite command: it needs the serial and video
+/// channels co-located on one host. Locally it ensures both daemons; remotely
+/// it starts them over SSH and holds tunnels to both.
+fn cmd_console(
+    lab_flag: Option<&str>,
+    target: Option<&str>,
+    interface: Option<&str>,
+) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    let target = resolve_single_target(&lab, target)?;
+    let rt = lab
+        .resolved_target(&target)
+        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+    let serial_host = model::channel_host(&rt, model::ChannelKind::Serial, interface)?;
+    let video_host = model::channel_host(&rt, model::ChannelKind::Video, None)?;
+    if serial_host != video_host {
+        bail!(
+            "console needs the serial and video channels on one host; \
+             serial is on '{serial_host}', video on '{video_host}'"
+        );
+    }
+    let host = lab.host(&serial_host);
+    if !host.is_local(&serial_host) {
+        return remote_console(&lab, &target, &serial_host, interface);
+    }
+
+    // Local: ensure both daemons (OS-assigned ports; discovery finds them).
+    let video_url = match video::daemon_url() {
+        Some(u) => u,
+        None => {
+            let v = local_video(&lab, &target)?;
+            let device = v
+                .device
+                .ok_or_else(|| anyhow!("video channel for '{target}' has no device set"))?;
+            eprintln!("Starting video daemon…");
+            video::start_daemon(&device, 0, Some(&target))?;
+            daemons::wait_for_daemon(video::DAEMON, std::time::Duration::from_secs(5))
+                .ok_or_else(|| anyhow!("video daemon did not start within 5 s"))?
+        }
+    };
+    if serial::daemon_url().is_none() {
+        let serials = local_serials(&lab, &target)?;
+        if serials.is_empty() {
+            bail!("no serial interfaces configured for '{target}' (paniolo serial add ...)");
+        }
+        eprintln!("Starting serial daemon…");
+        serial::start_daemon(&serials, 0)?;
+        daemons::wait_for_daemon(serial::DAEMON, std::time::Duration::from_secs(5))
+            .ok_or_else(|| anyhow!("serial daemon did not start within 5 s"))?;
+    }
+    let url = dashboard_url(&video_url, None, interface);
+    open_in_browser(&url);
+    println!("Opened {url}");
+    Ok(())
+}
+
+fn remote_console(lab: &Lab, target: &str, host_name: &str, interface: Option<&str>) -> Result<()> {
+    let host = lab.host(host_name);
+    eprintln!("Starting daemons on {host_name}…");
+    for sub in [["video", "watch"], ["serial", "watch"]] {
+        let out = dispatch::run_subcommand(lab, target, host_name, &[sub[0], sub[1], target])?;
+        if out.status != 0 {
+            let msg = if out.stderr.trim().is_empty() {
+                out.stdout.trim().to_string()
+            } else {
+                out.stderr.trim().to_string()
+            };
+            bail!(
+                "failed to start '{} {}' on {host_name}: {msg}",
+                sub[0],
+                sub[1]
+            );
+        }
+    }
+    let video_port = dispatch::remote_daemon_port(&host, "hdmicap")
+        .ok_or_else(|| anyhow!("could not read the hdmicap daemon port on {host_name}"))?;
+    let serial_port = dispatch::remote_daemon_port(&host, "serialcap")
+        .ok_or_else(|| anyhow!("could not read the serialcap daemon port on {host_name}"))?;
+
+    let fwd_video = ssh::forward(&host, video_port)?;
+    let fwd_serial = ssh::forward(&host, serial_port)?;
+    let url = dashboard_url(
+        &format!("http://127.0.0.1:{}", fwd_video.local_port),
+        Some(&format!("ws://127.0.0.1:{}/stream", fwd_serial.local_port)),
+        interface,
+    );
+    open_in_browser(&url);
+    println!("Opened {url}");
+    println!("Tunnels to {host_name} open. Press Ctrl-C to close.");
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+// ── power runtime bodies ────────────────────────────────────────────────────
+
+/// The target's power channel as visible on *this* host.
+fn local_power(lab: &Lab, target: &str) -> Result<model::PowerChannel> {
+    let t = lab
+        .targets
+        .get(target)
+        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+    let dh = t.default_host().to_string();
+    let p = t.power.clone().ok_or_else(|| {
+        anyhow!("target '{target}' has no power channel (paniolo power set -t {target} ...)")
+    })?;
+    if p.host.as_deref().unwrap_or(&dh) != model::LOCAL {
+        bail!("power channel for '{target}' is not on this host");
+    }
+    Ok(p)
+}
+
+fn cmd_power_cycle(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    let target = resolve_single_target(&lab, target)?;
+    if let Some(code) = dispatch::maybe_dispatch(
+        &lab,
+        &target,
+        model::ChannelKind::Power,
+        None,
+        dispatch::Mode::Reexec,
+    )? {
+        std::process::exit(code);
+    }
+    let p = local_power(&lab, &target)?;
+    let cmd = p.cycle_cmd.ok_or_else(|| {
+        anyhow!(
+            "no cycle_cmd configured for '{target}' \
+             (paniolo power set -t {target} --cycle-cmd /path/to/script)"
+        )
+    })?;
+    eprintln!("Power cycling '{target}' via {cmd}");
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .status()?;
+    if status.success() {
+        println!("Power cycle complete.");
+        Ok(())
+    } else {
+        eprintln!(
+            "power-cycle script exited with code {}",
+            status.code().unwrap_or(1)
+        );
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+fn cmd_power_state(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    let target = resolve_single_target(&lab, target)?;
+    if let Some(code) = dispatch::maybe_dispatch(
+        &lab,
+        &target,
+        model::ChannelKind::Power,
+        None,
+        dispatch::Mode::Reexec,
+    )? {
+        std::process::exit(code);
+    }
+    let p = local_power(&lab, &target)?;
+    let si = p.serial_interface.ok_or_else(|| {
+        anyhow!(
+            "no power serial_interface configured for '{target}' \
+             (paniolo power set -t {target} --serial-interface <name>)"
+        )
+    })?;
+    let url = serial::daemon_url().ok_or_else(|| {
+        anyhow!("serialcap daemon not running — start it with `paniolo serial watch`")
+    })?;
+    match power::read_power_state(&url, &si) {
+        Some(true) => {
+            println!("Power ON  ({target})");
+            Ok(())
+        }
+        Some(false) => {
+            println!("Power OFF  ({target})");
+            Ok(())
+        }
+        None => bail!(
+            "power state unknown — the sense signal may not be configured on '{si}' \
+             (paniolo serial set {si} -t {target} --sense <cts|dsr|dcd|ri>)"
+        ),
+    }
+}
+
+// ── serial runtime bodies ───────────────────────────────────────────────────
+
+/// The target's serial channels visible on *this* host (all of them when
+/// running against a shipped slice, the local ones otherwise).
+fn local_serials(lab: &Lab, target: &str) -> Result<Vec<model::SerialChannel>> {
+    let t = lab
+        .targets
+        .get(target)
+        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+    let dh = t.default_host().to_string();
+    Ok(t.serial
+        .iter()
+        .filter(|s| s.host.as_deref().unwrap_or(&dh) == model::LOCAL)
+        .cloned()
+        .collect())
+}
+
+fn pick_serial<'a>(
+    serials: &'a [model::SerialChannel],
+    name: Option<&str>,
+) -> Result<&'a model::SerialChannel> {
+    let have = || {
+        serials
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match name {
+        Some(n) => serials
+            .iter()
+            .find(|s| s.name == n)
+            .ok_or_else(|| anyhow!("no serial interface '{n}' (have: {})", have())),
+        None => match serials.len() {
+            1 => Ok(&serials[0]),
+            0 => bail!("no serial interfaces configured (paniolo serial add ...)"),
+            _ => bail!(
+                "multiple serial interfaces ({}); specify one with -i",
+                have()
+            ),
+        },
+    }
+}
+
+/// Common preamble for serial runtime commands: resolve the target, dispatch
+/// to the channel's host if remote, and return the local serial channels.
+fn serial_runtime(
+    lab_flag: Option<&str>,
+    target: Option<&str>,
+    interface: Option<&str>,
+    mode: dispatch::Mode,
+) -> Result<Vec<model::SerialChannel>> {
+    let lab = load_for_read(lab_flag)?;
+    let target = resolve_single_target(&lab, target)?;
+    if let Some(code) =
+        dispatch::maybe_dispatch(&lab, &target, model::ChannelKind::Serial, interface, mode)?
+    {
+        std::process::exit(code);
+    }
+    local_serials(&lab, &target)
+}
+
+fn cmd_serial_connect(
+    lab_flag: Option<&str>,
+    target: Option<&str>,
+    interface: Option<&str>,
+) -> Result<()> {
+    let serials = serial_runtime(lab_flag, target, interface, dispatch::Mode::Interactive)?;
+    let ch = pick_serial(&serials, interface)?;
+    serial::exec_tio(&ch.device, ch.baud)
+}
+
+fn cmd_serial_watch(lab_flag: Option<&str>, target: Option<&str>, port: u16) -> Result<()> {
+    let serials = serial_runtime(lab_flag, target, None, dispatch::Mode::Reexec)?;
+    if serials.is_empty() {
+        bail!("no serial interfaces configured (paniolo serial add ...)");
+    }
+    if let Some(url) = serial::daemon_url() {
+        println!("Serial daemon already running at {url}");
+        return Ok(());
+    }
+    serial::start_daemon(&serials, port)?;
+    let names: Vec<&str> = serials.iter().map(|s| s.name.as_str()).collect();
+    eprintln!(
+        "Starting serial daemon for {} interface(s): {}…",
+        serials.len(),
+        names.join(", ")
+    );
+    match daemons::wait_for_daemon(serial::DAEMON, std::time::Duration::from_secs(5)) {
+        Some(url) => {
+            println!("Serial daemon started. {url}");
+            Ok(())
+        }
+        None => bail!("serial daemon did not start within 5 s"),
+    }
+}
+
+fn cmd_serial_send(
+    lab_flag: Option<&str>,
+    target: Option<&str>,
+    interface: Option<&str>,
+    text: &str,
+    pace_ms: u32,
+    newline: bool,
+) -> Result<()> {
+    let serials = serial_runtime(lab_flag, target, interface, dispatch::Mode::Reexec)?;
+    let ch = pick_serial(&serials, interface)?;
+    let url = serial::daemon_url().ok_or_else(|| {
+        anyhow!("serialcap daemon not running — start it with `paniolo serial watch`")
+    })?;
+    let mut payload = text.as_bytes().to_vec();
+    if newline {
+        payload.push(b'\r');
+    }
+    let pace_note = if pace_ms > 0 {
+        format!(" paced {pace_ms} ms/byte")
+    } else {
+        String::new()
+    };
+    eprintln!(
+        "Sending {} bytes to '{}'{pace_note}",
+        payload.len(),
+        ch.name
+    );
+    serial::send_input(&url, &ch.name, &payload, pace_ms)?;
+    println!("Sent.");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_serial_log(
+    lab_flag: Option<&str>,
+    target: Option<&str>,
+    interface: Option<&str>,
+    tail: Option<u64>,
+    from: Option<u64>,
+    to: Option<u64>,
+    since: Option<u64>,
+    raw: bool,
+    json: bool,
+    no_pending: bool,
+) -> Result<()> {
+    // Dispatch to the channel's host; the capture log lives where the daemon ran.
+    let serials = serial_runtime(lab_flag, target, interface, dispatch::Mode::Reexec)?;
+    // serialcap reads its own on-disk log, so this works daemon-up or -down.
+    let binary = daemons::find_binary(serial::DAEMON)
+        .ok_or_else(|| anyhow!("serialcap not found — run `paniolo setup`"))?;
+    let mut cmd = std::process::Command::new(binary);
+    cmd.arg("log");
+    // Name the interface explicitly when we can (sole or selected).
+    if let Some(name) = interface.or_else(|| {
+        if serials.len() == 1 {
+            Some(serials[0].name.as_str())
+        } else {
+            None
+        }
+    }) {
+        cmd.arg("--interface").arg(name);
+    }
+    if let Some(n) = tail {
+        cmd.arg("--tail").arg(n.to_string());
+    }
+    if let Some(n) = from {
+        cmd.arg("--from").arg(n.to_string());
+    }
+    if let Some(n) = to {
+        cmd.arg("--to").arg(n.to_string());
+    }
+    if let Some(n) = since {
+        cmd.arg("--since").arg(n.to_string());
+    }
+    if raw {
+        cmd.arg("--raw");
+    }
+    if json {
+        cmd.arg("--json");
+    }
+    if no_pending {
+        cmd.arg("--no-pending");
+    }
+    let status = cmd.status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+fn cmd_serial_show(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
+    let serials = serial_runtime(lab_flag, target, None, dispatch::Mode::Reexec)?;
+    if serials.is_empty() {
+        println!("No serial interfaces configured. (paniolo serial add ...)");
+        return Ok(());
+    }
+    for ch in &serials {
+        let sense = ch
+            .power_sense_signal
+            .as_deref()
+            .map(|s| format!("  (sense: {s})"))
+            .unwrap_or_default();
+        println!("{}\t{} @ {}{sense}", ch.name, ch.device, ch.baud);
+    }
+    match serial::daemon_url() {
+        Some(url) => println!("daemon\trunning at {url}"),
+        None => println!("daemon\tstopped"),
+    }
+    Ok(())
+}
+
+// ── video runtime bodies ────────────────────────────────────────────────────
+
+/// The target's video channel as visible on *this* host.
+fn local_video(lab: &Lab, target: &str) -> Result<model::VideoChannel> {
+    let t = lab
+        .targets
+        .get(target)
+        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+    let dh = t.default_host().to_string();
+    let v = t.video.clone().ok_or_else(|| {
+        anyhow!(
+            "target '{target}' has no video channel (paniolo video set -t {target} --device ...)"
+        )
+    })?;
+    if v.host.as_deref().unwrap_or(&dh) != model::LOCAL {
+        bail!("video channel for '{target}' is not on this host");
+    }
+    Ok(v)
+}
+
+fn video_runtime(
+    lab_flag: Option<&str>,
+    target: Option<&str>,
+) -> Result<(String, model::VideoChannel)> {
+    let lab = load_for_read(lab_flag)?;
+    let target = resolve_single_target(&lab, target)?;
+    if let Some(code) = dispatch::maybe_dispatch(
+        &lab,
+        &target,
+        model::ChannelKind::Video,
+        None,
+        dispatch::Mode::Reexec,
+    )? {
+        std::process::exit(code);
+    }
+    let v = local_video(&lab, &target)?;
+    Ok((target, v))
+}
+
+fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
+    match cmd {
+        VideoCmd::Set {
+            target,
+            device,
+            host,
+        } => {
+            edit_lab(lab_flag, |lf| {
+                lf.set_video(&target, Some(&device), host.as_deref())
+            })?;
+            println!("video channel set for '{target}'.");
+            Ok(())
+        }
+        VideoCmd::Rm { target } => {
+            edit_lab(lab_flag, |lf| lf.remove_video(&target))?;
+            println!("video channel removed from '{target}'.");
+            Ok(())
+        }
+        VideoCmd::Watch {
+            target,
+            port,
+            restart,
+        } => {
+            let (target, v) = video_runtime(lab_flag, target.as_deref())?;
+            let device = v
+                .device
+                .ok_or_else(|| anyhow!("video channel for '{target}' has no device set"))?;
+            if let Some(url) = video::daemon_url() {
+                if !restart {
+                    println!("Video daemon already running at {url}");
+                    return Ok(());
+                }
+                let _ = video::stop_daemon();
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            eprintln!("Starting video daemon for '{device}'…");
+            video::start_daemon(&device, port, Some(&target))?;
+            match daemons::wait_for_daemon(video::DAEMON, std::time::Duration::from_secs(5)) {
+                Some(url) => {
+                    println!("Video daemon started. Preview at {url}");
+                    Ok(())
+                }
+                None => bail!("video daemon did not start within 5 s"),
+            }
+        }
+        VideoCmd::Stop => {
+            let code = video::stop_daemon()?;
+            if code == 0 {
+                println!("Video daemon stopped.");
+                Ok(())
+            } else {
+                std::process::exit(code);
+            }
+        }
+        VideoCmd::Shot {
+            target,
+            stable,
+            changed_since,
+            timeout,
+            out,
+        } => {
+            let _ = video_runtime(lab_flag, target.as_deref())?;
+            let mut args = vec![
+                "shot".to_string(),
+                "--timeout".to_string(),
+                timeout.to_string(),
+                "--out".to_string(),
+                out,
+            ];
+            if stable {
+                args.push("--stable".to_string());
+            }
+            if let Some(h) = changed_since {
+                args.push("--changed-since".to_string());
+                args.push(h);
+            }
+            std::process::exit(video::passthrough(&args)?);
+        }
+        VideoCmd::Preview => match video::daemon_url() {
+            Some(url) => {
+                println!("{url}");
+                Ok(())
+            }
+            None => bail!("no video daemon running — start one with `paniolo video watch`"),
+        },
+        VideoCmd::Devices => {
+            std::process::exit(video::passthrough(&["devices".to_string()])?);
+        }
+        VideoCmd::Show { target } => {
+            let (_target, v) = video_runtime(lab_flag, target.as_deref())?;
+            println!("device\t{}", v.device.as_deref().unwrap_or("(not set)"));
+            match video::daemon_url() {
+                Some(url) => println!("daemon\trunning at {url}"),
+                None => println!("daemon\tstopped"),
+            }
+            Ok(())
+        }
+    }
+}
+
+fn netboot_cmd(lab_flag: Option<&str>, cmd: NetbootCmd) -> Result<()> {
+    match cmd {
+        NetbootCmd::Set {
+            target,
+            interface,
+            host_ip,
+            tftp_root,
+            host,
+        } => {
+            edit_lab(lab_flag, |lf| {
+                lf.set_netboot(
+                    &target,
+                    interface.as_deref(),
+                    host_ip.as_deref(),
+                    tftp_root.as_deref(),
+                    host.as_deref(),
+                )
+            })?;
+            println!("netboot channel set for '{target}'.");
+            Ok(())
+        }
+        NetbootCmd::Rm { target } => {
+            edit_lab(lab_flag, |lf| lf.remove_netboot(&target))?;
+            println!("netboot channel removed from '{target}'.");
+            Ok(())
+        }
+        NetbootCmd::Start { target } => {
+            let (target, iface, host_ip, tftp_root) = netboot_runtime(lab_flag, target.as_deref())?;
+            let root = tftp_root.ok_or_else(|| {
+                anyhow!(
+                    "no tftp_root configured \
+                     (paniolo netboot set -t {target} --tftp-root <path>)"
+                )
+            })?;
+            netboot::start(&target, &iface, &host_ip, &root)?;
+            println!("netboot started for '{target}' on {iface} ({host_ip}, tftp {root}).");
+            Ok(())
+        }
+        NetbootCmd::Stop { target } => {
+            let (target, ..) = netboot_runtime(lab_flag, target.as_deref())?;
+            netboot::stop(&target)?;
+            println!("netboot stopped for '{target}'.");
+            Ok(())
+        }
+        NetbootCmd::Status { target } => {
+            let (target, ..) = netboot_runtime(lab_flag, target.as_deref())?;
+            let st = netboot::status(&target);
+            match st.state {
+                None => println!("netboot\tnot running (no state)"),
+                Some(s) => {
+                    println!(
+                        "netboot\t{}",
+                        if st.running {
+                            "running"
+                        } else {
+                            "NOT running (stale state)"
+                        }
+                    );
+                    println!("pid\t{}", s.dhcp_pid);
+                    println!("interface\t{}", s.interface);
+                    println!("tftp_root\t{}", s.tftp_root);
+                    if let Some(up) = st.uptime_seconds {
+                        println!("uptime\t{:.0}s", up);
+                    }
+                }
+            }
+            Ok(())
+        }
+        NetbootCmd::Logs {
+            target,
+            tail,
+            follow,
+        } => {
+            let (target, ..) = netboot_runtime(lab_flag, target.as_deref())?;
+            cmd_netboot_logs(&target, tail, follow)
+        }
+        NetbootCmd::TftpRoot { target } => {
+            let (_t, _i, _ip, tftp_root) = netboot_runtime(lab_flag, target.as_deref())?;
+            match tftp_root {
+                Some(r) => {
+                    println!("{r}");
+                    Ok(())
+                }
+                None => bail!("no tftp_root configured"),
+            }
+        }
+        NetbootCmd::Devices => {
+            let ifaces = netif::list_usb_ethernet_interfaces();
+            if ifaces.is_empty() {
+                println!("No candidate Ethernet interfaces found.");
+            }
+            for i in ifaces {
+                println!(
+                    "{}\t{}\t{}",
+                    i.device,
+                    i.port,
+                    if i.active { "active" } else { "inactive" }
+                );
+            }
+            Ok(())
+        }
+        NetbootCmd::LinkUp { target } => {
+            let (_t, iface, host_ip, _r) = netboot_runtime(lab_flag, target.as_deref())?;
+            netif::configure_interface(&iface, &host_ip)?;
+            let active = netif::is_interface_active(&iface);
+            println!(
+                "Link {}  {iface}  {host_ip}",
+                if active { "up" } else { "not yet up" }
+            );
+            Ok(())
+        }
+        NetbootCmd::LinkDown { target } => {
+            let (_t, iface, ..) = netboot_runtime(lab_flag, target.as_deref())?;
+            netif::restore_interface(&iface);
+            println!("Link down  {iface}");
+            Ok(())
+        }
+        NetbootCmd::LinkStatus { target } => {
+            let (_t, iface, ..) = netboot_runtime(lab_flag, target.as_deref())?;
+            let (inet, inet6) = netif::iface_addresses(&iface);
+            println!("interface\t{iface}");
+            println!(
+                "carrier\t{}",
+                if netif::is_interface_active(&iface) {
+                    "yes"
+                } else {
+                    "no"
+                }
+            );
+            let mut addrs = inet;
+            addrs.extend(inet6);
+            println!(
+                "addresses\t{}",
+                if addrs.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    addrs.join(" ")
+                }
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Common preamble for netboot/netif runtime commands: resolve, dispatch to the
+/// netboot channel's host if remote, and return (target, interface, host_ip,
+/// tftp_root) from the local channel.
+fn netboot_runtime(
+    lab_flag: Option<&str>,
+    target: Option<&str>,
+) -> Result<(String, String, String, Option<String>)> {
+    let lab = load_for_read(lab_flag)?;
+    let target = resolve_single_target(&lab, target)?;
+    if let Some(code) = dispatch::maybe_dispatch(
+        &lab,
+        &target,
+        model::ChannelKind::Netboot,
+        None,
+        dispatch::Mode::Reexec,
+    )? {
+        std::process::exit(code);
+    }
+    let t = lab
+        .targets
+        .get(&target)
+        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+    let dh = t.default_host().to_string();
+    let nb = t.netboot.clone().ok_or_else(|| {
+        anyhow!("target '{target}' has no netboot channel (paniolo netboot set -t {target} ...)")
+    })?;
+    if nb.host.as_deref().unwrap_or(&dh) != model::LOCAL {
+        bail!("netboot channel for '{target}' is not on this host");
+    }
+    let iface = nb
+        .interface
+        .ok_or_else(|| anyhow!("netboot channel for '{target}' has no interface set"))?;
+    let host_ip = nb
+        .host_ip
+        .unwrap_or_else(|| model::DEFAULT_HOST_IP.to_string());
+    Ok((target, iface, host_ip, nb.tftp_root))
+}
+
+fn cmd_netboot_logs(target: &str, tail: usize, follow: bool) -> Result<()> {
+    let path = state::netboot_log_path(target);
+    if !path.exists() {
+        bail!("no netboot log for '{target}' yet ({})", path.display());
+    }
+    let text = std::fs::read_to_string(&path)?;
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(tail);
+    for line in &lines[start..] {
+        println!("{line}");
+    }
+    if !follow {
+        return Ok(());
+    }
+    // Follow: poll for appended bytes (Ctrl-C to stop).
+    use std::io::{Read, Seek};
+    let mut f = std::fs::File::open(&path)?;
+    f.seek(std::io::SeekFrom::End(0))?;
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        f.read_to_string(&mut buf)?;
+        if !buf.is_empty() {
+            print!("{buf}");
+            use std::io::Write;
+            std::io::stdout().flush()?;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+fn netif_cmd(lab_flag: Option<&str>, cmd: NetifCmd) -> Result<()> {
+    match cmd {
+        NetifCmd::Mode { mode, target } => {
+            if !netif::MODES.contains(&mode.as_str()) {
+                bail!(
+                    "unknown mode '{mode}' (use one of: {})",
+                    netif::MODES.join(", ")
+                );
+            }
+            let (target, iface, host_ip, tftp_root) = netboot_runtime(lab_flag, target.as_deref())?;
+            match mode.as_str() {
+                "netboot" => {
+                    let root = tftp_root.clone().ok_or_else(|| {
+                        anyhow!("no tftp_root configured — netboot mode needs one")
+                    })?;
+                    netif::mode_netboot(&target, &iface, &host_ip, &root)?;
+                }
+                "ffx" => netif::mode_ffx(&target, &iface)?,
+                _ => netif::mode_off(&target, &iface, &host_ip)?,
+            }
+            print_netif_status(&target, &iface, &host_ip);
+            Ok(())
+        }
+        NetifCmd::Status { target } => {
+            let (target, iface, host_ip, _r) = netboot_runtime(lab_flag, target.as_deref())?;
+            print_netif_status(&target, &iface, &host_ip);
+            Ok(())
+        }
+    }
+}
+
+fn print_netif_status(target: &str, iface: &str, host_ip: &str) {
+    let s = netif::get_status(target, iface);
+    println!("target\t{target}");
+    println!("interface\t{iface}");
+    println!("mode\t{}", s.mode);
+    println!(
+        "inet\t{}",
+        if s.inet.is_empty() {
+            "(none)".to_string()
+        } else {
+            s.inet.join(" ")
+        }
+    );
+    println!(
+        "inet6\t{}",
+        if s.inet6.is_empty() {
+            "(none)".to_string()
+        } else {
+            s.inet6.join(" ")
+        }
+    );
+    if s.mode == "netboot" {
+        println!("dhcp+tftp\tserving on {host_ip}/24");
+    }
+    if s.mode == "ffx" {
+        if s.peers.is_empty() {
+            println!("peer\t(none discovered yet — power-cycle the target and wait for SLAAC)");
+        }
+        for peer in &s.peers {
+            println!("peer\t{peer}%{iface}  (try: ffx target add {peer}%{iface})");
+        }
+    }
+}
+
+fn power_cmd(lab_flag: Option<&str>, cmd: PowerCmd) -> Result<()> {
+    match cmd {
+        PowerCmd::Set {
+            target,
+            cycle_cmd,
+            serial_interface,
+            host,
+        } => {
+            edit_lab(lab_flag, |lf| {
+                lf.set_power(
+                    &target,
+                    cycle_cmd.as_deref(),
+                    serial_interface.as_deref(),
+                    host.as_deref(),
+                )
+            })?;
+            println!("power channel set for '{target}'.");
+            Ok(())
+        }
+        PowerCmd::Rm { target } => {
+            edit_lab(lab_flag, |lf| lf.remove_power(&target))?;
+            println!("power channel removed from '{target}'.");
+            Ok(())
+        }
+    }
+}
+
+// ── rendering helpers ───────────────────────────────────────────────────────
+
+fn normalize_sense(sense: Option<&str>) -> Result<Option<String>> {
+    match sense {
+        None => Ok(None),
+        Some(s) if s.eq_ignore_ascii_case("none") => Ok(None),
+        Some(s) => {
+            let v = s.to_ascii_lowercase();
+            if !model::VALID_SENSE_SIGNALS.contains(&v.as_str()) {
+                bail!(
+                    "Unknown sense signal '{s}'. Valid: {}, none",
+                    model::VALID_SENSE_SIGNALS.join(", ")
+                );
+            }
+            Ok(Some(v))
+        }
+    }
+}
+
+fn fields_str(fields: &[(&'static str, String)]) -> String {
+    fields
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+fn channel_name(ch: &ResolvedChannel) -> String {
+    if ch.name == ch.kind.as_str() {
+        ch.kind.as_str().to_string()
+    } else {
+        format!("{} {}", ch.kind.as_str(), ch.name)
+    }
+}
+
+fn channel_label(ch: &ResolvedChannel) -> String {
+    let fields = fields_str(&ch.fields);
+    let tail = if fields.is_empty() {
+        String::new()
+    } else {
+        format!("  {fields}")
+    };
+    format!("{} @{}{tail}", channel_name(ch), ch.host)
+}
+
+fn target_headline(rt: &ResolvedTarget) -> String {
+    let hosts = rt.hosts();
+    if hosts.len() > 1 {
+        format!("{}  (spans {})", rt.name, hosts.join(", "))
+    } else if let Some(h) = hosts.first() {
+        format!("{}  @{h}", rt.name)
+    } else {
+        rt.name.clone()
+    }
+}
+
+fn print_resolved_target(rt: &ResolvedTarget) {
+    println!("Target: {}", target_headline(rt));
+    println!("  default host  {}", rt.default_host);
+    if let Some(note) = &rt.note {
+        println!("  note          {note}");
+    }
+    if rt.channels.is_empty() {
+        println!("  channels      (none)");
+    } else {
+        for ch in &rt.channels {
+            println!("  channel       {}", channel_label(ch));
+        }
+    }
+}
 ````
 
 ## File: src/paniolo/_cli.py
@@ -20123,6 +27157,7 @@ import grp
 import json
 import os
 import pwd
+import shlex
 import shutil
 import subprocess
 import sys
@@ -20133,11 +27168,13 @@ from typing import Annotated, Optional
 import typer
 from rich.console import Console
 from rich.table import Table
+from rich.tree import Tree
 
 from . import (
     _config,
     _hid,
     _lab,
+    _labfile,
     _netboot,
     _netif,
     _ocr,
@@ -20170,12 +27207,24 @@ serial_app = typer.Typer(
 hid_app = typer.Typer(
     help="Inject USB keyboard/mouse input via the HID rig.", no_args_is_help=True
 )
+config_app = typer.Typer(
+    help="Inspect and edit the lab configuration file.", no_args_is_help=True
+)
+host_app = typer.Typer(
+    help="Manage control hosts declared in the lab.", no_args_is_help=True
+)
+power_app = typer.Typer(
+    help="Configure a target's power channel.", no_args_is_help=True
+)
 app.add_typer(target_app, name="target")
 app.add_typer(netboot_app, name="netboot")
 app.add_typer(netif_app, name="netif")
 app.add_typer(video_app, name="video")
 app.add_typer(serial_app, name="serial")
 app.add_typer(hid_app, name="hid")
+app.add_typer(config_app, name="config")
+app.add_typer(host_app, name="host")
+app.add_typer(power_app, name="power")
 
 console = Console()
 err = Console(stderr=True)
@@ -20312,121 +27361,510 @@ def remote_capable(mode: str = _remote.REEXEC):
     return decorator
 
 
+# ── lab config: init / inspect ─────────────────────────────────────────────────
+
+
+def _load_lab_for_read() -> _lab.Lab:
+    """Load the active lab for a read command, or exit with a hint."""
+    try:
+        lab = _lab.load()
+    except _lab.LabError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    if lab is None:
+        err.print(
+            "[red]No lab configured.[/red] Create one with [bold]paniolo init[/bold], "
+            "or point at one with --lab / PANIOLO_LAB."
+        )
+        raise typer.Exit(1)
+    return lab
+
+
+def _open_lab_for_write() -> _labfile.LabFile:
+    """Open the active lab for editing, creating it if it doesn't exist yet.
+
+    Config writes are always local and pure: they edit the lab file on this
+    machine and never touch a target or SSH.
+    """
+    path = _lab.lab_path() or _lab.DEFAULT_LAB_PATH
+    full = Path(os.path.expanduser(path))
+    if full.exists():
+        try:
+            return _labfile.LabFile.load(path)
+        except (_lab.LabError, OSError) as exc:
+            err.print(f"[red]Cannot edit lab: {exc}[/red]")
+            raise typer.Exit(1)
+    lf = _labfile.LabFile.create(path)
+    console.print(f"[dim]Created new lab: {full}[/dim]")
+    return lf
+
+
+def _edit_lab(mutate) -> None:
+    """Open the lab, apply ``mutate(lab_file)``, validate, and save it back."""
+    lf = _open_lab_for_write()
+    try:
+        mutate(lf)
+        lf.save()
+    except _lab.LabError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+
+def _normalize_sense(power_sense: Optional[str]) -> Optional[str]:
+    """Validate/lower a --sense value; treat 'none' as clearing it."""
+    if power_sense is None or power_sense.lower() == "none":
+        return None
+    value = power_sense.lower()
+    if value not in _config.VALID_SENSE_SIGNALS:
+        err.print(
+            f"[red]Unknown sense signal '{power_sense}'.[/red] "
+            f"Valid: {', '.join(_config.VALID_SENSE_SIGNALS)}, none"
+        )
+        raise typer.Exit(1)
+    return value
+
+
+def _fields_str(fields: dict) -> str:
+    return "  ".join(f"{k}={v}" for k, v in fields.items())
+
+
+def _probe(host: _ssh.Host, script: str) -> Optional[int]:
+    """Run a POSIX-sh probe on ``host`` (locally or over SSH); return its rc.
+
+    Returns None if the host is unreachable. An ssh transport failure surfaces
+    as rc 255, which callers treat the same as unreachable.
+    """
+    if host.is_local:
+        return subprocess.run(
+            ["sh", "-c", script], capture_output=True, text=True, check=False
+        ).returncode
+    try:
+        return _ssh.run(host, ["sh", "-c", script], timeout=15).returncode
+    except (_ssh.SSHError, subprocess.SubprocessError, OSError):
+        return None
+
+
+def _interpret_probe(rc: Optional[int], what: str) -> tuple[str, str]:
+    if rc is None or rc == 255:
+        return ("unreachable", "host unreachable")
+    if rc == 0:
+        return ("ok", what)
+    return ("missing", what)
+
+
+def _check_channel(
+    host: _ssh.Host, ch: _lab.ResolvedChannel, rt: _lab.ResolvedTarget
+) -> tuple[str, str]:
+    """Probe one channel on its host; return (status, detail)."""
+    if ch.kind in ("serial", "video"):
+        path = ch.fields.get("device")
+        if not path:
+            return ("incomplete", "no device set")
+        return _interpret_probe(_probe(host, f"test -e {shlex.quote(path)}"), path)
+    if ch.kind == "netboot":
+        iface = ch.fields.get("interface")
+        if not iface:
+            return ("incomplete", "no interface set")
+        q = shlex.quote(iface)
+        # Linux exposes interfaces under /sys; fall back to ifconfig elsewhere.
+        script = f"test -e /sys/class/net/{q} || ifconfig {q} >/dev/null 2>&1"
+        return _interpret_probe(_probe(host, script), iface)
+    if ch.kind == "power":
+        si = ch.fields.get("serial_interface")
+        if si and si not in {c.name for c in rt.channels if c.kind == "serial"}:
+            return ("missing", f"serial_interface '{si}' has no matching serial")
+        cmd = ch.fields.get("cycle_cmd")
+        if cmd:
+            prog = shlex.split(cmd)[0] if cmd.strip() else ""
+            if prog.startswith("/"):
+                return _interpret_probe(
+                    _probe(host, f"test -e {shlex.quote(prog)}"), prog
+                )
+            return ("ok", f"cmd={cmd}")
+        return ("ok", "dtr via serial" if si else "configured")
+    return ("ok", "")
+
+
+_STATUS_STYLE = {
+    "ok": "[green]ok[/green]",
+    "missing": "[red]MISSING[/red]",
+    "unreachable": "[yellow]unreachable[/yellow]",
+    "incomplete": "[dim]incomplete[/dim]",
+}
+
+
+def _channel_label(ch: _lab.ResolvedChannel) -> str:
+    """One line for a resolved channel: 'serial console @bench1  device=…'."""
+    head = ch.kind if ch.name == ch.kind else f"{ch.kind} {ch.name}"
+    fields = _fields_str(ch.fields)
+    tail = f"  [dim]{fields}[/dim]" if fields else ""
+    return f"{head} [cyan]@{ch.host}[/cyan]{tail}"
+
+
+def _print_resolved_target(rt: _lab.ResolvedTarget) -> None:
+    title = f"Target: [bold]{rt.name}[/bold]"
+    if len(rt.hosts()) > 1:
+        title += f"  [yellow](spans {', '.join(rt.hosts())})[/yellow]"
+    t = Table(title=title, show_header=False, box=None, padding=(0, 2))
+    t.add_row("default host", rt.default_host)
+    if rt.note:
+        t.add_row("note", rt.note)
+    if rt.channels:
+        for idx, ch in enumerate(rt.channels):
+            t.add_row("channels" if idx == 0 else "", _channel_label(ch))
+    else:
+        t.add_row("channels", "[dim]none[/dim]")
+    console.print(t)
+
+
+@app.command("init")
+def init(
+    path: Annotated[
+        Optional[str],
+        typer.Option(
+            "--path",
+            help="Where to create the lab (default: --lab path "
+            "or ~/.config/paniolo/lab.toml)",
+        ),
+    ] = None,
+) -> None:
+    """Create an empty lab file."""
+    target = path or _lab.lab_path() or _lab.DEFAULT_LAB_PATH
+    full = Path(os.path.expanduser(target))
+    if full.exists():
+        err.print(f"[red]Lab file already exists:[/red] {full}")
+        raise typer.Exit(1)
+    _labfile.LabFile.create(target).save()
+    console.print(f"[green]Created lab:[/green] {full}")
+    console.print(
+        "  Add a host:   [bold]paniolo host add <name> --ssh user@host[/bold]"
+    )
+    console.print("  Add a target: [bold]paniolo target add <name>[/bold]")
+
+
+@config_app.command("show")
+def config_show() -> None:
+    """Show the whole lab: hosts and targets, each channel with its host."""
+    lab = _load_lab_for_read()
+    tree = Tree(f"[bold]Lab[/bold] [dim]{os.path.expanduser(_lab.lab_path())}[/dim]")
+
+    hosts_node = tree.add("[bold]Hosts[/bold]")
+    if lab.hosts:
+        for name, h in sorted(lab.hosts.items()):
+            extra = f"  [dim]identity={h.identity}[/dim]" if h.identity else ""
+            hosts_node.add(f"{name}  [cyan]{h.ssh}[/cyan]{extra}")
+    else:
+        hosts_node.add("[dim]none (everything runs on the local dev machine)[/dim]")
+
+    targets_node = tree.add("[bold]Targets[/bold]")
+    if lab.target_names():
+        for tname in lab.target_names():
+            rt = lab.resolved_target(tname)
+            label = tname
+            if len(rt.hosts()) > 1:
+                label += f"  [yellow](spans {', '.join(rt.hosts())})[/yellow]"
+            elif rt.hosts():
+                label += f"  [cyan]@{rt.hosts()[0]}[/cyan]"
+            tnode = targets_node.add(label)
+            if rt.note:
+                tnode.add(f"[dim]note: {rt.note}[/dim]")
+            for ch in rt.channels:
+                tnode.add(_channel_label(ch))
+            if not rt.channels:
+                tnode.add("[dim]no channels[/dim]")
+    else:
+        targets_node.add("[dim]none[/dim]")
+
+    console.print(tree)
+
+
+@config_app.command("path")
+def config_path() -> None:
+    """Print the active lab file path (stdout); note on stderr if it's absent."""
+    p = _lab.lab_path()
+    if p:
+        print(os.path.expanduser(p))
+    else:
+        print(os.path.expanduser(_lab.DEFAULT_LAB_PATH))
+        err.print("[dim](does not exist yet — create it with `paniolo init`)[/dim]")
+
+
+@config_app.command("edit")
+def config_edit() -> None:
+    """Open the raw lab file in $EDITOR."""
+    p = _lab.lab_path()
+    if not p:
+        err.print(
+            "[red]No lab to edit.[/red] Create one with [bold]paniolo init[/bold]."
+        )
+        raise typer.Exit(1)
+    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
+    raise typer.Exit(subprocess.call([*shlex.split(editor), os.path.expanduser(p)]))
+
+
+# ── host (inspect) ──────────────────────────────────────────────────────────────
+
+
+@host_app.command("list")
+def host_list() -> None:
+    """List the control hosts declared in the lab."""
+    lab = _load_lab_for_read()
+    if not lab.hosts:
+        console.print("No hosts declared. [dim](everything runs locally)[/dim]")
+        return
+    table = Table(box=None, padding=(0, 2))
+    table.add_column("host", style="bold")
+    table.add_column("ssh")
+    table.add_column("identity", style="dim")
+    for name, h in sorted(lab.hosts.items()):
+        table.add_row(name, h.ssh, h.identity or "")
+    console.print(table)
+
+
+@host_app.command("show")
+def host_show(
+    name: Annotated[str, typer.Argument(help="Host name (e.g. bench1)")],
+) -> None:
+    """Show a host's connection info and the channels that live on it."""
+    lab = _load_lab_for_read()
+    if name != _ssh.LOCAL and name not in lab.hosts:
+        have = ", ".join(sorted(lab.hosts)) or "(none)"
+        err.print(f"[red]Host '{name}' not in lab.[/red] Hosts: {have}")
+        raise typer.Exit(1)
+
+    if name in lab.hosts:
+        h = lab.hosts[name]
+        info = Table(
+            title=f"Host: [bold]{name}[/bold]",
+            show_header=False,
+            box=None,
+            padding=(0, 2),
+        )
+        info.add_row("ssh", h.ssh)
+        if h.identity:
+            info.add_row("identity", h.identity)
+        if h.control_path:
+            info.add_row("control_path", h.control_path)
+        if h.paniolo_cmd:
+            info.add_row("paniolo_cmd", h.paniolo_cmd)
+        console.print(info)
+    else:
+        console.print("Host: [bold]local[/bold]  [dim](the dev machine)[/dim]")
+
+    pairs = lab.channels_on_host(name)
+    if not pairs:
+        console.print("  [dim]no channels bound to this host[/dim]")
+        return
+    table = Table(box=None, padding=(0, 2))
+    table.add_column("target", style="bold")
+    table.add_column("channel")
+    table.add_column("config", style="dim")
+    for tname, ch in pairs:
+        chan = ch.kind if ch.name == ch.kind else f"{ch.kind} {ch.name}"
+        table.add_row(tname, chan, _fields_str(ch.fields))
+    console.print(table)
+
+
+@host_app.command("add")
+def host_add(
+    name: Annotated[str, typer.Argument(help="Host name (e.g. bench1)")],
+    ssh: Annotated[
+        str,
+        typer.Option(
+            "--ssh",
+            help="ssh destination: user@host, an ssh_config alias, or 'local'",
+        ),
+    ],
+    identity: Annotated[
+        Optional[str], typer.Option("--identity", help="SSH private-key path")
+    ] = None,
+    control_path: Annotated[
+        Optional[str],
+        typer.Option("--control-path", help="ControlMaster socket path override"),
+    ] = None,
+    paniolo_cmd: Annotated[
+        Optional[str],
+        typer.Option("--paniolo-cmd", help="Path to paniolo on the host"),
+    ] = None,
+) -> None:
+    """Declare a control host in the lab."""
+    _edit_lab(
+        lambda lf: lf.add_host(
+            name,
+            ssh,
+            identity=identity,
+            control_path=control_path,
+            paniolo_cmd=paniolo_cmd,
+        )
+    )
+    console.print(f"[green]Host '[bold]{name}[/bold]' added.[/green] ({ssh})")
+
+
+@host_app.command("set")
+def host_set(
+    name: Annotated[str, typer.Argument(help="Host name")],
+    ssh: Annotated[Optional[str], typer.Option("--ssh")] = None,
+    identity: Annotated[Optional[str], typer.Option("--identity")] = None,
+    control_path: Annotated[Optional[str], typer.Option("--control-path")] = None,
+    paniolo_cmd: Annotated[Optional[str], typer.Option("--paniolo-cmd")] = None,
+) -> None:
+    """Update fields of an existing host (only the options you pass change)."""
+    _edit_lab(
+        lambda lf: lf.update_host(
+            name,
+            ssh=ssh,
+            identity=identity,
+            control_path=control_path,
+            paniolo_cmd=paniolo_cmd,
+        )
+    )
+    console.print(f"[green]Host '[bold]{name}[/bold]' updated.[/green]")
+
+
+@host_app.command("rm")
+def host_rm(
+    name: Annotated[str, typer.Argument(help="Host name to remove")],
+) -> None:
+    """Remove a host (refused if any target still binds to it)."""
+    _edit_lab(lambda lf: lf.remove_host(name))
+    console.print(f"[green]Host '[bold]{name}[/bold]' removed.[/green]")
+
+
+@app.command("doctor")
+def doctor(
+    target: Annotated[
+        Optional[str], typer.Argument(help="Target to check (default: all)")
+    ] = None,
+    host: Annotated[
+        Optional[str],
+        typer.Option("--host", help="Only check channels on this host"),
+    ] = None,
+) -> None:
+    """Probe each channel's device on the host it lives on; report config vs reality.
+
+    Read-only: it SSHes to each control host to test that configured devices and
+    interfaces actually exist. This is the probing that used to be baked into the
+    `setup` commands, now separated so config edits stay local and offline.
+    """
+    lab = _load_lab_for_read()
+    names = [target] if target else lab.target_names()
+    if not names:
+        console.print("No targets configured.")
+        return
+
+    table = Table(box=None, padding=(0, 2))
+    table.add_column("target", style="bold")
+    table.add_column("channel")
+    table.add_column("host", style="cyan")
+    table.add_column("status")
+    table.add_column("detail", style="dim")
+
+    bad = 0
+    for tname in names:
+        try:
+            rt = lab.resolved_target(tname)
+        except KeyError:
+            err.print(f"[red]Target '{tname}' not found in lab.[/red]")
+            bad += 1
+            continue
+        for ch in rt.channels:
+            if host is not None and ch.host != host:
+                continue
+            status, detail = _check_channel(lab._host(ch.host), ch, rt)
+            if status in ("missing", "unreachable"):
+                bad += 1
+            chan = ch.kind if ch.name == ch.kind else f"{ch.kind} {ch.name}"
+            table.add_row(
+                tname, chan, ch.host, _STATUS_STYLE.get(status, status), detail
+            )
+
+    console.print(table)
+    if bad:
+        err.print(f"[red]{bad} problem(s) found.[/red]")
+        raise typer.Exit(1)
+    console.print("[green]All configured channels present.[/green]")
+
+
 # ── target ────────────────────────────────────────────────────────────────────
+
+
+@target_app.command("add")
+def target_add(
+    name: Annotated[str, typer.Argument(help="Target name (e.g. fortune)")],
+    host: Annotated[
+        Optional[str],
+        typer.Option(
+            "--host",
+            help="Default control host for this target's channels (default: local)",
+        ),
+    ] = None,
+    note: Annotated[
+        Optional[str], typer.Option("--note", help="Free-text note, kept in the lab")
+    ] = None,
+) -> None:
+    """Create a target. Add its hardware with `netboot/serial/power set`."""
+    _edit_lab(lambda lf: lf.add_target(name, host=host, note=note))
+    where = f" on host '{host}'" if host else ""
+    console.print(f"[green]Target '[bold]{name}[/bold]' added.[/green]{where}")
 
 
 @target_app.command("set")
 def target_set(
-    name: Annotated[str, typer.Argument(help="Target name (e.g. fortune)")],
-    interface: Annotated[
-        Optional[str],
-        typer.Option(
-            "--interface",
-            "-i",
-            help="USB-Ethernet interface (e.g. en3); auto-detected if omitted",
-        ),
-    ] = None,
-    tftp_root: Annotated[
-        Optional[str],
-        typer.Option("--tftp-root", "-r", help="Path to TFTP files directory"),
-    ] = None,
-    host_ip: Annotated[
-        str, typer.Option("--host-ip", help="Static IP to assign to the interface")
-    ] = "192.168.99.1",
-    power_cycle_cmd: Annotated[
-        Optional[str],
-        typer.Option(
-            "--power-cycle-cmd",
-            help="Shell command or script path to power-cycle the target",
-        ),
-    ] = None,
-    power_serial: Annotated[
-        Optional[str],
-        typer.Option(
-            "--power-serial",
-            help="Serial interface name used for DTR power cycling via J2"
-            " (e.g. console)",
-        ),
-    ] = None,
+    name: Annotated[str, typer.Argument(help="Target name")],
+    host: Annotated[Optional[str], typer.Option("--host")] = None,
+    note: Annotated[Optional[str], typer.Option("--note")] = None,
 ) -> None:
-    """Create or update a target configuration.
+    """Update a target's default host or note (only the options you pass change)."""
+    _edit_lab(lambda lf: lf.update_target(name, host=host, note=note))
+    console.print(f"[green]Target '[bold]{name}[/bold]' updated.[/green]")
 
-    Serial consoles are managed separately with `paniolo serial setup` (a target
-    can have several named interfaces), so they're preserved across updates here."""
-    if interface is None:
-        candidates = _netboot.list_usb_ethernet_interfaces()
-        if not candidates:
-            err.print(
-                "[red]No USB-Ethernet interfaces found.[/red]"
-                " Specify one with --interface."
-            )
-            raise typer.Exit(1)
-        active = [c for c in candidates if c["active"]]
-        if len(active) == 1:
-            interface = active[0]["device"]
-            console.print(
-                f"[dim]Auto-detected interface:[/dim] {interface} ({active[0]['port']})"
-            )
-        elif len(candidates) == 1:
-            interface = candidates[0]["device"]
-            console.print(
-                f"[dim]Auto-detected interface:[/dim] {interface}"
-                f" ({candidates[0]['port']}) "
-                "[dim](no cable detected)[/dim]"
-            )
-        else:
-            console.print(
-                "[yellow]Multiple USB-Ethernet interfaces found"
-                " — use --interface to choose:[/yellow]"
-            )
-            for c in candidates:
-                status = (
-                    "[green]active[/green]" if c["active"] else "[dim]inactive[/dim]"
-                )
-                console.print(f"  {c['device']:6s}  {c['port']}  {status}")
-            raise typer.Exit(1)
 
-    try:
-        existing = _config.load_target(name)
-    except FileNotFoundError:
-        existing = None
-
-    cfg = _config.TargetConfig(
-        name=name,
-        interface=interface,
-        host_ip=host_ip,
-        tftp_root=tftp_root,
-        power_cycle_cmd=(
-            power_cycle_cmd
-            if power_cycle_cmd is not None
-            else (existing.power_cycle_cmd if existing else None)
-        ),
-        power_serial_interface=(
-            power_serial
-            if power_serial is not None
-            else (existing.power_serial_interface if existing else None)
-        ),
-        serial_interfaces=existing.serial_interfaces if existing else [],
-    )
-    _config.save_target(cfg)
-    console.print(f"[green]Target '[bold]{name}[/bold]' saved.[/green]")
-    console.print(f"  interface   : {interface}")
-    console.print(f"  host_ip     : {host_ip}")
-    if tftp_root:
-        console.print(f"  tftp_root   : {tftp_root}")
-    if cfg.power_cycle_cmd:
-        console.print(f"  power_cycle : {cfg.power_cycle_cmd}")
-    if cfg.power_serial_interface:
-        console.print(f"  power_serial: {cfg.power_serial_interface}")
-    for iface in cfg.serial_interfaces:
-        console.print(f"  serial      : {iface.name}: {iface.device} @ {iface.baud}")
+@target_app.command("list")
+def target_list() -> None:
+    """List targets with their host(s) and channels."""
+    lab = _load_lab_for_read()
+    names = lab.target_names()
+    if not names:
+        console.print("No targets configured. [dim](paniolo target add <name>)[/dim]")
+        return
+    table = Table(box=None, padding=(0, 2))
+    table.add_column("target", style="bold")
+    table.add_column("host(s)")
+    table.add_column("channels", style="dim")
+    for tname in names:
+        rt = lab.resolved_target(tname)
+        hosts = ", ".join(rt.hosts())
+        chans = ", ".join(
+            ch.kind if ch.name == ch.kind else f"{ch.kind}:{ch.name}"
+            for ch in rt.channels
+        )
+        table.add_row(tname, hosts, chans or "[dim]none[/dim]")
+    console.print(table)
 
 
 @target_app.command("show")
 def target_show(
     name: Annotated[Optional[str], typer.Argument()] = None,
 ) -> None:
-    """Show target configuration(s)."""
+    """Show target configuration(s), with each channel's resolved host."""
+    try:
+        lab = _lab.load()
+    except _lab.LabError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    if lab is not None:
+        names = [name] if name else lab.target_names()
+        if not names:
+            console.print("No targets configured.")
+            return
+        for tname in names:
+            try:
+                _print_resolved_target(lab.resolved_target(tname))
+            except KeyError:
+                err.print(f"[red]Target '{tname}' not found in lab.[/red]")
+        return
+
+    # Legacy per-target files (retired in a later stage).
     names = [name] if name else _config.list_targets()
     if not names:
         console.print("No targets configured.")
@@ -20456,20 +27894,59 @@ def target_show(
         console.print(t)
 
 
-@target_app.command("clear")
-def target_clear(
-    name: Annotated[str, typer.Argument()],
+@target_app.command("rm")
+def target_rm(
+    name: Annotated[str, typer.Argument(help="Target name to remove")],
 ) -> None:
-    """Remove a target configuration."""
-    path = _config.target_path(name)
-    if not path.exists():
-        err.print(f"[red]Target '{name}' not found.[/red]")
-        raise typer.Exit(1)
-    path.unlink()
-    console.print(f"Target '[bold]{name}[/bold]' cleared.")
+    """Remove a target and all its channels from the lab."""
+    _edit_lab(lambda lf: lf.remove_target(name))
+    console.print(f"[green]Target '[bold]{name}[/bold]' removed.[/green]")
 
 
 # ── netboot ───────────────────────────────────────────────────────────────────
+
+
+@netboot_app.command("set")
+def netboot_set(
+    target: Annotated[str, typer.Option("--target", "-t", help="Target name")],
+    interface: Annotated[
+        Optional[str],
+        typer.Option("--interface", "-i", help="USB-Ethernet interface (e.g. en3)"),
+    ] = None,
+    host_ip: Annotated[
+        Optional[str],
+        typer.Option("--host-ip", help="Static IP for the control-host side"),
+    ] = None,
+    tftp_root: Annotated[
+        Optional[str], typer.Option("--tftp-root", "-r", help="TFTP files directory")
+    ] = None,
+    host: Annotated[
+        Optional[str],
+        typer.Option("--host", help="Override the host this channel lives on"),
+    ] = None,
+) -> None:
+    """Configure the target's netboot channel (one per target)."""
+    _edit_lab(
+        lambda lf: lf.set_netboot(
+            target,
+            interface=interface,
+            host_ip=host_ip,
+            tftp_root=tftp_root,
+            host=host,
+        )
+    )
+    console.print(f"[green]netboot channel set for '[bold]{target}[/bold]'.[/green]")
+
+
+@netboot_app.command("rm")
+def netboot_rm(
+    target: Annotated[str, typer.Option("--target", "-t", help="Target name")],
+) -> None:
+    """Remove the target's netboot channel."""
+    _edit_lab(lambda lf: lf.remove_netboot(target))
+    console.print(
+        f"[green]netboot channel removed from '[bold]{target}[/bold]'.[/green]"
+    )
 
 
 @netboot_app.command("start")
@@ -21195,7 +28672,7 @@ def open_dashboard(
         if not cfg_s.serial_interfaces:
             err.print(
                 f"[red]No serial interfaces configured for '{cfg_s.name}'.[/red] "
-                "Run: paniolo serial setup"
+                "Run: paniolo serial add"
             )
             raise typer.Exit(1)
         if not _serial.serialcap_binary():
@@ -21236,7 +28713,7 @@ def _dtr_button(
     try:
         iface = cfg.serial_interface(interface_name)
     except ValueError as exc:
-        err.print(f"[red]{exc}.[/red] Run: paniolo serial setup")
+        err.print(f"[red]{exc}.[/red] Run: paniolo serial add")
         raise typer.Exit(1)
 
     daemon_url = _serial.daemon_url()
@@ -21259,6 +28736,46 @@ def _dtr_button(
         except (OSError, RuntimeError) as exc:
             err.print(f"[red]{label} failed:[/red] {exc}")
             raise typer.Exit(1)
+
+
+@power_app.command("set")
+def power_set(
+    target: Annotated[str, typer.Option("--target", "-t", help="Target name")],
+    cycle_cmd: Annotated[
+        Optional[str],
+        typer.Option("--cycle-cmd", help="Shell command/script to power-cycle"),
+    ] = None,
+    serial_interface: Annotated[
+        Optional[str],
+        typer.Option(
+            "--serial-interface",
+            help="Serial interface name used for DTR power cycling (e.g. console)",
+        ),
+    ] = None,
+    host: Annotated[
+        Optional[str],
+        typer.Option("--host", help="Override the host this channel lives on"),
+    ] = None,
+) -> None:
+    """Configure the target's power channel (one per target)."""
+    _edit_lab(
+        lambda lf: lf.set_power(
+            target,
+            cycle_cmd=cycle_cmd,
+            serial_interface=serial_interface,
+            host=host,
+        )
+    )
+    console.print(f"[green]power channel set for '[bold]{target}[/bold]'.[/green]")
+
+
+@power_app.command("rm")
+def power_rm(
+    target: Annotated[str, typer.Option("--target", "-t", help="Target name")],
+) -> None:
+    """Remove the target's power channel."""
+    _edit_lab(lambda lf: lf.remove_power(target))
+    console.print(f"[green]power channel removed from '[bold]{target}[/bold]'.[/green]")
 
 
 @app.command("power-cycle")
@@ -21321,7 +28838,7 @@ def power_state(
         err.print(
             "[yellow]Power state unknown[/yellow] — sense signal may not be"
             " configured on this interface."
-            " Run: paniolo serial setup --power-sense <cts|dsr|dcd|ri>"
+            " Run: paniolo serial set <name> -t <target> --sense <cts|dsr|dcd|ri>"
         )
         raise typer.Exit(1)
     if state:
@@ -21333,108 +28850,88 @@ def power_state(
 # ── serial ────────────────────────────────────────────────────────────────────
 
 
-@serial_app.command("setup")
-def serial_setup(
-    target: Annotated[Optional[str], typer.Argument()] = None,
-    name: Annotated[
-        str, typer.Option("--name", help="Interface name (e.g. console, bmc)")
-    ] = _config.DEFAULT_SERIAL_NAME,
-    device: Annotated[
-        Optional[str],
-        typer.Option("--device", help="Serial device path; auto-detected if omitted"),
-    ] = None,
+_SENSE_HELP = (
+    "FTDI modem-control input wired to the target's 3.3 V rail "
+    "(cts | dsr | dcd | ri | none), for power-state sensing"
+)
+
+
+@serial_app.command("add")
+def serial_add(
+    name: Annotated[str, typer.Argument(help="Interface name (e.g. console, bmc)")],
+    target: Annotated[str, typer.Option("--target", "-t", help="Target name")],
+    device: Annotated[str, typer.Option("--device", "-d", help="Serial device path")],
     baud: Annotated[int, typer.Option("--baud", help="Baud rate")] = 115200,
-    power_sense: Annotated[
+    sense: Annotated[Optional[str], typer.Option("--sense", help=_SENSE_HELP)] = None,
+    host: Annotated[
         Optional[str],
-        typer.Option(
-            "--power-sense",
-            help=(
-                "FTDI modem-control input wired to the target 3.3 V rail "
-                "(cts | dsr | dcd | ri | none). "
-                "Enables power-state sensing in GET /status and smart"
-                " power-cycle waits."
-            ),
-        ),
+        typer.Option("--host", help="Override the host this channel lives on"),
     ] = None,
 ) -> None:
-    """Add or update a named serial interface for a target.
-
-    A target may have several (run setup once per interface, e.g. --name console,
-    --name bmc). Re-running with an existing name updates that interface.
-
-    Use --power-sense to specify which FTDI input pin is wired to the target's
-    3.3 V rail for power-state detection (see hardware notes in AGENTS.md)."""
-    cfg = _resolve(target)
-
-    if device is None:
-        devices = _serial.list_serial_devices()
-        if not devices:
-            err.print("[red]No serial devices found.[/red] Specify one with --device.")
-            raise typer.Exit(1)
-        if len(devices) == 1:
-            device = devices[0]
-            console.print(f"[dim]Auto-detected serial device:[/dim] {device}")
-        else:
-            console.print("Available serial devices:")
-            for d in devices:
-                console.print(f"  {d}")
-            err.print("[red]Multiple devices found — specify one with --device.[/red]")
-            raise typer.Exit(1)
-
-    device = _serial.canonical_device_path(device)
-
-    if power_sense is not None and power_sense.lower() == "none":
-        power_sense = None
-    elif (
-        power_sense is not None
-        and power_sense.lower() not in _config.VALID_SENSE_SIGNALS
-    ):
-        err.print(
-            f"[red]Unknown sense signal '{power_sense}'.[/red] "
-            f"Valid values: {', '.join(_config.VALID_SENSE_SIGNALS)}, none"
-        )
-        raise typer.Exit(1)
-    elif power_sense is not None:
-        power_sense = power_sense.lower()
-
-    # Preserve existing sense signal when --power-sense is not given.
-    if power_sense is None:
-        existing_iface = next(
-            (i for i in cfg.serial_interfaces if i.name == name), None
-        )
-        sense = existing_iface.power_sense_signal if existing_iface else None
-    else:
-        sense = power_sense
-
-    cfg.upsert_serial_interface(
-        _config.SerialInterface(
-            name=name, device=device, baud=baud, power_sense_signal=sense
+    """Add a named serial console to a target (a target may have several)."""
+    sense_value = _normalize_sense(sense)
+    _edit_lab(
+        lambda lf: lf.add_serial(
+            target,
+            name,
+            device,
+            baud=baud,
+            power_sense_signal=sense_value,
+            host=host,
         )
     )
-    _config.save_target(cfg)
-    sense_label = f"  power_sense : {sense}" if sense else ""
     console.print(
-        f"[green]Serial interface '[bold]{name}[/bold]' saved for "
-        f"'[bold]{cfg.name}[/bold]':[/green] {device} @ {baud}"
+        f"[green]Serial '[bold]{name}[/bold]' added to "
+        f"'[bold]{target}[/bold]':[/green] {device} @ {baud}"
     )
-    if sense_label:
-        console.print(sense_label)
 
 
-@serial_app.command("remove")
-def serial_remove(
+@serial_app.command("set")
+def serial_set(
+    name: Annotated[str, typer.Argument(help="Interface name to update")],
+    target: Annotated[str, typer.Option("--target", "-t", help="Target name")],
+    device: Annotated[
+        Optional[str], typer.Option("--device", "-d", help="Serial device path")
+    ] = None,
+    baud: Annotated[Optional[int], typer.Option("--baud", help="Baud rate")] = None,
+    sense: Annotated[Optional[str], typer.Option("--sense", help=_SENSE_HELP)] = None,
+    host: Annotated[Optional[str], typer.Option("--host")] = None,
+) -> None:
+    """Update an existing serial interface (only the options you pass change)."""
+    sense_value = None
+    if sense is not None:
+        sense_value = _normalize_sense(sense)
+        if sense_value is None:  # user passed "none"
+            err.print(
+                "[red]`set` can't clear a sense signal.[/red] Remove and re-add "
+                "the interface to clear it."
+            )
+            raise typer.Exit(1)
+    _edit_lab(
+        lambda lf: lf.update_serial(
+            target,
+            name,
+            device=device,
+            baud=baud,
+            power_sense_signal=sense_value,
+            host=host,
+        )
+    )
+    console.print(
+        f"[green]Serial '[bold]{name}[/bold]' updated on '[bold]{target}[/bold]'.[/green]"
+    )
+
+
+@serial_app.command("rm")
+def serial_rm(
     name: Annotated[str, typer.Argument(help="Interface name to remove")],
-    target: Annotated[Optional[str], typer.Option("--target", "-t")] = None,
+    target: Annotated[str, typer.Option("--target", "-t", help="Target name")],
 ) -> None:
     """Remove a named serial interface from a target."""
-    cfg = _resolve(target)
-    if cfg.remove_serial_interface(name):
-        _config.save_target(cfg)
-        console.print(f"[green]Removed serial interface '[bold]{name}[/bold]'.[/green]")
-    else:
-        have = ", ".join(i.name for i in cfg.serial_interfaces) or "none"
-        err.print(f"[red]No serial interface '{name}'.[/red] (have: {have})")
-        raise typer.Exit(1)
+    _edit_lab(lambda lf: lf.remove_serial(target, name))
+    console.print(
+        f"[green]Serial '[bold]{name}[/bold]' removed from '{target}'.[/green]"
+    )
 
 
 def _resolve_interface(
@@ -21443,7 +28940,7 @@ def _resolve_interface(
     try:
         return cfg.serial_interface(interface)
     except ValueError as exc:
-        err.print(f"[red]{exc}.[/red] Run: paniolo serial setup")
+        err.print(f"[red]{exc}.[/red] Run: paniolo serial add")
         raise typer.Exit(1)
 
 
@@ -21603,7 +29100,7 @@ def serial_watch(
     if not cfg.serial_interfaces:
         err.print(
             f"[red]No serial interfaces configured for '{cfg.name}'.[/red] "
-            "Run: paniolo serial setup"
+            "Run: paniolo serial add"
         )
         raise typer.Exit(1)
 
@@ -21736,7 +29233,7 @@ def serial_show(
     if not cfg.serial_interfaces:
         console.print(
             f"No serial interfaces configured for '{cfg.name}'."
-            " Run: paniolo serial setup"
+            " Run: paniolo serial add"
         )
         return
     url = _serial.daemon_url()
@@ -22330,7 +29827,56 @@ enabling inter-subsystem coordination (e.g., "stream serial output whenever
 a netboot attempt fires"). Will be implemented in Rust when the complexity
 of option A is no longer sufficient.
 
-## Module layout
+## Rust control plane (`cli/` — the current implementation)
+
+The CLI + orchestration + device glue is rewritten in Rust (the `cli/` crate),
+finishing the Python→Rust migration the daemons started. Design + status:
+[`docs/config-redesign.md`](docs/config-redesign.md). Key differences from the
+Python tree below:
+
+- **Config is one CLI-managed lab file** (`~/.config/paniolo/lab.toml`, or
+  `--lab`/`PANIOLO_LAB`): hosts + targets, each target's hardware as *channels*
+  (`netboot`, `serial[]`, `power`, `video`) with per-channel host binding.
+  Edited surgically via `toml_edit` (hand-comments survive); validated on load
+  and before every save. The legacy `~/.config/paniolo/targets/*.toml` files are
+  not used by the Rust CLI.
+- **Dispatch is per-channel**: a command resolves the host of the channel it
+  touches and re-execs there over SSH against a shipped one-target slice.
+  Composites (`console`) require co-located channels.
+- **Daemons bind OS-assigned ports** (port 0) and are found via their
+  `daemon.json` discovery files — fixed defaults collided with stale tunnels.
+- **Netboot is rust-engine only** (netbootd); the pure-Python DHCP/TFTP engine
+  exists only in the legacy tree.
+
+```
+cli/src/
+  main.rs       clap CLI — all command groups + runtime handler bodies
+  model.rs      typed lab (serde), validate(), resolved per-channel view, channel_host
+  labfile.rs    toml_edit comment-preserving lab editor (the write side)
+  dispatch.rs   per-channel re-exec: slice building/shipping, maybe_dispatch,
+                run_subcommand, remote_daemon_port
+  ssh.rs        SSH transport: ControlMaster run/passthrough/interactive, forward (tunnels)
+  daemons.rs    shared daemon contract: find_binary, daemon.json discovery, wait
+  serial.rs     serialcap orchestration + tio exec + /input + device listing
+  video.rs      hdmicap orchestration (daemon start/stop, client passthrough)
+  netboot.rs    netbootd lifecycle (spawn with log, stop, status)
+  netif.rs      interface discovery/config (sudo), netboot/ffx/off modes
+  power.rs      DTR via serialcap /button (+ direct-serial fallback), power_on sense
+  state.rs      netboot state files (JSON-compatible with the Python's)
+  doctor.rs     config-vs-reality probing (local + over SSH)
+  discover.rs   hardware inventory + the configure proposal block
+  setup.rs      installer: cargo install daemons + the paniolo CLI, bpf-helper
+                setuid, OCR helpers, Linux groups
+```
+
+Deferred (tracked in docs/config-redesign.md): OCR (`video read`), the
+Openterface CH9329 HID backend (clean-room spec at docs/ch9329-spec.md), legacy
+Python removal.
+
+## Module layout (legacy Python — being retired)
+
+The Python tree below remains the shipping CLI on `main` until the Rust CLI is
+cut over; its module docs are kept for that transition.
 
 ```
 src/paniolo/

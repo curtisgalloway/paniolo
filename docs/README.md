@@ -31,11 +31,12 @@ and power-cycle it without a person at the bench each iteration. See the root
 | [Distributed control: one lab, one file](distributed-control.md) | Driving targets on remote control hosts: a single git-tracked lab file describing hosts + targets, SSH transport with the dev machine as the data-plane hub, per-resource host binding (multi-host-ready), and a discovery-proposes/human-approves config flow. Shipped: `--lab`, transparent re-exec, tunnelled `console`. |
 | [Implementation plan](distributed-control-plan.md) | Phased build sequence — Phases 0–3 shipped (SSH transport, lab model, re-exec, console); Phases 4–5 (remote `setup`, discovery-assisted `configure`) and multi-host pending. |
 
-## Rust control-plane rewrite (in progress)
+## Rust control-plane rewrite (at command parity)
 
-The CLI + orchestration + device glue is being rewritten Python→Rust (the `cli/` crate),
-finishing the migration the daemons started. The lab file becomes the single, CLI-managed
-source of truth.
+The CLI + orchestration + device glue is rewritten Python→Rust (the `cli/` crate),
+finishing the migration the daemons started. The lab file is the single, CLI-managed
+source of truth. All commands are ported and rig-verified locally; remote-host
+dispatch and the Python-tree retirement are the remaining steps.
 
 | Doc | What it covers |
 |---|---|

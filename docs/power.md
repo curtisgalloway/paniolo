@@ -35,14 +35,13 @@ target. The DTR and sense signals share the same USB serial port.
 
 ```bash
 # Add a serial interface with power sense
-paniolo serial setup target-machine \
-    --name console \
+paniolo serial add console -t target-machine \
     --device /dev/tty.usbserial-0001 \
     --baud 115200 \
-    --power-sense cts       # whichever modem-control input is wired
+    --sense cts             # whichever modem-control input is wired
 
 # Tell the target which interface to use as the default for power commands
-paniolo target set target-machine --power-serial console
+paniolo power set -t target-machine --serial-interface console
 ```
 
 ### DTR commands
@@ -86,8 +85,8 @@ For cases where DTR isn't wired (or where you want full mains control), set a
 shell script on the target:
 
 ```bash
-paniolo target set target-machine \
-    --power-cycle-cmd /Users/you/.config/paniolo/scripts/power-cycle-target-machine.sh
+paniolo power set -t target-machine \
+    --cycle-cmd /Users/you/.config/paniolo/scripts/power-cycle-target-machine.sh
 ```
 
 The script can do anything — call a Home Assistant API, drive a PDU relay, toggle

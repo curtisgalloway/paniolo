@@ -21,15 +21,13 @@ Connect the target's HDMI output to the capture card, then the card to the Mac.
 # Detect available capture devices
 paniolo video devices
 
-# Save which device to use
-paniolo video setup
-# or specify explicitly:
-paniolo video setup --device "USB Video"
+# Configure the target's video channel
+paniolo video set -t target-machine --device "USB Video"
 ```
 
-The device name is saved to `~/.config/paniolo/video.toml` and used by
-subsequent commands. When only one non-built-in camera is present, `setup`
-auto-selects it.
+The device lives on the target's `video` channel in the lab file (see
+[config-redesign.md](config-redesign.md)); `paniolo configure` proposes it
+automatically when one non-built-in capture device is present.
 
 ---
 

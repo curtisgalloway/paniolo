@@ -16,11 +16,15 @@ limitations under the License.
 
 # Config redesign: a CLI-managed lab
 
-Status: **Python implementation paused at Stage 4; control plane is being rewritten
-in Rust** (see "Pivot to Rust" at the end). Stages 1–4 (config model, CRUD, doctor)
-exist in Python on the `config-cli-redesign` branch as a working, tested reference —
-the executable spec the Rust port follows. Stages 5–6 were intentionally *not* built
-in Python.
+Status: **Rust control plane implemented through full command parity** (the `cli/`
+crate): config model + CRUD + doctor (R1), per-channel dispatch + SSH transport
+(R2), and the serial / video / power / netboot / netif runtimes plus `console`,
+`discover`, `configure`, `setup` (R3) — rig-verified against a live Pi 5 bench
+(serial round-trip, live HDMI capture, netbootd serving DHCP+TFTP, netif mode
+transitions). Remaining: live remote-host dispatch test (needs a second control
+host), a real TFTP boot, docs/cutover, and the deferred OCR + Openterface HID.
+The Python Stages 1–4 on this branch are the original tested reference; the
+Python tree is retired only after the Rust CLI has proven itself in daily use.
 
 ## Why
 

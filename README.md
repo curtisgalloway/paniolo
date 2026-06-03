@@ -54,11 +54,17 @@ make install           # Python CLI + Rust daemons + OCR helper, in one step
 `make install` runs `uv tool install --reinstall .` for the Python CLI, then
 `paniolo setup`, which compiles and installs the Rust daemons (`hdmicap`,
 `serialcap`, `netbootd`) and the OCR helper (`visionocr` on macOS via `swiftc`,
-`linuxocr` on Linux) into `~/.cargo/bin`. Netboot defaults to the single-binary
-`netbootd` (Rust) engine; the legacy pure-Python DHCP/TFTP pair is still
-available via `--engine python`. (On macOS, `setup` also installs the legacy
-`tftp-now` via Homebrew, and installs `netbootd-bpf-helper` setuid-root — one
-sudo — for the `netbootd` raw-frame send path.)
+`linuxocr` on Linux) into `~/.cargo/bin`. Netboot is served by the
+single-binary `netbootd` (Rust) engine. (On macOS, `setup` also installs
+`netbootd-bpf-helper` setuid-root — one sudo — for the `netbootd` raw-frame
+send path.)
+
+> **Rust control plane:** the CLI itself is being rewritten in Rust (the
+> `cli/` crate; see [docs/config-redesign.md](docs/config-redesign.md)).
+> `paniolo setup` from the Rust CLI installs the daemons *and* the Rust
+> `paniolo` binary into `~/.cargo/bin` — a single static binary per control
+> host, no Python environment needed. Configuration moves to one CLI-managed
+> lab file (`~/.config/paniolo/lab.toml`).
 
 To pick up code changes after pulling or editing, just re-run it:
 
@@ -93,10 +99,9 @@ control Mac to drive the target:
 
 ```bash
 # Configure target once
-ssh control-mac "paniolo target set target-machine \
-    --interface en3 \
-    --tftp-root ~/pxe \
-    --power-cycle-cmd /path/to/power-cycle.sh"
+ssh control-mac "paniolo target add target-machine"
+ssh control-mac "paniolo netboot set -t target-machine --interface en3 --tftp-root ~/pxe"
+ssh control-mac "paniolo power set -t target-machine --cycle-cmd /path/to/power-cycle.sh"
 
 # Deploy a new kernel and boot
 TFTP_ROOT=$(ssh control-mac "paniolo netboot tftp-root target-machine")
@@ -117,12 +122,15 @@ ssh control-mac "paniolo power-cycle target-machine"
 
 ### Target
 
-A *target* is a named machine you want to control. Its configuration lives in
-`~/.config/paniolo/targets/<name>.toml`. One config file per target; no daemon
-required. If exactly one target is configured it is the default and can be
-omitted from every command.
+A *target* is a named machine you want to control. Configuration lives in a
+single CLI-managed **lab file** (`~/.config/paniolo/lab.toml`, or `--lab` /
+`PANIOLO_LAB`): hosts plus targets, each target's hardware described as
+*channels* (`netboot`, `serial`, `power`, `video`) bound to the host they're
+physically attached to. No daemon required. If exactly one target is
+configured it is the default and can be omitted from every command.
 
-See [`paniolo target set --help`](docs/netboot.md#target-configuration) for all fields.
+See [docs/config-redesign.md](docs/config-redesign.md) for the model and
+[Target configuration](docs/netboot.md#target-configuration) for the fields.
 
 ### Runtime paths
 
