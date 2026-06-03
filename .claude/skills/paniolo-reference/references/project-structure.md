@@ -6,6 +6,25 @@
 .github/
   workflows/
     ci.yml (155 lines)
+cli/
+  src/
+    daemons.rs (76 lines)
+    discover.rs (227 lines)
+    dispatch.rs (289 lines)
+    doctor.rs (184 lines)
+    labfile.rs (505 lines)
+    main.rs (2103 lines)
+    model.rs (519 lines)
+    netboot.rs (163 lines)
+    netif.rs (428 lines)
+    power.rs (61 lines)
+    serial.rs (183 lines)
+    setup.rs (247 lines)
+    ssh.rs (294 lines)
+    state.rs (134 lines)
+    video.rs (76 lines)
+  .gitignore (1 lines)
+  Cargo.toml (57 lines)
 docs/
   ci-integration/
     design.md (276 lines)
@@ -13,17 +32,19 @@ docs/
     redfish-provider.md (147 lines)
     related-work.md (158 lines)
   architecture.md (266 lines)
+  ch9329-spec.md (126 lines)
+  config-redesign.md (324 lines)
   dashboard.md (71 lines)
   distributed-control-plan.md (209 lines)
   distributed-control.md (266 lines)
   hid.md (105 lines)
-  netboot.md (162 lines)
+  netboot.md (186 lines)
   netif.md (112 lines)
-  power.md (145 lines)
-  README.md (55 lines)
+  power.md (144 lines)
+  README.md (67 lines)
   requirements.md (258 lines)
-  serial.md (230 lines)
-  video.md (91 lines)
+  serial.md (225 lines)
+  video.md (89 lines)
 hdmicap/
   assets/
     index.html (285 lines)
@@ -88,15 +109,16 @@ serialcap/
   Cargo.toml (45 lines)
 skills/
   paniolo/
-    SKILL.md (280 lines)
+    SKILL.md (289 lines)
 src/
   paniolo/
     __init__.py (13 lines)
-    _cli.py (2137 lines)
+    _cli.py (2600 lines)
     _config.py (208 lines)
     _dhcp.py (354 lines)
     _hid.py (236 lines)
-    _lab.py (232 lines)
+    _lab.py (370 lines)
+    _labfile.py (418 lines)
     _netboot.py (601 lines)
     _netif.py (295 lines)
     _ocr.py (134 lines)
@@ -110,9 +132,11 @@ src/
     _video.py (187 lines)
 tests/
   test_cli.py (208 lines)
+  test_config_cli.py (148 lines)
   test_config.py (164 lines)
   test_hid.py (181 lines)
-  test_lab.py (200 lines)
+  test_lab.py (249 lines)
+  test_labfile.py (150 lines)
   test_netboot.py (158 lines)
   test_netif.py (161 lines)
   test_paths.py (95 lines)
@@ -122,9 +146,9 @@ tests/
   test_state.py (203 lines)
   test_video.py (146 lines)
 .gitignore (10 lines)
-AGENTS.md (800 lines)
+AGENTS.md (849 lines)
 LICENSE (201 lines)
 Makefile (76 lines)
-pyproject.toml (35 lines)
-README.md (143 lines)
+pyproject.toml (36 lines)
+README.md (151 lines)
 ```

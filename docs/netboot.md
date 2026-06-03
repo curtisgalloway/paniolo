@@ -20,31 +20,39 @@ networksetup -listallhardwareports
 
 ## Target configuration
 
+Config lives in the lab file (see [config-redesign.md](config-redesign.md));
+the netboot link is a per-target `netboot` channel:
+
 ```bash
-# Create or update a target
-paniolo target set target-machine \
+# Create the target, then configure its netboot channel
+paniolo target add target-machine
+paniolo netboot set -t target-machine \
     --interface en3 \
     --tftp-root ~/src/fuchsia/pxe/tftp-root
 
-# Show all configured targets
-paniolo target show
+# List candidate USB-Ethernet interfaces (primary NIC excluded)
+paniolo netboot devices
 
-# Show a specific target
+# Show all configured targets / a specific one
+paniolo target show
 paniolo target show target-machine
 
-# Remove a target
-paniolo target clear target-machine
+# Remove the netboot channel, or the whole target
+paniolo netboot rm -t target-machine
+paniolo target rm target-machine
 ```
 
-Target config fields:
+netboot channel fields:
 
 | Field | Default | Description |
 |---|---|---|
 | `--interface` | (required) | USB-Ethernet interface name (e.g. `en3`) |
 | `--host-ip` | `192.168.99.1` | Static IP assigned to the interface; also the TFTP server address |
 | `--tftp-root` | (none) | Directory whose contents are served over TFTP |
-| `--power-cycle-cmd` | (none) | Shell command run by `paniolo power-cycle` |
-| `--power-serial` | (none) | Serial interface name used for DTR power control |
+| `--host` | target default | Lab host the channel lives on |
+
+Power-cycle and DTR control are configured on the `power` channel
+(`paniolo power set …` — see [power.md](power.md)).
 
 ---
 

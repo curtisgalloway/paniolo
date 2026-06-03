@@ -63,7 +63,7 @@
 | SER-B | Timestamped rolling JSONL capture log, addressable by seq; rotation | M | ☑ | `capture.rs`; `serial log` |
 | SER-C | Interactive terminal via `tio` (`serial connect`) | M | ☑ | |
 | SER-D | Bidirectional live `/stream` (WebSocket) — read + write-back | M | ☑ | `server.rs` (used by dashboard) |
-| SER-E | `serial setup/remove/devices/show`, multi-interface per target | M | ☑ | |
+| SER-E | `serial add/set/rm/devices/show`, multi-interface per target | M | ☑ | |
 | SER-F | DTR control: `serial dtr`, `serial reset` (soft-reset semantics) | M | ☑ | `_power.py` |
 | SER-G | Power-sense read via modem-control input (`--power-sense cts\|dsr\|dcd\|ri`) | S | ☑ | `/status` → `power_on` |
 
