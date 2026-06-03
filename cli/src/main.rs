@@ -25,12 +25,14 @@
 // caller; drop this allow when those commands land.
 #![allow(dead_code)]
 
+mod daemons;
 mod dispatch;
 mod doctor;
 mod labfile;
 mod model;
 mod serial;
 mod ssh;
+mod video;
 
 use std::path::PathBuf;
 
@@ -91,6 +93,11 @@ enum Command {
     Power {
         #[command(subcommand)]
         cmd: PowerCmd,
+    },
+    /// Configure and drive a target's HDMI-capture (video) channel.
+    Video {
+        #[command(subcommand)]
+        cmd: VideoCmd,
     },
     /// Probe configured channels against reality over SSH (config vs hardware).
     Doctor {
@@ -315,6 +322,58 @@ enum PowerCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum VideoCmd {
+    /// Configure the target's video channel (one per target).
+    Set {
+        #[arg(long, short)]
+        target: String,
+        /// Capture device: an hdmicap device name substring, index, or /dev path.
+        #[arg(long, short)]
+        device: String,
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Remove the target's video channel.
+    Rm {
+        #[arg(long, short)]
+        target: String,
+    },
+    /// Start the hdmicap warm-stream daemon for the target's capture device.
+    Watch {
+        target: Option<String>,
+        #[arg(long, default_value_t = video::DEFAULT_PORT)]
+        port: u16,
+        /// Force-restart a running (possibly stalled) daemon.
+        #[arg(long)]
+        restart: bool,
+    },
+    /// Stop the running hdmicap daemon.
+    Stop,
+    /// Fetch one PNG screenshot from the running daemon.
+    Shot {
+        target: Option<String>,
+        /// Wait until the signal is stable before capturing.
+        #[arg(long)]
+        stable: bool,
+        /// Only return once the frame differs from this hex hash.
+        #[arg(long)]
+        changed_since: Option<String>,
+        /// Timeout in ms.
+        #[arg(long, default_value_t = 2000)]
+        timeout: u64,
+        /// Output path; "-" for stdout.
+        #[arg(long, short, default_value = "-")]
+        out: String,
+    },
+    /// Print the live-preview URL of the running daemon.
+    Preview,
+    /// List available capture devices.
+    Devices,
+    /// Show the target's video channel and daemon status.
+    Show { target: Option<String> },
+}
+
 fn main() {
     let cli = Cli::parse();
     if let Err(e) = run(cli) {
@@ -337,6 +396,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Serial { cmd } => serial_cmd(lab_flag, cmd),
         Command::Netboot { cmd } => netboot_cmd(lab_flag, cmd),
         Command::Power { cmd } => power_cmd(lab_flag, cmd),
+        Command::Video { cmd } => video_cmd(lab_flag, cmd),
         Command::Doctor { target, host } => {
             cmd_doctor(lab_flag, target.as_deref(), host.as_deref())
         }
@@ -877,7 +937,7 @@ fn cmd_serial_watch(lab_flag: Option<&str>, target: Option<&str>, port: u16) -> 
         serials.len(),
         names.join(", ")
     );
-    match serial::wait_for_daemon(std::time::Duration::from_secs(5)) {
+    match daemons::wait_for_daemon(serial::DAEMON, std::time::Duration::from_secs(5)) {
         Some(url) => {
             println!("Serial daemon started. {url}");
             Ok(())
@@ -934,7 +994,7 @@ fn cmd_serial_log(
     // Dispatch to the channel's host; the capture log lives where the daemon ran.
     let serials = serial_runtime(lab_flag, target, interface, dispatch::Mode::Reexec)?;
     // serialcap reads its own on-disk log, so this works daemon-up or -down.
-    let binary = serial::find_binary("serialcap")
+    let binary = daemons::find_binary(serial::DAEMON)
         .ok_or_else(|| anyhow!("serialcap not found — run `paniolo setup`"))?;
     let mut cmd = std::process::Command::new(binary);
     cmd.arg("log");
@@ -996,6 +1056,145 @@ fn cmd_serial_show(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
         None => println!("daemon\tstopped"),
     }
     Ok(())
+}
+
+// ── video runtime bodies ────────────────────────────────────────────────────
+
+/// The target's video channel as visible on *this* host.
+fn local_video(lab: &Lab, target: &str) -> Result<model::VideoChannel> {
+    let t = lab
+        .targets
+        .get(target)
+        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+    let dh = t.default_host().to_string();
+    let v = t.video.clone().ok_or_else(|| {
+        anyhow!(
+            "target '{target}' has no video channel (paniolo video set -t {target} --device ...)"
+        )
+    })?;
+    if v.host.as_deref().unwrap_or(&dh) != model::LOCAL {
+        bail!("video channel for '{target}' is not on this host");
+    }
+    Ok(v)
+}
+
+fn video_runtime(
+    lab_flag: Option<&str>,
+    target: Option<&str>,
+) -> Result<(String, model::VideoChannel)> {
+    let lab = load_for_read(lab_flag)?;
+    let target = resolve_single_target(&lab, target)?;
+    if let Some(code) = dispatch::maybe_dispatch(
+        &lab,
+        &target,
+        model::ChannelKind::Video,
+        None,
+        dispatch::Mode::Reexec,
+    )? {
+        std::process::exit(code);
+    }
+    let v = local_video(&lab, &target)?;
+    Ok((target, v))
+}
+
+fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
+    match cmd {
+        VideoCmd::Set {
+            target,
+            device,
+            host,
+        } => {
+            edit_lab(lab_flag, |lf| {
+                lf.set_video(&target, Some(&device), host.as_deref())
+            })?;
+            println!("video channel set for '{target}'.");
+            Ok(())
+        }
+        VideoCmd::Rm { target } => {
+            edit_lab(lab_flag, |lf| lf.remove_video(&target))?;
+            println!("video channel removed from '{target}'.");
+            Ok(())
+        }
+        VideoCmd::Watch {
+            target,
+            port,
+            restart,
+        } => {
+            let (target, v) = video_runtime(lab_flag, target.as_deref())?;
+            let device = v
+                .device
+                .ok_or_else(|| anyhow!("video channel for '{target}' has no device set"))?;
+            if let Some(url) = video::daemon_url() {
+                if !restart {
+                    println!("Video daemon already running at {url}");
+                    return Ok(());
+                }
+                let _ = video::stop_daemon();
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            eprintln!("Starting video daemon for '{device}'…");
+            video::start_daemon(&device, port, Some(&target))?;
+            match daemons::wait_for_daemon(video::DAEMON, std::time::Duration::from_secs(5)) {
+                Some(url) => {
+                    println!("Video daemon started. Preview at {url}");
+                    Ok(())
+                }
+                None => bail!("video daemon did not start within 5 s"),
+            }
+        }
+        VideoCmd::Stop => {
+            let code = video::stop_daemon()?;
+            if code == 0 {
+                println!("Video daemon stopped.");
+                Ok(())
+            } else {
+                std::process::exit(code);
+            }
+        }
+        VideoCmd::Shot {
+            target,
+            stable,
+            changed_since,
+            timeout,
+            out,
+        } => {
+            let _ = video_runtime(lab_flag, target.as_deref())?;
+            let mut args = vec![
+                "shot".to_string(),
+                "--timeout".to_string(),
+                timeout.to_string(),
+                "--out".to_string(),
+                out,
+            ];
+            if stable {
+                args.push("--stable".to_string());
+            }
+            if let Some(h) = changed_since {
+                args.push("--changed-since".to_string());
+                args.push(h);
+            }
+            std::process::exit(video::passthrough(&args)?);
+        }
+        VideoCmd::Preview => match video::daemon_url() {
+            Some(url) => {
+                println!("{url}");
+                Ok(())
+            }
+            None => bail!("no video daemon running — start one with `paniolo video watch`"),
+        },
+        VideoCmd::Devices => {
+            std::process::exit(video::passthrough(&["devices".to_string()])?);
+        }
+        VideoCmd::Show { target } => {
+            let (_target, v) = video_runtime(lab_flag, target.as_deref())?;
+            println!("device\t{}", v.device.as_deref().unwrap_or("(not set)"));
+            match video::daemon_url() {
+                Some(url) => println!("daemon\trunning at {url}"),
+                None => println!("daemon\tstopped"),
+            }
+            Ok(())
+        }
+    }
 }
 
 fn netboot_cmd(lab_flag: Option<&str>, cmd: NetbootCmd) -> Result<()> {
