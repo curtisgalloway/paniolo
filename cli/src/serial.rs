@@ -21,61 +21,24 @@
 //! `{pid, port, …}`; an interface is passed to the daemon as
 //! `NAME=DEVICE@BAUD[:SENSE]`.
 
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 
+use crate::daemons;
 use crate::model::SerialChannel;
+
+pub const DAEMON: &str = "serialcap";
 
 /// Default daemon port: 0 = OS-assigned. The discovery file carries the actual
 /// port and every consumer reads it, so a fixed default buys nothing and
 /// collides with stale `ssh -L` dashboard tunnels squatting the old 8724.
 pub const DEFAULT_PORT: u16 = 0;
 
-/// Find an installed binary: $PATH first, then ~/.cargo/bin (where
-/// `paniolo setup` installs the daemons). Never the in-repo build tree.
-pub fn find_binary(name: &str) -> Option<PathBuf> {
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let p = dir.join(name);
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-    }
-    let cargo = dirs::home_dir()?.join(".cargo/bin").join(name);
-    cargo.is_file().then_some(cargo)
-}
-
-// ── daemon discovery ────────────────────────────────────────────────────────
-
-fn runtime_base() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-}
-
-fn discovery_path() -> PathBuf {
-    runtime_base().join("serialcap").join("daemon.json")
-}
-
-fn pid_alive(pid: i32) -> bool {
-    // Safe: kill(pid, 0) only probes for existence.
-    unsafe { libc::kill(pid, 0) == 0 }
-}
-
 /// Base URL of the running serialcap daemon, or None if it isn't running.
 pub fn daemon_url() -> Option<String> {
-    let text = std::fs::read_to_string(discovery_path()).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let pid = v.get("pid")?.as_i64()? as i32;
-    let port = v.get("port")?.as_u64()?;
-    if !pid_alive(pid) {
-        return None;
-    }
-    Some(format!("http://127.0.0.1:{port}"))
+    daemons::daemon_url(DAEMON)
 }
 
 // ── daemon control ──────────────────────────────────────────────────────────
@@ -94,7 +57,7 @@ pub fn interface_arg(ch: &SerialChannel) -> String {
 /// Start the serialcap daemon (owning every given interface), detached.
 /// The caller polls [`daemon_url`] for readiness.
 pub fn start_daemon(ifaces: &[SerialChannel], port: u16) -> Result<()> {
-    let binary = find_binary("serialcap").ok_or_else(|| {
+    let binary = daemons::find_binary(DAEMON).ok_or_else(|| {
         anyhow!("serialcap not found (PATH or ~/.cargo/bin) — run `paniolo setup`")
     })?;
     let mut cmd = Command::new(binary);
@@ -125,7 +88,7 @@ pub fn wait_for_daemon(timeout: Duration) -> Option<String> {
 
 /// Stop the running daemon via `serialcap stop` (it owns the clean shutdown).
 pub fn stop_daemon() -> Result<i32> {
-    let binary = find_binary("serialcap").ok_or_else(|| anyhow!("serialcap not found"))?;
+    let binary = daemons::find_binary(DAEMON).ok_or_else(|| anyhow!("serialcap not found"))?;
     let status = Command::new(binary).arg("stop").status()?;
     Ok(status.code().unwrap_or(1))
 }
@@ -153,7 +116,7 @@ pub fn send_input(base_url: &str, interface: &str, data: &[u8], pace_ms: u32) ->
 /// Replace this process with `tio` on the given device (never returns on
 /// success).
 pub fn exec_tio(device: &str, baud: i64) -> Result<()> {
-    let tio = find_binary("tio")
+    let tio = daemons::find_binary("tio")
         .ok_or_else(|| anyhow!("tio not found in PATH — install it (e.g. brew install tio)"))?;
     let err = std::os::unix::process::CommandExt::exec(
         Command::new(tio)
