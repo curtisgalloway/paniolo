@@ -554,7 +554,19 @@ fn cmd_discover(json: bool) -> Result<()> {
         .as_array()
         .map(|a| {
             a.iter()
-                .map(|d| format!("{}: {}", d["index"], d["name"].as_str().unwrap_or("")))
+                .map(|d| {
+                    let id = d["id"].as_str().unwrap_or("");
+                    let id_note = if id.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  id={id}")
+                    };
+                    format!(
+                        "{}: {}{id_note}",
+                        d["index"],
+                        d["name"].as_str().unwrap_or("")
+                    )
+                })
                 .collect()
         })
         .unwrap_or_default();

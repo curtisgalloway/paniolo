@@ -116,7 +116,8 @@ use crate::{daemons, netif, serial, video};
 const BUILTIN_CAPTURE: [&str; 5] = ["FaceTime", "Capture screen", "iSight", "iPhone", "iPad"];
 
 /// This host's lab-relevant hardware, in the same JSON shape the Python CLI
-/// emits (so mixed-version labs interoperate during the migration).
+/// emits (so mixed-version labs interoperate during the migration; the video
+/// entries' `id` field is a Rust-side addition).
 pub fn local_inventory() -> Value {
     let ethernet: Vec<Value> = netif::list_usb_ethernet_interfaces()
         .iter()
@@ -126,44 +127,26 @@ pub fn local_inventory() -> Value {
         .into_iter()
         .map(Value::String)
         .collect();
-    let video: Vec<Value> = list_capture_devices()
-        .into_iter()
-        .map(|d| json!({"index": d.0, "name": d.1, "misc": d.2}))
-        .collect();
-    json!({"ethernet": ethernet, "serial": serial, "video": video})
+    json!({"ethernet": ethernet, "serial": serial, "video": list_capture_devices()})
 }
 
-/// Parse `hdmicap devices` output: `  0  Name  [misc]` per line.
-fn list_capture_devices() -> Vec<(u64, String, String)> {
+/// Capture devices from `hdmicap devices --json`:
+/// `[{index, name, misc, id}, ...]` — `id` is the stable, port-derived
+/// identifier (AVFoundation uniqueID on macOS, /dev/v4l/by-path on Linux).
+fn list_capture_devices() -> Vec<Value> {
     let Some(binary) = daemons::find_binary(video::DAEMON) else {
         return Vec::new();
     };
-    let Ok(out) = std::process::Command::new(binary).arg("devices").output() else {
+    let Ok(out) = std::process::Command::new(binary)
+        .args(["devices", "--json"])
+        .output()
+    else {
         return Vec::new();
     };
     if !out.status.success() {
         return Vec::new();
     }
-    let mut devices = Vec::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let s = line.trim_start();
-        let Some((idx_str, rest)) = s.split_once(char::is_whitespace) else {
-            continue;
-        };
-        let Ok(index) = idx_str.parse::<u64>() else {
-            continue;
-        };
-        let rest = rest.trim();
-        let (name, misc) = match rest.rfind('[') {
-            Some(i) => (
-                rest[..i].trim().to_string(),
-                rest[i + 1..].trim_end_matches(']').to_string(),
-            ),
-            None => (rest.to_string(), String::new()),
-        };
-        devices.push((index, name, misc));
-    }
-    devices
+    serde_json::from_slice(&out.stdout).unwrap_or_default()
 }
 
 fn str_at<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
@@ -230,19 +213,29 @@ pub fn propose_target_block(name: &str, host: &str, inv: &Value) -> String {
     out.push(String::new());
 
     // video: propose the one non-built-in capture device, if unambiguous.
-    let captures: Vec<&str> = inv
+    // Prefer the stable id (port-derived, survives enumeration-order shifts)
+    // with the human name as a comment; fall back to the name when the
+    // discovering hdmicap reported no id.
+    let device_ref = |name: &str, id: &str| {
+        if id.is_empty() {
+            format!("device = \"{name}\"")
+        } else {
+            format!("device = \"{id}\"  # {name}")
+        }
+    };
+    let captures: Vec<(&str, &str)> = inv
         .get("video")
         .and_then(Value::as_array)
         .map(|a| {
             a.iter()
-                .filter_map(|d| str_at(d, "name"))
-                .filter(|n| !BUILTIN_CAPTURE.iter().any(|b| n.contains(b)))
+                .filter_map(|d| Some((str_at(d, "name")?, str_at(d, "id").unwrap_or(""))))
+                .filter(|(n, _)| !BUILTIN_CAPTURE.iter().any(|b| n.contains(b)))
                 .collect()
         })
         .unwrap_or_default();
-    if captures.len() == 1 {
+    if let [(cap_name, cap_id)] = captures.as_slice() {
         out.push(format!("[targets.{name}.video]"));
-        out.push(format!("device = \"{}\"", captures[0]));
+        out.push(device_ref(cap_name, cap_id));
     } else if captures.is_empty() {
         out.push(format!(
             "# [targets.{name}.video]  # no capture device discovered"
@@ -251,8 +244,8 @@ pub fn propose_target_block(name: &str, host: &str, inv: &Value) -> String {
         out.push(format!(
             "# [targets.{name}.video]  # multiple capture devices — pick one:"
         ));
-        for c in &captures {
-            out.push(format!("# device = \"{c}\""));
+        for (cap_name, cap_id) in &captures {
+            out.push(format!("# {}", device_ref(cap_name, cap_id)));
         }
     }
     out.push(String::new());
@@ -277,8 +270,8 @@ mod tests {
             ],
             "serial": ["/dev/tty.usbserial-A", "/dev/tty.usbserial-B"],
             "video": [
-                {"index": 0, "name": "USB Video", "misc": ""},
-                {"index": 1, "name": "FaceTime HD Camera", "misc": ""},
+                {"index": 0, "name": "USB Video", "misc": "", "id": "0x8300000534d2109"},
+                {"index": 1, "name": "FaceTime HD Camera", "misc": "", "id": "0x11000005ac8514"},
             ],
         });
         let block = propose_target_block("pi5", "bench1", &inv);
@@ -300,9 +293,46 @@ mod tests {
             block.contains("# another serial device: /dev/tty.usbserial-B"),
             "{block}"
         );
-        // FaceTime filtered as built-in → USB Video is the unambiguous capture.
+        // FaceTime filtered as built-in → USB Video is the unambiguous capture,
+        // proposed by stable id with the name as a comment.
         assert!(block.contains("[targets.pi5.video]"), "{block}");
+        assert!(
+            block.contains("device = \"0x8300000534d2109\"  # USB Video"),
+            "{block}"
+        );
+    }
+
+    #[test]
+    fn propose_falls_back_to_name_without_id() {
+        let inv = json!({
+            "ethernet": [],
+            "serial": [],
+            "video": [{"index": 0, "name": "USB Video", "misc": ""}],
+        });
+        let block = propose_target_block("t", "local", &inv);
         assert!(block.contains("device = \"USB Video\""), "{block}");
+    }
+
+    #[test]
+    fn propose_lists_duplicate_dongles_as_id_alternatives() {
+        let inv = json!({
+            "ethernet": [],
+            "serial": [],
+            "video": [
+                {"index": 0, "name": "USB Video", "misc": "", "id": "0x8300000534d2109"},
+                {"index": 1, "name": "USB Video", "misc": "", "id": "0x8200000534d2109"},
+            ],
+        });
+        let block = propose_target_block("t", "local", &inv);
+        assert!(block.contains("multiple capture devices"), "{block}");
+        assert!(
+            block.contains("# device = \"0x8300000534d2109\"  # USB Video"),
+            "{block}"
+        );
+        assert!(
+            block.contains("# device = \"0x8200000534d2109\"  # USB Video"),
+            "{block}"
+        );
     }
 
     #[test]
@@ -9383,16 +9413,29 @@ Connect the target's HDMI output to the capture card, then the card to the Mac.
 ## Setup
 
 ```bash
-# Detect available capture devices
+# Detect available capture devices (each line ends with its stable id)
 paniolo video devices
 
-# Configure the target's video channel
-paniolo video set -t target-machine --device "USB Video"
+# Configure the target's video channel — prefer the stable id
+paniolo video set -t target-machine --device "0x8300000534d2109"
 ```
 
+The `--device` value may be:
+
+- a **stable id** (preferred): the AVFoundation `uniqueID` on macOS, the
+  `/dev/v4l/by-path/...` symlink on Linux. Both are derived from USB port
+  topology — they survive reboots and enumeration-order shifts, distinguish
+  two identical dongles, and change only if the dongle moves to a different
+  physical port.
+- a **name substring** (e.g. `"USB Video"`): convenient, but identical dongles
+  share a name. A substring matching more than one device is an error that
+  lists the candidates' ids — never a silent first-match guess.
+- a **`/dev/video*` path** (Linux): accepted, but not stable across reboots.
+
 The device lives on the target's `video` channel in the lab file (see
-[config-redesign.md](config-redesign.md)); `paniolo configure` proposes it
-automatically when one non-built-in capture device is present.
+[config-redesign.md](config-redesign.md)); `paniolo configure` proposes the
+stable id (with the human name as a comment) when one non-built-in capture
+device is present, and lists id alternatives when there are several.
 
 ---
 
@@ -10017,7 +10060,11 @@ enum Cmd {
         port: u16,
     },
     /// List available capture devices and exit (no daemon needed).
-    Devices,
+    Devices {
+        /// Emit machine-readable JSON instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Fetch one screenshot from the running daemon.
     Shot {
         /// Wait until the signal is Stable before capturing.
@@ -10055,7 +10102,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Daemon { device, port } => daemon::run(DeviceSpec::parse(&device), port),
-        Cmd::Devices => cmd_devices(),
+        Cmd::Devices { json } => cmd_devices(json),
         Cmd::Shot {
             stable,
             changed_since,
@@ -10073,9 +10120,20 @@ fn base_url() -> Result<String> {
     Ok(format!("http://127.0.0.1:{}", d.port))
 }
 
-fn cmd_devices() -> Result<()> {
-    for d in capture::enumerate()? {
-        println!("{:>3}  {}  [{}]", d.index, d.name, d.misc);
+fn cmd_devices(json: bool) -> Result<()> {
+    let devices = capture::enumerate()?;
+    if json {
+        let list: Vec<serde_json::Value> = devices
+            .iter()
+            .map(|d| {
+                serde_json::json!({"index": d.index, "name": d.name, "misc": d.misc, "id": d.id})
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&list)?);
+        return Ok(());
+    }
+    for d in devices {
+        println!("{:>3}  {}  [{}]  id={}", d.index, d.name, d.misc, d.id);
     }
     Ok(())
 }
@@ -14505,7 +14563,7 @@ cycle_cmd = "/home/curtisg/src/rpi5-bringup/scripts/power-cycle.sh"
 # --- the future case: one target spanning two control hosts ---
 [targets.fortune.video]
 host   = "bench2"                 # HDMI capture is on a different host
-device = "MS2109"
+device = "0x8300000534d2109"      # USB Video — stable, port-derived id
 ```
 
 - `host = "local"` (or unset, on a single-host lab) means the dev machine — i.e.
@@ -19070,217 +19128,6 @@ mod tests {
 }
 ````
 
-## File: cli/src/doctor.rs
-````rust
-// Copyright 2026 Curtis Galloway
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-//! `paniolo doctor` — probe configured channels against reality.
-//!
-//! Read-only health check: for each channel it SSHes to the control host the
-//! channel lives on (or runs locally) and tests that the configured device or
-//! interface actually exists. This is the probing that used to be baked into the
-//! Python `setup` commands, separated so config edits stay local and offline.
-
-use std::process::Command;
-
-use crate::model::{ChannelKind, Lab, ResolvedChannel, ResolvedTarget};
-use crate::ssh;
-
-#[derive(PartialEq, Eq)]
-enum Status {
-    Ok,
-    Missing,
-    Unreachable,
-    Incomplete,
-}
-
-impl Status {
-    fn label(&self) -> &'static str {
-        match self {
-            Status::Ok => "ok",
-            Status::Missing => "MISSING",
-            Status::Unreachable => "unreachable",
-            Status::Incomplete => "incomplete",
-        }
-    }
-    fn is_problem(&self) -> bool {
-        matches!(self, Status::Missing | Status::Unreachable)
-    }
-}
-
-/// Run a POSIX-sh probe on a host (locally or over SSH); None == unreachable.
-fn probe(lab: &Lab, host_name: &str, script: &str) -> Option<i32> {
-    let host = lab.host(host_name);
-    if host.is_local(host_name) {
-        return Command::new("sh")
-            .arg("-c")
-            .arg(script)
-            .status()
-            .ok()
-            .map(|s| s.code().unwrap_or(-1));
-    }
-    match ssh::run(
-        &host,
-        &["sh".to_string(), "-c".to_string(), script.to_string()],
-        None,
-        &[],
-    ) {
-        Ok(o) => Some(o.status),
-        Err(_) => None,
-    }
-}
-
-fn interpret(rc: Option<i32>, what: &str) -> (Status, String) {
-    match rc {
-        None | Some(255) => (Status::Unreachable, "host unreachable".to_string()),
-        Some(0) => (Status::Ok, what.to_string()),
-        Some(_) => (Status::Missing, what.to_string()),
-    }
-}
-
-fn field<'a>(ch: &'a ResolvedChannel, key: &str) -> Option<&'a str> {
-    ch.fields
-        .iter()
-        .find(|(k, _)| *k == key)
-        .map(|(_, v)| v.as_str())
-}
-
-/// Probe script for a video channel. The device is usually a capture-device
-/// NAME (e.g. "USB Video" on macOS), not a path, so `test -e` alone is wrong:
-/// ask `hdmicap devices` on the channel host whether it enumerates. Path-style
-/// devices (`/dev/video0`) still short-circuit via `test -e`. Exit 3 = hdmicap
-/// itself is missing (PATH or ~/.cargo/bin), a distinct failure from a missing
-/// device.
-fn video_probe_script(device: &str) -> String {
-    let q = ssh::shell_quote(device);
-    format!(
-        "test -e {q} && exit 0; \
-         bin=$(command -v hdmicap) || bin=\"$HOME/.cargo/bin/hdmicap\"; \
-         test -x \"$bin\" || exit 3; \
-         \"$bin\" devices 2>/dev/null | grep -F -q -- {q}"
-    )
-}
-
-fn check_channel(lab: &Lab, ch: &ResolvedChannel, rt: &ResolvedTarget) -> (Status, String) {
-    match ch.kind {
-        ChannelKind::Serial => match field(ch, "device") {
-            None => (Status::Incomplete, "no device set".to_string()),
-            Some(dev) => interpret(
-                probe(lab, &ch.host, &format!("test -e {}", ssh::shell_quote(dev))),
-                dev,
-            ),
-        },
-        ChannelKind::Video => match field(ch, "device") {
-            None => (Status::Incomplete, "no device set".to_string()),
-            Some(dev) => match probe(lab, &ch.host, &video_probe_script(dev)) {
-                Some(3) => (Status::Missing, format!("{dev} (hdmicap not installed)")),
-                rc => interpret(rc, dev),
-            },
-        },
-        ChannelKind::Netboot => match field(ch, "interface") {
-            None => (Status::Incomplete, "no interface set".to_string()),
-            Some(iface) => {
-                let q = ssh::shell_quote(iface);
-                let script = format!("test -e /sys/class/net/{q} || ifconfig {q} >/dev/null 2>&1");
-                interpret(probe(lab, &ch.host, &script), iface)
-            }
-        },
-        ChannelKind::Power => {
-            if let Some(si) = field(ch, "serial_interface") {
-                let have = rt
-                    .channels
-                    .iter()
-                    .any(|c| c.kind == ChannelKind::Serial && c.name == si);
-                if !have {
-                    return (
-                        Status::Missing,
-                        format!("serial_interface '{si}' has no matching serial"),
-                    );
-                }
-            }
-            if let Some(cmd) = field(ch, "cycle_cmd") {
-                let prog = cmd.split_whitespace().next().unwrap_or("");
-                if prog.starts_with('/') {
-                    return interpret(
-                        probe(
-                            lab,
-                            &ch.host,
-                            &format!("test -e {}", ssh::shell_quote(prog)),
-                        ),
-                        prog,
-                    );
-                }
-                return (Status::Ok, format!("cmd={cmd}"));
-            }
-            (Status::Ok, "configured".to_string())
-        }
-    }
-}
-
-fn channel_name(ch: &ResolvedChannel) -> String {
-    if ch.name == ch.kind.as_str() {
-        ch.kind.as_str().to_string()
-    } else {
-        format!("{} {}", ch.kind.as_str(), ch.name)
-    }
-}
-
-/// Probe `target` (or all targets), optionally limited to `host_filter`.
-/// Prints a report and returns the number of problems found.
-pub fn run(lab: &Lab, target: Option<&str>, host_filter: Option<&str>) -> i32 {
-    let names: Vec<String> = match target {
-        Some(n) => vec![n.to_string()],
-        None => lab.targets.keys().cloned().collect(),
-    };
-    if names.is_empty() {
-        println!("No targets configured.");
-        return 0;
-    }
-    let mut problems = 0;
-    for tname in names {
-        let Some(rt) = lab.resolved_target(&tname) else {
-            eprintln!("Target '{tname}' not found in lab.");
-            problems += 1;
-            continue;
-        };
-        for ch in &rt.channels {
-            if let Some(h) = host_filter {
-                if ch.host != h {
-                    continue;
-                }
-            }
-            let (status, detail) = check_channel(lab, ch, &rt);
-            if status.is_problem() {
-                problems += 1;
-            }
-            println!(
-                "{tname}\t{}\t@{}\t{}\t{}",
-                channel_name(ch),
-                ch.host,
-                status.label(),
-                detail
-            );
-        }
-    }
-    if problems == 0 {
-        println!("All configured channels present.");
-    }
-    problems
-}
-````
-
 ## File: cli/src/model.rs
 ````rust
 // Copyright 2026 Curtis Galloway
@@ -19843,6 +19690,11 @@ pub struct DeviceInfo {
     pub index: u32,
     pub name: String,
     pub misc: String,
+    /// Stable identifier, derived from USB topology — survives reboots and
+    /// enumeration-order shifts, changes only if the device moves to another
+    /// port. macOS: the AVFoundation `uniqueID` (location ID + VID + PID).
+    /// Linux: the `/dev/v4l/by-path/...` symlink. Empty when unavailable.
+    pub id: String,
 }
 
 /// How the user asked us to pick a device.
@@ -19889,47 +19741,121 @@ pub trait CaptureBackend {
     fn frame(&mut self) -> Result<CapturedFrame>;
 }
 
+/// Map V4L2 device index → its stable `/dev/v4l/by-path` symlink (the Linux
+/// analogue of AVFoundation's uniqueID: derived from USB port topology).
+#[cfg(target_os = "linux")]
+fn stable_ids_by_index() -> std::collections::HashMap<u32, String> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(entries) = std::fs::read_dir("/dev/v4l/by-path") else {
+        return map;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(target) = std::fs::canonicalize(&path) else {
+            continue;
+        };
+        let target = target.to_string_lossy();
+        let Some(idx) = target
+            .strip_prefix("/dev/video")
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        map.entry(idx)
+            .or_insert_with(|| path.to_string_lossy().into_owned());
+    }
+    map
+}
+
 pub fn enumerate() -> Result<Vec<DeviceInfo>> {
     let cams = query(ApiBackend::Auto).context("nokhwa device query failed")?;
+    #[cfg(target_os = "linux")]
+    let by_path = stable_ids_by_index();
     Ok(cams
         .into_iter()
-        .map(|c| DeviceInfo {
-            index: match c.index() {
+        .map(|c| {
+            let index = match c.index() {
                 CameraIndex::Index(i) => *i,
                 CameraIndex::String(_) => u32::MAX,
-            },
-            name: c.human_name(),
-            misc: c.description().to_string(),
+            };
+            // macOS: the vendored bindings carry the AVFoundation uniqueID in
+            // CameraInfo::misc. Linux: join against the by-path symlinks.
+            #[cfg(not(target_os = "linux"))]
+            let id = c.misc();
+            #[cfg(target_os = "linux")]
+            let id = by_path.get(&index).cloned().unwrap_or_default();
+            DeviceInfo {
+                index,
+                name: c.human_name(),
+                misc: c.description().to_string(),
+                id,
+            }
         })
         .collect())
 }
 
 pub fn resolve(spec: &DeviceSpec) -> Result<u32> {
+    if let DeviceSpec::Index(i) = spec {
+        return Ok(*i);
+    }
+    // Any path-style spec (e.g. /dev/v4l/by-id/...) canonicalizes to
+    // /dev/videoN; by-path specs also hit the exact-id match in resolve_in.
+    #[cfg(target_os = "linux")]
+    if let DeviceSpec::Name(s) = spec {
+        if s.starts_with('/') {
+            if let Ok(target) = std::fs::canonicalize(s) {
+                if let Some(idx) = target
+                    .to_string_lossy()
+                    .strip_prefix("/dev/video")
+                    .and_then(|n| n.parse::<u32>().ok())
+                {
+                    return Ok(idx);
+                }
+            }
+        }
+    }
+    resolve_in(&enumerate()?, spec)
+}
+
+/// Pick a device from `devices` per `spec`. An exact stable-id match wins;
+/// otherwise case-insensitive name substring, which must match exactly one
+/// device — a first-match-wins guess is how two identical dongles end up
+/// silently swapped.
+fn resolve_in(devices: &[DeviceInfo], spec: &DeviceSpec) -> Result<u32> {
+    if devices.is_empty() {
+        return Err(anyhow!("no capture devices found"));
+    }
     match spec {
         DeviceSpec::Index(i) => Ok(*i),
-        _ => {
-            let devices = enumerate()?;
-            if devices.is_empty() {
-                return Err(anyhow!("no capture devices found"));
+        DeviceSpec::Name(s) => {
+            if let Some(d) = devices.iter().find(|d| !d.id.is_empty() && d.id == *s) {
+                return Ok(d.index);
             }
-            match spec {
-                DeviceSpec::Index(i) => Ok(*i),
-                DeviceSpec::Name(sub) => {
-                    let sub = sub.to_lowercase();
-                    devices
-                        .iter()
-                        .find(|d| d.name.to_lowercase().contains(&sub))
-                        .map(|d| d.index)
-                        .ok_or_else(|| anyhow!("no device matching name {:?}", sub))
-                }
-                DeviceSpec::Auto => {
-                    let external = devices.iter().find(|d| {
-                        let n = d.name.to_lowercase();
-                        !BUILTIN_HINTS.iter().any(|h| n.contains(h))
-                    });
-                    Ok(external.unwrap_or(&devices[0]).index)
-                }
+            let sub = s.to_lowercase();
+            let matches: Vec<&DeviceInfo> = devices
+                .iter()
+                .filter(|d| d.name.to_lowercase().contains(&sub))
+                .collect();
+            match matches.as_slice() {
+                [] => Err(anyhow!("no device matching name or id {:?}", s)),
+                [d] => Ok(d.index),
+                many => Err(anyhow!(
+                    "device {:?} is ambiguous ({} matches) — use a stable id:\n{}",
+                    s,
+                    many.len(),
+                    many.iter()
+                        .map(|d| format!("  {:>3}  {}  id={}", d.index, d.name, d.id))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )),
             }
+        }
+        DeviceSpec::Auto => {
+            let external = devices.iter().find(|d| {
+                let n = d.name.to_lowercase();
+                !BUILTIN_HINTS.iter().any(|h| n.contains(h))
+            });
+            Ok(external.unwrap_or(&devices[0]).index)
         }
     }
 }
@@ -20168,6 +20094,78 @@ mod macos {
                 rgb: decoded,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dev(index: u32, name: &str, id: &str) -> DeviceInfo {
+        DeviceInfo {
+            index,
+            name: name.to_string(),
+            misc: String::new(),
+            id: id.to_string(),
+        }
+    }
+
+    fn two_dongles() -> Vec<DeviceInfo> {
+        vec![
+            dev(0, "USB Video", "0x8300000534d2109"),
+            dev(1, "USB Video", "0x8200000534d2109"),
+            dev(2, "FaceTime HD Camera", "0x1421000005ac8514"),
+        ]
+    }
+
+    #[test]
+    fn exact_id_match_wins() {
+        let devices = two_dongles();
+        let spec = DeviceSpec::parse("0x8200000534d2109");
+        assert_eq!(resolve_in(&devices, &spec).unwrap(), 1);
+    }
+
+    #[test]
+    fn unique_name_substring_matches() {
+        let devices = two_dongles();
+        let spec = DeviceSpec::parse("facetime");
+        assert_eq!(resolve_in(&devices, &spec).unwrap(), 2);
+    }
+
+    #[test]
+    fn ambiguous_name_is_an_error_listing_ids() {
+        let devices = two_dongles();
+        let spec = DeviceSpec::parse("USB Video");
+        let err = resolve_in(&devices, &spec).unwrap_err().to_string();
+        assert!(err.contains("ambiguous"), "{err}");
+        assert!(err.contains("0x8300000534d2109"), "{err}");
+        assert!(err.contains("0x8200000534d2109"), "{err}");
+    }
+
+    #[test]
+    fn no_match_is_an_error() {
+        let devices = two_dongles();
+        let spec = DeviceSpec::parse("Elgato");
+        assert!(resolve_in(&devices, &spec).is_err());
+    }
+
+    #[test]
+    fn auto_prefers_external_over_builtin() {
+        let devices = vec![
+            dev(0, "FaceTime HD Camera", "0x1421000005ac8514"),
+            dev(1, "USB Video", "0x8300000534d2109"),
+        ];
+        assert_eq!(resolve_in(&devices, &DeviceSpec::Auto).unwrap(), 1);
+    }
+
+    #[test]
+    fn empty_id_never_matches_empty_spec_id() {
+        // A device with no stable id must not be selected by id equality.
+        let devices = vec![dev(0, "USB Video", "")];
+        let spec = DeviceSpec::Name(String::new());
+        // Empty string parses to Auto via parse(); construct Name directly to
+        // prove the id-equality guard, then expect substring match (matches).
+        assert_eq!(resolve_in(&devices, &spec).unwrap(), 0);
     }
 }
 ````
@@ -21309,6 +21307,217 @@ if __name__ == "__main__":
     main()
 ````
 
+## File: cli/src/doctor.rs
+````rust
+// Copyright 2026 Curtis Galloway
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! `paniolo doctor` — probe configured channels against reality.
+//!
+//! Read-only health check: for each channel it SSHes to the control host the
+//! channel lives on (or runs locally) and tests that the configured device or
+//! interface actually exists. This is the probing that used to be baked into the
+//! Python `setup` commands, separated so config edits stay local and offline.
+
+use std::process::Command;
+
+use crate::model::{ChannelKind, Lab, ResolvedChannel, ResolvedTarget};
+use crate::ssh;
+
+#[derive(PartialEq, Eq)]
+enum Status {
+    Ok,
+    Missing,
+    Unreachable,
+    Incomplete,
+}
+
+impl Status {
+    fn label(&self) -> &'static str {
+        match self {
+            Status::Ok => "ok",
+            Status::Missing => "MISSING",
+            Status::Unreachable => "unreachable",
+            Status::Incomplete => "incomplete",
+        }
+    }
+    fn is_problem(&self) -> bool {
+        matches!(self, Status::Missing | Status::Unreachable)
+    }
+}
+
+/// Run a POSIX-sh probe on a host (locally or over SSH); None == unreachable.
+fn probe(lab: &Lab, host_name: &str, script: &str) -> Option<i32> {
+    let host = lab.host(host_name);
+    if host.is_local(host_name) {
+        return Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .status()
+            .ok()
+            .map(|s| s.code().unwrap_or(-1));
+    }
+    match ssh::run(
+        &host,
+        &["sh".to_string(), "-c".to_string(), script.to_string()],
+        None,
+        &[],
+    ) {
+        Ok(o) => Some(o.status),
+        Err(_) => None,
+    }
+}
+
+fn interpret(rc: Option<i32>, what: &str) -> (Status, String) {
+    match rc {
+        None | Some(255) => (Status::Unreachable, "host unreachable".to_string()),
+        Some(0) => (Status::Ok, what.to_string()),
+        Some(_) => (Status::Missing, what.to_string()),
+    }
+}
+
+fn field<'a>(ch: &'a ResolvedChannel, key: &str) -> Option<&'a str> {
+    ch.fields
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v.as_str())
+}
+
+/// Probe script for a video channel. The device is usually a capture-device
+/// NAME (e.g. "USB Video" on macOS), not a path, so `test -e` alone is wrong:
+/// ask `hdmicap devices` on the channel host whether it enumerates. Path-style
+/// devices (`/dev/video0`) still short-circuit via `test -e`. Exit 3 = hdmicap
+/// itself is missing (PATH or ~/.cargo/bin), a distinct failure from a missing
+/// device.
+fn video_probe_script(device: &str) -> String {
+    let q = ssh::shell_quote(device);
+    format!(
+        "test -e {q} && exit 0; \
+         bin=$(command -v hdmicap) || bin=\"$HOME/.cargo/bin/hdmicap\"; \
+         test -x \"$bin\" || exit 3; \
+         \"$bin\" devices 2>/dev/null | grep -F -q -- {q}"
+    )
+}
+
+fn check_channel(lab: &Lab, ch: &ResolvedChannel, rt: &ResolvedTarget) -> (Status, String) {
+    match ch.kind {
+        ChannelKind::Serial => match field(ch, "device") {
+            None => (Status::Incomplete, "no device set".to_string()),
+            Some(dev) => interpret(
+                probe(lab, &ch.host, &format!("test -e {}", ssh::shell_quote(dev))),
+                dev,
+            ),
+        },
+        ChannelKind::Video => match field(ch, "device") {
+            None => (Status::Incomplete, "no device set".to_string()),
+            Some(dev) => match probe(lab, &ch.host, &video_probe_script(dev)) {
+                Some(3) => (Status::Missing, format!("{dev} (hdmicap not installed)")),
+                rc => interpret(rc, dev),
+            },
+        },
+        ChannelKind::Netboot => match field(ch, "interface") {
+            None => (Status::Incomplete, "no interface set".to_string()),
+            Some(iface) => {
+                let q = ssh::shell_quote(iface);
+                let script = format!("test -e /sys/class/net/{q} || ifconfig {q} >/dev/null 2>&1");
+                interpret(probe(lab, &ch.host, &script), iface)
+            }
+        },
+        ChannelKind::Power => {
+            if let Some(si) = field(ch, "serial_interface") {
+                let have = rt
+                    .channels
+                    .iter()
+                    .any(|c| c.kind == ChannelKind::Serial && c.name == si);
+                if !have {
+                    return (
+                        Status::Missing,
+                        format!("serial_interface '{si}' has no matching serial"),
+                    );
+                }
+            }
+            if let Some(cmd) = field(ch, "cycle_cmd") {
+                let prog = cmd.split_whitespace().next().unwrap_or("");
+                if prog.starts_with('/') {
+                    return interpret(
+                        probe(
+                            lab,
+                            &ch.host,
+                            &format!("test -e {}", ssh::shell_quote(prog)),
+                        ),
+                        prog,
+                    );
+                }
+                return (Status::Ok, format!("cmd={cmd}"));
+            }
+            (Status::Ok, "configured".to_string())
+        }
+    }
+}
+
+fn channel_name(ch: &ResolvedChannel) -> String {
+    if ch.name == ch.kind.as_str() {
+        ch.kind.as_str().to_string()
+    } else {
+        format!("{} {}", ch.kind.as_str(), ch.name)
+    }
+}
+
+/// Probe `target` (or all targets), optionally limited to `host_filter`.
+/// Prints a report and returns the number of problems found.
+pub fn run(lab: &Lab, target: Option<&str>, host_filter: Option<&str>) -> i32 {
+    let names: Vec<String> = match target {
+        Some(n) => vec![n.to_string()],
+        None => lab.targets.keys().cloned().collect(),
+    };
+    if names.is_empty() {
+        println!("No targets configured.");
+        return 0;
+    }
+    let mut problems = 0;
+    for tname in names {
+        let Some(rt) = lab.resolved_target(&tname) else {
+            eprintln!("Target '{tname}' not found in lab.");
+            problems += 1;
+            continue;
+        };
+        for ch in &rt.channels {
+            if let Some(h) = host_filter {
+                if ch.host != h {
+                    continue;
+                }
+            }
+            let (status, detail) = check_channel(lab, ch, &rt);
+            if status.is_problem() {
+                problems += 1;
+            }
+            println!(
+                "{tname}\t{}\t@{}\t{}\t{}",
+                channel_name(ch),
+                ch.host,
+                status.label(),
+                detail
+            );
+        }
+    }
+    if problems == 0 {
+        println!("All configured channels present.");
+    }
+    problems
+}
+````
+
 ## File: docs/requirements.md
 ````markdown
 # Paniolo — Requirements & progress tracker
@@ -21959,7 +22168,9 @@ async fn devices() -> Response {
     match crate::capture::enumerate() {
         Ok(list) => Json(
             list.into_iter()
-                .map(|d| serde_json::json!({"index": d.index, "name": d.name, "misc": d.misc}))
+                .map(|d| {
+                    serde_json::json!({"index": d.index, "name": d.name, "misc": d.misc, "id": d.id})
+                })
                 .collect::<Vec<_>>(),
         )
         .into_response(),
@@ -24643,7 +24854,7 @@ paniolo target add <name> [--host <labhost>] [--note <text>]
 paniolo netboot set -t <name> --interface <iface> [--tftp-root <dir>] [--host-ip <ip>]
 paniolo serial add console -t <name> --device <path> [--baud 115200] [--sense cts]
 paniolo power set -t <name> [--cycle-cmd <script>] [--serial-interface console]
-paniolo video set -t <name> --device "<capture name>"
+paniolo video set -t <name> --device "<capture id or name>"
 ```
 
 - `paniolo netboot devices` lists candidate USB-Ethernet interfaces (the
@@ -24708,8 +24919,8 @@ passwordless `sudo` requirement as netboot (`ip` on Linux, `ifconfig` on macOS).
 ## Video — capture, preview, OCR
 
 ```
-paniolo video devices                 # list capture devices
-paniolo video set -t <target> --device "<name>"   # configure the video channel
+paniolo video devices                 # list capture devices (with stable ids)
+paniolo video set -t <target> --device "<id-or-name>"   # configure the video channel
 paniolo video watch                   # start the capture daemon (background)
 paniolo video preview                 # open the dashboard in a browser
 paniolo video shot [--stable] [--out frame.png]   # one lossless PNG
@@ -24721,6 +24932,13 @@ paniolo video stop
 - The **dashboard** (the video daemon's URL — ports are OS-assigned, printed by
   `video watch`/`console`) shows live video on top, a
   serial terminal below, and an **OCR button** that reads the current screen.
+- The `device` may be a **stable id** (preferred — `video devices` prints
+  `id=…`: the AVFoundation uniqueID on macOS, the `/dev/v4l/by-path` symlink on
+  Linux), a name substring, or a `/dev/video*` path. Ids are derived from USB
+  port topology, so they survive reboots and tell two identical dongles apart;
+  replugging into a different port changes the id. A name substring matching
+  more than one device is an error (listing the candidates' ids), not a silent
+  first-match guess.
 - `--stable` waits for a steady frame before capturing (useful right after a mode
   switch or reboot).
 - **OCR** (`video read` and the dashboard button) is on-device (Apple Vision). It
@@ -25603,7 +25821,19 @@ fn cmd_discover(json: bool) -> Result<()> {
         .as_array()
         .map(|a| {
             a.iter()
-                .map(|d| format!("{}: {}", d["index"], d["name"].as_str().unwrap_or("")))
+                .map(|d| {
+                    let id = d["id"].as_str().unwrap_or("");
+                    let id_note = if id.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  id={id}")
+                    };
+                    format!(
+                        "{}: {}{id_note}",
+                        d["index"],
+                        d["name"].as_str().unwrap_or("")
+                    )
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -30581,9 +30811,13 @@ Paniolo runs on Linux as well as macOS. Platform differences:
   NOPASSWD sudo (`ifconfig`/`networksetup` on macOS, `ip` on Linux).
 - **SSH PATH.** Non-interactive SSH shells often lack `/opt/homebrew/bin`.
   `_find_bin()` probes `_BREW_PATHS` on macOS and `/usr/sbin`+`/sbin` on Linux.
-- **hdmicap device auto-detection.** With two non-built-in cameras (e.g. MS2109
-  + Razer Kiyo), `guess_capture_device` returns None and the user is prompted.
-  Pass `--device "USB Video"` (or whatever substring matches) to skip the prompt.
+- **hdmicap device identity.** Capture devices have a stable, port-derived id
+  (AVFoundation `uniqueID` on macOS, `/dev/v4l/by-path` symlink on Linux) shown
+  by `hdmicap devices` / `paniolo video devices`. Prefer the id in lab files —
+  identical dongles (MS2109s ship without USB serials) are indistinguishable by
+  name. A name substring matching more than one device is a hard error listing
+  the candidates' ids; with several non-built-in captures (e.g. MS2109 + Razer
+  Kiyo), `paniolo configure` lists the id alternatives as comments.
 - **nokhwa MS2109 compatibility.** The MS2109 HDMI capture card doesn't expose
   standard MJPEG/YUYV formats through nokhwa's filtered list and throws
   NSException from AVFoundation frame-duration KVC calls. The vendor patch in

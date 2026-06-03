@@ -821,9 +821,13 @@ Paniolo runs on Linux as well as macOS. Platform differences:
   NOPASSWD sudo (`ifconfig`/`networksetup` on macOS, `ip` on Linux).
 - **SSH PATH.** Non-interactive SSH shells often lack `/opt/homebrew/bin`.
   `_find_bin()` probes `_BREW_PATHS` on macOS and `/usr/sbin`+`/sbin` on Linux.
-- **hdmicap device auto-detection.** With two non-built-in cameras (e.g. MS2109
-  + Razer Kiyo), `guess_capture_device` returns None and the user is prompted.
-  Pass `--device "USB Video"` (or whatever substring matches) to skip the prompt.
+- **hdmicap device identity.** Capture devices have a stable, port-derived id
+  (AVFoundation `uniqueID` on macOS, `/dev/v4l/by-path` symlink on Linux) shown
+  by `hdmicap devices` / `paniolo video devices`. Prefer the id in lab files —
+  identical dongles (MS2109s ship without USB serials) are indistinguishable by
+  name. A name substring matching more than one device is a hard error listing
+  the candidates' ids; with several non-built-in captures (e.g. MS2109 + Razer
+  Kiyo), `paniolo configure` lists the id alternatives as comments.
 - **nokhwa MS2109 compatibility.** The MS2109 HDMI capture card doesn't expose
   standard MJPEG/YUYV formats through nokhwa's filtered list and throws
   NSException from AVFoundation frame-duration KVC calls. The vendor patch in

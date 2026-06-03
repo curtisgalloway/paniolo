@@ -109,7 +109,7 @@ cycle_cmd = "/home/curtisg/src/rpi5-bringup/scripts/power-cycle.sh"
 # --- the future case: one target spanning two control hosts ---
 [targets.fortune.video]
 host   = "bench2"                 # HDMI capture is on a different host
-device = "MS2109"
+device = "0x8300000534d2109"      # USB Video — stable, port-derived id
 ```
 
 - `host = "local"` (or unset, on a single-host lab) means the dev machine — i.e.

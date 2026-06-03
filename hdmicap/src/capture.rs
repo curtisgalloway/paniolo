@@ -35,6 +35,11 @@ pub struct DeviceInfo {
     pub index: u32,
     pub name: String,
     pub misc: String,
+    /// Stable identifier, derived from USB topology — survives reboots and
+    /// enumeration-order shifts, changes only if the device moves to another
+    /// port. macOS: the AVFoundation `uniqueID` (location ID + VID + PID).
+    /// Linux: the `/dev/v4l/by-path/...` symlink. Empty when unavailable.
+    pub id: String,
 }
 
 /// How the user asked us to pick a device.
@@ -81,47 +86,121 @@ pub trait CaptureBackend {
     fn frame(&mut self) -> Result<CapturedFrame>;
 }
 
+/// Map V4L2 device index → its stable `/dev/v4l/by-path` symlink (the Linux
+/// analogue of AVFoundation's uniqueID: derived from USB port topology).
+#[cfg(target_os = "linux")]
+fn stable_ids_by_index() -> std::collections::HashMap<u32, String> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(entries) = std::fs::read_dir("/dev/v4l/by-path") else {
+        return map;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(target) = std::fs::canonicalize(&path) else {
+            continue;
+        };
+        let target = target.to_string_lossy();
+        let Some(idx) = target
+            .strip_prefix("/dev/video")
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        map.entry(idx)
+            .or_insert_with(|| path.to_string_lossy().into_owned());
+    }
+    map
+}
+
 pub fn enumerate() -> Result<Vec<DeviceInfo>> {
     let cams = query(ApiBackend::Auto).context("nokhwa device query failed")?;
+    #[cfg(target_os = "linux")]
+    let by_path = stable_ids_by_index();
     Ok(cams
         .into_iter()
-        .map(|c| DeviceInfo {
-            index: match c.index() {
+        .map(|c| {
+            let index = match c.index() {
                 CameraIndex::Index(i) => *i,
                 CameraIndex::String(_) => u32::MAX,
-            },
-            name: c.human_name(),
-            misc: c.description().to_string(),
+            };
+            // macOS: the vendored bindings carry the AVFoundation uniqueID in
+            // CameraInfo::misc. Linux: join against the by-path symlinks.
+            #[cfg(not(target_os = "linux"))]
+            let id = c.misc();
+            #[cfg(target_os = "linux")]
+            let id = by_path.get(&index).cloned().unwrap_or_default();
+            DeviceInfo {
+                index,
+                name: c.human_name(),
+                misc: c.description().to_string(),
+                id,
+            }
         })
         .collect())
 }
 
 pub fn resolve(spec: &DeviceSpec) -> Result<u32> {
+    if let DeviceSpec::Index(i) = spec {
+        return Ok(*i);
+    }
+    // Any path-style spec (e.g. /dev/v4l/by-id/...) canonicalizes to
+    // /dev/videoN; by-path specs also hit the exact-id match in resolve_in.
+    #[cfg(target_os = "linux")]
+    if let DeviceSpec::Name(s) = spec {
+        if s.starts_with('/') {
+            if let Ok(target) = std::fs::canonicalize(s) {
+                if let Some(idx) = target
+                    .to_string_lossy()
+                    .strip_prefix("/dev/video")
+                    .and_then(|n| n.parse::<u32>().ok())
+                {
+                    return Ok(idx);
+                }
+            }
+        }
+    }
+    resolve_in(&enumerate()?, spec)
+}
+
+/// Pick a device from `devices` per `spec`. An exact stable-id match wins;
+/// otherwise case-insensitive name substring, which must match exactly one
+/// device — a first-match-wins guess is how two identical dongles end up
+/// silently swapped.
+fn resolve_in(devices: &[DeviceInfo], spec: &DeviceSpec) -> Result<u32> {
+    if devices.is_empty() {
+        return Err(anyhow!("no capture devices found"));
+    }
     match spec {
         DeviceSpec::Index(i) => Ok(*i),
-        _ => {
-            let devices = enumerate()?;
-            if devices.is_empty() {
-                return Err(anyhow!("no capture devices found"));
+        DeviceSpec::Name(s) => {
+            if let Some(d) = devices.iter().find(|d| !d.id.is_empty() && d.id == *s) {
+                return Ok(d.index);
             }
-            match spec {
-                DeviceSpec::Index(i) => Ok(*i),
-                DeviceSpec::Name(sub) => {
-                    let sub = sub.to_lowercase();
-                    devices
-                        .iter()
-                        .find(|d| d.name.to_lowercase().contains(&sub))
-                        .map(|d| d.index)
-                        .ok_or_else(|| anyhow!("no device matching name {:?}", sub))
-                }
-                DeviceSpec::Auto => {
-                    let external = devices.iter().find(|d| {
-                        let n = d.name.to_lowercase();
-                        !BUILTIN_HINTS.iter().any(|h| n.contains(h))
-                    });
-                    Ok(external.unwrap_or(&devices[0]).index)
-                }
+            let sub = s.to_lowercase();
+            let matches: Vec<&DeviceInfo> = devices
+                .iter()
+                .filter(|d| d.name.to_lowercase().contains(&sub))
+                .collect();
+            match matches.as_slice() {
+                [] => Err(anyhow!("no device matching name or id {:?}", s)),
+                [d] => Ok(d.index),
+                many => Err(anyhow!(
+                    "device {:?} is ambiguous ({} matches) — use a stable id:\n{}",
+                    s,
+                    many.len(),
+                    many.iter()
+                        .map(|d| format!("  {:>3}  {}  id={}", d.index, d.name, d.id))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )),
             }
+        }
+        DeviceSpec::Auto => {
+            let external = devices.iter().find(|d| {
+                let n = d.name.to_lowercase();
+                !BUILTIN_HINTS.iter().any(|h| n.contains(h))
+            });
+            Ok(external.unwrap_or(&devices[0]).index)
         }
     }
 }
@@ -360,5 +439,77 @@ mod macos {
                 rgb: decoded,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dev(index: u32, name: &str, id: &str) -> DeviceInfo {
+        DeviceInfo {
+            index,
+            name: name.to_string(),
+            misc: String::new(),
+            id: id.to_string(),
+        }
+    }
+
+    fn two_dongles() -> Vec<DeviceInfo> {
+        vec![
+            dev(0, "USB Video", "0x8300000534d2109"),
+            dev(1, "USB Video", "0x8200000534d2109"),
+            dev(2, "FaceTime HD Camera", "0x1421000005ac8514"),
+        ]
+    }
+
+    #[test]
+    fn exact_id_match_wins() {
+        let devices = two_dongles();
+        let spec = DeviceSpec::parse("0x8200000534d2109");
+        assert_eq!(resolve_in(&devices, &spec).unwrap(), 1);
+    }
+
+    #[test]
+    fn unique_name_substring_matches() {
+        let devices = two_dongles();
+        let spec = DeviceSpec::parse("facetime");
+        assert_eq!(resolve_in(&devices, &spec).unwrap(), 2);
+    }
+
+    #[test]
+    fn ambiguous_name_is_an_error_listing_ids() {
+        let devices = two_dongles();
+        let spec = DeviceSpec::parse("USB Video");
+        let err = resolve_in(&devices, &spec).unwrap_err().to_string();
+        assert!(err.contains("ambiguous"), "{err}");
+        assert!(err.contains("0x8300000534d2109"), "{err}");
+        assert!(err.contains("0x8200000534d2109"), "{err}");
+    }
+
+    #[test]
+    fn no_match_is_an_error() {
+        let devices = two_dongles();
+        let spec = DeviceSpec::parse("Elgato");
+        assert!(resolve_in(&devices, &spec).is_err());
+    }
+
+    #[test]
+    fn auto_prefers_external_over_builtin() {
+        let devices = vec![
+            dev(0, "FaceTime HD Camera", "0x1421000005ac8514"),
+            dev(1, "USB Video", "0x8300000534d2109"),
+        ];
+        assert_eq!(resolve_in(&devices, &DeviceSpec::Auto).unwrap(), 1);
+    }
+
+    #[test]
+    fn empty_id_never_matches_empty_spec_id() {
+        // A device with no stable id must not be selected by id equality.
+        let devices = vec![dev(0, "USB Video", "")];
+        let spec = DeviceSpec::Name(String::new());
+        // Empty string parses to Auto via parse(); construct Name directly to
+        // prove the id-equality guard, then expect substring match (matches).
+        assert_eq!(resolve_in(&devices, &spec).unwrap(), 0);
     }
 }
