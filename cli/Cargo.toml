@@ -39,8 +39,12 @@ thiserror = "2"
 # --- Paths ---------------------------------------------------------------
 dirs = "5"
 
-# --- uid for the per-user ControlMaster socket dir -----------------------
+# --- uid for the per-user ControlMaster socket dir; daemon pid checks ----
 libc = "0.2"
+
+# --- talking to the serialcap/hdmicap daemons (localhost HTTP) -----------
+ureq = "2"
+serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"
