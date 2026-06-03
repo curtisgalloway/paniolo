@@ -11,7 +11,7 @@ cli/
     daemons.rs (76 lines)
     discover.rs (227 lines)
     dispatch.rs (289 lines)
-    doctor.rs (184 lines)
+    doctor.rs (207 lines)
     labfile.rs (505 lines)
     main.rs (2103 lines)
     model.rs (519 lines)

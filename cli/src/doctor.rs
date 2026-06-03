@@ -83,14 +83,37 @@ fn field<'a>(ch: &'a ResolvedChannel, key: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
+/// Probe script for a video channel. The device is usually a capture-device
+/// NAME (e.g. "USB Video" on macOS), not a path, so `test -e` alone is wrong:
+/// ask `hdmicap devices` on the channel host whether it enumerates. Path-style
+/// devices (`/dev/video0`) still short-circuit via `test -e`. Exit 3 = hdmicap
+/// itself is missing (PATH or ~/.cargo/bin), a distinct failure from a missing
+/// device.
+fn video_probe_script(device: &str) -> String {
+    let q = ssh::shell_quote(device);
+    format!(
+        "test -e {q} && exit 0; \
+         bin=$(command -v hdmicap) || bin=\"$HOME/.cargo/bin/hdmicap\"; \
+         test -x \"$bin\" || exit 3; \
+         \"$bin\" devices 2>/dev/null | grep -F -q -- {q}"
+    )
+}
+
 fn check_channel(lab: &Lab, ch: &ResolvedChannel, rt: &ResolvedTarget) -> (Status, String) {
     match ch.kind {
-        ChannelKind::Serial | ChannelKind::Video => match field(ch, "device") {
+        ChannelKind::Serial => match field(ch, "device") {
             None => (Status::Incomplete, "no device set".to_string()),
             Some(dev) => interpret(
                 probe(lab, &ch.host, &format!("test -e {}", ssh::shell_quote(dev))),
                 dev,
             ),
+        },
+        ChannelKind::Video => match field(ch, "device") {
+            None => (Status::Incomplete, "no device set".to_string()),
+            Some(dev) => match probe(lab, &ch.host, &video_probe_script(dev)) {
+                Some(3) => (Status::Missing, format!("{dev} (hdmicap not installed)")),
+                rc => interpret(rc, dev),
+            },
         },
         ChannelKind::Netboot => match field(ch, "interface") {
             None => (Status::Incomplete, "no interface set".to_string()),
