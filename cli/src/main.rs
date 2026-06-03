@@ -19,20 +19,17 @@
 //! channels that connect them. This module is the CLI surface; the model and
 //! editor live in [`model`] and [`labfile`].
 
-// The dispatch + SSH transport and a few model/labfile helpers are per-channel
-// runtime infrastructure (unit-tested) that the runtime commands — netboot,
-// serial, video, power — will consume once ported (R3). Until then they have no
-// caller; drop this allow when those commands land.
-#![allow(dead_code)]
-
 mod daemons;
 mod dispatch;
 mod doctor;
 mod labfile;
 mod model;
+mod netboot;
+mod netif;
 mod power;
 mod serial;
 mod ssh;
+mod state;
 mod video;
 
 use std::path::PathBuf;
@@ -85,10 +82,15 @@ enum Command {
         #[command(subcommand)]
         cmd: SerialCmd,
     },
-    /// Configure a target's netboot channel.
+    /// Configure a target's netboot channel and run DHCP+TFTP netboot.
     Netboot {
         #[command(subcommand)]
         cmd: NetbootCmd,
+    },
+    /// Switch the USB-Ethernet link between netboot and ffx modes.
+    Netif {
+        #[command(subcommand)]
+        cmd: NetifCmd,
     },
     /// Configure a target's power channel.
     Power {
@@ -324,6 +326,44 @@ enum NetbootCmd {
         #[arg(long, short)]
         target: String,
     },
+    /// Start DHCP+TFTP netboot (the netbootd daemon) for a target.
+    Start { target: Option<String> },
+    /// Stop netboot and restore the interface.
+    Stop { target: Option<String> },
+    /// Show netboot daemon status.
+    Status { target: Option<String> },
+    /// Show the netboot log (combined DHCP+TFTP).
+    Logs {
+        target: Option<String>,
+        /// Show only the most recent N lines.
+        #[arg(long, short = 'n', default_value_t = 50)]
+        tail: usize,
+        /// Keep printing new lines as they arrive.
+        #[arg(long, short)]
+        follow: bool,
+    },
+    /// Print the target's TFTP root path.
+    TftpRoot { target: Option<String> },
+    /// List candidate USB-Ethernet interfaces on this machine.
+    Devices,
+    /// Bring the USB-Ethernet link up with the host IP assigned.
+    LinkUp { target: Option<String> },
+    /// Take the link down and release the host IP.
+    LinkDown { target: Option<String> },
+    /// Show the current state of the USB-Ethernet link.
+    LinkStatus { target: Option<String> },
+}
+
+#[derive(Subcommand)]
+enum NetifCmd {
+    /// Switch the link mode: netboot | ffx | off (idempotent).
+    Mode {
+        /// netboot | ffx | off.
+        mode: String,
+        target: Option<String>,
+    },
+    /// Show which mode the link is in and its addresses.
+    Status { target: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -419,6 +459,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Target { cmd } => target_cmd(lab_flag, cmd),
         Command::Serial { cmd } => serial_cmd(lab_flag, cmd),
         Command::Netboot { cmd } => netboot_cmd(lab_flag, cmd),
+        Command::Netif { cmd } => netif_cmd(lab_flag, cmd),
         Command::Power { cmd } => power_cmd(lab_flag, cmd),
         Command::Video { cmd } => video_cmd(lab_flag, cmd),
         Command::PowerCycle { target } => cmd_power_cycle(lab_flag, target.as_deref()),
@@ -1402,6 +1443,255 @@ fn netboot_cmd(lab_flag: Option<&str>, cmd: NetbootCmd) -> Result<()> {
             edit_lab(lab_flag, |lf| lf.remove_netboot(&target))?;
             println!("netboot channel removed from '{target}'.");
             Ok(())
+        }
+        NetbootCmd::Start { target } => {
+            let (target, iface, host_ip, tftp_root) = netboot_runtime(lab_flag, target.as_deref())?;
+            let root = tftp_root.ok_or_else(|| {
+                anyhow!(
+                    "no tftp_root configured \
+                     (paniolo netboot set -t {target} --tftp-root <path>)"
+                )
+            })?;
+            netboot::start(&target, &iface, &host_ip, &root)?;
+            println!("netboot started for '{target}' on {iface} ({host_ip}, tftp {root}).");
+            Ok(())
+        }
+        NetbootCmd::Stop { target } => {
+            let (target, ..) = netboot_runtime(lab_flag, target.as_deref())?;
+            netboot::stop(&target)?;
+            println!("netboot stopped for '{target}'.");
+            Ok(())
+        }
+        NetbootCmd::Status { target } => {
+            let (target, ..) = netboot_runtime(lab_flag, target.as_deref())?;
+            let st = netboot::status(&target);
+            match st.state {
+                None => println!("netboot\tnot running (no state)"),
+                Some(s) => {
+                    println!(
+                        "netboot\t{}",
+                        if st.running {
+                            "running"
+                        } else {
+                            "NOT running (stale state)"
+                        }
+                    );
+                    println!("pid\t{}", s.dhcp_pid);
+                    println!("interface\t{}", s.interface);
+                    println!("tftp_root\t{}", s.tftp_root);
+                    if let Some(up) = st.uptime_seconds {
+                        println!("uptime\t{:.0}s", up);
+                    }
+                }
+            }
+            Ok(())
+        }
+        NetbootCmd::Logs {
+            target,
+            tail,
+            follow,
+        } => {
+            let (target, ..) = netboot_runtime(lab_flag, target.as_deref())?;
+            cmd_netboot_logs(&target, tail, follow)
+        }
+        NetbootCmd::TftpRoot { target } => {
+            let (_t, _i, _ip, tftp_root) = netboot_runtime(lab_flag, target.as_deref())?;
+            match tftp_root {
+                Some(r) => {
+                    println!("{r}");
+                    Ok(())
+                }
+                None => bail!("no tftp_root configured"),
+            }
+        }
+        NetbootCmd::Devices => {
+            let ifaces = netif::list_usb_ethernet_interfaces();
+            if ifaces.is_empty() {
+                println!("No candidate Ethernet interfaces found.");
+            }
+            for i in ifaces {
+                println!(
+                    "{}\t{}\t{}",
+                    i.device,
+                    i.port,
+                    if i.active { "active" } else { "inactive" }
+                );
+            }
+            Ok(())
+        }
+        NetbootCmd::LinkUp { target } => {
+            let (_t, iface, host_ip, _r) = netboot_runtime(lab_flag, target.as_deref())?;
+            netif::configure_interface(&iface, &host_ip)?;
+            let active = netif::is_interface_active(&iface);
+            println!(
+                "Link {}  {iface}  {host_ip}",
+                if active { "up" } else { "not yet up" }
+            );
+            Ok(())
+        }
+        NetbootCmd::LinkDown { target } => {
+            let (_t, iface, ..) = netboot_runtime(lab_flag, target.as_deref())?;
+            netif::restore_interface(&iface);
+            println!("Link down  {iface}");
+            Ok(())
+        }
+        NetbootCmd::LinkStatus { target } => {
+            let (_t, iface, ..) = netboot_runtime(lab_flag, target.as_deref())?;
+            let (inet, inet6) = netif::iface_addresses(&iface);
+            println!("interface\t{iface}");
+            println!(
+                "carrier\t{}",
+                if netif::is_interface_active(&iface) {
+                    "yes"
+                } else {
+                    "no"
+                }
+            );
+            let mut addrs = inet;
+            addrs.extend(inet6);
+            println!(
+                "addresses\t{}",
+                if addrs.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    addrs.join(" ")
+                }
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Common preamble for netboot/netif runtime commands: resolve, dispatch to the
+/// netboot channel's host if remote, and return (target, interface, host_ip,
+/// tftp_root) from the local channel.
+fn netboot_runtime(
+    lab_flag: Option<&str>,
+    target: Option<&str>,
+) -> Result<(String, String, String, Option<String>)> {
+    let lab = load_for_read(lab_flag)?;
+    let target = resolve_single_target(&lab, target)?;
+    if let Some(code) = dispatch::maybe_dispatch(
+        &lab,
+        &target,
+        model::ChannelKind::Netboot,
+        None,
+        dispatch::Mode::Reexec,
+    )? {
+        std::process::exit(code);
+    }
+    let t = lab
+        .targets
+        .get(&target)
+        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+    let dh = t.default_host().to_string();
+    let nb = t.netboot.clone().ok_or_else(|| {
+        anyhow!("target '{target}' has no netboot channel (paniolo netboot set -t {target} ...)")
+    })?;
+    if nb.host.as_deref().unwrap_or(&dh) != model::LOCAL {
+        bail!("netboot channel for '{target}' is not on this host");
+    }
+    let iface = nb
+        .interface
+        .ok_or_else(|| anyhow!("netboot channel for '{target}' has no interface set"))?;
+    let host_ip = nb
+        .host_ip
+        .unwrap_or_else(|| model::DEFAULT_HOST_IP.to_string());
+    Ok((target, iface, host_ip, nb.tftp_root))
+}
+
+fn cmd_netboot_logs(target: &str, tail: usize, follow: bool) -> Result<()> {
+    let path = state::netboot_log_path(target);
+    if !path.exists() {
+        bail!("no netboot log for '{target}' yet ({})", path.display());
+    }
+    let text = std::fs::read_to_string(&path)?;
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(tail);
+    for line in &lines[start..] {
+        println!("{line}");
+    }
+    if !follow {
+        return Ok(());
+    }
+    // Follow: poll for appended bytes (Ctrl-C to stop).
+    use std::io::{Read, Seek};
+    let mut f = std::fs::File::open(&path)?;
+    f.seek(std::io::SeekFrom::End(0))?;
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        f.read_to_string(&mut buf)?;
+        if !buf.is_empty() {
+            print!("{buf}");
+            use std::io::Write;
+            std::io::stdout().flush()?;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+fn netif_cmd(lab_flag: Option<&str>, cmd: NetifCmd) -> Result<()> {
+    match cmd {
+        NetifCmd::Mode { mode, target } => {
+            if !netif::MODES.contains(&mode.as_str()) {
+                bail!(
+                    "unknown mode '{mode}' (use one of: {})",
+                    netif::MODES.join(", ")
+                );
+            }
+            let (target, iface, host_ip, tftp_root) = netboot_runtime(lab_flag, target.as_deref())?;
+            match mode.as_str() {
+                "netboot" => {
+                    let root = tftp_root.clone().ok_or_else(|| {
+                        anyhow!("no tftp_root configured — netboot mode needs one")
+                    })?;
+                    netif::mode_netboot(&target, &iface, &host_ip, &root)?;
+                }
+                "ffx" => netif::mode_ffx(&target, &iface)?,
+                _ => netif::mode_off(&target, &iface, &host_ip)?,
+            }
+            print_netif_status(&target, &iface, &host_ip);
+            Ok(())
+        }
+        NetifCmd::Status { target } => {
+            let (target, iface, host_ip, _r) = netboot_runtime(lab_flag, target.as_deref())?;
+            print_netif_status(&target, &iface, &host_ip);
+            Ok(())
+        }
+    }
+}
+
+fn print_netif_status(target: &str, iface: &str, host_ip: &str) {
+    let s = netif::get_status(target, iface);
+    println!("target\t{target}");
+    println!("interface\t{iface}");
+    println!("mode\t{}", s.mode);
+    println!(
+        "inet\t{}",
+        if s.inet.is_empty() {
+            "(none)".to_string()
+        } else {
+            s.inet.join(" ")
+        }
+    );
+    println!(
+        "inet6\t{}",
+        if s.inet6.is_empty() {
+            "(none)".to_string()
+        } else {
+            s.inet6.join(" ")
+        }
+    );
+    if s.mode == "netboot" {
+        println!("dhcp+tftp\tserving on {host_ip}/24");
+    }
+    if s.mode == "ffx" {
+        if s.peers.is_empty() {
+            println!("peer\t(none discovered yet — power-cycle the target and wait for SLAAC)");
+        }
+        for peer in &s.peers {
+            println!("peer\t{peer}%{iface}  (try: ffx target add {peer}%{iface})");
         }
     }
 }
