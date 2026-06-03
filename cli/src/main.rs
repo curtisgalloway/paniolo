@@ -30,6 +30,7 @@ mod dispatch;
 mod doctor;
 mod labfile;
 mod model;
+mod power;
 mod serial;
 mod ssh;
 mod video;
@@ -99,6 +100,10 @@ enum Command {
         #[command(subcommand)]
         cmd: VideoCmd,
     },
+    /// Run the target's configured power-cycle command.
+    PowerCycle { target: Option<String> },
+    /// Show whether the target is powered on (via the serial sense line).
+    PowerState { target: Option<String> },
     /// Probe configured channels against reality over SSH (config vs hardware).
     Doctor {
         /// Target to check (default: all).
@@ -278,6 +283,25 @@ enum SerialCmd {
     Devices,
     /// Show a target's serial interfaces and the daemon status.
     Show { target: Option<String> },
+    /// Pulse the DTR line (J2 power-button header) on a serial interface.
+    Dtr {
+        target: Option<String>,
+        /// Pulse duration in ms (≤500 = soft power-button event, ≥3000 = hard off).
+        #[arg(long, default_value_t = 200)]
+        ms: u64,
+        /// Interface name (default: the power channel's serial_interface, or the
+        /// only one).
+        #[arg(long, short)]
+        interface: Option<String>,
+    },
+    /// Send a soft-reset signal via a brief J2 power-button press.
+    Reset {
+        target: Option<String>,
+        #[arg(long, default_value_t = 200)]
+        ms: u64,
+        #[arg(long, short)]
+        interface: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -397,6 +421,8 @@ fn run(cli: Cli) -> Result<()> {
         Command::Netboot { cmd } => netboot_cmd(lab_flag, cmd),
         Command::Power { cmd } => power_cmd(lab_flag, cmd),
         Command::Video { cmd } => video_cmd(lab_flag, cmd),
+        Command::PowerCycle { target } => cmd_power_cycle(lab_flag, target.as_deref()),
+        Command::PowerState { target } => cmd_power_state(lab_flag, target.as_deref()),
         Command::Doctor { target, host } => {
             cmd_doctor(lab_flag, target.as_deref(), host.as_deref())
         }
@@ -846,6 +872,160 @@ fn serial_cmd(lab_flag: Option<&str>, cmd: SerialCmd) -> Result<()> {
             Ok(())
         }
         SerialCmd::Show { target } => cmd_serial_show(lab_flag, target.as_deref()),
+        SerialCmd::Dtr {
+            target,
+            ms,
+            interface,
+        } => cmd_serial_dtr(
+            lab_flag,
+            target.as_deref(),
+            ms,
+            interface.as_deref(),
+            "DTR pulse",
+        ),
+        SerialCmd::Reset {
+            target,
+            ms,
+            interface,
+        } => cmd_serial_dtr(
+            lab_flag,
+            target.as_deref(),
+            ms,
+            interface.as_deref(),
+            "Soft reset",
+        ),
+    }
+}
+
+/// Pulse DTR on a target's serial interface — via the serialcap daemon when it
+/// is running (it owns the port), else directly.
+fn cmd_serial_dtr(
+    lab_flag: Option<&str>,
+    target: Option<&str>,
+    ms: u64,
+    interface: Option<&str>,
+    label: &str,
+) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    let target = resolve_single_target(&lab, target)?;
+    // Default interface: the power channel's serial_interface (if configured).
+    let default_iface = lab
+        .targets
+        .get(&target)
+        .and_then(|t| t.power.as_ref())
+        .and_then(|p| p.serial_interface.clone());
+    let iface = interface.map(String::from).or(default_iface);
+    if let Some(code) = dispatch::maybe_dispatch(
+        &lab,
+        &target,
+        model::ChannelKind::Serial,
+        iface.as_deref(),
+        dispatch::Mode::Reexec,
+    )? {
+        std::process::exit(code);
+    }
+    let serials = local_serials(&lab, &target)?;
+    let ch = pick_serial(&serials, iface.as_deref())?;
+    if let Some(url) = serial::daemon_url() {
+        eprintln!("{label} on '{target}' ({ms} ms via serialcap daemon)");
+        power::dtr_press_daemon(&url, &ch.name, ms)?;
+    } else {
+        eprintln!("{label} on '{target}' ({ms} ms via {} directly)", ch.device);
+        power::dtr_press_direct(&ch.device, ms)?;
+    }
+    println!("Done.");
+    Ok(())
+}
+
+// ── power runtime bodies ────────────────────────────────────────────────────
+
+/// The target's power channel as visible on *this* host.
+fn local_power(lab: &Lab, target: &str) -> Result<model::PowerChannel> {
+    let t = lab
+        .targets
+        .get(target)
+        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+    let dh = t.default_host().to_string();
+    let p = t.power.clone().ok_or_else(|| {
+        anyhow!("target '{target}' has no power channel (paniolo power set -t {target} ...)")
+    })?;
+    if p.host.as_deref().unwrap_or(&dh) != model::LOCAL {
+        bail!("power channel for '{target}' is not on this host");
+    }
+    Ok(p)
+}
+
+fn cmd_power_cycle(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    let target = resolve_single_target(&lab, target)?;
+    if let Some(code) = dispatch::maybe_dispatch(
+        &lab,
+        &target,
+        model::ChannelKind::Power,
+        None,
+        dispatch::Mode::Reexec,
+    )? {
+        std::process::exit(code);
+    }
+    let p = local_power(&lab, &target)?;
+    let cmd = p.cycle_cmd.ok_or_else(|| {
+        anyhow!(
+            "no cycle_cmd configured for '{target}' \
+             (paniolo power set -t {target} --cycle-cmd /path/to/script)"
+        )
+    })?;
+    eprintln!("Power cycling '{target}' via {cmd}");
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .status()?;
+    if status.success() {
+        println!("Power cycle complete.");
+        Ok(())
+    } else {
+        eprintln!(
+            "power-cycle script exited with code {}",
+            status.code().unwrap_or(1)
+        );
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+fn cmd_power_state(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    let target = resolve_single_target(&lab, target)?;
+    if let Some(code) = dispatch::maybe_dispatch(
+        &lab,
+        &target,
+        model::ChannelKind::Power,
+        None,
+        dispatch::Mode::Reexec,
+    )? {
+        std::process::exit(code);
+    }
+    let p = local_power(&lab, &target)?;
+    let si = p.serial_interface.ok_or_else(|| {
+        anyhow!(
+            "no power serial_interface configured for '{target}' \
+             (paniolo power set -t {target} --serial-interface <name>)"
+        )
+    })?;
+    let url = serial::daemon_url().ok_or_else(|| {
+        anyhow!("serialcap daemon not running — start it with `paniolo serial watch`")
+    })?;
+    match power::read_power_state(&url, &si) {
+        Some(true) => {
+            println!("Power ON  ({target})");
+            Ok(())
+        }
+        Some(false) => {
+            println!("Power OFF  ({target})");
+            Ok(())
+        }
+        None => bail!(
+            "power state unknown — the sense signal may not be configured on '{si}' \
+             (paniolo serial set {si} -t {target} --sense <cts|dsr|dcd|ri>)"
+        ),
     }
 }
 
