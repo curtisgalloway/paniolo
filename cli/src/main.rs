@@ -102,6 +102,13 @@ enum Command {
         #[command(subcommand)]
         cmd: VideoCmd,
     },
+    /// Open the combined video+serial dashboard, starting daemons if needed.
+    Console {
+        target: Option<String>,
+        /// Serial interface name to preselect in the dashboard terminal.
+        #[arg(long, short)]
+        interface: Option<String>,
+    },
     /// Run the target's configured power-cycle command.
     PowerCycle { target: Option<String> },
     /// Show whether the target is powered on (via the serial sense line).
@@ -462,6 +469,9 @@ fn run(cli: Cli) -> Result<()> {
         Command::Netif { cmd } => netif_cmd(lab_flag, cmd),
         Command::Power { cmd } => power_cmd(lab_flag, cmd),
         Command::Video { cmd } => video_cmd(lab_flag, cmd),
+        Command::Console { target, interface } => {
+            cmd_console(lab_flag, target.as_deref(), interface.as_deref())
+        }
         Command::PowerCycle { target } => cmd_power_cycle(lab_flag, target.as_deref()),
         Command::PowerState { target } => cmd_power_state(lab_flag, target.as_deref()),
         Command::Doctor { target, host } => {
@@ -976,6 +986,130 @@ fn cmd_serial_dtr(
     }
     println!("Done.");
     Ok(())
+}
+
+// ── console (composite: video + serial dashboard) ───────────────────────────
+
+fn dashboard_url(video_base: &str, serial_ws: Option<&str>, interface: Option<&str>) -> String {
+    let mut params: Vec<String> = Vec::new();
+    if let Some(ws) = serial_ws {
+        params.push(format!("serialws={ws}"));
+    }
+    if let Some(i) = interface {
+        params.push(format!("interface={i}"));
+    }
+    if params.is_empty() {
+        video_base.to_string()
+    } else {
+        format!("{video_base}/?{}", params.join("&"))
+    }
+}
+
+fn open_in_browser(url: &str) {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(opener)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// The combined dashboard is a composite command: it needs the serial and video
+/// channels co-located on one host. Locally it ensures both daemons; remotely
+/// it starts them over SSH and holds tunnels to both.
+fn cmd_console(
+    lab_flag: Option<&str>,
+    target: Option<&str>,
+    interface: Option<&str>,
+) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    let target = resolve_single_target(&lab, target)?;
+    let rt = lab
+        .resolved_target(&target)
+        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+    let serial_host = model::channel_host(&rt, model::ChannelKind::Serial, interface)?;
+    let video_host = model::channel_host(&rt, model::ChannelKind::Video, None)?;
+    if serial_host != video_host {
+        bail!(
+            "console needs the serial and video channels on one host; \
+             serial is on '{serial_host}', video on '{video_host}'"
+        );
+    }
+    let host = lab.host(&serial_host);
+    if !host.is_local(&serial_host) {
+        return remote_console(&lab, &target, &serial_host, interface);
+    }
+
+    // Local: ensure both daemons (OS-assigned ports; discovery finds them).
+    let video_url = match video::daemon_url() {
+        Some(u) => u,
+        None => {
+            let v = local_video(&lab, &target)?;
+            let device = v
+                .device
+                .ok_or_else(|| anyhow!("video channel for '{target}' has no device set"))?;
+            eprintln!("Starting video daemon…");
+            video::start_daemon(&device, 0, Some(&target))?;
+            daemons::wait_for_daemon(video::DAEMON, std::time::Duration::from_secs(5))
+                .ok_or_else(|| anyhow!("video daemon did not start within 5 s"))?
+        }
+    };
+    if serial::daemon_url().is_none() {
+        let serials = local_serials(&lab, &target)?;
+        if serials.is_empty() {
+            bail!("no serial interfaces configured for '{target}' (paniolo serial add ...)");
+        }
+        eprintln!("Starting serial daemon…");
+        serial::start_daemon(&serials, 0)?;
+        daemons::wait_for_daemon(serial::DAEMON, std::time::Duration::from_secs(5))
+            .ok_or_else(|| anyhow!("serial daemon did not start within 5 s"))?;
+    }
+    let url = dashboard_url(&video_url, None, interface);
+    open_in_browser(&url);
+    println!("Opened {url}");
+    Ok(())
+}
+
+fn remote_console(lab: &Lab, target: &str, host_name: &str, interface: Option<&str>) -> Result<()> {
+    let host = lab.host(host_name);
+    eprintln!("Starting daemons on {host_name}…");
+    for sub in [["video", "watch"], ["serial", "watch"]] {
+        let out = dispatch::run_subcommand(lab, target, host_name, &[sub[0], sub[1], target])?;
+        if out.status != 0 {
+            let msg = if out.stderr.trim().is_empty() {
+                out.stdout.trim().to_string()
+            } else {
+                out.stderr.trim().to_string()
+            };
+            bail!(
+                "failed to start '{} {}' on {host_name}: {msg}",
+                sub[0],
+                sub[1]
+            );
+        }
+    }
+    let video_port = dispatch::remote_daemon_port(&host, "hdmicap")
+        .ok_or_else(|| anyhow!("could not read the hdmicap daemon port on {host_name}"))?;
+    let serial_port = dispatch::remote_daemon_port(&host, "serialcap")
+        .ok_or_else(|| anyhow!("could not read the serialcap daemon port on {host_name}"))?;
+
+    let fwd_video = ssh::forward(&host, video_port)?;
+    let fwd_serial = ssh::forward(&host, serial_port)?;
+    let url = dashboard_url(
+        &format!("http://127.0.0.1:{}", fwd_video.local_port),
+        Some(&format!("ws://127.0.0.1:{}/stream", fwd_serial.local_port)),
+        interface,
+    );
+    open_in_browser(&url);
+    println!("Opened {url}");
+    println!("Tunnels to {host_name} open. Press Ctrl-C to close.");
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
 }
 
 // ── power runtime bodies ────────────────────────────────────────────────────

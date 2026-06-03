@@ -62,8 +62,11 @@ fn control_args(host: &Host) -> Vec<String> {
     ]
 }
 
-/// Base `ssh` argv (program + options) for a non-local host.
-fn base_args(host: &Host, interactive: bool) -> Vec<String> {
+/// Base `ssh` argv (program + options) for a non-local host. `multiplex=false`
+/// gives a standalone connection — a port forward must own its channel: an
+/// `ssh -N -L` attached to a ControlMaster hands the forward to the master and
+/// exits, so the process no longer represents (or can tear down) the tunnel.
+fn base_args(host: &Host, interactive: bool, multiplex: bool) -> Vec<String> {
     debug_assert!(host.ssh != LOCAL, "ssh called for the local host");
     let mut a = vec!["ssh".to_string()];
     if !interactive {
@@ -79,7 +82,15 @@ fn base_args(host: &Host, interactive: bool) -> Vec<String> {
         a.push("-o".into());
         a.push("IdentitiesOnly=yes".into());
     }
-    a.extend(control_args(host));
+    if multiplex {
+        a.extend(control_args(host));
+    } else {
+        a.extend(
+            ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
+                .iter()
+                .map(|s| s.to_string()),
+        );
+    }
     a
 }
 
@@ -121,7 +132,7 @@ pub fn run(
     env: &[(String, String)],
 ) -> std::io::Result<Output> {
     let mut cmd = Command::new("ssh");
-    cmd.args(&base_args(host, false)[1..]);
+    cmd.args(&base_args(host, false, true)[1..]);
     cmd.arg(&host.ssh);
     cmd.arg(remote_command(argv, env));
     cmd.stdin(if stdin.is_some() {
@@ -155,7 +166,7 @@ pub fn run_passthrough(
     env: &[(String, String)],
 ) -> std::io::Result<i32> {
     let status = Command::new("ssh")
-        .args(&base_args(host, false)[1..])
+        .args(&base_args(host, false, true)[1..])
         .arg(&host.ssh)
         .arg(remote_command(argv, env))
         .status()?;
@@ -169,12 +180,70 @@ pub fn run_interactive(
     env: &[(String, String)],
 ) -> std::io::Result<i32> {
     let status = Command::new("ssh")
-        .args(&base_args(host, true)[1..])
+        .args(&base_args(host, true, true)[1..])
         .arg("-t")
         .arg(&host.ssh)
         .arg(remote_command(argv, env))
         .status()?;
     Ok(status.code().unwrap_or(-1))
+}
+
+/// A held `ssh -L` tunnel to a port on `host`; killed on drop.
+pub struct Forward {
+    pub local_port: u16,
+    child: std::process::Child,
+}
+
+impl Drop for Forward {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn free_local_port() -> std::io::Result<u16> {
+    // Small TOCTOU window is acceptable.
+    let l = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    Ok(l.local_addr()?.port())
+}
+
+/// Open an `ssh -L` tunnel to `127.0.0.1:remote_port` on `host`, returning once
+/// the local end accepts connections. The forwarder is standalone (not
+/// multiplexed) so killing it reliably tears the tunnel down.
+pub fn forward(host: &Host, remote_port: u16) -> anyhow::Result<Forward> {
+    use anyhow::bail;
+    let local_port = free_local_port()?;
+    let spec = format!("{local_port}:127.0.0.1:{remote_port}");
+    let mut child = Command::new("ssh")
+        .args(&base_args(host, false, false)[1..])
+        .arg("-N")
+        .arg("-L")
+        .arg(&spec)
+        .arg(&host.ssh)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            bail!(
+                "ssh forward to {}:{remote_port} exited early ({status})",
+                host.ssh
+            );
+        }
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], local_port));
+        if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500))
+            .is_ok()
+        {
+            return Ok(Forward { local_port, child });
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            bail!("timed out waiting for forwarded port {local_port}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 #[cfg(test)]
@@ -215,11 +284,11 @@ mod tests {
             identity: Some("~/.ssh/id".into()),
             ..Default::default()
         };
-        let a = base_args(&host, false).join(" ");
+        let a = base_args(&host, false, true).join(" ");
         assert!(a.contains("BatchMode=yes"), "{a}");
         assert!(a.contains("ControlMaster=auto"), "{a}");
         assert!(a.contains("IdentitiesOnly=yes"), "{a}");
         // Interactive variant drops BatchMode (so a PTY/password can work).
-        assert!(!base_args(&host, true).join(" ").contains("BatchMode"));
+        assert!(!base_args(&host, true, true).join(" ").contains("BatchMode"));
     }
 }
