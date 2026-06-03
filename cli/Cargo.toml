@@ -42,6 +42,9 @@ dirs = "5"
 # --- uid for the per-user ControlMaster socket dir -----------------------
 libc = "0.2"
 
+# --- serial I/O for the CH9329 HID injector (Openterface) ----------------
+serialport = "4"
+
 [dev-dependencies]
 tempfile = "3"
 

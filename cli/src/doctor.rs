@@ -85,7 +85,7 @@ fn field<'a>(ch: &'a ResolvedChannel, key: &str) -> Option<&'a str> {
 
 fn check_channel(lab: &Lab, ch: &ResolvedChannel, rt: &ResolvedTarget) -> (Status, String) {
     match ch.kind {
-        ChannelKind::Serial | ChannelKind::Video => match field(ch, "device") {
+        ChannelKind::Serial | ChannelKind::Video | ChannelKind::Hid => match field(ch, "device") {
             None => (Status::Incomplete, "no device set".to_string()),
             Some(dev) => interpret(
                 probe(lab, &ch.host, &format!("test -e {}", ssh::shell_quote(dev))),

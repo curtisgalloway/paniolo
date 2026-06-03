@@ -19,6 +19,7 @@
 //! channels that connect them. This module is the CLI surface; the model and
 //! editor live in [`model`] and [`labfile`].
 
+mod ch9329;
 mod dispatch;
 mod doctor;
 mod labfile;
@@ -84,6 +85,11 @@ enum Command {
     Power {
         #[command(subcommand)]
         cmd: PowerCmd,
+    },
+    /// Configure and drive a target's HID (keyboard/mouse) channel.
+    Hid {
+        #[command(subcommand)]
+        cmd: HidCmd,
     },
     /// Probe configured channels against reality over SSH (config vs hardware).
     Doctor {
@@ -246,6 +252,37 @@ enum PowerCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum HidCmd {
+    /// Configure the target's HID channel (one per target).
+    Set {
+        #[arg(long, short)]
+        target: String,
+        /// Injection backend (default: ch9329, the Openterface Mini-KVM).
+        #[arg(long)]
+        backend: Option<String>,
+        /// Control device (e.g. the CH9329 USB-serial port).
+        #[arg(long, short)]
+        device: Option<String>,
+        #[arg(long)]
+        baud: Option<i64>,
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Remove the target's HID channel.
+    Rm {
+        #[arg(long, short)]
+        target: String,
+    },
+    /// Type a string into the target via its HID channel.
+    Type {
+        /// Text to type (US keyboard layout).
+        text: String,
+        #[arg(long, short)]
+        target: Option<String>,
+    },
+}
+
 fn main() {
     let cli = Cli::parse();
     if let Err(e) = run(cli) {
@@ -268,10 +305,97 @@ fn run(cli: Cli) -> Result<()> {
         Command::Serial { cmd } => serial_cmd(lab_flag, cmd),
         Command::Netboot { cmd } => netboot_cmd(lab_flag, cmd),
         Command::Power { cmd } => power_cmd(lab_flag, cmd),
+        Command::Hid { cmd } => hid_cmd(lab_flag, cmd),
         Command::Doctor { target, host } => {
             cmd_doctor(lab_flag, target.as_deref(), host.as_deref())
         }
     }
+}
+
+/// Resolve a runtime command's target: the given name, or the sole target.
+fn resolve_single_target(lab: &Lab, name: Option<&str>) -> Result<String> {
+    if let Some(n) = name {
+        return Ok(n.to_string());
+    }
+    let names = lab.target_names();
+    match names.len() {
+        1 => Ok(names[0].to_string()),
+        0 => bail!("No targets configured."),
+        _ => bail!(
+            "Multiple targets ({}) — specify one with -t.",
+            names.join(", ")
+        ),
+    }
+}
+
+fn hid_cmd(lab_flag: Option<&str>, cmd: HidCmd) -> Result<()> {
+    match cmd {
+        HidCmd::Set {
+            target,
+            backend,
+            device,
+            baud,
+            host,
+        } => {
+            edit_lab(lab_flag, |lf| {
+                lf.set_hid(
+                    &target,
+                    backend.as_deref(),
+                    device.as_deref(),
+                    host.as_deref(),
+                )?;
+                if let Some(b) = baud {
+                    lf.set_hid_baud(&target, b)?;
+                }
+                Ok(())
+            })?;
+            println!("hid channel set for '{target}'.");
+            Ok(())
+        }
+        HidCmd::Rm { target } => {
+            edit_lab(lab_flag, |lf| lf.remove_hid(&target))?;
+            println!("hid channel removed from '{target}'.");
+            Ok(())
+        }
+        HidCmd::Type { text, target } => cmd_hid_type(lab_flag, target.as_deref(), &text),
+    }
+}
+
+fn cmd_hid_type(lab_flag: Option<&str>, target: Option<&str>, text: &str) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    let target = resolve_single_target(&lab, target)?;
+    // Per-channel dispatch: run on the host the HID channel lives on.
+    if let Some(code) = dispatch::maybe_dispatch(
+        &lab,
+        &target,
+        model::ChannelKind::Hid,
+        None,
+        dispatch::Mode::Reexec,
+    )? {
+        std::process::exit(code);
+    }
+    // Local: drive the CH9329 directly.
+    let hid = lab
+        .targets
+        .get(&target)
+        .and_then(|t| t.hid.clone())
+        .ok_or_else(|| {
+            anyhow!(
+                "target '{target}' has no hid channel \
+                 (paniolo hid set -t {target} --device ...)"
+            )
+        })?;
+    let backend = hid.backend_or_default().to_string();
+    if backend != "ch9329" {
+        bail!("hid backend '{backend}' is not supported yet (only ch9329)");
+    }
+    let device = hid
+        .device
+        .ok_or_else(|| anyhow!("hid channel for '{target}' has no device set"))?;
+    let baud = hid.baud.unwrap_or(ch9329::DEFAULT_BAUD as i64) as u32;
+    ch9329::type_string(&device, baud, text)?;
+    eprintln!("typed {} char(s) into '{target}'.", text.chars().count());
+    Ok(())
 }
 
 fn cmd_doctor(lab_flag: Option<&str>, target: Option<&str>, host: Option<&str>) -> Result<()> {
