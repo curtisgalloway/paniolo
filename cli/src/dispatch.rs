@@ -80,7 +80,19 @@ pub fn build_slice(lab: &Lab, target: &str, host: &str) -> Result<String, LabErr
             )?;
         }
     }
-    // video: deferred until the runtime video commands are ported (R3+).
+    if let Some(v) = &t.video {
+        if on(&v.host) {
+            lf.set_video(target, v.device.as_deref(), None)?;
+        }
+    }
+    if let Some(h) = &t.hid {
+        if on(&h.host) {
+            lf.set_hid(target, h.backend.as_deref(), h.device.as_deref(), None)?;
+            if let Some(b) = h.baud {
+                lf.set_hid_baud(target, b)?;
+            }
+        }
+    }
     Ok(lf.doc.to_string())
 }
 
