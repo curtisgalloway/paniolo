@@ -371,36 +371,6 @@ impl LabFile {
         self.remove_singleton(target, "video")
     }
 
-    pub fn set_hid(
-        &mut self,
-        target: &str,
-        backend: Option<&str>,
-        device: Option<&str>,
-        host: Option<&str>,
-    ) -> Result<(), LabError> {
-        self.set_singleton(
-            target,
-            "hid",
-            &[("backend", backend), ("device", device), ("host", host)],
-        )
-    }
-
-    pub fn set_hid_baud(&mut self, target: &str, baud: i64) -> Result<(), LabError> {
-        let t = self.target_mut(target)?;
-        if !t.contains_key("hid") {
-            t.insert("hid", Item::Table(Table::new()));
-        }
-        t.get_mut("hid")
-            .and_then(|i| i.as_table_mut())
-            .ok_or_else(|| LabError(format!("target '{target}': hid is not a table")))?
-            .insert("baud", value(baud));
-        Ok(())
-    }
-
-    pub fn remove_hid(&mut self, target: &str) -> Result<(), LabError> {
-        self.remove_singleton(target, "hid")
-    }
-
     fn target_mut(&mut self, name: &str) -> Result<&mut Table, LabError> {
         self.doc
             .get_mut("targets")

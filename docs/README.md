@@ -40,7 +40,7 @@ source of truth.
 | Doc | What it covers |
 |---|---|
 | [Config redesign: a CLI-managed lab](config-redesign.md) | The lab data model (hosts/targets/per-channel hosts), the CRUD command surface, per-channel dispatch design, and the Python→Rust pivot + staged plan. |
-| [CH9329 driver spec (clean-room)](ch9329-spec.md) | WCH CH9329 USB-HID bridge serial protocol (the Openterface HID backend): frame format, GET_INFO, keyboard report, parameter-config/baud, reset, ACK codes. |
+| [CH9329 driver spec (clean-room)](ch9329-spec.md) | **Deferred** (Openterface HID backend, to revisit): WCH CH9329 serial protocol — frame format, GET_INFO, keyboard report, parameter-config/baud, reset, ACK codes. Reference for when the `hid` channel is reintroduced. |
 
 ## Hardware-CI integration (in design)
 

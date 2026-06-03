@@ -34,8 +34,6 @@ use serde::Deserialize;
 pub const LOCAL: &str = "local";
 pub const DEFAULT_HOST_IP: &str = "192.168.99.1";
 pub const VALID_SENSE_SIGNALS: [&str; 4] = ["cts", "dsr", "dcd", "ri"];
-pub const DEFAULT_HID_BACKEND: &str = "ch9329";
-pub const VALID_HID_BACKENDS: [&str; 1] = ["ch9329"];
 
 /// The lab file is malformed or a mutation would make it invalid.
 #[derive(Debug, thiserror::Error)]
@@ -105,22 +103,6 @@ pub struct VideoChannel {
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
-pub struct HidChannel {
-    /// Injection backend: "ch9329" (Openterface) is the only one so far.
-    pub backend: Option<String>,
-    /// Control device, e.g. the CH9329's USB-serial port.
-    pub device: Option<String>,
-    pub baud: Option<i64>,
-    pub host: Option<String>,
-}
-
-impl HidChannel {
-    pub fn backend_or_default(&self) -> &str {
-        self.backend.as_deref().unwrap_or(DEFAULT_HID_BACKEND)
-    }
-}
-
-#[derive(Debug, Default, Clone, Deserialize)]
 pub struct Target {
     pub host: Option<String>,
     pub note: Option<String>,
@@ -129,7 +111,6 @@ pub struct Target {
     pub serial: Vec<SerialChannel>,
     pub power: Option<PowerChannel>,
     pub video: Option<VideoChannel>,
-    pub hid: Option<HidChannel>,
 }
 
 impl Target {
@@ -154,7 +135,6 @@ pub enum ChannelKind {
     Serial,
     Power,
     Video,
-    Hid,
 }
 
 impl ChannelKind {
@@ -164,7 +144,6 @@ impl ChannelKind {
             ChannelKind::Serial => "serial",
             ChannelKind::Power => "power",
             ChannelKind::Video => "video",
-            ChannelKind::Hid => "hid",
         }
     }
 }
@@ -264,19 +243,6 @@ impl Lab {
                 kind: ChannelKind::Video,
                 name: "video".into(),
                 host: host_of(&v.host),
-                fields: f,
-            });
-        }
-        if let Some(h) = &t.hid {
-            let mut f = vec![("backend", h.backend_or_default().to_string())];
-            push_opt(&mut f, "device", &h.device);
-            if let Some(b) = h.baud {
-                f.push(("baud", b.to_string()));
-            }
-            channels.push(ResolvedChannel {
-                kind: ChannelKind::Hid,
-                name: "hid".into(),
-                host: host_of(&h.host),
                 fields: f,
             });
         }
@@ -395,17 +361,6 @@ pub fn validate(lab: &Lab) -> Result<(), LabError> {
         if let Some(v) = &t.video {
             let h = v.host.as_deref().unwrap_or(default_host);
             check_host_ref(h, &declared, &format!("target '{name}' video"))?;
-        }
-        if let Some(hid) = &t.hid {
-            let h = hid.host.as_deref().unwrap_or(default_host);
-            check_host_ref(h, &declared, &format!("target '{name}' hid"))?;
-            let backend = hid.backend_or_default();
-            if !VALID_HID_BACKENDS.contains(&backend) {
-                return lab_err(format!(
-                    "target '{name}' hid: unknown backend '{backend}' (valid: {})",
-                    VALID_HID_BACKENDS.join(", ")
-                ));
-            }
         }
         let mut seen: BTreeSet<&str> = BTreeSet::new();
         for s in &t.serial {
