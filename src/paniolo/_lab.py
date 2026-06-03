@@ -58,16 +58,55 @@ import tomllib
 from pathlib import Path
 from typing import Optional
 
-from ._config import SerialInterface, TargetConfig
+from ._config import CONFIG_DIR, SerialInterface, TargetConfig
 from ._ssh import LOCAL, Host
 
 # Default host name when neither a resource nor its target names one.
 DEFAULT_HOST = LOCAL
 DEFAULT_HOST_IP = "192.168.99.1"
 
+# The lab file used when neither --lab nor PANIOLO_LAB is given.
+DEFAULT_LAB_PATH = str(CONFIG_DIR / "lab.toml")
+
 
 class LabError(RuntimeError):
     """The lab file is malformed or describes something unsupported."""
+
+
+def _without_host(d: dict, drop: tuple[str, ...] = ()) -> dict:
+    """A channel's scalar fields, minus ``host`` and any explicitly dropped keys."""
+    skip = {"host", *drop}
+    return {k: v for k, v in d.items() if k not in skip}
+
+
+@dataclasses.dataclass
+class ResolvedChannel:
+    """One channel of a target, with its physical host resolved.
+
+    ``kind`` is the channel type ("netboot" | "serial" | "power" | "video");
+    ``name`` is the serial interface name, or the kind for singleton channels.
+    ``host`` is the host the channel resolves to (its own ``host``, else the
+    target's default). ``fields`` holds the remaining scalar config.
+    """
+
+    kind: str
+    name: str
+    host: str
+    fields: dict
+
+
+@dataclasses.dataclass
+class ResolvedTarget:
+    """A target's channels with per-channel hosts resolved (no single-host rule)."""
+
+    name: str
+    default_host: str
+    note: Optional[str]
+    channels: list[ResolvedChannel]
+
+    def hosts(self) -> list[str]:
+        """The distinct hosts this target's channels live on."""
+        return sorted({c.host for c in self.channels} or {self.default_host})
 
 
 @dataclasses.dataclass
@@ -138,7 +177,6 @@ class Lab:
         if power:
             used.add(power.get("host", default_host))
 
-        # No resources named a host → the target falls on its default host.
         if not used:
             used.add(default_host)
         if len(used) > 1:
@@ -157,6 +195,95 @@ class Lab:
             serial_interfaces=serial_interfaces,
         )
         return cfg, self._host(next(iter(used)))
+
+    def host_slice(self, name: str, host_name: str) -> TargetConfig:
+        """Flatten the channels of ``name`` that live on ``host_name`` to a config.
+
+        This is the slice a single host sees — what runs locally on the dev
+        machine (``host_name == "local"``) and what is shipped to a control host
+        for remote re-exec. Channels on *other* hosts are omitted, so the result
+        is always single-host. Raises KeyError if the target is unknown.
+        """
+        rt = self.resolved_target(name)
+        serial_interfaces: list[SerialInterface] = []
+        netboot: dict = {}
+        power: dict = {}
+        for ch in rt.channels:
+            if ch.host != host_name:
+                continue
+            if ch.kind == "serial":
+                serial_interfaces.append(
+                    SerialInterface(
+                        name=ch.name,
+                        device=ch.fields.get("device", ""),
+                        baud=int(ch.fields.get("baud", 115200)),
+                        power_sense_signal=ch.fields.get("power_sense_signal"),
+                    )
+                )
+            elif ch.kind == "netboot":
+                netboot = ch.fields
+            elif ch.kind == "power":
+                power = ch.fields
+        return TargetConfig(
+            name=name,
+            interface=netboot.get("interface", ""),
+            host_ip=netboot.get("host_ip", DEFAULT_HOST_IP),
+            tftp_root=netboot.get("tftp_root"),
+            power_cycle_cmd=power.get("cycle_cmd"),
+            power_serial_interface=power.get("serial_interface"),
+            serial_interfaces=serial_interfaces,
+        )
+
+    def resolved_target(self, name: str) -> ResolvedTarget:
+        """Flatten a target to its channels with per-channel hosts resolved.
+
+        Unlike :meth:`resolve_target`, this imposes no single-host rule — it is
+        the read view, and the basis for per-channel dispatch. Raises KeyError
+        if the target is unknown.
+        """
+        if name not in self.targets:
+            raise KeyError(name)
+        t = self.targets[name]
+        default_host = t.get("host", DEFAULT_HOST)
+        channels: list[ResolvedChannel] = []
+
+        nb = t.get("netboot")
+        if nb:
+            channels.append(
+                ResolvedChannel(
+                    "netboot",
+                    "netboot",
+                    nb.get("host", default_host),
+                    _without_host(nb),
+                )
+            )
+        for s in t.get("serial") or []:
+            channels.append(
+                ResolvedChannel(
+                    "serial",
+                    s.get("name", ""),
+                    s.get("host", default_host),
+                    _without_host(s, drop=("name",)),
+                )
+            )
+        for kind in ("power", "video"):
+            c = t.get(kind)
+            if c:
+                channels.append(
+                    ResolvedChannel(
+                        kind, kind, c.get("host", default_host), _without_host(c)
+                    )
+                )
+        return ResolvedTarget(name, default_host, t.get("note"), channels)
+
+    def channels_on_host(self, host: str) -> list[tuple[str, ResolvedChannel]]:
+        """Every (target, channel) pair whose channel resolves to ``host``."""
+        out: list[tuple[str, ResolvedChannel]] = []
+        for tname in self.target_names():
+            for ch in self.resolved_target(tname).channels:
+                if ch.host == host:
+                    out.append((tname, ch))
+        return out
 
 
 def propose_target_block(name: str, host: str, inventory: dict) -> str:
@@ -218,8 +345,19 @@ def set_lab_path(path: Optional[str]) -> None:
 
 
 def lab_path() -> Optional[str]:
-    """The active lab file path: --lab if given, else $PANIOLO_LAB, else None."""
-    return _override_path or os.environ.get("PANIOLO_LAB")
+    """The active lab file path.
+
+    Resolution order: ``--lab`` (recorded via :func:`set_lab_path`), then
+    ``$PANIOLO_LAB``, then the default ``~/.config/paniolo/lab.toml`` *if it
+    exists*. Returns None when none of those resolve, leaving the legacy
+    per-target files in play until they are retired.
+    """
+    explicit = _override_path or os.environ.get("PANIOLO_LAB")
+    if explicit:
+        return explicit
+    if Path(os.path.expanduser(DEFAULT_LAB_PATH)).exists():
+        return DEFAULT_LAB_PATH
+    return None
 
 
 def load() -> Optional[Lab]:
