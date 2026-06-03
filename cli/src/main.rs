@@ -19,8 +19,11 @@
 //! channels that connect them. This module is the CLI surface; the model and
 //! editor live in [`model`] and [`labfile`].
 
+mod dispatch;
+mod doctor;
 mod labfile;
 mod model;
+mod ssh;
 
 use std::path::PathBuf;
 
@@ -81,6 +84,14 @@ enum Command {
     Power {
         #[command(subcommand)]
         cmd: PowerCmd,
+    },
+    /// Probe configured channels against reality over SSH (config vs hardware).
+    Doctor {
+        /// Target to check (default: all).
+        target: Option<String>,
+        /// Only check channels on this host.
+        #[arg(long)]
+        host: Option<String>,
     },
 }
 
@@ -257,7 +268,20 @@ fn run(cli: Cli) -> Result<()> {
         Command::Serial { cmd } => serial_cmd(lab_flag, cmd),
         Command::Netboot { cmd } => netboot_cmd(lab_flag, cmd),
         Command::Power { cmd } => power_cmd(lab_flag, cmd),
+        Command::Doctor { target, host } => {
+            cmd_doctor(lab_flag, target.as_deref(), host.as_deref())
+        }
     }
+}
+
+fn cmd_doctor(lab_flag: Option<&str>, target: Option<&str>, host: Option<&str>) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    let problems = doctor::run(&lab, target, host);
+    if problems > 0 {
+        eprintln!("{problems} problem(s) found.");
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 // ── lab open helpers ────────────────────────────────────────────────────────

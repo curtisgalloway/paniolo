@@ -160,3 +160,19 @@ combined log at `~/.local/share/paniolo/<name>/netboot.log`.
 |---|---|
 | Daemon state (DHCP/TFTP PIDs, uptime) | `~/.local/share/paniolo/<name>/netboot.json` |
 | Combined log | `~/.local/share/paniolo/<name>/netboot.log` |
+
+---
+
+## Known issue: TFTP responsiveness under host load
+
+On a heavily loaded control host the **Python** legacy TFTP server has been
+observed to starve — it doesn't service requests quickly enough and the
+client (e.g. the Pi 5 EEPROM) times out the transfer. A stopgap is to raise the
+server's scheduling priority (`renice` to a negative nice value).
+
+Future work for the **Rust `netbootd`** default engine: make TFTP serving
+robust to host load by design rather than relying on `renice` — e.g. run the
+send path on a dedicated/elevated-priority thread, set socket priority, and keep
+the per-request hot path allocation-free so latency stays bounded when the
+machine is busy. (Tracked from a real starvation incident; netbootd is already
+the default, so this is the right place to fix it permanently.)

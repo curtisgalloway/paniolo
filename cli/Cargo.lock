@@ -304,6 +304,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dirs",
+ "libc",
  "serde",
  "tempfile",
  "thiserror 2.0.18",
