@@ -281,6 +281,19 @@ enum HidCmd {
         #[arg(long, short)]
         target: Option<String>,
     },
+    /// Initialize the HID chip to high speed (CH9329 → 115200, persisted).
+    Init {
+        #[arg(long, short)]
+        target: Option<String>,
+        /// Baud to configure (default 115200).
+        #[arg(long, default_value_t = 115200)]
+        baud: u32,
+    },
+    /// Restore the HID chip to factory defaults (CH9329 → 9600).
+    Reset {
+        #[arg(long, short)]
+        target: Option<String>,
+    },
 }
 
 fn main() {
@@ -358,13 +371,19 @@ fn hid_cmd(lab_flag: Option<&str>, cmd: HidCmd) -> Result<()> {
             Ok(())
         }
         HidCmd::Type { text, target } => cmd_hid_type(lab_flag, target.as_deref(), &text),
+        HidCmd::Init { target, baud } => cmd_hid_init(lab_flag, target.as_deref(), baud),
+        HidCmd::Reset { target } => cmd_hid_reset(lab_flag, target.as_deref()),
     }
 }
 
-fn cmd_hid_type(lab_flag: Option<&str>, target: Option<&str>, text: &str) -> Result<()> {
+/// Resolve a target's HID channel to (device, baud-hint), dispatching to its host
+/// first if it's remote. Returns None if the command was dispatched (caller exits).
+fn hid_local_device(
+    lab_flag: Option<&str>,
+    target: Option<&str>,
+) -> Result<Option<(String, Option<u32>)>> {
     let lab = load_for_read(lab_flag)?;
     let target = resolve_single_target(&lab, target)?;
-    // Per-channel dispatch: run on the host the HID channel lives on.
     if let Some(code) = dispatch::maybe_dispatch(
         &lab,
         &target,
@@ -374,15 +393,13 @@ fn cmd_hid_type(lab_flag: Option<&str>, target: Option<&str>, text: &str) -> Res
     )? {
         std::process::exit(code);
     }
-    // Local: drive the CH9329 directly.
     let hid = lab
         .targets
         .get(&target)
         .and_then(|t| t.hid.clone())
         .ok_or_else(|| {
             anyhow!(
-                "target '{target}' has no hid channel \
-                 (paniolo hid set -t {target} --device ...)"
+                "target '{target}' has no hid channel (paniolo hid set -t {target} --device ...)"
             )
         })?;
     let backend = hid.backend_or_default().to_string();
@@ -392,10 +409,30 @@ fn cmd_hid_type(lab_flag: Option<&str>, target: Option<&str>, text: &str) -> Res
     let device = hid
         .device
         .ok_or_else(|| anyhow!("hid channel for '{target}' has no device set"))?;
-    let baud = hid.baud.unwrap_or(ch9329::DEFAULT_BAUD as i64) as u32;
+    Ok(Some((device, hid.baud.map(|b| b as u32))))
+}
+
+fn cmd_hid_type(lab_flag: Option<&str>, target: Option<&str>, text: &str) -> Result<()> {
+    let Some((device, baud)) = hid_local_device(lab_flag, target)? else {
+        return Ok(());
+    };
     ch9329::type_string(&device, baud, text)?;
-    eprintln!("typed {} char(s) into '{target}'.", text.chars().count());
+    eprintln!("typed {} char(s).", text.chars().count());
     Ok(())
+}
+
+fn cmd_hid_init(lab_flag: Option<&str>, target: Option<&str>, baud: u32) -> Result<()> {
+    let Some((device, _)) = hid_local_device(lab_flag, target)? else {
+        return Ok(());
+    };
+    ch9329::configure_baud(&device, baud)
+}
+
+fn cmd_hid_reset(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
+    let Some((device, _)) = hid_local_device(lab_flag, target)? else {
+        return Ok(());
+    };
+    ch9329::restore_defaults(&device)
 }
 
 fn cmd_doctor(lab_flag: Option<&str>, target: Option<&str>, host: Option<&str>) -> Result<()> {

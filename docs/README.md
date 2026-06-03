@@ -31,6 +31,17 @@ and power-cycle it without a person at the bench each iteration. See the root
 | [Distributed control: one lab, one file](distributed-control.md) | Driving targets on remote control hosts: a single git-tracked lab file describing hosts + targets, SSH transport with the dev machine as the data-plane hub, per-resource host binding (multi-host-ready), and a discovery-proposes/human-approves config flow. Shipped: `--lab`, transparent re-exec, tunnelled `console`. |
 | [Implementation plan](distributed-control-plan.md) | Phased build sequence — Phases 0–3 shipped (SSH transport, lab model, re-exec, console); Phases 4–5 (remote `setup`, discovery-assisted `configure`) and multi-host pending. |
 
+## Rust control-plane rewrite (in progress)
+
+The CLI + orchestration + device glue is being rewritten Python→Rust (the `cli/` crate),
+finishing the migration the daemons started. The lab file becomes the single, CLI-managed
+source of truth.
+
+| Doc | What it covers |
+|---|---|
+| [Config redesign: a CLI-managed lab](config-redesign.md) | The lab data model (hosts/targets/per-channel hosts), the CRUD command surface, per-channel dispatch design, and the Python→Rust pivot + staged plan. |
+| [CH9329 driver spec (clean-room)](ch9329-spec.md) | WCH CH9329 USB-HID bridge serial protocol (the Openterface HID backend): frame format, GET_INFO, keyboard report, parameter-config/baud, reset, ACK codes. |
+
 ## Hardware-CI integration (in design)
 
 Making paniolo's primitives consumable by hardware-CI orchestrators, without paniolo owning test
