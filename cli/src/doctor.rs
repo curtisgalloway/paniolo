@@ -21,7 +21,6 @@
 
 use std::process::Command;
 
-use crate::ch9329;
 use crate::model::{ChannelKind, Lab, ResolvedChannel, ResolvedTarget};
 use crate::ssh;
 
@@ -93,31 +92,6 @@ fn check_channel(lab: &Lab, ch: &ResolvedChannel, rt: &ResolvedTarget) -> (Statu
                 dev,
             ),
         },
-        ChannelKind::Hid => {
-            let Some(dev) = field(ch, "device") else {
-                return (Status::Incomplete, "no device set".to_string());
-            };
-            // The chip-level probe (GET_INFO) runs only where the device lives;
-            // for a remote host we just confirm the device node exists.
-            if !lab.host(&ch.host).is_local(&ch.host) {
-                return interpret(
-                    probe(lab, &ch.host, &format!("test -e {}", ssh::shell_quote(dev))),
-                    dev,
-                );
-            }
-            let prefer = field(ch, "baud").and_then(|b| b.parse::<u32>().ok());
-            match ch9329::probe(dev, prefer) {
-                Ok((baud, info)) if info.target_connected => (
-                    Status::Ok,
-                    format!("ch9329 @{baud}, v0x{:02x}, target connected", info.version),
-                ),
-                Ok((baud, _info)) => (
-                    Status::Missing,
-                    format!("ch9329 @{baud} but target USB not enumerated"),
-                ),
-                Err(e) => (Status::Missing, format!("{e}")),
-            }
-        }
         ChannelKind::Netboot => match field(ch, "interface") {
             None => (Status::Incomplete, "no interface set".to_string()),
             Some(iface) => {
