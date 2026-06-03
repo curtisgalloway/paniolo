@@ -24,6 +24,7 @@ import grp
 import json
 import os
 import pwd
+import shlex
 import shutil
 import subprocess
 import sys
@@ -34,11 +35,13 @@ from typing import Annotated, Optional
 import typer
 from rich.console import Console
 from rich.table import Table
+from rich.tree import Tree
 
 from . import (
     _config,
     _hid,
     _lab,
+    _labfile,
     _netboot,
     _netif,
     _ocr,
@@ -71,12 +74,24 @@ serial_app = typer.Typer(
 hid_app = typer.Typer(
     help="Inject USB keyboard/mouse input via the HID rig.", no_args_is_help=True
 )
+config_app = typer.Typer(
+    help="Inspect and edit the lab configuration file.", no_args_is_help=True
+)
+host_app = typer.Typer(
+    help="Manage control hosts declared in the lab.", no_args_is_help=True
+)
+power_app = typer.Typer(
+    help="Configure a target's power channel.", no_args_is_help=True
+)
 app.add_typer(target_app, name="target")
 app.add_typer(netboot_app, name="netboot")
 app.add_typer(netif_app, name="netif")
 app.add_typer(video_app, name="video")
 app.add_typer(serial_app, name="serial")
 app.add_typer(hid_app, name="hid")
+app.add_typer(config_app, name="config")
+app.add_typer(host_app, name="host")
+app.add_typer(power_app, name="power")
 
 console = Console()
 err = Console(stderr=True)
@@ -213,121 +228,510 @@ def remote_capable(mode: str = _remote.REEXEC):
     return decorator
 
 
+# ── lab config: init / inspect ─────────────────────────────────────────────────
+
+
+def _load_lab_for_read() -> _lab.Lab:
+    """Load the active lab for a read command, or exit with a hint."""
+    try:
+        lab = _lab.load()
+    except _lab.LabError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    if lab is None:
+        err.print(
+            "[red]No lab configured.[/red] Create one with [bold]paniolo init[/bold], "
+            "or point at one with --lab / PANIOLO_LAB."
+        )
+        raise typer.Exit(1)
+    return lab
+
+
+def _open_lab_for_write() -> _labfile.LabFile:
+    """Open the active lab for editing, creating it if it doesn't exist yet.
+
+    Config writes are always local and pure: they edit the lab file on this
+    machine and never touch a target or SSH.
+    """
+    path = _lab.lab_path() or _lab.DEFAULT_LAB_PATH
+    full = Path(os.path.expanduser(path))
+    if full.exists():
+        try:
+            return _labfile.LabFile.load(path)
+        except (_lab.LabError, OSError) as exc:
+            err.print(f"[red]Cannot edit lab: {exc}[/red]")
+            raise typer.Exit(1)
+    lf = _labfile.LabFile.create(path)
+    console.print(f"[dim]Created new lab: {full}[/dim]")
+    return lf
+
+
+def _edit_lab(mutate) -> None:
+    """Open the lab, apply ``mutate(lab_file)``, validate, and save it back."""
+    lf = _open_lab_for_write()
+    try:
+        mutate(lf)
+        lf.save()
+    except _lab.LabError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+
+def _normalize_sense(power_sense: Optional[str]) -> Optional[str]:
+    """Validate/lower a --sense value; treat 'none' as clearing it."""
+    if power_sense is None or power_sense.lower() == "none":
+        return None
+    value = power_sense.lower()
+    if value not in _config.VALID_SENSE_SIGNALS:
+        err.print(
+            f"[red]Unknown sense signal '{power_sense}'.[/red] "
+            f"Valid: {', '.join(_config.VALID_SENSE_SIGNALS)}, none"
+        )
+        raise typer.Exit(1)
+    return value
+
+
+def _fields_str(fields: dict) -> str:
+    return "  ".join(f"{k}={v}" for k, v in fields.items())
+
+
+def _probe(host: _ssh.Host, script: str) -> Optional[int]:
+    """Run a POSIX-sh probe on ``host`` (locally or over SSH); return its rc.
+
+    Returns None if the host is unreachable. An ssh transport failure surfaces
+    as rc 255, which callers treat the same as unreachable.
+    """
+    if host.is_local:
+        return subprocess.run(
+            ["sh", "-c", script], capture_output=True, text=True, check=False
+        ).returncode
+    try:
+        return _ssh.run(host, ["sh", "-c", script], timeout=15).returncode
+    except (_ssh.SSHError, subprocess.SubprocessError, OSError):
+        return None
+
+
+def _interpret_probe(rc: Optional[int], what: str) -> tuple[str, str]:
+    if rc is None or rc == 255:
+        return ("unreachable", "host unreachable")
+    if rc == 0:
+        return ("ok", what)
+    return ("missing", what)
+
+
+def _check_channel(
+    host: _ssh.Host, ch: _lab.ResolvedChannel, rt: _lab.ResolvedTarget
+) -> tuple[str, str]:
+    """Probe one channel on its host; return (status, detail)."""
+    if ch.kind in ("serial", "video"):
+        path = ch.fields.get("device")
+        if not path:
+            return ("incomplete", "no device set")
+        return _interpret_probe(_probe(host, f"test -e {shlex.quote(path)}"), path)
+    if ch.kind == "netboot":
+        iface = ch.fields.get("interface")
+        if not iface:
+            return ("incomplete", "no interface set")
+        q = shlex.quote(iface)
+        # Linux exposes interfaces under /sys; fall back to ifconfig elsewhere.
+        script = f"test -e /sys/class/net/{q} || ifconfig {q} >/dev/null 2>&1"
+        return _interpret_probe(_probe(host, script), iface)
+    if ch.kind == "power":
+        si = ch.fields.get("serial_interface")
+        if si and si not in {c.name for c in rt.channels if c.kind == "serial"}:
+            return ("missing", f"serial_interface '{si}' has no matching serial")
+        cmd = ch.fields.get("cycle_cmd")
+        if cmd:
+            prog = shlex.split(cmd)[0] if cmd.strip() else ""
+            if prog.startswith("/"):
+                return _interpret_probe(
+                    _probe(host, f"test -e {shlex.quote(prog)}"), prog
+                )
+            return ("ok", f"cmd={cmd}")
+        return ("ok", "dtr via serial" if si else "configured")
+    return ("ok", "")
+
+
+_STATUS_STYLE = {
+    "ok": "[green]ok[/green]",
+    "missing": "[red]MISSING[/red]",
+    "unreachable": "[yellow]unreachable[/yellow]",
+    "incomplete": "[dim]incomplete[/dim]",
+}
+
+
+def _channel_label(ch: _lab.ResolvedChannel) -> str:
+    """One line for a resolved channel: 'serial console @bench1  device=…'."""
+    head = ch.kind if ch.name == ch.kind else f"{ch.kind} {ch.name}"
+    fields = _fields_str(ch.fields)
+    tail = f"  [dim]{fields}[/dim]" if fields else ""
+    return f"{head} [cyan]@{ch.host}[/cyan]{tail}"
+
+
+def _print_resolved_target(rt: _lab.ResolvedTarget) -> None:
+    title = f"Target: [bold]{rt.name}[/bold]"
+    if len(rt.hosts()) > 1:
+        title += f"  [yellow](spans {', '.join(rt.hosts())})[/yellow]"
+    t = Table(title=title, show_header=False, box=None, padding=(0, 2))
+    t.add_row("default host", rt.default_host)
+    if rt.note:
+        t.add_row("note", rt.note)
+    if rt.channels:
+        for idx, ch in enumerate(rt.channels):
+            t.add_row("channels" if idx == 0 else "", _channel_label(ch))
+    else:
+        t.add_row("channels", "[dim]none[/dim]")
+    console.print(t)
+
+
+@app.command("init")
+def init(
+    path: Annotated[
+        Optional[str],
+        typer.Option(
+            "--path",
+            help="Where to create the lab (default: --lab path "
+            "or ~/.config/paniolo/lab.toml)",
+        ),
+    ] = None,
+) -> None:
+    """Create an empty lab file."""
+    target = path or _lab.lab_path() or _lab.DEFAULT_LAB_PATH
+    full = Path(os.path.expanduser(target))
+    if full.exists():
+        err.print(f"[red]Lab file already exists:[/red] {full}")
+        raise typer.Exit(1)
+    _labfile.LabFile.create(target).save()
+    console.print(f"[green]Created lab:[/green] {full}")
+    console.print(
+        "  Add a host:   [bold]paniolo host add <name> --ssh user@host[/bold]"
+    )
+    console.print("  Add a target: [bold]paniolo target add <name>[/bold]")
+
+
+@config_app.command("show")
+def config_show() -> None:
+    """Show the whole lab: hosts and targets, each channel with its host."""
+    lab = _load_lab_for_read()
+    tree = Tree(f"[bold]Lab[/bold] [dim]{os.path.expanduser(_lab.lab_path())}[/dim]")
+
+    hosts_node = tree.add("[bold]Hosts[/bold]")
+    if lab.hosts:
+        for name, h in sorted(lab.hosts.items()):
+            extra = f"  [dim]identity={h.identity}[/dim]" if h.identity else ""
+            hosts_node.add(f"{name}  [cyan]{h.ssh}[/cyan]{extra}")
+    else:
+        hosts_node.add("[dim]none (everything runs on the local dev machine)[/dim]")
+
+    targets_node = tree.add("[bold]Targets[/bold]")
+    if lab.target_names():
+        for tname in lab.target_names():
+            rt = lab.resolved_target(tname)
+            label = tname
+            if len(rt.hosts()) > 1:
+                label += f"  [yellow](spans {', '.join(rt.hosts())})[/yellow]"
+            elif rt.hosts():
+                label += f"  [cyan]@{rt.hosts()[0]}[/cyan]"
+            tnode = targets_node.add(label)
+            if rt.note:
+                tnode.add(f"[dim]note: {rt.note}[/dim]")
+            for ch in rt.channels:
+                tnode.add(_channel_label(ch))
+            if not rt.channels:
+                tnode.add("[dim]no channels[/dim]")
+    else:
+        targets_node.add("[dim]none[/dim]")
+
+    console.print(tree)
+
+
+@config_app.command("path")
+def config_path() -> None:
+    """Print the active lab file path (stdout); note on stderr if it's absent."""
+    p = _lab.lab_path()
+    if p:
+        print(os.path.expanduser(p))
+    else:
+        print(os.path.expanduser(_lab.DEFAULT_LAB_PATH))
+        err.print("[dim](does not exist yet — create it with `paniolo init`)[/dim]")
+
+
+@config_app.command("edit")
+def config_edit() -> None:
+    """Open the raw lab file in $EDITOR."""
+    p = _lab.lab_path()
+    if not p:
+        err.print(
+            "[red]No lab to edit.[/red] Create one with [bold]paniolo init[/bold]."
+        )
+        raise typer.Exit(1)
+    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
+    raise typer.Exit(subprocess.call([*shlex.split(editor), os.path.expanduser(p)]))
+
+
+# ── host (inspect) ──────────────────────────────────────────────────────────────
+
+
+@host_app.command("list")
+def host_list() -> None:
+    """List the control hosts declared in the lab."""
+    lab = _load_lab_for_read()
+    if not lab.hosts:
+        console.print("No hosts declared. [dim](everything runs locally)[/dim]")
+        return
+    table = Table(box=None, padding=(0, 2))
+    table.add_column("host", style="bold")
+    table.add_column("ssh")
+    table.add_column("identity", style="dim")
+    for name, h in sorted(lab.hosts.items()):
+        table.add_row(name, h.ssh, h.identity or "")
+    console.print(table)
+
+
+@host_app.command("show")
+def host_show(
+    name: Annotated[str, typer.Argument(help="Host name (e.g. bench1)")],
+) -> None:
+    """Show a host's connection info and the channels that live on it."""
+    lab = _load_lab_for_read()
+    if name != _ssh.LOCAL and name not in lab.hosts:
+        have = ", ".join(sorted(lab.hosts)) or "(none)"
+        err.print(f"[red]Host '{name}' not in lab.[/red] Hosts: {have}")
+        raise typer.Exit(1)
+
+    if name in lab.hosts:
+        h = lab.hosts[name]
+        info = Table(
+            title=f"Host: [bold]{name}[/bold]",
+            show_header=False,
+            box=None,
+            padding=(0, 2),
+        )
+        info.add_row("ssh", h.ssh)
+        if h.identity:
+            info.add_row("identity", h.identity)
+        if h.control_path:
+            info.add_row("control_path", h.control_path)
+        if h.paniolo_cmd:
+            info.add_row("paniolo_cmd", h.paniolo_cmd)
+        console.print(info)
+    else:
+        console.print("Host: [bold]local[/bold]  [dim](the dev machine)[/dim]")
+
+    pairs = lab.channels_on_host(name)
+    if not pairs:
+        console.print("  [dim]no channels bound to this host[/dim]")
+        return
+    table = Table(box=None, padding=(0, 2))
+    table.add_column("target", style="bold")
+    table.add_column("channel")
+    table.add_column("config", style="dim")
+    for tname, ch in pairs:
+        chan = ch.kind if ch.name == ch.kind else f"{ch.kind} {ch.name}"
+        table.add_row(tname, chan, _fields_str(ch.fields))
+    console.print(table)
+
+
+@host_app.command("add")
+def host_add(
+    name: Annotated[str, typer.Argument(help="Host name (e.g. bench1)")],
+    ssh: Annotated[
+        str,
+        typer.Option(
+            "--ssh",
+            help="ssh destination: user@host, an ssh_config alias, or 'local'",
+        ),
+    ],
+    identity: Annotated[
+        Optional[str], typer.Option("--identity", help="SSH private-key path")
+    ] = None,
+    control_path: Annotated[
+        Optional[str],
+        typer.Option("--control-path", help="ControlMaster socket path override"),
+    ] = None,
+    paniolo_cmd: Annotated[
+        Optional[str],
+        typer.Option("--paniolo-cmd", help="Path to paniolo on the host"),
+    ] = None,
+) -> None:
+    """Declare a control host in the lab."""
+    _edit_lab(
+        lambda lf: lf.add_host(
+            name,
+            ssh,
+            identity=identity,
+            control_path=control_path,
+            paniolo_cmd=paniolo_cmd,
+        )
+    )
+    console.print(f"[green]Host '[bold]{name}[/bold]' added.[/green] ({ssh})")
+
+
+@host_app.command("set")
+def host_set(
+    name: Annotated[str, typer.Argument(help="Host name")],
+    ssh: Annotated[Optional[str], typer.Option("--ssh")] = None,
+    identity: Annotated[Optional[str], typer.Option("--identity")] = None,
+    control_path: Annotated[Optional[str], typer.Option("--control-path")] = None,
+    paniolo_cmd: Annotated[Optional[str], typer.Option("--paniolo-cmd")] = None,
+) -> None:
+    """Update fields of an existing host (only the options you pass change)."""
+    _edit_lab(
+        lambda lf: lf.update_host(
+            name,
+            ssh=ssh,
+            identity=identity,
+            control_path=control_path,
+            paniolo_cmd=paniolo_cmd,
+        )
+    )
+    console.print(f"[green]Host '[bold]{name}[/bold]' updated.[/green]")
+
+
+@host_app.command("rm")
+def host_rm(
+    name: Annotated[str, typer.Argument(help="Host name to remove")],
+) -> None:
+    """Remove a host (refused if any target still binds to it)."""
+    _edit_lab(lambda lf: lf.remove_host(name))
+    console.print(f"[green]Host '[bold]{name}[/bold]' removed.[/green]")
+
+
+@app.command("doctor")
+def doctor(
+    target: Annotated[
+        Optional[str], typer.Argument(help="Target to check (default: all)")
+    ] = None,
+    host: Annotated[
+        Optional[str],
+        typer.Option("--host", help="Only check channels on this host"),
+    ] = None,
+) -> None:
+    """Probe each channel's device on the host it lives on; report config vs reality.
+
+    Read-only: it SSHes to each control host to test that configured devices and
+    interfaces actually exist. This is the probing that used to be baked into the
+    `setup` commands, now separated so config edits stay local and offline.
+    """
+    lab = _load_lab_for_read()
+    names = [target] if target else lab.target_names()
+    if not names:
+        console.print("No targets configured.")
+        return
+
+    table = Table(box=None, padding=(0, 2))
+    table.add_column("target", style="bold")
+    table.add_column("channel")
+    table.add_column("host", style="cyan")
+    table.add_column("status")
+    table.add_column("detail", style="dim")
+
+    bad = 0
+    for tname in names:
+        try:
+            rt = lab.resolved_target(tname)
+        except KeyError:
+            err.print(f"[red]Target '{tname}' not found in lab.[/red]")
+            bad += 1
+            continue
+        for ch in rt.channels:
+            if host is not None and ch.host != host:
+                continue
+            status, detail = _check_channel(lab._host(ch.host), ch, rt)
+            if status in ("missing", "unreachable"):
+                bad += 1
+            chan = ch.kind if ch.name == ch.kind else f"{ch.kind} {ch.name}"
+            table.add_row(
+                tname, chan, ch.host, _STATUS_STYLE.get(status, status), detail
+            )
+
+    console.print(table)
+    if bad:
+        err.print(f"[red]{bad} problem(s) found.[/red]")
+        raise typer.Exit(1)
+    console.print("[green]All configured channels present.[/green]")
+
+
 # ── target ────────────────────────────────────────────────────────────────────
+
+
+@target_app.command("add")
+def target_add(
+    name: Annotated[str, typer.Argument(help="Target name (e.g. fortune)")],
+    host: Annotated[
+        Optional[str],
+        typer.Option(
+            "--host",
+            help="Default control host for this target's channels (default: local)",
+        ),
+    ] = None,
+    note: Annotated[
+        Optional[str], typer.Option("--note", help="Free-text note, kept in the lab")
+    ] = None,
+) -> None:
+    """Create a target. Add its hardware with `netboot/serial/power set`."""
+    _edit_lab(lambda lf: lf.add_target(name, host=host, note=note))
+    where = f" on host '{host}'" if host else ""
+    console.print(f"[green]Target '[bold]{name}[/bold]' added.[/green]{where}")
 
 
 @target_app.command("set")
 def target_set(
-    name: Annotated[str, typer.Argument(help="Target name (e.g. fortune)")],
-    interface: Annotated[
-        Optional[str],
-        typer.Option(
-            "--interface",
-            "-i",
-            help="USB-Ethernet interface (e.g. en3); auto-detected if omitted",
-        ),
-    ] = None,
-    tftp_root: Annotated[
-        Optional[str],
-        typer.Option("--tftp-root", "-r", help="Path to TFTP files directory"),
-    ] = None,
-    host_ip: Annotated[
-        str, typer.Option("--host-ip", help="Static IP to assign to the interface")
-    ] = "192.168.99.1",
-    power_cycle_cmd: Annotated[
-        Optional[str],
-        typer.Option(
-            "--power-cycle-cmd",
-            help="Shell command or script path to power-cycle the target",
-        ),
-    ] = None,
-    power_serial: Annotated[
-        Optional[str],
-        typer.Option(
-            "--power-serial",
-            help="Serial interface name used for DTR power cycling via J2"
-            " (e.g. console)",
-        ),
-    ] = None,
+    name: Annotated[str, typer.Argument(help="Target name")],
+    host: Annotated[Optional[str], typer.Option("--host")] = None,
+    note: Annotated[Optional[str], typer.Option("--note")] = None,
 ) -> None:
-    """Create or update a target configuration.
+    """Update a target's default host or note (only the options you pass change)."""
+    _edit_lab(lambda lf: lf.update_target(name, host=host, note=note))
+    console.print(f"[green]Target '[bold]{name}[/bold]' updated.[/green]")
 
-    Serial consoles are managed separately with `paniolo serial setup` (a target
-    can have several named interfaces), so they're preserved across updates here."""
-    if interface is None:
-        candidates = _netboot.list_usb_ethernet_interfaces()
-        if not candidates:
-            err.print(
-                "[red]No USB-Ethernet interfaces found.[/red]"
-                " Specify one with --interface."
-            )
-            raise typer.Exit(1)
-        active = [c for c in candidates if c["active"]]
-        if len(active) == 1:
-            interface = active[0]["device"]
-            console.print(
-                f"[dim]Auto-detected interface:[/dim] {interface} ({active[0]['port']})"
-            )
-        elif len(candidates) == 1:
-            interface = candidates[0]["device"]
-            console.print(
-                f"[dim]Auto-detected interface:[/dim] {interface}"
-                f" ({candidates[0]['port']}) "
-                "[dim](no cable detected)[/dim]"
-            )
-        else:
-            console.print(
-                "[yellow]Multiple USB-Ethernet interfaces found"
-                " — use --interface to choose:[/yellow]"
-            )
-            for c in candidates:
-                status = (
-                    "[green]active[/green]" if c["active"] else "[dim]inactive[/dim]"
-                )
-                console.print(f"  {c['device']:6s}  {c['port']}  {status}")
-            raise typer.Exit(1)
 
-    try:
-        existing = _config.load_target(name)
-    except FileNotFoundError:
-        existing = None
-
-    cfg = _config.TargetConfig(
-        name=name,
-        interface=interface,
-        host_ip=host_ip,
-        tftp_root=tftp_root,
-        power_cycle_cmd=(
-            power_cycle_cmd
-            if power_cycle_cmd is not None
-            else (existing.power_cycle_cmd if existing else None)
-        ),
-        power_serial_interface=(
-            power_serial
-            if power_serial is not None
-            else (existing.power_serial_interface if existing else None)
-        ),
-        serial_interfaces=existing.serial_interfaces if existing else [],
-    )
-    _config.save_target(cfg)
-    console.print(f"[green]Target '[bold]{name}[/bold]' saved.[/green]")
-    console.print(f"  interface   : {interface}")
-    console.print(f"  host_ip     : {host_ip}")
-    if tftp_root:
-        console.print(f"  tftp_root   : {tftp_root}")
-    if cfg.power_cycle_cmd:
-        console.print(f"  power_cycle : {cfg.power_cycle_cmd}")
-    if cfg.power_serial_interface:
-        console.print(f"  power_serial: {cfg.power_serial_interface}")
-    for iface in cfg.serial_interfaces:
-        console.print(f"  serial      : {iface.name}: {iface.device} @ {iface.baud}")
+@target_app.command("list")
+def target_list() -> None:
+    """List targets with their host(s) and channels."""
+    lab = _load_lab_for_read()
+    names = lab.target_names()
+    if not names:
+        console.print("No targets configured. [dim](paniolo target add <name>)[/dim]")
+        return
+    table = Table(box=None, padding=(0, 2))
+    table.add_column("target", style="bold")
+    table.add_column("host(s)")
+    table.add_column("channels", style="dim")
+    for tname in names:
+        rt = lab.resolved_target(tname)
+        hosts = ", ".join(rt.hosts())
+        chans = ", ".join(
+            ch.kind if ch.name == ch.kind else f"{ch.kind}:{ch.name}"
+            for ch in rt.channels
+        )
+        table.add_row(tname, hosts, chans or "[dim]none[/dim]")
+    console.print(table)
 
 
 @target_app.command("show")
 def target_show(
     name: Annotated[Optional[str], typer.Argument()] = None,
 ) -> None:
-    """Show target configuration(s)."""
+    """Show target configuration(s), with each channel's resolved host."""
+    try:
+        lab = _lab.load()
+    except _lab.LabError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    if lab is not None:
+        names = [name] if name else lab.target_names()
+        if not names:
+            console.print("No targets configured.")
+            return
+        for tname in names:
+            try:
+                _print_resolved_target(lab.resolved_target(tname))
+            except KeyError:
+                err.print(f"[red]Target '{tname}' not found in lab.[/red]")
+        return
+
+    # Legacy per-target files (retired in a later stage).
     names = [name] if name else _config.list_targets()
     if not names:
         console.print("No targets configured.")
@@ -357,20 +761,59 @@ def target_show(
         console.print(t)
 
 
-@target_app.command("clear")
-def target_clear(
-    name: Annotated[str, typer.Argument()],
+@target_app.command("rm")
+def target_rm(
+    name: Annotated[str, typer.Argument(help="Target name to remove")],
 ) -> None:
-    """Remove a target configuration."""
-    path = _config.target_path(name)
-    if not path.exists():
-        err.print(f"[red]Target '{name}' not found.[/red]")
-        raise typer.Exit(1)
-    path.unlink()
-    console.print(f"Target '[bold]{name}[/bold]' cleared.")
+    """Remove a target and all its channels from the lab."""
+    _edit_lab(lambda lf: lf.remove_target(name))
+    console.print(f"[green]Target '[bold]{name}[/bold]' removed.[/green]")
 
 
 # ── netboot ───────────────────────────────────────────────────────────────────
+
+
+@netboot_app.command("set")
+def netboot_set(
+    target: Annotated[str, typer.Option("--target", "-t", help="Target name")],
+    interface: Annotated[
+        Optional[str],
+        typer.Option("--interface", "-i", help="USB-Ethernet interface (e.g. en3)"),
+    ] = None,
+    host_ip: Annotated[
+        Optional[str],
+        typer.Option("--host-ip", help="Static IP for the control-host side"),
+    ] = None,
+    tftp_root: Annotated[
+        Optional[str], typer.Option("--tftp-root", "-r", help="TFTP files directory")
+    ] = None,
+    host: Annotated[
+        Optional[str],
+        typer.Option("--host", help="Override the host this channel lives on"),
+    ] = None,
+) -> None:
+    """Configure the target's netboot channel (one per target)."""
+    _edit_lab(
+        lambda lf: lf.set_netboot(
+            target,
+            interface=interface,
+            host_ip=host_ip,
+            tftp_root=tftp_root,
+            host=host,
+        )
+    )
+    console.print(f"[green]netboot channel set for '[bold]{target}[/bold]'.[/green]")
+
+
+@netboot_app.command("rm")
+def netboot_rm(
+    target: Annotated[str, typer.Option("--target", "-t", help="Target name")],
+) -> None:
+    """Remove the target's netboot channel."""
+    _edit_lab(lambda lf: lf.remove_netboot(target))
+    console.print(
+        f"[green]netboot channel removed from '[bold]{target}[/bold]'.[/green]"
+    )
 
 
 @netboot_app.command("start")
@@ -1096,7 +1539,7 @@ def open_dashboard(
         if not cfg_s.serial_interfaces:
             err.print(
                 f"[red]No serial interfaces configured for '{cfg_s.name}'.[/red] "
-                "Run: paniolo serial setup"
+                "Run: paniolo serial add"
             )
             raise typer.Exit(1)
         if not _serial.serialcap_binary():
@@ -1137,7 +1580,7 @@ def _dtr_button(
     try:
         iface = cfg.serial_interface(interface_name)
     except ValueError as exc:
-        err.print(f"[red]{exc}.[/red] Run: paniolo serial setup")
+        err.print(f"[red]{exc}.[/red] Run: paniolo serial add")
         raise typer.Exit(1)
 
     daemon_url = _serial.daemon_url()
@@ -1160,6 +1603,46 @@ def _dtr_button(
         except (OSError, RuntimeError) as exc:
             err.print(f"[red]{label} failed:[/red] {exc}")
             raise typer.Exit(1)
+
+
+@power_app.command("set")
+def power_set(
+    target: Annotated[str, typer.Option("--target", "-t", help="Target name")],
+    cycle_cmd: Annotated[
+        Optional[str],
+        typer.Option("--cycle-cmd", help="Shell command/script to power-cycle"),
+    ] = None,
+    serial_interface: Annotated[
+        Optional[str],
+        typer.Option(
+            "--serial-interface",
+            help="Serial interface name used for DTR power cycling (e.g. console)",
+        ),
+    ] = None,
+    host: Annotated[
+        Optional[str],
+        typer.Option("--host", help="Override the host this channel lives on"),
+    ] = None,
+) -> None:
+    """Configure the target's power channel (one per target)."""
+    _edit_lab(
+        lambda lf: lf.set_power(
+            target,
+            cycle_cmd=cycle_cmd,
+            serial_interface=serial_interface,
+            host=host,
+        )
+    )
+    console.print(f"[green]power channel set for '[bold]{target}[/bold]'.[/green]")
+
+
+@power_app.command("rm")
+def power_rm(
+    target: Annotated[str, typer.Option("--target", "-t", help="Target name")],
+) -> None:
+    """Remove the target's power channel."""
+    _edit_lab(lambda lf: lf.remove_power(target))
+    console.print(f"[green]power channel removed from '[bold]{target}[/bold]'.[/green]")
 
 
 @app.command("power-cycle")
@@ -1222,7 +1705,7 @@ def power_state(
         err.print(
             "[yellow]Power state unknown[/yellow] — sense signal may not be"
             " configured on this interface."
-            " Run: paniolo serial setup --power-sense <cts|dsr|dcd|ri>"
+            " Run: paniolo serial set <name> -t <target> --sense <cts|dsr|dcd|ri>"
         )
         raise typer.Exit(1)
     if state:
@@ -1234,108 +1717,88 @@ def power_state(
 # ── serial ────────────────────────────────────────────────────────────────────
 
 
-@serial_app.command("setup")
-def serial_setup(
-    target: Annotated[Optional[str], typer.Argument()] = None,
-    name: Annotated[
-        str, typer.Option("--name", help="Interface name (e.g. console, bmc)")
-    ] = _config.DEFAULT_SERIAL_NAME,
-    device: Annotated[
-        Optional[str],
-        typer.Option("--device", help="Serial device path; auto-detected if omitted"),
-    ] = None,
+_SENSE_HELP = (
+    "FTDI modem-control input wired to the target's 3.3 V rail "
+    "(cts | dsr | dcd | ri | none), for power-state sensing"
+)
+
+
+@serial_app.command("add")
+def serial_add(
+    name: Annotated[str, typer.Argument(help="Interface name (e.g. console, bmc)")],
+    target: Annotated[str, typer.Option("--target", "-t", help="Target name")],
+    device: Annotated[str, typer.Option("--device", "-d", help="Serial device path")],
     baud: Annotated[int, typer.Option("--baud", help="Baud rate")] = 115200,
-    power_sense: Annotated[
+    sense: Annotated[Optional[str], typer.Option("--sense", help=_SENSE_HELP)] = None,
+    host: Annotated[
         Optional[str],
-        typer.Option(
-            "--power-sense",
-            help=(
-                "FTDI modem-control input wired to the target 3.3 V rail "
-                "(cts | dsr | dcd | ri | none). "
-                "Enables power-state sensing in GET /status and smart"
-                " power-cycle waits."
-            ),
-        ),
+        typer.Option("--host", help="Override the host this channel lives on"),
     ] = None,
 ) -> None:
-    """Add or update a named serial interface for a target.
-
-    A target may have several (run setup once per interface, e.g. --name console,
-    --name bmc). Re-running with an existing name updates that interface.
-
-    Use --power-sense to specify which FTDI input pin is wired to the target's
-    3.3 V rail for power-state detection (see hardware notes in AGENTS.md)."""
-    cfg = _resolve(target)
-
-    if device is None:
-        devices = _serial.list_serial_devices()
-        if not devices:
-            err.print("[red]No serial devices found.[/red] Specify one with --device.")
-            raise typer.Exit(1)
-        if len(devices) == 1:
-            device = devices[0]
-            console.print(f"[dim]Auto-detected serial device:[/dim] {device}")
-        else:
-            console.print("Available serial devices:")
-            for d in devices:
-                console.print(f"  {d}")
-            err.print("[red]Multiple devices found — specify one with --device.[/red]")
-            raise typer.Exit(1)
-
-    device = _serial.canonical_device_path(device)
-
-    if power_sense is not None and power_sense.lower() == "none":
-        power_sense = None
-    elif (
-        power_sense is not None
-        and power_sense.lower() not in _config.VALID_SENSE_SIGNALS
-    ):
-        err.print(
-            f"[red]Unknown sense signal '{power_sense}'.[/red] "
-            f"Valid values: {', '.join(_config.VALID_SENSE_SIGNALS)}, none"
-        )
-        raise typer.Exit(1)
-    elif power_sense is not None:
-        power_sense = power_sense.lower()
-
-    # Preserve existing sense signal when --power-sense is not given.
-    if power_sense is None:
-        existing_iface = next(
-            (i for i in cfg.serial_interfaces if i.name == name), None
-        )
-        sense = existing_iface.power_sense_signal if existing_iface else None
-    else:
-        sense = power_sense
-
-    cfg.upsert_serial_interface(
-        _config.SerialInterface(
-            name=name, device=device, baud=baud, power_sense_signal=sense
+    """Add a named serial console to a target (a target may have several)."""
+    sense_value = _normalize_sense(sense)
+    _edit_lab(
+        lambda lf: lf.add_serial(
+            target,
+            name,
+            device,
+            baud=baud,
+            power_sense_signal=sense_value,
+            host=host,
         )
     )
-    _config.save_target(cfg)
-    sense_label = f"  power_sense : {sense}" if sense else ""
     console.print(
-        f"[green]Serial interface '[bold]{name}[/bold]' saved for "
-        f"'[bold]{cfg.name}[/bold]':[/green] {device} @ {baud}"
+        f"[green]Serial '[bold]{name}[/bold]' added to "
+        f"'[bold]{target}[/bold]':[/green] {device} @ {baud}"
     )
-    if sense_label:
-        console.print(sense_label)
 
 
-@serial_app.command("remove")
-def serial_remove(
+@serial_app.command("set")
+def serial_set(
+    name: Annotated[str, typer.Argument(help="Interface name to update")],
+    target: Annotated[str, typer.Option("--target", "-t", help="Target name")],
+    device: Annotated[
+        Optional[str], typer.Option("--device", "-d", help="Serial device path")
+    ] = None,
+    baud: Annotated[Optional[int], typer.Option("--baud", help="Baud rate")] = None,
+    sense: Annotated[Optional[str], typer.Option("--sense", help=_SENSE_HELP)] = None,
+    host: Annotated[Optional[str], typer.Option("--host")] = None,
+) -> None:
+    """Update an existing serial interface (only the options you pass change)."""
+    sense_value = None
+    if sense is not None:
+        sense_value = _normalize_sense(sense)
+        if sense_value is None:  # user passed "none"
+            err.print(
+                "[red]`set` can't clear a sense signal.[/red] Remove and re-add "
+                "the interface to clear it."
+            )
+            raise typer.Exit(1)
+    _edit_lab(
+        lambda lf: lf.update_serial(
+            target,
+            name,
+            device=device,
+            baud=baud,
+            power_sense_signal=sense_value,
+            host=host,
+        )
+    )
+    console.print(
+        f"[green]Serial '[bold]{name}[/bold]' updated on '[bold]{target}[/bold]'.[/green]"
+    )
+
+
+@serial_app.command("rm")
+def serial_rm(
     name: Annotated[str, typer.Argument(help="Interface name to remove")],
-    target: Annotated[Optional[str], typer.Option("--target", "-t")] = None,
+    target: Annotated[str, typer.Option("--target", "-t", help="Target name")],
 ) -> None:
     """Remove a named serial interface from a target."""
-    cfg = _resolve(target)
-    if cfg.remove_serial_interface(name):
-        _config.save_target(cfg)
-        console.print(f"[green]Removed serial interface '[bold]{name}[/bold]'.[/green]")
-    else:
-        have = ", ".join(i.name for i in cfg.serial_interfaces) or "none"
-        err.print(f"[red]No serial interface '{name}'.[/red] (have: {have})")
-        raise typer.Exit(1)
+    _edit_lab(lambda lf: lf.remove_serial(target, name))
+    console.print(
+        f"[green]Serial '[bold]{name}[/bold]' removed from '{target}'.[/green]"
+    )
 
 
 def _resolve_interface(
@@ -1344,7 +1807,7 @@ def _resolve_interface(
     try:
         return cfg.serial_interface(interface)
     except ValueError as exc:
-        err.print(f"[red]{exc}.[/red] Run: paniolo serial setup")
+        err.print(f"[red]{exc}.[/red] Run: paniolo serial add")
         raise typer.Exit(1)
 
 
@@ -1504,7 +1967,7 @@ def serial_watch(
     if not cfg.serial_interfaces:
         err.print(
             f"[red]No serial interfaces configured for '{cfg.name}'.[/red] "
-            "Run: paniolo serial setup"
+            "Run: paniolo serial add"
         )
         raise typer.Exit(1)
 
@@ -1637,7 +2100,7 @@ def serial_show(
     if not cfg.serial_interfaces:
         console.print(
             f"No serial interfaces configured for '{cfg.name}'."
-            " Run: paniolo serial setup"
+            " Run: paniolo serial add"
         )
         return
     url = _serial.daemon_url()

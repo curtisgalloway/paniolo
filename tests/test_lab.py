@@ -178,9 +178,11 @@ def test_load_lab_parses_a_real_toml_file(tmp_path):
 
 
 @pytest.fixture(autouse=True)
-def _reset_override(monkeypatch):
+def _reset_override(monkeypatch, tmp_path):
     monkeypatch.setattr(_lab, "_override_path", None)
     monkeypatch.delenv("PANIOLO_LAB", raising=False)
+    # Isolate from the real ~/.config/paniolo/lab.toml default during tests.
+    monkeypatch.setattr(_lab, "DEFAULT_LAB_PATH", str(tmp_path / "absent.toml"))
 
 
 def test_load_is_none_without_a_configured_lab():
@@ -194,7 +196,54 @@ def test_lab_path_prefers_override_then_env(monkeypatch):
     assert _lab.lab_path() == "/from/flag.toml"
 
 
+def test_lab_path_falls_back_to_default_when_it_exists(monkeypatch, tmp_path):
+    default = tmp_path / "lab.toml"
+    default.write_text("")
+    monkeypatch.setattr(_lab, "DEFAULT_LAB_PATH", str(default))
+    assert _lab.lab_path() == str(default)
+
+
 def test_load_raises_on_missing_file():
     _lab.set_lab_path("/no/such/lab.toml")
     with pytest.raises(LabError, match="not found"):
         _lab.load()
+
+
+# ── resolved read view (per-channel hosts) ─────────────────────────────────────
+
+
+def _multihost_lab():
+    data = {
+        "hosts": {"bench1": {"ssh": "u@bench1"}, "bench2": {"ssh": "u@bench2"}},
+        "targets": {
+            "fortune": {
+                "host": "bench1",
+                "note": "n",
+                "netboot": {"interface": "en0"},
+                "serial": [{"name": "console", "device": "/dev/ttyUSB0"}],
+                "video": {"device": "/dev/video0", "host": "bench2"},
+            }
+        },
+    }
+    return _lab.Lab.from_dict(data)
+
+
+def test_resolved_target_resolves_per_channel_host():
+    rt = _multihost_lab().resolved_target("fortune")
+    by_name = {(c.kind, c.name): c for c in rt.channels}
+    assert by_name[("netboot", "netboot")].host == "bench1"  # inherits default
+    assert by_name[("serial", "console")].host == "bench1"
+    assert by_name[("video", "video")].host == "bench2"  # explicit override
+    assert rt.hosts() == ["bench1", "bench2"]
+    assert by_name[("serial", "console")].fields == {
+        "device": "/dev/ttyUSB0"
+    }  # name + host stripped
+
+
+def test_channels_on_host_inverse_index():
+    lab = _multihost_lab()
+    assert [(t, c.kind) for t, c in lab.channels_on_host("bench2")] == [
+        ("fortune", "video")
+    ]
+    on1 = {c.kind for _, c in lab.channels_on_host("bench1")}
+    assert on1 == {"netboot", "serial"}
