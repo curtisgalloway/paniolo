@@ -71,8 +71,12 @@ const LINUX_SKIP_PREFIXES: [&str; 8] = [
     "lo", "docker", "veth", "br", "virbr", "vlan", "bond", "dummy",
 ];
 
-/// External (non-built-in) Ethernet interfaces, active ones first.
+/// External (non-built-in) Ethernet interfaces, active ones first. The
+/// interface carrying the system default route is excluded — it can never be a
+/// netboot link (the start guard refuses to reconfigure the primary NIC), so
+/// surfacing it in discovery only invites a misconfiguration.
 pub fn list_usb_ethernet_interfaces() -> Vec<EthInterface> {
+    let primary = default_route_interface();
     let mut out: Vec<EthInterface> = Vec::new();
     if macos() {
         let Ok(o) = run(&["networksetup", "-listallhardwareports"]) else {
@@ -88,6 +92,7 @@ pub fn list_usb_ethernet_interfaces() -> Vec<EthInterface> {
                     let device = d.trim().to_string();
                     let excluded = device == "bridge0"
                         || device == "lo0"
+                        || primary.as_deref() == Some(device.as_str())
                         || MAC_EXCLUDE_PORTS.iter().any(|x| p.starts_with(x));
                     if !excluded {
                         let active = is_interface_active(&device);
@@ -103,7 +108,9 @@ pub fn list_usb_ethernet_interfaces() -> Vec<EthInterface> {
     } else if let Ok(rd) = std::fs::read_dir("/sys/class/net") {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            if LINUX_SKIP_PREFIXES.iter().any(|p| name.starts_with(p)) {
+            if LINUX_SKIP_PREFIXES.iter().any(|p| name.starts_with(p))
+                || primary.as_deref() == Some(name.as_str())
+            {
                 continue;
             }
             // Type 1 = Ethernet (ARPHRD_ETHER).
