@@ -9,11 +9,11 @@
 cli/
   src/
     daemons.rs (76 lines)
-    discover.rs (227 lines)
+    discover.rs (257 lines)
     dispatch.rs (289 lines)
     doctor.rs (207 lines)
     labfile.rs (505 lines)
-    main.rs (2103 lines)
+    main.rs (2115 lines)
     model.rs (519 lines)
     netboot.rs (163 lines)
     netif.rs (428 lines)
@@ -44,7 +44,7 @@ docs/
   README.md (67 lines)
   requirements.md (258 lines)
   serial.md (225 lines)
-  video.md (89 lines)
+  video.md (102 lines)
 hdmicap/
   assets/
     index.html (285 lines)
@@ -53,11 +53,11 @@ hdmicap/
     xterm.js (2 lines)
   src/
     capture_thread.rs (212 lines)
-    capture.rs (364 lines)
+    capture.rs (515 lines)
     daemon.rs (143 lines)
     frame.rs (203 lines)
-    main.rs (202 lines)
-    server.rs (405 lines)
+    main.rs (217 lines)
+    server.rs (407 lines)
   vendor/
     nokhwa-bindings-macos/
       src/
@@ -109,7 +109,7 @@ serialcap/
   Cargo.toml (45 lines)
 skills/
   paniolo/
-    SKILL.md (289 lines)
+    SKILL.md (296 lines)
 src/
   paniolo/
     __init__.py (13 lines)
@@ -146,7 +146,7 @@ tests/
   test_state.py (203 lines)
   test_video.py (146 lines)
 .gitignore (10 lines)
-AGENTS.md (849 lines)
+AGENTS.md (853 lines)
 LICENSE (201 lines)
 Makefile (76 lines)
 pyproject.toml (36 lines)

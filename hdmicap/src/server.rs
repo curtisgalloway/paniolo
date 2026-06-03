@@ -384,7 +384,9 @@ async fn devices() -> Response {
     match crate::capture::enumerate() {
         Ok(list) => Json(
             list.into_iter()
-                .map(|d| serde_json::json!({"index": d.index, "name": d.name, "misc": d.misc}))
+                .map(|d| {
+                    serde_json::json!({"index": d.index, "name": d.name, "misc": d.misc, "id": d.id})
+                })
                 .collect::<Vec<_>>(),
         )
         .into_response(),

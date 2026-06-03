@@ -54,7 +54,11 @@ enum Cmd {
         port: u16,
     },
     /// List available capture devices and exit (no daemon needed).
-    Devices,
+    Devices {
+        /// Emit machine-readable JSON instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Fetch one screenshot from the running daemon.
     Shot {
         /// Wait until the signal is Stable before capturing.
@@ -92,7 +96,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Daemon { device, port } => daemon::run(DeviceSpec::parse(&device), port),
-        Cmd::Devices => cmd_devices(),
+        Cmd::Devices { json } => cmd_devices(json),
         Cmd::Shot {
             stable,
             changed_since,
@@ -110,9 +114,20 @@ fn base_url() -> Result<String> {
     Ok(format!("http://127.0.0.1:{}", d.port))
 }
 
-fn cmd_devices() -> Result<()> {
-    for d in capture::enumerate()? {
-        println!("{:>3}  {}  [{}]", d.index, d.name, d.misc);
+fn cmd_devices(json: bool) -> Result<()> {
+    let devices = capture::enumerate()?;
+    if json {
+        let list: Vec<serde_json::Value> = devices
+            .iter()
+            .map(|d| {
+                serde_json::json!({"index": d.index, "name": d.name, "misc": d.misc, "id": d.id})
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&list)?);
+        return Ok(());
+    }
+    for d in devices {
+        println!("{:>3}  {}  [{}]  id={}", d.index, d.name, d.misc, d.id);
     }
     Ok(())
 }

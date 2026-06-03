@@ -42,7 +42,7 @@ paniolo target add <name> [--host <labhost>] [--note <text>]
 paniolo netboot set -t <name> --interface <iface> [--tftp-root <dir>] [--host-ip <ip>]
 paniolo serial add console -t <name> --device <path> [--baud 115200] [--sense cts]
 paniolo power set -t <name> [--cycle-cmd <script>] [--serial-interface console]
-paniolo video set -t <name> --device "<capture name>"
+paniolo video set -t <name> --device "<capture id or name>"
 ```
 
 - `paniolo netboot devices` lists candidate USB-Ethernet interfaces (the
@@ -107,8 +107,8 @@ passwordless `sudo` requirement as netboot (`ip` on Linux, `ifconfig` on macOS).
 ## Video — capture, preview, OCR
 
 ```
-paniolo video devices                 # list capture devices
-paniolo video set -t <target> --device "<name>"   # configure the video channel
+paniolo video devices                 # list capture devices (with stable ids)
+paniolo video set -t <target> --device "<id-or-name>"   # configure the video channel
 paniolo video watch                   # start the capture daemon (background)
 paniolo video preview                 # open the dashboard in a browser
 paniolo video shot [--stable] [--out frame.png]   # one lossless PNG
@@ -120,6 +120,13 @@ paniolo video stop
 - The **dashboard** (the video daemon's URL — ports are OS-assigned, printed by
   `video watch`/`console`) shows live video on top, a
   serial terminal below, and an **OCR button** that reads the current screen.
+- The `device` may be a **stable id** (preferred — `video devices` prints
+  `id=…`: the AVFoundation uniqueID on macOS, the `/dev/v4l/by-path` symlink on
+  Linux), a name substring, or a `/dev/video*` path. Ids are derived from USB
+  port topology, so they survive reboots and tell two identical dongles apart;
+  replugging into a different port changes the id. A name substring matching
+  more than one device is an error (listing the candidates' ids), not a silent
+  first-match guess.
 - `--stable` waits for a steady frame before capturing (useful right after a mode
   switch or reboot).
 - **OCR** (`video read` and the dashboard button) is on-device (Apple Vision). It

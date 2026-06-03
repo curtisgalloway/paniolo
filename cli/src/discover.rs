@@ -27,7 +27,8 @@ use crate::{daemons, netif, serial, video};
 const BUILTIN_CAPTURE: [&str; 5] = ["FaceTime", "Capture screen", "iSight", "iPhone", "iPad"];
 
 /// This host's lab-relevant hardware, in the same JSON shape the Python CLI
-/// emits (so mixed-version labs interoperate during the migration).
+/// emits (so mixed-version labs interoperate during the migration; the video
+/// entries' `id` field is a Rust-side addition).
 pub fn local_inventory() -> Value {
     let ethernet: Vec<Value> = netif::list_usb_ethernet_interfaces()
         .iter()
@@ -37,44 +38,26 @@ pub fn local_inventory() -> Value {
         .into_iter()
         .map(Value::String)
         .collect();
-    let video: Vec<Value> = list_capture_devices()
-        .into_iter()
-        .map(|d| json!({"index": d.0, "name": d.1, "misc": d.2}))
-        .collect();
-    json!({"ethernet": ethernet, "serial": serial, "video": video})
+    json!({"ethernet": ethernet, "serial": serial, "video": list_capture_devices()})
 }
 
-/// Parse `hdmicap devices` output: `  0  Name  [misc]` per line.
-fn list_capture_devices() -> Vec<(u64, String, String)> {
+/// Capture devices from `hdmicap devices --json`:
+/// `[{index, name, misc, id}, ...]` — `id` is the stable, port-derived
+/// identifier (AVFoundation uniqueID on macOS, /dev/v4l/by-path on Linux).
+fn list_capture_devices() -> Vec<Value> {
     let Some(binary) = daemons::find_binary(video::DAEMON) else {
         return Vec::new();
     };
-    let Ok(out) = std::process::Command::new(binary).arg("devices").output() else {
+    let Ok(out) = std::process::Command::new(binary)
+        .args(["devices", "--json"])
+        .output()
+    else {
         return Vec::new();
     };
     if !out.status.success() {
         return Vec::new();
     }
-    let mut devices = Vec::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let s = line.trim_start();
-        let Some((idx_str, rest)) = s.split_once(char::is_whitespace) else {
-            continue;
-        };
-        let Ok(index) = idx_str.parse::<u64>() else {
-            continue;
-        };
-        let rest = rest.trim();
-        let (name, misc) = match rest.rfind('[') {
-            Some(i) => (
-                rest[..i].trim().to_string(),
-                rest[i + 1..].trim_end_matches(']').to_string(),
-            ),
-            None => (rest.to_string(), String::new()),
-        };
-        devices.push((index, name, misc));
-    }
-    devices
+    serde_json::from_slice(&out.stdout).unwrap_or_default()
 }
 
 fn str_at<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
@@ -141,19 +124,29 @@ pub fn propose_target_block(name: &str, host: &str, inv: &Value) -> String {
     out.push(String::new());
 
     // video: propose the one non-built-in capture device, if unambiguous.
-    let captures: Vec<&str> = inv
+    // Prefer the stable id (port-derived, survives enumeration-order shifts)
+    // with the human name as a comment; fall back to the name when the
+    // discovering hdmicap reported no id.
+    let device_ref = |name: &str, id: &str| {
+        if id.is_empty() {
+            format!("device = \"{name}\"")
+        } else {
+            format!("device = \"{id}\"  # {name}")
+        }
+    };
+    let captures: Vec<(&str, &str)> = inv
         .get("video")
         .and_then(Value::as_array)
         .map(|a| {
             a.iter()
-                .filter_map(|d| str_at(d, "name"))
-                .filter(|n| !BUILTIN_CAPTURE.iter().any(|b| n.contains(b)))
+                .filter_map(|d| Some((str_at(d, "name")?, str_at(d, "id").unwrap_or(""))))
+                .filter(|(n, _)| !BUILTIN_CAPTURE.iter().any(|b| n.contains(b)))
                 .collect()
         })
         .unwrap_or_default();
-    if captures.len() == 1 {
+    if let [(cap_name, cap_id)] = captures.as_slice() {
         out.push(format!("[targets.{name}.video]"));
-        out.push(format!("device = \"{}\"", captures[0]));
+        out.push(device_ref(cap_name, cap_id));
     } else if captures.is_empty() {
         out.push(format!(
             "# [targets.{name}.video]  # no capture device discovered"
@@ -162,8 +155,8 @@ pub fn propose_target_block(name: &str, host: &str, inv: &Value) -> String {
         out.push(format!(
             "# [targets.{name}.video]  # multiple capture devices — pick one:"
         ));
-        for c in &captures {
-            out.push(format!("# device = \"{c}\""));
+        for (cap_name, cap_id) in &captures {
+            out.push(format!("# {}", device_ref(cap_name, cap_id)));
         }
     }
     out.push(String::new());
@@ -188,8 +181,8 @@ mod tests {
             ],
             "serial": ["/dev/tty.usbserial-A", "/dev/tty.usbserial-B"],
             "video": [
-                {"index": 0, "name": "USB Video", "misc": ""},
-                {"index": 1, "name": "FaceTime HD Camera", "misc": ""},
+                {"index": 0, "name": "USB Video", "misc": "", "id": "0x8300000534d2109"},
+                {"index": 1, "name": "FaceTime HD Camera", "misc": "", "id": "0x11000005ac8514"},
             ],
         });
         let block = propose_target_block("pi5", "bench1", &inv);
@@ -211,9 +204,46 @@ mod tests {
             block.contains("# another serial device: /dev/tty.usbserial-B"),
             "{block}"
         );
-        // FaceTime filtered as built-in → USB Video is the unambiguous capture.
+        // FaceTime filtered as built-in → USB Video is the unambiguous capture,
+        // proposed by stable id with the name as a comment.
         assert!(block.contains("[targets.pi5.video]"), "{block}");
+        assert!(
+            block.contains("device = \"0x8300000534d2109\"  # USB Video"),
+            "{block}"
+        );
+    }
+
+    #[test]
+    fn propose_falls_back_to_name_without_id() {
+        let inv = json!({
+            "ethernet": [],
+            "serial": [],
+            "video": [{"index": 0, "name": "USB Video", "misc": ""}],
+        });
+        let block = propose_target_block("t", "local", &inv);
         assert!(block.contains("device = \"USB Video\""), "{block}");
+    }
+
+    #[test]
+    fn propose_lists_duplicate_dongles_as_id_alternatives() {
+        let inv = json!({
+            "ethernet": [],
+            "serial": [],
+            "video": [
+                {"index": 0, "name": "USB Video", "misc": "", "id": "0x8300000534d2109"},
+                {"index": 1, "name": "USB Video", "misc": "", "id": "0x8200000534d2109"},
+            ],
+        });
+        let block = propose_target_block("t", "local", &inv);
+        assert!(block.contains("multiple capture devices"), "{block}");
+        assert!(
+            block.contains("# device = \"0x8300000534d2109\"  # USB Video"),
+            "{block}"
+        );
+        assert!(
+            block.contains("# device = \"0x8200000534d2109\"  # USB Video"),
+            "{block}"
+        );
     }
 
     #[test]
