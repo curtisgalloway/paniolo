@@ -74,18 +74,6 @@ pub fn start_daemon(ifaces: &[SerialChannel], port: u16) -> Result<()> {
     Ok(())
 }
 
-/// Block until the daemon answers discovery, or time out.
-pub fn wait_for_daemon(timeout: Duration) -> Option<String> {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        if let Some(url) = daemon_url() {
-            return Some(url);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    None
-}
-
 /// Stop the running daemon via `serialcap stop` (it owns the clean shutdown).
 pub fn stop_daemon() -> Result<i32> {
     let binary = daemons::find_binary(DAEMON).ok_or_else(|| anyhow!("serialcap not found"))?;
