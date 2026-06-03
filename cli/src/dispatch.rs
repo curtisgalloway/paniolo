@@ -166,6 +166,49 @@ pub fn dispatch(
     Ok(code)
 }
 
+/// Run a paniolo subcommand on `host_name` against a shipped slice, captured.
+/// Used by composite commands (e.g. `console`) to drive helper commands on the
+/// host before tunnelling to its daemons.
+pub fn run_subcommand(
+    lab: &Lab,
+    target: &str,
+    host_name: &str,
+    subargs: &[&str],
+) -> anyhow::Result<ssh::Output> {
+    let host = lab.host(host_name);
+    let slice = build_slice(lab, target, host_name)?;
+    let remote_path = ship_slice(&host, &slice)?;
+    let mut argv = vec![host.paniolo(), "--lab".to_string(), remote_path.clone()];
+    argv.extend(subargs.iter().map(|s| s.to_string()));
+    let out = ssh::run(&host, &argv, None, &[]);
+    let _ = ssh::run(
+        &host,
+        &["rm".to_string(), "-f".to_string(), remote_path],
+        None,
+        &[],
+    );
+    Ok(out?)
+}
+
+/// Read the TCP port from a daemon's discovery file on `host`, or None.
+/// The path is resolved by a remote shell so the host's own runtime dir applies.
+pub fn remote_daemon_port(host: &crate::model::Host, subdir: &str) -> Option<u16> {
+    let script =
+        format!("cat \"${{XDG_RUNTIME_DIR:-${{TMPDIR:-/tmp}}}}/{subdir}/daemon.json\" 2>/dev/null");
+    let out = ssh::run(
+        host,
+        &["sh".to_string(), "-c".to_string(), script],
+        None,
+        &[],
+    )
+    .ok()?;
+    if out.status != 0 || out.stdout.trim().is_empty() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(out.stdout.trim()).ok()?;
+    v.get("port")?.as_u64().map(|p| p as u16)
+}
+
 /// Resolve where a command should run and dispatch if remote.
 ///
 /// Returns `Some(exit_code)` when the command was dispatched to a control host
