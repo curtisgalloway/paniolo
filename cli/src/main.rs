@@ -29,6 +29,7 @@ mod dispatch;
 mod doctor;
 mod labfile;
 mod model;
+mod serial;
 mod ssh;
 
 use std::path::PathBuf;
@@ -208,6 +209,68 @@ enum SerialCmd {
         #[arg(long, short)]
         target: String,
     },
+    /// Open an interactive serial console (via tio) on the channel's host.
+    Connect {
+        target: Option<String>,
+        /// Interface name (default: the only one).
+        #[arg(long, short)]
+        interface: Option<String>,
+    },
+    /// Start the serialcap daemon (owning every configured interface).
+    Watch {
+        target: Option<String>,
+        #[arg(long, default_value_t = serial::DEFAULT_PORT)]
+        port: u16,
+    },
+    /// Stop the running serialcap daemon.
+    Stop,
+    /// Send a line of input to the console through the running daemon.
+    Send {
+        /// Text to send.
+        text: String,
+        #[arg(long, short)]
+        target: Option<String>,
+        #[arg(long, short)]
+        interface: Option<String>,
+        /// Per-byte pacing in ms for slow polled consoles (0 = full rate).
+        #[arg(long, default_value_t = 0)]
+        pace_ms: u32,
+        /// Don't append a carriage return after the text.
+        #[arg(long)]
+        no_newline: bool,
+    },
+    /// Print captured serial output (reads serialcap's on-disk log).
+    Log {
+        #[arg(long, short)]
+        target: Option<String>,
+        #[arg(long, short)]
+        interface: Option<String>,
+        /// Show only the most recent N lines.
+        #[arg(long, short = 'n')]
+        tail: Option<u64>,
+        /// Lowest line sequence number (inclusive).
+        #[arg(long)]
+        from: Option<u64>,
+        /// Highest line sequence number (inclusive).
+        #[arg(long)]
+        to: Option<u64>,
+        /// Only lines newer than this sequence number.
+        #[arg(long)]
+        since: Option<u64>,
+        /// Keep raw bytes (ANSI/control) instead of cleaning.
+        #[arg(long)]
+        raw: bool,
+        /// Emit JSON Lines instead of formatted text.
+        #[arg(long)]
+        json: bool,
+        /// Exclude the current unterminated line.
+        #[arg(long)]
+        no_pending: bool,
+    },
+    /// List available serial devices on this machine.
+    Devices,
+    /// Show a target's serial interfaces and the daemon status.
+    Show { target: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -663,7 +726,276 @@ fn serial_cmd(lab_flag: Option<&str>, cmd: SerialCmd) -> Result<()> {
             println!("Serial '{name}' removed from '{target}'.");
             Ok(())
         }
+        SerialCmd::Connect { target, interface } => {
+            cmd_serial_connect(lab_flag, target.as_deref(), interface.as_deref())
+        }
+        SerialCmd::Watch { target, port } => cmd_serial_watch(lab_flag, target.as_deref(), port),
+        SerialCmd::Stop => {
+            let code = serial::stop_daemon()?;
+            if code == 0 {
+                println!("Serial daemon stopped.");
+                Ok(())
+            } else {
+                std::process::exit(code);
+            }
+        }
+        SerialCmd::Send {
+            text,
+            target,
+            interface,
+            pace_ms,
+            no_newline,
+        } => cmd_serial_send(
+            lab_flag,
+            target.as_deref(),
+            interface.as_deref(),
+            &text,
+            pace_ms,
+            !no_newline,
+        ),
+        SerialCmd::Log {
+            target,
+            interface,
+            tail,
+            from,
+            to,
+            since,
+            raw,
+            json,
+            no_pending,
+        } => cmd_serial_log(
+            lab_flag,
+            target.as_deref(),
+            interface.as_deref(),
+            tail,
+            from,
+            to,
+            since,
+            raw,
+            json,
+            no_pending,
+        ),
+        SerialCmd::Devices => {
+            let devices = serial::list_devices();
+            if devices.is_empty() {
+                println!("No serial devices found.");
+            }
+            for d in devices {
+                println!("  {d}");
+            }
+            Ok(())
+        }
+        SerialCmd::Show { target } => cmd_serial_show(lab_flag, target.as_deref()),
     }
+}
+
+// ── serial runtime bodies ───────────────────────────────────────────────────
+
+/// The target's serial channels visible on *this* host (all of them when
+/// running against a shipped slice, the local ones otherwise).
+fn local_serials(lab: &Lab, target: &str) -> Result<Vec<model::SerialChannel>> {
+    let t = lab
+        .targets
+        .get(target)
+        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+    let dh = t.default_host().to_string();
+    Ok(t.serial
+        .iter()
+        .filter(|s| s.host.as_deref().unwrap_or(&dh) == model::LOCAL)
+        .cloned()
+        .collect())
+}
+
+fn pick_serial<'a>(
+    serials: &'a [model::SerialChannel],
+    name: Option<&str>,
+) -> Result<&'a model::SerialChannel> {
+    let have = || {
+        serials
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match name {
+        Some(n) => serials
+            .iter()
+            .find(|s| s.name == n)
+            .ok_or_else(|| anyhow!("no serial interface '{n}' (have: {})", have())),
+        None => match serials.len() {
+            1 => Ok(&serials[0]),
+            0 => bail!("no serial interfaces configured (paniolo serial add ...)"),
+            _ => bail!(
+                "multiple serial interfaces ({}); specify one with -i",
+                have()
+            ),
+        },
+    }
+}
+
+/// Common preamble for serial runtime commands: resolve the target, dispatch
+/// to the channel's host if remote, and return the local serial channels.
+fn serial_runtime(
+    lab_flag: Option<&str>,
+    target: Option<&str>,
+    interface: Option<&str>,
+    mode: dispatch::Mode,
+) -> Result<Vec<model::SerialChannel>> {
+    let lab = load_for_read(lab_flag)?;
+    let target = resolve_single_target(&lab, target)?;
+    if let Some(code) =
+        dispatch::maybe_dispatch(&lab, &target, model::ChannelKind::Serial, interface, mode)?
+    {
+        std::process::exit(code);
+    }
+    local_serials(&lab, &target)
+}
+
+fn cmd_serial_connect(
+    lab_flag: Option<&str>,
+    target: Option<&str>,
+    interface: Option<&str>,
+) -> Result<()> {
+    let serials = serial_runtime(lab_flag, target, interface, dispatch::Mode::Interactive)?;
+    let ch = pick_serial(&serials, interface)?;
+    serial::exec_tio(&ch.device, ch.baud)
+}
+
+fn cmd_serial_watch(lab_flag: Option<&str>, target: Option<&str>, port: u16) -> Result<()> {
+    let serials = serial_runtime(lab_flag, target, None, dispatch::Mode::Reexec)?;
+    if serials.is_empty() {
+        bail!("no serial interfaces configured (paniolo serial add ...)");
+    }
+    if let Some(url) = serial::daemon_url() {
+        println!("Serial daemon already running at {url}");
+        return Ok(());
+    }
+    serial::start_daemon(&serials, port)?;
+    let names: Vec<&str> = serials.iter().map(|s| s.name.as_str()).collect();
+    eprintln!(
+        "Starting serial daemon for {} interface(s): {}…",
+        serials.len(),
+        names.join(", ")
+    );
+    match serial::wait_for_daemon(std::time::Duration::from_secs(5)) {
+        Some(url) => {
+            println!("Serial daemon started. {url}");
+            Ok(())
+        }
+        None => bail!("serial daemon did not start within 5 s"),
+    }
+}
+
+fn cmd_serial_send(
+    lab_flag: Option<&str>,
+    target: Option<&str>,
+    interface: Option<&str>,
+    text: &str,
+    pace_ms: u32,
+    newline: bool,
+) -> Result<()> {
+    let serials = serial_runtime(lab_flag, target, interface, dispatch::Mode::Reexec)?;
+    let ch = pick_serial(&serials, interface)?;
+    let url = serial::daemon_url().ok_or_else(|| {
+        anyhow!("serialcap daemon not running — start it with `paniolo serial watch`")
+    })?;
+    let mut payload = text.as_bytes().to_vec();
+    if newline {
+        payload.push(b'\r');
+    }
+    let pace_note = if pace_ms > 0 {
+        format!(" paced {pace_ms} ms/byte")
+    } else {
+        String::new()
+    };
+    eprintln!(
+        "Sending {} bytes to '{}'{pace_note}",
+        payload.len(),
+        ch.name
+    );
+    serial::send_input(&url, &ch.name, &payload, pace_ms)?;
+    println!("Sent.");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_serial_log(
+    lab_flag: Option<&str>,
+    target: Option<&str>,
+    interface: Option<&str>,
+    tail: Option<u64>,
+    from: Option<u64>,
+    to: Option<u64>,
+    since: Option<u64>,
+    raw: bool,
+    json: bool,
+    no_pending: bool,
+) -> Result<()> {
+    // Dispatch to the channel's host; the capture log lives where the daemon ran.
+    let serials = serial_runtime(lab_flag, target, interface, dispatch::Mode::Reexec)?;
+    // serialcap reads its own on-disk log, so this works daemon-up or -down.
+    let binary = serial::find_binary("serialcap")
+        .ok_or_else(|| anyhow!("serialcap not found — run `paniolo setup`"))?;
+    let mut cmd = std::process::Command::new(binary);
+    cmd.arg("log");
+    // Name the interface explicitly when we can (sole or selected).
+    if let Some(name) = interface.or_else(|| {
+        if serials.len() == 1 {
+            Some(serials[0].name.as_str())
+        } else {
+            None
+        }
+    }) {
+        cmd.arg("--interface").arg(name);
+    }
+    if let Some(n) = tail {
+        cmd.arg("--tail").arg(n.to_string());
+    }
+    if let Some(n) = from {
+        cmd.arg("--from").arg(n.to_string());
+    }
+    if let Some(n) = to {
+        cmd.arg("--to").arg(n.to_string());
+    }
+    if let Some(n) = since {
+        cmd.arg("--since").arg(n.to_string());
+    }
+    if raw {
+        cmd.arg("--raw");
+    }
+    if json {
+        cmd.arg("--json");
+    }
+    if no_pending {
+        cmd.arg("--no-pending");
+    }
+    let status = cmd.status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+fn cmd_serial_show(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
+    let serials = serial_runtime(lab_flag, target, None, dispatch::Mode::Reexec)?;
+    if serials.is_empty() {
+        println!("No serial interfaces configured. (paniolo serial add ...)");
+        return Ok(());
+    }
+    for ch in &serials {
+        let sense = ch
+            .power_sense_signal
+            .as_deref()
+            .map(|s| format!("  (sense: {s})"))
+            .unwrap_or_default();
+        println!("{}\t{} @ {}{sense}", ch.name, ch.device, ch.baud);
+    }
+    match serial::daemon_url() {
+        Some(url) => println!("daemon\trunning at {url}"),
+        None => println!("daemon\tstopped"),
+    }
+    Ok(())
 }
 
 fn netboot_cmd(lab_flag: Option<&str>, cmd: NetbootCmd) -> Result<()> {
