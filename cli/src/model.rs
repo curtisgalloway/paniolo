@@ -62,6 +62,13 @@ impl Host {
     pub fn is_local(&self, name: &str) -> bool {
         self.ssh == LOCAL || name == LOCAL
     }
+
+    /// How to invoke paniolo on this host (bare `paniolo` unless pinned).
+    pub fn paniolo(&self) -> String {
+        self.paniolo_cmd
+            .clone()
+            .unwrap_or_else(|| "paniolo".to_string())
+    }
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -177,6 +184,18 @@ impl Lab {
         self.targets.keys().map(String::as_str).collect()
     }
 
+    /// Look up a control host by name. `local` (and any undeclared name, which
+    /// validation forbids) resolves to a synthetic local host.
+    pub fn host(&self, name: &str) -> Host {
+        if let Some(h) = self.hosts.get(name) {
+            return h.clone();
+        }
+        Host {
+            ssh: LOCAL.to_string(),
+            ..Default::default()
+        }
+    }
+
     /// Flatten a target to its channels with per-channel hosts resolved.
     pub fn resolved_target(&self, name: &str) -> Option<ResolvedTarget> {
         let t = self.targets.get(name)?;
@@ -255,6 +274,54 @@ fn push_opt(fields: &mut Vec<(&'static str, String)>, key: &'static str, v: &Opt
     if let Some(val) = v {
         fields.push((key, val.clone()));
     }
+}
+
+/// Resolve the host a command should run on, given the channel it touches.
+///
+/// Singleton kinds use that channel's host (else the target default). Serial
+/// with a name uses that interface's host; serial without a name uses the common
+/// host of all interfaces, erroring if they span hosts (the `serial watch` case,
+/// where the daemon owns every interface). A missing channel falls back to the
+/// target's default host so the body can report it.
+pub fn channel_host(
+    rt: &ResolvedTarget,
+    kind: ChannelKind,
+    serial_name: Option<&str>,
+) -> Result<String, LabError> {
+    if kind == ChannelKind::Serial {
+        let serials: Vec<&ResolvedChannel> = rt
+            .channels
+            .iter()
+            .filter(|c| c.kind == ChannelKind::Serial)
+            .collect();
+        if let Some(n) = serial_name {
+            return Ok(serials
+                .iter()
+                .find(|c| c.name == n)
+                .map(|c| c.host.clone())
+                .unwrap_or_else(|| rt.default_host.clone()));
+        }
+        if serials.is_empty() {
+            return Ok(rt.default_host.clone());
+        }
+        let hosts: BTreeSet<&str> = serials.iter().map(|c| c.host.as_str()).collect();
+        if hosts.len() > 1 {
+            let list: Vec<&str> = hosts.into_iter().collect();
+            return lab_err(format!(
+                "target '{}' has serial interfaces on multiple hosts ({}); \
+                 specify one with --interface",
+                rt.name,
+                list.join(", ")
+            ));
+        }
+        return Ok(serials[0].host.clone());
+    }
+    for c in &rt.channels {
+        if c.kind == kind {
+            return Ok(c.host.clone());
+        }
+    }
+    Ok(rt.default_host.clone())
 }
 
 // ── validation (shared by load and the editor's save) ───────────────────────
