@@ -117,7 +117,9 @@ paniolo video stop
 
 - The **dashboard** (the video daemon's URL — ports are OS-assigned, printed by
   `video watch`/`console`) shows live video on top, a
-  serial terminal below, and an **OCR button** that reads the current screen.
+  serial terminal below, an **OCR button** that reads the current screen, and —
+  when the target has a `hid` channel — a **⌨ Capture input** button that turns
+  the page into a KVM (see HID injection below).
 - The `device` may be a **stable id** (preferred — `video devices` prints
   `id=…`: the AVFoundation uniqueID on macOS, the `/dev/v4l/by-path` symlink on
   Linux), a name substring, or a `/dev/video*` path. Ids are derived from USB
@@ -241,11 +243,23 @@ paniolo hid send -t <name> click left | scroll -3 | releaseall
 paniolo hid send -t <name> ping               # injector liveness check
 ```
 
+Absolute mouse (click-where-you-point): `paniolo hid send -t <name> moveabs
+<x> <y>` positions the cursor in a 0..32767 logical space the OS maps across
+the screen (the KB2040 firmware advertises the `moveabs` capability).
+
 Sequences: `hidrig run <file>` runs a command file (one command per line,
 `# comments`, `delay <ms>` / `sleep <seconds>`) — the file must be on the
 channel's host. The injector is powered by the target's USB port, so it is
 silent while the target is off and reboots with it. Protocol spec (for new
 injector implementations): `docs/hid-serial-protocol.md`.
+
+**KVM in the console.** `paniolo console <name>` shows a **⌨ Capture input**
+button over the video when the target has a `hid` channel: engage it to drive
+the target with your own keyboard + mouse (absolute — the cursor follows where
+you point), right-Ctrl to release. It auto-starts the hid daemon (`hidrig
+serve`), which owns the UART and re-exposes the protocol over a WebSocket;
+`paniolo hid send` injections intermix with what you type in the browser.
+Manual daemon control: `paniolo hid serve|stop -t <name>`.
 
 ## Targets on a remote control host (a "lab")
 

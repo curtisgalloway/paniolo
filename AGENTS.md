@@ -74,7 +74,7 @@ Current capabilities:
   log queryable by line range (`paniolo serial log -i <name>`)
 - Combined video+serial web dashboard (hdmicap's `GET /`: video on top, xterm.js terminal below)
 - On-device OCR of the captured screen (`paniolo video read`, dashboard OCR button): Apple Vision on macOS, Tesseract on Linux
-- USB HID input (keyboard/mouse injection) via a generic helper hook (`paniolo hid send`); the `hidrig` helper drives the KB2040 injector over its control UART (HID serial protocol, docs/hid-serial-protocol.md)
+- USB HID input (keyboard/mouse injection) via a generic helper hook (`paniolo hid send`); the `hidrig` helper drives the KB2040 injector over its control UART (HID serial protocol, docs/hid-serial-protocol.md). `hidrig serve` runs a daemon that owns the UART and re-exposes the protocol over a WebSocket, so `paniolo console` works as a **KVM** — stream the browser's keyboard + absolute mouse (`moveabs`) to the target, intermixed with CLI injection on the one wire
 - Power control via DTR (J2 wiring) or generic shell-command hooks (`on_cmd`, `off_cmd`, `cycle_cmd`, `state_cmd`): `paniolo serial dtr`, `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`
 
 ## Architecture
@@ -214,14 +214,30 @@ ocr/             OCR helpers (compiled/installed binaries are gitignored):
                    visionocr.swift  Apple Vision OCR (macOS); built by paniolo setup via swiftc
                    linuxocr         Tesseract OCR wrapper (Linux); copied by paniolo setup
 
-hidrig/          USB HID injector: host CLI (Rust) + KB2040 firmware
-  src/main.rs      `hidrig` CLI — clap subcommands mirroring the HID serial
-                   protocol (type/key/combo/move/.../ping/version) + `run`
-                   command files (delay/sleep directives live host-side)
+hidrig/          USB HID injector: host CLI + daemon (Rust) + KB2040 firmware
+  src/main.rs      `hidrig` CLI — one-shot subcommands mirroring the HID serial
+                   protocol (type/key/.../moveabs/ping/version) + `run` command
+                   files; `serve`/`stop` for the daemon. A `Sender` routes each
+                   one-shot through a running daemon (POST /send) when one owns
+                   the same device, else opens the UART directly
   src/proto.rs     line protocol client (send/OK-ERR parse) + sequence parser
-  firmware/code.py reference implementation of the protocol: UART line
-                   commands -> USB HID keyboard/mouse (CircuitPython 9.x)
-  firmware/boot.py USB identity: HID-only toward the target; D2->GND jumper
+                   + clamp_abs (moveabs range)
+  src/uart.rs      the UART owner: one async task, an mpsc<(line,reply)> queue
+                   serializing every command (CLI + web) onto the one wire, a
+                   broadcast transcript; lazy open + reopen-on-error
+  src/server.rs    axum: GET /hid (WebSocket carrier), POST /send, /status,
+                   /version. WS clients send command lines; all results are
+                   broadcast as `evt ok|err …` frames so observers see the
+                   intermixed stream
+  src/daemon.rs    advisory lock, discovery file at /tmp/paniolo-<uid>/hid/
+                   (the channel name, not "hidrig", so paniolo finds it without
+                   knowing the helper), tokio runtime, graceful shutdown
+  firmware/code.py reference implementation of the protocol: UART line commands
+                   -> USB HID keyboard/abs-mouse (CircuitPython 9.x). Tracks a
+                   virtual cursor so relative `move` and `moveabs` share one
+                   absolute-pointer device
+  firmware/boot.py USB identity: HID-only toward the target (keyboard + custom
+                   absolute-pointer descriptor, 0..32767 axes); D2->GND jumper
                    at boot re-enables CIRCUITPY + REPL for development
   host/hid_seize_reports.c  macOS IOKit tool: seizes the HID device exclusively
                    and prints raw input reports — for pipeline testing without
@@ -229,6 +245,21 @@ hidrig/          USB HID injector: host CLI (Rust) + KB2040 firmware
   README.md        wiring, firmware setup, CLI usage; the protocol spec is
                    docs/hid-serial-protocol.md (normative, device-independent)
 ```
+
+### hid daemon + KVM (`hidrig serve`)
+
+The UART can have only one owner, so KVM streaming and CLI injection can't both
+open it. `hidrig serve` resolves this: it owns the UART and re-exposes the line
+protocol over a WebSocket (`GET /hid`) and `POST /send`. Every command — from a
+browser, from `paniolo hid send`, from another script — flows through one
+`mpsc` queue in `uart.rs`, one in flight, request/reply; that single queue is
+what makes events intermix correctly. `paniolo console` starts the daemon when
+the target has a `hid` channel (local: `?hid=PORT`; remote: an SSH-tunnelled
+`?hidws=` URL) and the dashboard's **Capture input** toggle streams
+`down`/`up`/`moveabs`/`scroll` to it. The mouse is absolute (the firmware's
+custom HID descriptor), so the cursor follows where you point in the video;
+right-Ctrl releases capture. paniolo discovers the daemon by the channel name
+`hid` (`daemons::daemon_port("hid")`), staying agnostic to the helper.
 
 ## Combined dashboard (video + serial)
 

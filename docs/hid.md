@@ -58,6 +58,7 @@ paniolo hid send -t pi5 combo LEFT_CONTROL C # chord: press all, release all
 paniolo hid send -t pi5 releaseall           # release any held keys
 paniolo hid send -t pi5 click left           # click left/right/middle
 paniolo hid send -t pi5 move 300 -50         # relative mouse move
+paniolo hid send -t pi5 moveabs 16000 8000   # absolute move (0..32767 logical)
 paniolo hid send -t pi5 scroll -3            # scroll wheel (negative = down)
 paniolo hid send -t pi5 ping                 # injector liveness check
 ```
@@ -99,6 +100,41 @@ hidrig -d /dev/cu.usbserial-XXXX run - < boot-sequence.txt   # via stdin
 ```
 
 Sequencing and timing live on the host; the firmware stays dumb.
+
+---
+
+## KVM mode — type and click from the web console
+
+`paniolo console` turns the dashboard into a KVM: a **⌨ Capture input** button
+appears over the video when the target has a `hid` channel. Engage it and your
+keyboard and mouse drive the target — keys are forwarded as HID events and the
+mouse is **absolute**, so the target cursor lands where you point inside the
+video. **Right-Ctrl** releases capture (the classic host-key convention); while
+released, the page and serial terminal behave normally. Losing window focus
+auto-releases and clears held keys so nothing sticks on the target.
+
+Under the hood this is the **hid daemon**: the helper owns the UART and
+re-exposes the protocol over a localhost WebSocket (the
+[HID serial protocol](hid-serial-protocol.md) §2 carrier). `paniolo console`
+starts it on demand; the browser streams `moveabs`/`down`/`up`/`scroll`
+commands to it. Because the daemon serializes every command — from the browser
+*and* from the CLI — onto the one wire, `paniolo hid send` injections intermix
+cleanly with what you type in the console:
+
+```bash
+paniolo console pi5                    # KVM dashboard (auto-starts the hid daemon)
+paniolo hid serve -t pi5               # warm the daemon ahead of time (idempotent)
+paniolo hid send  -t pi5 type "while console is open"   # intermixes with the browser
+paniolo hid stop  -t pi5               # stop the daemon
+```
+
+Absolute positioning requires the `moveabs` capability (the KB2040 reference
+firmware advertises it in its `version` reply). A relative-only injector still
+works as a console keyboard, but click-where-you-point needs `moveabs`.
+
+When a daemon is running for a device, `hidrig -d <device> …` one-shots route
+through it automatically (the UART has a single owner), so the CLI and the web
+console never contend for the port.
 
 ---
 

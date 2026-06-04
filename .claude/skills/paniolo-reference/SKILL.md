@@ -5,7 +5,7 @@ description: Reference codebase for Paniolo. Use this skill when you need to und
 
 # Paniolo Codebase Reference
 
-131 files | 31972 lines | 391049 tokens
+134 files | 33263 lines | 404622 tokens
 
 ## Overview
 
@@ -20,11 +20,11 @@ Use this skill when you need to:
 | Crate | Purpose |
 |-------|---------|
 | `cli/` | Main `paniolo` binary — all commands, lab file, dispatch, SSH |
-| `hdmicap/` | Warm-stream HDMI capture daemon |
+| `hdmicap/` | Warm-stream HDMI capture daemon; serves the web dashboard (incl. KVM input capture) |
 | `serialcap/` | Serial console daemon (multi-interface, WebSocket, capture log) |
 | `netbootd/` | DHCP + TFTP netboot engine (single binary) |
-| `cambrionix/` | Standalone helper: Cambrionix USB hub control UART driver. Wired into paniolo via generic power hooks (`--on-cmd`, `--off-cmd`, `--cycle-cmd`, `--state-cmd`). `state <port>` prints `on`/`off` matching the `state_cmd` contract. |
-| `hidrig/` | Standalone helper: `hidrig` CLI for the KB2040 USB HID injector (keyboard/mouse injection over a control UART; HID serial protocol v1, spec at `docs/hid-serial-protocol.md`). Firmware in `hidrig/firmware/`. Wired into paniolo via the generic `hid` channel (`paniolo hid set --cmd`). |
+| `cambrionix/` | Standalone helper: Cambrionix USB hub control UART driver. Wired into paniolo via generic power hooks (`--on-cmd`, `--off-cmd`, `--cycle-cmd`, `--state-cmd`). `state <port>` prints `on`/`off`. |
+| `hidrig/` | Standalone helper: `hidrig` CLI + daemon for the KB2040 USB HID injector (HID serial protocol v1, spec at `docs/hid-serial-protocol.md`). One-shots + `serve` daemon (owns the UART, WebSocket `/hid` for KVM). Firmware in `hidrig/firmware/`. Wired into paniolo via the generic `hid` channel. |
 | `ocr/` | OCR helpers: `visionocr` (Swift/Apple Vision, macOS) + `linuxocr` (Tesseract, Linux) |
 
 ## Power hook fields (lab file `[targets.<name>.power]`)
@@ -41,7 +41,7 @@ Use this skill when you need to:
 
 | Field | Set via | Effect |
 |-------|---------|--------|
-| `cmd` | `--cmd` | opaque helper prefix; `paniolo hid send <args...>` appends args and runs it via `sh -c` |
+| `cmd` | `--cmd` | opaque helper prefix; `paniolo hid send <args...>` appends args and runs via `sh -c`; `paniolo console`/`hid serve` runs `<cmd> serve --port 0` for the KVM daemon |
 | `host` | `--host` | control host owning the channel (SSH dispatch) |
 
 ## Files

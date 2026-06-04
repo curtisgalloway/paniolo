@@ -19,13 +19,13 @@ cli/
     dispatch.rs (297 lines)
     doctor.rs (236 lines)
     labfile.rs (587 lines)
-    main.rs (2341 lines)
+    main.rs (2511 lines)
     model.rs (551 lines)
     netboot.rs (163 lines)
     netif.rs (428 lines)
     power.rs (61 lines)
     serial.rs (184 lines)
-    setup.rs (247 lines)
+    setup.rs (254 lines)
     ssh.rs (294 lines)
     state.rs (134 lines)
     video.rs (77 lines)
@@ -40,21 +40,21 @@ docs/
   architecture.md (267 lines)
   ch9329-spec.md (126 lines)
   config-redesign.md (325 lines)
-  dashboard.md (74 lines)
+  dashboard.md (84 lines)
   distributed-control-plan.md (209 lines)
   distributed-control.md (266 lines)
-  hid-serial-protocol.md (157 lines)
-  hid.md (127 lines)
+  hid-serial-protocol.md (181 lines)
+  hid.md (163 lines)
   netboot.md (190 lines)
   netif.md (112 lines)
   power.md (227 lines)
   README.md (68 lines)
-  requirements.md (259 lines)
+  requirements.md (262 lines)
   serial.md (226 lines)
   video.md (103 lines)
 hdmicap/
   assets/
-    index.html (285 lines)
+    index.html (448 lines)
     xterm-addon-fit.js (2 lines)
     xterm.css (209 lines)
     xterm.js (2 lines)
@@ -79,17 +79,20 @@ hdmicap/
   Cargo.toml (62 lines)
 hidrig/
   firmware/
-    boot.py (48 lines)
-    code.py (187 lines)
+    boot.py (104 lines)
+    code.py (233 lines)
   host/
     hid_seize_reports.c (156 lines)
     Makefile (8 lines)
   src/
-    main.rs (184 lines)
-    proto.rs (171 lines)
+    daemon.rs (166 lines)
+    main.rs (308 lines)
+    proto.rs (197 lines)
+    server.rs (142 lines)
+    uart.rs (233 lines)
   .gitignore (1 lines)
-  Cargo.toml (33 lines)
-  README.md (130 lines)
+  Cargo.toml (49 lines)
+  README.md (154 lines)
   SETUP.md (128 lines)
 netbootd/
   src/
@@ -120,7 +123,7 @@ serialcap/
   Cargo.toml (45 lines)
 skills/
   paniolo/
-    SKILL.md (345 lines)
+    SKILL.md (359 lines)
 src/
   paniolo/
     __init__.py (13 lines)
@@ -157,7 +160,7 @@ tests/
   test_state.py (203 lines)
   test_video.py (146 lines)
 .gitignore (10 lines)
-AGENTS.md (871 lines)
+AGENTS.md (902 lines)
 LICENSE (201 lines)
 Makefile (82 lines)
 pyproject.toml (36 lines)
