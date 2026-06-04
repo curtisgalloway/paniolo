@@ -5,7 +5,7 @@ description: Reference codebase for Paniolo. Use this skill when you need to und
 
 # Paniolo Codebase Reference
 
-123 files | 30477 lines | 376815 tokens
+131 files | 31972 lines | 391049 tokens
 
 ## Overview
 
@@ -24,6 +24,7 @@ Use this skill when you need to:
 | `serialcap/` | Serial console daemon (multi-interface, WebSocket, capture log) |
 | `netbootd/` | DHCP + TFTP netboot engine (single binary) |
 | `cambrionix/` | Standalone helper: Cambrionix USB hub control UART driver. Wired into paniolo via generic power hooks (`--on-cmd`, `--off-cmd`, `--cycle-cmd`, `--state-cmd`). `state <port>` prints `on`/`off` matching the `state_cmd` contract. |
+| `hidrig/` | Standalone helper: `hidrig` CLI for the KB2040 USB HID injector (keyboard/mouse injection over a control UART; HID serial protocol v1, spec at `docs/hid-serial-protocol.md`). Firmware in `hidrig/firmware/`. Wired into paniolo via the generic `hid` channel (`paniolo hid set --cmd`). |
 | `ocr/` | OCR helpers: `visionocr` (Swift/Apple Vision, macOS) + `linuxocr` (Tesseract, Linux) |
 
 ## Power hook fields (lab file `[targets.<name>.power]`)
@@ -35,6 +36,13 @@ Use this skill when you need to:
 | `off_cmd` | `--off-cmd` | `paniolo power off` |
 | `state_cmd` | `--state-cmd` | `paniolo power-state` (first token of stdout: `on`/`off`); overrides sense-line |
 | `serial_interface` | `--serial-interface` | default interface for DTR commands |
+
+## HID channel (lab file `[targets.<name>.hid]`)
+
+| Field | Set via | Effect |
+|-------|---------|--------|
+| `cmd` | `--cmd` | opaque helper prefix; `paniolo hid send <args...>` appends args and runs it via `sh -c` |
+| `host` | `--host` | control host owning the channel (SSH dispatch) |
 
 ## Files
 

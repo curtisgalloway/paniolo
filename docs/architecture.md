@@ -98,7 +98,7 @@ power_sense_signal = "cts"       # optional; cts|dsr|dcd|ri — modem-control in
 
 | Purpose | Path |
 |---|---|
-| Target / video / HID configs | `~/.config/paniolo/{targets/<name>.toml, video.toml, hid.toml}` |
+| Target / video configs (legacy Python) | `~/.config/paniolo/{targets/<name>.toml, video.toml}` |
 | Netboot state (pids, uptime) | `~/.local/share/paniolo/<name>/netboot.json` |
 | Netboot combined log | `~/.local/share/paniolo/<name>/netboot.log` |
 | hdmicap discovery / lock | `/tmp/paniolo-<uid>/hdmicap/{daemon.json, daemon.lock}` |
@@ -166,10 +166,11 @@ Apple Vision (`visionocr`) on macOS, Tesseract (`linuxocr`) on Linux — tuned f
 fonts (2× upscale, black-pad, `.fast`/lowered min text height).
 
 ### HID injection ([`hid.md`](hid.md))
-A two-board KB2040 rig injects USB keyboard/mouse events. `paniolo hid` is a **thin text-command
-client** over the control board's USB-CDC data port; the board owns the wire protocol and relays
-events over I2C to the target board, which presents as a USB HID device to the DUT. Requires the
-optional `pyserial` extra.
+A single KB2040 presents as a USB HID keyboard + mouse to the DUT; the control host drives it
+over a UART (USB-serial adapter) speaking the device-independent
+[HID serial protocol](hid-serial-protocol.md). The `hidrig` helper CLI is the protocol client,
+and paniolo integrates it through the generic per-target `hid` channel — an opaque command
+prefix (`paniolo hid send` appends arguments), exactly like the power hooks.
 
 ### Dashboard ([`dashboard.md`](dashboard.md))
 `paniolo console` opens hdmicap's `GET /` — a two-pane web UI (live video on top, xterm.js

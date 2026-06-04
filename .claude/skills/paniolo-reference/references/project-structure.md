@@ -6,15 +6,21 @@
 .github/
   workflows/
     ci.yml (155 lines)
+cambrionix/
+  src/
+    main.rs (216 lines)
+    proto.rs (234 lines)
+  .gitignore (1 lines)
+  Cargo.toml (33 lines)
 cli/
   src/
-    daemons.rs (135 lines)
+    daemons.rs (140 lines)
     discover.rs (257 lines)
-    dispatch.rs (289 lines)
-    doctor.rs (207 lines)
-    labfile.rs (505 lines)
-    main.rs (2123 lines)
-    model.rs (519 lines)
+    dispatch.rs (297 lines)
+    doctor.rs (236 lines)
+    labfile.rs (587 lines)
+    main.rs (2341 lines)
+    model.rs (551 lines)
     netboot.rs (163 lines)
     netif.rs (428 lines)
     power.rs (61 lines)
@@ -31,18 +37,19 @@ docs/
     gap-analysis.md (228 lines)
     redfish-provider.md (147 lines)
     related-work.md (158 lines)
-  architecture.md (266 lines)
+  architecture.md (267 lines)
   ch9329-spec.md (126 lines)
-  config-redesign.md (324 lines)
-  dashboard.md (71 lines)
+  config-redesign.md (325 lines)
+  dashboard.md (74 lines)
   distributed-control-plan.md (209 lines)
   distributed-control.md (266 lines)
-  hid.md (105 lines)
-  netboot.md (186 lines)
+  hid-serial-protocol.md (157 lines)
+  hid.md (127 lines)
+  netboot.md (190 lines)
   netif.md (112 lines)
-  power.md (144 lines)
-  README.md (67 lines)
-  requirements.md (258 lines)
+  power.md (227 lines)
+  README.md (68 lines)
+  requirements.md (259 lines)
   serial.md (226 lines)
   video.md (103 lines)
 hdmicap/
@@ -71,15 +78,19 @@ hdmicap/
   .gitignore (1 lines)
   Cargo.toml (62 lines)
 hidrig/
-  control/
-    boot.py (29 lines)
-    code.py (167 lines)
+  firmware/
+    boot.py (48 lines)
+    code.py (187 lines)
   host/
     hid_seize_reports.c (156 lines)
     Makefile (8 lines)
-  HANDOFF.md (97 lines)
-  README.md (139 lines)
-  SETUP.md (142 lines)
+  src/
+    main.rs (184 lines)
+    proto.rs (171 lines)
+  .gitignore (1 lines)
+  Cargo.toml (33 lines)
+  README.md (130 lines)
+  SETUP.md (128 lines)
 netbootd/
   src/
     bin/
@@ -109,7 +120,7 @@ serialcap/
   Cargo.toml (45 lines)
 skills/
   paniolo/
-    SKILL.md (293 lines)
+    SKILL.md (345 lines)
 src/
   paniolo/
     __init__.py (13 lines)
@@ -146,7 +157,7 @@ tests/
   test_state.py (203 lines)
   test_video.py (146 lines)
 .gitignore (10 lines)
-AGENTS.md (867 lines)
+AGENTS.md (871 lines)
 LICENSE (201 lines)
 Makefile (82 lines)
 pyproject.toml (36 lines)
