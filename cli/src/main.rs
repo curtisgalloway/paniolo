@@ -461,6 +461,12 @@ enum HidCmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         args: Vec<String>,
     },
+    /// Start the injection daemon (the KVM path): the helper owns the UART and
+    /// re-exposes it over a WebSocket. `paniolo console` starts it on demand;
+    /// run this to warm it ahead of time. Idempotent.
+    Serve { target: Option<String> },
+    /// Stop the running injection daemon.
+    Stop { target: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -1224,20 +1230,32 @@ fn cmd_serial_dtr(
 
 // ── console (composite: video + serial dashboard) ───────────────────────────
 
-fn dashboard_url(
-    video_base: &str,
-    serial_ws: Option<&str>,
+/// Daemon endpoints the dashboard needs, as URL query parameters. Each daemon
+/// passes either a cross-port `*ws` URL (the remote/tunnel path) or a bare
+/// `port` (the local same-host path); the page builds the WebSocket URL.
+#[derive(Default)]
+struct DashboardLinks<'a> {
+    serial_ws: Option<&'a str>,
     serial_port: Option<u16>,
-    interface: Option<&str>,
-) -> String {
+    interface: Option<&'a str>,
+    hid_ws: Option<&'a str>,
+    hid_port: Option<u16>,
+}
+
+fn dashboard_url(video_base: &str, links: &DashboardLinks) -> String {
     let mut params: Vec<String> = Vec::new();
-    if let Some(ws) = serial_ws {
+    if let Some(ws) = links.serial_ws {
         params.push(format!("serialws={ws}"));
-    } else if let Some(port) = serial_port {
+    } else if let Some(port) = links.serial_port {
         params.push(format!("serial={port}"));
     }
-    if let Some(i) = interface {
+    if let Some(i) = links.interface {
         params.push(format!("interface={i}"));
+    }
+    if let Some(ws) = links.hid_ws {
+        params.push(format!("hidws={ws}"));
+    } else if let Some(port) = links.hid_port {
+        params.push(format!("hid={port}"));
     }
     if params.is_empty() {
         video_base.to_string()
@@ -1311,10 +1329,26 @@ fn cmd_console(
             || daemons::start_failure(serial::DAEMON, std::time::Duration::from_secs(5)),
         )?;
     }
-    // The dashboard's serial pane can't discover serialcap's OS-assigned
-    // port itself — hand it over as ?serial=PORT.
+    // Optional KVM leg: if the target has a local hid channel, ensure its
+    // daemon and hand the dashboard its port (?hid=PORT). Absent/remote hid
+    // channels just leave the console without input injection.
+    let hid_port = ensure_hid_daemon_local(&lab, &target).unwrap_or_else(|e| {
+        eprintln!("hid (KVM) disabled: {e}");
+        None
+    });
+
+    // The dashboard's panes can't discover the daemons' OS-assigned ports
+    // themselves — hand them over as ?serial=PORT / ?hid=PORT.
     let serial_port = daemons::daemon_port(serial::DAEMON);
-    let url = dashboard_url(&video_url, None, serial_port, interface);
+    let url = dashboard_url(
+        &video_url,
+        &DashboardLinks {
+            serial_port,
+            interface,
+            hid_port,
+            ..Default::default()
+        },
+    );
     open_in_browser(&url);
     println!("Opened {url}");
     Ok(())
@@ -1345,11 +1379,47 @@ fn remote_console(lab: &Lab, target: &str, host_name: &str, interface: Option<&s
 
     let fwd_video = ssh::forward(&host, video_port)?;
     let fwd_serial = ssh::forward(&host, serial_port)?;
+
+    // Optional KVM leg: start the hid daemon on the host if its channel lives
+    // there too, then tunnel its port. A KVM-less console still works.
+    let hid_on_host = lab
+        .resolved_target(target)
+        .map(|rt| model::channel_host(&rt, model::ChannelKind::Hid, None).ok())
+        .unwrap_or(None)
+        .as_deref()
+        == Some(host_name)
+        && lab
+            .targets
+            .get(target)
+            .and_then(|t| t.hid.as_ref())
+            .is_some();
+    let mut _fwd_hid = None;
+    let hid_ws: Option<String> = if hid_on_host {
+        match dispatch::run_subcommand(lab, target, host_name, &["hid", "serve", target]) {
+            Ok(out) if out.status == 0 => dispatch::remote_daemon_port(&host, HID_DAEMON)
+                .and_then(|p| ssh::forward(&host, p).ok())
+                .map(|fwd| {
+                    let url = format!("ws://127.0.0.1:{}/hid", fwd.local_port);
+                    _fwd_hid = Some(fwd);
+                    url
+                }),
+            _ => {
+                eprintln!("hid (KVM) disabled: could not start the hid daemon on {host_name}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let url = dashboard_url(
         &format!("http://127.0.0.1:{}", fwd_video.local_port),
-        Some(&format!("ws://127.0.0.1:{}/stream", fwd_serial.local_port)),
-        None,
-        interface,
+        &DashboardLinks {
+            serial_ws: Some(&format!("ws://127.0.0.1:{}/stream", fwd_serial.local_port)),
+            interface,
+            hid_ws: hid_ws.as_deref(),
+            ..Default::default()
+        },
     );
     open_in_browser(&url);
     println!("Opened {url}");
@@ -2222,7 +2292,107 @@ fn hid_cmd(lab_flag: Option<&str>, cmd: HidCmd) -> Result<()> {
             Ok(())
         }
         HidCmd::Send { target, args } => cmd_hid_send(lab_flag, target.as_deref(), &args),
+        HidCmd::Serve { target } => cmd_hid_serve(lab_flag, target.as_deref()),
+        HidCmd::Stop { target } => cmd_hid_stop(lab_flag, target.as_deref()),
     }
+}
+
+/// The `hid` daemon discovery name (must match hidrig's DISCOVERY_NAME).
+const HID_DAEMON: &str = "hid";
+
+/// Ensure the hid injection daemon is running locally for `target`, returning
+/// its port, or None when the target has no local hid channel. The helper's
+/// `cmd` is run as `<cmd> serve --port 0` via `sh -c`; the contract is that it
+/// daemonizes and publishes `/tmp/paniolo-<uid>/hid/daemon.json`.
+fn ensure_hid_daemon_local(lab: &Lab, target: &str) -> Result<Option<u16>> {
+    let t = lab
+        .targets
+        .get(target)
+        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+    let dh = t.default_host().to_string();
+    let h = match &t.hid {
+        Some(h) => h,
+        None => return Ok(None),
+    };
+    if h.host.as_deref().unwrap_or(&dh) != model::LOCAL {
+        return Ok(None);
+    }
+    if let Some(port) = daemons::daemon_port(HID_DAEMON) {
+        return Ok(Some(port));
+    }
+    let cmd = h.cmd.clone().ok_or_else(|| {
+        anyhow!("hid channel for '{target}' has no cmd (paniolo hid set -t {target} --cmd ...)")
+    })?;
+    eprintln!("Starting hid daemon…");
+    let log = std::fs::File::create(daemons::ensure_runtime_dir(HID_DAEMON)?.join("daemon.log"))?;
+    let mut command = std::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg(format!("exec {cmd} serve --port 0"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(log);
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    command.spawn()?;
+    Ok(Some(
+        daemons::wait_for_daemon(HID_DAEMON, std::time::Duration::from_secs(5))
+            .and_then(|_| daemons::daemon_port(HID_DAEMON))
+            .ok_or_else(|| daemons::start_failure(HID_DAEMON, std::time::Duration::from_secs(5)))?,
+    ))
+}
+
+fn cmd_hid_serve(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    let target = resolve_single_target(&lab, target)?;
+    if let Some(code) = dispatch::maybe_dispatch(
+        &lab,
+        &target,
+        model::ChannelKind::Hid,
+        None,
+        dispatch::Mode::Reexec,
+    )? {
+        std::process::exit(code);
+    }
+    match ensure_hid_daemon_local(&lab, &target)? {
+        Some(port) => {
+            println!("hid daemon running for '{target}' (port {port}).");
+            Ok(())
+        }
+        None => bail!("target '{target}' has no hid channel on this host"),
+    }
+}
+
+fn cmd_hid_stop(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    let target = resolve_single_target(&lab, target)?;
+    if let Some(code) = dispatch::maybe_dispatch(
+        &lab,
+        &target,
+        model::ChannelKind::Hid,
+        None,
+        dispatch::Mode::Reexec,
+    )? {
+        std::process::exit(code);
+    }
+    let t = lab
+        .targets
+        .get(&target)
+        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+    let cmd = t
+        .hid
+        .as_ref()
+        .and_then(|h| h.cmd.clone())
+        .ok_or_else(|| anyhow!("target '{target}' has no hid channel"))?;
+    // The helper owns its own stop (e.g. `hidrig stop`); strip any trailing
+    // device args isn't needed — `<cmd> stop` ignores extra args it doesn't use.
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{cmd} stop"))
+        .status()?;
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
 }
 
 /// Run the target's hid helper with `args` appended, propagating its exit code.
