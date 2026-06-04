@@ -17,7 +17,7 @@
 //! accepts input over localhost HTTP so input coexists with capture).
 //!
 //! Ported from the Python `_serial.py`. serialcap's discovery file is
-//! `$XDG_RUNTIME_DIR/serialcap/daemon.json` (else the temp dir), holding
+//! `/tmp/paniolo-<uid>/serialcap/daemon.json` (see daemons.rs), holding
 //! `{pid, port, …}`; an interface is passed to the daemon as
 //! `NAME=DEVICE@BAUD[:SENSE]`.
 
@@ -65,9 +65,10 @@ pub fn start_daemon(ifaces: &[SerialChannel], port: u16) -> Result<()> {
     for ch in ifaces {
         cmd.arg("--interface").arg(interface_arg(ch));
     }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    // Capture stderr (tracing output) so a startup failure is diagnosable;
+    // daemons::start_failure() reads the tail on timeout.
+    let log = std::fs::File::create(daemons::ensure_runtime_dir(DAEMON)?.join("daemon.log"))?;
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
     // Detach into its own process group so it survives this CLI exiting.
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     cmd.spawn()?;

@@ -34,13 +34,33 @@ pub struct Discovery {
     pub port: u16,
 }
 
+/// Stable per-user runtime dir: `/tmp/paniolo-<uid>/hdmicap`, identical in
+/// every environment of the same user. Deliberately NOT `$TMPDIR`/`temp_dir()`
+/// (macOS hands each environment a different TMPDIR — GUI terminal vs SSH vs
+/// sandboxed agent shells — so a running daemon was invisible from the others)
+/// and NOT `$XDG_RUNTIME_DIR` (systemd removes `/run/user/<uid>` when the
+/// user's last session ends, breaking daemons that outlive the SSH session
+/// that started them). Keep in sync with `runtime_base()` in the paniolo
+/// CLI's daemons.rs and serialcap's daemon.rs.
 fn runtime_dir() -> Result<PathBuf> {
-    // XDG_RUNTIME_DIR on Linux; a per-user tmp path on macOS via `directories`.
-    let dirs = directories::BaseDirs::new().context("no base dirs")?;
-    let base = dirs
-        .runtime_dir()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(std::env::temp_dir);
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    // Safe: getuid is always successful.
+    let uid = unsafe { libc::getuid() };
+    let base = PathBuf::from(format!("/tmp/paniolo-{uid}"));
+    match fs::DirBuilder::new().mode(0o700).create(&base) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Guard against a squatter pre-creating the /tmp path.
+            let md = fs::symlink_metadata(&base)?;
+            if !md.is_dir() || md.uid() != uid {
+                return Err(anyhow!(
+                    "{} exists but is not a directory owned by uid {uid}",
+                    base.display()
+                ));
+            }
+        }
+        Err(e) => return Err(e.into()),
+    }
     let dir = base.join("hdmicap");
     fs::create_dir_all(&dir)?;
     Ok(dir)

@@ -8,21 +8,21 @@
     ci.yml (155 lines)
 cli/
   src/
-    daemons.rs (76 lines)
+    daemons.rs (135 lines)
     discover.rs (257 lines)
     dispatch.rs (289 lines)
     doctor.rs (207 lines)
     labfile.rs (505 lines)
-    main.rs (2115 lines)
+    main.rs (2123 lines)
     model.rs (519 lines)
     netboot.rs (163 lines)
     netif.rs (428 lines)
     power.rs (61 lines)
-    serial.rs (183 lines)
+    serial.rs (184 lines)
     setup.rs (247 lines)
     ssh.rs (294 lines)
     state.rs (134 lines)
-    video.rs (76 lines)
+    video.rs (77 lines)
   .gitignore (1 lines)
   Cargo.toml (57 lines)
 docs/
@@ -43,8 +43,8 @@ docs/
   power.md (144 lines)
   README.md (67 lines)
   requirements.md (258 lines)
-  serial.md (225 lines)
-  video.md (102 lines)
+  serial.md (226 lines)
+  video.md (103 lines)
 hdmicap/
   assets/
     index.html (285 lines)
@@ -54,7 +54,7 @@ hdmicap/
   src/
     capture_thread.rs (212 lines)
     capture.rs (515 lines)
-    daemon.rs (143 lines)
+    daemon.rs (163 lines)
     frame.rs (203 lines)
     main.rs (217 lines)
     server.rs (407 lines)
@@ -101,7 +101,7 @@ ocr/
 serialcap/
   src/
     capture.rs (683 lines)
-    daemon.rs (162 lines)
+    daemon.rs (183 lines)
     main.rs (194 lines)
     serial_io.rs (614 lines)
     server.rs (270 lines)
@@ -146,7 +146,7 @@ tests/
   test_state.py (203 lines)
   test_video.py (146 lines)
 .gitignore (10 lines)
-AGENTS.md (853 lines)
+AGENTS.md (863 lines)
 LICENSE (201 lines)
 Makefile (76 lines)
 pyproject.toml (36 lines)

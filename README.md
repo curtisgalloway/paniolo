@@ -140,9 +140,9 @@ See [docs/config-redesign.md](docs/config-redesign.md) for the model and
 | Video config | `~/.config/paniolo/video.toml` |
 | HID config | `~/.config/paniolo/hid.toml` |
 | Netboot daemon state | `~/.local/share/paniolo/<name>/netboot.json` |
-| hdmicap discovery | `$XDG_RUNTIME_DIR/hdmicap/daemon.json` (Linux) / `$TMPDIR/hdmicap/daemon.json` (macOS) |
-| serialcap discovery | `$XDG_RUNTIME_DIR/serialcap/daemon.json` (Linux) / `$TMPDIR/serialcap/daemon.json` (macOS) |
-| Serial capture logs | `$XDG_RUNTIME_DIR/serialcap/capture/<name>/serial.jsonl` (Linux) |
+| hdmicap discovery | `/tmp/paniolo-<uid>/hdmicap/daemon.json` |
+| serialcap discovery | `/tmp/paniolo-<uid>/serialcap/daemon.json` |
+| Serial capture logs | `/tmp/paniolo-<uid>/serialcap/capture/<name>/serial.jsonl` |
 
 ---
 

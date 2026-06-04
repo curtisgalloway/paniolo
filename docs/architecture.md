@@ -101,10 +101,10 @@ power_sense_signal = "cts"       # optional; cts|dsr|dcd|ri — modem-control in
 | Target / video / HID configs | `~/.config/paniolo/{targets/<name>.toml, video.toml, hid.toml}` |
 | Netboot state (pids, uptime) | `~/.local/share/paniolo/<name>/netboot.json` |
 | Netboot combined log | `~/.local/share/paniolo/<name>/netboot.log` |
-| hdmicap discovery / lock | `$XDG_RUNTIME_DIR/hdmicap/{daemon.json, daemon.lock}` (macOS: `$TMPDIR`) |
-| serialcap discovery / lock | `$XDG_RUNTIME_DIR/serialcap/{daemon.json, daemon.lock}` (macOS: `$TMPDIR`) |
-| serialcap capture log (per interface) | `$XDG_RUNTIME_DIR/serialcap/capture/<name>/serial.jsonl(.1..)` |
-| serialcap pending (unterminated) line | `$XDG_RUNTIME_DIR/serialcap/capture/<name>/pending.json` |
+| hdmicap discovery / lock | `/tmp/paniolo-<uid>/hdmicap/{daemon.json, daemon.lock}` |
+| serialcap discovery / lock | `/tmp/paniolo-<uid>/serialcap/{daemon.json, daemon.lock}` |
+| serialcap capture log (per interface) | `/tmp/paniolo-<uid>/serialcap/capture/<name>/serial.jsonl(.1..)` |
+| serialcap pending (unterminated) line | `/tmp/paniolo-<uid>/serialcap/capture/<name>/pending.json` |
 
 ## 5. Subsystems
 

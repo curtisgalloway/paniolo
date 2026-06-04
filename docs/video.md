@@ -97,6 +97,7 @@ via the OCR button.
 
 | Purpose | Path |
 |---|---|
-| Video config | `~/.config/paniolo/video.toml` |
-| hdmicap discovery | `$TMPDIR/hdmicap/daemon.json` (`{pid, port}`) |
-| hdmicap advisory lock | `$TMPDIR/hdmicap/daemon.lock` |
+| Video config | the target's `video` channel in the lab file (`~/.config/paniolo/lab.toml`) |
+| hdmicap discovery | `/tmp/paniolo-<uid>/hdmicap/daemon.json` (`{pid, port}`) |
+| hdmicap advisory lock | `/tmp/paniolo-<uid>/hdmicap/daemon.lock` |
+| hdmicap stderr log | `/tmp/paniolo-<uid>/hdmicap/daemon.log` (truncated on each start; shown on start timeout) |

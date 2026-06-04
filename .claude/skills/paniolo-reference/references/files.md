@@ -26,11 +26,13 @@
 //! Every daemon follows the same contract: it is an installed binary (PATH or
 //! `~/.cargo/bin`), binds localhost (port 0 = OS-assigned), and writes a
 //! discovery file `<runtime>/<name>/daemon.json` containing `{pid, port, …}`
-//! where `<runtime>` is `$XDG_RUNTIME_DIR` (else the temp dir). Liveness is
-//! "the recorded pid still exists".
+//! where `<runtime>` is `/tmp/paniolo-<uid>` (see [`runtime_base`]). Liveness
+//! is "the recorded pid still exists".
 
 use std::path::PathBuf;
 use std::time::Duration;
+
+use anyhow::{anyhow, Result};
 
 /// Find an installed binary: $PATH first, then ~/.cargo/bin (where
 /// `paniolo setup` installs the daemons). Never the in-repo build tree, so a
@@ -48,10 +50,67 @@ pub fn find_binary(name: &str) -> Option<PathBuf> {
     cargo.is_file().then_some(cargo)
 }
 
+/// Stable per-user runtime base: `/tmp/paniolo-<uid>`, identical in every
+/// environment of the same user. Deliberately NOT `$TMPDIR`/`temp_dir()`
+/// (macOS hands each environment a different TMPDIR — GUI terminal vs SSH vs
+/// sandboxed agent shells — so a running daemon was invisible from the
+/// others) and NOT `$XDG_RUNTIME_DIR` (systemd removes `/run/user/<uid>`
+/// when the user's last session ends, breaking daemons that outlive the SSH
+/// session that started them). Keep in sync with `runtime_dir()` in
+/// hdmicap/src/daemon.rs and serialcap/src/daemon.rs.
 fn runtime_base() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
+    // Safe: getuid is always successful.
+    let uid = unsafe { libc::getuid() };
+    PathBuf::from(format!("/tmp/paniolo-{uid}"))
+}
+
+/// Create (0700) and validate the runtime base, then `<base>/<name>`.
+/// The ownership check guards against a squatter pre-creating the /tmp path.
+pub fn ensure_runtime_dir(name: &str) -> Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let base = runtime_base();
+    match std::fs::DirBuilder::new().mode(0o700).create(&base) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let uid = unsafe { libc::getuid() };
+            let md = std::fs::symlink_metadata(&base)?;
+            if !md.is_dir() || md.uid() != uid {
+                return Err(anyhow!(
+                    "{} exists but is not a directory owned by uid {uid}",
+                    base.display()
+                ));
+            }
+        }
+        Err(e) => return Err(e.into()),
+    }
+    let dir = base.join(name);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Where a spawned daemon's stderr is captured (truncated on each start).
+pub fn log_path(name: &str) -> PathBuf {
+    runtime_base().join(name).join("daemon.log")
+}
+
+/// Error for a daemon that didn't publish discovery in time, carrying the
+/// tail of its stderr log so the failure is diagnosable.
+pub fn start_failure(name: &str, timeout: Duration) -> anyhow::Error {
+    let log = std::fs::read_to_string(log_path(name)).unwrap_or_default();
+    let mut tail: Vec<&str> = log.lines().rev().take(5).collect();
+    tail.reverse();
+    if tail.is_empty() {
+        anyhow!(
+            "{name} daemon did not start within {} s (no stderr captured)",
+            timeout.as_secs()
+        )
+    } else {
+        anyhow!(
+            "{name} daemon did not start within {} s; last stderr:\n  {}",
+            timeout.as_secs(),
+            tail.join("\n  ")
+        )
+    }
 }
 
 fn pid_alive(pid: i32) -> bool {
@@ -82,267 +141,6 @@ pub fn wait_for_daemon(name: &str, timeout: Duration) -> Option<String> {
         std::thread::sleep(Duration::from_millis(100));
     }
     None
-}
-````
-
-## File: cli/src/discover.rs
-````rust
-// Copyright 2026 Curtis Galloway
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-//! Hardware discovery for lab authoring.
-//!
-//! `paniolo discover` lists this host's lab-relevant hardware (USB-Ethernet,
-//! serial, capture devices); `paniolo configure` runs it over SSH on a lab host
-//! and renders a proposed `[targets.<name>]` block for review. The proposal is
-//! never written — the human approves it by adding it to the lab and committing.
-
-use serde_json::{json, Value};
-
-use crate::{daemons, netif, serial, video};
-
-/// Capture-device names that are built-in cameras, not HDMI capture.
-const BUILTIN_CAPTURE: [&str; 5] = ["FaceTime", "Capture screen", "iSight", "iPhone", "iPad"];
-
-/// This host's lab-relevant hardware, in the same JSON shape the Python CLI
-/// emits (so mixed-version labs interoperate during the migration; the video
-/// entries' `id` field is a Rust-side addition).
-pub fn local_inventory() -> Value {
-    let ethernet: Vec<Value> = netif::list_usb_ethernet_interfaces()
-        .iter()
-        .map(|e| json!({"port": e.port, "device": e.device, "active": e.active}))
-        .collect();
-    let serial: Vec<Value> = serial::list_devices()
-        .into_iter()
-        .map(Value::String)
-        .collect();
-    json!({"ethernet": ethernet, "serial": serial, "video": list_capture_devices()})
-}
-
-/// Capture devices from `hdmicap devices --json`:
-/// `[{index, name, misc, id}, ...]` — `id` is the stable, port-derived
-/// identifier (AVFoundation uniqueID on macOS, /dev/v4l/by-path on Linux).
-fn list_capture_devices() -> Vec<Value> {
-    let Some(binary) = daemons::find_binary(video::DAEMON) else {
-        return Vec::new();
-    };
-    let Ok(out) = std::process::Command::new(binary)
-        .args(["devices", "--json"])
-        .output()
-    else {
-        return Vec::new();
-    };
-    if !out.status.success() {
-        return Vec::new();
-    }
-    serde_json::from_slice(&out.stdout).unwrap_or_default()
-}
-
-fn str_at<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
-    v.get(key).and_then(Value::as_str)
-}
-
-/// Render a proposed `[targets.<name>]` lab block from a host's inventory.
-/// Best-guesses one value per channel; alternatives become comments. Meant to
-/// be reviewed and pasted into the lab — paniolo never writes it.
-pub fn propose_target_block(name: &str, host: &str, inv: &Value) -> String {
-    let mut out: Vec<String> = Vec::new();
-    out.push(format!("[targets.{name}]"));
-    out.push(format!("host = \"{host}\""));
-    out.push(String::new());
-
-    // netboot: prefer the carrier-up interface (the list is sorted actives-first).
-    let eths: Vec<&Value> = inv
-        .get("ethernet")
-        .and_then(Value::as_array)
-        .map(|a| a.iter().collect())
-        .unwrap_or_default();
-    out.push(format!("[targets.{name}.netboot]"));
-    if let Some(first) = eths.first() {
-        let dev = str_at(first, "device").unwrap_or("");
-        let note = if first
-            .get("active")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            "  # carrier up"
-        } else {
-            ""
-        };
-        out.push(format!("interface = \"{dev}\"{note}"));
-        for e in &eths[1..] {
-            let dev = str_at(e, "device").unwrap_or("");
-            out.push(format!("# interface = \"{dev}\"  # alternative"));
-        }
-    } else {
-        out.push("# interface = \"\"  # no USB-Ethernet interface discovered".to_string());
-    }
-    out.push("# tftp_root = \"/path/to/tftp\"  # set to enable netboot".to_string());
-    out.push(String::new());
-
-    // serial: first device as the console; the rest as comments.
-    let serials: Vec<&str> = inv
-        .get("serial")
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
-    if let Some(first) = serials.first() {
-        out.push(format!("[[targets.{name}.serial]]"));
-        out.push("name = \"console\"".to_string());
-        out.push(format!("device = \"{first}\""));
-        out.push("baud = 115200".to_string());
-        for extra in &serials[1..] {
-            out.push(format!("# another serial device: {extra}"));
-        }
-    } else {
-        out.push(format!(
-            "# [[targets.{name}.serial]]  # no serial devices discovered"
-        ));
-    }
-    out.push(String::new());
-
-    // video: propose the one non-built-in capture device, if unambiguous.
-    // Prefer the stable id (port-derived, survives enumeration-order shifts)
-    // with the human name as a comment; fall back to the name when the
-    // discovering hdmicap reported no id.
-    let device_ref = |name: &str, id: &str| {
-        if id.is_empty() {
-            format!("device = \"{name}\"")
-        } else {
-            format!("device = \"{id}\"  # {name}")
-        }
-    };
-    let captures: Vec<(&str, &str)> = inv
-        .get("video")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|d| Some((str_at(d, "name")?, str_at(d, "id").unwrap_or(""))))
-                .filter(|(n, _)| !BUILTIN_CAPTURE.iter().any(|b| n.contains(b)))
-                .collect()
-        })
-        .unwrap_or_default();
-    if let [(cap_name, cap_id)] = captures.as_slice() {
-        out.push(format!("[targets.{name}.video]"));
-        out.push(device_ref(cap_name, cap_id));
-    } else if captures.is_empty() {
-        out.push(format!(
-            "# [targets.{name}.video]  # no capture device discovered"
-        ));
-    } else {
-        out.push(format!(
-            "# [targets.{name}.video]  # multiple capture devices — pick one:"
-        ));
-        for (cap_name, cap_id) in &captures {
-            out.push(format!("# {}", device_ref(cap_name, cap_id)));
-        }
-    }
-    out.push(String::new());
-    out.push(format!("# [targets.{name}.power]"));
-    out.push("# cycle_cmd = \"/path/to/power-cycle.sh\"  # not discoverable".to_string());
-
-    let mut s = out.join("\n");
-    s.push('\n');
-    s
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn propose_prefers_active_eth_and_first_serial() {
-        let inv = json!({
-            "ethernet": [
-                {"port": "AX88179A", "device": "en16", "active": true},
-                {"port": "Ethernet Adapter", "device": "en8", "active": false},
-            ],
-            "serial": ["/dev/tty.usbserial-A", "/dev/tty.usbserial-B"],
-            "video": [
-                {"index": 0, "name": "USB Video", "misc": "", "id": "0x8300000534d2109"},
-                {"index": 1, "name": "FaceTime HD Camera", "misc": "", "id": "0x11000005ac8514"},
-            ],
-        });
-        let block = propose_target_block("pi5", "bench1", &inv);
-        assert!(block.contains("[targets.pi5]"), "{block}");
-        assert!(block.contains("host = \"bench1\""), "{block}");
-        assert!(
-            block.contains("interface = \"en16\"  # carrier up"),
-            "{block}"
-        );
-        assert!(
-            block.contains("# interface = \"en8\"  # alternative"),
-            "{block}"
-        );
-        assert!(
-            block.contains("device = \"/dev/tty.usbserial-A\""),
-            "{block}"
-        );
-        assert!(
-            block.contains("# another serial device: /dev/tty.usbserial-B"),
-            "{block}"
-        );
-        // FaceTime filtered as built-in → USB Video is the unambiguous capture,
-        // proposed by stable id with the name as a comment.
-        assert!(block.contains("[targets.pi5.video]"), "{block}");
-        assert!(
-            block.contains("device = \"0x8300000534d2109\"  # USB Video"),
-            "{block}"
-        );
-    }
-
-    #[test]
-    fn propose_falls_back_to_name_without_id() {
-        let inv = json!({
-            "ethernet": [],
-            "serial": [],
-            "video": [{"index": 0, "name": "USB Video", "misc": ""}],
-        });
-        let block = propose_target_block("t", "local", &inv);
-        assert!(block.contains("device = \"USB Video\""), "{block}");
-    }
-
-    #[test]
-    fn propose_lists_duplicate_dongles_as_id_alternatives() {
-        let inv = json!({
-            "ethernet": [],
-            "serial": [],
-            "video": [
-                {"index": 0, "name": "USB Video", "misc": "", "id": "0x8300000534d2109"},
-                {"index": 1, "name": "USB Video", "misc": "", "id": "0x8200000534d2109"},
-            ],
-        });
-        let block = propose_target_block("t", "local", &inv);
-        assert!(block.contains("multiple capture devices"), "{block}");
-        assert!(
-            block.contains("# device = \"0x8300000534d2109\"  # USB Video"),
-            "{block}"
-        );
-        assert!(
-            block.contains("# device = \"0x8200000534d2109\"  # USB Video"),
-            "{block}"
-        );
-    }
-
-    #[test]
-    fn propose_with_empty_inventory_is_all_stubs() {
-        let inv = json!({"ethernet": [], "serial": [], "video": []});
-        let block = propose_target_block("t", "local", &inv);
-        assert!(block.contains("# interface = \"\""), "{block}");
-        assert!(block.contains("# [[targets.t.serial]]"), "{block}");
-        assert!(block.contains("# [targets.t.video]"), "{block}");
-    }
 }
 ````
 
@@ -1023,9 +821,10 @@ pub fn start_daemon(device: &str, port: u16, target_name: Option<&str>) -> Resul
     if let Some(name) = target_name {
         cmd.env("PANIOLO_TARGET", name);
     }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    // Capture stderr (tracing output) so a startup failure is diagnosable;
+    // daemons::start_failure() reads the tail on timeout.
+    let log = std::fs::File::create(daemons::ensure_runtime_dir(DAEMON)?.join("daemon.log"))?;
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     cmd.spawn()?;
     Ok(())
@@ -6467,7 +6266,7 @@ clap = { version = "4", features = ["derive"] }
 
 # --- Daemon plumbing -----------------------------------------------------
 fs2 = "0.4"
-directories = "5"
+libc = "0.2"
 nix = { version = "0.29", features = ["signal", "process"] }
 
 # --- Errors / logging / serde -------------------------------------------
@@ -7692,6 +7491,267 @@ clean:
 	@for crate in $(CRATES); do \
 		( cd $$crate && cargo clean ); \
 	done
+````
+
+## File: cli/src/discover.rs
+````rust
+// Copyright 2026 Curtis Galloway
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Hardware discovery for lab authoring.
+//!
+//! `paniolo discover` lists this host's lab-relevant hardware (USB-Ethernet,
+//! serial, capture devices); `paniolo configure` runs it over SSH on a lab host
+//! and renders a proposed `[targets.<name>]` block for review. The proposal is
+//! never written — the human approves it by adding it to the lab and committing.
+
+use serde_json::{json, Value};
+
+use crate::{daemons, netif, serial, video};
+
+/// Capture-device names that are built-in cameras, not HDMI capture.
+const BUILTIN_CAPTURE: [&str; 5] = ["FaceTime", "Capture screen", "iSight", "iPhone", "iPad"];
+
+/// This host's lab-relevant hardware, in the same JSON shape the Python CLI
+/// emits (so mixed-version labs interoperate during the migration; the video
+/// entries' `id` field is a Rust-side addition).
+pub fn local_inventory() -> Value {
+    let ethernet: Vec<Value> = netif::list_usb_ethernet_interfaces()
+        .iter()
+        .map(|e| json!({"port": e.port, "device": e.device, "active": e.active}))
+        .collect();
+    let serial: Vec<Value> = serial::list_devices()
+        .into_iter()
+        .map(Value::String)
+        .collect();
+    json!({"ethernet": ethernet, "serial": serial, "video": list_capture_devices()})
+}
+
+/// Capture devices from `hdmicap devices --json`:
+/// `[{index, name, misc, id}, ...]` — `id` is the stable, port-derived
+/// identifier (AVFoundation uniqueID on macOS, /dev/v4l/by-path on Linux).
+fn list_capture_devices() -> Vec<Value> {
+    let Some(binary) = daemons::find_binary(video::DAEMON) else {
+        return Vec::new();
+    };
+    let Ok(out) = std::process::Command::new(binary)
+        .args(["devices", "--json"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    serde_json::from_slice(&out.stdout).unwrap_or_default()
+}
+
+fn str_at<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    v.get(key).and_then(Value::as_str)
+}
+
+/// Render a proposed `[targets.<name>]` lab block from a host's inventory.
+/// Best-guesses one value per channel; alternatives become comments. Meant to
+/// be reviewed and pasted into the lab — paniolo never writes it.
+pub fn propose_target_block(name: &str, host: &str, inv: &Value) -> String {
+    let mut out: Vec<String> = Vec::new();
+    out.push(format!("[targets.{name}]"));
+    out.push(format!("host = \"{host}\""));
+    out.push(String::new());
+
+    // netboot: prefer the carrier-up interface (the list is sorted actives-first).
+    let eths: Vec<&Value> = inv
+        .get("ethernet")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    out.push(format!("[targets.{name}.netboot]"));
+    if let Some(first) = eths.first() {
+        let dev = str_at(first, "device").unwrap_or("");
+        let note = if first
+            .get("active")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            "  # carrier up"
+        } else {
+            ""
+        };
+        out.push(format!("interface = \"{dev}\"{note}"));
+        for e in &eths[1..] {
+            let dev = str_at(e, "device").unwrap_or("");
+            out.push(format!("# interface = \"{dev}\"  # alternative"));
+        }
+    } else {
+        out.push("# interface = \"\"  # no USB-Ethernet interface discovered".to_string());
+    }
+    out.push("# tftp_root = \"/path/to/tftp\"  # set to enable netboot".to_string());
+    out.push(String::new());
+
+    // serial: first device as the console; the rest as comments.
+    let serials: Vec<&str> = inv
+        .get("serial")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if let Some(first) = serials.first() {
+        out.push(format!("[[targets.{name}.serial]]"));
+        out.push("name = \"console\"".to_string());
+        out.push(format!("device = \"{first}\""));
+        out.push("baud = 115200".to_string());
+        for extra in &serials[1..] {
+            out.push(format!("# another serial device: {extra}"));
+        }
+    } else {
+        out.push(format!(
+            "# [[targets.{name}.serial]]  # no serial devices discovered"
+        ));
+    }
+    out.push(String::new());
+
+    // video: propose the one non-built-in capture device, if unambiguous.
+    // Prefer the stable id (port-derived, survives enumeration-order shifts)
+    // with the human name as a comment; fall back to the name when the
+    // discovering hdmicap reported no id.
+    let device_ref = |name: &str, id: &str| {
+        if id.is_empty() {
+            format!("device = \"{name}\"")
+        } else {
+            format!("device = \"{id}\"  # {name}")
+        }
+    };
+    let captures: Vec<(&str, &str)> = inv
+        .get("video")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|d| Some((str_at(d, "name")?, str_at(d, "id").unwrap_or(""))))
+                .filter(|(n, _)| !BUILTIN_CAPTURE.iter().any(|b| n.contains(b)))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let [(cap_name, cap_id)] = captures.as_slice() {
+        out.push(format!("[targets.{name}.video]"));
+        out.push(device_ref(cap_name, cap_id));
+    } else if captures.is_empty() {
+        out.push(format!(
+            "# [targets.{name}.video]  # no capture device discovered"
+        ));
+    } else {
+        out.push(format!(
+            "# [targets.{name}.video]  # multiple capture devices — pick one:"
+        ));
+        for (cap_name, cap_id) in &captures {
+            out.push(format!("# {}", device_ref(cap_name, cap_id)));
+        }
+    }
+    out.push(String::new());
+    out.push(format!("# [targets.{name}.power]"));
+    out.push("# cycle_cmd = \"/path/to/power-cycle.sh\"  # not discoverable".to_string());
+
+    let mut s = out.join("\n");
+    s.push('\n');
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn propose_prefers_active_eth_and_first_serial() {
+        let inv = json!({
+            "ethernet": [
+                {"port": "AX88179A", "device": "en16", "active": true},
+                {"port": "Ethernet Adapter", "device": "en8", "active": false},
+            ],
+            "serial": ["/dev/tty.usbserial-A", "/dev/tty.usbserial-B"],
+            "video": [
+                {"index": 0, "name": "USB Video", "misc": "", "id": "0x8300000534d2109"},
+                {"index": 1, "name": "FaceTime HD Camera", "misc": "", "id": "0x11000005ac8514"},
+            ],
+        });
+        let block = propose_target_block("pi5", "bench1", &inv);
+        assert!(block.contains("[targets.pi5]"), "{block}");
+        assert!(block.contains("host = \"bench1\""), "{block}");
+        assert!(
+            block.contains("interface = \"en16\"  # carrier up"),
+            "{block}"
+        );
+        assert!(
+            block.contains("# interface = \"en8\"  # alternative"),
+            "{block}"
+        );
+        assert!(
+            block.contains("device = \"/dev/tty.usbserial-A\""),
+            "{block}"
+        );
+        assert!(
+            block.contains("# another serial device: /dev/tty.usbserial-B"),
+            "{block}"
+        );
+        // FaceTime filtered as built-in → USB Video is the unambiguous capture,
+        // proposed by stable id with the name as a comment.
+        assert!(block.contains("[targets.pi5.video]"), "{block}");
+        assert!(
+            block.contains("device = \"0x8300000534d2109\"  # USB Video"),
+            "{block}"
+        );
+    }
+
+    #[test]
+    fn propose_falls_back_to_name_without_id() {
+        let inv = json!({
+            "ethernet": [],
+            "serial": [],
+            "video": [{"index": 0, "name": "USB Video", "misc": ""}],
+        });
+        let block = propose_target_block("t", "local", &inv);
+        assert!(block.contains("device = \"USB Video\""), "{block}");
+    }
+
+    #[test]
+    fn propose_lists_duplicate_dongles_as_id_alternatives() {
+        let inv = json!({
+            "ethernet": [],
+            "serial": [],
+            "video": [
+                {"index": 0, "name": "USB Video", "misc": "", "id": "0x8300000534d2109"},
+                {"index": 1, "name": "USB Video", "misc": "", "id": "0x8200000534d2109"},
+            ],
+        });
+        let block = propose_target_block("t", "local", &inv);
+        assert!(block.contains("multiple capture devices"), "{block}");
+        assert!(
+            block.contains("# device = \"0x8300000534d2109\"  # USB Video"),
+            "{block}"
+        );
+        assert!(
+            block.contains("# device = \"0x8200000534d2109\"  # USB Video"),
+            "{block}"
+        );
+    }
+
+    #[test]
+    fn propose_with_empty_inventory_is_all_stubs() {
+        let inv = json!({"ethernet": [], "serial": [], "video": []});
+        let block = propose_target_block("t", "local", &inv);
+        assert!(block.contains("# interface = \"\""), "{block}");
+        assert!(block.contains("# [[targets.t.serial]]"), "{block}");
+        assert!(block.contains("# [targets.t.video]"), "{block}");
+    }
+}
 ````
 
 ## File: cli/src/netif.rs
@@ -9391,112 +9451,6 @@ Runs `power_cycle_cmd` and exits with its return code. No built-in timing or
 sense-signal logic — the script is responsible for the full sequence.
 ````
 
-## File: docs/video.md
-````markdown
-# Video capture
-
-paniolo drives `hdmicap`, a Rust warm-stream daemon that keeps a USB HDMI
-capture device open continuously and serves the current frame over HTTP. This
-avoids the multi-second reopen latency you'd get by running ffmpeg per capture.
-
----
-
-## Hardware
-
-Any USB HDMI capture card that presents as a UVC device (V4L2 / AVFoundation).
-Tested with the MS2109-based cards (e.g. generic "USB3.0 HDMI Capture" dongles).
-
-Connect the target's HDMI output to the capture card, then the card to the Mac.
-
----
-
-## Setup
-
-```bash
-# Detect available capture devices (each line ends with its stable id)
-paniolo video devices
-
-# Configure the target's video channel — prefer the stable id
-paniolo video set -t target-machine --device "0x8300000534d2109"
-```
-
-The `--device` value may be:
-
-- a **stable id** (preferred): the AVFoundation `uniqueID` on macOS, the
-  `/dev/v4l/by-path/...` symlink on Linux. Both are derived from USB port
-  topology — they survive reboots and enumeration-order shifts, distinguish
-  two identical dongles, and change only if the dongle moves to a different
-  physical port.
-- a **name substring** (e.g. `"USB Video"`): convenient, but identical dongles
-  share a name. A substring matching more than one device is an error that
-  lists the candidates' ids — never a silent first-match guess.
-- a **`/dev/video*` path** (Linux): accepted, but not stable across reboots.
-
-The device lives on the target's `video` channel in the lab file (see
-[config-redesign.md](config-redesign.md)); `paniolo configure` proposes the
-stable id (with the human name as a comment) when one non-built-in capture
-device is present, and lists id alternatives when there are several.
-
----
-
-## Starting and stopping the daemon
-
-```bash
-paniolo video watch [target-machine]   # start hdmicap daemon for a target
-paniolo video stop  [target-machine]   # stop it
-paniolo video show  [target-machine]   # show daemon URL and status
-```
-
-`watch` starts `hdmicap daemon` detached and polls for startup. The daemon URL
-is printed — open it in a browser for the live preview.
-
----
-
-## Capturing frames
-
-```bash
-paniolo video shot [target-machine]           # save a screenshot to a temp file
-paniolo video shot [target-machine] -o out.png  # save to a specific path
-paniolo video preview [target-machine]        # open the live MJPEG stream in a browser
-```
-
-`shot` fetches a single PNG-encoded frame from the running daemon via
-`hdmicap shot`.
-
----
-
-## OCR (Apple Vision)
-
-```bash
-paniolo video read [target-machine]
-```
-
-Fetches the current frame and runs Apple Vision's `VNRecognizeTextRequest` on
-it, printing the recognized text to stdout. On-device — no network, no model
-download required.
-
-`paniolo setup` compiles `ocr/visionocr.swift` into `~/.cargo/bin/visionocr`
-with `swiftc`. The OCR tool is also accessible from the [web dashboard](dashboard.md)
-via the OCR button.
-
-**OCR tuning notes:**
-- `.fast` recognition level is used (not `.accurate` — the latter misses small
-  console text entirely; it's tuned for natural document text).
-- The frame is 2×-upscaled and black-padded before recognition to improve
-  accuracy on thin console fonts.
-- `minimumTextHeight` is lowered from the default to catch small terminal text.
-
----
-
-## Runtime paths
-
-| Purpose | Path |
-|---|---|
-| Video config | `~/.config/paniolo/video.toml` |
-| hdmicap discovery | `$TMPDIR/hdmicap/daemon.json` (`{pid, port}`) |
-| hdmicap advisory lock | `$TMPDIR/hdmicap/daemon.lock` |
-````
-
 ## File: hdmicap/assets/index.html
 ````html
 <!DOCTYPE html>
@@ -10002,227 +9956,6 @@ fn all_receivers_gone(tx: &watch::Sender<Arc<FrameState>>) -> bool {
 }
 ````
 
-## File: hdmicap/src/main.rs
-````rust
-// Copyright 2026 Curtis Galloway
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-//! hdmicap — warm-stream HDMI capture daemon + thin client CLI.
-//!
-//! Subcommands:
-//!   daemon   run the capture daemon (the controller starts this)
-//!   devices  list capture devices
-//!   shot     fetch one PNG from a running daemon (--stable, --out)
-//!   watch    block until the screen changes, then print the new hash
-//!   stop     ask the running daemon to exit
-//!   preview  print the URL to open in a browser
-
-mod capture;
-mod capture_thread;
-mod daemon;
-mod frame;
-mod server;
-
-use std::io::{Read, Write};
-
-use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-
-use capture::DeviceSpec;
-
-#[derive(Parser)]
-#[command(name = "hdmicap", version, about)]
-struct Cli {
-    #[command(subcommand)]
-    cmd: Cmd,
-}
-
-#[derive(Subcommand)]
-enum Cmd {
-    /// Run the capture daemon (foreground; controller manages the process).
-    Daemon {
-        /// Device: "auto" (default), an index, or a name substring.
-        #[arg(long, default_value = "auto")]
-        device: String,
-        /// Port to bind on localhost. 0 = OS-assigned.
-        #[arg(long, default_value_t = 8723)]
-        port: u16,
-    },
-    /// List available capture devices and exit (no daemon needed).
-    Devices {
-        /// Emit machine-readable JSON instead of the human table.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Fetch one screenshot from the running daemon.
-    Shot {
-        /// Wait until the signal is Stable before capturing.
-        #[arg(long)]
-        stable: bool,
-        /// Only return once the frame differs from this hex hash.
-        #[arg(long)]
-        changed_since: Option<String>,
-        /// Timeout in ms.
-        #[arg(long, default_value_t = 2000)]
-        timeout: u64,
-        /// Output path; "-" for stdout.
-        #[arg(long, default_value = "-")]
-        out: String,
-    },
-    /// Block until the screen changes vs the current frame; print the new hash.
-    Watch {
-        #[arg(long, default_value_t = 30000)]
-        timeout: u64,
-    },
-    /// Print the preview URL (open in a browser).
-    Preview,
-    /// Tell the running daemon to shut down.
-    Stop,
-}
-
-fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "hdmicap=info".into()),
-        )
-        .init();
-
-    let cli = Cli::parse();
-    match cli.cmd {
-        Cmd::Daemon { device, port } => daemon::run(DeviceSpec::parse(&device), port),
-        Cmd::Devices { json } => cmd_devices(json),
-        Cmd::Shot {
-            stable,
-            changed_since,
-            timeout,
-            out,
-        } => cmd_shot(stable, changed_since, timeout, &out),
-        Cmd::Watch { timeout } => cmd_watch(timeout),
-        Cmd::Preview => cmd_preview(),
-        Cmd::Stop => cmd_stop(),
-    }
-}
-
-fn base_url() -> Result<String> {
-    let d = daemon::discover()?;
-    Ok(format!("http://127.0.0.1:{}", d.port))
-}
-
-fn cmd_devices(json: bool) -> Result<()> {
-    let devices = capture::enumerate()?;
-    if json {
-        let list: Vec<serde_json::Value> = devices
-            .iter()
-            .map(|d| {
-                serde_json::json!({"index": d.index, "name": d.name, "misc": d.misc, "id": d.id})
-            })
-            .collect();
-        println!("{}", serde_json::to_string(&list)?);
-        return Ok(());
-    }
-    for d in devices {
-        println!("{:>3}  {}  [{}]  id={}", d.index, d.name, d.misc, d.id);
-    }
-    Ok(())
-}
-
-fn cmd_shot(stable: bool, changed_since: Option<String>, timeout: u64, out: &str) -> Result<()> {
-    let url = base_url().context("is the daemon running? try `hdmicap daemon`")?;
-    let mut snap_url = format!("{url}/snapshot?timeout={timeout}");
-    if stable {
-        snap_url.push_str("&wait=stable");
-    }
-    if let Some(ref hash) = changed_since {
-        snap_url.push_str(&format!("&changed_since={hash}"));
-    }
-
-    let resp = ureq::get(&snap_url)
-        .call()
-        .context("GET /snapshot failed")?;
-
-    let timed_out = resp.header("x-timeout") == Some("1");
-    let signal = resp.header("x-signal").unwrap_or("unknown").to_string();
-    let hash = resp.header("x-frame-hash").unwrap_or("").to_string();
-    eprintln!(
-        "signal={}  hash={}{}",
-        signal,
-        hash,
-        if timed_out { "  (timeout)" } else { "" }
-    );
-
-    let mut body = Vec::new();
-    resp.into_reader().read_to_end(&mut body)?;
-
-    if out == "-" {
-        std::io::stdout().write_all(&body)?;
-    } else {
-        std::fs::write(out, &body).with_context(|| format!("writing {out}"))?;
-        eprintln!("wrote {} bytes to {out}", body.len());
-    }
-    Ok(())
-}
-
-fn cmd_watch(timeout: u64) -> Result<()> {
-    let url = base_url().context("is the daemon running? try `hdmicap daemon`")?;
-
-    // Read the current hash so we can long-poll for a change.
-    let body = ureq::get(&format!("{url}/status"))
-        .call()
-        .context("GET /status failed")?
-        .into_string()
-        .context("reading /status body")?;
-    let status: serde_json::Value = serde_json::from_str(&body).context("parsing /status JSON")?;
-    let hash = status["hash"]
-        .as_str()
-        .unwrap_or("0000000000000000")
-        .to_string();
-
-    // Block until the frame changes or we time out.
-    let resp = ureq::get(&format!(
-        "{url}/snapshot?changed_since={hash}&timeout={timeout}"
-    ))
-    .call()
-    .context("GET /snapshot (changed_since) failed")?;
-
-    let new_hash = resp.header("x-frame-hash").unwrap_or("").to_string();
-    let timed_out = resp.header("x-timeout") == Some("1");
-    if timed_out {
-        anyhow::bail!("timed out waiting for screen change after {timeout}ms");
-    }
-    println!("{new_hash}");
-    Ok(())
-}
-
-fn cmd_preview() -> Result<()> {
-    let url = base_url().context("is the daemon running? try `hdmicap daemon`")?;
-    println!("Open {url}/preview in a browser to watch the screen.");
-    Ok(())
-}
-
-fn cmd_stop() -> Result<()> {
-    use nix::sys::signal::{kill, Signal};
-    use nix::unistd::Pid;
-
-    let d = daemon::discover().context("is the daemon running?")?;
-    kill(Pid::from_raw(d.pid as i32), Signal::SIGTERM)
-        .context("failed to send SIGTERM to daemon")?;
-    println!("daemon (pid {}) stopping", d.pid);
-    Ok(())
-}
-````
-
 ## File: hdmicap/vendor/nokhwa-bindings-macos/Cargo.toml
 ````toml
 # THIS FILE IS AUTOMATICALLY GENERATED BY CARGO
@@ -10333,7 +10066,7 @@ clap = { version = "4", features = ["derive"] }
 
 # --- Daemon plumbing -----------------------------------------------------
 fs2 = "0.4"
-directories = "5"
+libc = "0.2"
 
 # --- Errors / logging / serde -------------------------------------------
 anyhow = "1"
@@ -11704,12 +11437,33 @@ pub struct Discovery {
     pub interfaces: Vec<DiscoveryInterface>,
 }
 
+/// Stable per-user runtime dir: `/tmp/paniolo-<uid>/serialcap`, identical in
+/// every environment of the same user. Deliberately NOT `$TMPDIR`/`temp_dir()`
+/// (macOS hands each environment a different TMPDIR — GUI terminal vs SSH vs
+/// sandboxed agent shells — so a running daemon was invisible from the others)
+/// and NOT `$XDG_RUNTIME_DIR` (systemd removes `/run/user/<uid>` when the
+/// user's last session ends, breaking daemons that outlive the SSH session
+/// that started them). Keep in sync with `runtime_base()` in the paniolo
+/// CLI's daemons.rs and hdmicap's daemon.rs.
 pub fn runtime_dir() -> Result<PathBuf> {
-    let dirs = directories::BaseDirs::new().context("no base dirs")?;
-    let base = dirs
-        .runtime_dir()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(std::env::temp_dir);
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    // Safe: getuid is always successful.
+    let uid = unsafe { libc::getuid() };
+    let base = PathBuf::from(format!("/tmp/paniolo-{uid}"));
+    match fs::DirBuilder::new().mode(0o700).create(&base) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Guard against a squatter pre-creating the /tmp path.
+            let md = fs::symlink_metadata(&base)?;
+            if !md.is_dir() || md.uid() != uid {
+                return Err(anyhow!(
+                    "{} exists but is not a directory owned by uid {uid}",
+                    base.display()
+                ));
+            }
+        }
+        Err(e) => return Err(e.into()),
+    }
     let dir = base.join("serialcap");
     fs::create_dir_all(&dir)?;
     Ok(dir)
@@ -14284,7 +14038,7 @@ mod tests {
 //! accepts input over localhost HTTP so input coexists with capture).
 //!
 //! Ported from the Python `_serial.py`. serialcap's discovery file is
-//! `$XDG_RUNTIME_DIR/serialcap/daemon.json` (else the temp dir), holding
+//! `/tmp/paniolo-<uid>/serialcap/daemon.json` (see daemons.rs), holding
 //! `{pid, port, …}`; an interface is passed to the daemon as
 //! `NAME=DEVICE@BAUD[:SENSE]`.
 
@@ -14332,9 +14086,10 @@ pub fn start_daemon(ifaces: &[SerialChannel], port: u16) -> Result<()> {
     for ch in ifaces {
         cmd.arg("--interface").arg(interface_arg(ch));
     }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    // Capture stderr (tracing output) so a startup failure is diagnosable;
+    // daemons::start_failure() reads the tail on timeout.
+    let log = std::fs::File::create(daemons::ensure_runtime_dir(DAEMON)?.join("daemon.log"))?;
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
     // Detach into its own process group so it survives this CLI exiting.
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     cmd.spawn()?;
@@ -14450,276 +14205,6 @@ mod tests {
 }
 ````
 
-## File: docs/distributed-control.md
-````markdown
-# Distributed control: one lab, one file
-
-> **Status: Phases 0–5 implemented** (#20 for 0–3, #22 for 4–5; 2026-06-01).
-> Shipped: the SSH transport, the one-file lab model (`--lab` / `PANIOLO_LAB`),
-> transparent re-exec of one-shot commands on a target's host, a tunnelled
-> `console` for a remote target, remote `setup --host`, and discovery-assisted
-> `configure`. Still design-only: multi-host targets, `console --detach`, and
-> multi-user locking (see the [implementation plan](distributed-control-plan.md)
-> for the phasing). Compare [related work: paniolo vs. labgrid](ci-integration/related-work.md),
-> whose distributed model directly informs this.
-
-## The problem
-
-Today paniolo assumes the machine you run it on is the machine wired to the
-target. When your dev machine isn't the control host — the common case — you
-SSH into the control host by hand and run `paniolo …` there (the remote-control
-pattern in the root [README](../README.md)). That works, but it leaks the host
-boundary into every workflow: you manage SSH sessions yourself, and anything
-that serves a port (the dashboard, `serial watch`, `video preview`) means
-hand-rolling `ssh -L` port forwards. The friction is acute for the console —
-making the live dashboard reachable from your laptop is just enough manual SSH
-plumbing to discourage using it.
-
-The goal: **abstract away host location.** From your dev machine you say
-`paniolo console fortune` and it transparently does the right thing on whichever
-control host `fortune` is wired to — including, eventually, a target whose
-hardware is spread across more than one control host.
-
-## The core decision: one lab, one file
-
-A **lab** is described by a single config file that lives in a git repo. You
-point paniolo at it (a `--lab` flag or `PANIOLO_LAB` env var, defaulting to a
-conventional path). That file declares every **host** in the lab and every
-**target**, and which host each piece of a target's hardware lives on. One lab,
-one file — deliberately simple; multi-file / multi-lab composition can come
-later if it ever earns its keep.
-
-The file is the contract. It is plain, reviewable config under version control,
-edited by a human (optionally with an agent's help — see
-[Configuration workflow](#configuration-workflow)); paniolo reads it but is not
-the authority over it. This keeps paniolo's existing grain, where target config
-is reviewable TOML rather than daemon-managed state.
-
-## Design principles
-
-These fell out of the discussion and constrain everything below:
-
-1. **The dev machine is the hub.** It is the only node guaranteed to reach every
-   control host (a star topology). Control hosts cannot be assumed to reach each
-   other — they may sit on isolated lab segments with no mutual SSH trust. So the
-   data plane must **rendezvous at the dev machine**, never between control hosts.
-2. **Config is centralized and reviewed; runtime state lives next to the
-   hardware.** The lab file (config) lives in one place a human reviews. Only
-   *runtime* state — daemons, capture logs, advisory locks, discovery files —
-   lives on the control host, because it must be co-located with the hardware it
-   describes. This sharpens paniolo's old "state lives next to the hardware" rule,
-   which was only ever true because everything ran on one host.
-3. **Control hosts are stateless executors.** They hold no durable target config.
-   paniolo ships the relevant slice of config to a host at command time. A control
-   host is therefore *disposable*: re-image it, re-run `paniolo setup` on it, and
-   it resumes its role from the lab file with nothing to restore.
-4. **SSH is the transport.** It already solves auth, encryption, and identity, and
-   the key infrastructure exists. A custom agent/RPC server would either reinvent
-   that or tunnel over SSH anyway. labgrid uses SSH for its data plane for exactly
-   this reason.
-5. **Don't preclude multi-host targets.** A single logical target may span control
-   hosts (serial on one, HDMI capture on another, power on a third). The schema is
-   designed for this from day one even though the first implementation handles only
-   the same-host case.
-
-## The config model
-
-Host binding lives on **each resource**, not on the target as a whole — because a
-target can span hosts. This mirrors labgrid's Resource model (a Resource is
-passive access-info bound to a specific exporter). A target-level `host` sets the
-default; each resource inherits it unless it overrides. The default-of-the-default
-is `local` (the dev machine itself), so a lab with one local host and one target
-reproduces today's single-host behavior exactly.
-
-```toml
-# mylab.toml — checked into a git repo; PANIOLO_LAB points here.
-
-[hosts.bench1]
-ssh = "curtisg@bench1.local"      # ssh destination; the only required field
-# identity = "~/.ssh/id_lab"      # optional key; set it to avoid agent key-spray (below)
-# control_path = "~/.ssh/cm-%h"   # optional ControlMaster socket (see Transport)
-# paniolo_cmd = "/Users/me/.local/bin/paniolo"  # if paniolo isn't on the host's ssh PATH
-
-[hosts.bench2]
-ssh = "curtisg@bench2.local"
-
-# A normal single-host target. Everything inherits host = bench1.
-[targets.fortune]
-host = "bench1"                   # default host for this target's resources
-
-[targets.fortune.netboot]
-interface = "enx00e04c08d9a0"
-host_ip   = "192.168.99.1"
-tftp_root = "/home/curtisg/tftp/fortune"
-
-[[targets.fortune.serial]]
-name   = "console"
-device = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG00W7NY-if00-port0"
-baud   = 115200
-
-[targets.fortune.power]
-cycle_cmd = "/home/curtisg/src/rpi5-bringup/scripts/power-cycle.sh"
-
-# --- the future case: one target spanning two control hosts ---
-[targets.fortune.video]
-host   = "bench2"                 # HDMI capture is on a different host
-device = "0x8300000534d2109"      # USB Video — stable, port-derived id
-```
-
-- `host = "local"` (or unset, on a single-host lab) means the dev machine — i.e.
-  today's behavior, no SSH involved.
-- Existing `~/.config/paniolo/targets/*.toml` files are effectively an *implicit
-  local lab*. Backward compatibility: with no `--lab`/`PANIOLO_LAB`, paniolo uses
-  those exactly as now. The migration path is to fold them into a lab file; it is
-  opt-in, not forced.
-
-## Transport (the "Fork B" model)
-
-The transport splits by command type, and leans entirely on SSH and the fact
-that paniolo's subsystem daemons (`serialcap`, `hdmicap`) are *already* network
-services speaking HTTP/WebSocket on a discovery port.
-
-**One-shot control commands** — `power-cycle`, `netboot start/stop`,
-`video shot`, `serial log`, `serial send`, config reads — **re-exec over SSH.**
-For a resource on `bench1`, paniolo runs the same command on `bench1` and
-forwards stdin/stdout/stderr and the exit code. The far-side paniolo is
-unchanged, so this reuses 100% of existing logic; runtime state (logs, locks,
-discovery) naturally stays on the control host where it belongs.
-
-**Streaming / port-serving commands** — the dashboard, `serial watch`,
-`video preview` — **SSH-tunnel to the existing daemon.** paniolo re-execs the
-daemon start remotely (idempotent), reads the remote discovery port over SSH,
-opens an `ssh -L` forward to it, and points the local client/browser at the
-forwarded local port. No new protocol and no always-on server: the daemon's
-existing HTTP/WS *is* the API.
-
-**Latency** is handled with one **ControlMaster** connection per host, shared by
-every re-exec and every `-L` forward, so only the first command per host pays the
-SSH handshake. The host's `control_path` in the lab file names the master socket.
-
-**Interactive `serial connect`** (tio) needs **no tunnel** — `ssh -t bench1
-paniolo serial connect fortune` runs tio straight over SSH's own PTY. The tunnel
-machinery is only for the browser dashboard, not the terminal CLI.
-
-**Two operational notes** (learned while implementing this):
-
-- **`paniolo` must be reachable on the host.** Re-exec runs `paniolo …` over a
-  *non-interactive* ssh, whose PATH often omits `~/.local/bin`. If bare `paniolo`
-  doesn't resolve there, set the host's `paniolo_cmd` to an absolute path.
-- **Set `identity` to avoid ssh-agent key-spray.** An agent offering many keys
-  (e.g. 1Password) can trip the host's `MaxAuthTries` *before* the right key on
-  the first connect. A per-host `identity` makes paniolo pass
-  `-i <key> -o IdentitiesOnly=yes`, offering exactly one. (This is the user's ssh
-  setup, not something paniolo can fix for them — but the lab field is the lever.)
-
-### The dashboard, and why multi-host rules out a reverse-proxy
-
-The dashboard is the one place two subsystems interlock: hdmicap serves the page
-but reaches serialcap by an **absolute URL** (`ws://<host>:8724/stream`), with a
-`?serialws=` override (see [architecture §7](architecture.md)). So the browser
-makes a *second* connection, to serialcap, possibly on a different port and a
-different host.
-
-The clean answer uses the override and the hub principle together: forward each
-daemon's port to the dev machine, then open the dashboard at
-`http://127.0.0.1:<local-hdmi>/?serialws=ws://127.0.0.1:<local-serial>/stream`.
-The `?serialws=` knob — which already exists — stitches the two together and does
-not care that the daemons are on different hosts, only that both resolve as
-forwarded local ports. This needs **zero changes to hdmicap or serialcap.**
-
-We explicitly considered, and rejected, making hdmicap **reverse-proxy** serialcap
-to collapse the dashboard to one origin/one forward. It would require hdmicap on
-one host to connect to serialcap on another — exactly the cross-host path
-principle 1 says we cannot assume. The forward-each-daemon-to-the-dev-machine
-model is the only one that always works, and it generalizes to multi-host targets
-for free.
-
-### Why not a long-running agent daemon (labgrid's exporter)
-
-A per-host paniolo agent with its own RPC API (labgrid's exporter / "Option B" in
-`AGENTS.md`) would give cleaner streaming multiplexing and a natural home for
-multi-user locking. We chose against it for now because it directly trades away
-paniolo's stated identity — *zero-infrastructure, no coordinator/exporter/client
-to stand up* ([related-work](ci-integration/related-work.md)). SSH-tunnelling the
-daemons that already exist gets local-feeling console with no always-on server and
-no new auth surface. The agent remains a *someday* option, gated on whether
-multi-user/board-farm scale ever becomes a goal — at which point paniolo would be
-choosing to become a different kind of tool, deliberately.
-
-## Console lifecycle
-
-`paniolo console <target>` is **foreground-blocking** by default: it opens the
-forward(s), launches the browser, and blocks holding the tunnel until you Ctrl-C,
-then tears down. This feels exactly like a local dashboard and needs **no
-persistent local runtime state** — the forwards die with the process. It assumes a
-human is present, which is consistent with the fact that physical setup already
-requires interactive access to the control host.
-
-A non-blocking `--detach` mode (set up the forward, print the URL, return; reap on
-`console --down` or idle timeout) is a plausible later addition for agent use, but
-it introduces a *local tunnel registry* — transient runtime state on the dev
-machine — so it is deferred until something actually needs the live console
-without a terminal held open. (Most agent workflows use `video shot`/`read`, not
-the live stream.)
-
-## Configuration workflow
-
-Discovery **assists** authoring; it does not replace it. Control hosts can
-enumerate their hardware (serial devices, USB-Ethernet interfaces, HDMI capture
-devices) to scaffold config, but the authoritative lab file is always written and
-approved by a human.
-
-The flow is two-phase — **propose, then approve**:
-
-1. `paniolo configure fortune --serial bench1 --video bench2` runs discovery on
-   the named hosts over SSH and merges their inventories into a **proposed** target
-   definition.
-2. paniolo shows the **diff** against the current lab file and writes nothing
-   authoritative.
-3. The human reviews and approves; the change lands as a git commit to the lab
-   repo.
-
-An agent can drive step 1 and prepare the diff, but it can only *stage* a
-proposal — it never silently mutates the authoritative config. Because the lab
-file is in git, every change is a reviewable, revertible commit. Reconfiguration
-is the same flow against the existing file.
-
-## What's deferred
-
-Designed-for but **not** in the first implementation:
-
-- **Multi-host targets.** The schema (per-resource `host`) and the transport
-  (dev-machine rendezvous) both support it; the first cut handles same-host
-  targets only and rejects cross-host targets with a clear error.
-- **`console --detach`** and the local tunnel registry it requires.
-- **Multi-user / locking / reservations** (labgrid's coordinator-enforced
-  *places*). Single-user is assumed.
-- **A long-running agent daemon / RPC API.** Only if scale demands it.
-- **Multi-file / multi-lab composition.** One lab, one file, for now.
-
-## Relationship to labgrid
-
-This design is, knowingly, a smaller-footprint rediscovery of labgrid's
-distributed shape: per-resource host binding ≈ labgrid Resources bound to
-exporters; SSH data plane ≈ labgrid's client→exporter-over-SSH data plane;
-discovery-assisted config ≈ a coordinator-as-registry, minus the always-on
-server. The deliberate divergence is **no coordinator and no exporter daemon** —
-a single git-tracked lab file plus SSH, preserving paniolo's zero-infrastructure,
-agent-in-the-loop niche. See [related work](ci-integration/related-work.md) for
-the full comparison.
-
-## Open questions
-
-- Exact spelling of "point paniolo at the lab" (`--lab` flag, `PANIOLO_LAB`,
-  default path, or a `[lab]` pointer in user config) and how it composes with the
-  legacy `~/.config/paniolo/targets/*.toml` during migration.
-- Whether the per-command config slice shipped to a host travels as CLI args, a
-  temp file over SSH, or stdin — a mechanism choice, not an architecture one.
-- How `paniolo setup` is invoked per remote host (`setup --host bench1` re-execing
-  over SSH is the obvious answer, since building daemons must happen on the host
-  wired to the hardware).
-````
-
 ## File: docs/serial.md
 ````markdown
 # Serial console
@@ -14819,7 +14304,7 @@ log rotation) and a UTC timestamp (`ts_ms`). The `--since` flag polls for lines
 with `seq` greater than the last seen value — safe to re-run from scripts.
 
 Each interface writes to its own capture directory so logs never conflate:
-`$TMPDIR/serialcap/capture/<name>/serial.jsonl`.
+`/tmp/paniolo-<uid>/serialcap/capture/<name>/serial.jsonl`.
 
 ---
 
@@ -14922,10 +14407,11 @@ a full command reference.
 
 | Purpose | Path |
 |---|---|
-| serialcap discovery | `$TMPDIR/serialcap/daemon.json` (`{pid, port, interfaces:[...]}`) |
-| serialcap advisory lock | `$TMPDIR/serialcap/daemon.lock` |
-| Capture log (per interface) | `$TMPDIR/serialcap/capture/<name>/serial.jsonl(.1..)` |
-| Pending (unterminated) line | `$TMPDIR/serialcap/capture/<name>/pending.json` |
+| serialcap discovery | `/tmp/paniolo-<uid>/serialcap/daemon.json` (`{pid, port, interfaces:[...]}`) |
+| serialcap advisory lock | `/tmp/paniolo-<uid>/serialcap/daemon.lock` |
+| serialcap stderr log | `/tmp/paniolo-<uid>/serialcap/daemon.log` (truncated on each start; shown on start timeout) |
+| Capture log (per interface) | `/tmp/paniolo-<uid>/serialcap/capture/<name>/serial.jsonl(.1..)` |
+| Pending (unterminated) line | `/tmp/paniolo-<uid>/serialcap/capture/<name>/pending.json` |
 
 ---
 
@@ -14947,6 +14433,113 @@ configured interface. Responses carry a permissive CORS header.
 with live capture. A paced write (`pace_ms > 0`) blocks until the whole body is
 sent (~`len × pace_ms` ms). Returns 200 on success, 404 for an unknown interface,
 503 if the supervisor isn't running.
+````
+
+## File: docs/video.md
+````markdown
+# Video capture
+
+paniolo drives `hdmicap`, a Rust warm-stream daemon that keeps a USB HDMI
+capture device open continuously and serves the current frame over HTTP. This
+avoids the multi-second reopen latency you'd get by running ffmpeg per capture.
+
+---
+
+## Hardware
+
+Any USB HDMI capture card that presents as a UVC device (V4L2 / AVFoundation).
+Tested with the MS2109-based cards (e.g. generic "USB3.0 HDMI Capture" dongles).
+
+Connect the target's HDMI output to the capture card, then the card to the Mac.
+
+---
+
+## Setup
+
+```bash
+# Detect available capture devices (each line ends with its stable id)
+paniolo video devices
+
+# Configure the target's video channel — prefer the stable id
+paniolo video set -t target-machine --device "0x8300000534d2109"
+```
+
+The `--device` value may be:
+
+- a **stable id** (preferred): the AVFoundation `uniqueID` on macOS, the
+  `/dev/v4l/by-path/...` symlink on Linux. Both are derived from USB port
+  topology — they survive reboots and enumeration-order shifts, distinguish
+  two identical dongles, and change only if the dongle moves to a different
+  physical port.
+- a **name substring** (e.g. `"USB Video"`): convenient, but identical dongles
+  share a name. A substring matching more than one device is an error that
+  lists the candidates' ids — never a silent first-match guess.
+- a **`/dev/video*` path** (Linux): accepted, but not stable across reboots.
+
+The device lives on the target's `video` channel in the lab file (see
+[config-redesign.md](config-redesign.md)); `paniolo configure` proposes the
+stable id (with the human name as a comment) when one non-built-in capture
+device is present, and lists id alternatives when there are several.
+
+---
+
+## Starting and stopping the daemon
+
+```bash
+paniolo video watch [target-machine]   # start hdmicap daemon for a target
+paniolo video stop  [target-machine]   # stop it
+paniolo video show  [target-machine]   # show daemon URL and status
+```
+
+`watch` starts `hdmicap daemon` detached and polls for startup. The daemon URL
+is printed — open it in a browser for the live preview.
+
+---
+
+## Capturing frames
+
+```bash
+paniolo video shot [target-machine]           # save a screenshot to a temp file
+paniolo video shot [target-machine] -o out.png  # save to a specific path
+paniolo video preview [target-machine]        # open the live MJPEG stream in a browser
+```
+
+`shot` fetches a single PNG-encoded frame from the running daemon via
+`hdmicap shot`.
+
+---
+
+## OCR (Apple Vision)
+
+```bash
+paniolo video read [target-machine]
+```
+
+Fetches the current frame and runs Apple Vision's `VNRecognizeTextRequest` on
+it, printing the recognized text to stdout. On-device — no network, no model
+download required.
+
+`paniolo setup` compiles `ocr/visionocr.swift` into `~/.cargo/bin/visionocr`
+with `swiftc`. The OCR tool is also accessible from the [web dashboard](dashboard.md)
+via the OCR button.
+
+**OCR tuning notes:**
+- `.fast` recognition level is used (not `.accurate` — the latter misses small
+  console text entirely; it's tuned for natural document text).
+- The frame is 2×-upscaled and black-padded before recognition to improve
+  accuracy on thin console fonts.
+- `minimumTextHeight` is lowered from the default to catch small terminal text.
+
+---
+
+## Runtime paths
+
+| Purpose | Path |
+|---|---|
+| Video config | the target's `video` channel in the lab file (`~/.config/paniolo/lab.toml`) |
+| hdmicap discovery | `/tmp/paniolo-<uid>/hdmicap/daemon.json` (`{pid, port}`) |
+| hdmicap advisory lock | `/tmp/paniolo-<uid>/hdmicap/daemon.lock` |
+| hdmicap stderr log | `/tmp/paniolo-<uid>/hdmicap/daemon.log` (truncated on each start; shown on start timeout) |
 ````
 
 ## File: hdmicap/src/daemon.rs
@@ -14987,13 +14580,33 @@ pub struct Discovery {
     pub port: u16,
 }
 
+/// Stable per-user runtime dir: `/tmp/paniolo-<uid>/hdmicap`, identical in
+/// every environment of the same user. Deliberately NOT `$TMPDIR`/`temp_dir()`
+/// (macOS hands each environment a different TMPDIR — GUI terminal vs SSH vs
+/// sandboxed agent shells — so a running daemon was invisible from the others)
+/// and NOT `$XDG_RUNTIME_DIR` (systemd removes `/run/user/<uid>` when the
+/// user's last session ends, breaking daemons that outlive the SSH session
+/// that started them). Keep in sync with `runtime_base()` in the paniolo
+/// CLI's daemons.rs and serialcap's daemon.rs.
 fn runtime_dir() -> Result<PathBuf> {
-    // XDG_RUNTIME_DIR on Linux; a per-user tmp path on macOS via `directories`.
-    let dirs = directories::BaseDirs::new().context("no base dirs")?;
-    let base = dirs
-        .runtime_dir()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(std::env::temp_dir);
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    // Safe: getuid is always successful.
+    let uid = unsafe { libc::getuid() };
+    let base = PathBuf::from(format!("/tmp/paniolo-{uid}"));
+    match fs::DirBuilder::new().mode(0o700).create(&base) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Guard against a squatter pre-creating the /tmp path.
+            let md = fs::symlink_metadata(&base)?;
+            if !md.is_dir() || md.uid() != uid {
+                return Err(anyhow!(
+                    "{} exists but is not a directory owned by uid {uid}",
+                    base.display()
+                ));
+            }
+        }
+        Err(e) => return Err(e.into()),
+    }
     let dir = base.join("hdmicap");
     fs::create_dir_all(&dir)?;
     Ok(dir)
@@ -15300,6 +14913,227 @@ mod tests {
         };
         assert_ne!(ahash(&gradient(true)), ahash(&gradient(false)));
     }
+}
+````
+
+## File: hdmicap/src/main.rs
+````rust
+// Copyright 2026 Curtis Galloway
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! hdmicap — warm-stream HDMI capture daemon + thin client CLI.
+//!
+//! Subcommands:
+//!   daemon   run the capture daemon (the controller starts this)
+//!   devices  list capture devices
+//!   shot     fetch one PNG from a running daemon (--stable, --out)
+//!   watch    block until the screen changes, then print the new hash
+//!   stop     ask the running daemon to exit
+//!   preview  print the URL to open in a browser
+
+mod capture;
+mod capture_thread;
+mod daemon;
+mod frame;
+mod server;
+
+use std::io::{Read, Write};
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+
+use capture::DeviceSpec;
+
+#[derive(Parser)]
+#[command(name = "hdmicap", version, about)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Run the capture daemon (foreground; controller manages the process).
+    Daemon {
+        /// Device: "auto" (default), an index, or a name substring.
+        #[arg(long, default_value = "auto")]
+        device: String,
+        /// Port to bind on localhost. 0 = OS-assigned.
+        #[arg(long, default_value_t = 8723)]
+        port: u16,
+    },
+    /// List available capture devices and exit (no daemon needed).
+    Devices {
+        /// Emit machine-readable JSON instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fetch one screenshot from the running daemon.
+    Shot {
+        /// Wait until the signal is Stable before capturing.
+        #[arg(long)]
+        stable: bool,
+        /// Only return once the frame differs from this hex hash.
+        #[arg(long)]
+        changed_since: Option<String>,
+        /// Timeout in ms.
+        #[arg(long, default_value_t = 2000)]
+        timeout: u64,
+        /// Output path; "-" for stdout.
+        #[arg(long, default_value = "-")]
+        out: String,
+    },
+    /// Block until the screen changes vs the current frame; print the new hash.
+    Watch {
+        #[arg(long, default_value_t = 30000)]
+        timeout: u64,
+    },
+    /// Print the preview URL (open in a browser).
+    Preview,
+    /// Tell the running daemon to shut down.
+    Stop,
+}
+
+fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "hdmicap=info".into()),
+        )
+        .init();
+
+    let cli = Cli::parse();
+    match cli.cmd {
+        Cmd::Daemon { device, port } => daemon::run(DeviceSpec::parse(&device), port),
+        Cmd::Devices { json } => cmd_devices(json),
+        Cmd::Shot {
+            stable,
+            changed_since,
+            timeout,
+            out,
+        } => cmd_shot(stable, changed_since, timeout, &out),
+        Cmd::Watch { timeout } => cmd_watch(timeout),
+        Cmd::Preview => cmd_preview(),
+        Cmd::Stop => cmd_stop(),
+    }
+}
+
+fn base_url() -> Result<String> {
+    let d = daemon::discover()?;
+    Ok(format!("http://127.0.0.1:{}", d.port))
+}
+
+fn cmd_devices(json: bool) -> Result<()> {
+    let devices = capture::enumerate()?;
+    if json {
+        let list: Vec<serde_json::Value> = devices
+            .iter()
+            .map(|d| {
+                serde_json::json!({"index": d.index, "name": d.name, "misc": d.misc, "id": d.id})
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&list)?);
+        return Ok(());
+    }
+    for d in devices {
+        println!("{:>3}  {}  [{}]  id={}", d.index, d.name, d.misc, d.id);
+    }
+    Ok(())
+}
+
+fn cmd_shot(stable: bool, changed_since: Option<String>, timeout: u64, out: &str) -> Result<()> {
+    let url = base_url().context("is the daemon running? try `hdmicap daemon`")?;
+    let mut snap_url = format!("{url}/snapshot?timeout={timeout}");
+    if stable {
+        snap_url.push_str("&wait=stable");
+    }
+    if let Some(ref hash) = changed_since {
+        snap_url.push_str(&format!("&changed_since={hash}"));
+    }
+
+    let resp = ureq::get(&snap_url)
+        .call()
+        .context("GET /snapshot failed")?;
+
+    let timed_out = resp.header("x-timeout") == Some("1");
+    let signal = resp.header("x-signal").unwrap_or("unknown").to_string();
+    let hash = resp.header("x-frame-hash").unwrap_or("").to_string();
+    eprintln!(
+        "signal={}  hash={}{}",
+        signal,
+        hash,
+        if timed_out { "  (timeout)" } else { "" }
+    );
+
+    let mut body = Vec::new();
+    resp.into_reader().read_to_end(&mut body)?;
+
+    if out == "-" {
+        std::io::stdout().write_all(&body)?;
+    } else {
+        std::fs::write(out, &body).with_context(|| format!("writing {out}"))?;
+        eprintln!("wrote {} bytes to {out}", body.len());
+    }
+    Ok(())
+}
+
+fn cmd_watch(timeout: u64) -> Result<()> {
+    let url = base_url().context("is the daemon running? try `hdmicap daemon`")?;
+
+    // Read the current hash so we can long-poll for a change.
+    let body = ureq::get(&format!("{url}/status"))
+        .call()
+        .context("GET /status failed")?
+        .into_string()
+        .context("reading /status body")?;
+    let status: serde_json::Value = serde_json::from_str(&body).context("parsing /status JSON")?;
+    let hash = status["hash"]
+        .as_str()
+        .unwrap_or("0000000000000000")
+        .to_string();
+
+    // Block until the frame changes or we time out.
+    let resp = ureq::get(&format!(
+        "{url}/snapshot?changed_since={hash}&timeout={timeout}"
+    ))
+    .call()
+    .context("GET /snapshot (changed_since) failed")?;
+
+    let new_hash = resp.header("x-frame-hash").unwrap_or("").to_string();
+    let timed_out = resp.header("x-timeout") == Some("1");
+    if timed_out {
+        anyhow::bail!("timed out waiting for screen change after {timeout}ms");
+    }
+    println!("{new_hash}");
+    Ok(())
+}
+
+fn cmd_preview() -> Result<()> {
+    let url = base_url().context("is the daemon running? try `hdmicap daemon`")?;
+    println!("Open {url}/preview in a browser to watch the screen.");
+    Ok(())
+}
+
+fn cmd_stop() -> Result<()> {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+
+    let d = daemon::discover().context("is the daemon running?")?;
+    kill(Pid::from_raw(d.pid as i32), Signal::SIGTERM)
+        .context("failed to send SIGTERM to daemon")?;
+    println!("daemon (pid {}) stopping", d.pid);
+    Ok(())
 }
 ````
 
@@ -19030,10 +18864,10 @@ pub fn run_subcommand(
 }
 
 /// Read the TCP port from a daemon's discovery file on `host`, or None.
-/// The path is resolved by a remote shell so the host's own runtime dir applies.
+/// The path is resolved by a remote shell so the host's own uid applies;
+/// must match `runtime_base()` in daemons.rs (and the daemon crates).
 pub fn remote_daemon_port(host: &crate::model::Host, subdir: &str) -> Option<u16> {
-    let script =
-        format!("cat \"${{XDG_RUNTIME_DIR:-${{TMPDIR:-/tmp}}}}/{subdir}/daemon.json\" 2>/dev/null");
+    let script = format!("cat \"/tmp/paniolo-$(id -u)/{subdir}/daemon.json\" 2>/dev/null");
     let out = ssh::run(
         host,
         &["sh".to_string(), "-c".to_string(), script],
@@ -19651,523 +19485,274 @@ mod tests {
 }
 ````
 
-## File: hdmicap/src/capture.rs
-````rust
-// Copyright 2026 Curtis Galloway
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+## File: docs/distributed-control.md
+````markdown
+# Distributed control: one lab, one file
 
-//! Capture backend abstraction.
-//!
-//! On Linux we bypass nokhwa and use the `v4l` crate directly so we can:
-//!   - Call `stream.set_timeout()` to avoid an indefinite VIDIOC_DQBUF block
-//!   - Keep raw MJPEG bytes for zero-cost preview serving
-//!   - Use turbojpeg (libjpeg-turbo) for fast RGB decode when signal detection
-//!     or OCR needs pixel data
-//!
-//! On macOS the nokhwa + AVFoundation path is kept as-is.
+> **Status: Phases 0–5 implemented** (#20 for 0–3, #22 for 4–5; 2026-06-01).
+> Shipped: the SSH transport, the one-file lab model (`--lab` / `PANIOLO_LAB`),
+> transparent re-exec of one-shot commands on a target's host, a tunnelled
+> `console` for a remote target, remote `setup --host`, and discovery-assisted
+> `configure`. Still design-only: multi-host targets, `console --detach`, and
+> multi-user locking (see the [implementation plan](distributed-control-plan.md)
+> for the phasing). Compare [related work: paniolo vs. labgrid](ci-integration/related-work.md),
+> whose distributed model directly informs this.
 
-use std::sync::Arc;
+## The problem
 
-use anyhow::{anyhow, Context, Result};
-use image::RgbImage;
+Today paniolo assumes the machine you run it on is the machine wired to the
+target. When your dev machine isn't the control host — the common case — you
+SSH into the control host by hand and run `paniolo …` there (the remote-control
+pattern in the root [README](../README.md)). That works, but it leaks the host
+boundary into every workflow: you manage SSH sessions yourself, and anything
+that serves a port (the dashboard, `serial watch`, `video preview`) means
+hand-rolling `ssh -L` port forwards. The friction is acute for the console —
+making the live dashboard reachable from your laptop is just enough manual SSH
+plumbing to discourage using it.
 
-use nokhwa::query;
-use nokhwa::utils::{ApiBackend, CameraIndex};
+The goal: **abstract away host location.** From your dev machine you say
+`paniolo console fortune` and it transparently does the right thing on whichever
+control host `fortune` is wired to — including, eventually, a target whose
+hardware is spread across more than one control host.
 
-#[derive(Clone, Debug)]
-pub struct DeviceInfo {
-    pub index: u32,
-    pub name: String,
-    pub misc: String,
-    /// Stable identifier, derived from USB topology — survives reboots and
-    /// enumeration-order shifts, changes only if the device moves to another
-    /// port. macOS: the AVFoundation `uniqueID` (location ID + VID + PID).
-    /// Linux: the `/dev/v4l/by-path/...` symlink. Empty when unavailable.
-    pub id: String,
-}
+## The core decision: one lab, one file
 
-/// How the user asked us to pick a device.
-#[derive(Clone, Debug)]
-pub enum DeviceSpec {
-    Auto,
-    Index(u32),
-    Name(String),
-}
+A **lab** is described by a single config file that lives in a git repo. You
+point paniolo at it (a `--lab` flag or `PANIOLO_LAB` env var, defaulting to a
+conventional path). That file declares every **host** in the lab and every
+**target**, and which host each piece of a target's hardware lives on. One lab,
+one file — deliberately simple; multi-file / multi-lab composition can come
+later if it ever earns its keep.
 
-impl DeviceSpec {
-    pub fn parse(s: &str) -> Self {
-        let s = s.trim();
-        if s.is_empty() || s.eq_ignore_ascii_case("auto") {
-            DeviceSpec::Auto
-        } else if let Ok(i) = s.parse::<u32>() {
-            DeviceSpec::Index(i)
-        } else if let Some(idx) = s
-            .strip_prefix("/dev/video")
-            .and_then(|n| n.parse::<u32>().ok())
-        {
-            DeviceSpec::Index(idx)
-        } else {
-            DeviceSpec::Name(s.to_string())
-        }
-    }
-}
+The file is the contract. It is plain, reviewable config under version control,
+edited by a human (optionally with an agent's help — see
+[Configuration workflow](#configuration-workflow)); paniolo reads it but is not
+the authority over it. This keeps paniolo's existing grain, where target config
+is reviewable TOML rather than daemon-managed state.
 
-const BUILTIN_HINTS: &[&str] = &["facetime", "built-in", "integrated", "isight"];
+## Design principles
 
-/// One captured frame. `jpeg` carries raw MJPEG bytes when available (Linux
-/// MJPEG path); the preview endpoint serves these directly with zero server
-/// decode/re-encode. `rgb` is always populated for signal detection (ahash,
-/// is_no_signal); on the Linux path it comes from turbojpeg (fast).
-pub struct CapturedFrame {
-    /// Raw MJPEG bytes from the device. Present on the Linux v4l path when the
-    /// device is in MJPEG mode; None on macOS or YUYV sources.
-    pub jpeg: Option<Arc<[u8]>>,
-    /// Decoded RGB8 pixels for signal detection. Always populated.
-    pub rgb: RgbImage,
-}
+These fell out of the discussion and constrain everything below:
 
-pub trait CaptureBackend {
-    fn frame(&mut self) -> Result<CapturedFrame>;
-}
+1. **The dev machine is the hub.** It is the only node guaranteed to reach every
+   control host (a star topology). Control hosts cannot be assumed to reach each
+   other — they may sit on isolated lab segments with no mutual SSH trust. So the
+   data plane must **rendezvous at the dev machine**, never between control hosts.
+2. **Config is centralized and reviewed; runtime state lives next to the
+   hardware.** The lab file (config) lives in one place a human reviews. Only
+   *runtime* state — daemons, capture logs, advisory locks, discovery files —
+   lives on the control host, because it must be co-located with the hardware it
+   describes. This sharpens paniolo's old "state lives next to the hardware" rule,
+   which was only ever true because everything ran on one host.
+3. **Control hosts are stateless executors.** They hold no durable target config.
+   paniolo ships the relevant slice of config to a host at command time. A control
+   host is therefore *disposable*: re-image it, re-run `paniolo setup` on it, and
+   it resumes its role from the lab file with nothing to restore.
+4. **SSH is the transport.** It already solves auth, encryption, and identity, and
+   the key infrastructure exists. A custom agent/RPC server would either reinvent
+   that or tunnel over SSH anyway. labgrid uses SSH for its data plane for exactly
+   this reason.
+5. **Don't preclude multi-host targets.** A single logical target may span control
+   hosts (serial on one, HDMI capture on another, power on a third). The schema is
+   designed for this from day one even though the first implementation handles only
+   the same-host case.
 
-/// Map V4L2 device index → its stable `/dev/v4l/by-path` symlink (the Linux
-/// analogue of AVFoundation's uniqueID: derived from USB port topology).
-#[cfg(target_os = "linux")]
-fn stable_ids_by_index() -> std::collections::HashMap<u32, String> {
-    let mut map = std::collections::HashMap::new();
-    let Ok(entries) = std::fs::read_dir("/dev/v4l/by-path") else {
-        return map;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(target) = std::fs::canonicalize(&path) else {
-            continue;
-        };
-        let target = target.to_string_lossy();
-        let Some(idx) = target
-            .strip_prefix("/dev/video")
-            .and_then(|n| n.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        map.entry(idx)
-            .or_insert_with(|| path.to_string_lossy().into_owned());
-    }
-    map
-}
+## The config model
 
-pub fn enumerate() -> Result<Vec<DeviceInfo>> {
-    let cams = query(ApiBackend::Auto).context("nokhwa device query failed")?;
-    #[cfg(target_os = "linux")]
-    let by_path = stable_ids_by_index();
-    Ok(cams
-        .into_iter()
-        .map(|c| {
-            let index = match c.index() {
-                CameraIndex::Index(i) => *i,
-                CameraIndex::String(_) => u32::MAX,
-            };
-            // macOS: the vendored bindings carry the AVFoundation uniqueID in
-            // CameraInfo::misc. Linux: join against the by-path symlinks.
-            #[cfg(not(target_os = "linux"))]
-            let id = c.misc();
-            #[cfg(target_os = "linux")]
-            let id = by_path.get(&index).cloned().unwrap_or_default();
-            DeviceInfo {
-                index,
-                name: c.human_name(),
-                misc: c.description().to_string(),
-                id,
-            }
-        })
-        .collect())
-}
+Host binding lives on **each resource**, not on the target as a whole — because a
+target can span hosts. This mirrors labgrid's Resource model (a Resource is
+passive access-info bound to a specific exporter). A target-level `host` sets the
+default; each resource inherits it unless it overrides. The default-of-the-default
+is `local` (the dev machine itself), so a lab with one local host and one target
+reproduces today's single-host behavior exactly.
 
-pub fn resolve(spec: &DeviceSpec) -> Result<u32> {
-    if let DeviceSpec::Index(i) = spec {
-        return Ok(*i);
-    }
-    // Any path-style spec (e.g. /dev/v4l/by-id/...) canonicalizes to
-    // /dev/videoN; by-path specs also hit the exact-id match in resolve_in.
-    #[cfg(target_os = "linux")]
-    if let DeviceSpec::Name(s) = spec {
-        if s.starts_with('/') {
-            if let Ok(target) = std::fs::canonicalize(s) {
-                if let Some(idx) = target
-                    .to_string_lossy()
-                    .strip_prefix("/dev/video")
-                    .and_then(|n| n.parse::<u32>().ok())
-                {
-                    return Ok(idx);
-                }
-            }
-        }
-    }
-    resolve_in(&enumerate()?, spec)
-}
+```toml
+# mylab.toml — checked into a git repo; PANIOLO_LAB points here.
 
-/// Pick a device from `devices` per `spec`. An exact stable-id match wins;
-/// otherwise case-insensitive name substring, which must match exactly one
-/// device — a first-match-wins guess is how two identical dongles end up
-/// silently swapped.
-fn resolve_in(devices: &[DeviceInfo], spec: &DeviceSpec) -> Result<u32> {
-    if devices.is_empty() {
-        return Err(anyhow!("no capture devices found"));
-    }
-    match spec {
-        DeviceSpec::Index(i) => Ok(*i),
-        DeviceSpec::Name(s) => {
-            if let Some(d) = devices.iter().find(|d| !d.id.is_empty() && d.id == *s) {
-                return Ok(d.index);
-            }
-            let sub = s.to_lowercase();
-            let matches: Vec<&DeviceInfo> = devices
-                .iter()
-                .filter(|d| d.name.to_lowercase().contains(&sub))
-                .collect();
-            match matches.as_slice() {
-                [] => Err(anyhow!("no device matching name or id {:?}", s)),
-                [d] => Ok(d.index),
-                many => Err(anyhow!(
-                    "device {:?} is ambiguous ({} matches) — use a stable id:\n{}",
-                    s,
-                    many.len(),
-                    many.iter()
-                        .map(|d| format!("  {:>3}  {}  id={}", d.index, d.name, d.id))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                )),
-            }
-        }
-        DeviceSpec::Auto => {
-            let external = devices.iter().find(|d| {
-                let n = d.name.to_lowercase();
-                !BUILTIN_HINTS.iter().any(|h| n.contains(h))
-            });
-            Ok(external.unwrap_or(&devices[0]).index)
-        }
-    }
-}
+[hosts.bench1]
+ssh = "curtisg@bench1.local"      # ssh destination; the only required field
+# identity = "~/.ssh/id_lab"      # optional key; set it to avoid agent key-spray (below)
+# control_path = "~/.ssh/cm-%h"   # optional ControlMaster socket (see Transport)
+# paniolo_cmd = "/Users/me/.local/bin/paniolo"  # if paniolo isn't on the host's ssh PATH
 
-pub fn open_backend(spec: &DeviceSpec) -> Result<Box<dyn CaptureBackend>> {
-    #[cfg(target_os = "linux")]
-    {
-        linux::LinuxV4LBackend::open(spec).map(|b| Box::new(b) as Box<dyn CaptureBackend>)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        macos::NokhwaBackend::open(spec).map(|b| Box::new(b) as Box<dyn CaptureBackend>)
-    }
-}
+[hosts.bench2]
+ssh = "curtisg@bench2.local"
 
-// ── Linux backend ─────────────────────────────────────────────────────────────
+# A normal single-host target. Everything inherits host = bench1.
+[targets.fortune]
+host = "bench1"                   # default host for this target's resources
 
-#[cfg(target_os = "linux")]
-mod linux {
-    use std::io;
-    use std::sync::Arc;
-    use std::time::Duration;
+[targets.fortune.netboot]
+interface = "enx00e04c08d9a0"
+host_ip   = "192.168.99.1"
+tftp_root = "/home/curtisg/tftp/fortune"
 
-    use anyhow::{anyhow, Context, Result};
-    use image::RgbImage;
-    use v4l::buffer::Type;
-    use v4l::device::Device;
-    use v4l::format::{Format, FourCC};
-    use v4l::io::mmap::Stream;
-    use v4l::io::traits::CaptureStream;
-    use v4l::video::Capture;
+[[targets.fortune.serial]]
+name   = "console"
+device = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG00W7NY-if00-port0"
+baud   = 115200
 
-    use super::{resolve, CaptureBackend, CapturedFrame, DeviceSpec};
+[targets.fortune.power]
+cycle_cmd = "/home/curtisg/src/rpi5-bringup/scripts/power-cycle.sh"
 
-    const FORMATS: &[(u32, u32, &[u8; 4])] = &[
-        (1280, 720, b"MJPG"),
-        (1920, 1080, b"MJPG"),
-        (1280, 720, b"YUYV"),
-        (640, 480, b"YUYV"),
-    ];
+# --- the future case: one target spanning two control hosts ---
+[targets.fortune.video]
+host   = "bench2"                 # HDMI capture is on a different host
+device = "0x8300000534d2109"      # USB Video — stable, port-derived id
+```
 
-    const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+- `host = "local"` (or unset, on a single-host lab) means the dev machine — i.e.
+  today's behavior, no SSH involved.
+- Existing `~/.config/paniolo/targets/*.toml` files are effectively an *implicit
+  local lab*. Backward compatibility: with no `--lab`/`PANIOLO_LAB`, paniolo uses
+  those exactly as now. The migration path is to fold them into a lab file; it is
+  opt-in, not forced.
 
-    pub struct LinuxV4LBackend {
-        stream: Stream<'static>,
-        dev: Box<Device>,
-        dims: (u32, u32),
-        is_mjpeg: bool,
-    }
+## Transport (the "Fork B" model)
 
-    impl LinuxV4LBackend {
-        pub fn open(spec: &DeviceSpec) -> Result<Self> {
-            let idx = resolve(spec)?;
-            let dev = Box::new(
-                Device::new(idx as usize).map_err(|e| anyhow!("open /dev/video{idx}: {e}"))?,
-            );
+The transport splits by command type, and leans entirely on SSH and the fact
+that paniolo's subsystem daemons (`serialcap`, `hdmicap`) are *already* network
+services speaking HTTP/WebSocket on a discovery port.
 
-            let mut last_err = anyhow!("no formats succeeded");
-            for &(w, h, fourcc) in FORMATS {
-                let fmt = Format::new(w, h, FourCC::new(fourcc));
-                if dev.set_format(&fmt).is_err() {
-                    continue;
-                }
-                let dev_ref: &'static Device = unsafe { &*(dev.as_ref() as *const Device) };
-                match Stream::with_buffers(dev_ref, Type::VideoCapture, 4) {
-                    Ok(mut stream) => {
-                        stream.set_timeout(FRAME_TIMEOUT);
-                        let actual_fmt = dev.format().unwrap_or(fmt);
-                        let is_mjpeg = actual_fmt.fourcc == FourCC::new(b"MJPG");
-                        tracing::info!(
-                            "capture opened {}x{} {:?}",
-                            actual_fmt.width,
-                            actual_fmt.height,
-                            if is_mjpeg { "MJPEG" } else { "YUYV" }
-                        );
-                        return Ok(LinuxV4LBackend {
-                            stream,
-                            dev,
-                            dims: (actual_fmt.width, actual_fmt.height),
-                            is_mjpeg,
-                        });
-                    }
-                    Err(e) => {
-                        last_err = anyhow!("stream init {w}x{h}: {e}");
-                    }
-                }
-            }
-            Err(last_err)
-        }
-    }
+**One-shot control commands** — `power-cycle`, `netboot start/stop`,
+`video shot`, `serial log`, `serial send`, config reads — **re-exec over SSH.**
+For a resource on `bench1`, paniolo runs the same command on `bench1` and
+forwards stdin/stdout/stderr and the exit code. The far-side paniolo is
+unchanged, so this reuses 100% of existing logic; runtime state (logs, locks,
+discovery) naturally stays on the control host where it belongs.
 
-    impl CaptureBackend for LinuxV4LBackend {
-        fn frame(&mut self) -> Result<CapturedFrame> {
-            let (buf, _meta) = self.stream.next().map_err(|e| {
-                if e.kind() == io::ErrorKind::TimedOut {
-                    anyhow!("frame timeout (device stalled)")
-                } else {
-                    anyhow!("VIDIOC_DQBUF: {e}")
-                }
-            })?;
+**Streaming / port-serving commands** — the dashboard, `serial watch`,
+`video preview` — **SSH-tunnel to the existing daemon.** paniolo re-execs the
+daemon start remotely (idempotent), reads the remote discovery port over SSH,
+opens an `ssh -L` forward to it, and points the local client/browser at the
+forwarded local port. No new protocol and no always-on server: the daemon's
+existing HTTP/WS *is* the API.
 
-            if self.is_mjpeg {
-                // Keep a copy of the raw JPEG bytes for zero-cost preview serving.
-                let jpeg_bytes: Arc<[u8]> = Arc::from(buf.to_vec().into_boxed_slice());
+**Latency** is handled with one **ControlMaster** connection per host, shared by
+every re-exec and every `-L` forward, so only the first command per host pays the
+SSH handshake. The host's `control_path` in the lab file names the master socket.
 
-                // Decode with turbojpeg (libjpeg-turbo) for signal detection.
-                // ~5ms at 720p vs ~50ms with the pure-Rust image crate.
-                let rgb = turbojpeg::decompress_image::<image::Rgb<u8>>(buf)
-                    .context("turbojpeg MJPEG decode failed")?;
-                let (w, h) = (rgb.width(), rgb.height());
-                self.dims = (w, h);
+**Interactive `serial connect`** (tio) needs **no tunnel** — `ssh -t bench1
+paniolo serial connect fortune` runs tio straight over SSH's own PTY. The tunnel
+machinery is only for the browser dashboard, not the terminal CLI.
 
-                Ok(CapturedFrame {
-                    jpeg: Some(jpeg_bytes),
-                    rgb,
-                })
-            } else {
-                // YUYV: no raw JPEG, decode to RGB for signal detection and storage.
-                let fmt = self.dev.format().ok();
-                let (w, h) = fmt
-                    .as_ref()
-                    .map(|f| (f.width, f.height))
-                    .unwrap_or(self.dims);
-                self.dims = (w, h);
-                Ok(CapturedFrame {
-                    jpeg: None,
-                    rgb: yuyv_to_rgb(buf, w, h),
-                })
-            }
-        }
-    }
+**Two operational notes** (learned while implementing this):
 
-    fn yuyv_to_rgb(buf: &[u8], w: u32, h: u32) -> RgbImage {
-        let mut rgb = RgbImage::new(w, h);
-        let pairs = (w * h / 2) as usize;
-        for i in 0..pairs {
-            let base = i * 4;
-            if base + 3 >= buf.len() {
-                break;
-            }
-            let y0 = buf[base] as f32;
-            let cb = buf[base + 1] as f32 - 128.0;
-            let y1 = buf[base + 2] as f32;
-            let cr = buf[base + 3] as f32 - 128.0;
-            let to_u8 = |v: f32| v.clamp(0.0, 255.0) as u8;
-            let r = |y: f32| to_u8(y + 1.402 * cr);
-            let g = |y: f32| to_u8(y - 0.344 * cb - 0.714 * cr);
-            let b = |y: f32| to_u8(y + 1.772 * cb);
-            let x0 = ((i * 2) % w as usize) as u32;
-            let y_row = ((i * 2) / w as usize) as u32;
-            if x0 < w && y_row < h {
-                rgb.put_pixel(x0, y_row, image::Rgb([r(y0), g(y0), b(y0)]));
-            }
-            if x0 + 1 < w && y_row < h {
-                rgb.put_pixel(x0 + 1, y_row, image::Rgb([r(y1), g(y1), b(y1)]));
-            }
-        }
-        rgb
-    }
-}
+- **`paniolo` must be reachable on the host.** Re-exec runs `paniolo …` over a
+  *non-interactive* ssh, whose PATH often omits `~/.local/bin`. If bare `paniolo`
+  doesn't resolve there, set the host's `paniolo_cmd` to an absolute path.
+- **Set `identity` to avoid ssh-agent key-spray.** An agent offering many keys
+  (e.g. 1Password) can trip the host's `MaxAuthTries` *before* the right key on
+  the first connect. A per-host `identity` makes paniolo pass
+  `-i <key> -o IdentitiesOnly=yes`, offering exactly one. (This is the user's ssh
+  setup, not something paniolo can fix for them — but the lab field is the lever.)
 
-// ── macOS backend ─────────────────────────────────────────────────────────────
+### The dashboard, and why multi-host rules out a reverse-proxy
 
-#[cfg(not(target_os = "linux"))]
-mod macos {
-    use anyhow::{anyhow, Context, Result};
-    use nokhwa::pixel_format::RgbFormat;
-    use nokhwa::utils::{
-        CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution,
-    };
-    use nokhwa::Camera;
+The dashboard is the one place two subsystems interlock: hdmicap serves the page
+but reaches serialcap by an **absolute URL** (`ws://<host>:8724/stream`), with a
+`?serialws=` override (see [architecture §7](architecture.md)). So the browser
+makes a *second* connection, to serialcap, possibly on a different port and a
+different host.
 
-    use super::{resolve, CaptureBackend, CapturedFrame, DeviceSpec};
+The clean answer uses the override and the hub principle together: forward each
+daemon's port to the dev machine, then open the dashboard at
+`http://127.0.0.1:<local-hdmi>/?serialws=ws://127.0.0.1:<local-serial>/stream`.
+The `?serialws=` knob — which already exists — stitches the two together and does
+not care that the daemons are on different hosts, only that both resolve as
+forwarded local ports. This needs **zero changes to hdmicap or serialcap.**
 
-    pub struct NokhwaBackend {
-        cam: Camera,
-        dims: (u32, u32),
-    }
+We explicitly considered, and rejected, making hdmicap **reverse-proxy** serialcap
+to collapse the dashboard to one origin/one forward. It would require hdmicap on
+one host to connect to serialcap on another — exactly the cross-host path
+principle 1 says we cannot assume. The forward-each-daemon-to-the-dev-machine
+model is the only one that always works, and it generalizes to multi-host targets
+for free.
 
-    impl NokhwaBackend {
-        pub fn open(spec: &DeviceSpec) -> Result<Self> {
-            let idx = resolve(spec)?;
-            let format_types: &[RequestedFormatType] = &[
-                RequestedFormatType::Closest(CameraFormat::new(
-                    Resolution::new(1280, 720),
-                    FrameFormat::MJPEG,
-                    30,
-                )),
-                RequestedFormatType::Closest(CameraFormat::new(
-                    Resolution::new(1920, 1080),
-                    FrameFormat::MJPEG,
-                    30,
-                )),
-                RequestedFormatType::AbsoluteHighestResolution,
-            ];
+### Why not a long-running agent daemon (labgrid's exporter)
 
-            let mut last_err: anyhow::Error = anyhow!("no formats to try");
-            for &fmt_type in format_types {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    try_open(idx, fmt_type)
-                }));
-                match result {
-                    Ok(Ok(backend)) => return Ok(backend),
-                    Ok(Err(e)) => {
-                        last_err = e;
-                    }
-                    Err(_) => {
-                        last_err = anyhow!("format {:?} not supported", fmt_type);
-                    }
-                }
-            }
-            Err(last_err)
-        }
-    }
+A per-host paniolo agent with its own RPC API (labgrid's exporter / "Option B" in
+`AGENTS.md`) would give cleaner streaming multiplexing and a natural home for
+multi-user locking. We chose against it for now because it directly trades away
+paniolo's stated identity — *zero-infrastructure, no coordinator/exporter/client
+to stand up* ([related-work](ci-integration/related-work.md)). SSH-tunnelling the
+daemons that already exist gets local-feeling console with no always-on server and
+no new auth surface. The agent remains a *someday* option, gated on whether
+multi-user/board-farm scale ever becomes a goal — at which point paniolo would be
+choosing to become a different kind of tool, deliberately.
 
-    fn try_open(idx: u32, fmt_type: RequestedFormatType) -> Result<NokhwaBackend> {
-        let requested = RequestedFormat::new::<RgbFormat>(fmt_type);
-        let mut cam = Camera::new(CameraIndex::Index(idx), requested)
-            .map_err(|e| anyhow!("failed to open capture device {idx}: {e}"))?;
-        cam.open_stream()
-            .map_err(|e| anyhow!("failed to open capture device {idx}: {e}"))?;
-        let res = cam.resolution();
-        Ok(NokhwaBackend {
-            cam,
-            dims: (res.width(), res.height()),
-        })
-    }
+## Console lifecycle
 
-    impl CaptureBackend for NokhwaBackend {
-        fn frame(&mut self) -> Result<CapturedFrame> {
-            let buf = self.cam.frame().context("frame grab failed")?;
-            let decoded = buf.decode_image::<RgbFormat>().context("decode failed")?;
-            self.dims = (decoded.width(), decoded.height());
-            Ok(CapturedFrame {
-                jpeg: None, // nokhwa gives decoded pixels, not raw JPEG
-                rgb: decoded,
-            })
-        }
-    }
-}
+`paniolo console <target>` is **foreground-blocking** by default: it opens the
+forward(s), launches the browser, and blocks holding the tunnel until you Ctrl-C,
+then tears down. This feels exactly like a local dashboard and needs **no
+persistent local runtime state** — the forwards die with the process. It assumes a
+human is present, which is consistent with the fact that physical setup already
+requires interactive access to the control host.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+A non-blocking `--detach` mode (set up the forward, print the URL, return; reap on
+`console --down` or idle timeout) is a plausible later addition for agent use, but
+it introduces a *local tunnel registry* — transient runtime state on the dev
+machine — so it is deferred until something actually needs the live console
+without a terminal held open. (Most agent workflows use `video shot`/`read`, not
+the live stream.)
 
-    fn dev(index: u32, name: &str, id: &str) -> DeviceInfo {
-        DeviceInfo {
-            index,
-            name: name.to_string(),
-            misc: String::new(),
-            id: id.to_string(),
-        }
-    }
+## Configuration workflow
 
-    fn two_dongles() -> Vec<DeviceInfo> {
-        vec![
-            dev(0, "USB Video", "0x8300000534d2109"),
-            dev(1, "USB Video", "0x8200000534d2109"),
-            dev(2, "FaceTime HD Camera", "0x1421000005ac8514"),
-        ]
-    }
+Discovery **assists** authoring; it does not replace it. Control hosts can
+enumerate their hardware (serial devices, USB-Ethernet interfaces, HDMI capture
+devices) to scaffold config, but the authoritative lab file is always written and
+approved by a human.
 
-    #[test]
-    fn exact_id_match_wins() {
-        let devices = two_dongles();
-        let spec = DeviceSpec::parse("0x8200000534d2109");
-        assert_eq!(resolve_in(&devices, &spec).unwrap(), 1);
-    }
+The flow is two-phase — **propose, then approve**:
 
-    #[test]
-    fn unique_name_substring_matches() {
-        let devices = two_dongles();
-        let spec = DeviceSpec::parse("facetime");
-        assert_eq!(resolve_in(&devices, &spec).unwrap(), 2);
-    }
+1. `paniolo configure fortune --serial bench1 --video bench2` runs discovery on
+   the named hosts over SSH and merges their inventories into a **proposed** target
+   definition.
+2. paniolo shows the **diff** against the current lab file and writes nothing
+   authoritative.
+3. The human reviews and approves; the change lands as a git commit to the lab
+   repo.
 
-    #[test]
-    fn ambiguous_name_is_an_error_listing_ids() {
-        let devices = two_dongles();
-        let spec = DeviceSpec::parse("USB Video");
-        let err = resolve_in(&devices, &spec).unwrap_err().to_string();
-        assert!(err.contains("ambiguous"), "{err}");
-        assert!(err.contains("0x8300000534d2109"), "{err}");
-        assert!(err.contains("0x8200000534d2109"), "{err}");
-    }
+An agent can drive step 1 and prepare the diff, but it can only *stage* a
+proposal — it never silently mutates the authoritative config. Because the lab
+file is in git, every change is a reviewable, revertible commit. Reconfiguration
+is the same flow against the existing file.
 
-    #[test]
-    fn no_match_is_an_error() {
-        let devices = two_dongles();
-        let spec = DeviceSpec::parse("Elgato");
-        assert!(resolve_in(&devices, &spec).is_err());
-    }
+## What's deferred
 
-    #[test]
-    fn auto_prefers_external_over_builtin() {
-        let devices = vec![
-            dev(0, "FaceTime HD Camera", "0x1421000005ac8514"),
-            dev(1, "USB Video", "0x8300000534d2109"),
-        ];
-        assert_eq!(resolve_in(&devices, &DeviceSpec::Auto).unwrap(), 1);
-    }
+Designed-for but **not** in the first implementation:
 
-    #[test]
-    fn empty_id_never_matches_empty_spec_id() {
-        // A device with no stable id must not be selected by id equality.
-        let devices = vec![dev(0, "USB Video", "")];
-        let spec = DeviceSpec::Name(String::new());
-        // Empty string parses to Auto via parse(); construct Name directly to
-        // prove the id-equality guard, then expect substring match (matches).
-        assert_eq!(resolve_in(&devices, &spec).unwrap(), 0);
-    }
-}
+- **Multi-host targets.** The schema (per-resource `host`) and the transport
+  (dev-machine rendezvous) both support it; the first cut handles same-host
+  targets only and rejects cross-host targets with a clear error.
+- **`console --detach`** and the local tunnel registry it requires.
+- **Multi-user / locking / reservations** (labgrid's coordinator-enforced
+  *places*). Single-user is assumed.
+- **A long-running agent daemon / RPC API.** Only if scale demands it.
+- **Multi-file / multi-lab composition.** One lab, one file, for now.
+
+## Relationship to labgrid
+
+This design is, knowingly, a smaller-footprint rediscovery of labgrid's
+distributed shape: per-resource host binding ≈ labgrid Resources bound to
+exporters; SSH data plane ≈ labgrid's client→exporter-over-SSH data plane;
+discovery-assisted config ≈ a coordinator-as-registry, minus the always-on
+server. The deliberate divergence is **no coordinator and no exporter daemon** —
+a single git-tracked lab file plus SSH, preserving paniolo's zero-infrastructure,
+agent-in-the-loop niche. See [related work](ci-integration/related-work.md) for
+the full comparison.
+
+## Open questions
+
+- Exact spelling of "point paniolo at the lab" (`--lab` flag, `PANIOLO_LAB`,
+  default path, or a `[lab]` pointer in user config) and how it composes with the
+  legacy `~/.config/paniolo/targets/*.toml` during migration.
+- Whether the per-command config slice shipped to a host travels as CLI args, a
+  temp file over SSH, or stdin — a mechanism choice, not an architecture one.
+- How `paniolo setup` is invoked per remote host (`setup --host bench1` re-execing
+  over SSH is the obvious answer, since building daemons must happen on the host
+  wired to the hardware).
 ````
 
 ## File: src/paniolo/_config.py
@@ -21780,7 +21365,7 @@ Prompts to resolve when populating (not yet requirements — discussion seeds):
 | PWR-Q1 | `[power]` shape + `power_cycle_cmd` migration | ✓ Resolved (D-8): clean breaking block, no alias |
 ````
 
-## File: hdmicap/src/server.rs
+## File: hdmicap/src/capture.rs
 ````rust
 // Copyright 2026 Curtis Galloway
 //
@@ -21796,399 +21381,507 @@ Prompts to resolve when populating (not yet requirements — discussion seeds):
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Localhost HTTP API. Handlers never touch the device — they only read the
-//! latest FrameState from their `watch::Receiver`. PNG encoding is lazy, here.
+//! Capture backend abstraction.
+//!
+//! On Linux we bypass nokhwa and use the `v4l` crate directly so we can:
+//!   - Call `stream.set_timeout()` to avoid an indefinite VIDIOC_DQBUF block
+//!   - Keep raw MJPEG bytes for zero-cost preview serving
+//!   - Use turbojpeg (libjpeg-turbo) for fast RGB decode when signal detection
+//!     or OCR needs pixel data
+//!
+//! On macOS the nokhwa + AVFoundation path is kept as-is.
 
-use std::io::Cursor;
-use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 
-use axum::{
-    body::Body,
-    extract::{Query, State},
-    http::{header, StatusCode},
-    response::{IntoResponse, Response},
-    routing::{get, post},
-    Json, Router,
-};
-use bytes::Bytes;
-use image::codecs::jpeg::JpegEncoder;
-use image::{ImageBuffer, ImageEncoder, Rgb};
-use serde::Deserialize;
-use tokio::sync::watch;
+use anyhow::{anyhow, Context, Result};
+use image::RgbImage;
 
-use crate::capture_thread::FrameRx;
-use crate::frame::{FrameState, Signal, StatusDto};
+use nokhwa::query;
+use nokhwa::utils::{ApiBackend, CameraIndex};
 
-#[derive(Clone)]
-pub struct AppState {
-    pub frames: FrameRx,
+#[derive(Clone, Debug)]
+pub struct DeviceInfo {
+    pub index: u32,
+    pub name: String,
+    pub misc: String,
+    /// Stable identifier, derived from USB topology — survives reboots and
+    /// enumeration-order shifts, changes only if the device moves to another
+    /// port. macOS: the AVFoundation `uniqueID` (location ID + VID + PID).
+    /// Linux: the `/dev/v4l/by-path/...` symlink. Empty when unavailable.
+    pub id: String,
 }
 
-pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/", get(index))
-        .route("/status", get(status))
-        .route("/snapshot", get(snapshot))
-        .route("/preview", get(preview))
-        .route("/ocr", get(ocr))
-        .route("/power-cycle", post(power_cycle))
-        .route("/devices", get(devices))
-        // Vendored xterm.js assets for the serial terminal pane.
-        .route("/xterm.js", get(xterm_js))
-        .route("/xterm.css", get(xterm_css))
-        .route("/xterm-addon-fit.js", get(xterm_fit_js))
-        .with_state(state)
+/// How the user asked us to pick a device.
+#[derive(Clone, Debug)]
+pub enum DeviceSpec {
+    Auto,
+    Index(u32),
+    Name(String),
 }
 
-async fn index() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        include_str!("../assets/index.html"),
-    )
-}
-
-async fn xterm_js() -> impl IntoResponse {
-    (
-        [(
-            header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
-        include_str!("../assets/xterm.js"),
-    )
-}
-
-async fn xterm_css() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        include_str!("../assets/xterm.css"),
-    )
-}
-
-async fn xterm_fit_js() -> impl IntoResponse {
-    (
-        [(
-            header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
-        include_str!("../assets/xterm-addon-fit.js"),
-    )
-}
-
-async fn status(State(s): State<AppState>) -> Json<StatusDto> {
-    let f = s.frames.borrow().clone();
-    Json(StatusDto::from(f.as_ref()))
-}
-
-#[derive(Deserialize)]
-struct SnapReq {
-    /// "stable" -> wait until signal == Stable.
-    wait: Option<String>,
-    /// Hex hash from a prior /status; wait until the published hash differs.
-    changed_since: Option<String>,
-    /// Milliseconds; default applied below.
-    timeout: Option<u64>,
-}
-
-const DEFAULT_TIMEOUT_MS: u64 = 2000;
-
-async fn snapshot(State(s): State<AppState>, Query(q): Query<SnapReq>) -> Response {
-    let mut rx = s.frames.clone();
-    let timeout_ms = q.timeout.unwrap_or(DEFAULT_TIMEOUT_MS);
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms).min(Duration::from_secs(60));
-    let want_stable = q.wait.as_deref() == Some("stable");
-    let changed_since = q
-        .changed_since
-        .as_ref()
-        .and_then(|h| u64::from_str_radix(h, 16).ok());
-
-    loop {
-        let ready = {
-            let f = rx.borrow_and_update();
-            match (want_stable, changed_since) {
-                (true, _) => f.signal == Signal::Stable,
-                (_, Some(h)) => f.hash != h,
-                _ => true,
-            }
-        };
-
-        if ready {
-            let f = rx.borrow().clone();
-            return png_response(&f, false);
-        }
-
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            let f = rx.borrow().clone();
-            return png_response(&f, true);
-        }
-        if tokio::time::timeout(remaining, rx.changed()).await.is_err() {
-            let f = rx.borrow().clone();
-            return png_response(&f, true);
+impl DeviceSpec {
+    pub fn parse(s: &str) -> Self {
+        let s = s.trim();
+        if s.is_empty() || s.eq_ignore_ascii_case("auto") {
+            DeviceSpec::Auto
+        } else if let Ok(i) = s.parse::<u32>() {
+            DeviceSpec::Index(i)
+        } else if let Some(idx) = s
+            .strip_prefix("/dev/video")
+            .and_then(|n| n.parse::<u32>().ok())
+        {
+            DeviceSpec::Index(idx)
+        } else {
+            DeviceSpec::Name(s.to_string())
         }
     }
 }
 
-/// Decode the frame to an RGB image. On the Linux MJPEG path `rgb` is empty
-/// and we decode `jpeg` with turbojpeg. On other paths `rgb` is pre-decoded.
-fn decode_rgb(f: &FrameState) -> Option<ImageBuffer<Rgb<u8>, Vec<u8>>> {
-    if !f.rgb.is_empty() {
-        return ImageBuffer::from_raw(f.width, f.height, f.rgb.to_vec());
-    }
-    #[cfg(target_os = "linux")]
-    if let Some(ref jpeg) = f.jpeg {
-        return turbojpeg::decompress_image::<Rgb<u8>>(jpeg).ok();
-    }
-    None
+const BUILTIN_HINTS: &[&str] = &["facetime", "built-in", "integrated", "isight"];
+
+/// One captured frame. `jpeg` carries raw MJPEG bytes when available (Linux
+/// MJPEG path); the preview endpoint serves these directly with zero server
+/// decode/re-encode. `rgb` is always populated for signal detection (ahash,
+/// is_no_signal); on the Linux path it comes from turbojpeg (fast).
+pub struct CapturedFrame {
+    /// Raw MJPEG bytes from the device. Present on the Linux v4l path when the
+    /// device is in MJPEG mode; None on macOS or YUYV sources.
+    pub jpeg: Option<Arc<[u8]>>,
+    /// Decoded RGB8 pixels for signal detection. Always populated.
+    pub rgb: RgbImage,
 }
 
-/// Encode the frame to PNG bytes. Shared by /snapshot and /ocr.
-fn encode_png(f: &FrameState) -> Option<Vec<u8>> {
-    let img = decode_rgb(f)?;
-    let mut bytes = Vec::new();
-    img.write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
-        .ok()?;
-    Some(bytes)
+pub trait CaptureBackend {
+    fn frame(&mut self) -> Result<CapturedFrame>;
 }
 
-/// Lazily encode the current RGB buffer to PNG. PNG for agent snapshots: text
-/// edges matter for OCR and the dongle already adds MJPEG artifacts.
-fn png_response(f: &FrameState, timed_out: bool) -> Response {
-    if f.signal == Signal::NoDevice || f.width == 0 {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [(header::HeaderName::from_static("x-signal"), "no_device")],
-            "no capture device",
-        )
-            .into_response();
-    }
-
-    let bytes = match encode_png(f) {
-        Some(b) => b,
-        None => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "frame buffer size mismatch",
-            )
-                .into_response()
-        }
+/// Map V4L2 device index → its stable `/dev/v4l/by-path` symlink (the Linux
+/// analogue of AVFoundation's uniqueID: derived from USB port topology).
+#[cfg(target_os = "linux")]
+fn stable_ids_by_index() -> std::collections::HashMap<u32, String> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(entries) = std::fs::read_dir("/dev/v4l/by-path") else {
+        return map;
     };
-
-    let signal_str = signal_name(f.signal);
-
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "image/png".to_string()),
-            (
-                header::HeaderName::from_static("x-signal"),
-                signal_str.to_string(),
-            ),
-            (
-                header::HeaderName::from_static("x-resolution-epoch"),
-                f.resolution_epoch.to_string(),
-            ),
-            (
-                header::HeaderName::from_static("x-frame-hash"),
-                format!("{:016x}", f.hash),
-            ),
-            (
-                header::HeaderName::from_static("x-timeout"),
-                (timed_out as u8).to_string(),
-            ),
-        ],
-        bytes,
-    )
-        .into_response()
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(target) = std::fs::canonicalize(&path) else {
+            continue;
+        };
+        let target = target.to_string_lossy();
+        let Some(idx) = target
+            .strip_prefix("/dev/video")
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        map.entry(idx)
+            .or_insert_with(|| path.to_string_lossy().into_owned());
+    }
+    map
 }
 
-/// multipart/x-mixed-replace MJPEG stream for the human browser preview.
-/// Reads the same warm buffer as /snapshot — zero device contention.
-/// When raw JPEG bytes are available (Linux MJPEG path), they are served
-/// directly with zero server-side decode or re-encode. Otherwise we re-encode
-/// from the decoded RGB buffer at quality 80.
-async fn preview(State(s): State<AppState>) -> Response {
-    let mut frames = s.frames.clone();
-
-    let stream = async_stream::stream! {
-        let mut interval = tokio::time::interval(Duration::from_millis(67));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        loop {
-            interval.tick().await;
-            let f = frames.borrow_and_update().clone();
-
-            if f.signal == Signal::NoDevice || f.width == 0 {
-                continue;
+pub fn enumerate() -> Result<Vec<DeviceInfo>> {
+    let cams = query(ApiBackend::Auto).context("nokhwa device query failed")?;
+    #[cfg(target_os = "linux")]
+    let by_path = stable_ids_by_index();
+    Ok(cams
+        .into_iter()
+        .map(|c| {
+            let index = match c.index() {
+                CameraIndex::Index(i) => *i,
+                CameraIndex::String(_) => u32::MAX,
+            };
+            // macOS: the vendored bindings carry the AVFoundation uniqueID in
+            // CameraInfo::misc. Linux: join against the by-path symlinks.
+            #[cfg(not(target_os = "linux"))]
+            let id = c.misc();
+            #[cfg(target_os = "linux")]
+            let id = by_path.get(&index).cloned().unwrap_or_default();
+            DeviceInfo {
+                index,
+                name: c.human_name(),
+                misc: c.description().to_string(),
+                id,
             }
+        })
+        .collect())
+}
 
-            // Fast path: raw JPEG bytes from the device — no decode/re-encode.
-            let jpeg_bytes: Vec<u8> = if let Some(ref raw) = f.jpeg {
-                raw.to_vec()
-            } else {
-                // Fallback: re-encode from decoded RGB (macOS / YUYV path).
-                let img: ImageBuffer<Rgb<u8>, _> =
-                    match ImageBuffer::from_raw(f.width, f.height, f.rgb.to_vec()) {
-                        Some(i) => i,
-                        None => continue,
-                    };
-                let mut buf = Vec::new();
-                let encoder = JpegEncoder::new_with_quality(Cursor::new(&mut buf), 80);
-                if encoder
-                    .write_image(
-                        img.as_raw(),
-                        img.width(),
-                        img.height(),
-                        image::ExtendedColorType::Rgb8,
-                    )
-                    .is_err()
+pub fn resolve(spec: &DeviceSpec) -> Result<u32> {
+    if let DeviceSpec::Index(i) = spec {
+        return Ok(*i);
+    }
+    // Any path-style spec (e.g. /dev/v4l/by-id/...) canonicalizes to
+    // /dev/videoN; by-path specs also hit the exact-id match in resolve_in.
+    #[cfg(target_os = "linux")]
+    if let DeviceSpec::Name(s) = spec {
+        if s.starts_with('/') {
+            if let Ok(target) = std::fs::canonicalize(s) {
+                if let Some(idx) = target
+                    .to_string_lossy()
+                    .strip_prefix("/dev/video")
+                    .and_then(|n| n.parse::<u32>().ok())
                 {
+                    return Ok(idx);
+                }
+            }
+        }
+    }
+    resolve_in(&enumerate()?, spec)
+}
+
+/// Pick a device from `devices` per `spec`. An exact stable-id match wins;
+/// otherwise case-insensitive name substring, which must match exactly one
+/// device — a first-match-wins guess is how two identical dongles end up
+/// silently swapped.
+fn resolve_in(devices: &[DeviceInfo], spec: &DeviceSpec) -> Result<u32> {
+    if devices.is_empty() {
+        return Err(anyhow!("no capture devices found"));
+    }
+    match spec {
+        DeviceSpec::Index(i) => Ok(*i),
+        DeviceSpec::Name(s) => {
+            if let Some(d) = devices.iter().find(|d| !d.id.is_empty() && d.id == *s) {
+                return Ok(d.index);
+            }
+            let sub = s.to_lowercase();
+            let matches: Vec<&DeviceInfo> = devices
+                .iter()
+                .filter(|d| d.name.to_lowercase().contains(&sub))
+                .collect();
+            match matches.as_slice() {
+                [] => Err(anyhow!("no device matching name or id {:?}", s)),
+                [d] => Ok(d.index),
+                many => Err(anyhow!(
+                    "device {:?} is ambiguous ({} matches) — use a stable id:\n{}",
+                    s,
+                    many.len(),
+                    many.iter()
+                        .map(|d| format!("  {:>3}  {}  id={}", d.index, d.name, d.id))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )),
+            }
+        }
+        DeviceSpec::Auto => {
+            let external = devices.iter().find(|d| {
+                let n = d.name.to_lowercase();
+                !BUILTIN_HINTS.iter().any(|h| n.contains(h))
+            });
+            Ok(external.unwrap_or(&devices[0]).index)
+        }
+    }
+}
+
+pub fn open_backend(spec: &DeviceSpec) -> Result<Box<dyn CaptureBackend>> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::LinuxV4LBackend::open(spec).map(|b| Box::new(b) as Box<dyn CaptureBackend>)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        macos::NokhwaBackend::open(spec).map(|b| Box::new(b) as Box<dyn CaptureBackend>)
+    }
+}
+
+// ── Linux backend ─────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::io;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use anyhow::{anyhow, Context, Result};
+    use image::RgbImage;
+    use v4l::buffer::Type;
+    use v4l::device::Device;
+    use v4l::format::{Format, FourCC};
+    use v4l::io::mmap::Stream;
+    use v4l::io::traits::CaptureStream;
+    use v4l::video::Capture;
+
+    use super::{resolve, CaptureBackend, CapturedFrame, DeviceSpec};
+
+    const FORMATS: &[(u32, u32, &[u8; 4])] = &[
+        (1280, 720, b"MJPG"),
+        (1920, 1080, b"MJPG"),
+        (1280, 720, b"YUYV"),
+        (640, 480, b"YUYV"),
+    ];
+
+    const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+
+    pub struct LinuxV4LBackend {
+        stream: Stream<'static>,
+        dev: Box<Device>,
+        dims: (u32, u32),
+        is_mjpeg: bool,
+    }
+
+    impl LinuxV4LBackend {
+        pub fn open(spec: &DeviceSpec) -> Result<Self> {
+            let idx = resolve(spec)?;
+            let dev = Box::new(
+                Device::new(idx as usize).map_err(|e| anyhow!("open /dev/video{idx}: {e}"))?,
+            );
+
+            let mut last_err = anyhow!("no formats succeeded");
+            for &(w, h, fourcc) in FORMATS {
+                let fmt = Format::new(w, h, FourCC::new(fourcc));
+                if dev.set_format(&fmt).is_err() {
                     continue;
                 }
-                buf
-            };
-
-            let part_header = format!(
-                "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
-                jpeg_bytes.len()
-            );
-            let mut chunk = Vec::with_capacity(part_header.len() + jpeg_bytes.len() + 2);
-            chunk.extend_from_slice(part_header.as_bytes());
-            chunk.extend_from_slice(&jpeg_bytes);
-            chunk.extend_from_slice(b"\r\n");
-
-            yield Ok::<Bytes, std::io::Error>(Bytes::from(chunk));
+                let dev_ref: &'static Device = unsafe { &*(dev.as_ref() as *const Device) };
+                match Stream::with_buffers(dev_ref, Type::VideoCapture, 4) {
+                    Ok(mut stream) => {
+                        stream.set_timeout(FRAME_TIMEOUT);
+                        let actual_fmt = dev.format().unwrap_or(fmt);
+                        let is_mjpeg = actual_fmt.fourcc == FourCC::new(b"MJPG");
+                        tracing::info!(
+                            "capture opened {}x{} {:?}",
+                            actual_fmt.width,
+                            actual_fmt.height,
+                            if is_mjpeg { "MJPEG" } else { "YUYV" }
+                        );
+                        return Ok(LinuxV4LBackend {
+                            stream,
+                            dev,
+                            dims: (actual_fmt.width, actual_fmt.height),
+                            is_mjpeg,
+                        });
+                    }
+                    Err(e) => {
+                        last_err = anyhow!("stream init {w}x{h}: {e}");
+                    }
+                }
+            }
+            Err(last_err)
         }
-    };
-
-    Response::builder()
-        .header(
-            header::CONTENT_TYPE,
-            "multipart/x-mixed-replace;boundary=frame",
-        )
-        .body(Body::from_stream(stream))
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
-}
-
-/// OCR the current warm frame by shelling out to the `visionocr` tool (Apple
-/// Vision). The daemon doesn't link Vision itself — it pipes a PNG to whatever
-/// `PANIOLO_VISIONOCR` points at (paniolo sets this), falling back to PATH.
-async fn ocr(State(s): State<AppState>) -> Response {
-    let f = s.frames.borrow().clone();
-    if f.signal == Signal::NoDevice || f.width == 0 {
-        return (StatusCode::SERVICE_UNAVAILABLE, "no capture device").into_response();
-    }
-    let png = match encode_png(&f) {
-        Some(p) => p,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "png encode failed").into_response(),
-    };
-
-    let bin = std::env::var("PANIOLO_VISIONOCR").unwrap_or_else(|_| "visionocr".to_string());
-    let mut child = match tokio::process::Command::new(&bin)
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::NOT_IMPLEMENTED,
-                format!("visionocr unavailable ({bin}): {e}"),
-            )
-                .into_response()
-        }
-    };
-
-    // Write the PNG to stdin on a task while we collect stdout, so a large
-    // frame can't deadlock the pipe.
-    if let Some(mut stdin) = child.stdin.take() {
-        tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
-            let _ = stdin.write_all(&png).await;
-            // stdin dropped here -> EOF, so visionocr stops reading.
-        });
     }
 
-    match child.wait_with_output().await {
-        Ok(out) if out.status.success() => (
-            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            out.stdout,
-        )
-            .into_response(),
-        Ok(out) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("visionocr failed: {}", String::from_utf8_lossy(&out.stderr)),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("visionocr wait: {e}"),
-        )
-            .into_response(),
-    }
-}
+    impl CaptureBackend for LinuxV4LBackend {
+        fn frame(&mut self) -> Result<CapturedFrame> {
+            let (buf, _meta) = self.stream.next().map_err(|e| {
+                if e.kind() == io::ErrorKind::TimedOut {
+                    anyhow!("frame timeout (device stalled)")
+                } else {
+                    anyhow!("VIDIOC_DQBUF: {e}")
+                }
+            })?;
 
-/// Trigger a power cycle by calling `paniolo power-cycle <target>`.
-/// Requires PANIOLO_TARGET to be set in the daemon's environment (done by
-/// `paniolo video watch <target>`). Returns 501 if not configured.
-async fn power_cycle() -> Response {
-    let target = match std::env::var("PANIOLO_TARGET") {
-        Ok(t) if !t.is_empty() => t,
-        _ => {
-            return (
-                StatusCode::NOT_IMPLEMENTED,
-                "PANIOLO_TARGET not set — start the daemon with: paniolo video watch <target>",
-            )
-                .into_response()
-        }
-    };
-    let paniolo = std::env::var("PANIOLO_BIN").unwrap_or_else(|_| "paniolo".to_string());
-    match tokio::process::Command::new(&paniolo)
-        .args(["power-cycle", &target])
-        .status()
-        .await
-    {
-        Ok(s) if s.success() => (StatusCode::OK, "power cycle triggered").into_response(),
-        Ok(s) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("paniolo power-cycle exited with {s}"),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to run {paniolo}: {e}"),
-        )
-            .into_response(),
-    }
-}
+            if self.is_mjpeg {
+                // Keep a copy of the raw JPEG bytes for zero-cost preview serving.
+                let jpeg_bytes: Arc<[u8]> = Arc::from(buf.to_vec().into_boxed_slice());
 
-async fn devices() -> Response {
-    match crate::capture::enumerate() {
-        Ok(list) => Json(
-            list.into_iter()
-                .map(|d| {
-                    serde_json::json!({"index": d.index, "name": d.name, "misc": d.misc, "id": d.id})
+                // Decode with turbojpeg (libjpeg-turbo) for signal detection.
+                // ~5ms at 720p vs ~50ms with the pure-Rust image crate.
+                let rgb = turbojpeg::decompress_image::<image::Rgb<u8>>(buf)
+                    .context("turbojpeg MJPEG decode failed")?;
+                let (w, h) = (rgb.width(), rgb.height());
+                self.dims = (w, h);
+
+                Ok(CapturedFrame {
+                    jpeg: Some(jpeg_bytes),
+                    rgb,
                 })
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+            } else {
+                // YUYV: no raw JPEG, decode to RGB for signal detection and storage.
+                let fmt = self.dev.format().ok();
+                let (w, h) = fmt
+                    .as_ref()
+                    .map(|f| (f.width, f.height))
+                    .unwrap_or(self.dims);
+                self.dims = (w, h);
+                Ok(CapturedFrame {
+                    jpeg: None,
+                    rgb: yuyv_to_rgb(buf, w, h),
+                })
+            }
+        }
+    }
+
+    fn yuyv_to_rgb(buf: &[u8], w: u32, h: u32) -> RgbImage {
+        let mut rgb = RgbImage::new(w, h);
+        let pairs = (w * h / 2) as usize;
+        for i in 0..pairs {
+            let base = i * 4;
+            if base + 3 >= buf.len() {
+                break;
+            }
+            let y0 = buf[base] as f32;
+            let cb = buf[base + 1] as f32 - 128.0;
+            let y1 = buf[base + 2] as f32;
+            let cr = buf[base + 3] as f32 - 128.0;
+            let to_u8 = |v: f32| v.clamp(0.0, 255.0) as u8;
+            let r = |y: f32| to_u8(y + 1.402 * cr);
+            let g = |y: f32| to_u8(y - 0.344 * cb - 0.714 * cr);
+            let b = |y: f32| to_u8(y + 1.772 * cb);
+            let x0 = ((i * 2) % w as usize) as u32;
+            let y_row = ((i * 2) / w as usize) as u32;
+            if x0 < w && y_row < h {
+                rgb.put_pixel(x0, y_row, image::Rgb([r(y0), g(y0), b(y0)]));
+            }
+            if x0 + 1 < w && y_row < h {
+                rgb.put_pixel(x0 + 1, y_row, image::Rgb([r(y1), g(y1), b(y1)]));
+            }
+        }
+        rgb
     }
 }
 
-fn signal_name(s: Signal) -> &'static str {
-    match s {
-        Signal::Stable => "stable",
-        Signal::ModeSwitching => "mode_switching",
-        Signal::NoSignal => "no_signal",
-        Signal::NoDevice => "no_device",
+// ── macOS backend ─────────────────────────────────────────────────────────────
+
+#[cfg(not(target_os = "linux"))]
+mod macos {
+    use anyhow::{anyhow, Context, Result};
+    use nokhwa::pixel_format::RgbFormat;
+    use nokhwa::utils::{
+        CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution,
+    };
+    use nokhwa::Camera;
+
+    use super::{resolve, CaptureBackend, CapturedFrame, DeviceSpec};
+
+    pub struct NokhwaBackend {
+        cam: Camera,
+        dims: (u32, u32),
+    }
+
+    impl NokhwaBackend {
+        pub fn open(spec: &DeviceSpec) -> Result<Self> {
+            let idx = resolve(spec)?;
+            let format_types: &[RequestedFormatType] = &[
+                RequestedFormatType::Closest(CameraFormat::new(
+                    Resolution::new(1280, 720),
+                    FrameFormat::MJPEG,
+                    30,
+                )),
+                RequestedFormatType::Closest(CameraFormat::new(
+                    Resolution::new(1920, 1080),
+                    FrameFormat::MJPEG,
+                    30,
+                )),
+                RequestedFormatType::AbsoluteHighestResolution,
+            ];
+
+            let mut last_err: anyhow::Error = anyhow!("no formats to try");
+            for &fmt_type in format_types {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    try_open(idx, fmt_type)
+                }));
+                match result {
+                    Ok(Ok(backend)) => return Ok(backend),
+                    Ok(Err(e)) => {
+                        last_err = e;
+                    }
+                    Err(_) => {
+                        last_err = anyhow!("format {:?} not supported", fmt_type);
+                    }
+                }
+            }
+            Err(last_err)
+        }
+    }
+
+    fn try_open(idx: u32, fmt_type: RequestedFormatType) -> Result<NokhwaBackend> {
+        let requested = RequestedFormat::new::<RgbFormat>(fmt_type);
+        let mut cam = Camera::new(CameraIndex::Index(idx), requested)
+            .map_err(|e| anyhow!("failed to open capture device {idx}: {e}"))?;
+        cam.open_stream()
+            .map_err(|e| anyhow!("failed to open capture device {idx}: {e}"))?;
+        let res = cam.resolution();
+        Ok(NokhwaBackend {
+            cam,
+            dims: (res.width(), res.height()),
+        })
+    }
+
+    impl CaptureBackend for NokhwaBackend {
+        fn frame(&mut self) -> Result<CapturedFrame> {
+            let buf = self.cam.frame().context("frame grab failed")?;
+            let decoded = buf.decode_image::<RgbFormat>().context("decode failed")?;
+            self.dims = (decoded.width(), decoded.height());
+            Ok(CapturedFrame {
+                jpeg: None, // nokhwa gives decoded pixels, not raw JPEG
+                rgb: decoded,
+            })
+        }
     }
 }
 
-#[allow(unused_imports)]
-use watch as _watch;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dev(index: u32, name: &str, id: &str) -> DeviceInfo {
+        DeviceInfo {
+            index,
+            name: name.to_string(),
+            misc: String::new(),
+            id: id.to_string(),
+        }
+    }
+
+    fn two_dongles() -> Vec<DeviceInfo> {
+        vec![
+            dev(0, "USB Video", "0x8300000534d2109"),
+            dev(1, "USB Video", "0x8200000534d2109"),
+            dev(2, "FaceTime HD Camera", "0x1421000005ac8514"),
+        ]
+    }
+
+    #[test]
+    fn exact_id_match_wins() {
+        let devices = two_dongles();
+        let spec = DeviceSpec::parse("0x8200000534d2109");
+        assert_eq!(resolve_in(&devices, &spec).unwrap(), 1);
+    }
+
+    #[test]
+    fn unique_name_substring_matches() {
+        let devices = two_dongles();
+        let spec = DeviceSpec::parse("facetime");
+        assert_eq!(resolve_in(&devices, &spec).unwrap(), 2);
+    }
+
+    #[test]
+    fn ambiguous_name_is_an_error_listing_ids() {
+        let devices = two_dongles();
+        let spec = DeviceSpec::parse("USB Video");
+        let err = resolve_in(&devices, &spec).unwrap_err().to_string();
+        assert!(err.contains("ambiguous"), "{err}");
+        assert!(err.contains("0x8300000534d2109"), "{err}");
+        assert!(err.contains("0x8200000534d2109"), "{err}");
+    }
+
+    #[test]
+    fn no_match_is_an_error() {
+        let devices = two_dongles();
+        let spec = DeviceSpec::parse("Elgato");
+        assert!(resolve_in(&devices, &spec).is_err());
+    }
+
+    #[test]
+    fn auto_prefers_external_over_builtin() {
+        let devices = vec![
+            dev(0, "FaceTime HD Camera", "0x1421000005ac8514"),
+            dev(1, "USB Video", "0x8300000534d2109"),
+        ];
+        assert_eq!(resolve_in(&devices, &DeviceSpec::Auto).unwrap(), 1);
+    }
+
+    #[test]
+    fn empty_id_never_matches_empty_spec_id() {
+        // A device with no stable id must not be selected by id equality.
+        let devices = vec![dev(0, "USB Video", "")];
+        let spec = DeviceSpec::Name(String::new());
+        // Empty string parses to Auto via parse(); construct Name directly to
+        // prove the id-equality guard, then expect substring match (matches).
+        assert_eq!(resolve_in(&devices, &spec).unwrap(), 0);
+    }
+}
 ````
 
 ## File: serialcap/src/serial_io.rs
@@ -23435,10 +23128,10 @@ power_sense_signal = "cts"       # optional; cts|dsr|dcd|ri — modem-control in
 | Target / video / HID configs | `~/.config/paniolo/{targets/<name>.toml, video.toml, hid.toml}` |
 | Netboot state (pids, uptime) | `~/.local/share/paniolo/<name>/netboot.json` |
 | Netboot combined log | `~/.local/share/paniolo/<name>/netboot.log` |
-| hdmicap discovery / lock | `$XDG_RUNTIME_DIR/hdmicap/{daemon.json, daemon.lock}` (macOS: `$TMPDIR`) |
-| serialcap discovery / lock | `$XDG_RUNTIME_DIR/serialcap/{daemon.json, daemon.lock}` (macOS: `$TMPDIR`) |
-| serialcap capture log (per interface) | `$XDG_RUNTIME_DIR/serialcap/capture/<name>/serial.jsonl(.1..)` |
-| serialcap pending (unterminated) line | `$XDG_RUNTIME_DIR/serialcap/capture/<name>/pending.json` |
+| hdmicap discovery / lock | `/tmp/paniolo-<uid>/hdmicap/{daemon.json, daemon.lock}` |
+| serialcap discovery / lock | `/tmp/paniolo-<uid>/serialcap/{daemon.json, daemon.lock}` |
+| serialcap capture log (per interface) | `/tmp/paniolo-<uid>/serialcap/capture/<name>/serial.jsonl(.1..)` |
+| serialcap pending (unterminated) line | `/tmp/paniolo-<uid>/serialcap/capture/<name>/pending.json` |
 
 ## 5. Subsystems
 
@@ -23598,6 +23291,417 @@ driver/protocol abstraction), labgrid's design independently *validates* the dir
 paniolo's CI-integration work. For a multi-board, multi-user farm, labgrid is the right tool;
 paniolo targets the single-target bring-up loop it under-serves. Full comparison:
 [`ci-integration/related-work.md`](ci-integration/related-work.md).
+````
+
+## File: hdmicap/src/server.rs
+````rust
+// Copyright 2026 Curtis Galloway
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Localhost HTTP API. Handlers never touch the device — they only read the
+//! latest FrameState from their `watch::Receiver`. PNG encoding is lazy, here.
+
+use std::io::Cursor;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+
+use axum::{
+    body::Body,
+    extract::{Query, State},
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use bytes::Bytes;
+use image::codecs::jpeg::JpegEncoder;
+use image::{ImageBuffer, ImageEncoder, Rgb};
+use serde::Deserialize;
+use tokio::sync::watch;
+
+use crate::capture_thread::FrameRx;
+use crate::frame::{FrameState, Signal, StatusDto};
+
+#[derive(Clone)]
+pub struct AppState {
+    pub frames: FrameRx,
+}
+
+pub fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/", get(index))
+        .route("/status", get(status))
+        .route("/snapshot", get(snapshot))
+        .route("/preview", get(preview))
+        .route("/ocr", get(ocr))
+        .route("/power-cycle", post(power_cycle))
+        .route("/devices", get(devices))
+        // Vendored xterm.js assets for the serial terminal pane.
+        .route("/xterm.js", get(xterm_js))
+        .route("/xterm.css", get(xterm_css))
+        .route("/xterm-addon-fit.js", get(xterm_fit_js))
+        .with_state(state)
+}
+
+async fn index() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("../assets/index.html"),
+    )
+}
+
+async fn xterm_js() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("../assets/xterm.js"),
+    )
+}
+
+async fn xterm_css() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../assets/xterm.css"),
+    )
+}
+
+async fn xterm_fit_js() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("../assets/xterm-addon-fit.js"),
+    )
+}
+
+async fn status(State(s): State<AppState>) -> Json<StatusDto> {
+    let f = s.frames.borrow().clone();
+    Json(StatusDto::from(f.as_ref()))
+}
+
+#[derive(Deserialize)]
+struct SnapReq {
+    /// "stable" -> wait until signal == Stable.
+    wait: Option<String>,
+    /// Hex hash from a prior /status; wait until the published hash differs.
+    changed_since: Option<String>,
+    /// Milliseconds; default applied below.
+    timeout: Option<u64>,
+}
+
+const DEFAULT_TIMEOUT_MS: u64 = 2000;
+
+async fn snapshot(State(s): State<AppState>, Query(q): Query<SnapReq>) -> Response {
+    let mut rx = s.frames.clone();
+    let timeout_ms = q.timeout.unwrap_or(DEFAULT_TIMEOUT_MS);
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms).min(Duration::from_secs(60));
+    let want_stable = q.wait.as_deref() == Some("stable");
+    let changed_since = q
+        .changed_since
+        .as_ref()
+        .and_then(|h| u64::from_str_radix(h, 16).ok());
+
+    loop {
+        let ready = {
+            let f = rx.borrow_and_update();
+            match (want_stable, changed_since) {
+                (true, _) => f.signal == Signal::Stable,
+                (_, Some(h)) => f.hash != h,
+                _ => true,
+            }
+        };
+
+        if ready {
+            let f = rx.borrow().clone();
+            return png_response(&f, false);
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let f = rx.borrow().clone();
+            return png_response(&f, true);
+        }
+        if tokio::time::timeout(remaining, rx.changed()).await.is_err() {
+            let f = rx.borrow().clone();
+            return png_response(&f, true);
+        }
+    }
+}
+
+/// Decode the frame to an RGB image. On the Linux MJPEG path `rgb` is empty
+/// and we decode `jpeg` with turbojpeg. On other paths `rgb` is pre-decoded.
+fn decode_rgb(f: &FrameState) -> Option<ImageBuffer<Rgb<u8>, Vec<u8>>> {
+    if !f.rgb.is_empty() {
+        return ImageBuffer::from_raw(f.width, f.height, f.rgb.to_vec());
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(ref jpeg) = f.jpeg {
+        return turbojpeg::decompress_image::<Rgb<u8>>(jpeg).ok();
+    }
+    None
+}
+
+/// Encode the frame to PNG bytes. Shared by /snapshot and /ocr.
+fn encode_png(f: &FrameState) -> Option<Vec<u8>> {
+    let img = decode_rgb(f)?;
+    let mut bytes = Vec::new();
+    img.write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
+        .ok()?;
+    Some(bytes)
+}
+
+/// Lazily encode the current RGB buffer to PNG. PNG for agent snapshots: text
+/// edges matter for OCR and the dongle already adds MJPEG artifacts.
+fn png_response(f: &FrameState, timed_out: bool) -> Response {
+    if f.signal == Signal::NoDevice || f.width == 0 {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::HeaderName::from_static("x-signal"), "no_device")],
+            "no capture device",
+        )
+            .into_response();
+    }
+
+    let bytes = match encode_png(f) {
+        Some(b) => b,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "frame buffer size mismatch",
+            )
+                .into_response()
+        }
+    };
+
+    let signal_str = signal_name(f.signal);
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "image/png".to_string()),
+            (
+                header::HeaderName::from_static("x-signal"),
+                signal_str.to_string(),
+            ),
+            (
+                header::HeaderName::from_static("x-resolution-epoch"),
+                f.resolution_epoch.to_string(),
+            ),
+            (
+                header::HeaderName::from_static("x-frame-hash"),
+                format!("{:016x}", f.hash),
+            ),
+            (
+                header::HeaderName::from_static("x-timeout"),
+                (timed_out as u8).to_string(),
+            ),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+/// multipart/x-mixed-replace MJPEG stream for the human browser preview.
+/// Reads the same warm buffer as /snapshot — zero device contention.
+/// When raw JPEG bytes are available (Linux MJPEG path), they are served
+/// directly with zero server-side decode or re-encode. Otherwise we re-encode
+/// from the decoded RGB buffer at quality 80.
+async fn preview(State(s): State<AppState>) -> Response {
+    let mut frames = s.frames.clone();
+
+    let stream = async_stream::stream! {
+        let mut interval = tokio::time::interval(Duration::from_millis(67));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            let f = frames.borrow_and_update().clone();
+
+            if f.signal == Signal::NoDevice || f.width == 0 {
+                continue;
+            }
+
+            // Fast path: raw JPEG bytes from the device — no decode/re-encode.
+            let jpeg_bytes: Vec<u8> = if let Some(ref raw) = f.jpeg {
+                raw.to_vec()
+            } else {
+                // Fallback: re-encode from decoded RGB (macOS / YUYV path).
+                let img: ImageBuffer<Rgb<u8>, _> =
+                    match ImageBuffer::from_raw(f.width, f.height, f.rgb.to_vec()) {
+                        Some(i) => i,
+                        None => continue,
+                    };
+                let mut buf = Vec::new();
+                let encoder = JpegEncoder::new_with_quality(Cursor::new(&mut buf), 80);
+                if encoder
+                    .write_image(
+                        img.as_raw(),
+                        img.width(),
+                        img.height(),
+                        image::ExtendedColorType::Rgb8,
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+                buf
+            };
+
+            let part_header = format!(
+                "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+                jpeg_bytes.len()
+            );
+            let mut chunk = Vec::with_capacity(part_header.len() + jpeg_bytes.len() + 2);
+            chunk.extend_from_slice(part_header.as_bytes());
+            chunk.extend_from_slice(&jpeg_bytes);
+            chunk.extend_from_slice(b"\r\n");
+
+            yield Ok::<Bytes, std::io::Error>(Bytes::from(chunk));
+        }
+    };
+
+    Response::builder()
+        .header(
+            header::CONTENT_TYPE,
+            "multipart/x-mixed-replace;boundary=frame",
+        )
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// OCR the current warm frame by shelling out to the `visionocr` tool (Apple
+/// Vision). The daemon doesn't link Vision itself — it pipes a PNG to whatever
+/// `PANIOLO_VISIONOCR` points at (paniolo sets this), falling back to PATH.
+async fn ocr(State(s): State<AppState>) -> Response {
+    let f = s.frames.borrow().clone();
+    if f.signal == Signal::NoDevice || f.width == 0 {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no capture device").into_response();
+    }
+    let png = match encode_png(&f) {
+        Some(p) => p,
+        None => return (StatusCode::INTERNAL_SERVER_ERROR, "png encode failed").into_response(),
+    };
+
+    let bin = std::env::var("PANIOLO_VISIONOCR").unwrap_or_else(|_| "visionocr".to_string());
+    let mut child = match tokio::process::Command::new(&bin)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                format!("visionocr unavailable ({bin}): {e}"),
+            )
+                .into_response()
+        }
+    };
+
+    // Write the PNG to stdin on a task while we collect stdout, so a large
+    // frame can't deadlock the pipe.
+    if let Some(mut stdin) = child.stdin.take() {
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(&png).await;
+            // stdin dropped here -> EOF, so visionocr stops reading.
+        });
+    }
+
+    match child.wait_with_output().await {
+        Ok(out) if out.status.success() => (
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            out.stdout,
+        )
+            .into_response(),
+        Ok(out) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("visionocr failed: {}", String::from_utf8_lossy(&out.stderr)),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("visionocr wait: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Trigger a power cycle by calling `paniolo power-cycle <target>`.
+/// Requires PANIOLO_TARGET to be set in the daemon's environment (done by
+/// `paniolo video watch <target>`). Returns 501 if not configured.
+async fn power_cycle() -> Response {
+    let target = match std::env::var("PANIOLO_TARGET") {
+        Ok(t) if !t.is_empty() => t,
+        _ => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                "PANIOLO_TARGET not set — start the daemon with: paniolo video watch <target>",
+            )
+                .into_response()
+        }
+    };
+    let paniolo = std::env::var("PANIOLO_BIN").unwrap_or_else(|_| "paniolo".to_string());
+    match tokio::process::Command::new(&paniolo)
+        .args(["power-cycle", &target])
+        .status()
+        .await
+    {
+        Ok(s) if s.success() => (StatusCode::OK, "power cycle triggered").into_response(),
+        Ok(s) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("paniolo power-cycle exited with {s}"),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to run {paniolo}: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn devices() -> Response {
+    match crate::capture::enumerate() {
+        Ok(list) => Json(
+            list.into_iter()
+                .map(|d| {
+                    serde_json::json!({"index": d.index, "name": d.name, "misc": d.misc, "id": d.id})
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    }
+}
+
+fn signal_name(s: Signal) -> &'static str {
+    match s {
+        Signal::Stable => "stable",
+        Signal::ModeSwitching => "mode_switching",
+        Signal::NoSignal => "no_signal",
+        Signal::NoDevice => "no_device",
+    }
+}
+
+#[allow(unused_imports)]
+use watch as _watch;
 ````
 
 ## File: src/paniolo/_state.py
@@ -24808,6 +24912,161 @@ change a subsystem, update its guide here and the [architecture overview](archit
 you change requirements/scope, update the [tracker](requirements.md).*
 ````
 
+## File: README.md
+````markdown
+# paniolo
+
+Agent-controlled target machine wrangler for low-level software development.
+
+"Paniolo" is the Hawaiian word for cowboy. The idea: an AI agent sits at the
+reins while you're writing bootloaders, firmware, or OS bring-up code — paniolo
+gives it the controls to netboot the target, watch its output, send it input,
+and power-cycle it without human intervention at each iteration.
+
+---
+
+## Capabilities
+
+| Subsystem | Commands | What it does |
+|---|---|---|
+| [Netboot](docs/netboot.md) | `paniolo netboot` | DHCP + TFTP netboot over a direct USB-Ethernet link |
+| [Remote labs](docs/distributed-control.md) | `paniolo --lab …` | Drive targets on remote control hosts transparently over SSH; one git-tracked lab file |
+| [Link mode](docs/netif.md) | `paniolo netif` | Atomically switch the link between netboot and ffx-over-IPv6 modes |
+| [Video](docs/video.md) | `paniolo video` | HDMI capture via warm-stream daemon; on-device OCR |
+| [Serial](docs/serial.md) | `paniolo serial` | Serial console — interactive (tio) or daemon-backed with timestamped rolling log |
+| [Power control](docs/power.md) | `paniolo serial dtr/reset`, `paniolo power-cycle`, `paniolo power-state` | DTR-based hardware power button (J2 header) and script-based power cycling |
+| [HID injection](docs/hid.md) | `paniolo hid` | USB keyboard/mouse injection via a two-board KB2040 rig |
+| [Dashboard](docs/dashboard.md) | `paniolo console` | Combined video + serial web UI; auto-starts daemons; `-i <name>` preselects a serial interface |
+
+---
+
+## Documentation
+
+Full docs live in [`docs/`](docs/README.md). Start with the
+[**architecture overview**](docs/architecture.md) for the whole-system design, then the
+per-subsystem guides linked above. Hardware-CI integration (KernelCI/LAVA, Fuchsia/botanist)
+design and the project requirements tracker are under [`docs/`](docs/README.md) as well.
+
+---
+
+## Requirements
+
+- macOS 10.14 (Mojave) or later, or Linux (x86-64 / arm64)
+- Python 3.11+
+- [uv](https://docs.astral.sh/uv/) (`brew install uv` on macOS, or the [uv installer](https://docs.astral.sh/uv/getting-started/installation/) on Linux)
+- [Homebrew](https://brew.sh) (macOS only — Linux uses the system package manager)
+- Rust toolchain (for hdmicap, serialcap — `brew install rustup` on macOS, or `rustup.rs` on Linux)
+
+---
+
+## Installation
+
+```bash
+git clone https://github.com/curtisgalloway/paniolo ~/src/paniolo
+cd ~/src/paniolo
+make install           # Python CLI + Rust daemons + OCR helper, in one step
+```
+
+`make install` runs `uv tool install --reinstall .` for the Python CLI, then
+`paniolo setup`, which compiles and installs the Rust daemons (`hdmicap`,
+`serialcap`, `netbootd`) and the OCR helper (`visionocr` on macOS via `swiftc`,
+`linuxocr` on Linux) into `~/.cargo/bin`. Netboot is served by the
+single-binary `netbootd` (Rust) engine. (On macOS, `setup` also installs
+`netbootd-bpf-helper` setuid-root — one sudo — for the `netbootd` raw-frame
+send path.)
+
+> **Rust control plane:** the CLI itself is being rewritten in Rust (the
+> `cli/` crate; see [docs/config-redesign.md](docs/config-redesign.md)).
+> `paniolo setup` from the Rust CLI installs the daemons *and* the Rust
+> `paniolo` binary into `~/.cargo/bin` — a single static binary per control
+> host, no Python environment needed. Configuration moves to one CLI-managed
+> lab file (`~/.config/paniolo/lab.toml`).
+
+To pick up code changes after pulling or editing, just re-run it:
+
+```bash
+make install           # rebuilds and reinstalls everything (idempotent)
+```
+
+Or target one layer while iterating: `make python` (CLI only), `make rust`
+(the Rust crates only, skipping OCR/setuid), `make native` (`paniolo setup`
+only). `make help` lists every target. The underlying commands still work
+directly if you prefer:
+
+```bash
+uv tool install --reinstall ~/src/paniolo
+cargo install --path ~/src/paniolo/hdmicap    # if hdmicap changed
+cargo install --path ~/src/paniolo/serialcap  # if serialcap changed
+cargo install --path ~/src/paniolo/netbootd   # if netbootd changed (re-run `paniolo setup` to re-setuid the helper on macOS)
+```
+
+For the USB HID commands, install the optional `pyserial` extra:
+
+```bash
+uv tool install --with pyserial ~/src/paniolo
+```
+
+---
+
+## Remote control pattern
+
+The intended use is an AI agent or script on a dev machine SSHing into the
+control Mac to drive the target:
+
+```bash
+# Configure target once
+ssh control-mac "paniolo target add target-machine"
+ssh control-mac "paniolo netboot set -t target-machine --interface en3 --tftp-root ~/pxe"
+ssh control-mac "paniolo power set -t target-machine --cycle-cmd /path/to/power-cycle.sh"
+
+# Deploy a new kernel and boot
+TFTP_ROOT=$(ssh control-mac "paniolo netboot tftp-root target-machine")
+scp out/kernel.img control-mac:"${TFTP_ROOT}/kernel_2712.img"
+ssh control-mac "paniolo netboot start target-machine"
+ssh control-mac "paniolo netboot logs -f target-machine"
+
+# Interact with the console
+ssh control-mac "paniolo serial log -i console --since --tail 50 target-machine"
+
+# Power cycle and repeat
+ssh control-mac "paniolo power-cycle target-machine"
+```
+
+---
+
+## Concepts
+
+### Target
+
+A *target* is a named machine you want to control. Configuration lives in a
+single CLI-managed **lab file** (`~/.config/paniolo/lab.toml`, or `--lab` /
+`PANIOLO_LAB`): hosts plus targets, each target's hardware described as
+*channels* (`netboot`, `serial`, `power`, `video`) bound to the host they're
+physically attached to. No daemon required. If exactly one target is
+configured it is the default and can be omitted from every command.
+
+See [docs/config-redesign.md](docs/config-redesign.md) for the model and
+[Target configuration](docs/netboot.md#target-configuration) for the fields.
+
+### Runtime paths
+
+| Purpose | Path |
+|---|---|
+| Target configs | `~/.config/paniolo/targets/<name>.toml` |
+| Video config | `~/.config/paniolo/video.toml` |
+| HID config | `~/.config/paniolo/hid.toml` |
+| Netboot daemon state | `~/.local/share/paniolo/<name>/netboot.json` |
+| hdmicap discovery | `/tmp/paniolo-<uid>/hdmicap/daemon.json` |
+| serialcap discovery | `/tmp/paniolo-<uid>/serialcap/daemon.json` |
+| Serial capture logs | `/tmp/paniolo-<uid>/serialcap/capture/<name>/serial.jsonl` |
+
+---
+
+## License
+
+Apache 2.0 — see [LICENSE](LICENSE).
+````
+
 ## File: skills/paniolo/SKILL.md
 ````markdown
 ---
@@ -25106,161 +25365,6 @@ daemons there over an ssh PTY.)
 ---
 
 Licensed under the Apache License, Version 2.0.
-````
-
-## File: README.md
-````markdown
-# paniolo
-
-Agent-controlled target machine wrangler for low-level software development.
-
-"Paniolo" is the Hawaiian word for cowboy. The idea: an AI agent sits at the
-reins while you're writing bootloaders, firmware, or OS bring-up code — paniolo
-gives it the controls to netboot the target, watch its output, send it input,
-and power-cycle it without human intervention at each iteration.
-
----
-
-## Capabilities
-
-| Subsystem | Commands | What it does |
-|---|---|---|
-| [Netboot](docs/netboot.md) | `paniolo netboot` | DHCP + TFTP netboot over a direct USB-Ethernet link |
-| [Remote labs](docs/distributed-control.md) | `paniolo --lab …` | Drive targets on remote control hosts transparently over SSH; one git-tracked lab file |
-| [Link mode](docs/netif.md) | `paniolo netif` | Atomically switch the link between netboot and ffx-over-IPv6 modes |
-| [Video](docs/video.md) | `paniolo video` | HDMI capture via warm-stream daemon; on-device OCR |
-| [Serial](docs/serial.md) | `paniolo serial` | Serial console — interactive (tio) or daemon-backed with timestamped rolling log |
-| [Power control](docs/power.md) | `paniolo serial dtr/reset`, `paniolo power-cycle`, `paniolo power-state` | DTR-based hardware power button (J2 header) and script-based power cycling |
-| [HID injection](docs/hid.md) | `paniolo hid` | USB keyboard/mouse injection via a two-board KB2040 rig |
-| [Dashboard](docs/dashboard.md) | `paniolo console` | Combined video + serial web UI; auto-starts daemons; `-i <name>` preselects a serial interface |
-
----
-
-## Documentation
-
-Full docs live in [`docs/`](docs/README.md). Start with the
-[**architecture overview**](docs/architecture.md) for the whole-system design, then the
-per-subsystem guides linked above. Hardware-CI integration (KernelCI/LAVA, Fuchsia/botanist)
-design and the project requirements tracker are under [`docs/`](docs/README.md) as well.
-
----
-
-## Requirements
-
-- macOS 10.14 (Mojave) or later, or Linux (x86-64 / arm64)
-- Python 3.11+
-- [uv](https://docs.astral.sh/uv/) (`brew install uv` on macOS, or the [uv installer](https://docs.astral.sh/uv/getting-started/installation/) on Linux)
-- [Homebrew](https://brew.sh) (macOS only — Linux uses the system package manager)
-- Rust toolchain (for hdmicap, serialcap — `brew install rustup` on macOS, or `rustup.rs` on Linux)
-
----
-
-## Installation
-
-```bash
-git clone https://github.com/curtisgalloway/paniolo ~/src/paniolo
-cd ~/src/paniolo
-make install           # Python CLI + Rust daemons + OCR helper, in one step
-```
-
-`make install` runs `uv tool install --reinstall .` for the Python CLI, then
-`paniolo setup`, which compiles and installs the Rust daemons (`hdmicap`,
-`serialcap`, `netbootd`) and the OCR helper (`visionocr` on macOS via `swiftc`,
-`linuxocr` on Linux) into `~/.cargo/bin`. Netboot is served by the
-single-binary `netbootd` (Rust) engine. (On macOS, `setup` also installs
-`netbootd-bpf-helper` setuid-root — one sudo — for the `netbootd` raw-frame
-send path.)
-
-> **Rust control plane:** the CLI itself is being rewritten in Rust (the
-> `cli/` crate; see [docs/config-redesign.md](docs/config-redesign.md)).
-> `paniolo setup` from the Rust CLI installs the daemons *and* the Rust
-> `paniolo` binary into `~/.cargo/bin` — a single static binary per control
-> host, no Python environment needed. Configuration moves to one CLI-managed
-> lab file (`~/.config/paniolo/lab.toml`).
-
-To pick up code changes after pulling or editing, just re-run it:
-
-```bash
-make install           # rebuilds and reinstalls everything (idempotent)
-```
-
-Or target one layer while iterating: `make python` (CLI only), `make rust`
-(the Rust crates only, skipping OCR/setuid), `make native` (`paniolo setup`
-only). `make help` lists every target. The underlying commands still work
-directly if you prefer:
-
-```bash
-uv tool install --reinstall ~/src/paniolo
-cargo install --path ~/src/paniolo/hdmicap    # if hdmicap changed
-cargo install --path ~/src/paniolo/serialcap  # if serialcap changed
-cargo install --path ~/src/paniolo/netbootd   # if netbootd changed (re-run `paniolo setup` to re-setuid the helper on macOS)
-```
-
-For the USB HID commands, install the optional `pyserial` extra:
-
-```bash
-uv tool install --with pyserial ~/src/paniolo
-```
-
----
-
-## Remote control pattern
-
-The intended use is an AI agent or script on a dev machine SSHing into the
-control Mac to drive the target:
-
-```bash
-# Configure target once
-ssh control-mac "paniolo target add target-machine"
-ssh control-mac "paniolo netboot set -t target-machine --interface en3 --tftp-root ~/pxe"
-ssh control-mac "paniolo power set -t target-machine --cycle-cmd /path/to/power-cycle.sh"
-
-# Deploy a new kernel and boot
-TFTP_ROOT=$(ssh control-mac "paniolo netboot tftp-root target-machine")
-scp out/kernel.img control-mac:"${TFTP_ROOT}/kernel_2712.img"
-ssh control-mac "paniolo netboot start target-machine"
-ssh control-mac "paniolo netboot logs -f target-machine"
-
-# Interact with the console
-ssh control-mac "paniolo serial log -i console --since --tail 50 target-machine"
-
-# Power cycle and repeat
-ssh control-mac "paniolo power-cycle target-machine"
-```
-
----
-
-## Concepts
-
-### Target
-
-A *target* is a named machine you want to control. Configuration lives in a
-single CLI-managed **lab file** (`~/.config/paniolo/lab.toml`, or `--lab` /
-`PANIOLO_LAB`): hosts plus targets, each target's hardware described as
-*channels* (`netboot`, `serial`, `power`, `video`) bound to the host they're
-physically attached to. No daemon required. If exactly one target is
-configured it is the default and can be omitted from every command.
-
-See [docs/config-redesign.md](docs/config-redesign.md) for the model and
-[Target configuration](docs/netboot.md#target-configuration) for the fields.
-
-### Runtime paths
-
-| Purpose | Path |
-|---|---|
-| Target configs | `~/.config/paniolo/targets/<name>.toml` |
-| Video config | `~/.config/paniolo/video.toml` |
-| HID config | `~/.config/paniolo/hid.toml` |
-| Netboot daemon state | `~/.local/share/paniolo/<name>/netboot.json` |
-| hdmicap discovery | `$XDG_RUNTIME_DIR/hdmicap/daemon.json` (Linux) / `$TMPDIR/hdmicap/daemon.json` (macOS) |
-| serialcap discovery | `$XDG_RUNTIME_DIR/serialcap/daemon.json` (Linux) / `$TMPDIR/serialcap/daemon.json` (macOS) |
-| Serial capture logs | `$XDG_RUNTIME_DIR/serialcap/capture/<name>/serial.jsonl` (Linux) |
-
----
-
-## License
-
-Apache 2.0 — see [LICENSE](LICENSE).
 ````
 
 ## File: cli/src/main.rs
@@ -26507,8 +26611,9 @@ fn cmd_console(
                 .ok_or_else(|| anyhow!("video channel for '{target}' has no device set"))?;
             eprintln!("Starting video daemon…");
             video::start_daemon(&device, 0, Some(&target))?;
-            daemons::wait_for_daemon(video::DAEMON, std::time::Duration::from_secs(5))
-                .ok_or_else(|| anyhow!("video daemon did not start within 5 s"))?
+            daemons::wait_for_daemon(video::DAEMON, std::time::Duration::from_secs(5)).ok_or_else(
+                || daemons::start_failure(video::DAEMON, std::time::Duration::from_secs(5)),
+            )?
         }
     };
     if serial::daemon_url().is_none() {
@@ -26518,8 +26623,9 @@ fn cmd_console(
         }
         eprintln!("Starting serial daemon…");
         serial::start_daemon(&serials, 0)?;
-        daemons::wait_for_daemon(serial::DAEMON, std::time::Duration::from_secs(5))
-            .ok_or_else(|| anyhow!("serial daemon did not start within 5 s"))?;
+        daemons::wait_for_daemon(serial::DAEMON, std::time::Duration::from_secs(5)).ok_or_else(
+            || daemons::start_failure(serial::DAEMON, std::time::Duration::from_secs(5)),
+        )?;
     }
     let url = dashboard_url(&video_url, None, interface);
     open_in_browser(&url);
@@ -26750,7 +26856,10 @@ fn cmd_serial_watch(lab_flag: Option<&str>, target: Option<&str>, port: u16) -> 
             println!("Serial daemon started. {url}");
             Ok(())
         }
-        None => bail!("serial daemon did not start within 5 s"),
+        None => Err(daemons::start_failure(
+            serial::DAEMON,
+            std::time::Duration::from_secs(5),
+        )),
     }
 }
 
@@ -26947,7 +27056,10 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
                     println!("Video daemon started. Preview at {url}");
                     Ok(())
                 }
-                None => bail!("video daemon did not start within 5 s"),
+                None => Err(daemons::start_failure(
+                    video::DAEMON,
+                    std::time::Duration::from_secs(5),
+                )),
             }
         }
         VideoCmd::Stop => {
@@ -30497,7 +30609,7 @@ setup` installs it (`cargo install`).
 `guess_capture_device(devices)` returns the single non-built-in device (filters
 out FaceTime, iSight, iPhone, iPad), or None if ambiguous.
 
-`daemon_url()` reads hdmicap's discovery file (`$TMPDIR/hdmicap/daemon.json`),
+`daemon_url()` reads hdmicap's discovery file (`/tmp/paniolo-<uid>/hdmicap/daemon.json`),
 verifies the PID is alive, and returns `http://127.0.0.1:<port>` or None.
 
 `start_daemon(cfg, port)` spawns `hdmicap daemon --device <name> --port <port>`
@@ -30719,12 +30831,14 @@ native side. Re-run it after editing anything. Narrower targets: `make python`,
 | Video config | `~/.config/paniolo/video.toml` |
 | Netboot daemon state | `~/.local/share/paniolo/<name>/netboot.json` |
 | Combined netboot log | `~/.local/share/paniolo/<name>/netboot.log` |
-| hdmicap discovery file | `$XDG_RUNTIME_DIR/hdmicap/daemon.json` (`{pid, port}`) — falls back to `$TMPDIR` |
-| hdmicap advisory lock | `$XDG_RUNTIME_DIR/hdmicap/daemon.lock` |
-| serialcap discovery file | `$XDG_RUNTIME_DIR/serialcap/daemon.json` (`{pid, port, interfaces:[{name, device, baud}]}`) — falls back to `$TMPDIR` |
-| serialcap advisory lock | `$XDG_RUNTIME_DIR/serialcap/daemon.lock` |
-| serialcap capture log | `$XDG_RUNTIME_DIR/serialcap/capture/<name>/serial.jsonl(.1..)` (rotated JSONL, per interface) |
-| serialcap pending line | `$XDG_RUNTIME_DIR/serialcap/capture/<name>/pending.json` (current unterminated line) |
+| hdmicap discovery file | `/tmp/paniolo-<uid>/hdmicap/daemon.json` (`{pid, port}`) |
+| hdmicap advisory lock | `/tmp/paniolo-<uid>/hdmicap/daemon.lock` |
+| hdmicap stderr log | `/tmp/paniolo-<uid>/hdmicap/daemon.log` (truncated on each CLI-spawned start) |
+| serialcap discovery file | `/tmp/paniolo-<uid>/serialcap/daemon.json` (`{pid, port, interfaces:[{name, device, baud}]}`) |
+| serialcap advisory lock | `/tmp/paniolo-<uid>/serialcap/daemon.lock` |
+| serialcap stderr log | `/tmp/paniolo-<uid>/serialcap/daemon.log` (truncated on each CLI-spawned start) |
+| serialcap capture log | `/tmp/paniolo-<uid>/serialcap/capture/<name>/serial.jsonl(.1..)` (rotated JSONL, per interface) |
+| serialcap pending line | `/tmp/paniolo-<uid>/serialcap/capture/<name>/pending.json` (current unterminated line) |
 
 ## Source code constraints
 
@@ -30822,6 +30936,14 @@ Paniolo runs on Linux as well as macOS. Platform differences:
   standard MJPEG/YUYV formats through nokhwa's filtered list and throws
   NSException from AVFoundation frame-duration KVC calls. The vendor patch in
   `hdmicap/vendor/nokhwa-bindings-macos/` fixes this.
+- **One daemon instance per user per host.** Discovery, lock, and stderr log
+  live in `/tmp/paniolo-<uid>/<daemon>/` — deliberately env-independent (NOT
+  `$TMPDIR`, which macOS varies per environment so a running daemon was
+  invisible from other shells; NOT `$XDG_RUNTIME_DIR`, which systemd deletes
+  when the user's last session ends, breaking daemons that outlive their SSH
+  session). Corollary: one hdmicap (= one capture device) per user per host —
+  two video targets on one control host would need per-target daemon dirs,
+  which don't exist yet.
 - **Daemon shutdown hard-exits.** Both hdmicap (`/preview` MJPEG) and serialcap
   (`/stream` WebSocket) serve infinite responses, so a plain axum graceful
   shutdown would block on them forever. On SIGTERM each daemon removes its

@@ -1240,8 +1240,9 @@ fn cmd_console(
                 .ok_or_else(|| anyhow!("video channel for '{target}' has no device set"))?;
             eprintln!("Starting video daemon…");
             video::start_daemon(&device, 0, Some(&target))?;
-            daemons::wait_for_daemon(video::DAEMON, std::time::Duration::from_secs(5))
-                .ok_or_else(|| anyhow!("video daemon did not start within 5 s"))?
+            daemons::wait_for_daemon(video::DAEMON, std::time::Duration::from_secs(5)).ok_or_else(
+                || daemons::start_failure(video::DAEMON, std::time::Duration::from_secs(5)),
+            )?
         }
     };
     if serial::daemon_url().is_none() {
@@ -1251,8 +1252,9 @@ fn cmd_console(
         }
         eprintln!("Starting serial daemon…");
         serial::start_daemon(&serials, 0)?;
-        daemons::wait_for_daemon(serial::DAEMON, std::time::Duration::from_secs(5))
-            .ok_or_else(|| anyhow!("serial daemon did not start within 5 s"))?;
+        daemons::wait_for_daemon(serial::DAEMON, std::time::Duration::from_secs(5)).ok_or_else(
+            || daemons::start_failure(serial::DAEMON, std::time::Duration::from_secs(5)),
+        )?;
     }
     let url = dashboard_url(&video_url, None, interface);
     open_in_browser(&url);
@@ -1483,7 +1485,10 @@ fn cmd_serial_watch(lab_flag: Option<&str>, target: Option<&str>, port: u16) -> 
             println!("Serial daemon started. {url}");
             Ok(())
         }
-        None => bail!("serial daemon did not start within 5 s"),
+        None => Err(daemons::start_failure(
+            serial::DAEMON,
+            std::time::Duration::from_secs(5),
+        )),
     }
 }
 
@@ -1680,7 +1685,10 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
                     println!("Video daemon started. Preview at {url}");
                     Ok(())
                 }
-                None => bail!("video daemon did not start within 5 s"),
+                None => Err(daemons::start_failure(
+                    video::DAEMON,
+                    std::time::Duration::from_secs(5),
+                )),
             }
         }
         VideoCmd::Stop => {
