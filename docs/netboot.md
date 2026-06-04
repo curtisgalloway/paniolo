@@ -184,3 +184,7 @@ send path on a dedicated/elevated-priority thread, set socket priority, and keep
 the per-request hot path allocation-free so latency stays bounded when the
 machine is busy. (Tracked from a real starvation incident; netbootd is already
 the default, so this is the right place to fix it permanently.)
+
+Status 2026-06-04: netbootd carried a full real boot (Pi 5 firmware DHCP +
+TFTP, 20 MB ZBI at ~3.9 MB/s) on an idle host; the deliberate under-load
+re-test is still to be done.

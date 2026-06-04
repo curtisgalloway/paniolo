@@ -71,7 +71,7 @@
 
 | ID | Requirement | Pri | Status | Notes |
 |---|---|---|---|---|
-| PWR-A | `power-cycle` via configurable script (`--power-cycle-cmd`) | M | ☑ | *to be superseded by `[power]` block — PWR-5 in §9* |
+| PWR-A | `power-cycle` via configurable script (`--power-cycle-cmd`) | M | ☑ | *superseded by the `[power]` hook block (`--cycle-cmd` et al.) — PWR-5 in §9* |
 | PWR-B | `power-state` (read-only on/off via sense signal) | M | ☑ | `power-state` |
 | PWR-C | DTR-based hardware power-button toggling (J2 header): ≤500ms soft / ≥3s hard | M | ☑ | `_power.py` |
 
@@ -136,13 +136,13 @@
 
 | ID | Requirement | Source | Pri | Status | Notes |
 |---|---|---|---|---|---|
-| PWR-1 | `paniolo power on` — applies power; DUT begins booting unattended | LAVA | M | ☐ | Maps to `power_on_command` (hard requirement) |
-| PWR-2 | `paniolo power off` — cuts power | LAVA | M | ☐ | DTR long-press or PDU script |
-| PWR-3 | `paniolo power reset` — off+delay+on (hard reset) | LAVA | M | ☐ | Supersedes `power-cycle` (PWR-A) |
-| PWR-4 | `paniolo power state` — read on/off | BOTH | M | ☑ | exists as `power-state` (PWR-B); rename only |
-| PWR-5 | `[power]` config block w/ `backend = script\|dtr\|pdu\|jtag` + on/off/reset cmds | BOTH | M | ☐ | **Breaking**: replaces flat `power_cycle_cmd` (no alias) |
-| PWR-6 | Power commands usable as plain shell cmds (string or list) from a generator | LAVA | M | ☐ | LAVA fields accept string OR list |
-| PWR-7 | Update `AGENTS.md` for the new `[power]` config + verbs | OWNER | M | ☐ | Agent reconfigures targets on redeploy |
+| PWR-1 | `paniolo power on` — applies power; DUT begins booting unattended | LAVA | M | ☑ | `on_cmd` hook (2026-06-04) |
+| PWR-2 | `paniolo power off` — cuts power | LAVA | M | ☑ | `off_cmd` hook (2026-06-04) |
+| PWR-3 | `paniolo power reset` — off+delay+on (hard reset) | LAVA | M | ☐ | verb is still `power-cycle`; the `cambrionix` helper's `cycle` does off+delay+on |
+| PWR-4 | `paniolo power state` — read on/off | BOTH | M | ☑ | `power-state`, now `state_cmd`-backed when configured; rename only |
+| PWR-5 | `[power]` config block w/ `backend = script\|dtr\|pdu\|jtag` + on/off/reset cmds | BOTH | M | ☑ | landed 2026-06-04 as generic hooks (`cycle/on/off/state_cmd`) — no backend enum; device-specific logic lives in helper binaries |
+| PWR-6 | Power commands usable as plain shell cmds (string or list) from a generator | LAVA | M | ☑ | hooks are plain `sh -c` strings |
+| PWR-7 | Update `AGENTS.md` for the new `[power]` config + verbs | OWNER | M | ☑ | done with the hooks change |
 
 ### 9.2 Agnostic device-control API — Serial (core gap)
 

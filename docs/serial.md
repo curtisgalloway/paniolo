@@ -189,8 +189,8 @@ paniolo serial dtr [--ms 200] [-i console] [target-machine]   # pulse DTR
 paniolo serial reset [-i console] [target-machine]             # soft reset (200 ms)
 ```
 
-See [power.md](power.md) for wiring diagrams, `power_cycle_cmd` setup, and
-a full command reference.
+See [power.md](power.md) for wiring diagrams, the generic power hooks
+(`cycle_cmd`/`on_cmd`/`off_cmd`/`state_cmd`), and a full command reference.
 
 ---
 
