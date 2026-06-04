@@ -41,6 +41,14 @@
     #pwrbtn { color: #fca; background: rgba(0,0,0,.6); border: 1px solid #840;
               display: none; }
     #pwrbtn:hover { background: rgba(80,30,0,.7); }
+    #kvmbtn { color: #cfc; background: rgba(0,0,0,.6); border: 1px solid #4a4;
+              display: none; }
+    #kvmbtn:hover { background: rgba(30,80,30,.7); }
+    #kvmbtn.on { color: #000; background: #4d4; border-color: #4d4; font-weight: bold; }
+    #kvmstatus { position: absolute; bottom: 8px; left: 12px; z-index: 3;
+                 color: #4d4; background: rgba(0,0,0,.6); padding: 3px 8px;
+                 border-radius: 4px; display: none; }
+    #video.capturing { cursor: none; outline: 2px solid #4d4; outline-offset: -2px; }
     #pwrmodal { position: absolute; inset: 0; z-index: 10; display: none;
                 align-items: center; justify-content: center;
                 background: rgba(0,0,0,.7); }
@@ -81,9 +89,11 @@
     <img id="feed" src="/preview" alt="HDMI capture feed">
     <div id="videobtns">
       <button id="ocrbtn">⌕ OCR</button>
+      <button id="kvmbtn">⌨ Capture input</button>
       <button id="pwrbtn">⏻ Power Cycle</button>
     </div>
     <div id="vstatus">connecting…</div>
+    <div id="kvmstatus"></div>
     <div id="ocrpanel">
       <div id="ocrhead"><span id="ocrtitle">OCR</span><span id="ocrclose">×</span></div>
       <pre id="ocrtext"></pre>
@@ -280,6 +290,159 @@
         .then(list => buildPanes(Array.isArray(list) ? list.map(i => i.name) : [null]))
         .catch(() => buildPanes([null]));
     }
+
+    // ── KVM: keyboard + absolute mouse to the target via the hid daemon ──
+    // ?hidws=URL (remote/tunnel) or ?hid=PORT (local) enable the HID leg. While
+    // "Capture input" is engaged, all keyboard + mouse events are sent to the
+    // target and suppressed locally; right-Ctrl releases capture (so the serial
+    // terminal and the page work normally otherwise). The mouse is absolute:
+    // the cursor lands where you point inside the video.
+    (function () {
+      const hidWsUrl = params.get('hidws') ||
+        (params.get('hid')
+          ? 'ws://' + location.hostname + ':' + params.get('hid') + '/hid'
+          : null);
+      if (!hidWsUrl) return; // no HID channel on this console
+
+      const ABS_MAX = 32767;
+      const btn = document.getElementById('kvmbtn');
+      const kst = document.getElementById('kvmstatus');
+      const videoEl = document.getElementById('video');
+      const feed = document.getElementById('feed');
+      btn.style.display = '';
+
+      // event.code (physical key) -> adafruit_hid Keycode name.
+      const KEYMAP = (function () {
+        const m = {
+          Enter: 'ENTER', Escape: 'ESCAPE', Backspace: 'BACKSPACE', Tab: 'TAB',
+          Space: 'SPACE', Minus: 'MINUS', Equal: 'EQUALS',
+          BracketLeft: 'LEFT_BRACKET', BracketRight: 'RIGHT_BRACKET',
+          Backslash: 'BACKSLASH', Semicolon: 'SEMICOLON', Quote: 'QUOTE',
+          Backquote: 'GRAVE_ACCENT', Comma: 'COMMA', Period: 'PERIOD',
+          Slash: 'FORWARD_SLASH', CapsLock: 'CAPS_LOCK',
+          ArrowRight: 'RIGHT_ARROW', ArrowLeft: 'LEFT_ARROW',
+          ArrowUp: 'UP_ARROW', ArrowDown: 'DOWN_ARROW',
+          Home: 'HOME', End: 'END', PageUp: 'PAGE_UP', PageDown: 'PAGE_DOWN',
+          Insert: 'INSERT', Delete: 'DELETE', PrintScreen: 'PRINT_SCREEN',
+          ControlLeft: 'LEFT_CONTROL', ShiftLeft: 'LEFT_SHIFT',
+          AltLeft: 'LEFT_ALT', MetaLeft: 'LEFT_GUI', ShiftRight: 'RIGHT_SHIFT',
+          AltRight: 'RIGHT_ALT', MetaRight: 'RIGHT_GUI',
+        };
+        const digits = ['ZERO', 'ONE', 'TWO', 'THREE', 'FOUR', 'FIVE', 'SIX',
+                        'SEVEN', 'EIGHT', 'NINE'];
+        for (let i = 0; i < 26; i++) m['Key' + String.fromCharCode(65 + i)] =
+          String.fromCharCode(65 + i);
+        for (let i = 0; i < 10; i++) m['Digit' + i] = digits[i];
+        for (let i = 1; i <= 12; i++) m['F' + i] = 'F' + i;
+        return m;
+      })();
+
+      // ── hid WebSocket ──
+      let ws, gen = 0, wsOpen = false;
+      function setStatus(txt, color) { kst.textContent = txt; kst.style.color = color || '#4d4'; }
+      function connect() {
+        const myGen = ++gen;
+        ws = new WebSocket(hidWsUrl);
+        ws.onopen = () => { wsOpen = true; };
+        ws.onmessage = ev => {
+          // The daemon broadcasts `evt ok|err <line> :: <reply>`; surface errors.
+          const s = String(ev.data);
+          if (s.startsWith('evt err') && captured)
+            setStatus('capturing — ' + s.slice(8, 60), '#fa0');
+        };
+        ws.onclose = () => {
+          wsOpen = false;
+          if (myGen !== gen) return;
+          if (captured) disengage();
+          setTimeout(() => { if (myGen === gen) connect(); }, 3000);
+        };
+        ws.onerror = () => { try { ws.close(); } catch (e) {} };
+      }
+      function send(line) { if (ws && wsOpen) ws.send(line); }
+      connect();
+
+      // ── capture engage/disengage ──
+      let captured = false;
+      function engage() {
+        captured = true;
+        btn.classList.add('on');
+        videoEl.classList.add('capturing');
+        kst.style.display = '';
+        setStatus('capturing — right-Ctrl to release');
+        btn.textContent = '⌨ Capturing';
+      }
+      function disengage() {
+        captured = false;
+        btn.classList.remove('on');
+        videoEl.classList.remove('capturing');
+        kst.style.display = 'none';
+        btn.textContent = '⌨ Capture input';
+        send('releaseall'); // don't leave modifiers stuck on the target
+      }
+      btn.onclick = () => (captured ? disengage() : engage());
+      // Drop capture (and release held keys) if the window loses focus.
+      window.addEventListener('blur', () => { if (captured) disengage(); });
+
+      // ── keyboard ──
+      window.addEventListener('keydown', ev => {
+        if (!captured) return;
+        // right-Ctrl is the release hotkey — never forwarded to the target.
+        if (ev.code === 'ControlRight') { ev.preventDefault(); disengage(); return; }
+        ev.preventDefault();
+        if (ev.repeat) return; // the target applies its own auto-repeat while held
+        const name = KEYMAP[ev.code];
+        if (name) send('down ' + name);
+      }, true);
+      window.addEventListener('keyup', ev => {
+        if (!captured) return;
+        if (ev.code === 'ControlRight') return;
+        ev.preventDefault();
+        const name = KEYMAP[ev.code];
+        if (name) send('up ' + name);
+      }, true);
+
+      // ── absolute mouse ──
+      // Map a pointer position to the displayed-image rectangle. The <img> uses
+      // object-fit: contain, so it is letterboxed inside its box; compute the
+      // real content rect before scaling to the 0..ABS_MAX logical range.
+      function toLogical(ev) {
+        const r = feed.getBoundingClientRect();
+        const natAR = feed.naturalWidth / feed.naturalHeight;
+        if (!natAR || !r.width || !r.height) return null;
+        const boxAR = r.width / r.height;
+        let dispW, dispH, offX, offY;
+        if (natAR > boxAR) { dispW = r.width; dispH = r.width / natAR; offX = 0; offY = (r.height - dispH) / 2; }
+        else { dispH = r.height; dispW = r.height * natAR; offY = 0; offX = (r.width - dispW) / 2; }
+        const x = ev.clientX - r.left - offX;
+        const y = ev.clientY - r.top - offY;
+        if (x < 0 || y < 0 || x > dispW || y > dispH) return null; // in the letterbox
+        const clamp = v => Math.max(0, Math.min(ABS_MAX, Math.round(v)));
+        return [clamp(x / dispW * ABS_MAX), clamp(y / dispH * ABS_MAX)];
+      }
+      const BTN = ['left', 'middle', 'right']; // MouseEvent.button order
+      videoEl.addEventListener('mousemove', ev => {
+        if (!captured) return;
+        const p = toLogical(ev);
+        if (p) send('moveabs ' + p[0] + ' ' + p[1]);
+      });
+      videoEl.addEventListener('mousedown', ev => {
+        if (!captured) return;
+        ev.preventDefault();
+        const p = toLogical(ev);
+        if (p) send('moveabs ' + p[0] + ' ' + p[1]);
+        send('mdown ' + (BTN[ev.button] || 'left'));
+      });
+      window.addEventListener('mouseup', ev => {
+        if (!captured) return;
+        send('mup ' + (BTN[ev.button] || 'left'));
+      });
+      videoEl.addEventListener('contextmenu', ev => { if (captured) ev.preventDefault(); });
+      videoEl.addEventListener('wheel', ev => {
+        if (!captured) return;
+        ev.preventDefault();
+        send('scroll ' + (ev.deltaY < 0 ? 1 : -1));
+      }, { passive: false });
+    })();
   </script>
 </body>
 </html>
