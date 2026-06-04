@@ -13,11 +13,11 @@
 # limitations under the License.
 
 # Build and install paniolo: the Rust CLI (cli/) plus the daemons (hdmicap,
-# serialcap, netbootd) and the OCR helper. `make install` from a fresh clone
-# is the only command you need; re-run it after editing anything to rebuild
-# and reinstall.
+# serialcap, netbootd, cambrionix) and the OCR helper. `make install` from a
+# fresh clone is the only command you need; re-run it after editing anything to
+# rebuild and reinstall.
 
-CRATES = cli hdmicap serialcap netbootd
+CRATES = cli hdmicap serialcap netbootd cambrionix
 
 # The installed CLI, by absolute path: immune to a stale `paniolo` shadowing
 # ~/.cargo/bin earlier in PATH (e.g. the retired Python CLI's uv-tools shim).
@@ -38,8 +38,8 @@ help:
 	@echo "  make clean       cargo clean every crate."
 
 # Full build + install. Bootstrap the CLI with cargo, then let `paniolo setup`
-# do the rest — it rebuilds all four crates and applies the platform-specific
-# steps, so all that logic lives in one place (cli/src/setup.rs).
+# do the rest — it rebuilds all crates and applies the platform-specific steps,
+# so all that logic lives in one place (cli/src/setup.rs).
 install: check-shadow
 	cargo install --path cli
 	$(PANIOLO) setup

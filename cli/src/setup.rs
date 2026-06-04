@@ -28,7 +28,7 @@ use anyhow::{anyhow, bail, Result};
 
 /// The crates `setup` builds and installs, in order. `cli` is the paniolo
 /// binary itself — the single-binary deployment this rewrite exists for.
-const CRATES: [&str; 4] = ["hdmicap", "serialcap", "netbootd", "cli"];
+const CRATES: [&str; 5] = ["hdmicap", "serialcap", "netbootd", "cambrionix", "cli"];
 
 fn is_repo_root(d: &Path) -> bool {
     d.join("pyproject.toml").is_file()
