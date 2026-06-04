@@ -1,139 +1,130 @@
-# KB2040 HID Test Rig
+# KB2040 HID Injector
 
-A USB keyboard/mouse injector for automated software testing of a Raspberry Pi
-(or any USB host). A **control board** receives text commands from a test
-computer over USB serial and relays them over I2C (STEMMA QT) to a **target
-board**, which replays them as USB HID keyboard and mouse events into the Pi.
+A USB keyboard/mouse injector for automated testing of a target machine
+(SBC, e.g. a Raspberry Pi). A single **Adafruit KB2040** presents itself to
+the target as a plain USB HID keyboard + mouse; the control host drives it
+with line-based text commands over a UART on the board's TX/RX pins,
+typically through a USB-serial adapter.
 
 ```
-[Test computer] --USB serial--> [Control board: KB2040 / USB Trinkey QT2040]
-                                       |
-                                 STEMMA QT (I2C)
-                                       |
-[Raspberry Pi]  <--USB HID-- [Target board: KB2040]
+[Control host] --USB-serial adapter--+
+                                     | UART (TX/RX/GND, 115200 8N1, 3.3 V)
+                                     v
+                                 [KB2040] --built-in USB (HID device)--> [Target]
 ```
+
+The wire protocol is the **HID serial protocol v1** — see
+[`docs/hid-serial-protocol.md`](../docs/hid-serial-protocol.md) for the
+normative spec. This directory holds the reference firmware implementation
+(CircuitPython) and the host-side CLI (`hidrig`, Rust), which works against
+any device implementing the spec.
 
 ## Hardware
 
-- 1x Adafruit KB2040 — **target** (USB to the Pi, STEMMA QT to control board)
-- 1x Adafruit KB2040 **or** USB Trinkey QT2040 — **control** (USB to test
-  computer, STEMMA QT to target board)
-- 1x STEMMA QT / Qwiic cable between the two boards
+- 1x Adafruit KB2040 (any CircuitPython-capable RP2040 board with free
+  UART pins works with minor pin edits)
+- 1x 3.3 V USB-serial adapter (FTDI, CP2102, ...) on the control host
+- 3 jumper wires: adapter TX -> board RX, adapter RX -> board TX, GND -> GND
 
-STEMMA QT is I2C with built-in pull-ups, so no extra resistors are needed.
+The board is powered by the **target's** USB port, so it reboots with the
+target — held keys can never survive a target power cycle, and the UART is
+silent while the target is off.
+
+Pins (KB2040): `TX`/`D0` (GPIO0) and `RX`/`D1` (GPIO1), with GND adjacent.
+`D2` is the dev-mode jumper (below).
 
 ## Firmware setup
 
-Both boards run **CircuitPython 9.x**.
+The board runs **CircuitPython 9.x**. See [`SETUP.md`](SETUP.md) for the
+full runbook; in short:
 
-1. Install CircuitPython 9.x on each board (hold BOOT, copy the UF2).
-2. Download the matching CircuitPython library bundle and copy the
-   `adafruit_hid` folder into `/lib` on **both** boards' `CIRCUITPY` drives.
-   - `i2ctarget` is a built-in core module — no library needed for it.
-3. Copy files to the drives:
-   - Target board `CIRCUITPY/`: `target/code.py` -> `code.py`
-   - Control board `CIRCUITPY/`: `control/boot.py` -> `boot.py`
-     and `control/code.py` -> `code.py`
-   - `boot.py` only takes effect after a power cycle / hard reset.
+1. Install CircuitPython 9.x (hold BOOT, copy the UF2).
+2. `uvx circup --path /Volumes/CIRCUITPY install adafruit_hid`
+3. Copy `firmware/boot.py` and `firmware/code.py` to `CIRCUITPY/`.
+4. Hard-reset (replug). The board now enumerates as **HID only** — no
+   CIRCUITPY drive, no REPL.
 
-## Bring-up checklist
+**Dev mode:** jumper `D2` to GND (adjacent pins) and reset — CIRCUITPY and
+the REPL come back so you can edit the firmware. Plug into a dev machine
+(not the target) for that.
 
-1. Power both boards and connect the STEMMA QT cable.
-2. From the control board REPL, confirm the link:
-   ```python
-   import board
-   i2c = board.STEMMA_I2C()
-   while not i2c.try_lock():
-       pass
-   print([hex(a) for a in i2c.scan()])   # expect ['0x41']
-   i2c.unlock()
-   ```
-3. Plug the target board into the Pi; it should enumerate as a USB
-   keyboard + mouse.
-4. On the test computer, drive the rig with `paniolo hid` (run
-   `paniolo hid setup` first to detect/save the control board's data port).
+Status NeoPixel: blinking red = waiting for the target's USB to enumerate;
+green blip = up and serving; solid red = last command failed.
 
-## Command protocol
+## Host CLI
 
-One command per line, `\n` terminated, sent to the control board's USB CDC
-**data** port. The board replies `OK` or `ERR <message>`.
+`hidrig` (this crate) drives any conforming injector:
 
-| Command | Example | Effect |
-|---|---|---|
-| `type <text>` | `type hello world` | Type a string |
-| `key <NAME>` | `key ENTER` | Tap (press+release) a key |
-| `combo <NAME>...` | `combo LEFT_CONTROL C` | Chord: press all, release all |
-| `down <NAME>` | `down LEFT_SHIFT` | Press and hold |
-| `up <NAME>` | `up LEFT_SHIFT` | Release a held key |
-| `releaseall` | `releaseall` | Release all held keys |
-| `move <dx> <dy>` | `move 300 -50` | Relative mouse move (auto-stepped) |
-| `click <btn>` | `click left` | Click left/right/middle |
-| `mdown <btn>` / `mup <btn>` | `mdown left` | Hold / release a mouse button |
-| `scroll <amount>` | `scroll -3` | Scroll wheel |
+```bash
+cargo install --path hidrig
 
-`<NAME>` values are `adafruit_hid` Keycode names (A-Z, ENTER, TAB, ESCAPE,
-LEFT_CONTROL, LEFT_SHIFT, UP_ARROW, F1..F12, etc.).
+hidrig -d /dev/cu.usbserial-XXXX ping            # liveness
+hidrig -d /dev/cu.usbserial-XXXX version         # protocol + implementation
+hidrig -d /dev/cu.usbserial-XXXX type "hello world"
+hidrig -d /dev/cu.usbserial-XXXX key ENTER
+hidrig -d /dev/cu.usbserial-XXXX combo LEFT_CONTROL C
+hidrig -d /dev/cu.usbserial-XXXX move 300 -50
+hidrig -d /dev/cu.usbserial-XXXX click right
+hidrig -d /dev/cu.usbserial-XXXX scroll -3
+hidrig -d /dev/cu.usbserial-XXXX run boot-seq.txt   # command file; '-' = stdin
+```
 
-## Wire protocol (control -> target, over I2C)
+Command files take one protocol command per line; blank lines and
+`# comments` are skipped, and `delay <ms>` / `sleep <seconds>` pause between
+commands (sequencing lives on the host; the firmware stays dumb).
 
-Each I2C write is one packet: `[opcode][payload...]`.
+Key names are `adafruit_hid` Keycode names (`A`–`Z`, `ENTER`, `TAB`,
+`ESCAPE`, `LEFT_CONTROL`, `LEFT_SHIFT`, `UP_ARROW`, `F1`–`F12`, ...).
 
-| Opcode | Name | Payload |
-|---|---|---|
-| 0x01 | KEY_PRESS | one or more keycode bytes |
-| 0x02 | KEY_RELEASE | one or more keycode bytes |
-| 0x03 | KEY_RELEASE_ALL | (none) |
-| 0x04 | TYPE | UTF-8 text bytes (<=30 per packet) |
-| 0x10 | MOUSE_MOVE | dx (int8), dy (int8) |
-| 0x11 | MOUSE_PRESS | button mask (1=L, 2=R, 4=M) |
-| 0x12 | MOUSE_RELEASE | button mask |
-| 0x13 | MOUSE_SCROLL | amount (int8) |
+## paniolo integration
 
-## Design notes
+paniolo calls the tool through the generic per-target `hid` channel — an
+opaque command prefix, exactly like the power hooks:
 
-- The RP2040 `i2ctarget` core module uses I2C clock stretching. That is fine
-  here because the I2C bus is RP2040 <-> RP2040. The Raspberry Pi, which is
-  poor at clock stretching, sits on USB, not on this I2C bus.
-- The RP2040 supports a single I2C target address (`0x41` here).
-- HID relative mouse movement is int8 per report; the control board splits
-  larger moves into multiple steps automatically.
-- The default `adafruit_hid.Mouse` is relative-only. Absolute positioning
-  (jump to exact coordinates) needs a custom HID report descriptor in a
-  target-side `boot.py`. See HANDOFF.md for the extension task.
+```bash
+paniolo hid set -t pi5 --cmd "hidrig -d /dev/cu.usbserial-XXXX"
+paniolo hid send -t pi5 type hello
+paniolo hid send -t pi5 key ENTER
+```
+
+`paniolo hid send` appends its arguments to the configured command and runs
+it on whichever control host owns the channel (transparently over SSH for
+remote hosts). See [`docs/hid.md`](../docs/hid.md).
 
 ## Host testing tool
 
 `host/hid_seize_reports.c` is a macOS IOKit utility that exclusively seizes
-the target board's HID interface and prints raw input reports without any
-keystroke reaching the focused application. Use it to verify the full pipeline
-end-to-end on the same machine the control board is plugged into.
+the injector's HID interface and prints raw input reports without any
+keystroke reaching the focused application. Use it to verify the full
+pipeline end-to-end by plugging the injector's USB into the same machine
+that drives the UART.
 
 ```bash
 cd hidrig/host
 make
-./hid_seize_reports        # grant Input Monitoring in System Settings when prompted
+sudo ./hid_seize_reports   # grant Input Monitoring in System Settings
 ```
 
-In another terminal, drive the rig normally:
-```bash
-paniolo hid type "hello"
-```
-
-The tool prints the raw HID report bytes for every keyboard/mouse event.
-The VID/PID are set to 0x239A/0x8106 (KB2040 running CircuitPython).
+In another terminal: `hidrig -d /dev/cu.usbserial-XXXX type hello` and watch
+the raw HID report bytes. The VID/PID filter is 0x239A/0x8106 (KB2040
+running CircuitPython).
 
 ## Files
 
 ```
 hidrig/
-  target/code.py         # I2C target -> USB HID (runs on the board into the Pi)
-  control/boot.py        # enables the usb_cdc data channel
-  control/code.py        # USB serial -> I2C controller
+  src/                  # `hidrig` host CLI (Rust)
+  firmware/boot.py      # USB identity: HID-only (dev-mode jumper on D2)
+  firmware/code.py      # UART line protocol -> USB HID (reference impl)
   host/hid_seize_reports.c  # macOS IOKit HID capture tool
   host/Makefile
-  README.md
-  HANDOFF.md             # task brief for the remaining firmware work
 ```
 
-The host driver lives in paniolo: `src/paniolo/_hid.py` (the `paniolo hid`
-command group).
+## History
+
+The first version of this rig used two boards (a USB-CDC control board
+relaying I2C packets to a USB-HID target board) because the control link was
+the board's own USB port. Moving the control link to the UART eliminated the
+second board, the binary I2C protocol, and the duplicated opcode tables —
+see git history (`hidrig/control/`, `hidrig/target/`) if you need the old
+design.

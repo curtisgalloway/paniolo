@@ -12,18 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-CONTROL BOARD boot.py
+[package]
+name = "hidrig"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "CLI for the KB2040 USB HID injector: keyboard/mouse injection over a control UART"
 
-Enables a second USB serial channel (the "data" channel) so the host test
-scripts can send commands without colliding with the CircuitPython REPL
-console. Runs once at power-on / reset.
+[[bin]]
+name = "hidrig"
+path = "src/main.rs"
 
-After this is in place the control board enumerates TWO serial ports:
-  - console port (the REPL)
-  - data port    (used by host/example.py)
-"""
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+serialport = "4"
 
-import usb_cdc
-
-usb_cdc.enable(console=True, data=True)
+[profile.release]
+opt-level = 3
+lto = "thin"
