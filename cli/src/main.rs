@@ -404,6 +404,15 @@ enum PowerCmd {
         target: String,
         #[arg(long)]
         cycle_cmd: Option<String>,
+        /// Shell command to power the target on.
+        #[arg(long)]
+        on_cmd: Option<String>,
+        /// Shell command to power the target off.
+        #[arg(long)]
+        off_cmd: Option<String>,
+        /// Shell command to query power state (stdout must begin with 'on' or 'off').
+        #[arg(long)]
+        state_cmd: Option<String>,
         #[arg(long)]
         serial_interface: Option<String>,
         #[arg(long)]
@@ -414,6 +423,10 @@ enum PowerCmd {
         #[arg(long, short)]
         target: String,
     },
+    /// Power on the target via the configured on_cmd.
+    On { target: Option<String> },
+    /// Power off the target via the configured off_cmd.
+    Off { target: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -1176,10 +1189,17 @@ fn cmd_serial_dtr(
 
 // ── console (composite: video + serial dashboard) ───────────────────────────
 
-fn dashboard_url(video_base: &str, serial_ws: Option<&str>, interface: Option<&str>) -> String {
+fn dashboard_url(
+    video_base: &str,
+    serial_ws: Option<&str>,
+    serial_port: Option<u16>,
+    interface: Option<&str>,
+) -> String {
     let mut params: Vec<String> = Vec::new();
     if let Some(ws) = serial_ws {
         params.push(format!("serialws={ws}"));
+    } else if let Some(port) = serial_port {
+        params.push(format!("serial={port}"));
     }
     if let Some(i) = interface {
         params.push(format!("interface={i}"));
@@ -1256,7 +1276,10 @@ fn cmd_console(
             || daemons::start_failure(serial::DAEMON, std::time::Duration::from_secs(5)),
         )?;
     }
-    let url = dashboard_url(&video_url, None, interface);
+    // The dashboard's serial pane can't discover serialcap's OS-assigned
+    // port itself — hand it over as ?serial=PORT.
+    let serial_port = daemons::daemon_port(serial::DAEMON);
+    let url = dashboard_url(&video_url, None, serial_port, interface);
     open_in_browser(&url);
     println!("Opened {url}");
     Ok(())
@@ -1290,6 +1313,7 @@ fn remote_console(lab: &Lab, target: &str, host_name: &str, interface: Option<&s
     let url = dashboard_url(
         &format!("http://127.0.0.1:{}", fwd_video.local_port),
         Some(&format!("ws://127.0.0.1:{}/stream", fwd_serial.local_port)),
+        None,
         interface,
     );
     open_in_browser(&url);
@@ -1318,6 +1342,25 @@ fn local_power(lab: &Lab, target: &str) -> Result<model::PowerChannel> {
     Ok(p)
 }
 
+/// Run an opaque shell hook via `sh -c`, propagating its exit code.
+/// `label` is a human-readable description shown in the progress message.
+fn run_power_hook(cmd: &str, label: &str, target: &str) -> Result<()> {
+    eprintln!("{label} '{target}' via {cmd}");
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        eprintln!(
+            "{label} script exited with code {}",
+            status.code().unwrap_or(1)
+        );
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
 fn cmd_power_cycle(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
     let lab = load_for_read(lab_flag)?;
     let target = resolve_single_target(&lab, target)?;
@@ -1337,21 +1380,57 @@ fn cmd_power_cycle(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
              (paniolo power set -t {target} --cycle-cmd /path/to/script)"
         )
     })?;
-    eprintln!("Power cycling '{target}' via {cmd}");
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&cmd)
-        .status()?;
-    if status.success() {
-        println!("Power cycle complete.");
-        Ok(())
-    } else {
-        eprintln!(
-            "power-cycle script exited with code {}",
-            status.code().unwrap_or(1)
-        );
-        std::process::exit(status.code().unwrap_or(1));
+    run_power_hook(&cmd, "Power cycling", &target)?;
+    println!("Power cycle complete.");
+    Ok(())
+}
+
+fn cmd_power_on(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    let target = resolve_single_target(&lab, target)?;
+    if let Some(code) = dispatch::maybe_dispatch(
+        &lab,
+        &target,
+        model::ChannelKind::Power,
+        None,
+        dispatch::Mode::Reexec,
+    )? {
+        std::process::exit(code);
     }
+    let p = local_power(&lab, &target)?;
+    let cmd = p.on_cmd.ok_or_else(|| {
+        anyhow!(
+            "no on_cmd configured for '{target}' \
+             (paniolo power set -t {target} --on-cmd /path/to/script)"
+        )
+    })?;
+    run_power_hook(&cmd, "Powering on", &target)?;
+    println!("Power on complete.");
+    Ok(())
+}
+
+fn cmd_power_off(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    let target = resolve_single_target(&lab, target)?;
+    if let Some(code) = dispatch::maybe_dispatch(
+        &lab,
+        &target,
+        model::ChannelKind::Power,
+        None,
+        dispatch::Mode::Reexec,
+    )? {
+        std::process::exit(code);
+    }
+    let p = local_power(&lab, &target)?;
+    let cmd = p.off_cmd.ok_or_else(|| {
+        anyhow!(
+            "no off_cmd configured for '{target}' \
+             (paniolo power set -t {target} --off-cmd /path/to/script)"
+        )
+    })?;
+    run_power_hook(&cmd, "Powering off", &target)?;
+    println!("Power off complete.");
+    Ok(())
 }
 
 fn cmd_power_state(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
@@ -1367,28 +1446,62 @@ fn cmd_power_state(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
         std::process::exit(code);
     }
     let p = local_power(&lab, &target)?;
-    let si = p.serial_interface.ok_or_else(|| {
-        anyhow!(
-            "no power serial_interface configured for '{target}' \
-             (paniolo power set -t {target} --serial-interface <name>)"
-        )
-    })?;
-    let url = serial::daemon_url().ok_or_else(|| {
-        anyhow!("serialcap daemon not running — start it with `paniolo serial watch`")
-    })?;
-    match power::read_power_state(&url, &si) {
-        Some(true) => {
-            println!("Power ON  ({target})");
-            Ok(())
+
+    // Prefer state_cmd when configured; fall back to serial sense.
+    if let Some(cmd) = p.state_cmd {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .output()?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            bail!(
+                "state_cmd '{cmd}' exited with code {} — stdout: {stdout} stderr: {stderr}",
+                out.status.code().unwrap_or(1)
+            );
         }
-        Some(false) => {
-            println!("Power OFF  ({target})");
-            Ok(())
+        let text = String::from_utf8_lossy(&out.stdout);
+        let token = text
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        match token.as_str() {
+            "on" => {
+                println!("Power ON  ({target})");
+                Ok(())
+            }
+            "off" => {
+                println!("Power OFF  ({target})");
+                Ok(())
+            }
+            _ => bail!("state_cmd '{cmd}' output did not begin with 'on' or 'off' — got: {text}"),
         }
-        None => bail!(
-            "power state unknown — the sense signal may not be configured on '{si}' \
-             (paniolo serial set {si} -t {target} --sense <cts|dsr|dcd|ri>)"
-        ),
+    } else {
+        let si = p.serial_interface.ok_or_else(|| {
+            anyhow!(
+                "no power serial_interface configured for '{target}' \
+                 (paniolo power set -t {target} --serial-interface <name>)"
+            )
+        })?;
+        let url = serial::daemon_url().ok_or_else(|| {
+            anyhow!("serialcap daemon not running — start it with `paniolo serial watch`")
+        })?;
+        match power::read_power_state(&url, &si) {
+            Some(true) => {
+                println!("Power ON  ({target})");
+                Ok(())
+            }
+            Some(false) => {
+                println!("Power OFF  ({target})");
+                Ok(())
+            }
+            None => bail!(
+                "power state unknown — the sense signal may not be configured on '{si}' \
+                 (paniolo serial set {si} -t {target} --sense <cts|dsr|dcd|ri>)"
+            ),
+        }
     }
 }
 
@@ -2029,6 +2142,9 @@ fn power_cmd(lab_flag: Option<&str>, cmd: PowerCmd) -> Result<()> {
         PowerCmd::Set {
             target,
             cycle_cmd,
+            on_cmd,
+            off_cmd,
+            state_cmd,
             serial_interface,
             host,
         } => {
@@ -2036,6 +2152,9 @@ fn power_cmd(lab_flag: Option<&str>, cmd: PowerCmd) -> Result<()> {
                 lf.set_power(
                     &target,
                     cycle_cmd.as_deref(),
+                    on_cmd.as_deref(),
+                    off_cmd.as_deref(),
+                    state_cmd.as_deref(),
                     serial_interface.as_deref(),
                     host.as_deref(),
                 )
@@ -2048,6 +2167,8 @@ fn power_cmd(lab_flag: Option<&str>, cmd: PowerCmd) -> Result<()> {
             println!("power channel removed from '{target}'.");
             Ok(())
         }
+        PowerCmd::On { target } => cmd_power_on(lab_flag, target.as_deref()),
+        PowerCmd::Off { target } => cmd_power_off(lab_flag, target.as_deref()),
     }
 }
 
