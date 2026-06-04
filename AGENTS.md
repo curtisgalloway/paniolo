@@ -74,7 +74,7 @@ Current capabilities:
   log queryable by line range (`paniolo serial log -i <name>`)
 - Combined video+serial web dashboard (hdmicap's `GET /`: video on top, xterm.js terminal below)
 - On-device OCR of the captured screen (`paniolo video read`, dashboard OCR button): Apple Vision on macOS, Tesseract on Linux
-- USB HID input (keyboard/mouse injection) via the KB2040 rig (`paniolo hid`)
+- USB HID input (keyboard/mouse injection) via a generic helper hook (`paniolo hid send`); the `hidrig` helper drives the KB2040 injector over its control UART (HID serial protocol, docs/hid-serial-protocol.md)
 - Power control via DTR (J2 wiring) or generic shell-command hooks (`on_cmd`, `off_cmd`, `cycle_cmd`, `state_cmd`): `paniolo serial dtr`, `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`
 
 ## Architecture
@@ -99,7 +99,7 @@ Python tree below:
 
 - **Config is one CLI-managed lab file** (`~/.config/paniolo/lab.toml`, or
   `--lab`/`PANIOLO_LAB`): hosts + targets, each target's hardware as *channels*
-  (`netboot`, `serial[]`, `power`, `video`) with per-channel host binding.
+  (`netboot`, `serial[]`, `power`, `video`, `hid`) with per-channel host binding.
   Edited surgically via `toml_edit` (hand-comments survive); validated on load
   and before every save. The legacy `~/.config/paniolo/targets/*.toml` files are
   not used by the Rust CLI.
@@ -134,8 +134,9 @@ cli/src/
 ```
 
 Deferred (tracked in docs/config-redesign.md): OCR (`video read`), the
-Openterface CH9329 HID backend (clean-room spec at docs/ch9329-spec.md), legacy
-Python removal.
+Openterface CH9329 HID backend (clean-room spec at docs/ch9329-spec.md — a shim
+speaking the HID serial protocol would plug into the existing `hid` channel),
+legacy Python removal.
 
 ## Module layout (legacy Python — being retired)
 
@@ -213,15 +214,20 @@ ocr/             OCR helpers (compiled/installed binaries are gitignored):
                    visionocr.swift  Apple Vision OCR (macOS); built by paniolo setup via swiftc
                    linuxocr         Tesseract OCR wrapper (Linux); copied by paniolo setup
 
-hidrig/          CircuitPython firmware for the USB HID injection rig
-  target/code.py   I2C target -> USB HID (KB2040 plugged into the Pi)
-  control/code.py  USB serial -> I2C controller (text command parser; owns the
-                   wire protocol — source of truth, kept in sync with target)
-  control/boot.py  enables the usb_cdc data channel
+hidrig/          USB HID injector: host CLI (Rust) + KB2040 firmware
+  src/main.rs      `hidrig` CLI — clap subcommands mirroring the HID serial
+                   protocol (type/key/combo/move/.../ping/version) + `run`
+                   command files (delay/sleep directives live host-side)
+  src/proto.rs     line protocol client (send/OK-ERR parse) + sequence parser
+  firmware/code.py reference implementation of the protocol: UART line
+                   commands -> USB HID keyboard/mouse (CircuitPython 9.x)
+  firmware/boot.py USB identity: HID-only toward the target; D2->GND jumper
+                   at boot re-enables CIRCUITPY + REPL for development
   host/hid_seize_reports.c  macOS IOKit tool: seizes the HID device exclusively
                    and prints raw input reports — for pipeline testing without
                    keystrokes reaching the focused app. Build with host/Makefile.
-  README.md        wiring, command + wire protocol; HANDOFF.md: remaining firmware work
+  README.md        wiring, firmware setup, CLI usage; the protocol spec is
+                   docs/hid-serial-protocol.md (normative, device-independent)
 ```
 
 ## Combined dashboard (video + serial)
@@ -571,11 +577,15 @@ purely additive and runs on a separate thread so disk I/O can't stall the fan-ou
 
 ## _hid.py
 
-Host client for the `hidrig/` USB HID injection rig. `paniolo hid` is a **thin
-text-command client**: it sends line commands (`type ...`, `key ENTER`, `move
-dx dy`, ...) to the control board's USB CDC *data* port; the board parses them
-and relays HID events. The board owns the wire protocol — `_hid.py` does not
-re-encode packets host-side.
+**Superseded** by the `hidrig` crate + the Rust CLI's `hid` channel (the rig's
+control link moved from a USB CDC data port to a UART; see
+`docs/hid-serial-protocol.md`). Kept only until the Python tree is retired.
+
+Host client for the original two-board USB HID injection rig. `paniolo hid` is
+a **thin text-command client**: it sends line commands (`type ...`, `key
+ENTER`, `move dx dy`, ...) to the control board's USB CDC *data* port; the
+board parses them and relays HID events. The board owns the wire protocol —
+`_hid.py` does not re-encode packets host-side.
 
 - `HidConfig(port)` saved to `~/.config/paniolo/hid.toml`; `list_serial_ports()`
   / `guess_data_port()` find the control board's data CDC node (the
@@ -590,95 +600,78 @@ re-encode packets host-side.
 --extra hid`), imported lazily — the core install stays typer-only and the
 test suite needs neither pyserial nor hardware.
 
-## hidrig firmware
+## hidrig (USB HID injector)
 
-The `hidrig/` directory contains CircuitPython 9.x firmware for two RP2040
-boards that together form a USB HID injection rig.
+The `hidrig/` directory is the USB HID injector: a Rust host CLI plus
+CircuitPython 9.x firmware for a single Adafruit KB2040.
 
 ### Architecture
 
 ```
-[test computer]
-  |-- USB serial (data CDC) --> [control board: Trinkey QT2040 or KB2040]
-                                     |-- STEMMA QT (I2C, 100 kHz) -->
-                                                         [target board: KB2040]
-                                                              |-- USB HID -->
-                                                                     [Pi / DUT]
+[control host]
+  |-- USB-serial adapter -- UART (TX/RX/GND, 115200 8N1) --> [KB2040]
+                                                                |-- USB HID -->
+                                                                       [target / DUT]
 ```
 
-The control board (`control/code.py`) reads line-delimited text commands from
-the USB CDC **data** port, encodes them as compact binary I2C packets, and
-writes them to the target at address `0x41`. The target board (`target/code.py`)
-receives packets over I2C and replays them as USB HID keyboard/mouse events.
+The board's built-in USB port faces the **target** as a device-mode HID
+keyboard + mouse (and powers the board, so it reboots with the target); the
+control link is the UART. The wire protocol is the **HID serial protocol v1**
+(`docs/hid-serial-protocol.md` — normative and device-independent, so the same
+host tooling drives any conforming microcontroller implementation). The
+firmware (`firmware/code.py`) is the reference implementation; `hidrig`
+(`src/main.rs`, `src/proto.rs`) is the host client.
 
-### Wire protocol
+An earlier two-board design (USB-CDC control board relaying binary I2C packets
+to a USB-HID target board) lives only in git history (`hidrig/control/`,
+`hidrig/target/`, `HANDOFF.md`).
 
-Each I2C write is `[opcode][payload...]`. Opcodes 0x01–0x04 are keyboard;
-0x10–0x13 are mouse. The `TYPE` opcode (0x04) carries UTF-8 text; the control
-board chunks it at 30 bytes so the packet never exceeds 31 bytes total.
+### USB identity (`firmware/boot.py`)
 
-### I2C FIFO and drain loop
+In normal operation the target must see a plain keyboard + mouse, so boot.py
+disables the CIRCUITPY drive, the CDC REPL, and MIDI. Jumpering **D2 to GND**
+at reset re-enables them for firmware updates (plug into a dev machine, not
+the target). boot.py only re-runs on hard reset. The status NeoPixel is driven
+via the core `neopixel_write` module (no /lib dependency): blinking red =
+waiting for target enumeration, green blip = serving, solid red = last
+command failed.
 
-The RP2040 I2C hardware RX FIFO is **16 bytes deep**. For packets larger than
-16 bytes, `req.read()` in CircuitPython returns only the bytes currently
-buffered — it does not wait for the STOP condition — so calling it once after a
-fixed sleep truncates large TYPE packets.
+### paniolo integration
 
-The target uses a drain loop instead of a fixed sleep:
-
-```python
-data = bytearray()
-while True:
-    chunk = req.read(64)
-    if not chunk:
-        break
-    data.extend(chunk)
-    time.sleep(0.001)  # let next FIFO batch arrive
-handle(bytes(data))
-```
-
-The 1 ms inter-read sleep allows the next bytes to clock in (at 100 kHz, 11
-bytes arrive per ms). The loop terminates when `req.read()` returns empty bytes
-after the STOP condition is received. This approach is correct for any packet
-size and any I2C clock rate.
-
-### Handshake
-
-After each I2C write the control board polls a 1-byte I2C read from the target
-until the target responds `0x01`. The target sends `0x01` only after `handle()`
-returns (i.e., after the HID event has been submitted to the host). This
-back-pressure prevents the control board from sending the next packet while the
-target is still processing, which previously caused ENTER key flooding (release
-packet dropped → key held → auto-repeat) and `[Errno 5]` I/O errors on the I2C
-bus.
+`paniolo hid set -t <target> --cmd "hidrig -d <uart>"` stores an opaque
+command prefix in the lab file's `[targets.<name>.hid]` channel (mirroring the
+generic power hooks; no device-specific code in `cli/`). `paniolo hid send -t
+<target> <args...>` shell-quotes and appends the args and runs the result via
+`sh -c` on the channel's host (transparent SSH dispatch via
+`ChannelKind::Hid`). `paniolo doctor` probes absolute-path helpers with
+`test -e`.
 
 ### Host testing tool (`hidrig/host/`)
 
-`hid_seize_reports.c` is a macOS IOKit utility that opens the target board's
-HID interface with `kIOHIDOptionsTypeSeizeDevice`, preventing any keystroke from
+`hid_seize_reports.c` is a macOS IOKit utility that opens the injector's HID
+interface with `kIOHIDOptionsTypeSeizeDevice`, preventing any keystroke from
 reaching the focused application. It registers an input report callback and
 prints hex dumps of every keyboard and mouse report. Use it to verify the full
-pipeline end-to-end without the Pi:
+pipeline end-to-end without a target:
 
 ```bash
 cd hidrig/host && make
 sudo ./hid_seize_reports   # grant Input Monitoring in System Settings first
 ```
 
-Run `paniolo hid type/key/move/click/scroll` in a second terminal and read the
-reports. The tool prints the 156-byte report descriptor on first device match,
-so you can verify the HID descriptor matches expectations.
+Run `hidrig -d <adapter> type/key/move/click/scroll ...` in a second terminal
+and read the reports. The tool prints the 156-byte report descriptor on first
+device match, so you can verify the HID descriptor matches expectations.
 
 VID/PID are 0x239A/0x8106 (KB2040 running CircuitPython). The built binary is
 gitignored; re-run `make` after cloning.
 
 ### Negative number arguments (`move`, `scroll`)
 
-Click's tokenizer treats any token starting with `-` as a potential option flag.
-`paniolo hid move` and `paniolo hid scroll` use
-`context_settings={"ignore_unknown_options": True}` and accept `dx`/`dy`/`amount`
-as `str` arguments (cast to `int` internally) so that `paniolo hid move 50 -30`
-and `paniolo hid scroll -3` work without the `--` separator.
+clap treats a token starting with `-` as a potential option flag; the `dx`/
+`dy`/`amount` args use `allow_hyphen_values` so `hidrig move 50 -30` and
+`hidrig scroll -3` work without a `--` separator (same for `paniolo hid send`,
+whose trailing args allow hyphen values — keep `-t` before them).
 
 ## _power.py
 

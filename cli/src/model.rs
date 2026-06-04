@@ -105,6 +105,15 @@ pub struct VideoChannel {
     pub host: Option<String>,
 }
 
+/// USB HID input injection: an opaque helper command (e.g. `hidrig -d <uart>`)
+/// that `paniolo hid send` appends protocol arguments to — the device-specific
+/// tool lives outside paniolo, like the power hooks.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct HidChannel {
+    pub cmd: Option<String>,
+    pub host: Option<String>,
+}
+
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct Target {
     pub host: Option<String>,
@@ -114,6 +123,7 @@ pub struct Target {
     pub serial: Vec<SerialChannel>,
     pub power: Option<PowerChannel>,
     pub video: Option<VideoChannel>,
+    pub hid: Option<HidChannel>,
 }
 
 impl Target {
@@ -138,6 +148,7 @@ pub enum ChannelKind {
     Serial,
     Power,
     Video,
+    Hid,
 }
 
 impl ChannelKind {
@@ -147,6 +158,7 @@ impl ChannelKind {
             ChannelKind::Serial => "serial",
             ChannelKind::Power => "power",
             ChannelKind::Video => "video",
+            ChannelKind::Hid => "hid",
         }
     }
 }
@@ -249,6 +261,16 @@ impl Lab {
                 kind: ChannelKind::Video,
                 name: "video".into(),
                 host: host_of(&v.host),
+                fields: f,
+            });
+        }
+        if let Some(h) = &t.hid {
+            let mut f = Vec::new();
+            push_opt(&mut f, "cmd", &h.cmd);
+            channels.push(ResolvedChannel {
+                kind: ChannelKind::Hid,
+                name: "hid".into(),
+                host: host_of(&h.host),
                 fields: f,
             });
         }
@@ -367,6 +389,10 @@ pub fn validate(lab: &Lab) -> Result<(), LabError> {
         if let Some(v) = &t.video {
             let h = v.host.as_deref().unwrap_or(default_host);
             check_host_ref(h, &declared, &format!("target '{name}' video"))?;
+        }
+        if let Some(hid) = &t.hid {
+            let h = hid.host.as_deref().unwrap_or(default_host);
+            check_host_ref(h, &declared, &format!("target '{name}' hid"))?;
         }
         let mut seen: BTreeSet<&str> = BTreeSet::new();
         for s in &t.serial {

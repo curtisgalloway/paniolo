@@ -104,6 +104,11 @@ enum Command {
         #[command(subcommand)]
         cmd: VideoCmd,
     },
+    /// Inject USB HID keyboard/mouse input via the target's configured helper.
+    Hid {
+        #[command(subcommand)]
+        cmd: HidCmd,
+    },
     /// Open the combined video+serial dashboard, starting daemons if needed.
     Console {
         target: Option<String>,
@@ -430,6 +435,35 @@ enum PowerCmd {
 }
 
 #[derive(Subcommand)]
+enum HidCmd {
+    /// Configure the target's hid channel (one per target).
+    Set {
+        #[arg(long, short)]
+        target: String,
+        /// Injection helper command; `hid send` arguments are appended to it
+        /// (e.g. "hidrig -d /dev/cu.usbserial-XXXX").
+        #[arg(long)]
+        cmd: String,
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Remove the target's hid channel.
+    Rm {
+        #[arg(long, short)]
+        target: String,
+    },
+    /// Run the configured helper with the given arguments appended,
+    /// e.g. `paniolo hid send -t pi5 type hello`.
+    Send {
+        #[arg(long, short)]
+        target: Option<String>,
+        /// Arguments appended to the configured cmd (the helper's CLI).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        args: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum VideoCmd {
     /// Configure the target's video channel (one per target).
     Set {
@@ -505,6 +539,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Netif { cmd } => netif_cmd(lab_flag, cmd),
         Command::Power { cmd } => power_cmd(lab_flag, cmd),
         Command::Video { cmd } => video_cmd(lab_flag, cmd),
+        Command::Hid { cmd } => hid_cmd(lab_flag, cmd),
         Command::Console { target, interface } => {
             cmd_console(lab_flag, target.as_deref(), interface.as_deref())
         }
@@ -2170,6 +2205,68 @@ fn power_cmd(lab_flag: Option<&str>, cmd: PowerCmd) -> Result<()> {
         PowerCmd::On { target } => cmd_power_on(lab_flag, target.as_deref()),
         PowerCmd::Off { target } => cmd_power_off(lab_flag, target.as_deref()),
     }
+}
+
+fn hid_cmd(lab_flag: Option<&str>, cmd: HidCmd) -> Result<()> {
+    match cmd {
+        HidCmd::Set { target, cmd, host } => {
+            edit_lab(lab_flag, |lf| {
+                lf.set_hid(&target, Some(&cmd), host.as_deref())
+            })?;
+            println!("hid channel set for '{target}'.");
+            Ok(())
+        }
+        HidCmd::Rm { target } => {
+            edit_lab(lab_flag, |lf| lf.remove_hid(&target))?;
+            println!("hid channel removed from '{target}'.");
+            Ok(())
+        }
+        HidCmd::Send { target, args } => cmd_hid_send(lab_flag, target.as_deref(), &args),
+    }
+}
+
+/// Run the target's hid helper with `args` appended, propagating its exit code.
+/// Paniolo is agnostic to the helper's CLI — the configured cmd owns it (see
+/// docs/hid.md), exactly like the power hooks.
+fn cmd_hid_send(lab_flag: Option<&str>, target: Option<&str>, args: &[String]) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    let target = resolve_single_target(&lab, target)?;
+    if let Some(code) = dispatch::maybe_dispatch(
+        &lab,
+        &target,
+        model::ChannelKind::Hid,
+        None,
+        dispatch::Mode::Reexec,
+    )? {
+        std::process::exit(code);
+    }
+    let t = lab
+        .targets
+        .get(&target)
+        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+    let dh = t.default_host().to_string();
+    let h = t.hid.clone().ok_or_else(|| {
+        anyhow!("target '{target}' has no hid channel (paniolo hid set -t {target} --cmd ...)")
+    })?;
+    if h.host.as_deref().unwrap_or(&dh) != model::LOCAL {
+        bail!("hid channel for '{target}' is not on this host");
+    }
+    let cmd = h.cmd.ok_or_else(|| {
+        anyhow!(
+            "no hid cmd configured for '{target}' \
+             (paniolo hid set -t {target} --cmd 'hidrig -d /dev/...')"
+        )
+    })?;
+    let quoted: Vec<String> = args.iter().map(|a| ssh::shell_quote(a)).collect();
+    let full = format!("{cmd} {}", quoted.join(" "));
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&full)
+        .status()?;
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
 }
 
 // ── rendering helpers ───────────────────────────────────────────────────────

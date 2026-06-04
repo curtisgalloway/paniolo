@@ -161,6 +161,26 @@ fn check_channel(lab: &Lab, ch: &ResolvedChannel, rt: &ResolvedTarget) -> (Statu
                 (Status::Ok, configured.join(","))
             }
         }
+        ChannelKind::Hid => match field(ch, "cmd") {
+            None => (Status::Incomplete, "no cmd set".to_string()),
+            // Like the power hooks: absolute-path helpers are probed for
+            // existence; bare names (resolved via PATH) are taken on faith.
+            Some(cmd) => {
+                let prog = cmd.split_whitespace().next().unwrap_or("");
+                if prog.starts_with('/') {
+                    interpret(
+                        probe(
+                            lab,
+                            &ch.host,
+                            &format!("test -e {}", ssh::shell_quote(prog)),
+                        ),
+                        prog,
+                    )
+                } else {
+                    (Status::Ok, "configured".to_string())
+                }
+            }
+        },
     }
 }
 

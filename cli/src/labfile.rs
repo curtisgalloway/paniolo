@@ -378,6 +378,19 @@ impl LabFile {
         self.remove_singleton(target, "video")
     }
 
+    pub fn set_hid(
+        &mut self,
+        target: &str,
+        cmd: Option<&str>,
+        host: Option<&str>,
+    ) -> Result<(), LabError> {
+        self.set_singleton(target, "hid", &[("cmd", cmd), ("host", host)])
+    }
+
+    pub fn remove_hid(&mut self, target: &str) -> Result<(), LabError> {
+        self.remove_singleton(target, "hid")
+    }
+
     fn target_mut(&mut self, name: &str) -> Result<&mut Table, LabError> {
         self.doc
             .get_mut("targets")
@@ -539,6 +552,24 @@ mod tests {
             "cycle_cmd preserved"
         );
         assert_eq!(p.on_cmd.as_deref(), Some("on.sh"), "on_cmd set");
+    }
+
+    #[test]
+    fn set_hid_round_trips_and_removes() {
+        let (_d, path) = tmp();
+        let mut lf = LabFile::create(&path);
+        lf.add_target("t", None, None).unwrap();
+        lf.set_hid("t", Some("hidrig -d /dev/cu.usbserial-AB12"), None)
+            .unwrap();
+        lf.save().unwrap();
+        let lab = model::load(&path).unwrap();
+        let h = lab.targets["t"].hid.as_ref().unwrap();
+        assert_eq!(h.cmd.as_deref(), Some("hidrig -d /dev/cu.usbserial-AB12"));
+
+        lf.remove_hid("t").unwrap();
+        lf.save().unwrap();
+        let lab = model::load(&path).unwrap();
+        assert!(lab.targets["t"].hid.is_none());
     }
 
     #[test]

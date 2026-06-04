@@ -40,6 +40,7 @@ paniolo netboot set -t <name> --interface <iface> [--tftp-root <dir>] [--host-ip
 paniolo serial add console -t <name> --device <path> [--baud 115200] [--sense cts]
 paniolo power set -t <name> [--cycle-cmd C] [--on-cmd C] [--off-cmd C] [--state-cmd C] [--serial-interface console]
 paniolo video set -t <name> --device "<capture id or name>"
+paniolo hid set -t <name> --cmd "hidrig -d <uart>"   # USB HID injection helper
 ```
 
 - `paniolo netboot devices` lists candidate USB-Ethernet interfaces (the
@@ -47,7 +48,7 @@ paniolo video set -t <name> --device "<capture id or name>"
   `paniolo configure <name> -H <host>` proposes a whole block to paste in.
 - Inspect: `paniolo config show` (whole lab) / `paniolo target show <name>`.
 - Remove: `paniolo target rm <name>`, or per channel (`netboot rm`,
-  `serial rm <iface> -t <name>`, `power rm`, `video rm`).
+  `serial rm <iface> -t <name>`, `power rm`, `video rm`, `hid rm`).
 - `paniolo doctor` probes every configured channel against reality (devices
   exist, over SSH for remote hosts).
 
@@ -222,6 +223,29 @@ paniolo power set -t pi5 \
 ```
 
 See `docs/power.md` for the full `cambrionix` command surface.
+
+## HID injection — type and click into the target
+
+A KB2040 injector presents a USB keyboard + mouse to the target; the control
+host drives it over a UART (USB-serial adapter). The `hid` channel stores an
+opaque helper command (the `hidrig` CLI by default); `paniolo hid send`
+appends its arguments to it and runs it on the channel's host:
+
+```
+paniolo hid set -t <name> --cmd "hidrig -d /dev/cu.usbserial-XXXX" [--host <labhost>]
+paniolo hid send -t <name> type hello world   # type a string
+paniolo hid send -t <name> key ENTER          # tap a key (adafruit_hid Keycode names)
+paniolo hid send -t <name> combo LEFT_CONTROL C
+paniolo hid send -t <name> move 300 -50       # relative mouse move (negatives OK; keep -t first)
+paniolo hid send -t <name> click left | scroll -3 | releaseall
+paniolo hid send -t <name> ping               # injector liveness check
+```
+
+Sequences: `hidrig run <file>` runs a command file (one command per line,
+`# comments`, `delay <ms>` / `sleep <seconds>`) — the file must be on the
+channel's host. The injector is powered by the target's USB port, so it is
+silent while the target is off and reboots with it. Protocol spec (for new
+injector implementations): `docs/hid-serial-protocol.md`.
 
 ## Targets on a remote control host (a "lab")
 

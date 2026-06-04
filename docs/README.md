@@ -22,7 +22,8 @@ and power-cycle it without a person at the bench each iteration. See the root
 | [Power](power.md) | `paniolo power on/off`, `power-cycle`, `power-state`, `serial dtr/reset` | DTR power-button wiring (J2) and generic shell-command hooks; `cambrionix` hub helper. |
 | [Video](video.md) | `paniolo video` | `hdmicap` warm-stream HDMI capture + on-device OCR. |
 | [Dashboard](dashboard.md) | `paniolo console` | Combined video + serial web UI. |
-| [HID injection](hid.md) | `paniolo hid` | USB keyboard/mouse injection via the KB2040 rig. |
+| [HID injection](hid.md) | `paniolo hid` | USB keyboard/mouse injection via a generic helper hook; `hidrig` KB2040 injector. |
+| [HID serial protocol](hid-serial-protocol.md) | — | Normative device-independent spec for HID injectors (v1); implement it on any microcontroller. |
 
 ## Distributed control (Phases 0–3 shipped)
 
@@ -41,7 +42,7 @@ dispatch and the Python-tree retirement are the remaining steps.
 | Doc | What it covers |
 |---|---|
 | [Config redesign: a CLI-managed lab](config-redesign.md) | The lab data model (hosts/targets/per-channel hosts), the CRUD command surface, per-channel dispatch design, and the Python→Rust pivot + staged plan. |
-| [CH9329 driver spec (clean-room)](ch9329-spec.md) | **Deferred** (Openterface HID backend, to revisit): WCH CH9329 serial protocol — frame format, GET_INFO, keyboard report, parameter-config/baud, reset, ACK codes. Reference for when the `hid` channel is reintroduced. |
+| [CH9329 driver spec (clean-room)](ch9329-spec.md) | **Deferred** (Openterface HID backend, to revisit): WCH CH9329 serial protocol — frame format, GET_INFO, keyboard report, parameter-config/baud, reset, ACK codes. A CH9329 shim speaking the [HID serial protocol](hid-serial-protocol.md) would plug into the same `hid` channel. |
 
 ## Hardware-CI integration (in design)
 
@@ -58,7 +59,7 @@ orchestration or results.
 ## For contributors / agents
 
 - [`AGENTS.md`](../AGENTS.md) — module-by-module internals, source constraints, and how to add a subsystem.
-- [`hidrig/README.md`](../hidrig/README.md) — HID rig wiring, firmware, and wire protocol.
+- [`hidrig/README.md`](../hidrig/README.md) — HID injector wiring, firmware, and host CLI.
 
 ---
 

@@ -87,8 +87,9 @@
 
 | ID | Requirement | Pri | Status | Notes |
 |---|---|---|---|---|
-| HID-1 | USB keyboard/mouse injection via two-board KB2040 rig | S | ☑ | `hidrig/`; needs `pyserial` extra |
-| HID-2 | `hid type/key/combo/releaseall/click/move/scroll/run/setup/show` | S | ☑ | `_cli.py` |
+| HID-1 | USB keyboard/mouse injection via single-board KB2040 injector (UART control link) | S | ☑ | `hidrig/` crate + firmware |
+| HID-2 | Device-independent HID serial protocol (v1) so other microcontrollers can implement the injector | S | ☑ | `docs/hid-serial-protocol.md` |
+| HID-3 | Generic `hid` lab channel: `paniolo hid set/rm/send` appends args to an opaque helper cmd | S | ☑ | mirrors power hooks; SSH dispatch |
 
 ## 7. Dashboard
 

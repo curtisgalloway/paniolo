@@ -19,7 +19,7 @@ and power-cycle it without human intervention at each iteration.
 | [Video](docs/video.md) | `paniolo video` | HDMI capture via warm-stream daemon; on-device OCR |
 | [Serial](docs/serial.md) | `paniolo serial` | Serial console — interactive (tio) or daemon-backed with timestamped rolling log |
 | [Power control](docs/power.md) | `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`, `paniolo serial dtr/reset` | DTR-based hardware power button (J2 header) and generic shell-command hooks (on/off/cycle/state) |
-| [HID injection](docs/hid.md) | `paniolo hid` | USB keyboard/mouse injection via a two-board KB2040 rig |
+| [HID injection](docs/hid.md) | `paniolo hid` | USB keyboard/mouse injection via a generic helper hook (`hidrig` KB2040 injector by default) |
 | [Dashboard](docs/dashboard.md) | `paniolo console` | Combined video + serial web UI; auto-starts daemons; `-i <name>` preselects a serial interface |
 
 ---
@@ -51,7 +51,7 @@ make install           # paniolo CLI + daemons + OCR helper, in one step
 
 `make install` bootstraps the CLI with `cargo install --path cli`, then runs
 `paniolo setup`, which compiles and installs all of paniolo's binaries — the
-`paniolo` CLI itself plus the daemons and helpers (`hdmicap`, `serialcap`, `netbootd`, `cambrionix`) —
+`paniolo` CLI itself plus the daemons and helpers (`hdmicap`, `serialcap`, `netbootd`, `cambrionix`, `hidrig`) —
 and the OCR helper (`visionocr` on macOS via `swiftc`, `linuxocr` on Linux)
 into `~/.cargo/bin`. One static binary per component, no Python environment.
 Netboot is served by the single-binary `netbootd` (Rust) engine. (On macOS,
@@ -81,12 +81,12 @@ cargo install --path ~/src/paniolo/hdmicap    # if hdmicap changed
 cargo install --path ~/src/paniolo/serialcap  # if serialcap changed
 cargo install --path ~/src/paniolo/netbootd   # if netbootd changed (re-run `paniolo setup` to re-setuid the helper on macOS)
 cargo install --path ~/src/paniolo/cambrionix # if cambrionix changed
+cargo install --path ~/src/paniolo/hidrig     # if hidrig changed
 ```
 
-The USB HID commands (`paniolo hid`) still live in the legacy Python CLI
-pending the Rust port (see [docs/hid.md](docs/hid.md)); installing it via uv
-recreates the PATH shadow above, so prefer a throwaway run
-(`uv run --with pyserial paniolo hid ...`) if you need them.
+USB HID injection (`paniolo hid`) shells out to a helper speaking the
+[HID serial protocol](docs/hid-serial-protocol.md) — by default `hidrig`,
+the client for the KB2040 injector (see [docs/hid.md](docs/hid.md)).
 
 ---
 
@@ -123,7 +123,7 @@ ssh control-mac "paniolo power-cycle target-machine"
 A *target* is a named machine you want to control. Configuration lives in a
 single CLI-managed **lab file** (`~/.config/paniolo/lab.toml`, or `--lab` /
 `PANIOLO_LAB`): hosts plus targets, each target's hardware described as
-*channels* (`netboot`, `serial`, `power`, `video`) bound to the host they're
+*channels* (`netboot`, `serial`, `power`, `video`, `hid`) bound to the host they're
 physically attached to. No daemon required. If exactly one target is
 configured it is the default and can be omitted from every command.
 
@@ -136,7 +136,6 @@ See [docs/config-redesign.md](docs/config-redesign.md) for the model and
 |---|---|
 | Target configs | `~/.config/paniolo/targets/<name>.toml` |
 | Video config | `~/.config/paniolo/video.toml` |
-| HID config | `~/.config/paniolo/hid.toml` |
 | Netboot daemon state | `~/.local/share/paniolo/<name>/netboot.json` |
 | hdmicap discovery | `/tmp/paniolo-<uid>/hdmicap/daemon.json` |
 | serialcap discovery | `/tmp/paniolo-<uid>/serialcap/daemon.json` |

@@ -11,6 +11,21 @@
 - .gitignore
 - pyproject.toml
 
+## Tech Stack: cambrionix
+
+### Languages
+
+- Rust
+
+### Dependencies
+
+- clap
+
+### Configuration Files
+
+- .gitignore
+- Cargo.toml
+
 ## Tech Stack: cli
 
 ### Languages
@@ -46,6 +61,21 @@
 ### Languages
 
 - Rust
+
+### Configuration Files
+
+- .gitignore
+- Cargo.toml
+
+## Tech Stack: hidrig
+
+### Languages
+
+- Rust
+
+### Dependencies
+
+- clap
 
 ### Configuration Files
 

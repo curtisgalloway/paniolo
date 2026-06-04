@@ -38,15 +38,15 @@ This skill contains the following reference files:
 
 ## Statistics
 
-123 files | 30,477 lines
+131 files | 31,972 lines
 
 | Language | Files | Lines |
 |----------|------:|------:|
-| Rust | 37 | 14,175 |
-| Python | 34 | 9,571 |
-| Markdown | 25 | 4,964 |
-| No Extension | 12 | 480 |
-| TOML | 6 | 333 |
+| Rust | 41 | 15,354 |
+| Python | 34 | 9,610 |
+| Markdown | 25 | 5,173 |
+| No Extension | 14 | 482 |
+| TOML | 8 | 399 |
 | JavaScript | 2 | 4 |
 | LOCK | 1 | 1 |
 | CSS | 1 | 209 |
@@ -57,11 +57,11 @@ This skill contains the following reference files:
 **Largest files:**
 - `src/paniolo/_cli.py` (2,600 lines)
 - `hdmicap/vendor/nokhwa-bindings-macos/src/lib.rs` (2,463 lines)
-- `cli/src/main.rs` (2,123 lines)
+- `cli/src/main.rs` (2,341 lines)
 - `netbootd/src/tftp.rs` (919 lines)
-- `AGENTS.md` (867 lines)
+- `AGENTS.md` (871 lines)
 - `serialcap/src/capture.rs` (683 lines)
 - `serialcap/src/serial_io.rs` (614 lines)
 - `src/paniolo/_netboot.py` (601 lines)
+- `cli/src/labfile.rs` (587 lines)
 - `src/paniolo/_tftp.py` (563 lines)
-- `cli/src/model.rs` (519 lines)

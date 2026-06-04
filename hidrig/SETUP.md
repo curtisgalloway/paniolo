@@ -14,52 +14,39 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# HID rig bring-up
+# HID injector bring-up
 
-Step-by-step for flashing and provisioning the two boards, then driving them
-with `paniolo hid`. Verified end-to-end on macOS with an **Adafruit QT2040
-Trinkey** (control) + **Adafruit KB2040** (target) on CircuitPython 9.2.9: the
-full `paniolo` → control → I2C/STEMMA QT → target path was confirmed
-(`releaseall` returned `OK` across the link). Linux differs only in device
-paths (`/dev/ttyACM*`, CIRCUITPY under `/media|/run/media/<user>/`).
+Step-by-step for flashing and provisioning the KB2040 injector, then driving
+it with `hidrig` / `paniolo hid`. Linux differs from macOS only in device
+paths (`/dev/ttyUSB*` for the adapter, CIRCUITPY under
+`/media|/run/media/<user>/`).
 
-See `README.md` for wiring and the protocol; this file is the install runbook.
+See `README.md` for wiring and the protocol; this file is the install
+runbook.
 
-## Roles
+## 1. CircuitPython
 
-- **Control board** (KB2040 *or* QT2040 Trinkey): USB → test computer. Parses
-  text commands, relays binary packets over I2C. Does **no** HID itself; it
-  pulls in `adafruit_hid` only for the `Keycode` name→number table.
-- **Target board** (KB2040): USB → the Raspberry Pi (the actual HID keyboard +
-  mouse). Acts as the I2C peripheral at `0x41`.
-
-You need **both** boards plus a STEMMA QT cable for real input injection. With
-only the control board you can still validate the host→control path (below).
-
-## 1. CircuitPython (both boards)
-
-Match the firmware's target: **CircuitPython 9.x** (the `i2ctarget` /
-`adafruit_hid` APIs the target relies on may shift on 10.x — unverified). Latest
+Match the firmware's target: **CircuitPython 9.x** (10.x unverified). Latest
 9.x at time of writing: **9.2.9**.
 
-1. Find the board id from its CircuitPython page (the QT2040 Trinkey is
-   `adafruit_qt2040_trinkey`; the KB2040 is `adafruit_kb2040`). UF2 URL pattern:
+1. The KB2040's board id is `adafruit_kb2040`. UF2 URL pattern:
    ```
-   https://downloads.circuitpython.org/bin/<board_id>/en_US/adafruit-circuitpython-<board_id>-en_US-9.2.9.uf2
+   https://downloads.circuitpython.org/bin/adafruit_kb2040/en_US/adafruit-circuitpython-adafruit_kb2040-en_US-9.2.9.uf2
    ```
-2. Enter the UF2 bootloader: **unplug, hold the BOOT button, plug back in**
-   (the QT2040 Trinkey has a BOOT button, not a reset button). An `RPI-RP2`
-   drive mounts. Confirm with `cat /Volumes/RPI-RP2/INFO_UF2.TXT`.
+2. Enter the UF2 bootloader: **unplug, hold the BOOT button, plug into a dev
+   machine**. An `RPI-RP2` drive mounts. Confirm with
+   `cat /Volumes/RPI-RP2/INFO_UF2.TXT`.
 3. Copy the UF2 onto `RPI-RP2`:
    ```
-   cp adafruit-circuitpython-...-9.2.9.uf2 /Volumes/RPI-RP2/
+   cp adafruit-circuitpython-adafruit_kb2040-en_US-9.2.9.uf2 /Volumes/RPI-RP2/
    ```
-   On macOS `cp` to this FAT volume exits non-zero with an "extended attributes"
-   error — that's benign, the write succeeds and the board reboots. Don't retry.
+   On macOS `cp` to this FAT volume exits non-zero with an "extended
+   attributes" error — that's benign, the write succeeds and the board
+   reboots. Don't retry.
 4. The board reboots into CircuitPython and `CIRCUITPY` mounts (~5–10 s).
    `cat /Volumes/CIRCUITPY/boot_out.txt` shows the version + board id.
 
-## 2. adafruit_hid (both boards)
+## 2. adafruit_hid
 
 `circup` reads the board's CP version and installs the matching build:
 
@@ -67,76 +54,75 @@ Match the firmware's target: **CircuitPython 9.x** (the `i2ctarget` /
 uvx circup --path /Volumes/CIRCUITPY install adafruit_hid
 ```
 
-(`i2ctarget` is a built-in core module — no library needed.)
-
-## 3. Control board firmware
+## 3. Firmware
 
 ```
-cp hidrig/control/boot.py /Volumes/CIRCUITPY/boot.py
-cp hidrig/control/code.py /Volumes/CIRCUITPY/code.py
+cp hidrig/firmware/boot.py /Volumes/CIRCUITPY/boot.py
+cp hidrig/firmware/code.py /Volumes/CIRCUITPY/code.py
 ```
 
-`boot.py` enables the second USB CDC ("data") channel, and **only takes effect
-on a hard reset** — code saves trigger a soft reload, which does *not* re-run
-`boot.py`. **Unplug and replug** the board (normal plug, no button). It should
-now enumerate **two** serial ports:
+`boot.py` only takes effect on a **hard reset** (replug); a code save's soft
+reload does not re-run it. After the reset the board is **HID-only**: no
+CIRCUITPY drive, no REPL, no serial ports on its USB. That's correct — the
+USB now faces the target.
+
+**To get CIRCUITPY back** (firmware updates): jumper `D2` to GND (adjacent
+pins on the KB2040 edge), plug into the dev machine, and the drive + REPL
+re-enumerate. Remove the jumper and replug for normal operation.
+
+## 4. Wiring
+
+1. Plug the KB2040's USB into the **target** — it enumerates as a USB
+   keyboard + mouse and powers the board.
+2. Wire the control host's 3.3 V USB-serial adapter to the board:
+   adapter **TX -> RX**, adapter **RX -> TX**, **GND -> GND**.
+
+NeoPixel: blinking red until the target enumerates the board, then a green
+blip when it starts serving.
+
+## 5. Drive it
+
+Directly:
 
 ```
-ls /dev/cu.usbmodem*    # macOS: two nodes appear
+cargo install --path hidrig          # once
+hidrig -d /dev/cu.usbserial-XXXX ping
+hidrig -d /dev/cu.usbserial-XXXX version     # expect: 1 kb2040-circuitpython/1.0
+hidrig -d /dev/cu.usbserial-XXXX type "hello"
 ```
 
-The **data** port (the one `paniolo hid` uses) is the **higher-numbered** of the
-two; the lower one is the REPL console.
-
-## 4. Target board firmware
+Through paniolo (lab file is the source of truth):
 
 ```
-cp hidrig/target/code.py /Volumes/CIRCUITPY/code.py
+paniolo hid set -t <target> --cmd "hidrig -d /dev/cu.usbserial-XXXX"
+paniolo hid send -t <target> type hello
+paniolo hid send -t <target> key ENTER
 ```
 
-The target needs no `boot.py` today (only the future absolute-mouse descriptor
-in HANDOFF.md task 1 would add one). Then:
+## 6. Validate end-to-end without a target
 
-- Plug the **target** board's USB into the Raspberry Pi — it enumerates as a USB
-  keyboard + mouse.
-- Connect the **STEMMA QT cable** between the two boards (I2C; built-in
-  pull-ups, no resistors needed).
-
-## 5. Configure and drive with paniolo
+Plug the injector's USB into the same dev machine that drives the UART, then
+run the IOKit capture tool (macOS):
 
 ```
-paniolo hid setup --port /dev/cu.usbmodem<DATA>   # save the control board's data port
-paniolo hid type "hello"
-paniolo hid key ENTER
-paniolo hid combo LEFT_CONTROL A
-paniolo hid move 300 -50
-paniolo hid run sequence.txt                       # file of commands; # comments, delay/sleep
+cd hidrig/host && make
+sudo ./hid_seize_reports     # grant Input Monitoring when prompted
 ```
 
-`paniolo hid setup` with no `--port` lists candidates and prompts (the data port
-is the higher-numbered). `paniolo hid show` reports the saved port.
-
-## 6. Validate
-
-Send a command and watch the reply:
-
-- **No target board attached:** the control board parses the command, tries the
-  I2C relay, and replies `ERR [Errno 19] No such device`. That error is the
-  **success** signal for the control-only path — it proves the data channel,
-  command parser, and OK/ERR protocol all work.
-- **Target attached and on the Pi:** the command returns `OK` and the keystroke
-  / mouse event appears on the Pi.
+In a second terminal, `hidrig -d <adapter> type test` — the raw HID reports
+print in the first terminal and nothing reaches the focused app.
 
 ## Gotchas
 
-- **BOOT button, not reset** — the QT2040 Trinkey enters the bootloader by
-  holding BOOT while plugging in.
-- **`boot.py` needs a power cycle** to take effect (soft reload won't do it); if
-  you only see one CDC port, you haven't hard-reset since copying `boot.py`.
-- **FAT32 `cp` error on macOS is benign** (extended-attributes); the UF2/file
-  copy still succeeds.
-- **CircuitPython 9.x**, not 10.x, until the target firmware is verified on 10.
-- **Data vs console port:** commands only get `OK`/`ERR` replies on the data
-  (higher-numbered) port; the console port is the REPL.
-- If `CIRCUITPY` won't mount or is read-only, press the board's reset / replug;
+- **`boot.py` needs a hard reset** (replug) to take effect; a soft reload
+  won't re-run it.
+- **No serial ports on the board's USB is normal** — the control path is the
+  UART via the adapter. If you need the REPL, use the D2 dev jumper.
+- **Crossed wiring:** no reply to `ping` usually means TX/RX not crossed, a
+  missing ground, or the target (and therefore the board) is powered off.
+- **3.3 V adapters only** — a 5 V-logic adapter can damage the RP2040.
+- **FAT32 `cp` error on macOS is benign** (extended attributes); the
+  UF2/file copy still succeeds.
+- **CircuitPython 9.x**, not 10.x, until the firmware is verified on 10.
+- If `CIRCUITPY` won't mount or is read-only in dev mode, replug the board;
   a clean remount restores host write access.
