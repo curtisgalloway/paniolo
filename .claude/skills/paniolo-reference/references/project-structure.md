@@ -109,7 +109,7 @@ serialcap/
   Cargo.toml (45 lines)
 skills/
   paniolo/
-    SKILL.md (296 lines)
+    SKILL.md (293 lines)
 src/
   paniolo/
     __init__.py (13 lines)
@@ -146,9 +146,9 @@ tests/
   test_state.py (203 lines)
   test_video.py (146 lines)
 .gitignore (10 lines)
-AGENTS.md (863 lines)
+AGENTS.md (867 lines)
 LICENSE (201 lines)
-Makefile (76 lines)
+Makefile (82 lines)
 pyproject.toml (36 lines)
-README.md (151 lines)
+README.md (148 lines)
 ```

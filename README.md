@@ -36,10 +36,8 @@ design and the project requirements tracker are under [`docs/`](docs/README.md) 
 ## Requirements
 
 - macOS 10.14 (Mojave) or later, or Linux (x86-64 / arm64)
-- Python 3.11+
-- [uv](https://docs.astral.sh/uv/) (`brew install uv` on macOS, or the [uv installer](https://docs.astral.sh/uv/getting-started/installation/) on Linux)
 - [Homebrew](https://brew.sh) (macOS only — Linux uses the system package manager)
-- Rust toolchain (for hdmicap, serialcap — `brew install rustup` on macOS, or `rustup.rs` on Linux)
+- Rust toolchain (`brew install rustup` on macOS, or `rustup.rs` on Linux)
 
 ---
 
@@ -48,23 +46,24 @@ design and the project requirements tracker are under [`docs/`](docs/README.md) 
 ```bash
 git clone https://github.com/curtisgalloway/paniolo ~/src/paniolo
 cd ~/src/paniolo
-make install           # Python CLI + Rust daemons + OCR helper, in one step
+make install           # paniolo CLI + daemons + OCR helper, in one step
 ```
 
-`make install` runs `uv tool install --reinstall .` for the Python CLI, then
-`paniolo setup`, which compiles and installs the Rust daemons (`hdmicap`,
-`serialcap`, `netbootd`) and the OCR helper (`visionocr` on macOS via `swiftc`,
-`linuxocr` on Linux) into `~/.cargo/bin`. Netboot is served by the
-single-binary `netbootd` (Rust) engine. (On macOS, `setup` also installs
-`netbootd-bpf-helper` setuid-root — one sudo — for the `netbootd` raw-frame
-send path.)
+`make install` bootstraps the CLI with `cargo install --path cli`, then runs
+`paniolo setup`, which compiles and installs all of paniolo's binaries — the
+`paniolo` CLI itself plus the daemons (`hdmicap`, `serialcap`, `netbootd`) —
+and the OCR helper (`visionocr` on macOS via `swiftc`, `linuxocr` on Linux)
+into `~/.cargo/bin`. One static binary per component, no Python environment.
+Netboot is served by the single-binary `netbootd` (Rust) engine. (On macOS,
+`setup` also installs `netbootd-bpf-helper` setuid-root — one sudo — for the
+`netbootd` raw-frame send path.) Configuration is one CLI-managed lab file
+(`~/.config/paniolo/lab.toml`); see
+[docs/config-redesign.md](docs/config-redesign.md).
 
-> **Rust control plane:** the CLI itself is being rewritten in Rust (the
-> `cli/` crate; see [docs/config-redesign.md](docs/config-redesign.md)).
-> `paniolo setup` from the Rust CLI installs the daemons *and* the Rust
-> `paniolo` binary into `~/.cargo/bin` — a single static binary per control
-> host, no Python environment needed. Configuration moves to one CLI-managed
-> lab file (`~/.config/paniolo/lab.toml`).
+> **Upgrading from the Python CLI?** The old `make install` registered the
+> Python `paniolo` as a uv tool; its `~/.local/bin/paniolo` shim shadows the
+> Rust binary in `~/.cargo/bin`. Remove it once: `uv tool uninstall paniolo`
+> (`make install` warns if a shadow is detected).
 
 To pick up code changes after pulling or editing, just re-run it:
 
@@ -72,23 +71,21 @@ To pick up code changes after pulling or editing, just re-run it:
 make install           # rebuilds and reinstalls everything (idempotent)
 ```
 
-Or target one layer while iterating: `make python` (CLI only), `make rust`
-(the Rust crates only, skipping OCR/setuid), `make native` (`paniolo setup`
-only). `make help` lists every target. The underlying commands still work
-directly if you prefer:
+Or iterate faster with `make rust` (cargo-install the crates only, skipping
+the OCR/setuid steps). `make help` lists every target. The underlying commands
+still work directly if you prefer:
 
 ```bash
-uv tool install --reinstall ~/src/paniolo
+cargo install --path ~/src/paniolo/cli        # if the CLI changed
 cargo install --path ~/src/paniolo/hdmicap    # if hdmicap changed
 cargo install --path ~/src/paniolo/serialcap  # if serialcap changed
 cargo install --path ~/src/paniolo/netbootd   # if netbootd changed (re-run `paniolo setup` to re-setuid the helper on macOS)
 ```
 
-For the USB HID commands, install the optional `pyserial` extra:
-
-```bash
-uv tool install --with pyserial ~/src/paniolo
-```
+The USB HID commands (`paniolo hid`) still live in the legacy Python CLI
+pending the Rust port (see [docs/hid.md](docs/hid.md)); installing it via uv
+recreates the PATH shadow above, so prefer a throwaway run
+(`uv run --with pyserial paniolo hid ...`) if you need them.
 
 ---
 

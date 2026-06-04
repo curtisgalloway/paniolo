@@ -716,10 +716,13 @@ Top-level commands:
   `~/.cargo/bin`. On macOS it then installs `netbootd-bpf-helper` **setuid-root**
   (the one-time sudo) so the rust netboot engine's BPF path works unprivileged.
 
-`make install` (repo root) is the one-step build-and-install: it runs
-`uv tool install --reinstall .` for the Python CLI, then `paniolo setup` for the
-native side. Re-run it after editing anything. Narrower targets: `make python`,
-`make rust` (crates only), `make native` (`paniolo setup` only); `make help` lists all.
+`make install` (repo root) is the one-step build-and-install: it bootstraps
+the CLI with `cargo install --path cli`, then runs `paniolo setup` (by its
+installed `~/.cargo/bin` path, immune to PATH shadows) for everything else.
+Re-run it after editing anything; it warns if another `paniolo` shadows the
+installed one (e.g. the retired Python CLI's uv-tools shim — remove with
+`uv tool uninstall paniolo`). Narrower target: `make rust` (cargo-install the
+crates only, skipping OCR/setuid); `make help` lists all.
 
 ## Runtime paths
 
@@ -754,8 +757,9 @@ native side. Re-run it after editing anything. Narrower targets: `make python`,
   is disabled per-file where that pattern appears (not worked around).
 - **`paniolo setup` builds the native components from the source tree**, so it
   must run from a clone — `make install` (which invokes the *installed* CLI)
-  resolves the checkout via `_paths.repo_root()` (`__file__` or cwd). Run from
-  outside a checkout, setup errors clearly instead of silently skipping.
+  resolves the checkout by walking up from the cwd (`setup::find_repo_root`).
+  Run from outside a checkout, setup errors clearly instead of silently
+  skipping.
 
 ## Remote control pattern
 

@@ -17,20 +17,16 @@ configured, the name can be omitted.
 
 ```
 cd ~/src/paniolo
-uv tool install .          # installs the `paniolo` CLI into ~/.local/bin
-paniolo setup              # builds/installs hdmicap, serialcap, netbootd, visionocr;
+make install               # cargo-installs the `paniolo` CLI, then `paniolo setup`
+                           # builds/installs hdmicap, serialcap, netbootd, visionocr;
                            # on macOS also installs netbootd-bpf-helper setuid-root (one sudo)
 ```
 
-`uv tool install .` is required first — without it the `paniolo` command doesn't
-exist yet. Run both steps once per machine. Make sure `~/.local/bin` (uv tools)
-and `~/.cargo/bin` (Rust daemons) are on your `PATH`.
-
-To pick up Python code changes after pulling or editing:
-
-```
-cd ~/src/paniolo && uv tool install --reinstall .
-```
+Run once per machine; re-run after pulling or editing (it's a full rebuild).
+Everything lands in `~/.cargo/bin` — make sure it's on `PATH`. If a `paniolo`
+from the retired Python CLI shadows it (uv-tools shim in `~/.local/bin`),
+remove it with `uv tool uninstall paniolo`; `make install` warns when it
+detects a shadow.
 
 ## Configure a target
 
@@ -281,7 +277,8 @@ daemons there over an ssh PTY.)
 ## Quick reference — gotchas
 
 - Serial port is exclusive: one of `connect` / `watch` / external `tio`/`screen`.
-- `~/.local/bin` (uv tool) and `~/.cargo/bin` (Rust daemons) must be on `PATH`.
+- `~/.cargo/bin` (the CLI and daemons) must be on `PATH`; a stale Python
+  `paniolo` in `~/.local/bin` shadows it (`uv tool uninstall paniolo`).
 - `paniolo console` auto-starts both daemons if they aren't running.
 - Netboot requires passwordless `sudo` (`ip` on Linux, `ifconfig` on macOS).
 - netboot and ffx are mutually exclusive on the link — use `paniolo netif mode`

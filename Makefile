@@ -12,46 +12,53 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Build and install the entire paniolo package: the Python CLI plus the native
-# binaries (hdmicap, serialcap, netbootd) and the OCR helper. `make install`
-# from a fresh clone is the only command you need; re-run it after editing
-# anything to rebuild and reinstall.
+# Build and install paniolo: the Rust CLI (cli/) plus the daemons (hdmicap,
+# serialcap, netbootd) and the OCR helper. `make install` from a fresh clone
+# is the only command you need; re-run it after editing anything to rebuild
+# and reinstall.
 
-CRATES = hdmicap serialcap netbootd
-PANIOLO ?= paniolo
+CRATES = cli hdmicap serialcap netbootd
 
-.PHONY: help install reinstall python rust native test fmt clean
+# The installed CLI, by absolute path: immune to a stale `paniolo` shadowing
+# ~/.cargo/bin earlier in PATH (e.g. the retired Python CLI's uv-tools shim).
+PANIOLO ?= $(HOME)/.cargo/bin/paniolo
+
+.PHONY: help install reinstall rust test fmt clean check-shadow
 
 help:
 	@echo "paniolo build targets:"
-	@echo "  make install    Build + install everything: Python CLI, Rust daemons, OCR helper"
-	@echo "                   (+ tftp-now/setuid on macOS, group setup on Linux). Re-run anytime."
+	@echo "  make install    Build + install everything: the paniolo CLI, the daemons,"
+	@echo "                   and platform steps via 'paniolo setup' (OCR helper,"
+	@echo "                   bpf-helper setuid on macOS, group setup on Linux)."
 	@echo "  make reinstall   Alias for 'make install' (install is already a full rebuild)."
-	@echo "  make python      Reinstall just the Python CLI (uv tool install --reinstall)."
-	@echo "  make rust        Rebuild + install just the Rust crates ($(CRATES))."
-	@echo "  make native      Run 'paniolo setup' only (Rust crates + OCR + macOS setuid)."
-	@echo "  make test        Run the Python (pytest) and Rust (cargo test) suites."
+	@echo "  make rust        Fast path: cargo install the crates ($(CRATES)) only,"
+	@echo "                   skipping the OCR/setuid/group steps."
+	@echo "  make test        cargo test every crate."
 	@echo "  make fmt         rustfmt every crate."
 	@echo "  make clean       cargo clean every crate."
 
-# Full build + install. uv installs/reinstalls the Python CLI, then `paniolo
-# setup` (run from the freshly installed CLI) builds and installs the Rust
-# daemons and OCR helper and applies the platform-specific steps — tftp-now and
-# the setuid bpf-helper on macOS, dialout/video group membership on Linux.
-install: python native
+# Full build + install. Bootstrap the CLI with cargo, then let `paniolo setup`
+# do the rest — it rebuilds all four crates and applies the platform-specific
+# steps, so all that logic lives in one place (cli/src/setup.rs).
+install: check-shadow
+	cargo install --path cli
+	$(PANIOLO) setup
 
 reinstall: install
 
-python:
-	uv tool install --reinstall .
+# Warn when a different `paniolo` shadows the installed one. The pre-Rust
+# `make install` used to register the Python CLI as a uv tool; anyone who ran
+# it has a ~/.local/bin/paniolo shim that silently wins over ~/.cargo/bin.
+check-shadow:
+	@found=$$(command -v paniolo 2>/dev/null); \
+	if [ -n "$$found" ] && [ "$$found" != "$(PANIOLO)" ]; then \
+		echo "WARNING: 'paniolo' in PATH is $$found, not $(PANIOLO)."; \
+		echo "         If it is the retired Python CLI, remove it:"; \
+		echo "             uv tool uninstall paniolo"; \
+	fi
 
-# Native side via the CLI's own setup command, so all the platform logic
-# (setuid, Homebrew tools, Linux groups, OCR helper) lives in one place.
-native:
-	$(PANIOLO) setup
-
-# Fast path for iterating on the Rust daemons without re-running the full setup
-# (skips OCR and the macOS setuid step — re-run `make native` if you need those).
+# Fast path for iterating on the Rust code without re-running the full setup
+# (skips OCR and the macOS setuid step — re-run `make install` if you need those).
 rust:
 	@for crate in $(CRATES); do \
 		echo "==> cargo install --path $$crate"; \
@@ -59,7 +66,6 @@ rust:
 	done
 
 test:
-	uv run pytest -q
 	@for crate in $(CRATES); do \
 		echo "==> cargo test ($$crate)"; \
 		( cd $$crate && cargo test ) || exit 1; \
