@@ -52,6 +52,14 @@ width) layouts. The choice persists in `localStorage`.
 current frame via Apple Vision and displays the result. Requires
 `visionocr` to be installed (`paniolo setup`).
 
+**Capture input (KVM)** — when the target has a `hid` channel, a **⌨ Capture
+input** button appears over the video. Engaging it forwards your keyboard and
+mouse to the target as USB HID events (the mouse is absolute — the target
+cursor follows where you point in the video). **Right-Ctrl** releases capture.
+The page streams commands to the hid daemon over a WebSocket, and `paniolo hid
+send` injections from the CLI intermix with them. See
+[HID injection › KVM mode](hid.md#kvm-mode--type-and-click-from-the-web-console).
+
 ---
 
 ## URL parameters
@@ -61,6 +69,8 @@ current frame via Apple Vision and displays the result. Requires
 | `?serial=<port>` | Connect terminal to serialcap on a non-default port |
 | `?serialws=<url>` | Connect terminal to an explicit WebSocket URL |
 | `?interface=<name>` | Preselect a named serial interface |
+| `?hid=<port>` | Enable KVM input via the hid daemon on a local port |
+| `?hidws=<url>` | Enable KVM input via an explicit hid WebSocket URL |
 
 ---
 

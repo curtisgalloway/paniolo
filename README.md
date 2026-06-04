@@ -19,7 +19,7 @@ and power-cycle it without human intervention at each iteration.
 | [Video](docs/video.md) | `paniolo video` | HDMI capture via warm-stream daemon; on-device OCR |
 | [Serial](docs/serial.md) | `paniolo serial` | Serial console — interactive (tio) or daemon-backed with timestamped rolling log |
 | [Power control](docs/power.md) | `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`, `paniolo serial dtr/reset` | DTR-based hardware power button (J2 header) and generic shell-command hooks (on/off/cycle/state) |
-| [HID injection](docs/hid.md) | `paniolo hid` | USB keyboard/mouse injection via a generic helper hook (`hidrig` KB2040 injector by default) |
+| [HID injection](docs/hid.md) | `paniolo hid` | USB keyboard/mouse injection via a generic helper hook (`hidrig` KB2040 injector); KVM input from the web console |
 | [Dashboard](docs/dashboard.md) | `paniolo console` | Combined video + serial web UI; auto-starts daemons; `-i <name>` preselects a serial interface |
 
 ---

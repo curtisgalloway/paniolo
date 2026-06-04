@@ -18,11 +18,17 @@
 //! plugged into the target machine; this tool talks the board's line-based
 //! text protocol over the TX/RX UART (via a USB-serial adapter).
 //!
-//! Subcommands mirror the firmware protocol one-to-one (type, key, combo,
-//! down, up, releaseall, move, click, mdown, mup, scroll, ping), plus `run`
-//! for host-side command files with `delay`/`sleep` directives.
+//! One-shot subcommands mirror the firmware protocol one-to-one (type, key,
+//! combo, down, up, releaseall, move, moveabs, click, mdown, mup, scroll,
+//! ping, version), plus `run` for command files. `serve` runs a daemon that
+//! owns the UART and re-exposes the protocol over a WebSocket so the web
+//! console can stream events that intermix with CLI injections; when a daemon
+//! is running for the same device, one-shots route through it automatically.
 
+mod daemon;
 mod proto;
+mod server;
+mod uart;
 
 use std::io::Read;
 use std::thread;
@@ -82,6 +88,14 @@ enum Cmd {
         #[arg(allow_hyphen_values = true)]
         dy: i32,
     },
+    /// Absolute mouse move in a 0..32767 logical space (requires the
+    /// `moveabs` capability; the host OS maps the range across the screen).
+    Moveabs {
+        /// X in 0..32767 (clamped).
+        x: i32,
+        /// Y in 0..32767 (clamped).
+        y: i32,
+    },
     /// Click a mouse button.
     Click {
         /// left | right | middle.
@@ -105,7 +119,7 @@ enum Cmd {
     },
     /// No-op health check: confirms the board is powered and replying.
     Ping,
-    /// Print the board's protocol version and implementation id.
+    /// Print the board's protocol version, implementation id, and capabilities.
     Version,
     /// Run a command file: one protocol command per line; blank lines and
     /// `# comments` are skipped; `delay <ms>` / `sleep <seconds>` pause.
@@ -116,46 +130,136 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         delay_ms: u64,
     },
+    /// Run the daemon: own the UART and re-expose the protocol over a localhost
+    /// WebSocket (the KVM path). Blocks until stopped. One-shot invocations for
+    /// the same device route through this daemon automatically.
+    Serve {
+        /// TCP port to listen on (0 = OS-assigned; the port is published in the
+        /// discovery file the paniolo console reads).
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+    },
+    /// Stop a running hid daemon (SIGTERM to the recorded pid).
+    Stop,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let device = cli
-        .device
-        .as_deref()
-        .ok_or_else(|| anyhow!("required argument '--device <DEVICE>' (-d) was not provided"))?;
-    let mut port = open_port(device)?;
+
+    // Commands that don't open the UART directly.
+    match &cli.cmd {
+        Cmd::Serve { port } => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "info".into()),
+                )
+                .init();
+            let device = require_device(&cli)?;
+            return daemon::run(device.to_string(), *port);
+        }
+        Cmd::Stop => return cmd_stop(),
+        _ => {}
+    }
+
+    let device = require_device(&cli)?;
+    let mut tx = Sender::open(device)?;
 
     match cli.cmd {
-        Cmd::Type { text } => one(&mut port, &format!("type {}", text.join(" "))),
-        Cmd::Key { name } => one(&mut port, &format!("key {name}")),
-        Cmd::Combo { names } => one(&mut port, &format!("combo {}", names.join(" "))),
-        Cmd::Down { name } => one(&mut port, &format!("down {name}")),
-        Cmd::Up { name } => one(&mut port, &format!("up {name}")),
-        Cmd::Releaseall => one(&mut port, "releaseall"),
-        Cmd::Move { dx, dy } => one(&mut port, &format!("move {dx} {dy}")),
-        Cmd::Click { button } => one(&mut port, &format!("click {button}")),
-        Cmd::Mdown { button } => one(&mut port, &format!("mdown {button}")),
-        Cmd::Mup { button } => one(&mut port, &format!("mup {button}")),
-        Cmd::Scroll { amount } => one(&mut port, &format!("scroll {amount}")),
-        Cmd::Ping => one(&mut port, "ping"),
+        Cmd::Type { text } => one(&mut tx, &format!("type {}", text.join(" "))),
+        Cmd::Key { name } => one(&mut tx, &format!("key {name}")),
+        Cmd::Combo { names } => one(&mut tx, &format!("combo {}", names.join(" "))),
+        Cmd::Down { name } => one(&mut tx, &format!("down {name}")),
+        Cmd::Up { name } => one(&mut tx, &format!("up {name}")),
+        Cmd::Releaseall => one(&mut tx, "releaseall"),
+        Cmd::Move { dx, dy } => one(&mut tx, &format!("move {dx} {dy}")),
+        Cmd::Moveabs { x, y } => one(
+            &mut tx,
+            &format!("moveabs {} {}", proto::clamp_abs(x), proto::clamp_abs(y)),
+        ),
+        Cmd::Click { button } => one(&mut tx, &format!("click {button}")),
+        Cmd::Mdown { button } => one(&mut tx, &format!("mdown {button}")),
+        Cmd::Mup { button } => one(&mut tx, &format!("mup {button}")),
+        Cmd::Scroll { amount } => one(&mut tx, &format!("scroll {amount}")),
+        Cmd::Ping => one(&mut tx, "ping"),
         Cmd::Version => {
-            let reply = send_command(&mut port, "version")?;
+            let reply = tx.send("version")?;
             println!("{reply}");
             Ok(())
         }
-        Cmd::Run { file, delay_ms } => cmd_run(&mut port, &file, delay_ms),
+        Cmd::Run { file, delay_ms } => cmd_run(&mut tx, &file, delay_ms),
+        Cmd::Serve { .. } | Cmd::Stop => unreachable!("handled above"),
+    }
+}
+
+fn require_device(cli: &Cli) -> Result<&str> {
+    cli.device
+        .as_deref()
+        .ok_or_else(|| anyhow!("required argument '--device <DEVICE>' (-d) was not provided"))
+}
+
+/// One command line, sent either through a running daemon or directly to the
+/// UART, depending on what owns the device.
+enum Sender {
+    /// A hid daemon owns this device; route commands through its HTTP API.
+    Daemon { base: String },
+    /// No daemon for this device; we hold the UART ourselves.
+    Direct {
+        port: Box<dyn serialport::SerialPort>,
+    },
+}
+
+impl Sender {
+    /// Choose the transport: if a hid daemon is running for `device`, route
+    /// through it (it holds the port, so a direct open would fail anyway);
+    /// otherwise open the UART directly.
+    fn open(device: &str) -> Result<Sender> {
+        if let Some(d) = daemon::discover() {
+            if d.device == device {
+                return Ok(Sender::Daemon {
+                    base: format!("http://127.0.0.1:{}", d.port),
+                });
+            }
+        }
+        Ok(Sender::Direct {
+            port: open_port(device)?,
+        })
+    }
+
+    /// Send one command line, returning the `OK` reply data (empty for a bare
+    /// `OK`). Errors carry the board's `ERR` message or a transport failure.
+    fn send(&mut self, line: &str) -> Result<String> {
+        match self {
+            Sender::Daemon { base } => post_send(base, line),
+            Sender::Direct { port } => send_command(port, line),
+        }
+    }
+}
+
+/// POST one command line to a running daemon's `/send`; return the reply body.
+fn post_send(base: &str, line: &str) -> Result<String> {
+    match ureq::post(&format!("{base}/send"))
+        .timeout(Duration::from_secs(15))
+        .send_string(line)
+    {
+        Ok(resp) => Ok(resp.into_string().unwrap_or_default().trim().to_string()),
+        // A 503 carries the board's ERR / transport message in the body.
+        Err(ureq::Error::Status(_, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            Err(anyhow!("{}", body.trim()))
+        }
+        Err(e) => Err(anyhow!("hid daemon /send failed: {e}")),
     }
 }
 
 /// Send a single command and acknowledge with `OK` on stdout.
-fn one(port: &mut Box<dyn serialport::SerialPort>, cmd: &str) -> Result<()> {
-    send_command(port, cmd)?;
+fn one(tx: &mut Sender, cmd: &str) -> Result<()> {
+    tx.send(cmd)?;
     println!("OK");
     Ok(())
 }
 
-fn cmd_run(port: &mut Box<dyn serialport::SerialPort>, file: &str, delay_ms: u64) -> Result<()> {
+fn cmd_run(tx: &mut Sender, file: &str, delay_ms: u64) -> Result<()> {
     let text = if file == "-" {
         let mut s = String::new();
         std::io::stdin()
@@ -171,7 +275,7 @@ fn cmd_run(port: &mut Box<dyn serialport::SerialPort>, file: &str, delay_ms: u64
         match step {
             Step::Delay(secs) => thread::sleep(Duration::from_secs_f64(secs)),
             Step::Cmd(cmd) => {
-                send_command(port, &cmd)?;
+                tx.send(&cmd)?;
                 sent += 1;
                 if delay_ms > 0 {
                     thread::sleep(Duration::from_millis(delay_ms));
@@ -181,4 +285,24 @@ fn cmd_run(port: &mut Box<dyn serialport::SerialPort>, file: &str, delay_ms: u64
     }
     println!("OK ({sent} commands)");
     Ok(())
+}
+
+/// Stop a running hid daemon by sending SIGTERM to its recorded pid.
+fn cmd_stop() -> Result<()> {
+    match daemon::discover() {
+        Some(d) => {
+            // Safe: kill with SIGTERM to a pid we just confirmed alive.
+            let rc = unsafe { libc::kill(d.pid as i32, libc::SIGTERM) };
+            if rc == 0 {
+                println!("hid daemon (pid {}) stopped", d.pid);
+                Ok(())
+            } else {
+                Err(anyhow!("failed to signal hid daemon pid {}", d.pid))
+            }
+        }
+        None => {
+            println!("no hid daemon running");
+            Ok(())
+        }
+    }
 }

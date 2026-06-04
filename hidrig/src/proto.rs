@@ -26,6 +26,18 @@ use std::time::Duration;
 /// Fixed by the firmware (`BAUD` in firmware/code.py).
 pub const BAUD: u32 = 115_200;
 
+/// The absolute-pointer logical maximum (`moveabs` axis range is `0..=ABS_MAX`).
+pub const ABS_MAX: i32 = 32_767;
+
+/// Clamp a value into the `moveabs` logical range.
+///
+/// (Pixel→logical scaling for click-where-you-point lives in the dashboard,
+/// which knows the rendered video rectangle; the firmware and this tool only
+/// deal in the already-scaled logical range.)
+pub fn clamp_abs(v: i32) -> i32 {
+    v.clamp(0, ABS_MAX)
+}
+
 /// Open the injector's control UART (via the USB-serial adapter).
 ///
 /// The read timeout is generous because a long `type` or `move` executes a
@@ -167,5 +179,19 @@ mod tests {
     fn directive_case_insensitive() {
         let steps = parse_sequence("DELAY 1000\nSleep 2\n").unwrap();
         assert_eq!(steps, vec![Step::Delay(1.0), Step::Delay(2.0)]);
+    }
+
+    #[test]
+    fn moveabs_passes_through_as_a_command() {
+        let steps = parse_sequence("moveabs 16000 8000\n").unwrap();
+        assert_eq!(steps, vec![Step::Cmd("moveabs 16000 8000".into())]);
+    }
+
+    #[test]
+    fn clamp_abs_bounds() {
+        assert_eq!(clamp_abs(-1), 0);
+        assert_eq!(clamp_abs(0), 0);
+        assert_eq!(clamp_abs(ABS_MAX), ABS_MAX);
+        assert_eq!(clamp_abs(ABS_MAX + 100), ABS_MAX);
     }
 }

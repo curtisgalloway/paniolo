@@ -41,13 +41,14 @@ for the authoritative definition):
   down <NAME>            Press and hold a key
   up <NAME>              Release a held key
   releaseall             Release all held keys
-  move <dx> <dy>         Relative mouse move in pixels
+  move <dx> <dy>         Relative mouse move (accumulates into the cursor)
+  moveabs <x> <y>        Absolute mouse move in a 0..32767 logical space
   click <left|right|middle>   Click a mouse button (default left)
   mdown <left|right|middle>   Press and hold a mouse button
   mup <left|right|middle>     Release a mouse button
   scroll <amount>        Scroll wheel (positive = up, negative = down)
   ping                   No-op health check
-  version                Report protocol version + implementation id
+  version                Report protocol version + implementation id + caps
 
 <NAME> values are adafruit_hid Keycode names: A-Z, ZERO..NINE, ENTER, TAB,
 SPACE, ESCAPE, BACKSPACE, LEFT_CONTROL, LEFT_SHIFT, LEFT_ALT, LEFT_GUI,
@@ -74,8 +75,14 @@ BAUD = 115200
 
 PROTOCOL_VERSION = 1
 IMPL_ID = "kb2040-circuitpython/1.0"
+# Capability tokens advertised in the `version` reply (see the protocol spec).
+CAPS = "moveabs"
 
 BUTTONS = {"left": 1, "right": 2, "middle": 4}
+
+# Absolute-pointer logical range (matches the HID descriptor in boot.py); the
+# host OS spreads 0..ABS_MAX across the full screen in each axis.
+ABS_MAX = 32767
 
 # --- Status NeoPixel (core neopixel_write; no /lib dependency) --------------
 _px = digitalio.DigitalInOut(board.NEOPIXEL)
@@ -87,19 +94,25 @@ def status(r, g, b):
 
 
 # --- HID devices -------------------------------------------------------------
-# Constructing Keyboard()/Mouse() probes the host with a no-op report, which
-# raises OSError until the target has enumerated us. Powered from the target's
-# USB port we boot in parallel with it, so retry instead of crashing.
+def _find_abs_mouse():
+    """The absolute-pointer Device registered in boot.py (usage page 1, mouse)."""
+    for dev in usb_hid.devices:
+        if dev.usage_page == 0x01 and dev.usage == 0x02:
+            return dev
+    raise RuntimeError("absolute-mouse HID device not found — check boot.py")
+
+
+# Constructing Keyboard() probes the host with a no-op report, which raises
+# OSError until the target has enumerated us. Powered from the target's USB
+# port we boot in parallel with it, so retry instead of crashing.
 def make_devices():
     from adafruit_hid.keyboard import Keyboard
     from adafruit_hid.keyboard_layout_us import KeyboardLayoutUS
-    from adafruit_hid.mouse import Mouse
 
     while True:
         try:
             kbd = Keyboard(usb_hid.devices)
-            mouse = Mouse(usb_hid.devices)
-            return kbd, KeyboardLayoutUS(kbd), mouse
+            return kbd, KeyboardLayoutUS(kbd), _find_abs_mouse()
         except OSError:
             status(16, 0, 0)
             time.sleep(0.25)
@@ -107,15 +120,38 @@ def make_devices():
             time.sleep(0.25)
 
 
-kbd, layout, mouse = make_devices()
+kbd, layout, abs_mouse = make_devices()
+
+# Virtual cursor state for the absolute pointer. Relative `move` accumulates
+# into this; `moveabs` sets it directly. Start centered.
+_mx = ABS_MAX // 2
+_my = ABS_MAX // 2
+_buttons = 0
+_report = bytearray(6)
 
 
 def keycode_for(name):
     return getattr(Keycode, name.upper())
 
 
+def clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
+
+
+def send_mouse(wheel=0):
+    """Emit one absolute-pointer report at the current cursor + button state."""
+    _report[0] = _buttons & 0x07
+    _report[1] = _mx & 0xFF
+    _report[2] = (_mx >> 8) & 0xFF
+    _report[3] = _my & 0xFF
+    _report[4] = (_my >> 8) & 0xFF
+    _report[5] = wheel & 0xFF  # int8 two's-complement
+    abs_mouse.send_report(_report, 2)
+
+
 def handle_line(line):
     """Execute one command line; return extra OK-reply data or None."""
+    global _mx, _my, _buttons
     parts = line.strip().split(" ")
     cmd = parts[0].lower()
     if not cmd:
@@ -138,22 +174,32 @@ def handle_line(line):
     elif cmd == "releaseall":
         kbd.release_all()
     elif cmd == "move":
-        # adafruit_hid splits moves beyond int8 into multiple reports itself.
-        mouse.move(x=int(parts[1]), y=int(parts[2]))
+        # Relative move: accumulate into the virtual absolute cursor.
+        _mx = clamp(_mx + int(parts[1]), 0, ABS_MAX)
+        _my = clamp(_my + int(parts[2]), 0, ABS_MAX)
+        send_mouse()
+    elif cmd == "moveabs":
+        _mx = clamp(int(parts[1]), 0, ABS_MAX)
+        _my = clamp(int(parts[2]), 0, ABS_MAX)
+        send_mouse()
     elif cmd == "click":
         b = BUTTONS[parts[1].lower()] if len(parts) > 1 else 1
-        mouse.press(b)
-        mouse.release(b)
+        _buttons |= b
+        send_mouse()
+        _buttons &= ~b
+        send_mouse()
     elif cmd == "mdown":
-        mouse.press(BUTTONS[parts[1].lower()])
+        _buttons |= BUTTONS[parts[1].lower()]
+        send_mouse()
     elif cmd == "mup":
-        mouse.release(BUTTONS[parts[1].lower()])
+        _buttons &= ~BUTTONS[parts[1].lower()]
+        send_mouse()
     elif cmd == "scroll":
-        mouse.move(wheel=int(parts[1]))
+        send_mouse(wheel=clamp(int(parts[1]), -127, 127))
     elif cmd == "ping":
         pass
     elif cmd == "version":
-        return "%d %s" % (PROTOCOL_VERSION, IMPL_ID)
+        return "%d %s %s" % (PROTOCOL_VERSION, IMPL_ID, CAPS)
     else:
         raise ValueError("unknown command: " + cmd)
     return None
