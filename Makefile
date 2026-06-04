@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Build and install paniolo: the Rust CLI (cli/) plus the daemons (hdmicap,
-# serialcap, netbootd, cambrionix) and the OCR helper. `make install` from a
-# fresh clone is the only command you need; re-run it after editing anything to
-# rebuild and reinstall.
+# Build and install paniolo: the Rust CLI (cli/) plus the daemons and helpers
+# (hdmicap, serialcap, netbootd, cambrionix, hidrig) and the OCR helper.
+# `make install` from a fresh clone is the only command you need; re-run it
+# after editing anything to rebuild and reinstall.
 
-CRATES = cli hdmicap serialcap netbootd cambrionix
+CRATES = cli hdmicap serialcap netbootd cambrionix hidrig
 
 # The installed CLI, by absolute path: immune to a stale `paniolo` shadowing
 # ~/.cargo/bin earlier in PATH (e.g. the retired Python CLI's uv-tools shim).

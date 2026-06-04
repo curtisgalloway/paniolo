@@ -88,6 +88,11 @@ pub fn build_slice(lab: &Lab, target: &str, host: &str) -> Result<String, LabErr
             lf.set_video(target, v.device.as_deref(), None)?;
         }
     }
+    if let Some(h) = &t.hid {
+        if on(&h.host) {
+            lf.set_hid(target, h.cmd.as_deref(), None)?;
+        }
+    }
     Ok(lf.doc.to_string())
 }
 
