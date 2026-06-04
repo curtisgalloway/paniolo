@@ -18,7 +18,7 @@ and power-cycle it without human intervention at each iteration.
 | [Link mode](docs/netif.md) | `paniolo netif` | Atomically switch the link between netboot and ffx-over-IPv6 modes |
 | [Video](docs/video.md) | `paniolo video` | HDMI capture via warm-stream daemon; on-device OCR |
 | [Serial](docs/serial.md) | `paniolo serial` | Serial console — interactive (tio) or daemon-backed with timestamped rolling log |
-| [Power control](docs/power.md) | `paniolo serial dtr/reset`, `paniolo power-cycle`, `paniolo power-state` | DTR-based hardware power button (J2 header) and script-based power cycling |
+| [Power control](docs/power.md) | `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`, `paniolo serial dtr/reset` | DTR-based hardware power button (J2 header) and generic shell-command hooks (on/off/cycle/state) |
 | [HID injection](docs/hid.md) | `paniolo hid` | USB keyboard/mouse injection via a two-board KB2040 rig |
 | [Dashboard](docs/dashboard.md) | `paniolo console` | Combined video + serial web UI; auto-starts daemons; `-i <name>` preselects a serial interface |
 
@@ -51,7 +51,7 @@ make install           # paniolo CLI + daemons + OCR helper, in one step
 
 `make install` bootstraps the CLI with `cargo install --path cli`, then runs
 `paniolo setup`, which compiles and installs all of paniolo's binaries — the
-`paniolo` CLI itself plus the daemons (`hdmicap`, `serialcap`, `netbootd`) —
+`paniolo` CLI itself plus the daemons and helpers (`hdmicap`, `serialcap`, `netbootd`, `cambrionix`) —
 and the OCR helper (`visionocr` on macOS via `swiftc`, `linuxocr` on Linux)
 into `~/.cargo/bin`. One static binary per component, no Python environment.
 Netboot is served by the single-binary `netbootd` (Rust) engine. (On macOS,
@@ -80,6 +80,7 @@ cargo install --path ~/src/paniolo/cli        # if the CLI changed
 cargo install --path ~/src/paniolo/hdmicap    # if hdmicap changed
 cargo install --path ~/src/paniolo/serialcap  # if serialcap changed
 cargo install --path ~/src/paniolo/netbootd   # if netbootd changed (re-run `paniolo setup` to re-setuid the helper on macOS)
+cargo install --path ~/src/paniolo/cambrionix # if cambrionix changed
 ```
 
 The USB HID commands (`paniolo hid`) still live in the legacy Python CLI
