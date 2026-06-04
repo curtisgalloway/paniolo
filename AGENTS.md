@@ -507,7 +507,7 @@ setup` installs it (`cargo install`).
 `guess_capture_device(devices)` returns the single non-built-in device (filters
 out FaceTime, iSight, iPhone, iPad), or None if ambiguous.
 
-`daemon_url()` reads hdmicap's discovery file (`$TMPDIR/hdmicap/daemon.json`),
+`daemon_url()` reads hdmicap's discovery file (`/tmp/paniolo-<uid>/hdmicap/daemon.json`),
 verifies the PID is alive, and returns `http://127.0.0.1:<port>` or None.
 
 `start_daemon(cfg, port)` spawns `hdmicap daemon --device <name> --port <port>`
@@ -729,12 +729,14 @@ native side. Re-run it after editing anything. Narrower targets: `make python`,
 | Video config | `~/.config/paniolo/video.toml` |
 | Netboot daemon state | `~/.local/share/paniolo/<name>/netboot.json` |
 | Combined netboot log | `~/.local/share/paniolo/<name>/netboot.log` |
-| hdmicap discovery file | `$XDG_RUNTIME_DIR/hdmicap/daemon.json` (`{pid, port}`) — falls back to `$TMPDIR` |
-| hdmicap advisory lock | `$XDG_RUNTIME_DIR/hdmicap/daemon.lock` |
-| serialcap discovery file | `$XDG_RUNTIME_DIR/serialcap/daemon.json` (`{pid, port, interfaces:[{name, device, baud}]}`) — falls back to `$TMPDIR` |
-| serialcap advisory lock | `$XDG_RUNTIME_DIR/serialcap/daemon.lock` |
-| serialcap capture log | `$XDG_RUNTIME_DIR/serialcap/capture/<name>/serial.jsonl(.1..)` (rotated JSONL, per interface) |
-| serialcap pending line | `$XDG_RUNTIME_DIR/serialcap/capture/<name>/pending.json` (current unterminated line) |
+| hdmicap discovery file | `/tmp/paniolo-<uid>/hdmicap/daemon.json` (`{pid, port}`) |
+| hdmicap advisory lock | `/tmp/paniolo-<uid>/hdmicap/daemon.lock` |
+| hdmicap stderr log | `/tmp/paniolo-<uid>/hdmicap/daemon.log` (truncated on each CLI-spawned start) |
+| serialcap discovery file | `/tmp/paniolo-<uid>/serialcap/daemon.json` (`{pid, port, interfaces:[{name, device, baud}]}`) |
+| serialcap advisory lock | `/tmp/paniolo-<uid>/serialcap/daemon.lock` |
+| serialcap stderr log | `/tmp/paniolo-<uid>/serialcap/daemon.log` (truncated on each CLI-spawned start) |
+| serialcap capture log | `/tmp/paniolo-<uid>/serialcap/capture/<name>/serial.jsonl(.1..)` (rotated JSONL, per interface) |
+| serialcap pending line | `/tmp/paniolo-<uid>/serialcap/capture/<name>/pending.json` (current unterminated line) |
 
 ## Source code constraints
 
@@ -832,6 +834,14 @@ Paniolo runs on Linux as well as macOS. Platform differences:
   standard MJPEG/YUYV formats through nokhwa's filtered list and throws
   NSException from AVFoundation frame-duration KVC calls. The vendor patch in
   `hdmicap/vendor/nokhwa-bindings-macos/` fixes this.
+- **One daemon instance per user per host.** Discovery, lock, and stderr log
+  live in `/tmp/paniolo-<uid>/<daemon>/` — deliberately env-independent (NOT
+  `$TMPDIR`, which macOS varies per environment so a running daemon was
+  invisible from other shells; NOT `$XDG_RUNTIME_DIR`, which systemd deletes
+  when the user's last session ends, breaking daemons that outlive their SSH
+  session). Corollary: one hdmicap (= one capture device) per user per host —
+  two video targets on one control host would need per-target daemon dirs,
+  which don't exist yet.
 - **Daemon shutdown hard-exits.** Both hdmicap (`/preview` MJPEG) and serialcap
   (`/stream` WebSocket) serve infinite responses, so a plain axum graceful
   shutdown would block on them forever. On SIGTERM each daemon removes its

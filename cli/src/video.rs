@@ -52,9 +52,10 @@ pub fn start_daemon(device: &str, port: u16, target_name: Option<&str>) -> Resul
     if let Some(name) = target_name {
         cmd.env("PANIOLO_TARGET", name);
     }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    // Capture stderr (tracing output) so a startup failure is diagnosable;
+    // daemons::start_failure() reads the tail on timeout.
+    let log = std::fs::File::create(daemons::ensure_runtime_dir(DAEMON)?.join("daemon.log"))?;
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     cmd.spawn()?;
     Ok(())

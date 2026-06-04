@@ -17,11 +17,13 @@
 //! Every daemon follows the same contract: it is an installed binary (PATH or
 //! `~/.cargo/bin`), binds localhost (port 0 = OS-assigned), and writes a
 //! discovery file `<runtime>/<name>/daemon.json` containing `{pid, port, …}`
-//! where `<runtime>` is `$XDG_RUNTIME_DIR` (else the temp dir). Liveness is
-//! "the recorded pid still exists".
+//! where `<runtime>` is `/tmp/paniolo-<uid>` (see [`runtime_base`]). Liveness
+//! is "the recorded pid still exists".
 
 use std::path::PathBuf;
 use std::time::Duration;
+
+use anyhow::{anyhow, Result};
 
 /// Find an installed binary: $PATH first, then ~/.cargo/bin (where
 /// `paniolo setup` installs the daemons). Never the in-repo build tree, so a
@@ -39,10 +41,67 @@ pub fn find_binary(name: &str) -> Option<PathBuf> {
     cargo.is_file().then_some(cargo)
 }
 
+/// Stable per-user runtime base: `/tmp/paniolo-<uid>`, identical in every
+/// environment of the same user. Deliberately NOT `$TMPDIR`/`temp_dir()`
+/// (macOS hands each environment a different TMPDIR — GUI terminal vs SSH vs
+/// sandboxed agent shells — so a running daemon was invisible from the
+/// others) and NOT `$XDG_RUNTIME_DIR` (systemd removes `/run/user/<uid>`
+/// when the user's last session ends, breaking daemons that outlive the SSH
+/// session that started them). Keep in sync with `runtime_dir()` in
+/// hdmicap/src/daemon.rs and serialcap/src/daemon.rs.
 fn runtime_base() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
+    // Safe: getuid is always successful.
+    let uid = unsafe { libc::getuid() };
+    PathBuf::from(format!("/tmp/paniolo-{uid}"))
+}
+
+/// Create (0700) and validate the runtime base, then `<base>/<name>`.
+/// The ownership check guards against a squatter pre-creating the /tmp path.
+pub fn ensure_runtime_dir(name: &str) -> Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let base = runtime_base();
+    match std::fs::DirBuilder::new().mode(0o700).create(&base) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let uid = unsafe { libc::getuid() };
+            let md = std::fs::symlink_metadata(&base)?;
+            if !md.is_dir() || md.uid() != uid {
+                return Err(anyhow!(
+                    "{} exists but is not a directory owned by uid {uid}",
+                    base.display()
+                ));
+            }
+        }
+        Err(e) => return Err(e.into()),
+    }
+    let dir = base.join(name);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Where a spawned daemon's stderr is captured (truncated on each start).
+pub fn log_path(name: &str) -> PathBuf {
+    runtime_base().join(name).join("daemon.log")
+}
+
+/// Error for a daemon that didn't publish discovery in time, carrying the
+/// tail of its stderr log so the failure is diagnosable.
+pub fn start_failure(name: &str, timeout: Duration) -> anyhow::Error {
+    let log = std::fs::read_to_string(log_path(name)).unwrap_or_default();
+    let mut tail: Vec<&str> = log.lines().rev().take(5).collect();
+    tail.reverse();
+    if tail.is_empty() {
+        anyhow!(
+            "{name} daemon did not start within {} s (no stderr captured)",
+            timeout.as_secs()
+        )
+    } else {
+        anyhow!(
+            "{name} daemon did not start within {} s; last stderr:\n  {}",
+            timeout.as_secs(),
+            tail.join("\n  ")
+        )
+    }
 }
 
 fn pid_alive(pid: i32) -> bool {

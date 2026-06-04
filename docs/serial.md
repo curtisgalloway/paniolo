@@ -95,7 +95,7 @@ log rotation) and a UTC timestamp (`ts_ms`). The `--since` flag polls for lines
 with `seq` greater than the last seen value — safe to re-run from scripts.
 
 Each interface writes to its own capture directory so logs never conflate:
-`$TMPDIR/serialcap/capture/<name>/serial.jsonl`.
+`/tmp/paniolo-<uid>/serialcap/capture/<name>/serial.jsonl`.
 
 ---
 
@@ -198,10 +198,11 @@ a full command reference.
 
 | Purpose | Path |
 |---|---|
-| serialcap discovery | `$TMPDIR/serialcap/daemon.json` (`{pid, port, interfaces:[...]}`) |
-| serialcap advisory lock | `$TMPDIR/serialcap/daemon.lock` |
-| Capture log (per interface) | `$TMPDIR/serialcap/capture/<name>/serial.jsonl(.1..)` |
-| Pending (unterminated) line | `$TMPDIR/serialcap/capture/<name>/pending.json` |
+| serialcap discovery | `/tmp/paniolo-<uid>/serialcap/daemon.json` (`{pid, port, interfaces:[...]}`) |
+| serialcap advisory lock | `/tmp/paniolo-<uid>/serialcap/daemon.lock` |
+| serialcap stderr log | `/tmp/paniolo-<uid>/serialcap/daemon.log` (truncated on each start; shown on start timeout) |
+| Capture log (per interface) | `/tmp/paniolo-<uid>/serialcap/capture/<name>/serial.jsonl(.1..)` |
+| Pending (unterminated) line | `/tmp/paniolo-<uid>/serialcap/capture/<name>/pending.json` |
 
 ---
 
