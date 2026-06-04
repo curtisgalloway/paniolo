@@ -92,6 +92,9 @@ pub struct SerialChannel {
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct PowerChannel {
     pub cycle_cmd: Option<String>,
+    pub on_cmd: Option<String>,
+    pub off_cmd: Option<String>,
+    pub state_cmd: Option<String>,
     pub serial_interface: Option<String>,
     pub host: Option<String>,
 }
@@ -228,6 +231,9 @@ impl Lab {
         if let Some(p) = &t.power {
             let mut f = Vec::new();
             push_opt(&mut f, "cycle_cmd", &p.cycle_cmd);
+            push_opt(&mut f, "on_cmd", &p.on_cmd);
+            push_opt(&mut f, "off_cmd", &p.off_cmd);
+            push_opt(&mut f, "state_cmd", &p.state_cmd);
             push_opt(&mut f, "serial_interface", &p.serial_interface);
             channels.push(ResolvedChannel {
                 kind: ChannelKind::Power,

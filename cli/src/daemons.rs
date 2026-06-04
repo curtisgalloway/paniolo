@@ -109,8 +109,8 @@ fn pid_alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
-/// Base URL of the named running daemon, or None if it isn't running.
-pub fn daemon_url(name: &str) -> Option<String> {
+/// Listen port of the named running daemon, or None if it isn't running.
+pub fn daemon_port(name: &str) -> Option<u16> {
     let path = runtime_base().join(name).join("daemon.json");
     let text = std::fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -119,7 +119,12 @@ pub fn daemon_url(name: &str) -> Option<String> {
     if !pid_alive(pid) {
         return None;
     }
-    Some(format!("http://127.0.0.1:{port}"))
+    u16::try_from(port).ok()
+}
+
+/// Base URL of the named running daemon, or None if it isn't running.
+pub fn daemon_url(name: &str) -> Option<String> {
+    daemon_port(name).map(|port| format!("http://127.0.0.1:{port}"))
 }
 
 /// Block until the named daemon answers discovery, or time out.

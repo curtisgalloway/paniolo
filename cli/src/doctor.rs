@@ -136,21 +136,30 @@ fn check_channel(lab: &Lab, ch: &ResolvedChannel, rt: &ResolvedTarget) -> (Statu
                     );
                 }
             }
-            if let Some(cmd) = field(ch, "cycle_cmd") {
-                let prog = cmd.split_whitespace().next().unwrap_or("");
-                if prog.starts_with('/') {
-                    return interpret(
-                        probe(
+            // Probe all four hook fields; report the first absolute-path miss.
+            let hook_keys = ["cycle_cmd", "on_cmd", "off_cmd", "state_cmd"];
+            let mut configured: Vec<&str> = Vec::new();
+            for key in hook_keys {
+                if let Some(cmd) = field(ch, key) {
+                    configured.push(key);
+                    let prog = cmd.split_whitespace().next().unwrap_or("");
+                    if prog.starts_with('/') {
+                        let rc = probe(
                             lab,
                             &ch.host,
                             &format!("test -e {}", ssh::shell_quote(prog)),
-                        ),
-                        prog,
-                    );
+                        );
+                        if rc != Some(0) {
+                            return interpret(rc, prog);
+                        }
+                    }
                 }
-                return (Status::Ok, format!("cmd={cmd}"));
             }
-            (Status::Ok, "configured".to_string())
+            if configured.is_empty() {
+                (Status::Ok, "configured".to_string())
+            } else {
+                (Status::Ok, configured.join(","))
+            }
         }
     }
 }

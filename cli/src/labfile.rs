@@ -336,10 +336,14 @@ impl LabFile {
         self.remove_singleton(target, "netboot")
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn set_power(
         &mut self,
         target: &str,
         cycle_cmd: Option<&str>,
+        on_cmd: Option<&str>,
+        off_cmd: Option<&str>,
+        state_cmd: Option<&str>,
         serial_interface: Option<&str>,
         host: Option<&str>,
     ) -> Result<(), LabError> {
@@ -348,6 +352,9 @@ impl LabFile {
             "power",
             &[
                 ("cycle_cmd", cycle_cmd),
+                ("on_cmd", on_cmd),
+                ("off_cmd", off_cmd),
+                ("state_cmd", state_cmd),
                 ("serial_interface", serial_interface),
                 ("host", host),
             ],
@@ -488,6 +495,50 @@ mod tests {
         let mut lf = LabFile::create(&path);
         lf.add_target("t", Some("ghost"), None).unwrap();
         assert!(lf.save().is_err());
+    }
+
+    #[test]
+    fn set_power_writes_new_hook_fields() {
+        let (_d, path) = tmp();
+        let mut lf = LabFile::create(&path);
+        lf.add_target("t", None, None).unwrap();
+        lf.set_power(
+            "t",
+            Some("cycle.sh"),
+            Some("on.sh"),
+            Some("off.sh"),
+            Some("state.sh"),
+            None,
+            None,
+        )
+        .unwrap();
+        lf.save().unwrap();
+        let lab = model::load(&path).unwrap();
+        let p = lab.targets["t"].power.as_ref().unwrap();
+        assert_eq!(p.cycle_cmd.as_deref(), Some("cycle.sh"));
+        assert_eq!(p.on_cmd.as_deref(), Some("on.sh"));
+        assert_eq!(p.off_cmd.as_deref(), Some("off.sh"));
+        assert_eq!(p.state_cmd.as_deref(), Some("state.sh"));
+    }
+
+    #[test]
+    fn set_power_partial_update_preserves_others() {
+        let (_d, path) = tmp();
+        let mut lf = LabFile::create(&path);
+        lf.add_target("t", None, None).unwrap();
+        lf.set_power("t", Some("cycle.sh"), None, None, None, None, None)
+            .unwrap();
+        lf.set_power("t", None, Some("on.sh"), None, None, None, None)
+            .unwrap();
+        lf.save().unwrap();
+        let lab = model::load(&path).unwrap();
+        let p = lab.targets["t"].power.as_ref().unwrap();
+        assert_eq!(
+            p.cycle_cmd.as_deref(),
+            Some("cycle.sh"),
+            "cycle_cmd preserved"
+        );
+        assert_eq!(p.on_cmd.as_deref(), Some("on.sh"), "on_cmd set");
     }
 
     #[test]

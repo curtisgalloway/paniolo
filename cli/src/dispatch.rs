@@ -75,6 +75,9 @@ pub fn build_slice(lab: &Lab, target: &str, host: &str) -> Result<String, LabErr
             lf.set_power(
                 target,
                 p.cycle_cmd.as_deref(),
+                p.on_cmd.as_deref(),
+                p.off_cmd.as_deref(),
+                p.state_cmd.as_deref(),
                 p.serial_interface.as_deref(),
                 None,
             )?;
