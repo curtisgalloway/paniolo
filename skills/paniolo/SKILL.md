@@ -18,8 +18,9 @@ configured, the name can be omitted.
 ```
 cd ~/src/paniolo
 make install               # cargo-installs the `paniolo` CLI, then `paniolo setup`
-                           # builds/installs hdmicap, serialcap, netbootd, visionocr;
-                           # on macOS also installs netbootd-bpf-helper setuid-root (one sudo)
+                           # builds/installs hdmicap, serialcap, netbootd, cambrionix,
+                           # visionocr; on macOS also installs netbootd-bpf-helper
+                           # setuid-root (one sudo)
 ```
 
 Run once per machine; re-run after pulling or editing (it's a full rebuild).
@@ -37,7 +38,7 @@ Config lives in one CLI-managed **lab file** (`~/.config/paniolo/lab.toml`, or
 paniolo target add <name> [--host <labhost>] [--note <text>]
 paniolo netboot set -t <name> --interface <iface> [--tftp-root <dir>] [--host-ip <ip>]
 paniolo serial add console -t <name> --device <path> [--baud 115200] [--sense cts]
-paniolo power set -t <name> [--cycle-cmd <script>] [--serial-interface console]
+paniolo power set -t <name> [--cycle-cmd C] [--on-cmd C] [--off-cmd C] [--state-cmd C] [--serial-interface console]
 paniolo video set -t <name> --device "<capture id or name>"
 ```
 
@@ -182,20 +183,45 @@ marks the current unterminated line (e.g. a `login:` prompt with no newline yet)
 ## Power control
 
 ```
-paniolo power-cycle [target]           # run the target's power_cycle_cmd script
-paniolo power-state [target]           # show power state (requires sense signal + daemon)
+paniolo power on  [target]             # run on_cmd hook (error with hint if unset)
+paniolo power off [target]             # run off_cmd hook (error with hint if unset)
+paniolo power-cycle [target]           # run cycle_cmd hook
+paniolo power-state [target]           # state_cmd stdout ("on"/"off") or serial sense-line
 paniolo serial dtr [target] [--ms N]   # pulse DTR line on J2 header (soft/hard press)
 paniolo serial reset [target]          # soft reset via brief DTR pulse
 ```
 
-`power-cycle` runs the shell script set with
-`paniolo power set -t <name> --cycle-cmd <script>`.
-The script is responsible for the full off→on sequence (HA API, PDU relay, GPIO, etc.).
+Configure hooks with `paniolo power set`:
+
+```
+paniolo power set -t <name> \
+    [--cycle-cmd <cmd>] [--on-cmd <cmd>] [--off-cmd <cmd>] [--state-cmd <cmd>] \
+    [--serial-interface console]
+```
+
+All four hooks are optional and run via `sh -c`. `power-state` uses `state_cmd`
+if set (first whitespace token of stdout must be `on` or `off`); falls back to
+the serial sense-line otherwise.
 
 DTR commands drive the target's physical power button via an FTDI serial
 adapter wired to the Pi J2 header. A ≤500 ms pulse is a soft button event; ≥3000 ms
 is a hard PMIC power-off. Set the default interface with
 `paniolo power set -t <name> --serial-interface console`.
+
+### Cambrionix hub (example)
+
+The `cambrionix` helper binary drives a Cambrionix USB hub's control UART and
+satisfies the `state_cmd` contract (`state <port>` prints `on` or `off`):
+
+```
+paniolo power set -t pi5 \
+    --cycle-cmd "cambrionix -d /dev/cu.usbserial-DK0F9LZI cycle 4" \
+    --on-cmd    "cambrionix -d /dev/cu.usbserial-DK0F9LZI on 4" \
+    --off-cmd   "cambrionix -d /dev/cu.usbserial-DK0F9LZI off 4" \
+    --state-cmd "cambrionix -d /dev/cu.usbserial-DK0F9LZI state 4"
+```
+
+See `docs/power.md` for the full `cambrionix` command surface.
 
 ## Targets on a remote control host (a "lab")
 
@@ -279,7 +305,9 @@ daemons there over an ssh PTY.)
 - Serial port is exclusive: one of `connect` / `watch` / external `tio`/`screen`.
 - `~/.cargo/bin` (the CLI and daemons) must be on `PATH`; a stale Python
   `paniolo` in `~/.local/bin` shadows it (`uv tool uninstall paniolo`).
-- `paniolo console` auto-starts both daemons if they aren't running.
+- `paniolo console` auto-starts both daemons if they aren't running. Local
+  `console` passes the serialcap daemon's OS-assigned port as `?serial=PORT`
+  so the dashboard's serial pane connects correctly.
 - Netboot requires passwordless `sudo` (`ip` on Linux, `ifconfig` on macOS).
 - netboot and ffx are mutually exclusive on the link — use `paniolo netif mode`
   to switch; entering ffx mode stops netboot so a power-cycle boots from SD.

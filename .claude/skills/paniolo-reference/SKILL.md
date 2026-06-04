@@ -15,6 +15,27 @@ Use this skill when you need to:
 - Read source code for any file
 - Search for code patterns or keywords
 
+## Crates / top-level packages
+
+| Crate | Purpose |
+|-------|---------|
+| `cli/` | Main `paniolo` binary — all commands, lab file, dispatch, SSH |
+| `hdmicap/` | Warm-stream HDMI capture daemon |
+| `serialcap/` | Serial console daemon (multi-interface, WebSocket, capture log) |
+| `netbootd/` | DHCP + TFTP netboot engine (single binary) |
+| `cambrionix/` | Standalone helper: Cambrionix USB hub control UART driver. Wired into paniolo via generic power hooks (`--on-cmd`, `--off-cmd`, `--cycle-cmd`, `--state-cmd`). `state <port>` prints `on`/`off` matching the `state_cmd` contract. |
+| `ocr/` | OCR helpers: `visionocr` (Swift/Apple Vision, macOS) + `linuxocr` (Tesseract, Linux) |
+
+## Power hook fields (lab file `[targets.<name>.power]`)
+
+| Field | Set via | Effect |
+|-------|---------|--------|
+| `cycle_cmd` | `--cycle-cmd` | `paniolo power-cycle` |
+| `on_cmd` | `--on-cmd` | `paniolo power on` |
+| `off_cmd` | `--off-cmd` | `paniolo power off` |
+| `state_cmd` | `--state-cmd` | `paniolo power-state` (first token of stdout: `on`/`off`); overrides sense-line |
+| `serial_interface` | `--serial-interface` | default interface for DTR commands |
+
 ## Files
 
 | File | Contents |

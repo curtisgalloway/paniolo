@@ -4,8 +4,13 @@ paniolo provides two power control mechanisms:
 
 - **DTR via FTDI** — drives the target's J2 power button header directly over the
   serial cable. Generic and wiring-based; no external services required.
-- **`power_cycle_cmd`** — runs a configurable shell script. Write any script you
-  like (HA switch, PDU relay, GPIO, etc.) and paniolo calls it.
+- **Generic power hooks** — four optional shell commands (`on_cmd`, `off_cmd`,
+  `cycle_cmd`, `state_cmd`) wired via `paniolo power set`. Write any command
+  or point to a standalone helper binary; paniolo calls it via `sh -c`.
+
+**Design principle:** device-specific control logic never goes in the core
+crates. It lives in standalone helper binaries wired in via these generic
+hooks. The `cambrionix` helper described below is the canonical example.
 
 ---
 
@@ -79,20 +84,55 @@ serial interface (or fail if multiple are configured without an explicit choice)
 
 ---
 
-## power_cycle_cmd — script-based power control
+## Generic power hooks
 
-For cases where DTR isn't wired (or where you want full mains control), set a
-shell script on the target:
+For cases where DTR isn't wired (or where you want full software-defined
+control), configure one or more shell-command hooks on the target's power
+channel. All four are optional and independent:
+
+```bash
+paniolo power set -t <target> \
+    [--cycle-cmd <cmd>]   \   # paniolo power-cycle
+    [--on-cmd    <cmd>]   \   # paniolo power on
+    [--off-cmd   <cmd>]   \   # paniolo power off
+    [--state-cmd <cmd>]   \   # paniolo power-state (stdout: "on" or "off")
+    [--serial-interface <name>]   # default interface for DTR commands
+    [--host <labhost>]
+```
+
+Each hook is run via `sh -c <cmd>`. Exit code determines success or failure.
+Hooks can be any shell command, script path, or standalone helper binary.
+
+### Commands backed by hooks
+
+```bash
+paniolo power on  [target]        # run on_cmd; error with config hint when unset
+paniolo power off [target]        # run off_cmd; error with config hint when unset
+paniolo power-cycle [target]      # run cycle_cmd
+paniolo power-state [target]      # state_cmd if set; else serial sense-line
+```
+
+**`power-state` precedence:** if `state_cmd` is set, paniolo runs it and reads
+the first whitespace-delimited token of its stdout. The token must be `on` or
+`off` (case-insensitive); any other output is an error. If `state_cmd` is not
+set, paniolo falls back to the existing serial sense-line path (requires the
+sense signal to be wired and the serialcap daemon to be running).
+
+### `paniolo doctor` hook probing
+
+`paniolo doctor` probes every hook whose value is an absolute path with
+`test -e` (over SSH for remote hosts) and reports which hooks are configured
+by name, e.g. `cycle_cmd,on_cmd,off_cmd,state_cmd`.
+
+### Example: Home Assistant script (cycle_cmd)
+
+The following shows `cycle_cmd` wired to a Home Assistant API — a valid
+generic-hook example that doesn't require any device-specific helper:
 
 ```bash
 paniolo power set -t target-machine \
     --cycle-cmd /Users/you/.config/paniolo/scripts/power-cycle-target-machine.sh
 ```
-
-The script can do anything — call a Home Assistant API, drive a PDU relay, toggle
-a GPIO, etc. paniolo runs it and reports success or failure based on the exit code.
-
-### Example: Home Assistant script
 
 ```bash
 #!/usr/bin/env bash
@@ -140,5 +180,48 @@ ssh -o SendEnv=HA_TOKEN control-mac "paniolo power-cycle target-machine"
 paniolo power-cycle [target-machine]
 ```
 
-Runs `power_cycle_cmd` and exits with its return code. No built-in timing or
+Runs `cycle_cmd` and exits with its return code. No built-in timing or
 sense-signal logic — the script is responsible for the full sequence.
+
+---
+
+## Cambrionix hub control
+
+The `cambrionix` standalone binary drives a Cambrionix USB hub's control UART
+(115200 8N1, `>>` prompt, commands `mode c|s|o <port>` / `state`). It wires
+cleanly into paniolo's generic power hooks.
+
+### Installation
+
+`cambrionix` is built and installed by `make install` / `paniolo setup`
+alongside the other crates. It lands in `~/.cargo/bin`.
+
+### Commands
+
+```bash
+cambrionix -d <device> state              # table of all ports (volts, mA, attach/mode)
+cambrionix -d <device> state <port>       # print exactly "on" or "off" (state_cmd contract)
+cambrionix -d <device> on <port>          # mode c (charging/on)
+cambrionix -d <device> off <port>         # mode o (off)
+cambrionix -d <device> cycle <port> [--delay-ms 3000]
+                                          # off → delay → restore prior mode → confirm on
+```
+
+Ports 1–15 are accepted. Port 0 is the hub's own host/system row (read-only in
+the table output). `cycle` restores the previous mode: Sync (`s`) if it was
+Sync, otherwise charging (`c`).
+
+### Wiring into paniolo power hooks
+
+```bash
+paniolo power set -t pi5 \
+    --cycle-cmd "cambrionix -d /dev/cu.usbserial-DK0F9LZI cycle 4" \
+    --on-cmd    "cambrionix -d /dev/cu.usbserial-DK0F9LZI on 4" \
+    --off-cmd   "cambrionix -d /dev/cu.usbserial-DK0F9LZI off 4" \
+    --state-cmd "cambrionix -d /dev/cu.usbserial-DK0F9LZI state 4"
+```
+
+This example wires a Raspberry Pi 5 powered from hub port 4, with the hub's
+control UART on `/dev/cu.usbserial-DK0F9LZI`. After this config,
+`paniolo power on pi5`, `paniolo power off pi5`, `paniolo power-cycle pi5`,
+and `paniolo power-state pi5` all work without further setup.

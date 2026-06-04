@@ -75,7 +75,7 @@ Current capabilities:
 - Combined video+serial web dashboard (hdmicap's `GET /`: video on top, xterm.js terminal below)
 - On-device OCR of the captured screen (`paniolo video read`, dashboard OCR button): Apple Vision on macOS, Tesseract on Linux
 - USB HID input (keyboard/mouse injection) via the KB2040 rig (`paniolo hid`)
-- Power cycling via DTR (J2 wiring) or a configurable shell script (`paniolo serial dtr`, `paniolo power-cycle`)
+- Power control via DTR (J2 wiring) or generic shell-command hooks (`on_cmd`, `off_cmd`, `cycle_cmd`, `state_cmd`): `paniolo serial dtr`, `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`
 
 ## Architecture
 
@@ -124,7 +124,8 @@ cli/src/
   video.rs      hdmicap orchestration (daemon start/stop, client passthrough)
   netboot.rs    netbootd lifecycle (spawn with log, stop, status)
   netif.rs      interface discovery/config (sudo), netboot/ffx/off modes
-  power.rs      DTR via serialcap /button (+ direct-serial fallback), power_on sense
+  power.rs      generic power hooks (on/off/cycle/state_cmd via sh -c), DTR via
+                serialcap /button (+ direct-serial fallback), power_on sense
   state.rs      netboot state files (JSON-compatible with the Python's)
   doctor.rs     config-vs-reality probing (local + over SSH)
   discover.rs   hardware inventory + the configure proposal block
@@ -180,6 +181,12 @@ hdmicap/         Rust crate: warm-stream HDMI capture daemon
     nokhwa-bindings-macos/  patched: removes frame-duration KVC calls that throw
                             NSException on HDMI capture cards (e.g. MS2109)
 
+cambrionix/      Rust crate: standalone helper binary for Cambrionix USB hub control
+                 (control UART, 115200 8N1); wired into paniolo via generic power hooks.
+                 Commands: `state [port]`, `on <port>`, `off <port>`, `cycle <port>`
+                 `state <port>` prints exactly `on` or `off` (matches paniolo state_cmd
+                 contract). Built/installed by `make install` / `paniolo setup`.
+
 serialcap/       Rust crate: serial console daemon (parallels hdmicap)
   src/
     main.rs      CLI subcommands: daemon (--interface NAME=DEV[@BAUD], repeatable),
@@ -223,7 +230,9 @@ hdmicap's `GET /` serves a two-pane page: the MJPEG video on top, an xterm.js
 terminal below. The terminal opens a WebSocket to **serialcap** (a separate
 daemon/port), so the two subsystems stay decoupled — hdmicap only references
 serialcap by URL. Defaults to `ws://<host>:8724/stream`; override with
-`?serial=<port>` or `?serialws=<url>`. serialcap sends serial bytes as binary
+`?serial=<port>` or `?serialws=<url>`. Local `paniolo console` passes the
+serialcap daemon's OS-assigned port as `?serial=PORT`; the remote/tunnel path
+passes `?serialws=` (unchanged). serialcap sends serial bytes as binary
 frames and accepts keystrokes back over the same socket. xterm.js is vendored
 (not CDN) so the dashboard works on an isolated lab network. This is the first
 concrete instance of the "Option B" inter-subsystem coordination described above.
@@ -708,8 +717,9 @@ Subcommand groups:
 Top-level commands:
 - `paniolo console [TARGET] [-i INTERFACE]` — open the combined video+serial dashboard;
   starts daemons if needed (using TARGET for power-cycle wiring), opens the hdmicap URL
-- `paniolo power-cycle [TARGET]` — runs `cfg.power_cycle_cmd` via `subprocess.run(..., shell=True)`
-- `paniolo power-state [TARGET]` — reads power state from the serialcap daemon `/status` endpoint (requires sense signal wired)
+- `paniolo power on [TARGET]` / `paniolo power off [TARGET]` — run `on_cmd` / `off_cmd` hook
+- `paniolo power-cycle [TARGET]` — runs `cycle_cmd` hook via `sh -c`
+- `paniolo power-state [TARGET]` — runs `state_cmd` if set (stdout first token `on`/`off`); falls back to serialcap sense-line
 - `paniolo setup` — installs tftp-now (Homebrew) and builds/installs paniolo's
   own binaries: hdmicap + serialcap + netbootd (`cargo install`), visionocr
   (`swiftc`, macOS only), and linuxocr (copied script, Linux only) — all into
@@ -764,8 +774,9 @@ crates only, skipping OCR/setuid); `make help` lists all.
 ## Remote control pattern
 
 ```bash
-ssh control-mac "paniolo target set target-machine --interface en3 --tftp-root ~/pxe \
-  --power-cycle-cmd /Users/you/.config/paniolo/scripts/power-cycle-target-machine.sh"
+ssh control-mac "paniolo target set target-machine --interface en3 --tftp-root ~/pxe"
+ssh control-mac "paniolo power set -t target-machine \
+  --cycle-cmd /Users/you/.config/paniolo/scripts/power-cycle-target-machine.sh"
 ssh control-mac "paniolo netboot start target-machine"
 TFTP_ROOT=$(ssh control-mac "paniolo netboot tftp-root target-machine")
 scp kernel.img control-mac:"${TFTP_ROOT}/kernel_2712.img"
