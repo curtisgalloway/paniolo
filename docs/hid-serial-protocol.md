@@ -41,6 +41,15 @@ any conforming device.
 - Encoding is **UTF-8**.
 - No transport-level framing, checksums, or escaping: the stream is assumed
   reliable (it is a wire on a bench).
+- **WebSocket carrier (for the daemon / KVM path).** The `hidrig serve` daemon
+  owns the device's serial link and re-exposes the *same* line protocol over a
+  WebSocket (`GET /hid`): each client text frame is one command line (no
+  trailing `\n` needed), and the daemon answers with one text frame per command
+  (`OK`/`OK <data>`/`ERR <message>`). Many clients may connect at once — the
+  daemon serializes their commands onto the single device link, one in flight,
+  which is exactly how CLI-injected and browser-injected events intermix. This
+  is a carrier binding, not a different protocol: the command grammar below is
+  identical on the UART and the WebSocket.
 
 ## 2. Framing and flow control
 
@@ -75,24 +84,36 @@ are separated by single spaces.
 | `up <NAME>` | `OK` | Release a held key |
 | `releaseall` | `OK` | Release all held keys |
 | `move <dx> <dy>` | `OK` | Relative mouse move; signed decimal integers |
+| `moveabs <x> <y>` | `OK` | Absolute mouse move in a `0..32767` logical space (capability `moveabs`) |
 | `click <button>` | `OK` | Tap (press + release) a mouse button |
 | `mdown <button>` | `OK` | Press and hold a mouse button |
 | `mup <button>` | `OK` | Release a held mouse button |
 | `scroll <amount>` | `OK` | Scroll wheel; signed decimal integer, positive = up |
 | `ping` | `OK` | No-op liveness check |
-| `version` | `OK <ver> <impl>` | Protocol version (decimal integer) + implementation id (free-form) |
+| `version` | `OK <ver> <impl> [caps...]` | Protocol version + implementation id + capability tokens |
 
 - `<button>` is `left`, `right`, or `middle`.
 - `move` / `scroll` values may exceed one HID report's range (int8 for
   boot-protocol relative mice); the device MUST split them into multiple
-  reports transparently.
+  reports transparently (or, for an absolute-pointer device, accumulate the
+  relative delta into its tracked cursor).
+- `moveabs <x> <y>` positions the pointer at logical coordinates in `0..32767`
+  on each axis; the host OS maps that range across the full screen dimension,
+  so a caller scales pixel coordinates against the screen size (see §6). It is
+  **optional** — a device that implements it advertises the `moveabs`
+  capability in its `version` reply; one that does not MUST reply `ERR` (and
+  callers fall back to relative `move`). Implementing `moveabs` requires an
+  absolute-axis HID report descriptor on the device.
 - `type` text is the remainder of the line after `type ` — it may contain
   spaces and `#`; no quoting or escaping exists. Characters outside the
   device's keyboard layout (reference: US) may be typed approximately or
   rejected with `ERR`.
-- `version` for this spec replies `OK 1 <impl>`, e.g.
-  `OK 1 kb2040-circuitpython/1.0`. Hosts use it to detect protocol
-  compatibility; `<impl>` is informational only.
+- `version` replies `OK <ver> <impl> [caps...]`, e.g.
+  `OK 1 kb2040-circuitpython/1.0 moveabs`. `<ver>` is the protocol version
+  (decimal integer) hosts use for compatibility; `<impl>` is an informational
+  free-form id; each remaining whitespace-separated token is an **optional
+  capability** the device supports (currently `moveabs`). Absence of a token
+  means the corresponding command will `ERR`.
 
 ### Key names
 
@@ -127,31 +148,34 @@ names to HID usage IDs themselves.)
 - **Power:** an injector powered from the target's USB port reboots with the
   target; held keys cannot survive a target power cycle. Hosts must tolerate
   serial silence while the target is off.
-- **State:** the only session state is the set of held keys/buttons
-  (`down`/`mdown`). `releaseall` clears held keys. There is no reset
-  command; power-cycling the device is the reset.
+- **State:** the session state is the set of held keys/buttons
+  (`down`/`mdown`) plus, for an absolute-pointer device, the tracked cursor
+  position (`move`/`moveabs`). `releaseall` clears held keys. There is no
+  reset command; power-cycling the device is the reset.
 
 ## 5. Reserved extensions
 
-Future versions may add (implementations MUST `ERR` on these today, which
-v1 hosts treat as "not supported"):
+Future capabilities follow the same pattern as `moveabs`: a new optional
+command advertised by a `version` token, `ERR` when unsupported, so adding one
+does not bump the protocol version. Reserved:
 
-- `moveabs <x> <y>` — absolute mouse positioning in a logical
-  `0..32767` space (requires an absolute-axis HID report descriptor).
 - `consumer <NAME>` — consumer-control usages (volume, media keys).
 
-Protocol changes that break v1 semantics bump the `version` integer.
+Only a change that breaks the v1 semantics of an existing command bumps the
+`version` integer.
 
 ## 6. Conformance checklist for a new implementation
 
 1. Serve the byte stream (UART/CDC/TCP) with LF-terminated lines, CR
    tolerated, UTF-8.
-2. Implement every command in §3; reply `ERR` (never crash, never silence)
-   on anything unparseable.
+2. Implement every required command in §3; reply `ERR` (never crash, never
+   silence) on anything unparseable or unsupported.
 3. One response per command, in order, only after the HID effect is fully
    submitted.
 4. Accept the §3 key-name set case-insensitively.
 5. Split oversized `move`/`scroll` into multiple HID reports.
-6. Reply `OK 1 <your-impl-id>` to `version`.
+6. Reply `OK 1 <your-impl-id> [caps...]` to `version`, listing each optional
+   capability you implement (`moveabs` if you have an absolute pointer).
 7. Verify against the host tool: `hidrig -d <port> ping`, `version`, a
-   `type` round-trip, and `hidrig run` of a sequence file.
+   `type` round-trip, and `hidrig run` of a sequence file. For `moveabs`,
+   check the cursor lands where expected across the target's full screen.

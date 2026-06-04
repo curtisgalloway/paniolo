@@ -59,15 +59,35 @@ green blip = up and serving; solid red = last command failed.
 cargo install --path hidrig
 
 hidrig -d /dev/cu.usbserial-XXXX ping            # liveness
-hidrig -d /dev/cu.usbserial-XXXX version         # protocol + implementation
+hidrig -d /dev/cu.usbserial-XXXX version         # protocol + impl + capabilities
 hidrig -d /dev/cu.usbserial-XXXX type "hello world"
 hidrig -d /dev/cu.usbserial-XXXX key ENTER
 hidrig -d /dev/cu.usbserial-XXXX combo LEFT_CONTROL C
-hidrig -d /dev/cu.usbserial-XXXX move 300 -50
+hidrig -d /dev/cu.usbserial-XXXX move 300 -50      # relative
+hidrig -d /dev/cu.usbserial-XXXX moveabs 16000 8000 # absolute (0..32767 logical)
 hidrig -d /dev/cu.usbserial-XXXX click right
 hidrig -d /dev/cu.usbserial-XXXX scroll -3
 hidrig -d /dev/cu.usbserial-XXXX run boot-seq.txt   # command file; '-' = stdin
 ```
+
+### Daemon mode (`serve`) — the KVM path
+
+The control UART can have only one owner, so a streaming web console and CLI
+one-shots can't both open it. `hidrig serve` resolves that: it owns the UART
+and re-exposes the protocol over a localhost WebSocket (`GET /hid`) plus
+`POST /send`, serializing every command onto the one wire.
+
+```bash
+hidrig -d /dev/cu.usbserial-XXXX serve            # owns the UART, runs until stopped
+hidrig -d /dev/cu.usbserial-XXXX type hi          # auto-routes through the daemon
+hidrig stop                                       # stop the daemon
+```
+
+While a daemon for a device is running, every `hidrig -d <device> …` one-shot
+routes through it automatically (over `POST /send`), so the CLI and the web
+console never contend for the port. `paniolo console` starts this daemon on
+demand and the dashboard streams keyboard + absolute-mouse events to it — see
+[`docs/hid.md`](../docs/hid.md).
 
 Command files take one protocol command per line; blank lines and
 `# comments` are skipped, and `delay <ms>` / `sleep <seconds>` pause between
@@ -113,8 +133,12 @@ running CircuitPython).
 
 ```
 hidrig/
-  src/                  # `hidrig` host CLI (Rust)
-  firmware/boot.py      # USB identity: HID-only (dev-mode jumper on D2)
+  src/main.rs           # `hidrig` CLI: one-shots, `run`, `serve`/`stop`
+  src/proto.rs          # line protocol client + sequence parser
+  src/uart.rs           # daemon: the single UART owner (serializes all commands)
+  src/server.rs         # daemon: axum WebSocket /hid + POST /send
+  src/daemon.rs         # daemon: lock, discovery file, lifecycle
+  firmware/boot.py      # USB identity: HID-only, absolute-pointer descriptor
   firmware/code.py      # UART line protocol -> USB HID (reference impl)
   host/hid_seize_reports.c  # macOS IOKit HID capture tool
   host/Makefile
