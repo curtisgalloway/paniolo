@@ -69,3 +69,6 @@ current frame via Apple Vision and displays the result. Requires
 By default hdmicap connects the terminal to `ws://<host>:8724/stream` (the
 default serialcap port). The `?serial=` and `?serialws=` parameters let you
 point it at a different port or host if serialcap is running elsewhere.
+`paniolo console` supplies the right value automatically: the local path
+passes serialcap's OS-assigned port as `?serial=PORT`, and the remote/tunnel
+path passes an explicit `?serialws=` URL.

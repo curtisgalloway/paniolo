@@ -21,8 +21,9 @@ crate): config model + CRUD + doctor (R1), per-channel dispatch + SSH transport
 (R2), and the serial / video / power / netboot / netif runtimes plus `console`,
 `discover`, `configure`, `setup` (R3) — rig-verified against a live Pi 5 bench
 (serial round-trip, live HDMI capture, netbootd serving DHCP+TFTP, netif mode
-transitions). Remaining: live remote-host dispatch test (needs a second control
-host), a real TFTP boot, docs/cutover, and the deferred OCR + Openterface HID.
+transitions; a real TFTP boot — Fuchsia shim + ZBI on the Pi 5 — verified
+2026-06-04). Remaining: live remote-host dispatch test (needs a second control
+host), docs/cutover, and the deferred OCR + Openterface HID.
 The Python Stages 1–4 on this branch are the original tested reference; the
 Python tree is retired only after the Rust CLI has proven itself in daily use.
 
