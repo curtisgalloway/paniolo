@@ -39,6 +39,16 @@ Environment the helper must tolerate:
 - **Runs on the channel's control host.** Power commands re-exec over SSH on
   the host that owns the power channel (`paniolo power set --host <labhost>`).
   Install the helper on *that* host, not (only) where you type.
+- **State and temp data go where paniolo says.** Every invocation carries two
+  env vars, both pointing at directories that already exist:
+  `PANIOLO_STATE_DIR` (`~/.config/paniolo/helpers/<name>/`) for durable state
+  (databases, pairing records) and `PANIOLO_RUNTIME_DIR`
+  (`/tmp/paniolo-<uid>/<name>/`) for discovery files, locks, and logs (wiped
+  on reboot). `<name>` is the hook command's program basename (`zigplug …` →
+  `zigplug`); channel daemons get the channel name instead (hidrig → `hid`).
+  Prefer the env vars, fall back to the same literal paths when run
+  standalone — and **never** write unnamespaced files into
+  `~/.config/paniolo/` itself (that's where the lab file lives).
 - **One-shot, stateless, exclusive.** Each invocation opens the device, acts,
   exits. If the transport is an exclusive-open serial port, two concurrent
   invocations will collide — keep any long-lived helper modes (pairing
@@ -79,6 +89,11 @@ serial/HTTP protocol, Python if the driver library is Python (as with
 zigpy-znp). Anything goes as long as it installs an executable into the
 libexec dir (`~/.local/libexec/paniolo/bin`) — helpers stay off the user's
 PATH; run one by hand with `paniolo helper <name> …`.
+
+Whatever the language, read `PANIOLO_STATE_DIR`/`PANIOLO_RUNTIME_DIR` for
+any state or temp paths (see the hook-contract section; zigplug's
+`default_db_path()` and `runtime_dir()` are the reference implementations,
+including lazy migration from a pre-API path).
 
 **Rust helper (the `cambrionix` pattern):**
 

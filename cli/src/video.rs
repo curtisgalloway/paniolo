@@ -67,6 +67,7 @@ pub fn start_daemon(device: &str, port: u16, target_name: Option<&str>) -> Resul
         .arg(device)
         .arg("--port")
         .arg(port.to_string());
+    cmd.envs(daemons::helper_env(DAEMON));
     // visionocr on macOS, linuxocr (same interface) on Linux.
     if let Some(ocr) =
         daemons::find_binary("visionocr").or_else(|| daemons::find_binary("linuxocr"))

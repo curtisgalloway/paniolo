@@ -47,7 +47,7 @@ import logging
 import os
 import signal
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -65,7 +65,9 @@ app = typer.Typer(
 @dataclass
 class _Options:
     device: str = ""
-    db_path: Path = field(default_factory=lambda: _app.DEFAULT_DB)
+    # Resolved in main() — default_db_path() has a migration side effect that
+    # must not run when --db points elsewhere.
+    db_path: Optional[Path] = None
     no_daemon: bool = False
 
 
@@ -103,8 +105,7 @@ def main(
     if device is None:
         raise typer.BadParameter("required option '--device' (-d) was not provided")
     _options.device = device
-    if db is not None:
-        _options.db_path = db
+    _options.db_path = db if db is not None else _app.default_db_path()
     _options.no_daemon = no_daemon
     level = {0: logging.WARNING, 1: logging.INFO}.get(verbose, logging.DEBUG)
     logging.basicConfig(level=level, format="%(asctime)s %(name)s %(message)s")

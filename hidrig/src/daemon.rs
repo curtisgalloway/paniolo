@@ -46,11 +46,19 @@ pub struct Discovery {
     pub device: String,
 }
 
-/// Stable per-user runtime dir `/tmp/paniolo-<uid>/hid`. Kept byte-identical to
-/// the convention in serialcap/hdmicap daemons and the paniolo CLI's daemons.rs
-/// (deliberately not `$TMPDIR`/`$XDG_RUNTIME_DIR` — see those files for why).
+/// The daemon's runtime dir. Paniolo passes the canonical location as
+/// `PANIOLO_RUNTIME_DIR` (named for the hid *channel*, not this binary —
+/// any conforming injector helper serves the same discovery dir); the
+/// literal fallback below is for standalone invocations and matches it:
+/// `/tmp/paniolo-<uid>/hid` (deliberately not `$TMPDIR`/`$XDG_RUNTIME_DIR`
+/// — see the paniolo CLI's daemons.rs for why).
 pub fn runtime_dir() -> Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    if let Some(dir) = std::env::var_os("PANIOLO_RUNTIME_DIR") {
+        let dir = PathBuf::from(dir);
+        fs::create_dir_all(&dir)?;
+        return Ok(dir);
+    }
     // Safe: getuid always succeeds.
     let uid = unsafe { libc::getuid() };
     let base = PathBuf::from(format!("/tmp/paniolo-{uid}"));

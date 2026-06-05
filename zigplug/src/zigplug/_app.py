@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -39,7 +40,34 @@ from zigpy.zcl import Cluster
 from zigpy.zcl.clusters.general import OnOff
 from zigpy_znp.zigbee.application import ControllerApplication
 
-DEFAULT_DB = Path.home() / ".config" / "paniolo" / "zigbee.db"
+# Pre-state-dir-API location (zigbee.db beside the lab file — the collision
+# the helpers/ namespace exists to prevent); migrated lazily by
+# default_db_path().
+LEGACY_DB = Path.home() / ".config" / "paniolo" / "zigbee.db"
+
+
+def default_db_path() -> Path:
+    """The zigpy device DB path, honoring the paniolo helper state-dir API.
+
+    `$PANIOLO_STATE_DIR/zigbee.db` when paniolo set the env var; the same
+    canonical location (`~/.config/paniolo/helpers/zigplug/zigbee.db`) when
+    run standalone. A DB at the legacy top-level location is atomically
+    renamed into place (with its sqlite -wal/-shm sidecars) on first touch.
+    """
+    state = os.environ.get("PANIOLO_STATE_DIR")
+    base = (
+        Path(state)
+        if state
+        else Path.home() / ".config" / "paniolo" / "helpers" / "zigplug"
+    )
+    db = base / "zigbee.db"
+    if not db.exists() and LEGACY_DB.exists():
+        base.mkdir(parents=True, exist_ok=True)
+        for suffix in ("", "-wal", "-shm"):
+            src = LEGACY_DB.parent / (LEGACY_DB.name + suffix)
+            if src.exists():
+                os.rename(src, base / (LEGACY_DB.name + suffix))
+    return db
 
 
 class ZigplugError(Exception):

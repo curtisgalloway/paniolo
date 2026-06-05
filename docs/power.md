@@ -239,7 +239,8 @@ The `zigplug` standalone helper switches Zigbee smart plugs through a
 CC2652-based coordinator dongle (e.g. Sonoff ZBDongle-P) using
 [zigpy-znp](https://github.com/zigpy/zigpy-znp). Like `cambrionix`, it wires
 into paniolo's generic power hooks. Device interview data persists in a
-sqlite DB at `~/.config/paniolo/zigbee.db` (`--db` to override).
+sqlite DB at `~/.config/paniolo/helpers/zigplug/zigbee.db` (`--db` to
+override; a DB at the pre-0.3 top-level location is migrated automatically).
 
 **Operations run through a persistent daemon** that owns the coordinator
 session. The CLI auto-spawns it on first use and proxies transparently, so
