@@ -123,6 +123,12 @@ Python tree below:
   positionals as `<target> <text>`, one as just the text); `hid send` is the
   one runtime command that takes `-t` only, because its positional tail is
   the helper's args.
+- **`paniolo daemons`** is the unified daemon inventory: every discovery-file
+  daemon under `/tmp/paniolo-<uid>/` (serialcap, hdmicap, hid, zigplug),
+  netbootd via its state files, plus *stray* helper processes running out of
+  the libexec dir (wedged one-shots). `paniolo daemons stop [NAME…|--all]
+  [--force]` TERMs them (netbootd via its proper interface-restoring stop),
+  escalating to KILL with `--force` after a 3 s grace period.
 
 ```
 cli/src/
@@ -152,7 +158,14 @@ cli/src/
 Deferred (tracked in docs/config-redesign.md): the
 Openterface CH9329 HID backend (clean-room spec at docs/ch9329-spec.md — a shim
 speaking the HID serial protocol would plug into the existing `hid` channel),
-legacy Python removal.
+legacy Python removal, and a **helper state/runtime-dir API**: today each
+helper hand-rolls its paths (zigplug mirrors daemons.rs's `/tmp/paniolo-<uid>`
+logic and drops `zigbee.db` at the top of `~/.config/paniolo/`, beside the lab
+file) — helpers writing unnamespaced state into the shared config dir will
+eventually collide. The fix: per-helper subdirectories
+(`~/.config/paniolo/helpers/<name>/`, `/tmp/paniolo-<uid>/<name>/`), passed by
+paniolo as `PANIOLO_STATE_DIR`/`PANIOLO_RUNTIME_DIR` env vars when it invokes
+hooks and helpers, with documented fallbacks for standalone runs.
 
 ## Module layout (legacy Python — being retired)
 
@@ -210,15 +223,23 @@ cambrionix/      Rust crate: standalone helper binary for Cambrionix USB hub con
                  contract). Built/installed by `make install` / `paniolo setup`.
 
 zigplug/         Python (uv) helper: Zigbee smart plug control via a CC2652 (ZNP)
-                 coordinator dongle, using zigpy-znp. One-shot CLI wired into
-                 paniolo via generic power hooks, like cambrionix. Commands:
-                 `form` (one-time network setup), `permit` (pairing window),
-                 `list`, `on/off/state/cycle <ieee>`, `remove <ieee>`;
-                 `state <ieee>` prints exactly `on` or `off` (state_cmd contract).
-                 Device DB at ~/.config/paniolo/zigbee.db. Installed by
-                 `paniolo setup` via `uv tool install` when uv is present
-                 (shim in the libexec dir via UV_TOOL_BIN_DIR, off PATH).
-                 See docs/power.md for pairing + hook wiring.
+                 coordinator dongle, using zigpy-znp. CLI wired into paniolo
+                 via generic power hooks, like cambrionix — but operations
+                 proxy through a persistent daemon (`_daemon.py`, aiohttp on
+                 localhost, standard daemon.json discovery) that owns the
+                 coordinator session: one-shots reset the CC2652 on every
+                 serial open (auto-BSL lines) and collide on the stateful ZNP
+                 session, so the daemon serializes ops with hard timeouts.
+                 Auto-spawned on first use; hook strings stay one-shot-shaped.
+                 Commands: `form` (one-time network setup), `permit` (pairing
+                 window), `list`, `on/off/state/cycle <ieee>`, `remove <ieee>`,
+                 `serve/stop/status` (daemon), `backup`/`restore` (coordinator
+                 NVRAM recovery from zigpy's auto-backups — no re-pairing);
+                 `state <ieee>` prints exactly `on` or `off` (state_cmd
+                 contract). Device DB at ~/.config/paniolo/zigbee.db.
+                 Installed by `paniolo setup` via `uv tool install` when uv is
+                 present (shim in the libexec dir via UV_TOOL_BIN_DIR, off
+                 PATH). See docs/power.md for pairing, hook wiring, recovery.
 
 serialcap/       Rust crate: serial console daemon (parallels hdmicap)
   src/

@@ -25,6 +25,17 @@ transitions; a real TFTP boot — Fuchsia shim + ZBI on the Pi 5 — verified
 2026-06-04). Remaining: live remote-host dispatch test (needs a second control
 host), docs/cutover, and the deferred Openterface HID. (OCR landed 2026-06-05:
 `paniolo video read` wraps the hdmicap daemon's `GET /ocr`.)
+
+TODO — helper state/runtime-dir API: give helpers a clear, namespaced answer
+to "where do I store state and temporary data". Today each helper hand-rolls
+it (zigplug re-implements the `/tmp/paniolo-<uid>` runtime-dir logic from
+daemons.rs and stores `zigbee.db` at the top level of `~/.config/paniolo/`,
+beside the lab file); helpers writing unnamespaced files into the shared
+config dir will eventually collide. Proposed shape: per-helper dirs
+(`~/.config/paniolo/helpers/<name>/` durable, `/tmp/paniolo-<uid>/<name>/`
+runtime), exported as `PANIOLO_STATE_DIR`/`PANIOLO_RUNTIME_DIR` by paniolo
+when invoking hooks and `paniolo helper`, with documented fallbacks so
+standalone invocations keep working.
 The Python Stages 1–4 on this branch are the original tested reference; the
 Python tree is retired only after the Rust CLI has proven itself in daily use.
 

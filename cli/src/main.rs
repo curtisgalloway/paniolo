@@ -162,6 +162,29 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// List or stop paniolo's background daemons on this host.
+    Daemons {
+        #[command(subcommand)]
+        cmd: Option<DaemonsCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonsCmd {
+    /// List running daemons and stray helper processes (the default).
+    List,
+    /// Stop daemons — named ones, or every one with --all.
+    Stop {
+        /// Daemon names from `paniolo daemons` (e.g. serialcap, zigplug,
+        /// netbootd).
+        names: Vec<String>,
+        /// Stop every daemon, and TERM stray helper processes too.
+        #[arg(long)]
+        all: bool,
+        /// SIGKILL anything still alive after the 3 s grace period.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -595,7 +618,134 @@ fn run(cli: Cli) -> Result<()> {
         Command::Configure { target, host } => cmd_configure(lab_flag, &target, &host),
         Command::Setup { host, rust_only } => cmd_setup(lab_flag, host.as_deref(), rust_only),
         Command::Helper { name, args } => cmd_helper(name.as_deref(), &args),
+        Command::Daemons { cmd } => match cmd.unwrap_or(DaemonsCmd::List) {
+            DaemonsCmd::List => cmd_daemons_list(),
+            DaemonsCmd::Stop { names, all, force } => cmd_daemons_stop(&names, all, force),
+        },
     }
+}
+
+// ── daemon inventory ────────────────────────────────────────────────────────
+
+/// Running netboot engines, found via their per-target state files.
+fn running_netboots() -> Vec<(String, state::NetbootState)> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(state::state_dir()) {
+        for e in entries.flatten() {
+            let target = e.file_name().to_string_lossy().into_owned();
+            if let Some(st) = state::load_netboot_state(&target) {
+                if state::is_netboot_running(&target) {
+                    out.push((target, st));
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// One unified view of every paniolo background process on this host: the
+/// discovery-file daemons, netbootd (state files), and stray helper
+/// processes running out of the libexec dir.
+fn cmd_daemons_list() -> Result<()> {
+    let discovered = daemons::list_discovered();
+    let netboots = running_netboots();
+    let mut known: Vec<i32> = discovered.iter().map(|d| d.pid).collect();
+    known.extend(netboots.iter().map(|(_, st)| st.dhcp_pid));
+    let strays = daemons::list_stray_helpers(&known);
+
+    if discovered.is_empty() && netboots.is_empty() && strays.is_empty() {
+        println!("No paniolo daemons running.");
+        return Ok(());
+    }
+    for d in &discovered {
+        let port = d.port.map_or("-".to_string(), |p| p.to_string());
+        println!("{}\tpid {}\tport {}\t{}", d.name, d.pid, port, d.detail);
+    }
+    for (target, st) in &netboots {
+        println!(
+            "netbootd\tpid {}\tport -\ttarget {target} ({})",
+            st.dhcp_pid, st.interface
+        );
+    }
+    if !strays.is_empty() {
+        println!("\nStray helper processes (not daemons — wedged one-shots?):");
+        for (pid, args) in &strays {
+            println!("  pid {pid}\t{args}");
+        }
+        println!("Stop everything with `paniolo daemons stop --all [--force]`.");
+    }
+    Ok(())
+}
+
+/// Stop daemons by name or wholesale: netbootd via its proper teardown
+/// (interface cleanup), everything else via SIGTERM, with an optional
+/// SIGKILL escalation after a grace period.
+fn cmd_daemons_stop(names: &[String], all: bool, force: bool) -> Result<()> {
+    if !all && names.is_empty() {
+        bail!("name one or more daemons (see `paniolo daemons`), or pass --all");
+    }
+    let wanted = |n: &str| all || names.iter().any(|w| w == n);
+
+    // netbootd first — its stop also restores the interface.
+    for (target, _) in running_netboots() {
+        if wanted("netbootd") {
+            netboot::stop(&target)?;
+            println!("netbootd stopped (target {target}).");
+        }
+    }
+
+    let mut victims: Vec<(String, i32)> = daemons::list_discovered()
+        .into_iter()
+        .filter(|d| wanted(&d.name))
+        .map(|d| (d.name, d.pid))
+        .collect();
+    let known: Vec<i32> = victims.iter().map(|(_, p)| p).copied().collect();
+    if all {
+        for (pid, args) in daemons::list_stray_helpers(&known) {
+            let short = args
+                .split_whitespace()
+                .take(4)
+                .collect::<Vec<_>>()
+                .join(" ");
+            victims.push((format!("stray: {short}"), pid));
+        }
+    }
+    for name in names {
+        if name != "netbootd" && !victims.iter().any(|(n, _)| n == name) {
+            eprintln!("warning: no running daemon named '{name}'");
+        }
+    }
+    if victims.is_empty() {
+        println!("Nothing to stop.");
+        return Ok(());
+    }
+
+    for (name, pid) in &victims {
+        daemons::signal_pid(*pid, libc::SIGTERM);
+        println!("TERM {name} (pid {pid})");
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        victims.retain(|(_, pid)| state::is_pid_alive(*pid));
+        if victims.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+    victims.retain(|(_, pid)| state::is_pid_alive(*pid));
+    for (name, pid) in &victims {
+        if force {
+            daemons::signal_pid(*pid, libc::SIGKILL);
+            println!("KILL {name} (pid {pid})");
+        } else {
+            eprintln!("still alive: {name} (pid {pid}) — re-run with --force to SIGKILL");
+        }
+    }
+    if !force && !victims.is_empty() {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 // ── helper passthrough ──────────────────────────────────────────────────────

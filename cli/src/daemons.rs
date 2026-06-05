@@ -146,6 +146,88 @@ fn pid_alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+/// One live daemon found via its discovery file under the runtime base.
+pub struct DaemonInfo {
+    /// Discovery dir name (serialcap, hdmicap, hid, zigplug, …).
+    pub name: String,
+    pub pid: i32,
+    pub port: Option<u16>,
+    /// Daemon-specific detail (e.g. zigplug's serial device), if published.
+    pub detail: String,
+}
+
+/// Every daemon currently publishing a live discovery file. Stale files
+/// (dead pid) are skipped, mirroring [`daemon_port`]'s liveness rule.
+pub fn list_discovered() -> Vec<DaemonInfo> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(runtime_base()) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path().join("daemon.json");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(pid) = v.get("pid").and_then(|p| p.as_i64()) else {
+            continue;
+        };
+        if !pid_alive(pid as i32) {
+            continue;
+        }
+        out.push(DaemonInfo {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            pid: pid as i32,
+            port: v.get("port").and_then(|p| p.as_u64()).map(|p| p as u16),
+            detail: v
+                .get("device")
+                .and_then(|d| d.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Processes executing out of the libexec dir that are NOT in `exclude_pids` —
+/// stray helper invocations (e.g. wedged one-shots holding a serial port).
+pub fn list_stray_helpers(exclude_pids: &[i32]) -> Vec<(i32, String)> {
+    let Some(libexec) = libexec_dir() else {
+        return Vec::new();
+    };
+    let needle = libexec.to_string_lossy().into_owned();
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-axo", "pid=,args="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let me = std::process::id() as i32;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let (pid_s, args) = line.split_once(' ')?;
+            let pid: i32 = pid_s.parse().ok()?;
+            if !args.contains(&needle) || pid == me || exclude_pids.contains(&pid) {
+                return None;
+            }
+            Some((pid, args.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Send `signal` to `pid` (best-effort).
+pub fn signal_pid(pid: i32, signal: i32) {
+    // Safe: sending a signal to a pid we just enumerated; failure is fine.
+    unsafe {
+        libc::kill(pid, signal);
+    }
+}
+
 /// Listen port of the named running daemon, or None if it isn't running.
 pub fn daemon_port(name: &str) -> Option<u16> {
     let path = runtime_base().join(name).join("daemon.json");

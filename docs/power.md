@@ -238,11 +238,29 @@ and `paniolo power-state pi5` all work without further setup.
 The `zigplug` standalone helper switches Zigbee smart plugs through a
 CC2652-based coordinator dongle (e.g. Sonoff ZBDongle-P) using
 [zigpy-znp](https://github.com/zigpy/zigpy-znp). Like `cambrionix`, it wires
-into paniolo's generic power hooks. Each invocation is one-shot: it opens the
-dongle, acts, and exits — the Zigbee network lives in the dongle's NVRAM and
-the plugs (Zigbee routers) stay joined between invocations. Device interview
-data persists in a sqlite DB at `~/.config/paniolo/zigbee.db` (`--db` to
-override).
+into paniolo's generic power hooks. Device interview data persists in a
+sqlite DB at `~/.config/paniolo/zigbee.db` (`--db` to override).
+
+**Operations run through a persistent daemon** that owns the coordinator
+session. The CLI auto-spawns it on first use and proxies transparently, so
+hook strings stay plain one-shot commands. This is not an optimization but a
+correctness requirement, learned the hard way:
+
+- **Opening the serial port resets the chip.** The CP2102N's DTR/RTS lines
+  drive the stick's auto-bootloader circuit on every open; depending on the
+  line states at reset-sampling time the chip occasionally boots into the
+  bootloader instead of the app, and the session hangs forever.
+- **Concurrent one-shots collide.** Two invocations interleaving frames on
+  one stateful ZNP session wedge the coordinator (hardware-verified: a
+  pile-up of stuck `power-state` hooks wedged the dongle for hours and cost
+  the formed network its NVRAM).
+
+The daemon opens the port once, serializes every operation on one session,
+and bounds each with a hard timeout — a sick radio yields a fast error, never
+a hung power hook. It follows the standard daemon contract
+(`/tmp/paniolo-<uid>/zigplug/daemon.json`, localhost HTTP, OS-assigned port)
+and shows up in `paniolo daemons`. Manual control: `zigplug serve` / `stop` /
+`status`; `--no-daemon` forces the legacy direct path (debugging only).
 
 ### Installation
 
@@ -300,9 +318,33 @@ zigplug -d <device> off <ieee>            # switch off, confirm by read-back
 zigplug -d <device> cycle <ieee> [--delay-ms 3000]
                                           # off → delay → on → confirm
 zigplug -d <device> remove <ieee>         # unpair (ZDO leave + forget)
+zigplug -d <device> serve|stop|status     # daemon lifecycle (serve is automatic)
+zigplug -d <device> backup [-o FILE]      # network backup (key, counters) as JSON
+zigplug -d <device> restore [-i FILE]     # write a backup into coordinator NVRAM
 ```
 
 IEEE addresses are accepted with or without `:`/`-` separators.
+
+### Coordinator NVRAM recovery (backup/restore)
+
+zigpy automatically snapshots the full network state — PAN, channel, network
+key, frame counters — into the device DB on every session. If the
+coordinator's NVRAM is lost or corrupted (symptom: `coordinator has no
+Zigbee network` on a previously formed dongle), the network is recoverable
+**without re-pairing**:
+
+```bash
+paniolo helper zigplug -d <device> stop      # restore needs the port exclusively
+paniolo helper zigplug -d <device> restore   # newest auto-backup from zigbee.db
+paniolo helper zigplug -d <device> list      # verify the plugs answer
+```
+
+`restore` bumps the network-key frame counter (`--counter-increment`, default
+10000) past anything the old coordinator could have transmitted, so joined
+devices accept the restored coordinator. A plug that spent hours orphaned may
+not answer until it rescans — power-cycling the plug at the wall forces an
+immediate rejoin (note: whatever it powers cycles with it). Keep an off-host
+copy with `zigplug backup -o <file>` if the bench matters.
 
 ### Wiring into paniolo power hooks
 
@@ -314,7 +356,9 @@ paniolo power set -t target-machine \
     --state-cmd "zigplug -d /dev/cu.usbserial-XXXX state ff:ff:b4:0e:06:04:ea:b7"
 ```
 
-Note: each one-shot takes a few seconds (ZNP startup + network reconnect) —
-fine for power cycling, but not a fast polling path. The coordinator serial
-port is exclusive, so hooks must not run concurrently with a `permit` window
-or another zigplug invocation.
+Concurrency and latency are handled by the daemon: the first hook spawns it
+(a few seconds), after which operations answer in about a second, concurrent
+hooks serialize safely on its single session, and every operation has a hard
+timeout — a wedged radio fails a hook fast instead of hanging it. `form`,
+`restore`, and `backup` (when no daemon runs) open the port directly and
+refuse to run while the daemon does (`zigplug stop` first).
