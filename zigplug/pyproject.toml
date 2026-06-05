@@ -1,0 +1,32 @@
+[project]
+name = "zigplug"
+version = "0.1.0"
+description = "Zigbee smart plug control via a CC2652 (ZNP) coordinator dongle — paniolo power-hook helper"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "typer>=0.12",
+    "zigpy>=0.60",
+    "zigpy-znp>=0.12",
+]
+
+[project.scripts]
+zigplug = "zigplug._cli:app"
+
+[tool.uv]
+package = true
+
+[tool.pyink]
+line-length = 88
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
