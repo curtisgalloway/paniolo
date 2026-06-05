@@ -11,6 +11,8 @@ paniolo provides two power control mechanisms:
 **Design principle:** device-specific control logic never goes in the core
 crates. It lives in standalone helper binaries wired in via these generic
 hooks. The `cambrionix` helper described below is the canonical example.
+To add support for new power-switching hardware, follow the
+[power-helper recipe](adding-power-helpers.md).
 
 ---
 

@@ -848,6 +848,14 @@ ssh control-mac "paniolo netboot stop target-machine"
 
 ## Adding a new subsystem
 
+**Adding support for new power-switching hardware is not a subsystem** — it's
+a standalone helper binary wired in via the generic power hooks. Follow
+[docs/adding-power-helpers.md](docs/adding-power-helpers.md) (hook contract,
+helper CLI conventions, Rust/Python skeletons, verification ladder, PR
+checklist); `cambrionix/` and `zigplug/` are the exemplars.
+
+The steps below describe the legacy Python tree:
+
 1. Create `src/paniolo/_<subsystem>.py`.
 2. Add state dataclass + path helpers to `_state.py` if the subsystem is a
    daemon with a PID.

@@ -59,6 +59,7 @@ orchestration or results.
 ## For contributors / agents
 
 - [`AGENTS.md`](../AGENTS.md) — module-by-module internals, source constraints, and how to add a subsystem.
+- [Adding a power-control helper](adding-power-helpers.md) — recipe for supporting new power-switching hardware: the hook contract, helper CLI conventions, implementation skeletons (Rust/Python), verification ladder, and PR checklist.
 - [`hidrig/README.md`](../hidrig/README.md) — HID injector wiring, firmware, and host CLI.
 
 ---
