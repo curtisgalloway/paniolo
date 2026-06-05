@@ -18,7 +18,7 @@ and power-cycle it without human intervention at each iteration.
 | [Link mode](docs/netif.md) | `paniolo netif` | Atomically switch the link between netboot and ffx-over-IPv6 modes |
 | [Video](docs/video.md) | `paniolo video` | HDMI capture via warm-stream daemon; on-device OCR |
 | [Serial](docs/serial.md) | `paniolo serial` | Serial console — interactive (tio) or daemon-backed with timestamped rolling log |
-| [Power control](docs/power.md) | `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`, `paniolo serial dtr/reset` | DTR-based hardware power button (J2 header) and generic shell-command hooks (on/off/cycle/state) |
+| [Power control](docs/power.md) | `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`, `paniolo serial dtr/reset` | DTR-based hardware power button (J2 header) and generic shell-command hooks (on/off/cycle/state); helpers: `cambrionix` (USB hub ports), `zigplug` (Zigbee smart plugs) |
 | [HID injection](docs/hid.md) | `paniolo hid` | USB keyboard/mouse injection via a generic helper hook (`hidrig` KB2040 injector); KVM input from the web console |
 | [Dashboard](docs/dashboard.md) | `paniolo console` | Combined video + serial web UI; auto-starts daemons; `-i <name>` preselects a serial interface |
 
@@ -53,7 +53,9 @@ make install           # paniolo CLI + daemons + OCR helper, in one step
 `paniolo setup`, which compiles and installs all of paniolo's binaries — the
 `paniolo` CLI itself plus the daemons and helpers (`hdmicap`, `serialcap`, `netbootd`, `cambrionix`, `hidrig`) —
 and the OCR helper (`visionocr` on macOS via `swiftc`, `linuxocr` on Linux)
-into `~/.cargo/bin`. One static binary per component, no Python environment.
+into `~/.cargo/bin`. One static binary per component; the core needs no
+Python environment. (The optional `zigplug` Zigbee smart-plug helper is the
+one Python component — `setup` installs it as a uv tool when `uv` is on PATH.)
 Netboot is served by the single-binary `netbootd` (Rust) engine. (On macOS,
 `setup` also installs `netbootd-bpf-helper` setuid-root — one sudo — for the
 `netbootd` raw-frame send path.) Configuration is one CLI-managed lab file
@@ -82,6 +84,7 @@ cargo install --path ~/src/paniolo/serialcap  # if serialcap changed
 cargo install --path ~/src/paniolo/netbootd   # if netbootd changed (re-run `paniolo setup` to re-setuid the helper on macOS)
 cargo install --path ~/src/paniolo/cambrionix # if cambrionix changed
 cargo install --path ~/src/paniolo/hidrig     # if hidrig changed
+uv tool install --force ~/src/paniolo/zigplug # if zigplug changed
 ```
 
 USB HID injection (`paniolo hid`) shells out to a helper speaking the

@@ -75,7 +75,7 @@ Current capabilities:
 - Combined video+serial web dashboard (hdmicap's `GET /`: video on top, xterm.js terminal below)
 - On-device OCR of the captured screen (`paniolo video read`, dashboard OCR button): Apple Vision on macOS, Tesseract on Linux
 - USB HID input (keyboard/mouse injection) via a generic helper hook (`paniolo hid send`); the `hidrig` helper drives the KB2040 injector over its control UART (HID serial protocol, docs/hid-serial-protocol.md). `hidrig serve` runs a daemon that owns the UART and re-exposes the protocol over a WebSocket, so `paniolo console` works as a **KVM** — stream the browser's keyboard + absolute mouse (`moveabs`) to the target, intermixed with CLI injection on the one wire
-- Power control via DTR (J2 wiring) or generic shell-command hooks (`on_cmd`, `off_cmd`, `cycle_cmd`, `state_cmd`): `paniolo serial dtr`, `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`
+- Power control via DTR (J2 wiring) or generic shell-command hooks (`on_cmd`, `off_cmd`, `cycle_cmd`, `state_cmd`): `paniolo serial dtr`, `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`. Helpers that wire into the hooks: `cambrionix` (USB hub port power) and `zigplug` (Zigbee smart plugs via a CC2652 coordinator dongle)
 
 ## Architecture
 
@@ -187,6 +187,16 @@ cambrionix/      Rust crate: standalone helper binary for Cambrionix USB hub con
                  Commands: `state [port]`, `on <port>`, `off <port>`, `cycle <port>`
                  `state <port>` prints exactly `on` or `off` (matches paniolo state_cmd
                  contract). Built/installed by `make install` / `paniolo setup`.
+
+zigplug/         Python (uv) helper: Zigbee smart plug control via a CC2652 (ZNP)
+                 coordinator dongle, using zigpy-znp. One-shot CLI wired into
+                 paniolo via generic power hooks, like cambrionix. Commands:
+                 `form` (one-time network setup), `permit` (pairing window),
+                 `list`, `on/off/state/cycle <ieee>`, `remove <ieee>`;
+                 `state <ieee>` prints exactly `on` or `off` (state_cmd contract).
+                 Device DB at ~/.config/paniolo/zigbee.db. Installed by
+                 `paniolo setup` via `uv tool install` when uv is present.
+                 See docs/power.md for pairing + hook wiring.
 
 serialcap/       Rust crate: serial console daemon (parallels hdmicap)
   src/

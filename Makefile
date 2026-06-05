@@ -13,7 +13,8 @@
 # limitations under the License.
 
 # Build and install paniolo: the Rust CLI (cli/) plus the daemons and helpers
-# (hdmicap, serialcap, netbootd, cambrionix, hidrig) and the OCR helper.
+# (hdmicap, serialcap, netbootd, cambrionix, hidrig), the OCR helper, and the
+# zigplug Zigbee helper (Python, installed by `paniolo setup` as a uv tool).
 # `make install` from a fresh clone is the only command you need; re-run it
 # after editing anything to rebuild and reinstall.
 

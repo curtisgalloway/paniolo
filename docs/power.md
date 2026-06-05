@@ -225,3 +225,85 @@ This example wires a Raspberry Pi 5 powered from hub port 4, with the hub's
 control UART on `/dev/cu.usbserial-DK0F9LZI`. After this config,
 `paniolo power on pi5`, `paniolo power off pi5`, `paniolo power-cycle pi5`,
 and `paniolo power-state pi5` all work without further setup.
+
+---
+
+## Zigbee smart plug control (zigplug)
+
+The `zigplug` standalone helper switches Zigbee smart plugs through a
+CC2652-based coordinator dongle (e.g. Sonoff ZBDongle-P) using
+[zigpy-znp](https://github.com/zigpy/zigpy-znp). Like `cambrionix`, it wires
+into paniolo's generic power hooks. Each invocation is one-shot: it opens the
+dongle, acts, and exits — the Zigbee network lives in the dongle's NVRAM and
+the plugs (Zigbee routers) stay joined between invocations. Device interview
+data persists in a sqlite DB at `~/.config/paniolo/zigbee.db` (`--db` to
+override).
+
+### Installation
+
+`zigplug` is a Python project (`zigplug/`), installed by `paniolo setup` /
+`make install` as a uv tool when `uv` is on PATH:
+
+```bash
+uv tool install --force ~/src/paniolo/zigplug   # manual equivalent
+```
+
+### One-time setup: form the network
+
+```bash
+zigplug -d /dev/cu.usbserial-XXXX form              # channel picked by energy scan
+zigplug -d /dev/cu.usbserial-XXXX form --channel 25 # or explicit (25-26 avoid Wi-Fi)
+```
+
+`form` is idempotent — if the dongle already has a network it prints the
+existing channel/PAN and exits.
+
+**If formation fails with "too much RF interference":** put the dongle on a
+USB 2.0 extension cable away from USB 3.x ports/hubs and video-capture
+devices. This is a real, hardware-verified failure mode — radiated USB noise
+desensitizes the CC2652 radio enough that the coordinator refuses to start on
+any channel. A factory reset of stale dongle state is
+`python -m zigpy_znp.tools.nvram_reset <device>` (run from the `zigplug/`
+project venv), but cable placement is almost always the actual fix.
+
+### Pairing plugs
+
+```bash
+zigplug -d <device> permit --time 120   # open a join window
+# put the plug in pairing mode (hold button until LED blinks; factory-fresh
+# plugs usually enter pairing mode on first power-up)
+zigplug -d <device> list                # IEEE, NWK, manufacturer, model, state
+```
+
+`permit` prints each join and interview as it happens and exits non-zero if
+nothing paired. Plugs previously paired to another hub need a full factory
+reset (often a ~10 s button hold), not just pairing mode.
+
+### Commands
+
+```bash
+zigplug -d <device> list                  # table of joined plugs + live state
+zigplug -d <device> state <ieee>          # print exactly "on" or "off" (state_cmd contract)
+zigplug -d <device> on <ieee>             # switch on, confirm by read-back
+zigplug -d <device> off <ieee>            # switch off, confirm by read-back
+zigplug -d <device> cycle <ieee> [--delay-ms 3000]
+                                          # off → delay → on → confirm
+zigplug -d <device> remove <ieee>         # unpair (ZDO leave + forget)
+```
+
+IEEE addresses are accepted with or without `:`/`-` separators.
+
+### Wiring into paniolo power hooks
+
+```bash
+paniolo power set -t target-machine \
+    --cycle-cmd "zigplug -d /dev/cu.usbserial-XXXX cycle ff:ff:b4:0e:06:04:ea:b7" \
+    --on-cmd    "zigplug -d /dev/cu.usbserial-XXXX on    ff:ff:b4:0e:06:04:ea:b7" \
+    --off-cmd   "zigplug -d /dev/cu.usbserial-XXXX off   ff:ff:b4:0e:06:04:ea:b7" \
+    --state-cmd "zigplug -d /dev/cu.usbserial-XXXX state ff:ff:b4:0e:06:04:ea:b7"
+```
+
+Note: each one-shot takes a few seconds (ZNP startup + network reconnect) —
+fine for power cycling, but not a fast polling path. The coordinator serial
+port is exclusive, so hooks must not run concurrently with a `permit` window
+or another zigplug invocation.

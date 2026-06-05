@@ -240,6 +240,27 @@ pub fn run(repo: &Path) -> Result<()> {
         }
     }
 
+    // zigplug: Python (zigpy-znp) Zigbee smart plug helper, installed as a uv
+    // tool so the `zigplug` command resolves from power hooks without a venv.
+    let zigplug_dir = repo.join("zigplug");
+    if !zigplug_dir.join("pyproject.toml").is_file() {
+        println!("  … zigplug: source not found, skipped");
+    } else if let Some(uv) = crate::daemons::find_binary("uv") {
+        let ok = Command::new(&uv)
+            .args(["tool", "install", "--force", "--quiet"])
+            .arg(&zigplug_dir)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            println!("  ✓ {:12} (uv tool install)", "zigplug");
+        } else {
+            eprintln!("  ! zigplug: uv tool install failed, skipped");
+        }
+    } else {
+        println!("  … zigplug: uv not found (https://docs.astral.sh/uv), skipped");
+    }
+
     println!("\nSetup complete.");
     let on_path = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|d| d == bin_dir))
