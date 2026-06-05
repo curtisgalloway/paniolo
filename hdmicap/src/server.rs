@@ -48,6 +48,9 @@ pub fn router(state: AppState) -> Router {
         .route("/snapshot", get(snapshot))
         .route("/preview", get(preview))
         .route("/ocr", get(ocr))
+        .route("/power", get(power_state))
+        .route("/power-on", post(power_on))
+        .route("/power-off", post(power_off))
         .route("/power-cycle", post(power_cycle))
         .route("/devices", get(devices))
         // Vendored xterm.js assets for the serial terminal pane.
@@ -346,32 +349,95 @@ async fn ocr(State(s): State<AppState>) -> Response {
     }
 }
 
-/// Trigger a power cycle by calling `paniolo power-cycle <target>`.
-/// Requires PANIOLO_TARGET to be set in the daemon's environment (done by
-/// `paniolo video watch <target>`). Returns 501 if not configured.
-async fn power_cycle() -> Response {
-    let target = match std::env::var("PANIOLO_TARGET") {
-        Ok(t) if !t.is_empty() => t,
-        _ => {
-            return (
-                StatusCode::NOT_IMPLEMENTED,
-                "PANIOLO_TARGET not set — start the daemon with: paniolo video watch <target>",
-            )
-                .into_response()
-        }
+/// PANIOLO_TARGET (set by `paniolo video watch`/`console <target>`), or None
+/// when unset/empty.
+fn power_target() -> Option<String> {
+    std::env::var("PANIOLO_TARGET")
+        .ok()
+        .filter(|t| !t.is_empty())
+}
+
+/// The 501 power endpoints return when no target is configured.
+fn no_target_response() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "PANIOLO_TARGET not set — start the daemon with: paniolo video watch <target>",
+    )
+        .into_response()
+}
+
+/// Run `paniolo <action…> <target>` and map its exit status to a Response. The
+/// action endpoints (on/off/cycle) all funnel through here, so a request is the
+/// only thing that ever changes the target's power.
+async fn run_power_action(action: &[&str]) -> Response {
+    let target = match power_target() {
+        Some(t) => t,
+        None => return no_target_response(),
     };
     let paniolo = std::env::var("PANIOLO_BIN").unwrap_or_else(|_| "paniolo".to_string());
+    let mut args: Vec<&str> = action.to_vec();
+    args.push(&target);
     match tokio::process::Command::new(&paniolo)
-        .args(["power-cycle", &target])
+        .args(&args)
         .status()
         .await
     {
-        Ok(s) if s.success() => (StatusCode::OK, "power cycle triggered").into_response(),
+        Ok(s) if s.success() => (StatusCode::OK, "ok").into_response(),
         Ok(s) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("paniolo power-cycle exited with {s}"),
+            format!("paniolo {} exited with {s}", action.join(" ")),
         )
             .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to run {paniolo}: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /power-cycle` — `paniolo power-cycle <target>`.
+async fn power_cycle() -> Response {
+    run_power_action(&["power-cycle"]).await
+}
+
+/// `POST /power-on` — `paniolo power on <target>`.
+async fn power_on() -> Response {
+    run_power_action(&["power", "on"]).await
+}
+
+/// `POST /power-off` — `paniolo power off <target>`.
+async fn power_off() -> Response {
+    run_power_action(&["power", "off"]).await
+}
+
+/// `GET /power` — capability + current state WITHOUT acting, so the dashboard
+/// can probe availability and drive the on/off toggle on a timer without ever
+/// toggling the target. 501 if no target; otherwise runs `paniolo power-state
+/// <target>` and returns "on", "off", or "unknown".
+async fn power_state() -> Response {
+    let target = match power_target() {
+        Some(t) => t,
+        None => return no_target_response(),
+    };
+    let paniolo = std::env::var("PANIOLO_BIN").unwrap_or_else(|_| "paniolo".to_string());
+    match tokio::process::Command::new(&paniolo)
+        .args(["power-state", &target])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => {
+            // `power-state` prints a human line like "Power ON  (pi5)"; pull the
+            // on/off token out of it (case-insensitive, position-independent).
+            let out = String::from_utf8_lossy(&o.stdout);
+            let state = out
+                .split_whitespace()
+                .map(|t| t.to_ascii_lowercase())
+                .find(|t| t == "on" || t == "off")
+                .unwrap_or_else(|| "unknown".to_string());
+            (StatusCode::OK, state).into_response()
+        }
+        Ok(_) => (StatusCode::OK, "unknown").into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to run {paniolo}: {e}"),

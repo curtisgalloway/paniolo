@@ -262,11 +262,14 @@ browser, from `paniolo hid send`, from another script — flows through one
 `mpsc` queue in `uart.rs`, one in flight, request/reply; that single queue is
 what makes events intermix correctly. `paniolo console` starts the daemon when
 the target has a `hid` channel (local: `?hid=PORT`; remote: an SSH-tunnelled
-`?hidws=` URL). **Clicking the video grabs control** (first click engages + parks
-the cursor, doesn't fire on the target; the `⌨ Capture input` button does the
-same), then it streams `down`/`up`/`moveabs`/`scroll` to the daemon. The mouse
-is absolute (the firmware's custom HID descriptor), so the cursor follows where
-you point in the video; right-Ctrl releases. paniolo discovers the daemon by the
+`?hidws=` URL). The **`⌨ Capture input`** overlay button toggles capture (no click-to-grab, no
+host-key release): engaged, the page streams `down`/`up`/`moveabs`/`scroll` to
+the daemon; click the button again to release. The mouse is absolute (the
+firmware's custom HID descriptor), so the cursor follows where you point in the
+video, and the local cursor stays **visible as a crosshair** (no Pointer Lock —
+deliberately, so you never lose your pointer). Mouse listeners live on the
+`<img>`, so the overlay buttons never inject; window blur releases. paniolo
+discovers the daemon by the
 channel name `hid` (`daemons::daemon_port("hid")`), staying agnostic to the
 helper. Hardware-verified end-to-end on the pi5 Linux desktop (2026-06-04).
 
@@ -307,12 +310,17 @@ bottom (default, 40 vh) and right-panel (380 px fixed, video fills remaining
 width) layouts. The choice is persisted in `localStorage` under the key
 `paniolo-serial-layout`.
 
-**Power-cycle button:** an amber "⏻ Power Cycle" button appears in the video
-overlay when hdmicap's `POST /power-cycle` endpoint returns non-501. The endpoint
-delegates to `paniolo power-cycle <target>` using the `PANIOLO_TARGET` env var set
-when the daemon is started with `paniolo video watch <target>`. Clicking the button
-shows a confirmation modal before firing. The button is hidden if no target was
-passed at daemon start, so it is safe to use on shared dashboards.
+**Power controls:** an on/off **toggle switch** (`Power [switch] ON/OFF`,
+reflecting live state) plus a separate **⟳ Cycle** button appear in the video
+overlay, each gated by a confirmation modal. Availability + state come from
+**`GET /power`** — non-acting: it runs `paniolo power-state <target>` and returns
+`on`/`off`/`unknown`, and the dashboard polls it every 5 s to keep the toggle
+synced. The actions are **`POST /power-on` | `/power-off` | `/power-cycle`** →
+`paniolo power on|off` / `power-cycle <target>`. All use the `PANIOLO_TARGET` env
+var set when the daemon starts via `paniolo video watch <target>`; the controls
+are hidden (501) if no target was passed, so shared dashboards are safe.
+(Previously the availability probe was `POST /power-cycle`, which *triggered* a
+cycle on every page load — the probe is now the read-only `GET /power`.)
 
 ## OCR
 

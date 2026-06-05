@@ -52,14 +52,21 @@ width) layouts. The choice persists in `localStorage`.
 current frame via Apple Vision and displays the result. Requires
 `visionocr` to be installed (`paniolo setup`).
 
-**Capture input (KVM)** — when the target has a `hid` channel, **click the
-video to take control** (or use the **⌨ Capture input** button). Once engaged,
-your keyboard and mouse drive the target as USB HID events (the mouse is
-absolute — the target cursor follows where you point in the video). **Right-Ctrl**
-releases capture.
-The page streams commands to the hid daemon over a WebSocket, and `paniolo hid
-send` injections from the CLI intermix with them. See
+**Capture input (KVM)** — when the target has a `hid` channel, the **⌨ Capture
+input** button toggles KVM mode (it becomes **⌨ Capturing** while active; click
+again to release). Once engaged, your keyboard and mouse drive the target as USB
+HID events (the mouse is absolute — the target cursor follows where you point in
+the video). Your own cursor stays visible as a crosshair (no pointer lock), so
+there is a little feedback lag but you never lose your pointer; losing window
+focus also releases. The page streams commands to the hid daemon over a
+WebSocket, and `paniolo hid send` injections from the CLI intermix with them. See
 [HID injection › KVM mode](hid.md#kvm-mode--type-and-click-from-the-web-console).
+
+**Power** — when the target has a `power` channel, an on/off **toggle switch**
+(`Power [switch] ON/OFF`, reflecting live state, polled every few seconds) and a
+separate **⟳ Cycle** button appear in the overlay. Each asks for confirmation
+before acting. Availability and state come from `GET /power`, which performs **no**
+action — merely loading the dashboard never powers the target.
 
 ---
 

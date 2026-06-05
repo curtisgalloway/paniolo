@@ -34,21 +34,44 @@
     .pane-term { flex: 1 1 0; min-height: 0; padding: 4px 6px; }
     #videobtns { position: absolute; top: 8px; left: 12px; z-index: 3;
                  display: flex; gap: 6px; }
-    #ocrbtn, #pwrbtn { cursor: pointer; font: 12px ui-monospace, monospace;
-                       padding: 4px 10px; border-radius: 4px; }
-    #ocrbtn { color: #cdf; background: rgba(0,0,0,.6); border: 1px solid #46c; }
+    /* Fixed widths so a button's strip position never shifts when its label
+       changes (Capture input <-> Capturing, the toggle's on/off state). */
+    #videobtns button { cursor: pointer; font: 12px ui-monospace, monospace;
+                        padding: 4px 10px; border-radius: 4px; text-align: center;
+                        white-space: nowrap; }
+    #ocrbtn { color: #cdf; background: rgba(0,0,0,.6); border: 1px solid #46c;
+              min-width: 64px; }
     #ocrbtn:hover { background: rgba(40,80,160,.7); }
-    #pwrbtn { color: #fca; background: rgba(0,0,0,.6); border: 1px solid #840;
-              display: none; }
-    #pwrbtn:hover { background: rgba(80,30,0,.7); }
     #kvmbtn { color: #cfc; background: rgba(0,0,0,.6); border: 1px solid #4a4;
-              display: none; }
+              min-width: 150px; display: none; }
     #kvmbtn:hover { background: rgba(30,80,30,.7); }
     #kvmbtn.on { color: #000; background: #4d4; border-color: #4d4; font-weight: bold; }
+    /* Power: an on/off toggle switch + a separate cycle button. */
+    #pwrtoggle { color: #fca; background: rgba(0,0,0,.6); border: 1px solid #840;
+                 min-width: 128px; display: none; align-items: center;
+                 justify-content: center; gap: 8px; }
+    #pwrtoggle:hover { background: rgba(80,30,0,.7); }
+    #pwrlabel { color: #fca; }
+    #pwrtrack { width: 30px; height: 14px; border-radius: 7px; background: #722;
+                position: relative; flex: 0 0 auto; transition: background .15s; }
+    #pwrtoggle.on #pwrtrack { background: #2a7e2a; }
+    #pwrtoggle.unknown #pwrtrack { background: #6a5500; }
+    #pwrknob { position: absolute; top: 2px; left: 2px; width: 10px; height: 10px;
+               border-radius: 50%; background: #eee; transition: left .15s; }
+    #pwrtoggle.on #pwrknob { left: 18px; }
+    #pwrtoggle.unknown #pwrknob { left: 9px; }
+    /* fixed-width state label so ON<->OFF never nudges the switch */
+    #pwrstate { min-width: 24px; text-align: left; font-weight: bold; color: #e88; }
+    #pwrtoggle.on #pwrstate { color: #6e6; }
+    #pwrtoggle.unknown #pwrstate { color: #db4; }
+    #pwrcyclebtn { color: #fca; background: rgba(0,0,0,.6); border: 1px solid #840;
+                   min-width: 90px; display: none; }
+    #pwrcyclebtn:hover { background: rgba(80,30,0,.7); }
+    #pwrtoggle[disabled], #pwrcyclebtn[disabled] { opacity: .5; cursor: default; }
     #kvmstatus { position: absolute; bottom: 8px; left: 12px; z-index: 3;
                  color: #4d4; background: rgba(0,0,0,.6); padding: 3px 8px;
                  border-radius: 4px; display: none; }
-    #video.capturing { cursor: none; outline: 2px solid #4d4; outline-offset: -2px; }
+    #video.capturing { cursor: crosshair; outline: 2px solid #4d4; outline-offset: -2px; }
     #video img { -webkit-user-drag: none; user-select: none; }
     #kvmhint { position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%);
                z-index: 3; color: #cfc; background: rgba(0,0,0,.55); padding: 4px 12px;
@@ -92,11 +115,12 @@
 <body>
   <div id="video">
     <img id="feed" src="/preview" alt="HDMI capture feed" draggable="false">
-    <div id="kvmhint">⌨ Click to take control · right-Ctrl to release</div>
+    <div id="kvmhint">⌨ Use “Capture input” to control the target</div>
     <div id="videobtns">
       <button id="ocrbtn">⌕ OCR</button>
       <button id="kvmbtn">⌨ Capture input</button>
-      <button id="pwrbtn">⏻ Power Cycle</button>
+      <button id="pwrtoggle" title="Target power"><span id="pwrlabel">Power</span><span id="pwrtrack"><span id="pwrknob"></span></span><span id="pwrstate">—</span></button>
+      <button id="pwrcyclebtn">⟳ Cycle</button>
     </div>
     <div id="vstatus">connecting…</div>
     <div id="kvmstatus"></div>
@@ -106,10 +130,10 @@
     </div>
     <div id="pwrmodal">
       <div id="pwrbox">
-        <p>Power cycle the target?</p>
+        <p id="pwrmsg">Power cycle the target?</p>
         <div id="pwrbtns">
           <button id="pwrcancel">Cancel</button>
-          <button id="pwrconfirm">Power Cycle</button>
+          <button id="pwrconfirm">Confirm</button>
         </div>
       </div>
     </div>
@@ -175,26 +199,73 @@
         .catch(e => { ocrTitle.textContent = 'OCR — error'; ocrText.textContent = String(e); });
     };
 
-    // ── Power Cycle button — only shown when /power-cycle is available ──
-    const pwrBtn = document.getElementById('pwrbtn');
+    // ── Power: an on/off toggle switch + a separate cycle button, each
+    // confirmed before acting. Availability and live state come from GET /power,
+    // which performs NO action — so merely loading the page never toggles the
+    // target (the action endpoints /power-on|off|cycle are POST-only). The
+    // controls hide when no target is configured (501). The toggle is polled so
+    // it tracks the real rail even when power is changed elsewhere.
+    const pwrToggle = document.getElementById('pwrtoggle');
+    const pwrCycleBtn = document.getElementById('pwrcyclebtn');
     const pwrModal = document.getElementById('pwrmodal');
-    fetch('/power-cycle', { method: 'POST' })
-      .then(r => { if (r.status !== 501) pwrBtn.style.display = ''; })
-      .catch(() => {});
-    pwrBtn.onclick = () => pwrModal.classList.add('show');
-    document.getElementById('pwrcancel').onclick = () => pwrModal.classList.remove('show');
-    document.getElementById('pwrconfirm').onclick = () => {
+    const pwrMsg = document.getElementById('pwrmsg');
+    const pwrConfirm = document.getElementById('pwrconfirm');
+    const pwrStateLabel = document.getElementById('pwrstate');
+    let powerState = 'unknown', pwrAction = null, pwrBusy = false;
+
+    function renderPower() {
+      pwrToggle.classList.toggle('on', powerState === 'on');
+      pwrToggle.classList.toggle('unknown', powerState !== 'on' && powerState !== 'off');
+      pwrStateLabel.textContent = powerState === 'on' ? 'ON' : powerState === 'off' ? 'OFF' : '—';
+      pwrToggle.title = 'Target power: ' + powerState +
+        (powerState === 'on' ? ' — click to turn off'
+          : powerState === 'off' ? ' — click to turn on' : '');
+    }
+    function refreshPower() {
+      if (pwrBusy) return; // don't poll cambrionix while an action holds the port
+      fetch('/power').then(r => {
+        if (r.status === 501) { // no target configured — hide power controls
+          pwrToggle.style.display = 'none';
+          pwrCycleBtn.style.display = 'none';
+          return;
+        }
+        pwrToggle.style.display = 'inline-flex';
+        pwrCycleBtn.style.display = 'inline-block';
+        return r.text().then(t => { powerState = t.trim() || 'unknown'; renderPower(); });
+      }).catch(() => {});
+    }
+    refreshPower();
+    setInterval(refreshPower, 5000);
+
+    function askPower(msg, confirmLabel, fn) {
+      pwrMsg.textContent = msg;
+      pwrConfirm.textContent = confirmLabel;
+      pwrAction = fn;
+      pwrModal.classList.add('show');
+    }
+    document.getElementById('pwrcancel').onclick = () => { pwrModal.classList.remove('show'); pwrAction = null; };
+    pwrConfirm.onclick = () => {
       pwrModal.classList.remove('show');
-      pwrBtn.textContent = '⏻ cycling…';
-      pwrBtn.disabled = true;
-      fetch('/power-cycle', { method: 'POST' })
-        .then(r => r.text().then(t => {
-          pwrBtn.textContent = r.ok ? '⏻ Power Cycle' : '⏻ Error';
-          if (!r.ok) console.error('power-cycle:', t);
-        }))
-        .catch(e => { pwrBtn.textContent = '⏻ Error'; console.error(e); })
-        .finally(() => { pwrBtn.disabled = false; });
+      const fn = pwrAction; pwrAction = null;
+      if (fn) fn();
     };
+    function doPower(endpoint) {
+      pwrBusy = true;
+      pwrToggle.disabled = pwrCycleBtn.disabled = true;
+      fetch(endpoint, { method: 'POST' })
+        .then(r => { if (!r.ok) r.text().then(t => console.error(endpoint, t)); })
+        .catch(e => console.error(e))
+        .finally(() => {
+          pwrToggle.disabled = pwrCycleBtn.disabled = false;
+          pwrBusy = false;
+          setTimeout(refreshPower, 1500); // let the rail settle, then re-read
+        });
+    }
+    pwrToggle.onclick = () => {
+      if (powerState === 'on') askPower('Power OFF the target?', 'Power off', () => doPower('/power-off'));
+      else askPower('Power ON the target?', 'Power on', () => doPower('/power-on'));
+    };
+    pwrCycleBtn.onclick = () => askPower('Power cycle the target?', 'Power cycle', () => doPower('/power-cycle'));
 
     // ── serial: xterm.js panes fed by serialcap WebSocket (cross-port) ──
     // ?serial=PORT or ?serialws=URL override the default serialcap location.
@@ -298,11 +369,12 @@
     }
 
     // ── KVM: keyboard + absolute mouse to the target via the hid daemon ──
-    // ?hidws=URL (remote/tunnel) or ?hid=PORT (local) enable the HID leg. While
-    // "Capture input" is engaged, all keyboard + mouse events are sent to the
-    // target and suppressed locally; right-Ctrl releases capture (so the serial
-    // terminal and the page work normally otherwise). The mouse is absolute:
-    // the cursor lands where you point inside the video.
+    // ?hidws=URL (remote/tunnel) or ?hid=PORT (local) enable the HID leg. The
+    // "Capture input" header button toggles capture; while engaged, all
+    // keyboard + mouse events are sent to the target and suppressed locally
+    // (click the button again to release). The mouse is absolute and the local
+    // cursor stays visible (no pointer lock) — you point with it and the
+    // target's cursor follows where you point inside the video, a frame behind.
     (function () {
       const hidWsUrl = params.get('hidws') ||
         (params.get('hid')
@@ -315,8 +387,8 @@
       const kst = document.getElementById('kvmstatus');
       const videoEl = document.getElementById('video');
       const feed = document.getElementById('feed');
-      btn.style.display = '';
-      videoEl.classList.add('kvm-available'); // shows the "click to take control" hint
+      btn.style.display = 'inline-block'; // reveal the header toggle (CSS hides it by default)
+      videoEl.classList.add('kvm-available'); // reveals the "Capture input" hint
 
       // event.code (physical key) -> adafruit_hid Keycode name.
       const KEYMAP = (function () {
@@ -375,7 +447,7 @@
         btn.classList.add('on');
         videoEl.classList.add('capturing');
         kst.style.display = '';
-        setStatus('capturing — right-Ctrl to release');
+        setStatus('capturing — click ⌨ to release');
         btn.textContent = '⌨ Capturing';
       }
       function disengage() {
@@ -393,8 +465,6 @@
       // ── keyboard ──
       window.addEventListener('keydown', ev => {
         if (!captured) return;
-        // right-Ctrl is the release hotkey — never forwarded to the target.
-        if (ev.code === 'ControlRight') { ev.preventDefault(); disengage(); return; }
         ev.preventDefault();
         if (ev.repeat) return; // the target applies its own auto-repeat while held
         const name = KEYMAP[ev.code];
@@ -402,7 +472,6 @@
       }, true);
       window.addEventListener('keyup', ev => {
         if (!captured) return;
-        if (ev.code === 'ControlRight') return;
         ev.preventDefault();
         const name = KEYMAP[ev.code];
         if (name) send('up ' + name);
@@ -427,13 +496,12 @@
         return [clamp(x / dispW * ABS_MAX), clamp(y / dispH * ABS_MAX)];
       }
       const BTN = ['left', 'middle', 'right']; // MouseEvent.button order
-      let skipNextUp = false;
 
       // Coalesce mouse moves: a fast mouse fires 60–125 mousemove/sec, and each
       // moveabs is a serial round-trip to the board — sending them all backs up
-      // the queue and the cursor lags. Instead keep only the *latest* position
-      // and flush at most one per animation frame (~60 Hz). Clicks flush
-      // immediately so the press lands where you clicked.
+      // the queue and the target cursor lags. Instead keep only the *latest*
+      // position and flush at most one per animation frame (~60 Hz). Clicks
+      // flush immediately so the press lands where you clicked.
       let pendingMove = null;
       function flushMove() {
         if (captured && pendingMove) {
@@ -445,32 +513,28 @@
       requestAnimationFrame(flushMove);
       function moveNow(p) { send('moveabs ' + p[0] + ' ' + p[1]); pendingMove = null; }
 
-      videoEl.addEventListener('mousemove', ev => {
+      // Mouse listeners live on the <img> itself, so events over the overlay
+      // buttons (Capture/OCR/Power) are never forwarded to the target. Capture
+      // is engaged only from the header button — clicking the video just sends
+      // a real click where you point.
+      feed.addEventListener('mousemove', ev => {
         if (!captured) return;
         const p = toLogical(ev);
         if (p) pendingMove = p; // newest position wins; flushed on the next frame
       });
-      videoEl.addEventListener('mousedown', ev => {
+      feed.addEventListener('mousedown', ev => {
+        if (!captured) return;
         ev.preventDefault();
         const p = toLogical(ev);
-        if (!captured) {
-          // First click grabs control and parks the cursor where you clicked;
-          // it is NOT forwarded as a click (so nothing fires on the target yet).
-          engage();
-          if (p) moveNow(p);
-          skipNextUp = true;
-          return;
-        }
         if (p) moveNow(p); // land the press exactly where clicked, not a frame late
         send('mdown ' + (BTN[ev.button] || 'left'));
       });
       window.addEventListener('mouseup', ev => {
         if (!captured) return;
-        if (skipNextUp) { skipNextUp = false; return; } // the grab click
         send('mup ' + (BTN[ev.button] || 'left'));
       });
-      videoEl.addEventListener('contextmenu', ev => { if (captured) ev.preventDefault(); });
-      videoEl.addEventListener('wheel', ev => {
+      feed.addEventListener('contextmenu', ev => { if (captured) ev.preventDefault(); });
+      feed.addEventListener('wheel', ev => {
         if (!captured) return;
         ev.preventDefault();
         send('scroll ' + (ev.deltaY < 0 ? 1 : -1));

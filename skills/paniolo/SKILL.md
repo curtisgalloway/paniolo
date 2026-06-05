@@ -254,12 +254,14 @@ silent while the target is off and reboots with it. Protocol spec (for new
 injector implementations): `docs/hid-serial-protocol.md`.
 
 **KVM in the console.** `paniolo console <name>` shows a **⌨ Capture input**
-button over the video when the target has a `hid` channel: engage it to drive
-the target with your own keyboard + mouse (absolute — the cursor follows where
-you point), right-Ctrl to release. It auto-starts the hid daemon (`hidrig
-serve`), which owns the UART and re-exposes the protocol over a WebSocket;
-`paniolo hid send` injections intermix with what you type in the browser.
-Manual daemon control: `paniolo hid serve|stop -t <name>`.
+toggle button over the video when the target has a `hid` channel: click it to
+drive the target with your own keyboard + mouse (absolute — the cursor follows
+where you point; your local cursor stays visible as a crosshair), click again to
+release. It auto-starts the hid daemon (`hidrig serve`), which owns the UART and
+re-exposes the protocol over a WebSocket; `paniolo hid send` injections intermix
+with what you type in the browser. Manual daemon control: `paniolo hid
+serve|stop -t <name>`. When the target also has a `power` channel, the overlay
+adds an on/off toggle switch + a separate cycle button (each confirms first).
 
 ## Targets on a remote control host (a "lab")
 
