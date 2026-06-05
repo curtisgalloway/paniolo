@@ -49,6 +49,11 @@
                  color: #4d4; background: rgba(0,0,0,.6); padding: 3px 8px;
                  border-radius: 4px; display: none; }
     #video.capturing { cursor: none; outline: 2px solid #4d4; outline-offset: -2px; }
+    #video img { -webkit-user-drag: none; user-select: none; }
+    #kvmhint { position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%);
+               z-index: 3; color: #cfc; background: rgba(0,0,0,.55); padding: 4px 12px;
+               border-radius: 4px; font-size: 12px; pointer-events: none; display: none; }
+    #video.kvm-available:not(.capturing) #kvmhint { display: block; }
     #pwrmodal { position: absolute; inset: 0; z-index: 10; display: none;
                 align-items: center; justify-content: center;
                 background: rgba(0,0,0,.7); }
@@ -86,7 +91,8 @@
 </head>
 <body>
   <div id="video">
-    <img id="feed" src="/preview" alt="HDMI capture feed">
+    <img id="feed" src="/preview" alt="HDMI capture feed" draggable="false">
+    <div id="kvmhint">⌨ Click to take control · right-Ctrl to release</div>
     <div id="videobtns">
       <button id="ocrbtn">⌕ OCR</button>
       <button id="kvmbtn">⌨ Capture input</button>
@@ -310,6 +316,7 @@
       const videoEl = document.getElementById('video');
       const feed = document.getElementById('feed');
       btn.style.display = '';
+      videoEl.classList.add('kvm-available'); // shows the "click to take control" hint
 
       // event.code (physical key) -> adafruit_hid Keycode name.
       const KEYMAP = (function () {
@@ -420,20 +427,29 @@
         return [clamp(x / dispW * ABS_MAX), clamp(y / dispH * ABS_MAX)];
       }
       const BTN = ['left', 'middle', 'right']; // MouseEvent.button order
+      let skipNextUp = false;
       videoEl.addEventListener('mousemove', ev => {
         if (!captured) return;
         const p = toLogical(ev);
         if (p) send('moveabs ' + p[0] + ' ' + p[1]);
       });
       videoEl.addEventListener('mousedown', ev => {
-        if (!captured) return;
         ev.preventDefault();
         const p = toLogical(ev);
+        if (!captured) {
+          // First click grabs control and parks the cursor where you clicked;
+          // it is NOT forwarded as a click (so nothing fires on the target yet).
+          engage();
+          if (p) send('moveabs ' + p[0] + ' ' + p[1]);
+          skipNextUp = true;
+          return;
+        }
         if (p) send('moveabs ' + p[0] + ' ' + p[1]);
         send('mdown ' + (BTN[ev.button] || 'left'));
       });
       window.addEventListener('mouseup', ev => {
         if (!captured) return;
+        if (skipNextUp) { skipNextUp = false; return; } // the grab click
         send('mup ' + (BTN[ev.button] || 'left'));
       });
       videoEl.addEventListener('contextmenu', ev => { if (captured) ev.preventDefault(); });

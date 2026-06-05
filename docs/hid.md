@@ -105,13 +105,15 @@ Sequencing and timing live on the host; the firmware stays dumb.
 
 ## KVM mode — type and click from the web console
 
-`paniolo console` turns the dashboard into a KVM: a **⌨ Capture input** button
-appears over the video when the target has a `hid` channel. Engage it and your
-keyboard and mouse drive the target — keys are forwarded as HID events and the
-mouse is **absolute**, so the target cursor lands where you point inside the
-video. **Right-Ctrl** releases capture (the classic host-key convention); while
-released, the page and serial terminal behave normally. Losing window focus
-auto-releases and clears held keys so nothing sticks on the target.
+`paniolo console` turns the dashboard into a KVM when the target has a `hid`
+channel. **Click the video to take control** (or use the **⌨ Capture input**
+button) — the first click grabs input and parks the cursor where you clicked,
+without firing a click on the target. From then on your keyboard and mouse
+drive the target: keys are forwarded as HID events and the mouse is
+**absolute**, so the cursor lands where you point inside the video.
+**Right-Ctrl** releases (the classic host-key convention); while released, the
+page and serial terminal behave normally. Losing window focus auto-releases and
+clears held keys so nothing sticks on the target.
 
 Under the hood this is the **hid daemon**: the helper owns the UART and
 re-exposes the protocol over a localhost WebSocket (the
