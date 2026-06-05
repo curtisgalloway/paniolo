@@ -33,6 +33,9 @@ pub enum PixelData {
     Rgb(Arc<[u8]>),
     /// Bi-planar 4:2:0 as delivered by AVFoundation ('420v', video-range
     /// BT.601): `y` is w*h luma, `cbcr` is w*(h/2) interleaved chroma.
+    /// Only the macOS backend constructs this; Linux still matches on it
+    /// in the shared handlers, hence the cfg'd dead-code allow.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     Nv12 { y: Arc<[u8]>, cbcr: Arc<[u8]> },
 }
 
