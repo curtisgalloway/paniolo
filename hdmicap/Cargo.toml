@@ -10,17 +10,15 @@ name = "hdmicap"
 path = "src/main.rs"
 
 [dependencies]
-# --- Capture -------------------------------------------------------------
-# nokhwa unifies V4L2 (Linux) and AVFoundation (macOS) behind one API.
-# `input-native` pulls the right per-OS backend in recent 0.10.x.
-nokhwa = { version = "0.10", features = ["input-native"] }
-
 # --- Async runtime + HTTP ------------------------------------------------
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "net", "process", "io-util"] }
 axum = "0.7"
 
 # --- Imaging -------------------------------------------------------------
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Fast pure-Rust JPEG encoder for the preview path (no system deps; the
+# image crate's encoder is several times slower at preview resolutions).
+jpeg-encoder = "0.6"
 
 # --- CLI -----------------------------------------------------------------
 clap = { version = "4", features = ["derive"] }
@@ -45,17 +43,19 @@ nix = { version = "0.29", features = ["signal", "process"] }
 async-stream = "0.3"
 bytes = "1"
 
-# On Linux we bypass nokhwa for the actual frame loop and use v4l directly
-# so we can call stream.set_timeout() and avoid an indefinite VIDIOC_DQBUF block.
-# turbojpeg provides fast MJPEG decode (~5ms vs ~50ms pure-Rust) for signal detection.
+# Linux capture: the v4l crate directly, so we can call stream.set_timeout()
+# and avoid an indefinite VIDIOC_DQBUF block, plus keep the raw MJPEG tee.
+# nokhwa is used for device enumeration only. turbojpeg provides fast MJPEG
+# decode (~5ms vs ~50ms pure-Rust) for signal detection.
+# macOS capture: our own ObjC AVFoundation layer (src/capture_avf.m,
+# compiled by build.rs) — no nokhwa, no vendored bindings fork.
 [target.'cfg(target_os = "linux")'.dependencies]
+nokhwa = { version = "0.10", features = ["input-native"] }
 v4l = "0.14"
 turbojpeg = { version = "1.4", features = ["image"] }
 
-[patch.crates-io]
-# Local patch: skip activeVideoMin/MaxFrameDuration KVC calls that throw NSException
-# on HDMI capture cards (MS2109) under AVFoundation. See vendor/nokhwa-bindings-macos.
-nokhwa-bindings-macos = { path = "vendor/nokhwa-bindings-macos" }
+[build-dependencies]
+cc = "1"
 
 [profile.release]
 opt-level = 3

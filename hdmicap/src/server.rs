@@ -28,13 +28,13 @@ use axum::{
     Json, Router,
 };
 use bytes::Bytes;
-use image::codecs::jpeg::JpegEncoder;
-use image::{ImageBuffer, ImageEncoder, Rgb};
+use image::{ImageBuffer, Rgb};
 use serde::Deserialize;
 use tokio::sync::watch;
 
 use crate::capture_thread::FrameRx;
 use crate::frame::{FrameState, Signal, StatusDto};
+use crate::pixel::{nv12_to_rgb, nv12_to_rgb_half, PixelData};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -148,17 +148,47 @@ async fn snapshot(State(s): State<AppState>, Query(q): Query<SnapReq>) -> Respon
     }
 }
 
-/// Decode the frame to an RGB image. On the Linux MJPEG path `rgb` is empty
-/// and we decode `jpeg` with turbojpeg. On other paths `rgb` is pre-decoded.
+/// Decode the frame to a full-resolution RGB image. NV12 (macOS) converts
+/// here, lazily; on the Linux MJPEG path we decode `jpeg` with turbojpeg.
 fn decode_rgb(f: &FrameState) -> Option<ImageBuffer<Rgb<u8>, Vec<u8>>> {
-    if !f.rgb.is_empty() {
-        return ImageBuffer::from_raw(f.width, f.height, f.rgb.to_vec());
+    match &f.pixels {
+        PixelData::Rgb(buf) => ImageBuffer::from_raw(f.width, f.height, buf.to_vec()),
+        PixelData::Nv12 { y, cbcr } => Some(nv12_to_rgb(y, cbcr, f.width, f.height)),
+        PixelData::Empty => {
+            #[cfg(target_os = "linux")]
+            if let Some(ref jpeg) = f.jpeg {
+                return turbojpeg::decompress_image::<Rgb<u8>>(jpeg).ok();
+            }
+            None
+        }
     }
-    #[cfg(target_os = "linux")]
-    if let Some(ref jpeg) = f.jpeg {
-        return turbojpeg::decompress_image::<Rgb<u8>>(jpeg).ok();
-    }
-    None
+}
+
+/// Encode a preview JPEG from decoded pixels (the non-MJPEG fallback path).
+/// Large NV12 frames are halved first — the human preview doesn't need 8 MP,
+/// and 4:2:0 makes halving nearly free — then encoded with the fast
+/// `jpeg-encoder` crate.
+fn encode_preview_jpeg(f: &FrameState) -> Option<Vec<u8>> {
+    const PREVIEW_MAX_WIDTH: u32 = 1920;
+    let img = match &f.pixels {
+        PixelData::Nv12 { y, cbcr } if f.width > PREVIEW_MAX_WIDTH => {
+            nv12_to_rgb_half(y, cbcr, f.width, f.height)
+        }
+        PixelData::Nv12 { y, cbcr } => nv12_to_rgb(y, cbcr, f.width, f.height),
+        PixelData::Rgb(buf) => ImageBuffer::from_raw(f.width, f.height, buf.to_vec())?,
+        PixelData::Empty => return None,
+    };
+    let mut out = Vec::new();
+    let encoder = jpeg_encoder::Encoder::new(&mut out, 80);
+    encoder
+        .encode(
+            img.as_raw(),
+            img.width() as u16,
+            img.height() as u16,
+            jpeg_encoder::ColorType::Rgb,
+        )
+        .ok()?;
+    Some(out)
 }
 
 /// Encode the frame to PNG bytes. Shared by /snapshot and /ocr.
@@ -232,6 +262,9 @@ async fn preview(State(s): State<AppState>) -> Response {
     let stream = async_stream::stream! {
         let mut interval = tokio::time::interval(Duration::from_millis(67));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Don't re-encode (or re-send) a frame the client already has; at
+        // camera rates below the tick rate this halves the encode work.
+        let mut last_served: Option<Instant> = None;
 
         loop {
             interval.tick().await;
@@ -240,32 +273,21 @@ async fn preview(State(s): State<AppState>) -> Response {
             if f.signal == Signal::NoDevice || f.width == 0 {
                 continue;
             }
+            if last_served == Some(f.captured_at) {
+                continue;
+            }
 
             // Fast path: raw JPEG bytes from the device — no decode/re-encode.
             let jpeg_bytes: Vec<u8> = if let Some(ref raw) = f.jpeg {
                 raw.to_vec()
             } else {
-                // Fallback: re-encode from decoded RGB (macOS / YUYV path).
-                let img: ImageBuffer<Rgb<u8>, _> =
-                    match ImageBuffer::from_raw(f.width, f.height, f.rgb.to_vec()) {
-                        Some(i) => i,
-                        None => continue,
-                    };
-                let mut buf = Vec::new();
-                let encoder = JpegEncoder::new_with_quality(Cursor::new(&mut buf), 80);
-                if encoder
-                    .write_image(
-                        img.as_raw(),
-                        img.width(),
-                        img.height(),
-                        image::ExtendedColorType::Rgb8,
-                    )
-                    .is_err()
-                {
-                    continue;
+                // Fallback: encode from native pixels (macOS NV12 / YUYV).
+                match encode_preview_jpeg(&f) {
+                    Some(b) => b,
+                    None => continue,
                 }
-                buf
             };
+            last_served = Some(f.captured_at);
 
             let part_header = format!(
                 "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",

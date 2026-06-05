@@ -26,6 +26,7 @@ mod capture;
 mod capture_thread;
 mod daemon;
 mod frame;
+mod pixel;
 mod server;
 
 use std::io::{Read, Write};
