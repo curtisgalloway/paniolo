@@ -50,14 +50,35 @@ const READ_TIMEOUT: Duration = Duration::from_millis(10_000);
 /// Short timeout for liveness probes during baud auto-detection.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// macOS buffers serial reads behind a data-latency timer (`IOSSDATALAT`) whose
+/// default adds well over 100 ms to every request/reply round trip on FTDI
+/// adapters — measured ~230 ms cmd→reply, the dominant HID-path latency. The
+/// injector protocol sends one report per command for KVM streaming, so drop
+/// the timer to its floor. No-op off macOS (the `serialport` crate does not set
+/// this; Linux's ftdi_sio uses a low default and a `latency_timer` sysfs knob).
+#[cfg(target_os = "macos")]
+fn set_low_read_latency(fd: std::os::unix::io::RawFd) {
+    // _IOW('T', 0, c_ulong), per <IOKit/serial/ioss.h>.
+    const IOSSDATALAT: libc::c_ulong = 0x8008_5400;
+    let latency: libc::c_ulong = 1; // microseconds
+    // Best-effort: a failure just leaves the default (higher) latency in place.
+    unsafe { libc::ioctl(fd, IOSSDATALAT, &latency) };
+}
+
 fn open_at(device: &str, baud: u32, timeout: Duration) -> Result<Box<dyn SerialPort>> {
-    serialport::new(device, baud)
+    let port = serialport::new(device, baud)
         .data_bits(serialport::DataBits::Eight)
         .parity(serialport::Parity::None)
         .stop_bits(serialport::StopBits::One)
         .timeout(timeout)
-        .open()
-        .map_err(|e| anyhow!("cannot open {device}: {e}"))
+        .open_native()
+        .map_err(|e| anyhow!("cannot open {device}: {e}"))?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        set_low_read_latency(port.as_raw_fd());
+    }
+    Ok(Box::new(port))
 }
 
 /// Open the injector's control UART at the boot default [`BAUD`].
