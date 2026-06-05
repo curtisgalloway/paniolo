@@ -28,8 +28,10 @@ and power-cycle it without human intervention at each iteration.
 
 Full docs live in [`docs/`](docs/README.md). Start with the
 [**architecture overview**](docs/architecture.md) for the whole-system design, then the
-per-subsystem guides linked above. Hardware-CI integration (KernelCI/LAVA, Fuchsia/botanist)
-design and the project requirements tracker are under [`docs/`](docs/README.md) as well.
+per-subsystem guides linked above. The [tested-hardware list](docs/hardware.md) covers the
+bench gear each subsystem is verified with. Hardware-CI integration (KernelCI/LAVA,
+Fuchsia/botanist) design and the project requirements tracker are under
+[`docs/`](docs/README.md) as well.
 
 ---
 
