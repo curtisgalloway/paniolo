@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
+#include <time.h>
 
 // KB2040 running CircuitPython HID target firmware
 static const long kVendorID  = 0x239A;
@@ -57,13 +58,29 @@ static long GetDeviceLongProperty(IOHIDDeviceRef device, CFStringRef key, long f
 // numbered-report ID (0 if the device doesn't use numbered reports). NOTE: the
 // reportID byte is NOT included in `report` — prepend it yourself if your
 // simulated device uses numbered reports.
+//
+// Each line carries two timestamps taken at callback entry:
+//   ts=<sec.usec>  CLOCK_REALTIME (wall clock) — correlate with a sender's
+//                  wall-clock send timestamps on the same machine.
+//   dt=<usec>      delta from the previous report, from CLOCK_MONOTONIC_RAW —
+//                  inter-report spacing immune to NTP slew.
 static void InputReportCallback(void *context, IOReturn result, void *sender,
                                 IOHIDReportType type, uint32_t reportID,
                                 uint8_t *report, CFIndex reportLength) {
     (void)context; (void)result; (void)sender; (void)type;
 
+    static uint64_t prev_mono_ns = 0;
+    struct timespec wall, mono;
+    clock_gettime(CLOCK_REALTIME, &wall);
+    clock_gettime(CLOCK_MONOTONIC_RAW, &mono);
+    uint64_t mono_ns = (uint64_t)mono.tv_sec * 1000000000ull + (uint64_t)mono.tv_nsec;
+    long dt_us = prev_mono_ns ? (long)((mono_ns - prev_mono_ns) / 1000ull) : -1;
+    prev_mono_ns = mono_ns;
+
     // ---- Hook your forwarding here. For now just dump hex. ----
-    printf("report id=%u len=%ld:", reportID, (long)reportLength);
+    printf("report ts=%ld.%06ld dt=%ld id=%u len=%ld:",
+           (long)wall.tv_sec, (long)(wall.tv_nsec / 1000), dt_us,
+           reportID, (long)reportLength);
     for (CFIndex i = 0; i < reportLength; i++) printf(" %02X", report[i]);
     printf("\n");
     fflush(stdout);

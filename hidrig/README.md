@@ -116,37 +116,63 @@ paniolo hid send -t pi5 key ENTER
 it on whichever control host owns the channel (transparently over SSH for
 remote hosts). See [`docs/hid.md`](../docs/hid.md).
 
-## Host testing tool
+## Host testing tools (macOS)
 
-`host/hid_seize_reports.c` is a macOS IOKit utility that exclusively seizes
-the injector's HID interface and prints raw input reports without any
-keystroke reaching the focused application. Use it to verify the full
-pipeline end-to-end by plugging the injector's USB into the same machine
-that drives the UART.
+To verify the full pipeline end-to-end, plug the injector's USB into the same
+Mac that drives the UART and capture its HID reports while you inject. Build
+with `cd hidrig/host && make`.
+
+**`host/hid_capture_usb.m` — leak-safe capture (use this one).** Takes the
+injector away from the macOS HID stack entirely via IOUSBHost whole-device
+capture (`IOUSBHostObjectInitOptionsDeviceCapture`, root passes the gate), then
+prints each interrupt-IN report with timestamps. Because the device is detached,
+injected keystrokes and mouse moves reach **only** this tool — they never touch
+the focused app or the real cursor.
 
 ```bash
-cd hidrig/host
-make
-sudo ./hid_seize_reports   # grant Input Monitoring in System Settings
+sudo ./hid_capture_usb            # defaults to the injector serial
+sudo ./hid_capture_usb <serial>   # if you have more than one KB2040 attached
 ```
 
-In another terminal: `hidrig -d /dev/cu.usbserial-XXXX type hello` and watch
-the raw HID report bytes. The VID/PID filter is 0x239A/0x8106 (KB2040
-running CircuitPython).
+In another terminal: `hidrig -d /dev/cu.usbserial-XXXX moveabs 16000 8000` and
+watch the report bytes. **Start the capture tool before injecting** or the
+reports leak into your live session.
+
+> `host/hid_seize_reports.c` (the older `IOHIDDeviceOpen(..SeizeDevice)` tool)
+> is **non-exclusive** on modern macOS (Darwin 24/25): the seize succeeds and
+> reports arrive, but the system event path is not detached, so injected moves
+> still move the real cursor. Keep it only as a passive raw-report tap; use
+> `hid_capture_usb` when you need true exclusivity.
+
+`host/hid_bench.py` measures latency/throughput (modes `latency`/`rr`/`pipe`)
+and `host/leak_check.py` asserts no cursor leak — both via `uv run --with
+pyserial …`. See `host/README.md`.
+
+### macOS serial latency
+
+The daemon drops the macOS serial read-latency timer (`IOSSDATALAT`) to its
+floor when it opens the FTDI adapter (`proto.rs`). The default timer adds
+~230 ms to every command's round trip — the dominant HID-path latency until
+this was fixed. With it, a mouse move injects in ~8 ms (the USB interrupt
+endpoint's 8 ms `bInterval` is then the floor).
 
 ## Files
 
 ```
 hidrig/
   src/main.rs           # `hidrig` CLI: one-shots, `run`, `serve`/`stop`
-  src/proto.rs          # line protocol client + sequence parser
+  src/proto.rs          # line protocol client + sequence parser; macOS low-latency open
   src/uart.rs           # daemon: the single UART owner (serializes all commands)
   src/server.rs         # daemon: axum WebSocket /hid + POST /send
   src/daemon.rs         # daemon: lock, discovery file, lifecycle
   firmware/boot.py      # USB identity: HID-only, absolute-pointer descriptor
   firmware/code.py      # UART line protocol -> USB HID (reference impl)
-  host/hid_seize_reports.c  # macOS IOKit HID capture tool
+  host/hid_capture_usb.m    # macOS leak-safe HID capture (IOUSBHost device-capture)
+  host/hid_seize_reports.c  # macOS passive raw-report tap (non-exclusive on Darwin 24/25)
+  host/hid_bench.py         # latency/throughput bench
+  host/leak_check.py        # asserts injection does not leak to the live session
   host/Makefile
+  host/README.md
 ```
 
 ## History

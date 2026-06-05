@@ -159,16 +159,31 @@ cmd = "hidrig -d /dev/cu.usbserial-XXXX"
 
 ---
 
-## Host testing tool
+## Host testing tools (macOS)
 
-`hidrig/host/hid_seize_reports.c` is a macOS IOKit utility that exclusively
-seizes the injector's HID interface, preventing keystrokes from reaching any
-application. Use it to verify the full pipeline end-to-end without a target:
+To exercise the full pipeline without a target, plug the injector's USB into
+the same Mac that drives the UART and capture its HID reports while injecting.
+Build with `cd hidrig/host && make`.
+
+`hidrig/host/hid_capture_usb.c` (`.m`) is the **leak-safe** tool: it detaches
+the injector from the macOS HID stack via IOUSBHost whole-device capture and
+prints timestamped interrupt-IN reports, so injected input reaches only the
+tool — not the focused app or the real cursor.
 
 ```bash
-cd hidrig/host && make
-sudo ./hid_seize_reports   # grant Input Monitoring in System Settings first
+sudo ./hid_capture_usb         # start this BEFORE injecting
+# second terminal:
+hidrig -d <adapter> moveabs 16000 8000
 ```
 
-In a second terminal, run `hidrig -d <adapter> type test` and watch the raw
-HID report bytes appear.
+> The older `hid_seize_reports.c` (`IOHIDDeviceOpen(..SeizeDevice)`) is
+> **non-exclusive** on Darwin 24/25 — injected moves still move the real
+> cursor — so use it only as a passive tap. `hid_bench.py` (latency/throughput)
+> and `leak_check.py` round out the bench; see `hidrig/host/README.md`.
+
+### Latency note
+
+On macOS the daemon drops the serial read-latency timer (`IOSSDATALAT`) to its
+floor on open; the default added ~230 ms per command, which had dominated the
+felt KVM latency. With the fix a mouse move injects in ~8 ms (the USB endpoint's
+8 ms `bInterval` is the floor); `ping` is ~3 ms.
