@@ -138,6 +138,15 @@ When a daemon is running for a device, `hidrig -d <device> …` one-shots route
 through it automatically (the UART has a single owner), so the CLI and the web
 console never contend for the port.
 
+**Latency.** Each command is a serial round-trip, so cursor streaming is
+sensitive to per-command cost and event rate. Two things keep it responsive:
+the dashboard **coalesces mouse moves** to one `moveabs` per animation frame
+(newest position only, instead of every `mousemove`), and the daemon
+**negotiates the UART up** from the 115200 boot rate to 460800 when the device
+advertises the `baud` capability (the firmware boots at 115200 so a naive
+connect always works, and returns to it on power-cycle). One-shots stay at
+115200 — a single command doesn't need the speed.
+
 ---
 
 ## Lab file shape

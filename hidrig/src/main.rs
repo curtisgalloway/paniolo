@@ -141,6 +141,12 @@ enum Cmd {
     },
     /// Stop a running hid daemon (SIGTERM to the recorded pid).
     Stop,
+    /// Negotiate the link up to <RATE> baud (for testing; the device boots at
+    /// 115200 and re-syncs on power-cycle, the daemon does this automatically).
+    Baud {
+        /// New baud rate (e.g. 460800).
+        rate: u32,
+    },
 }
 
 fn main() -> Result<()> {
@@ -159,6 +165,13 @@ fn main() -> Result<()> {
             return daemon::run(device.to_string(), *port);
         }
         Cmd::Stop => return cmd_stop(),
+        Cmd::Baud { rate } => {
+            let device = require_device(&cli)?;
+            let mut port = open_port(device)?;
+            proto::negotiate_baud(&mut port, *rate)?;
+            println!("OK (link now at {rate} baud)");
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -188,7 +201,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Run { file, delay_ms } => cmd_run(&mut tx, &file, delay_ms),
-        Cmd::Serve { .. } | Cmd::Stop => unreachable!("handled above"),
+        Cmd::Serve { .. } | Cmd::Stop | Cmd::Baud { .. } => unreachable!("handled above"),
     }
 }
 

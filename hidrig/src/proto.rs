@@ -23,8 +23,14 @@ use serialport::SerialPort;
 use std::io::{BufRead, BufReader, Write};
 use std::time::Duration;
 
-/// Fixed by the firmware (`BAUD` in firmware/code.py).
+/// The firmware's boot default (`BAUD` in firmware/code.py). A naive connection
+/// always works at this rate; the daemon may negotiate up from here.
 pub const BAUD: u32 = 115_200;
+
+/// The rate the daemon negotiates up to for KVM-streaming throughput (the
+/// device must advertise the `baud` capability). Boots at [`BAUD`], so a
+/// power-cycle re-syncs.
+pub const FAST_BAUD: u32 = 460_800;
 
 /// The absolute-pointer logical maximum (`moveabs` axis range is `0..=ABS_MAX`).
 pub const ABS_MAX: i32 = 32_767;
@@ -38,19 +44,65 @@ pub fn clamp_abs(v: i32) -> i32 {
     v.clamp(0, ABS_MAX)
 }
 
-/// Open the injector's control UART (via the USB-serial adapter).
-///
-/// The read timeout is generous because a long `type` or `move` executes a
-/// HID report per step before the board replies.
-pub fn open_port(device: &str) -> Result<Box<dyn SerialPort>> {
-    let port = serialport::new(device, BAUD)
+/// Generous read timeout for normal operation: a long `type` or `move`
+/// executes a HID report per step before the board replies.
+const READ_TIMEOUT: Duration = Duration::from_millis(10_000);
+/// Short timeout for liveness probes during baud auto-detection.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+fn open_at(device: &str, baud: u32, timeout: Duration) -> Result<Box<dyn SerialPort>> {
+    serialport::new(device, baud)
         .data_bits(serialport::DataBits::Eight)
         .parity(serialport::Parity::None)
         .stop_bits(serialport::StopBits::One)
-        .timeout(Duration::from_millis(10_000))
+        .timeout(timeout)
         .open()
-        .map_err(|e| anyhow!("cannot open {device}: {e}"))?;
-    Ok(port)
+        .map_err(|e| anyhow!("cannot open {device}: {e}"))
+}
+
+/// Open the injector's control UART at the boot default [`BAUD`].
+pub fn open_port(device: &str) -> Result<Box<dyn SerialPort>> {
+    open_at(device, BAUD, READ_TIMEOUT)
+}
+
+/// Tell the device to switch to `rate`, then switch our port and confirm.
+///
+/// The device replies `OK` at the *current* rate and then switches; we wait for
+/// it to switch, change our port, and `ping` to confirm. On any failure the
+/// caller should treat the link as still at the previous rate.
+pub fn negotiate_baud(port: &mut Box<dyn SerialPort>, rate: u32) -> Result<()> {
+    send_command(port, &format!("baud {rate}"))?; // acked at the current rate
+    std::thread::sleep(Duration::from_millis(120)); // let the device switch
+    port.set_baud_rate(rate)
+        .map_err(|e| anyhow!("set_baud_rate {rate}: {e}"))?;
+    std::thread::sleep(Duration::from_millis(40));
+    send_command(port, "ping").map(|_| ())
+}
+
+/// Open the UART and end up speaking the device's actual rate, negotiating up
+/// to `fast` when possible. Tries the boot default first; if nothing answers
+/// there, probes `fast` (a prior session may have left the device elevated and
+/// not power-cycled). Returns the open port and the rate now in effect.
+pub fn open_synced(device: &str, fast: u32) -> Result<(Box<dyn SerialPort>, u32)> {
+    let mut port = open_at(device, BAUD, PROBE_TIMEOUT)?;
+    if send_command(&mut port, "ping").is_ok() {
+        port.set_timeout(READ_TIMEOUT).ok();
+        if fast != BAUD && negotiate_baud(&mut port, fast).is_ok() {
+            return Ok((port, fast));
+        }
+        port.set_baud_rate(BAUD).ok(); // negotiation reverts to the boot default
+        return Ok((port, BAUD));
+    }
+    // Nothing at the boot default — maybe the device is already elevated.
+    if fast != BAUD && port.set_baud_rate(fast).is_ok() && send_command(&mut port, "ping").is_ok() {
+        port.set_timeout(READ_TIMEOUT).ok();
+        return Ok((port, fast));
+    }
+    // Give up syncing; hand back a boot-default port and let the first real
+    // command surface the error.
+    port.set_baud_rate(BAUD).ok();
+    port.set_timeout(READ_TIMEOUT).ok();
+    Ok((port, BAUD))
 }
 
 /// Send one command line and return the board's reply with the `OK` prefix
