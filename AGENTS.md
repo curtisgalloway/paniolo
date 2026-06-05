@@ -158,14 +158,19 @@ cli/src/
 Deferred (tracked in docs/config-redesign.md): the
 Openterface CH9329 HID backend (clean-room spec at docs/ch9329-spec.md — a shim
 speaking the HID serial protocol would plug into the existing `hid` channel),
-legacy Python removal, and a **helper state/runtime-dir API**: today each
-helper hand-rolls its paths (zigplug mirrors daemons.rs's `/tmp/paniolo-<uid>`
-logic and drops `zigbee.db` at the top of `~/.config/paniolo/`, beside the lab
-file) — helpers writing unnamespaced state into the shared config dir will
-eventually collide. The fix: per-helper subdirectories
-(`~/.config/paniolo/helpers/<name>/`, `/tmp/paniolo-<uid>/<name>/`), passed by
-paniolo as `PANIOLO_STATE_DIR`/`PANIOLO_RUNTIME_DIR` env vars when it invokes
-hooks and helpers, with documented fallbacks for standalone runs.
+legacy Python removal.
+
+**Helper state/runtime-dir API** (daemons.rs `helper_env`): paniolo exports
+`PANIOLO_STATE_DIR` (`~/.config/paniolo/helpers/<name>/`, durable) and
+`PANIOLO_RUNTIME_DIR` (`/tmp/paniolo-<uid>/<name>/`, discovery/locks/logs) —
+directories pre-created — on every helper invocation: hook commands (named by
+the hook's program basename, see `hook_helper_name`), `paniolo helper`
+passthrough, and daemon spawns. Channel daemons use the channel name (hidrig
+publishes under `hid`). Helpers prefer the env vars, falling back to the same
+literal paths standalone; hdmicap/serialcap/hidrig/zigplug all do, and
+zigplug lazily migrates its `zigbee.db` from the legacy top-level
+`~/.config/paniolo/` location into its namespaced dir. Contract for new
+helpers: docs/adding-power-helpers.md.
 
 ## Module layout (legacy Python — being retired)
 
@@ -236,7 +241,9 @@ zigplug/         Python (uv) helper: Zigbee smart plug control via a CC2652 (ZNP
                  `serve/stop/status` (daemon), `backup`/`restore` (coordinator
                  NVRAM recovery from zigpy's auto-backups — no re-pairing);
                  `state <ieee>` prints exactly `on` or `off` (state_cmd
-                 contract). Device DB at ~/.config/paniolo/zigbee.db.
+                 contract). Device DB at
+                 ~/.config/paniolo/helpers/zigplug/zigbee.db (auto-migrated
+                 from the legacy top-level location).
                  Installed by `paniolo setup` via `uv tool install` when uv is
                  present (shim in the libexec dir via UV_TOOL_BIN_DIR, off
                  PATH). See docs/power.md for pairing, hook wiring, recovery.

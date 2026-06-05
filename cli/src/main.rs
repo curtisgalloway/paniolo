@@ -779,7 +779,17 @@ fn cmd_helper(name: Option<&str>, args: &[String]) -> Result<()> {
     };
     let binary = daemons::find_binary(name)
         .ok_or_else(|| anyhow!("helper '{name}' not found — run `paniolo setup`"))?;
-    let status = std::process::Command::new(binary).args(args).status()?;
+    // State/runtime dirs are keyed by helper name, except channel daemons
+    // whose discovery name is the channel (any conforming helper may serve
+    // it): hidrig publishes under "hid".
+    let env_name = match name {
+        "hidrig" => HID_DAEMON,
+        n => n,
+    };
+    let status = std::process::Command::new(binary)
+        .args(args)
+        .envs(daemons::helper_env(env_name))
+        .status()?;
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
@@ -1690,8 +1700,17 @@ fn local_power(lab: &Lab, target: &str) -> Result<model::PowerChannel> {
     Ok(p)
 }
 
+/// State/runtime-dir env pairs for an opaque hook command (named after the
+/// hook's program basename); empty when underivable.
+fn hook_envs(cmd: &str) -> Vec<(&'static str, std::path::PathBuf)> {
+    daemons::hook_helper_name(cmd)
+        .map(|n| daemons::helper_env(&n))
+        .unwrap_or_default()
+}
+
 /// Run an opaque shell hook via `sh -c`, propagating its exit code. The
-/// libexec dir is prepended to PATH so lab files can name helpers bare.
+/// libexec dir is prepended to PATH so lab files can name helpers bare, and
+/// the helper state/runtime dirs ride along as env vars.
 /// `label` is a human-readable description shown in the progress message.
 fn run_power_hook(cmd: &str, label: &str, target: &str) -> Result<()> {
     eprintln!("{label} '{target}' via {cmd}");
@@ -1699,6 +1718,7 @@ fn run_power_hook(cmd: &str, label: &str, target: &str) -> Result<()> {
         .arg("-c")
         .arg(cmd)
         .env("PATH", daemons::hook_path())
+        .envs(hook_envs(cmd))
         .status()?;
     if status.success() {
         Ok(())
@@ -1803,6 +1823,7 @@ fn cmd_power_state(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
             .arg("-c")
             .arg(&cmd)
             .env("PATH", daemons::hook_path())
+            .envs(hook_envs(&cmd))
             .output()?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -2593,6 +2614,9 @@ fn ensure_hid_daemon_local(lab: &Lab, target: &str) -> Result<Option<u16>> {
         .arg("-c")
         .arg(format!("exec {cmd} serve --port 0"))
         .env("PATH", daemons::hook_path())
+        // The hid daemon's discovery dir is the channel name ("hid"), not
+        // the helper binary's name — pass it explicitly.
+        .envs(daemons::helper_env(HID_DAEMON))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(log);
@@ -2653,6 +2677,7 @@ fn cmd_hid_stop(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
         .arg("-c")
         .arg(format!("{cmd} stop"))
         .env("PATH", daemons::hook_path())
+        .envs(daemons::helper_env(HID_DAEMON))
         .status()?;
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
@@ -2698,6 +2723,7 @@ fn cmd_hid_send(lab_flag: Option<&str>, target: Option<&str>, args: &[String]) -
         .arg("-c")
         .arg(&full)
         .env("PATH", daemons::hook_path())
+        .envs(daemons::helper_env(HID_DAEMON))
         .status()?;
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));

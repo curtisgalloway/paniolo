@@ -121,6 +121,57 @@ pub fn log_path(name: &str) -> PathBuf {
     runtime_base().join(name).join("daemon.log")
 }
 
+// ── helper state/runtime-dir API ────────────────────────────────────────────
+//
+// Helpers must not invent their own paths (a helper writing unnamespaced
+// state into ~/.config/paniolo/ collides with the lab file and each other),
+// and must not re-implement the runtime-base logic above. Paniolo is the
+// single source of truth: every invocation of a helper — `paniolo helper`,
+// hook commands, daemon spawns — carries two environment variables:
+//
+//   PANIOLO_STATE_DIR    ~/.config/paniolo/helpers/<name>   durable state
+//   PANIOLO_RUNTIME_DIR  /tmp/paniolo-<uid>/<name>          discovery, locks,
+//                                                           logs (wiped on boot)
+//
+// Both directories exist by the time the helper runs. Helpers should prefer
+// these over hand-rolled paths, falling back to the same literal locations
+// when run standalone (documented in docs/adding-power-helpers.md).
+
+/// Durable per-helper state base: `~/.config/paniolo/helpers`.
+pub fn state_base() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".config/paniolo/helpers"))
+}
+
+/// The `(var, value)` environment pairs for invoking helper `name`, with both
+/// directories created. Failures degrade to omitting the affected var — the
+/// helper's own fallback then applies.
+pub fn helper_env(name: &str) -> Vec<(&'static str, PathBuf)> {
+    let mut env = Vec::new();
+    if let Some(state) = state_base().map(|b| b.join(name)) {
+        if std::fs::create_dir_all(&state).is_ok() {
+            env.push(("PANIOLO_STATE_DIR", state));
+        }
+    }
+    if let Ok(runtime) = ensure_runtime_dir(name) {
+        env.push(("PANIOLO_RUNTIME_DIR", runtime));
+    }
+    env
+}
+
+/// The helper name for an opaque hook command: the basename of its first
+/// shell token (`zigplug -d … on …` → `zigplug`, `/path/to/script.sh …` →
+/// `script.sh`). Hooks are opaque strings, so this is a convention, not an
+/// inspection — documented in docs/adding-power-helpers.md.
+pub fn hook_helper_name(cmd: &str) -> Option<String> {
+    let first = cmd.split_whitespace().next()?;
+    let name = first.rsplit('/').next()?;
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
 /// Error for a daemon that didn't publish discovery in time, carrying the
 /// tail of its stderr log so the failure is diagnosable.
 pub fn start_failure(name: &str, timeout: Duration) -> anyhow::Error {
@@ -256,4 +307,27 @@ pub fn wait_for_daemon(name: &str, timeout: Duration) -> Option<String> {
         std::thread::sleep(Duration::from_millis(100));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hook_helper_name_takes_first_token_basename() {
+        assert_eq!(
+            hook_helper_name("zigplug -d /dev/x on 1").as_deref(),
+            Some("zigplug")
+        );
+        assert_eq!(
+            hook_helper_name("/usr/local/bin/script.sh --flag").as_deref(),
+            Some("script.sh")
+        );
+        assert_eq!(
+            hook_helper_name("  cambrionix state 4").as_deref(),
+            Some("cambrionix")
+        );
+        assert_eq!(hook_helper_name(""), None);
+        assert_eq!(hook_helper_name("   "), None);
+    }
 }

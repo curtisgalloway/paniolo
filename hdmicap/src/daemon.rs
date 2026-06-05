@@ -34,16 +34,24 @@ pub struct Discovery {
     pub port: u16,
 }
 
-/// Stable per-user runtime dir: `/tmp/paniolo-<uid>/hdmicap`, identical in
-/// every environment of the same user. Deliberately NOT `$TMPDIR`/`temp_dir()`
-/// (macOS hands each environment a different TMPDIR — GUI terminal vs SSH vs
-/// sandboxed agent shells — so a running daemon was invisible from the others)
-/// and NOT `$XDG_RUNTIME_DIR` (systemd removes `/run/user/<uid>` when the
-/// user's last session ends, breaking daemons that outlive the SSH session
-/// that started them). Keep in sync with `runtime_base()` in the paniolo
-/// CLI's daemons.rs and serialcap's daemon.rs.
+/// The daemon's runtime dir. Paniolo passes the canonical location as
+/// `PANIOLO_RUNTIME_DIR` (the helper state/runtime-dir API in the CLI's
+/// daemons.rs — the single source of truth); the literal fallback below is
+/// for standalone invocations and matches it byte-for-byte:
+/// `/tmp/paniolo-<uid>/hdmicap`, identical in every environment of the same
+/// user. Deliberately NOT `$TMPDIR`/`temp_dir()` (macOS hands each
+/// environment a different TMPDIR — GUI terminal vs SSH vs sandboxed agent
+/// shells — so a running daemon was invisible from the others) and NOT
+/// `$XDG_RUNTIME_DIR` (systemd removes `/run/user/<uid>` when the user's
+/// last session ends, breaking daemons that outlive the SSH session that
+/// started them).
 fn runtime_dir() -> Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    if let Some(dir) = std::env::var_os("PANIOLO_RUNTIME_DIR") {
+        let dir = PathBuf::from(dir);
+        fs::create_dir_all(&dir)?;
+        return Ok(dir);
+    }
     // Safe: getuid is always successful.
     let uid = unsafe { libc::getuid() };
     let base = PathBuf::from(format!("/tmp/paniolo-{uid}"));

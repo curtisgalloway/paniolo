@@ -61,6 +61,7 @@ pub fn start_daemon(ifaces: &[SerialChannel], port: u16) -> Result<()> {
         .ok_or_else(|| anyhow!("serialcap not found (libexec or PATH) — run `paniolo setup`"))?;
     let mut cmd = Command::new(binary);
     cmd.arg("daemon").arg("--port").arg(port.to_string());
+    cmd.envs(daemons::helper_env(DAEMON));
     for ch in ifaces {
         cmd.arg("--interface").arg(interface_arg(ch));
     }

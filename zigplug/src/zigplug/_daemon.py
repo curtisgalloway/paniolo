@@ -71,7 +71,18 @@ DISCOVERY_NAME = "zigplug"
 
 
 def runtime_dir() -> Path:
-    """`/tmp/paniolo-<uid>/zigplug`, creating the 0700 base if needed."""
+    """The daemon's runtime dir (discovery, locks, log).
+
+    Paniolo passes the canonical location as `PANIOLO_RUNTIME_DIR` (the
+    helper state/runtime-dir API in the CLI's daemons.rs); the literal
+    fallback below matches it byte-for-byte for standalone invocations:
+    `/tmp/paniolo-<uid>/zigplug`, created 0700 with an ownership check.
+    """
+    env = os.environ.get("PANIOLO_RUNTIME_DIR")
+    if env:
+        d = Path(env)
+        d.mkdir(parents=True, exist_ok=True)
+        return d
     base = Path(f"/tmp/paniolo-{os.getuid()}")
     try:
         base.mkdir(mode=0o700)

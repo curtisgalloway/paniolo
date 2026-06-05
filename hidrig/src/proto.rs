@@ -61,7 +61,7 @@ fn set_low_read_latency(fd: std::os::unix::io::RawFd) {
     // _IOW('T', 0, c_ulong), per <IOKit/serial/ioss.h>.
     const IOSSDATALAT: libc::c_ulong = 0x8008_5400;
     let latency: libc::c_ulong = 1; // microseconds
-    // Best-effort: a failure just leaves the default (higher) latency in place.
+                                    // Best-effort: a failure just leaves the default (higher) latency in place.
     unsafe { libc::ioctl(fd, IOSSDATALAT, &latency) };
 }
 
