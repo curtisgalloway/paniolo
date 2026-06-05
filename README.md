@@ -116,7 +116,7 @@ ssh control-mac "paniolo netboot start target-machine"
 ssh control-mac "paniolo netboot logs -f target-machine"
 
 # Interact with the console
-ssh control-mac "paniolo serial log -i console --since --tail 50 target-machine"
+ssh control-mac "paniolo serial log -t target-machine -i console --tail 50"
 
 # Power cycle and repeat
 ssh control-mac "paniolo power-cycle target-machine"

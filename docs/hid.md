@@ -130,9 +130,10 @@ cleanly with what you type in the console:
 
 ```bash
 paniolo console pi5                    # KVM dashboard (auto-starts the hid daemon)
-paniolo hid serve -t pi5               # warm the daemon ahead of time (idempotent)
+paniolo hid serve pi5                  # warm the daemon ahead of time (idempotent)
 paniolo hid send  -t pi5 type "while console is open"   # intermixes with the browser
-paniolo hid stop  -t pi5               # stop the daemon
+paniolo hid stop pi5                   # stop the daemon (positional target —
+                                       #   only `hid send`/`set`/`rm` use -t)
 ```
 
 Absolute positioning requires the `moveabs` capability (the KB2040 reference

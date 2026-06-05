@@ -110,12 +110,21 @@ passwordless `sudo` requirement as netboot (`ip` on Linux, `ifconfig` on macOS).
 ```
 paniolo video devices                 # list capture devices (with stable ids)
 paniolo video set -t <target> --device "<id-or-name>"   # configure the video channel
-paniolo video watch                   # start the capture daemon (background)
-paniolo video preview                 # open the dashboard in a browser
-paniolo video shot [--stable] [--out frame.png]   # one lossless PNG
-paniolo video read [--stable]         # OCR the current screen, print text
-paniolo video show                    # device + daemon status
-paniolo video stop
+paniolo video watch [target] [--restart]   # start the capture daemon (background);
+                                           #   --restart force-restarts a stalled one
+paniolo video preview                 # print the daemon's dashboard URL (no browser)
+paniolo video shot [target] [--stable] [--out frame.png]   # one lossless PNG
+paniolo video shot --changed-since <hex-hash> --timeout <ms>   # block until the
+                                           #   frame differs from a previous shot's hash
+paniolo video show [target]           # device + daemon status
+paniolo video stop                    # (no target — one daemon per host)
+```
+
+**OCR the current screen** (there is NO `video read` subcommand — OCR goes
+through the running daemon's HTTP endpoint):
+
+```
+curl -s "$(paniolo video preview)/ocr"
 ```
 
 - The **dashboard** (the video daemon's URL — ports are OS-assigned, printed by
@@ -131,10 +140,12 @@ paniolo video stop
   more than one device is an error (listing the candidates' ids), not a silent
   first-match guess.
 - `--stable` waits for a steady frame before capturing (useful right after a mode
-  switch or reboot).
-- **OCR** (`video read` and the dashboard button) is on-device (Apple Vision). It
-  reads large boot-screen / BIOS text well; very small console fonts can produce
-  a few character confusions (e.g. `1`/`l`, `2`/`Z`).
+  switch or reboot). `video shot` prints `signal=… hash=…` on stderr — feed that
+  hash to `--changed-since` to wait efficiently for the screen to change.
+- **OCR** (the `/ocr` endpoint and the dashboard button) is on-device (Apple
+  Vision on macOS, Tesseract on Linux). It reads large boot-screen / BIOS text
+  well; very small console fonts can produce a few character confusions
+  (e.g. `1`/`l`, `2`/`Z`).
 
 ## Serial console
 
@@ -150,13 +161,21 @@ paniolo serial rm <name> -t <target>                      # drop a named interfa
 paniolo serial connect [target] [-i name]      # interactive terminal (tio) in your shell
 paniolo serial watch [target]                  # run the daemon for ALL interfaces;
                                                #   they appear in the dashboard pane
-paniolo serial log [-i name] [options]         # print captured output (timestamped)
+paniolo serial send [-t target] [-i name] "text"   # send one line of input through
+                                               #   the running daemon (see below)
+paniolo serial log [-t target] [-i name] [options] # print captured output (timestamped)
 paniolo serial show [target]                   # list interfaces + daemon status
-paniolo serial stop                            # release the ports
+paniolo serial stop                            # release the ports (no target)
 paniolo serial devices                         # list serial devices on the host
 paniolo serial dtr [target] [-i name] [--ms N] # pulse DTR line (J2 power button header)
 paniolo serial reset [target] [-i name]        # soft reset via brief DTR pulse
 ```
+
+**Argument convention:** runtime commands take the target as an optional
+positional (`serial watch pi5`), but `serial send` and `serial log` take it
+via `-t` — their positional slot is the text/none (`paniolo serial log pi5`
+is an error; use `paniolo serial log -t pi5`). Channel-config commands
+(`add`/`set`/`rm`) always use `-t`. `serial stop` takes no target at all.
 
 `--name` defaults to `console`, so a single-interface setup needs no flags. With
 one interface, `-i`/`--interface` can be omitted everywhere. Don't run `connect`
@@ -180,11 +199,28 @@ paniolo serial log --raw              # keep ANSI colors / control bytes
 ```
 
 With more than one interface configured, pass `-i <name>` to choose one (omitting
-it errors and lists the names). Each line is shown as `[<UTC timestamp>] #<seq>
+it errors and lists the names); with more than one target, `-t <target>` (never
+positional). Each line is shown as `[<UTC timestamp>] #<seq>
 <text>`. The `seq` is a stable, monotonic line number — note it, then come back
 later with `--since <seq>` to get only what's new, or `--from/--to` to re-read an
 exact span. Output is ANSI-stripped by default; a `*` after the sequence number
 marks the current unterminated line (e.g. a `login:` prompt with no newline yet).
+
+### Sending input
+
+`paniolo serial send` injects one line through the **running daemon** (start
+`watch` first), so input coexists with capture — what you send and what the
+target echoes both land in the log:
+
+```
+paniolo serial send -t <target> "reboot"             # CR appended by default
+paniolo serial send --no-newline "partial input"     # suppress the CR
+paniolo serial send --pace-ms 8 "long command"       # per-byte pacing for slow
+                                                     #   polled consoles
+```
+
+Note the input only reaches the target if its console actually reads the UART
+(a kernel with a broken serial driver logs output but ignores input).
 
 ## Power control
 
@@ -263,7 +299,8 @@ where you point; your local cursor stays visible as a crosshair), click again to
 release. It auto-starts the hid daemon (`hidrig serve`), which owns the UART and
 re-exposes the protocol over a WebSocket; `paniolo hid send` injections intermix
 with what you type in the browser. Manual daemon control: `paniolo hid
-serve|stop -t <name>`. When the target also has a `power` channel, the overlay
+serve [target]` / `paniolo hid stop [target]` (positional target — only
+`hid send` and `hid set/rm` use `-t`). When the target also has a `power` channel, the overlay
 adds an on/off toggle switch + a separate cycle button (each confirms first).
 
 ## Targets on a remote control host (a "lab")
