@@ -28,11 +28,13 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 serialport = "4"
 
-# --- serve (daemon) mode: async runtime + HTTP/WebSocket + async serial -----
+# --- serve (daemon) mode: async runtime + HTTP/WebSocket --------------------
+# The UART itself is driven by the blocking `serialport` path on a dedicated
+# thread (see uart.rs) — tokio-serial's async reads are unreliable on a macOS
+# tty — bridged to the async server via tokio channels.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "net", "io-util"] }
 axum = { version = "0.7", features = ["ws"] }
 futures-util = "0.3"
-tokio-serial = "5"
 
 # --- daemon plumbing + client ----------------------------------------------
 fs2 = "0.4"

@@ -222,9 +222,13 @@ hidrig/          USB HID injector: host CLI + daemon (Rust) + KB2040 firmware
                    the same device, else opens the UART directly
   src/proto.rs     line protocol client (send/OK-ERR parse) + sequence parser
                    + clamp_abs (moveabs range)
-  src/uart.rs      the UART owner: one async task, an mpsc<(line,reply)> queue
-                   serializing every command (CLI + web) onto the one wire, a
-                   broadcast transcript; lazy open + reopen-on-error
+  src/uart.rs      the UART owner: a dedicated *blocking-serialport* thread
+                   (NOT tokio-serial — its async reads don't get read-readiness
+                   on a macOS tty, so they timed out), bridged to the async
+                   server via tokio channels (blocking_recv); an mpsc<(line,
+                   reply)> queue serializes every command (CLI + web) onto the
+                   one wire, with a broadcast transcript; lazy open + reopen-on-
+                   transport-error
   src/server.rs    axum: GET /hid (WebSocket carrier), POST /send, /status,
                    /version. WS clients send command lines; all results are
                    broadcast as `evt ok|err …` frames so observers see the
@@ -255,11 +259,15 @@ browser, from `paniolo hid send`, from another script — flows through one
 `mpsc` queue in `uart.rs`, one in flight, request/reply; that single queue is
 what makes events intermix correctly. `paniolo console` starts the daemon when
 the target has a `hid` channel (local: `?hid=PORT`; remote: an SSH-tunnelled
-`?hidws=` URL) and the dashboard's **Capture input** toggle streams
-`down`/`up`/`moveabs`/`scroll` to it. The mouse is absolute (the firmware's
-custom HID descriptor), so the cursor follows where you point in the video;
-right-Ctrl releases capture. paniolo discovers the daemon by the channel name
-`hid` (`daemons::daemon_port("hid")`), staying agnostic to the helper.
+`?hidws=` URL). **Clicking the video grabs control** (first click engages + parks
+the cursor, doesn't fire on the target; the `⌨ Capture input` button does the
+same), then it streams `down`/`up`/`moveabs`/`scroll` to the daemon. The mouse
+is absolute (the firmware's custom HID descriptor), so the cursor follows where
+you point in the video; right-Ctrl releases. paniolo discovers the daemon by the
+channel name `hid` (`daemons::daemon_port("hid")`), staying agnostic to the
+helper. (Hardware-verified end-to-end on the pi5 Linux desktop, 2026-06-04; the
+text protocol is one synchronous round-trip per command, which is the current
+KVM latency bottleneck — see the perf TODO.)
 
 ## Combined dashboard (video + serial)
 
