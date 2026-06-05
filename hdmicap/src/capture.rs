@@ -14,21 +14,22 @@
 
 //! Capture backend abstraction.
 //!
-//! On Linux we bypass nokhwa and use the `v4l` crate directly so we can:
+//! On Linux we use the `v4l` crate directly so we can:
 //!   - Call `stream.set_timeout()` to avoid an indefinite VIDIOC_DQBUF block
 //!   - Keep raw MJPEG bytes for zero-cost preview serving
 //!   - Use turbojpeg (libjpeg-turbo) for fast RGB decode when signal detection
 //!     or OCR needs pixel data
 //!
-//! On macOS the nokhwa + AVFoundation path is kept as-is.
+//! On macOS we use our own ObjC AVFoundation layer (src/capture_avf.m). The
+//! OS UVC stack decodes MJPEG before AVFoundation — only uncompressed formats
+//! are reachable — so the layer requests '420v' (bi-planar 4:2:0) and the
+//! frame loop classifies the luma plane directly; RGB materializes lazily.
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
-use image::RgbImage;
+use anyhow::{anyhow, Result};
 
-use nokhwa::query;
-use nokhwa::utils::{ApiBackend, CameraIndex};
+use crate::pixel::PixelData;
 
 #[derive(Clone, Debug)]
 pub struct DeviceInfo {
@@ -70,16 +71,17 @@ impl DeviceSpec {
 
 const BUILTIN_HINTS: &[&str] = &["facetime", "built-in", "integrated", "isight"];
 
-/// One captured frame. `jpeg` carries raw MJPEG bytes when available (Linux
-/// MJPEG path); the preview endpoint serves these directly with zero server
-/// decode/re-encode. `rgb` is always populated for signal detection (ahash,
-/// is_no_signal); on the Linux path it comes from turbojpeg (fast).
+/// One captured frame in its native form. `jpeg` carries raw MJPEG bytes when
+/// available (Linux MJPEG tee); `pixels` carries decoded data for
+/// classification and lazy RGB conversion.
 pub struct CapturedFrame {
-    /// Raw MJPEG bytes from the device. Present on the Linux v4l path when the
-    /// device is in MJPEG mode; None on macOS or YUYV sources.
+    /// Raw MJPEG bytes from the device. Present on the Linux v4l path when
+    /// the device is in MJPEG mode; None on macOS (the OS decodes upstream).
     pub jpeg: Option<Arc<[u8]>>,
-    /// Decoded RGB8 pixels for signal detection. Always populated.
-    pub rgb: RgbImage,
+    /// Native pixel data: RGB on decode paths, NV12 on the macOS path.
+    pub pixels: PixelData,
+    pub width: u32,
+    pub height: u32,
 }
 
 pub trait CaptureBackend {
@@ -112,9 +114,13 @@ fn stable_ids_by_index() -> std::collections::HashMap<u32, String> {
     map
 }
 
+#[cfg(target_os = "linux")]
 pub fn enumerate() -> Result<Vec<DeviceInfo>> {
+    use anyhow::Context;
+    use nokhwa::query;
+    use nokhwa::utils::{ApiBackend, CameraIndex};
+
     let cams = query(ApiBackend::Auto).context("nokhwa device query failed")?;
-    #[cfg(target_os = "linux")]
     let by_path = stable_ids_by_index();
     Ok(cams
         .into_iter()
@@ -123,11 +129,6 @@ pub fn enumerate() -> Result<Vec<DeviceInfo>> {
                 CameraIndex::Index(i) => *i,
                 CameraIndex::String(_) => u32::MAX,
             };
-            // macOS: the vendored bindings carry the AVFoundation uniqueID in
-            // CameraInfo::misc. Linux: join against the by-path symlinks.
-            #[cfg(not(target_os = "linux"))]
-            let id = c.misc();
-            #[cfg(target_os = "linux")]
             let id = by_path.get(&index).cloned().unwrap_or_default();
             DeviceInfo {
                 index,
@@ -139,13 +140,48 @@ pub fn enumerate() -> Result<Vec<DeviceInfo>> {
         .collect())
 }
 
+#[cfg(not(target_os = "linux"))]
+pub fn enumerate() -> Result<Vec<DeviceInfo>> {
+    use std::ffi::{c_char, c_void, CStr};
+
+    unsafe extern "C" fn collect(
+        ctx: *mut c_void,
+        name: *const c_char,
+        unique_id: *const c_char,
+        misc: *const c_char,
+    ) {
+        let out = unsafe { &mut *(ctx as *mut Vec<DeviceInfo>) };
+        let s = |p: *const c_char| {
+            if p.is_null() {
+                String::new()
+            } else {
+                unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+            }
+        };
+        out.push(DeviceInfo {
+            index: out.len() as u32,
+            name: s(name),
+            misc: s(misc),
+            id: s(unique_id),
+        });
+    }
+
+    let mut out: Vec<DeviceInfo> = Vec::new();
+    unsafe {
+        macos::avf_capture_enumerate(collect, &mut out as *mut Vec<DeviceInfo> as *mut c_void);
+    }
+    Ok(out)
+}
+
+/// Resolve a spec to a V4L2 device index (Linux; macOS resolves against the
+/// enumerated device list directly in AvfBackend::open).
+#[cfg(target_os = "linux")]
 pub fn resolve(spec: &DeviceSpec) -> Result<u32> {
     if let DeviceSpec::Index(i) = spec {
         return Ok(*i);
     }
     // Any path-style spec (e.g. /dev/v4l/by-id/...) canonicalizes to
     // /dev/videoN; by-path specs also hit the exact-id match in resolve_in.
-    #[cfg(target_os = "linux")]
     if let DeviceSpec::Name(s) = spec {
         if s.starts_with('/') {
             if let Ok(target) = std::fs::canonicalize(s) {
@@ -212,7 +248,7 @@ pub fn open_backend(spec: &DeviceSpec) -> Result<Box<dyn CaptureBackend>> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        macos::NokhwaBackend::open(spec).map(|b| Box::new(b) as Box<dyn CaptureBackend>)
+        macos::AvfBackend::open(spec).map(|b| Box::new(b) as Box<dyn CaptureBackend>)
     }
 }
 
@@ -225,7 +261,6 @@ mod linux {
     use std::time::Duration;
 
     use anyhow::{anyhow, Context, Result};
-    use image::RgbImage;
     use v4l::buffer::Type;
     use v4l::device::Device;
     use v4l::format::{Format, FourCC};
@@ -234,6 +269,7 @@ mod linux {
     use v4l::video::Capture;
 
     use super::{resolve, CaptureBackend, CapturedFrame, DeviceSpec};
+    use crate::pixel::{yuyv_to_rgb, PixelData};
 
     const FORMATS: &[(u32, u32, &[u8; 4])] = &[
         (1280, 720, b"MJPG"),
@@ -306,8 +342,8 @@ mod linux {
                 // Keep a copy of the raw JPEG bytes for zero-cost preview serving.
                 let jpeg_bytes: Arc<[u8]> = Arc::from(buf.to_vec().into_boxed_slice());
 
-                // Decode with turbojpeg (libjpeg-turbo) for signal detection.
-                // ~5ms at 720p vs ~50ms with the pure-Rust image crate.
+                // Decode with turbojpeg (libjpeg-turbo) for signal detection
+                // and lazy snapshot encoding. ~5ms at 720p.
                 let rgb = turbojpeg::decompress_image::<image::Rgb<u8>>(buf)
                     .context("turbojpeg MJPEG decode failed")?;
                 let (w, h) = (rgb.width(), rgb.height());
@@ -315,7 +351,9 @@ mod linux {
 
                 Ok(CapturedFrame {
                     jpeg: Some(jpeg_bytes),
-                    rgb,
+                    pixels: PixelData::Rgb(Arc::from(rgb.into_raw().into_boxed_slice())),
+                    width: w,
+                    height: h,
                 })
             } else {
                 // YUYV: no raw JPEG, decode to RGB for signal detection and storage.
@@ -325,40 +363,15 @@ mod linux {
                     .map(|f| (f.width, f.height))
                     .unwrap_or(self.dims);
                 self.dims = (w, h);
+                let rgb = yuyv_to_rgb(buf, w, h);
                 Ok(CapturedFrame {
                     jpeg: None,
-                    rgb: yuyv_to_rgb(buf, w, h),
+                    pixels: PixelData::Rgb(Arc::from(rgb.into_raw().into_boxed_slice())),
+                    width: w,
+                    height: h,
                 })
             }
         }
-    }
-
-    fn yuyv_to_rgb(buf: &[u8], w: u32, h: u32) -> RgbImage {
-        let mut rgb = RgbImage::new(w, h);
-        let pairs = (w * h / 2) as usize;
-        for i in 0..pairs {
-            let base = i * 4;
-            if base + 3 >= buf.len() {
-                break;
-            }
-            let y0 = buf[base] as f32;
-            let cb = buf[base + 1] as f32 - 128.0;
-            let y1 = buf[base + 2] as f32;
-            let cr = buf[base + 3] as f32 - 128.0;
-            let to_u8 = |v: f32| v.clamp(0.0, 255.0) as u8;
-            let r = |y: f32| to_u8(y + 1.402 * cr);
-            let g = |y: f32| to_u8(y - 0.344 * cb - 0.714 * cr);
-            let b = |y: f32| to_u8(y + 1.772 * cb);
-            let x0 = ((i * 2) % w as usize) as u32;
-            let y_row = ((i * 2) / w as usize) as u32;
-            if x0 < w && y_row < h {
-                rgb.put_pixel(x0, y_row, image::Rgb([r(y0), g(y0), b(y0)]));
-            }
-            if x0 + 1 < w && y_row < h {
-                rgb.put_pixel(x0 + 1, y_row, image::Rgb([r(y1), g(y1), b(y1)]));
-            }
-        }
-        rgb
     }
 }
 
@@ -366,78 +379,157 @@ mod linux {
 
 #[cfg(not(target_os = "linux"))]
 mod macos {
-    use anyhow::{anyhow, Context, Result};
-    use nokhwa::pixel_format::RgbFormat;
-    use nokhwa::utils::{
-        CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution,
-    };
-    use nokhwa::Camera;
+    use std::ffi::{c_char, c_void, CStr, CString};
+    use std::sync::Arc;
 
-    use super::{resolve, CaptureBackend, CapturedFrame, DeviceSpec};
+    use anyhow::{anyhow, Result};
 
-    pub struct NokhwaBackend {
-        cam: Camera,
-        dims: (u32, u32),
+    use super::{enumerate, resolve_in, CaptureBackend, CapturedFrame, DeviceSpec};
+    use crate::pixel::{yuyv_to_rgb, PixelData};
+
+    // FourCC tags mirrored from capture_avf.m.
+    const PIXFMT_NV12: u32 = 0x3432_3076; // '420v'
+    const PIXFMT_YUYV: u32 = 0x7975_7673; // 'yuvs'
+
+    /// Mirrors `AvfFrame` in capture_avf.m. Plane buffers are malloc'd by the
+    /// ObjC layer; ownership passes to us and is returned via frame_free.
+    #[repr(C)]
+    struct AvfFrame {
+        seq: u64,
+        width: u32,
+        height: u32,
+        pixfmt: u32,
+        y: *mut u8,
+        y_len: usize,
+        cbcr: *mut u8,
+        cbcr_len: usize,
     }
 
-    impl NokhwaBackend {
-        pub fn open(spec: &DeviceSpec) -> Result<Self> {
-            let idx = resolve(spec)?;
-            let format_types: &[RequestedFormatType] = &[
-                RequestedFormatType::Closest(CameraFormat::new(
-                    Resolution::new(1280, 720),
-                    FrameFormat::MJPEG,
-                    30,
-                )),
-                RequestedFormatType::Closest(CameraFormat::new(
-                    Resolution::new(1920, 1080),
-                    FrameFormat::MJPEG,
-                    30,
-                )),
-                RequestedFormatType::AbsoluteHighestResolution,
-            ];
+    extern "C" {
+        pub fn avf_capture_enumerate(
+            cb: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char, *const c_char),
+            ctx: *mut c_void,
+        );
+        fn avf_capture_open(
+            unique_id: *const c_char,
+            err: *mut c_char,
+            errlen: usize,
+        ) -> *mut c_void;
+        fn avf_capture_wait_frame(
+            h: *mut c_void,
+            last_seq: u64,
+            timeout_ms: u32,
+            out: *mut AvfFrame,
+        ) -> i32;
+        fn avf_capture_frame_free(f: *mut AvfFrame);
+        fn avf_capture_close(h: *mut c_void);
+    }
 
-            let mut last_err: anyhow::Error = anyhow!("no formats to try");
-            for &fmt_type in format_types {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    try_open(idx, fmt_type)
-                }));
-                match result {
-                    Ok(Ok(backend)) => return Ok(backend),
-                    Ok(Err(e)) => {
-                        last_err = e;
-                    }
-                    Err(_) => {
-                        last_err = anyhow!("format {:?} not supported", fmt_type);
-                    }
-                }
+    /// Matches the Linux backend's 5s VIDIOC_DQBUF timeout; the capture
+    /// thread's reconnect loop handles the resulting error.
+    const FRAME_TIMEOUT_MS: u32 = 5000;
+
+    pub struct AvfBackend {
+        handle: *mut c_void,
+        last_seq: u64,
+    }
+
+    // The handle is owned and used exclusively by the capture thread; the
+    // ObjC side does its own locking between the delegate queue and callers.
+    unsafe impl Send for AvfBackend {}
+
+    impl AvfBackend {
+        pub fn open(spec: &DeviceSpec) -> Result<Self> {
+            let devices = enumerate()?;
+            let idx = resolve_in(&devices, spec)?;
+            let dev = devices
+                .iter()
+                .find(|d| d.index == idx)
+                .ok_or_else(|| anyhow!("no capture device at index {idx}"))?;
+            if dev.id.is_empty() {
+                return Err(anyhow!("device {:?} has no uniqueID", dev.name));
             }
-            Err(last_err)
+
+            let cid = CString::new(dev.id.as_str())?;
+            let mut err = [0i8; 256];
+            let handle = unsafe {
+                avf_capture_open(cid.as_ptr(), err.as_mut_ptr() as *mut c_char, err.len())
+            };
+            if handle.is_null() {
+                let msg = unsafe { CStr::from_ptr(err.as_ptr() as *const c_char) };
+                return Err(anyhow!(
+                    "failed to open {:?}: {}",
+                    dev.name,
+                    msg.to_string_lossy()
+                ));
+            }
+            tracing::info!("capture opened: {} ({})", dev.name, dev.id);
+            Ok(AvfBackend {
+                handle,
+                last_seq: 0,
+            })
         }
     }
 
-    fn try_open(idx: u32, fmt_type: RequestedFormatType) -> Result<NokhwaBackend> {
-        let requested = RequestedFormat::new::<RgbFormat>(fmt_type);
-        let mut cam = Camera::new(CameraIndex::Index(idx), requested)
-            .map_err(|e| anyhow!("failed to open capture device {idx}: {e}"))?;
-        cam.open_stream()
-            .map_err(|e| anyhow!("failed to open capture device {idx}: {e}"))?;
-        let res = cam.resolution();
-        Ok(NokhwaBackend {
-            cam,
-            dims: (res.width(), res.height()),
-        })
+    impl CaptureBackend for AvfBackend {
+        fn frame(&mut self) -> Result<CapturedFrame> {
+            let mut raw = AvfFrame {
+                seq: 0,
+                width: 0,
+                height: 0,
+                pixfmt: 0,
+                y: std::ptr::null_mut(),
+                y_len: 0,
+                cbcr: std::ptr::null_mut(),
+                cbcr_len: 0,
+            };
+            let rc = unsafe {
+                avf_capture_wait_frame(self.handle, self.last_seq, FRAME_TIMEOUT_MS, &mut raw)
+            };
+            match rc {
+                0 => return Err(anyhow!("frame timeout (device stalled)")),
+                1 => {}
+                _ => return Err(anyhow!("capture session error (device lost?)")),
+            }
+            self.last_seq = raw.seq;
+
+            let (w, h) = (raw.width, raw.height);
+            let y = unsafe { std::slice::from_raw_parts(raw.y, raw.y_len) };
+            let frame = match raw.pixfmt {
+                PIXFMT_NV12 => {
+                    let cbcr = unsafe { std::slice::from_raw_parts(raw.cbcr, raw.cbcr_len) };
+                    CapturedFrame {
+                        jpeg: None,
+                        pixels: PixelData::Nv12 {
+                            y: Arc::from(y),
+                            cbcr: Arc::from(cbcr),
+                        },
+                        width: w,
+                        height: h,
+                    }
+                }
+                PIXFMT_YUYV => {
+                    let rgb = yuyv_to_rgb(y, w, h);
+                    CapturedFrame {
+                        jpeg: None,
+                        pixels: PixelData::Rgb(Arc::from(rgb.into_raw().into_boxed_slice())),
+                        width: w,
+                        height: h,
+                    }
+                }
+                other => {
+                    unsafe { avf_capture_frame_free(&mut raw) };
+                    return Err(anyhow!("unexpected pixel format {other:#x}"));
+                }
+            };
+            unsafe { avf_capture_frame_free(&mut raw) };
+            Ok(frame)
+        }
     }
 
-    impl CaptureBackend for NokhwaBackend {
-        fn frame(&mut self) -> Result<CapturedFrame> {
-            let buf = self.cam.frame().context("frame grab failed")?;
-            let decoded = buf.decode_image::<RgbFormat>().context("decode failed")?;
-            self.dims = (decoded.width(), decoded.height());
-            Ok(CapturedFrame {
-                jpeg: None, // nokhwa gives decoded pixels, not raw JPEG
-                rgb: decoded,
-            })
+    impl Drop for AvfBackend {
+        fn drop(&mut self) {
+            unsafe { avf_capture_close(self.handle) };
         }
     }
 }

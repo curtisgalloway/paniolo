@@ -169,18 +169,23 @@ src/paniolo/
 tests/           pytest suite (host-side; no hardware) — one test_<module>.py per module
 
 hdmicap/         Rust crate: warm-stream HDMI capture daemon
+  build.rs       compiles src/capture_avf.m via cc on macOS, links AVFoundation
   src/
     main.rs      CLI subcommands: daemon, devices, shot, watch, preview, stop
-    capture.rs   nokhwa-backed capture backend (avfoundation/v4l2)
+    capture.rs   capture backends: v4l (Linux, raw MJPEG tee + turbojpeg);
+                 macOS module wraps the C ABI of the ObjC layer below
+    capture_avf.m  our ObjC AVFoundation layer (macOS): enumeration, open at
+                 native resolution with NV12 delivery, blocking frame wait.
+                 Never sets frame durations — MS2109-class HDMI sticks throw
+                 NSException on those setters
     capture_thread.rs  std::thread owning device, publishes into watch channel
-    frame.rs     FrameState, Signal enum, aHash, is_no_signal
+    frame.rs     FrameState, Signal enum, one-pass strided classification
+                 (aHash + no-signal from ~1k luma samples, resolution-independent)
+    pixel.rs     PixelData (Rgb/Nv12/Empty) + NV12/YUYV -> RGB converters
     server.rs    axum HTTP API: GET / (dashboard), /status, /snapshot, /preview,
                  /ocr, /devices, POST /power-cycle, and /xterm.* static assets
     daemon.rs    advisory lock, discovery file, tokio runtime, graceful shutdown
   assets/        index.html (combined dashboard) + vendored xterm.js/css/fit addon
-  vendor/
-    nokhwa-bindings-macos/  patched: removes frame-duration KVC calls that throw
-                            NSException on HDMI capture cards (e.g. MS2109)
 
 cambrionix/      Rust crate: standalone helper binary for Cambrionix USB hub control
                  (control UART, 115200 8N1); wired into paniolo via generic power hooks.
@@ -914,10 +919,18 @@ Paniolo runs on Linux as well as macOS. Platform differences:
   name. A name substring matching more than one device is a hard error listing
   the candidates' ids; with several non-built-in captures (e.g. MS2109 + Razer
   Kiyo), `paniolo configure` lists the id alternatives as comments.
-- **nokhwa MS2109 compatibility.** The MS2109 HDMI capture card doesn't expose
-  standard MJPEG/YUYV formats through nokhwa's filtered list and throws
-  NSException from AVFoundation frame-duration KVC calls. The vendor patch in
-  `hdmicap/vendor/nokhwa-bindings-macos/` fixes this.
+- **macOS capture is our own AVFoundation layer** (`hdmicap/src/capture_avf.m`,
+  C ABI consumed by `capture.rs`), replacing nokhwa + a vendored bindings fork.
+  Two hard-won rules live in it: (1) never set
+  `activeVideoMin/MaxFrameDuration` — MS2109-class HDMI sticks throw
+  NSException from those KVC paths (the bug the old vendor patch existed for);
+  (2) `activeFormat` alone is ignored — the session's default preset scales
+  output to 1080p-class, so native resolution requires explicit
+  `kCVPixelBufferWidth/HeightKey` in the output's `videoSettings`
+  (`AVCaptureSessionPresetInputPriority` is iOS-only). Note the macOS UVC
+  stack decodes MJPEG before AVFoundation — raw-MJPEG passthrough (the Linux
+  tee) is impossible on macOS; frames arrive as NV12 ('420v', video-range)
+  and RGB materializes lazily per request.
 - **One daemon instance per user per host.** Discovery, lock, and stderr log
   live in `/tmp/paniolo-<uid>/<daemon>/` — deliberately env-independent (NOT
   `$TMPDIR`, which macOS varies per environment so a running daemon was

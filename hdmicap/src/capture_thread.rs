@@ -15,9 +15,10 @@
 //! The capture thread. Owns the device, runs the warm decode loop, classifies
 //! each frame, and publishes the latest FrameState into a `watch` channel.
 //!
-//! This is a plain std::thread, NOT a tokio task: nokhwa's grab is blocking and
-//! must not sit on the async runtime. `watch::Sender::send` is sync, so the
-//! thread publishes freely.
+//! This is a plain std::thread, NOT a tokio task: both backends' frame waits
+//! block (V4L2 DQBUF; the AVFoundation layer's condvar) and must not sit on
+//! the async runtime. `watch::Sender::send` is sync, so the thread publishes
+//! freely.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -28,7 +29,8 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::capture::{open_backend, DeviceSpec};
-use crate::frame::{ahash, is_no_signal, FrameState, Signal, STABLE_FRAMES};
+use crate::frame::{classify_nv12, classify_rgb, FrameState, Signal, STABLE_FRAMES};
+use crate::pixel::PixelData;
 
 pub type FrameRx = watch::Receiver<Arc<FrameState>>;
 
@@ -108,7 +110,10 @@ fn capture_loop(spec: DeviceSpec, tx: watch::Sender<Arc<FrameState>>) {
         let mut last_dims = (0u32, 0u32);
         let mut epoch = 0u64;
         let mut stable_count = 0u32;
-        let mut last_hash = 0u64;
+        // Linux only: the loop is rate-capped there (see below). On macOS the
+        // backend blocks until the device delivers the next frame, so the
+        // device's own cadence paces us.
+        #[cfg(target_os = "linux")]
         let mut frame_start = Instant::now();
         // Consecutive decode errors. Transient errors (bad buffer after open,
         // UVC flush frames) are tolerated; only a sustained run triggers reconnect.
@@ -139,27 +144,25 @@ fn capture_loop(spec: DeviceSpec, tx: watch::Sender<Arc<FrameState>>) {
                     continue;
                 }
             };
-            let jpeg = captured.jpeg;
-            let img = captured.rgb;
-
-            let (w, h) = (img.width(), img.height());
+            let (w, h) = (captured.width, captured.height);
 
             if (w, h) != last_dims {
                 epoch += 1;
                 stable_count = 0;
                 last_dims = (w, h);
-                last_hash = 0;
                 info!("resolution -> {w}x{h} (epoch {epoch})");
             }
 
-            let hash = ahash(&img);
+            // One-pass strided classification: hash + no-signal from ~1k luma
+            // samples, resolution-independent (the old full-image pass cost
+            // hundreds of ms at 8 MP).
+            let (hash, no_signal) = match &captured.pixels {
+                PixelData::Nv12 { y, .. } => classify_nv12(y, w, h),
+                PixelData::Rgb(buf) => classify_rgb(buf, w, h),
+                PixelData::Empty => (0, true),
+            };
 
-            // Skip the expensive per-pixel is_no_signal scan when the frame
-            // hash is unchanged and we're already Stable — static screens cost
-            // almost nothing after the first pass.
-            let signal = if hash == last_hash && stable_count >= STABLE_FRAMES {
-                Signal::Stable
-            } else if is_no_signal(&img) {
+            let signal = if no_signal {
                 stable_count = 0;
                 Signal::NoSignal
             } else if stable_count < STABLE_FRAMES {
@@ -169,24 +172,20 @@ fn capture_loop(spec: DeviceSpec, tx: watch::Sender<Arc<FrameState>>) {
                 Signal::Stable
             };
 
-            last_hash = hash;
             frame_count.fetch_add(1, Ordering::Relaxed);
 
-            // When raw JPEG bytes are available (Linux MJPEG path), store them
-            // for zero-cost preview serving. The RGB is kept for snapshot/OCR
-            // but only when JPEG is absent (YUYV or macOS paths).
-            let (jpeg_arc, rgb_arc) = if let Some(j) = jpeg {
-                (Some(j), Arc::from([] as [u8; 0]) as Arc<[u8]>)
+            // When raw JPEG bytes are available (Linux MJPEG path), the
+            // preview serves them directly and snapshot/OCR re-decode on
+            // demand — don't carry a redundant RGB copy in every FrameState.
+            let pixels = if captured.jpeg.is_some() {
+                PixelData::Empty
             } else {
-                let expected = w as usize * h as usize * 3;
-                let mut raw = img.into_raw();
-                raw.truncate(expected);
-                (None, Arc::from(raw.into_boxed_slice()) as Arc<[u8]>)
+                captured.pixels
             };
 
             let _ = tx.send(Arc::new(FrameState {
-                jpeg: jpeg_arc,
-                rgb: rgb_arc,
+                jpeg: captured.jpeg,
+                pixels,
                 width: w,
                 height: h,
                 hash,
@@ -195,14 +194,18 @@ fn capture_loop(spec: DeviceSpec, tx: watch::Sender<Arc<FrameState>>) {
                 captured_at: Instant::now(),
             }));
 
-            // Cap to TARGET_FPS. MJPEG decode is ~50ms/frame in software, so
-            // 10fps is a reasonable ceiling until the hot path uses lazy decode.
-            const TARGET_INTERVAL: Duration = Duration::from_millis(1000 / 10);
-            let elapsed = frame_start.elapsed();
-            if elapsed < TARGET_INTERVAL {
-                thread::sleep(TARGET_INTERVAL - elapsed);
+            // Linux: cap to 10fps — the v4l device delivers as fast as we
+            // dequeue, and the per-frame turbojpeg decode has real cost.
+            // macOS: no cap; the backend blocks until the next frame.
+            #[cfg(target_os = "linux")]
+            {
+                const TARGET_INTERVAL: Duration = Duration::from_millis(1000 / 10);
+                let elapsed = frame_start.elapsed();
+                if elapsed < TARGET_INTERVAL {
+                    thread::sleep(TARGET_INTERVAL - elapsed);
+                }
+                frame_start = Instant::now();
             }
-            frame_start = Instant::now();
         }
     }
 }
