@@ -50,15 +50,19 @@ make install           # paniolo CLI + daemons + OCR helper, in one step
 ```
 
 `make install` bootstraps the CLI with `cargo install --path cli`, then runs
-`paniolo setup`, which compiles and installs all of paniolo's binaries — the
-`paniolo` CLI itself plus the daemons and helpers (`hdmicap`, `serialcap`, `netbootd`, `cambrionix`, `hidrig`) —
-and the OCR helper (`visionocr` on macOS via `swiftc`, `linuxocr` on Linux)
-into `~/.cargo/bin`. One static binary per component; the core needs no
-Python environment. (The optional `zigplug` Zigbee smart-plug helper is the
-one Python component — `setup` installs it as a uv tool when `uv` is on PATH.)
-Netboot is served by the single-binary `netbootd` (Rust) engine. (On macOS,
-`setup` also installs `netbootd-bpf-helper` setuid-root — one sudo — for the
-`netbootd` raw-frame send path.) Configuration is one CLI-managed lab file
+`paniolo setup`, which compiles and installs all of paniolo's binaries. Only
+the `paniolo` CLI lands on PATH (`~/.cargo/bin`); the daemons and helpers
+(`hdmicap`, `serialcap`, `netbootd`, `cambrionix`, `hidrig`) and the OCR
+helper (`visionocr` on macOS via `swiftc`, `linuxocr` on Linux) install into
+the private libexec dir `~/.local/libexec/paniolo/bin`, where paniolo finds
+them without polluting your PATH — run one directly with
+`paniolo helper <name> [args…]` (no name lists them). One static binary per
+component; the core needs no Python environment. (The optional `zigplug`
+Zigbee smart-plug helper is the one Python component — `setup` installs it as
+a uv tool with its shim in the libexec dir.) Netboot is served by the
+single-binary `netbootd` (Rust) engine. (On macOS, `setup` also installs
+`netbootd-bpf-helper` setuid-root — one sudo — for the `netbootd` raw-frame
+send path.) Configuration is one CLI-managed lab file
 (`~/.config/paniolo/lab.toml`); see
 [docs/config-redesign.md](docs/config-redesign.md).
 
@@ -73,18 +77,19 @@ To pick up code changes after pulling or editing, just re-run it:
 make install           # rebuilds and reinstalls everything (idempotent)
 ```
 
-Or iterate faster with `make rust` (cargo-install the crates only, skipping
-the OCR/setuid steps). `make help` lists every target. The underlying commands
-still work directly if you prefer:
+Or iterate faster with `make rust` (build + install the Rust crates only,
+skipping the OCR/setuid/zigplug steps). `make help` lists every target. The
+underlying commands still work directly if you prefer — note the helpers
+install with `--root` so they land in libexec, not on PATH:
 
 ```bash
 cargo install --path ~/src/paniolo/cli        # if the CLI changed
-cargo install --path ~/src/paniolo/hdmicap    # if hdmicap changed
-cargo install --path ~/src/paniolo/serialcap  # if serialcap changed
-cargo install --path ~/src/paniolo/netbootd   # if netbootd changed (re-run `paniolo setup` to re-setuid the helper on macOS)
-cargo install --path ~/src/paniolo/cambrionix # if cambrionix changed
-cargo install --path ~/src/paniolo/hidrig     # if hidrig changed
-uv tool install --force ~/src/paniolo/zigplug # if zigplug changed
+cargo install --path ~/src/paniolo/hdmicap   --root ~/.local/libexec/paniolo  # if hdmicap changed
+cargo install --path ~/src/paniolo/serialcap --root ~/.local/libexec/paniolo  # if serialcap changed
+cargo install --path ~/src/paniolo/netbootd  --root ~/.local/libexec/paniolo  # if netbootd changed (re-run `paniolo setup` to re-setuid the helper on macOS)
+cargo install --path ~/src/paniolo/cambrionix --root ~/.local/libexec/paniolo # if cambrionix changed
+cargo install --path ~/src/paniolo/hidrig    --root ~/.local/libexec/paniolo  # if hidrig changed
+UV_TOOL_BIN_DIR=~/.local/libexec/paniolo/bin uv tool install --force ~/src/paniolo/zigplug # if zigplug changed
 ```
 
 USB HID injection (`paniolo hid`) shells out to a helper speaking the
@@ -111,7 +116,7 @@ ssh control-mac "paniolo netboot start target-machine"
 ssh control-mac "paniolo netboot logs -f target-machine"
 
 # Interact with the console
-ssh control-mac "paniolo serial log -i console --since --tail 50 target-machine"
+ssh control-mac "paniolo serial log -t target-machine -i console --tail 50"
 
 # Power cycle and repeat
 ssh control-mac "paniolo power-cycle target-machine"

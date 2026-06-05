@@ -59,7 +59,7 @@ timestamped rolling capture log.
 
 ```bash
 paniolo serial watch [target-machine]   # start serialcap daemon
-paniolo serial stop  [target-machine]   # stop it
+paniolo serial stop  [target-machine]   # stop it (on the target's host)
 ```
 
 A target with multiple serial interfaces starts a single daemon that manages
@@ -70,24 +70,27 @@ dashboard.
 
 ## Querying captured output
 
-The capture log persists across daemon restarts. `serialcap log` reads it
+The capture log persists across daemon restarts. `paniolo serial log` reads it
 directly — no daemon round-trip needed.
+
+The target may be positional or `-t`; both it and `-i` can be omitted when
+there is only one.
 
 ```bash
 # Tail the last 50 lines from the default interface
-paniolo serial log -i console --tail 50 [target-machine]
+paniolo serial log target-machine -i console --tail 50
 
-# Stream new lines as they arrive (poll mode)
-paniolo serial log -i console --since [target-machine]
+# Only lines newer than a previously-seen sequence number (poll mode)
+paniolo serial log target-machine -i console --since 1840
 
 # Specific sequence number range
-paniolo serial log -i console --from 1000 --to 1200 [target-machine]
+paniolo serial log target-machine -i console --from 1000 --to 1200
 
 # Keep ANSI escape codes (stripped by default)
-paniolo serial log -i console --raw [target-machine]
+paniolo serial log target-machine -i console --raw
 
-# JSON output (includes timestamp and sequence number)
-paniolo serial log -i console --json [target-machine]
+# JSON Lines output (includes timestamp and sequence number)
+paniolo serial log target-machine -i console --json
 ```
 
 Each captured line carries a monotonic sequence number (`seq`, stable across
@@ -107,12 +110,15 @@ and output keeps flowing to `serial log` and the dashboard. (Contrast
 `serial connect`, which holds the port exclusively and can't run alongside the
 daemon.) The daemon must be running (`paniolo serial watch`).
 
+With two positionals the first is the target (`serial send <target> <text>`);
+with one, it's the text and the sole target is implied. `-t` also works.
+
 ```bash
 # Send a command (a carriage return is appended by default)
-paniolo serial send -i console "iochk --live-dangerously /block/000" [target-machine]
+paniolo serial send target-machine -i console "iochk --live-dangerously /block/000"
 
 # Send without the trailing carriage return
-paniolo serial send -i console --no-newline "partial" [target-machine]
+paniolo serial send target-machine -i console --no-newline "partial"
 ```
 
 ### Pacing a slow console (`--pace-ms`)

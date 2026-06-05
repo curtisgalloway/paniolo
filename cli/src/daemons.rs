@@ -14,8 +14,9 @@
 
 //! Shared plumbing for paniolo's per-subsystem daemons (serialcap, hdmicap).
 //!
-//! Every daemon follows the same contract: it is an installed binary (PATH or
-//! `~/.cargo/bin`), binds localhost (port 0 = OS-assigned), and writes a
+//! Every daemon follows the same contract: it is an installed binary (the
+//! paniolo libexec dir, PATH, or legacy `~/.cargo/bin` — see [`find_binary`]),
+//! binds localhost (port 0 = OS-assigned), and writes a
 //! discovery file `<runtime>/<name>/daemon.json` containing `{pid, port, …}`
 //! where `<runtime>` is `/tmp/paniolo-<uid>` (see [`runtime_base`]). Liveness
 //! is "the recorded pid still exists".
@@ -25,10 +26,30 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 
-/// Find an installed binary: $PATH first, then ~/.cargo/bin (where
-/// `paniolo setup` installs the daemons). Never the in-repo build tree, so a
-/// running daemon can't point at an ephemeral build artifact.
+/// The cargo-install root for paniolo's helper binaries. Binaries land in
+/// `<root>/bin` (cargo appends `bin/` itself) — see [`libexec_dir`].
+pub fn libexec_root() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".local/libexec/paniolo"))
+}
+
+/// Private helper dir (libexec): `~/.local/libexec/paniolo/bin`. The helpers
+/// (hdmicap, serialcap, netbootd, cambrionix, hidrig, zigplug, visionocr, …)
+/// live here rather than on PATH — they are paniolo's plumbing, invoked by
+/// paniolo (or explicitly via `paniolo helper <name> …`), not user commands.
+pub fn libexec_dir() -> Option<PathBuf> {
+    libexec_root().map(|r| r.join("bin"))
+}
+
+/// Find an installed binary: the paniolo libexec dir first, then $PATH, then
+/// ~/.cargo/bin (the pre-libexec install location, kept as a transitional
+/// fallback). Never the in-repo build tree, so a running daemon can't point
+/// at an ephemeral build artifact.
 pub fn find_binary(name: &str) -> Option<PathBuf> {
+    if let Some(p) = libexec_dir().map(|d| d.join(name)) {
+        if p.is_file() {
+            return Some(p);
+        }
+    }
     if let Some(paths) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&paths) {
             let p = dir.join(name);
@@ -39,6 +60,22 @@ pub fn find_binary(name: &str) -> Option<PathBuf> {
     }
     let cargo = dirs::home_dir()?.join(".cargo/bin").join(name);
     cargo.is_file().then_some(cargo)
+}
+
+/// PATH value with the libexec dir prepended, for `sh -c` hook commands
+/// (power on/off/cycle/state, hid cmd). Lab files reference helpers by bare
+/// name (`zigplug …`, `cambrionix …`); prepending libexec keeps those names
+/// resolving without the helpers being user-visible on PATH.
+pub fn hook_path() -> std::ffi::OsString {
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    match libexec_dir() {
+        Some(dir) => {
+            let mut paths = vec![dir];
+            paths.extend(std::env::split_paths(&current));
+            std::env::join_paths(paths).unwrap_or(current)
+        }
+        None => current,
+    }
 }
 
 /// Stable per-user runtime base: `/tmp/paniolo-<uid>`, identical in every

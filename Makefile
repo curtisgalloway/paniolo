@@ -15,6 +15,9 @@
 # Build and install paniolo: the Rust CLI (cli/) plus the daemons and helpers
 # (hdmicap, serialcap, netbootd, cambrionix, hidrig), the OCR helper, and the
 # zigplug Zigbee helper (Python, installed by `paniolo setup` as a uv tool).
+# Only the `paniolo` CLI lands on PATH (~/.cargo/bin); the helpers install
+# into the private libexec dir (~/.local/libexec/paniolo/bin), run via
+# `paniolo helper <name> ...` when needed directly.
 # `make install` from a fresh clone is the only command you need; re-run it
 # after editing anything to rebuild and reinstall.
 
@@ -32,8 +35,8 @@ help:
 	@echo "                   and platform steps via 'paniolo setup' (OCR helper,"
 	@echo "                   bpf-helper setuid on macOS, group setup on Linux)."
 	@echo "  make reinstall   Alias for 'make install' (install is already a full rebuild)."
-	@echo "  make rust        Fast path: cargo install the crates ($(CRATES)) only,"
-	@echo "                   skipping the OCR/setuid/group steps."
+	@echo "  make rust        Fast path: build + install the Rust crates ($(CRATES)) only,"
+	@echo "                   skipping the OCR/setuid/zigplug/group steps."
 	@echo "  make test        cargo test every crate."
 	@echo "  make fmt         rustfmt every crate."
 	@echo "  make clean       cargo clean every crate."
@@ -59,12 +62,13 @@ check-shadow:
 	fi
 
 # Fast path for iterating on the Rust code without re-running the full setup
-# (skips OCR and the macOS setuid step — re-run `make install` if you need those).
+# (skips OCR and the macOS setuid step — re-run `make install` if you need
+# those). Bootstraps the CLI first so install-layout changes in setup.rs take
+# effect, then lets `paniolo setup --rust-only` place the helpers — the
+# libexec-vs-PATH layout logic lives in one place (cli/src/setup.rs).
 rust:
-	@for crate in $(CRATES); do \
-		echo "==> cargo install --path $$crate"; \
-		cargo install --path $$crate --force || exit 1; \
-	done
+	cargo install --path cli
+	$(PANIOLO) setup --rust-only
 
 test:
 	@for crate in $(CRATES); do \

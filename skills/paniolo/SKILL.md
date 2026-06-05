@@ -24,10 +24,13 @@ make install               # cargo-installs the `paniolo` CLI, then `paniolo set
 ```
 
 Run once per machine; re-run after pulling or editing (it's a full rebuild).
-Everything lands in `~/.cargo/bin` — make sure it's on `PATH`. If a `paniolo`
-from the retired Python CLI shadows it (uv-tools shim in `~/.local/bin`),
-remove it with `uv tool uninstall paniolo`; `make install` warns when it
-detects a shadow.
+Only the `paniolo` CLI lands in `~/.cargo/bin` — make sure that's on `PATH`.
+The helpers (hdmicap, serialcap, netbootd, cambrionix, hidrig, zigplug, the
+OCR tool) live in the private libexec dir `~/.local/libexec/paniolo/bin`,
+off PATH; paniolo resolves them itself, and `paniolo helper [NAME] [ARGS…]`
+lists or runs one directly. If a `paniolo` from the retired Python CLI
+shadows the CLI (uv-tools shim in `~/.local/bin`), remove it with
+`uv tool uninstall paniolo`; `make install` warns when it detects a shadow.
 
 ## Configure a target
 
@@ -107,12 +110,15 @@ passwordless `sudo` requirement as netboot (`ip` on Linux, `ifconfig` on macOS).
 ```
 paniolo video devices                 # list capture devices (with stable ids)
 paniolo video set -t <target> --device "<id-or-name>"   # configure the video channel
-paniolo video watch                   # start the capture daemon (background)
-paniolo video preview                 # open the dashboard in a browser
-paniolo video shot [--stable] [--out frame.png]   # one lossless PNG
-paniolo video read [--stable]         # OCR the current screen, print text
-paniolo video show                    # device + daemon status
-paniolo video stop
+paniolo video watch [target] [--restart]   # start the capture daemon (background);
+                                           #   --restart force-restarts a stalled one
+paniolo video preview                 # print the daemon's dashboard URL (no browser)
+paniolo video shot [target] [--stable] [--out frame.png]   # one lossless PNG
+paniolo video shot --changed-since <hex-hash> --timeout <ms>   # block until the
+                                           #   frame differs from a previous shot's hash
+paniolo video read [target] [--stable]   # OCR the current screen, print text
+paniolo video show [target]           # device + daemon status
+paniolo video stop [target]           # stop the daemon (on the target's host)
 ```
 
 - The **dashboard** (the video daemon's URL — ports are OS-assigned, printed by
@@ -128,10 +134,12 @@ paniolo video stop
   more than one device is an error (listing the candidates' ids), not a silent
   first-match guess.
 - `--stable` waits for a steady frame before capturing (useful right after a mode
-  switch or reboot).
-- **OCR** (`video read` and the dashboard button) is on-device (Apple Vision). It
-  reads large boot-screen / BIOS text well; very small console fonts can produce
-  a few character confusions (e.g. `1`/`l`, `2`/`Z`).
+  switch or reboot). `video shot` prints `signal=… hash=…` on stderr — feed that
+  hash to `--changed-since` to wait efficiently for the screen to change.
+- **OCR** (`video read`, which wraps the daemon's `GET /ocr`; also the
+  dashboard button) is on-device (Apple Vision on macOS, Tesseract on Linux).
+  It reads large boot-screen / BIOS text well; very small console fonts can
+  produce a few character confusions (e.g. `1`/`l`, `2`/`Z`).
 
 ## Serial console
 
@@ -147,13 +155,22 @@ paniolo serial rm <name> -t <target>                      # drop a named interfa
 paniolo serial connect [target] [-i name]      # interactive terminal (tio) in your shell
 paniolo serial watch [target]                  # run the daemon for ALL interfaces;
                                                #   they appear in the dashboard pane
-paniolo serial log [-i name] [options]         # print captured output (timestamped)
+paniolo serial send [target] "text"            # send one line of input through
+                                               #   the running daemon (see below)
+paniolo serial log [target] [-i name] [options] # print captured output (timestamped)
 paniolo serial show [target]                   # list interfaces + daemon status
-paniolo serial stop                            # release the ports
+paniolo serial stop [target]                   # release the ports (on the target's host)
 paniolo serial devices                         # list serial devices on the host
 paniolo serial dtr [target] [-i name] [--ms N] # pulse DTR line (J2 power button header)
 paniolo serial reset [target] [-i name]        # soft reset via brief DTR pulse
 ```
+
+**Argument convention:** every runtime command takes the target as an
+optional positional (omit it when the lab has one target); channel-config
+commands (`add`/`set`/`rm`) take `-t`. `serial send`/`serial log` accept
+`-t` too — `serial send` reads two positionals as `<target> <text>`, one as
+just the text. The sole `-t`-only runtime command is `hid send`, whose
+positional tail belongs to the helper.
 
 `--name` defaults to `console`, so a single-interface setup needs no flags. With
 one interface, `-i`/`--interface` can be omitted everywhere. Don't run `connect`
@@ -177,11 +194,29 @@ paniolo serial log --raw              # keep ANSI colors / control bytes
 ```
 
 With more than one interface configured, pass `-i <name>` to choose one (omitting
-it errors and lists the names). Each line is shown as `[<UTC timestamp>] #<seq>
+it errors and lists the names); with more than one target, name it
+(`serial log pi5 …` or `-t pi5`). Each line is shown as `[<UTC timestamp>] #<seq>
 <text>`. The `seq` is a stable, monotonic line number — note it, then come back
 later with `--since <seq>` to get only what's new, or `--from/--to` to re-read an
 exact span. Output is ANSI-stripped by default; a `*` after the sequence number
 marks the current unterminated line (e.g. a `login:` prompt with no newline yet).
+
+### Sending input
+
+`paniolo serial send` injects one line through the **running daemon** (start
+`watch` first), so input coexists with capture — what you send and what the
+target echoes both land in the log:
+
+```
+paniolo serial send <target> "reboot"                # CR appended by default
+paniolo serial send "reboot"                         # sole-target lab: text only
+paniolo serial send --no-newline "partial input"     # suppress the CR
+paniolo serial send --pace-ms 8 "long command"       # per-byte pacing for slow
+                                                     #   polled consoles
+```
+
+Note the input only reaches the target if its console actually reads the UART
+(a kernel with a broken serial driver logs output but ignores input).
 
 ## Power control
 
@@ -260,7 +295,8 @@ where you point; your local cursor stays visible as a crosshair), click again to
 release. It auto-starts the hid daemon (`hidrig serve`), which owns the UART and
 re-exposes the protocol over a WebSocket; `paniolo hid send` injections intermix
 with what you type in the browser. Manual daemon control: `paniolo hid
-serve|stop -t <name>`. When the target also has a `power` channel, the overlay
+serve [target]` / `paniolo hid stop [target]` (positional target — only
+`hid send` and `hid set/rm` use `-t`). When the target also has a `power` channel, the overlay
 adds an on/off toggle switch + a separate cycle button (each confirms first).
 
 ## Targets on a remote control host (a "lab")
@@ -343,8 +379,10 @@ daemons there over an ssh PTY.)
 ## Quick reference — gotchas
 
 - Serial port is exclusive: one of `connect` / `watch` / external `tio`/`screen`.
-- `~/.cargo/bin` (the CLI and daemons) must be on `PATH`; a stale Python
-  `paniolo` in `~/.local/bin` shadows it (`uv tool uninstall paniolo`).
+- `~/.cargo/bin` (the CLI) must be on `PATH`; a stale Python `paniolo` in
+  `~/.local/bin` shadows it (`uv tool uninstall paniolo`). The helper
+  binaries are *not* on PATH — they live in `~/.local/libexec/paniolo/bin`
+  (`paniolo helper <name> …` to run one by hand).
 - `paniolo console` auto-starts both daemons if they aren't running. Local
   `console` passes the serialcap daemon's OS-assigned port as `?serial=PORT`
   so the dashboard's serial pane connects correctly.

@@ -196,7 +196,10 @@ cleanly into paniolo's generic power hooks.
 ### Installation
 
 `cambrionix` is built and installed by `make install` / `paniolo setup`
-alongside the other crates. It lands in `~/.cargo/bin`.
+alongside the other crates. It lands in the private libexec dir
+(`~/.local/libexec/paniolo/bin`), not on PATH — hook strings still reference
+it by bare name (paniolo resolves libexec first); to run it by hand, go
+through `paniolo helper cambrionix …`.
 
 ### Commands
 
@@ -244,17 +247,21 @@ override).
 ### Installation
 
 `zigplug` is a Python project (`zigplug/`), installed by `paniolo setup` /
-`make install` as a uv tool when `uv` is on PATH:
+`make install` as a uv tool when `uv` is on PATH. Its shim lands in the
+private libexec dir (`~/.local/libexec/paniolo/bin`), not on PATH — hook
+strings still use the bare name; run it by hand via `paniolo helper
+zigplug …`.
 
 ```bash
-uv tool install --force ~/src/paniolo/zigplug   # manual equivalent
+# manual equivalent
+UV_TOOL_BIN_DIR=~/.local/libexec/paniolo/bin uv tool install --force ~/src/paniolo/zigplug
 ```
 
 ### One-time setup: form the network
 
 ```bash
-zigplug -d /dev/cu.usbserial-XXXX form              # channel picked by energy scan
-zigplug -d /dev/cu.usbserial-XXXX form --channel 25 # or explicit (25-26 avoid Wi-Fi)
+paniolo helper zigplug -d /dev/cu.usbserial-XXXX form              # channel picked by energy scan
+paniolo helper zigplug -d /dev/cu.usbserial-XXXX form --channel 25 # or explicit (25-26 avoid Wi-Fi)
 ```
 
 `form` is idempotent — if the dongle already has a network it prints the
@@ -271,10 +278,10 @@ project venv), but cable placement is almost always the actual fix.
 ### Pairing plugs
 
 ```bash
-zigplug -d <device> permit --time 120   # open a join window
+paniolo helper zigplug -d <device> permit --time 120   # open a join window
 # put the plug in pairing mode (hold button until LED blinks; factory-fresh
 # plugs usually enter pairing mode on first power-up)
-zigplug -d <device> list                # IEEE, NWK, manufacturer, model, state
+paniolo helper zigplug -d <device> list                # IEEE, NWK, manufacturer, model, state
 ```
 
 `permit` prints each join and interview as it happens and exits non-zero if
@@ -282,6 +289,8 @@ nothing paired. Plugs previously paired to another hub need a full factory
 reset (often a ~10 s button hold), not just pairing mode.
 
 ### Commands
+
+As hook strings (or after `paniolo helper` when run by hand):
 
 ```bash
 zigplug -d <device> list                  # table of joined plugs + live state

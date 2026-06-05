@@ -83,17 +83,24 @@ fn field<'a>(ch: &'a ResolvedChannel, key: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
+/// Shell fragment giving hook commands the same resolution paniolo uses
+/// locally: the libexec dir first, then PATH. The literal path must match
+/// `daemons::libexec_dir()`; it is expanded by the probed host's own shell so
+/// that host's $HOME applies.
+const HOOK_PATH_PREFIX: &str = "PATH=\"$HOME/.local/libexec/paniolo/bin:$PATH\"";
+
 /// Probe script for a video channel. The device is usually a capture-device
 /// NAME (e.g. "USB Video" on macOS), not a path, so `test -e` alone is wrong:
 /// ask `hdmicap devices` on the channel host whether it enumerates. Path-style
 /// devices (`/dev/video0`) still short-circuit via `test -e`. Exit 3 = hdmicap
-/// itself is missing (PATH or ~/.cargo/bin), a distinct failure from a missing
-/// device.
+/// itself is missing (libexec, PATH, or legacy ~/.cargo/bin), a distinct
+/// failure from a missing device.
 fn video_probe_script(device: &str) -> String {
     let q = ssh::shell_quote(device);
     format!(
         "test -e {q} && exit 0; \
-         bin=$(command -v hdmicap) || bin=\"$HOME/.cargo/bin/hdmicap\"; \
+         bin=\"$HOME/.local/libexec/paniolo/bin/hdmicap\"; \
+         test -x \"$bin\" || bin=$(command -v hdmicap) || bin=\"$HOME/.cargo/bin/hdmicap\"; \
          test -x \"$bin\" || exit 3; \
          \"$bin\" devices 2>/dev/null | grep -F -q -- {q}"
     )
@@ -136,22 +143,26 @@ fn check_channel(lab: &Lab, ch: &ResolvedChannel, rt: &ResolvedTarget) -> (Statu
                     );
                 }
             }
-            // Probe all four hook fields; report the first absolute-path miss.
+            // Probe all four hook fields; report the first missing program.
+            // Bare names resolve like the hooks themselves do: libexec first,
+            // then PATH (see daemons::hook_path()).
             let hook_keys = ["cycle_cmd", "on_cmd", "off_cmd", "state_cmd"];
             let mut configured: Vec<&str> = Vec::new();
             for key in hook_keys {
                 if let Some(cmd) = field(ch, key) {
                     configured.push(key);
                     let prog = cmd.split_whitespace().next().unwrap_or("");
-                    if prog.starts_with('/') {
-                        let rc = probe(
-                            lab,
-                            &ch.host,
-                            &format!("test -e {}", ssh::shell_quote(prog)),
-                        );
-                        if rc != Some(0) {
-                            return interpret(rc, prog);
-                        }
+                    let script = if prog.starts_with('/') {
+                        format!("test -e {}", ssh::shell_quote(prog))
+                    } else {
+                        format!(
+                            "{HOOK_PATH_PREFIX} command -v {} >/dev/null",
+                            ssh::shell_quote(prog)
+                        )
+                    };
+                    let rc = probe(lab, &ch.host, &script);
+                    if rc != Some(0) {
+                        return interpret(rc, prog);
                     }
                 }
             }
@@ -164,21 +175,18 @@ fn check_channel(lab: &Lab, ch: &ResolvedChannel, rt: &ResolvedTarget) -> (Statu
         ChannelKind::Hid => match field(ch, "cmd") {
             None => (Status::Incomplete, "no cmd set".to_string()),
             // Like the power hooks: absolute-path helpers are probed for
-            // existence; bare names (resolved via PATH) are taken on faith.
+            // existence; bare names are probed under libexec-then-PATH.
             Some(cmd) => {
                 let prog = cmd.split_whitespace().next().unwrap_or("");
-                if prog.starts_with('/') {
-                    interpret(
-                        probe(
-                            lab,
-                            &ch.host,
-                            &format!("test -e {}", ssh::shell_quote(prog)),
-                        ),
-                        prog,
-                    )
+                let script = if prog.starts_with('/') {
+                    format!("test -e {}", ssh::shell_quote(prog))
                 } else {
-                    (Status::Ok, "configured".to_string())
-                }
+                    format!(
+                        "{HOOK_PATH_PREFIX} command -v {} >/dev/null",
+                        ssh::shell_quote(prog)
+                    )
+                };
+                interpret(probe(lab, &ch.host, &script), prog)
             }
         },
     }

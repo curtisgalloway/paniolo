@@ -30,10 +30,12 @@ Paniolo runs each hook with `sh -c <cmd>` (`cli/src/main.rs`,
 Environment the helper must tolerate:
 
 - **`sh -c`, no shell profile.** The command string is evaluated by `sh` with
-  whatever PATH the paniolo process has. Use a bare helper name only if it
-  installs somewhere PATH-stable (`~/.cargo/bin`, `~/.local/bin`); absolute
-  paths are always safe and are the only thing `paniolo doctor` can probe
-  (it runs `test -e` on hooks whose value starts with `/`).
+  the paniolo process's PATH **plus the private libexec dir
+  (`~/.local/libexec/paniolo/bin`) prepended** — so helpers installed by
+  `paniolo setup` resolve by bare name without living on the user's PATH.
+  Absolute paths also work. `paniolo doctor` probes both forms: `test -e` for
+  absolute paths, `command -v` under the same libexec-then-PATH resolution
+  for bare names.
 - **Runs on the channel's control host.** Power commands re-exec over SSH on
   the host that owns the power channel (`paniolo power set --host <labhost>`).
   Install the helper on *that* host, not (only) where you type.
@@ -74,16 +76,18 @@ Mirror the existing helpers so hooks read uniformly across hardware:
 
 Pick the language by ecosystem fit — Rust if the device speaks a simple
 serial/HTTP protocol, Python if the driver library is Python (as with
-zigpy-znp). Anything goes as long as it installs a PATH-stable executable.
+zigpy-znp). Anything goes as long as it installs an executable into the
+libexec dir (`~/.local/libexec/paniolo/bin`) — helpers stay off the user's
+PATH; run one by hand with `paniolo helper <name> …`.
 
 **Rust helper (the `cambrionix` pattern):**
 
 1. `cargo new <helper> --bin` at the repo root; Apache 2.0 headers; `clap`
    (derive) + `anyhow` + whatever transport crate (`serialport`, `ureq`).
 2. `main.rs` = CLI surface + command logic; `proto.rs` = transport/protocol.
-3. Add the crate name to `CRATES` in [`Makefile`](../Makefile) **and** in
-   `cli/src/setup.rs` so `make install` / `paniolo setup` build and install
-   it to `~/.cargo/bin`.
+3. Add the crate name to `CRATES` in [`Makefile`](../Makefile) **and** to
+   `HELPER_CRATES` in `cli/src/setup.rs` so `make install` / `paniolo setup`
+   build and install it into the libexec dir (`cargo install --root`).
 
 **Python helper (the `zigplug` pattern):**
 
@@ -94,13 +98,14 @@ zigpy-znp). Anything goes as long as it installs a PATH-stable executable.
    map library exceptions to clean one-line errors (a traceback in hook
    output reads as paniolo breakage).
 3. Add an install block to `cli/src/setup.rs` following zigplug's: probe for
-   `uv`, run `uv tool install --force <repo>/<helper>` (lands in
-   `~/.local/bin`), skip with a note when uv is missing. Mention it in the
-   Makefile header comment.
+   `uv`, run `uv tool install --force <repo>/<helper>` with
+   `UV_TOOL_BIN_DIR` pointed at the libexec dir (the shim lands there, the
+   venv stays in uv's tool dir), skip with a note when uv is missing.
+   Mention it in the Makefile header comment.
 
-Either way: **install the helper before testing hooks** (`cargo install
---path <helper>` / `uv tool install --force ./<helper>`). Paniolo runs
-installed binaries, not repo checkouts.
+Either way: **install the helper before testing hooks** (`paniolo setup`, or
+`cargo install --path <helper> --root ~/.local/libexec/paniolo` for a
+one-off). Paniolo runs installed binaries, not repo checkouts.
 
 ## 4. Hardware verification ladder
 
@@ -112,15 +117,17 @@ comes last:
    some USB-serial chips (e.g. CP2102N) carry no serial number, so macOS
    names them by USB topology (`/dev/cu.usbserial-8310` ↔ location
    `08310000`) — the name changes if the dongle moves ports.
-2. **Helper one-shots directly**: any device-lifecycle setup (e.g.
-   `zigplug form` + `permit`), then `state <id>`, `on`, `off`, `cycle`,
-   confirming physically (relay click, LED, multimeter).
+2. **Helper one-shots directly** (`paniolo helper <name> …` — helpers are
+   not on PATH): any device-lifecycle setup (e.g. `paniolo helper zigplug
+   form` + `permit`), then `state <id>`, `on`, `off`, `cycle`, confirming
+   physically (relay click, LED, multimeter).
 3. **`paniolo power-state <target>`** — read-only, proves the hook string,
    `sh -c` environment, and the `on`/`off` token contract.
 4. **`paniolo power on/off <target>`** — switching through the full stack.
 5. **`paniolo power-cycle <target>`** — last, it reboots the target.
-6. `paniolo doctor` — confirms which hooks are configured (and probes
-   absolute-path hooks).
+6. `paniolo doctor` — confirms which hooks are configured and probes that
+   each hook's program exists (absolute paths via `test -e`, bare names via
+   `command -v` under libexec-then-PATH).
 
 ## 5. Wiring into a target
 

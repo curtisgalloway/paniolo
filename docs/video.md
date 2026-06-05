@@ -48,7 +48,8 @@ device is present, and lists id alternatives when there are several.
 
 ```bash
 paniolo video watch [target-machine]   # start hdmicap daemon for a target
-paniolo video stop  [target-machine]   # stop it
+paniolo video watch --restart          # force-restart a running (stalled) daemon
+paniolo video stop  [target-machine]   # stop it (on the target's host)
 paniolo video show  [target-machine]   # show daemon URL and status
 ```
 
@@ -60,29 +61,35 @@ is printed — open it in a browser for the live preview.
 ## Capturing frames
 
 ```bash
-paniolo video shot [target-machine]           # save a screenshot to a temp file
-paniolo video shot [target-machine] -o out.png  # save to a specific path
-paniolo video preview [target-machine]        # open the live MJPEG stream in a browser
+paniolo video shot [target-machine] -o out.png   # save a screenshot (PNG)
+paniolo video shot [target-machine]              # PNG to stdout (default -o -)
+paniolo video shot --stable -o out.png           # wait for a steady frame first
+paniolo video shot --changed-since <hex-hash> --timeout 10000 -o out.png
+                                                 # block until the frame differs
+paniolo video preview                            # print the live-dashboard URL
 ```
 
-`shot` fetches a single PNG-encoded frame from the running daemon via
-`hdmicap shot`.
+`shot` fetches a single PNG-encoded frame from the running daemon and prints
+`signal=… hash=…` to stderr; feed that hash to a later `--changed-since` to
+wait for the screen to change.
 
 ---
 
-## OCR (Apple Vision)
+## OCR
 
 ```bash
-paniolo video read [target-machine]
+paniolo video read [target-machine]            # OCR the current frame, text to stdout
+paniolo video read --stable [--timeout <ms>]   # wait for a steady frame first
 ```
 
-Fetches the current frame and runs Apple Vision's `VNRecognizeTextRequest` on
-it, printing the recognized text to stdout. On-device — no network, no model
-download required.
+`read` wraps the running daemon's `GET /ocr` endpoint (also reachable directly
+— `curl -s "$(paniolo video preview)/ocr"` — and via the OCR button on the
+[web dashboard](dashboard.md)). On macOS this uses Apple Vision's
+`VNRecognizeTextRequest` — on-device, no network, no model download required.
 
-`paniolo setup` compiles `ocr/visionocr.swift` into `~/.cargo/bin/visionocr`
-with `swiftc`. The OCR tool is also accessible from the [web dashboard](dashboard.md)
-via the OCR button.
+`paniolo setup` compiles `ocr/visionocr.swift` with `swiftc` into the private
+libexec dir (`~/.local/libexec/paniolo/bin/visionocr`); the hdmicap daemon
+finds it there (or via `PANIOLO_VISIONOCR`) and shells out to it per request.
 
 **OCR tuning notes:**
 - `.fast` recognition level is used (not `.accurate` — the latter misses small
