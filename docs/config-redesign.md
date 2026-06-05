@@ -23,7 +23,8 @@ crate): config model + CRUD + doctor (R1), per-channel dispatch + SSH transport
 (serial round-trip, live HDMI capture, netbootd serving DHCP+TFTP, netif mode
 transitions; a real TFTP boot — Fuchsia shim + ZBI on the Pi 5 — verified
 2026-06-04). Remaining: live remote-host dispatch test (needs a second control
-host), docs/cutover, and the deferred OCR + Openterface HID.
+host), docs/cutover, and the deferred Openterface HID. (OCR landed 2026-06-05:
+`paniolo video read` wraps the hdmicap daemon's `GET /ocr`.)
 The Python Stages 1–4 on this branch are the original tested reference; the
 Python tree is retired only after the Rust CLI has proven itself in daily use.
 

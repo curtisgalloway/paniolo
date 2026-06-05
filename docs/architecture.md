@@ -62,7 +62,7 @@ and persist between CLI invocations. State lives in plain files, not memory.
 | `hdmicap` | Rust (tokio/axum; ObjC AVFoundation layer on macOS, v4l on Linux) | "Warm-stream" daemon that keeps the USB HDMI capture device open and serves frames + the combined dashboard over HTTP. |
 | `netbootd` | Rust (tokio) | The default single-binary DHCP+TFTP netboot engine. Privilege-separated `/dev/bpf` send path on macOS via a setuid `netbootd-bpf-helper`. |
 | `_dhcp` / `_tftp` | Python modules | Legacy netboot DHCP and TFTP servers (`--engine python`), run as `python -m paniolo._dhcp` / `._tftp` subprocesses. The implementation `netbootd` was ported from; kept as a fallback. |
-| `visionocr` / `linuxocr` | Swift / shell+Tesseract | On-device OCR helpers invoked by `hdmicap` (`GET /ocr`, dashboard OCR button; the legacy Python CLI also exposed `video read`). |
+| `visionocr` / `linuxocr` | Swift / shell+Tesseract | On-device OCR helpers invoked by `hdmicap` (`GET /ocr`, wrapped by `paniolo video read` and the dashboard OCR button). |
 | HID rig firmware | CircuitPython | Two KB2040 boards that turn text commands into USB HID events (see [`hidrig/`](../hidrig/README.md)). |
 
 A future *Option B* — a single long-running Rust server with socket RPC for inter-subsystem
@@ -161,10 +161,10 @@ modem-control input wired to the target rail) via the serialcap daemon's `/statu
 ### Video + OCR ([`video.md`](video.md))
 `hdmicap` keeps a UVC HDMI capture device open continuously (avoiding multi-second per-capture
 reopen latency) and serves the current frame as PNG/MJPEG plus the dashboard over HTTP.
-hdmicap's `GET /ocr` and the dashboard OCR button run **on-device OCR** on the warm frame —
-Apple Vision (`visionocr`) on macOS, Tesseract (`linuxocr`) on Linux — tuned for thin console
-fonts (2× upscale, black-pad, `.fast`/lowered min text height). (`video read` existed only in
-the legacy Python CLI; the Rust equivalent is tracked as deferred in config-redesign.md.)
+`paniolo video read` (wrapping hdmicap's `GET /ocr`) and the dashboard OCR button run
+**on-device OCR** on the warm frame — Apple Vision (`visionocr`) on macOS, Tesseract
+(`linuxocr`) on Linux — tuned for thin console fonts (2× upscale, black-pad,
+`.fast`/lowered min text height).
 
 ### HID injection ([`hid.md`](hid.md))
 A single KB2040 presents as a USB HID keyboard + mouse to the DUT; the control host drives it

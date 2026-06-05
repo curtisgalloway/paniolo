@@ -285,12 +285,20 @@ enum SerialCmd {
         port: u16,
     },
     /// Stop the running serialcap daemon.
-    Stop,
+    Stop {
+        /// Target whose serial host's daemon to stop (optional when local).
+        target: Option<String>,
+    },
     /// Send a line of input to the console through the running daemon.
     Send {
-        /// Text to send.
-        text: String,
-        #[arg(long, short)]
+        /// With two positionals the first is the target (`serial send pi5
+        /// "text"`); with one, it is the text itself (`serial send "text"`).
+        #[arg(value_name = "TARGET|TEXT")]
+        first: String,
+        /// Text to send (when the first positional is the target).
+        #[arg(value_name = "TEXT")]
+        second: Option<String>,
+        #[arg(long, short, conflicts_with = "second")]
         target: Option<String>,
         #[arg(long, short)]
         interface: Option<String>,
@@ -303,6 +311,9 @@ enum SerialCmd {
     },
     /// Print captured serial output (reads serialcap's on-disk log).
     Log {
+        /// Target (optional when the lab has one); `-t` also accepted.
+        #[arg(value_name = "TARGET", conflicts_with = "target")]
+        target_pos: Option<String>,
         #[arg(long, short)]
         target: Option<String>,
         #[arg(long, short)]
@@ -509,7 +520,10 @@ enum VideoCmd {
         restart: bool,
     },
     /// Stop the running hdmicap daemon.
-    Stop,
+    Stop {
+        /// Target whose video host's daemon to stop (optional when local).
+        target: Option<String>,
+    },
     /// Fetch one PNG screenshot from the running daemon.
     Shot {
         target: Option<String>,
@@ -525,6 +539,16 @@ enum VideoCmd {
         /// Output path; "-" for stdout.
         #[arg(long, short, default_value = "-")]
         out: String,
+    },
+    /// OCR the current frame via the running daemon, printing the text.
+    Read {
+        target: Option<String>,
+        /// Wait until the signal is stable before reading.
+        #[arg(long)]
+        stable: bool,
+        /// Timeout in ms for the stable wait.
+        #[arg(long, default_value_t = 2000)]
+        timeout: u64,
     },
     /// Print the live-preview URL of the running daemon.
     Preview,
@@ -1162,7 +1186,11 @@ fn serial_cmd(lab_flag: Option<&str>, cmd: SerialCmd) -> Result<()> {
             cmd_serial_connect(lab_flag, target.as_deref(), interface.as_deref())
         }
         SerialCmd::Watch { target, port } => cmd_serial_watch(lab_flag, target.as_deref(), port),
-        SerialCmd::Stop => {
+        SerialCmd::Stop { target } => {
+            // With a target, route to its serial channel's host (no-op locally).
+            if let Some(t) = target.as_deref() {
+                let _ = serial_runtime(lab_flag, Some(t), None, dispatch::Mode::Reexec)?;
+            }
             let code = serial::stop_daemon()?;
             if code == 0 {
                 println!("Serial daemon stopped.");
@@ -1172,20 +1200,30 @@ fn serial_cmd(lab_flag: Option<&str>, cmd: SerialCmd) -> Result<()> {
             }
         }
         SerialCmd::Send {
-            text,
+            first,
+            second,
             target,
             interface,
             pace_ms,
             no_newline,
-        } => cmd_serial_send(
-            lab_flag,
-            target.as_deref(),
-            interface.as_deref(),
-            &text,
-            pace_ms,
-            !no_newline,
-        ),
+        } => {
+            // Two positionals = target + text; one = text (clap rejects -t
+            // alongside a second positional).
+            let (target, text) = match second {
+                Some(text) => (Some(first), text),
+                None => (target, first),
+            };
+            cmd_serial_send(
+                lab_flag,
+                target.as_deref(),
+                interface.as_deref(),
+                &text,
+                pace_ms,
+                !no_newline,
+            )
+        }
         SerialCmd::Log {
+            target_pos,
             target,
             interface,
             tail,
@@ -1197,7 +1235,7 @@ fn serial_cmd(lab_flag: Option<&str>, cmd: SerialCmd) -> Result<()> {
             no_pending,
         } => cmd_serial_log(
             lab_flag,
-            target.as_deref(),
+            target_pos.or(target).as_deref(),
             interface.as_deref(),
             tail,
             from,
@@ -1967,7 +2005,11 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
                 )),
             }
         }
-        VideoCmd::Stop => {
+        VideoCmd::Stop { target } => {
+            // With a target, route to its video channel's host (no-op locally).
+            if let Some(t) = target.as_deref() {
+                let _ = video_runtime(lab_flag, Some(t))?;
+            }
             let code = video::stop_daemon()?;
             if code == 0 {
                 println!("Video daemon stopped.");
@@ -1999,6 +2041,19 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
                 args.push(h);
             }
             std::process::exit(video::passthrough(&args)?);
+        }
+        VideoCmd::Read {
+            target,
+            stable,
+            timeout,
+        } => {
+            let _ = video_runtime(lab_flag, target.as_deref())?;
+            let text = video::ocr(stable, timeout)?;
+            print!("{text}");
+            if !text.ends_with('\n') {
+                println!();
+            }
+            Ok(())
         }
         VideoCmd::Preview => match video::daemon_url() {
             Some(url) => {

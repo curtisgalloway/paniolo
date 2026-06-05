@@ -36,6 +36,27 @@ pub fn daemon_url() -> Option<String> {
     daemons::daemon_url(DAEMON)
 }
 
+/// OCR the daemon's current frame via `GET /ocr` (optionally waiting for a
+/// stable signal first), returning the recognized text.
+pub fn ocr(stable: bool, timeout_ms: u64) -> Result<String> {
+    let url = daemon_url()
+        .ok_or_else(|| anyhow!("no video daemon running — start one with `paniolo video watch`"))?;
+    if stable {
+        // The snapshot blocks until the signal settles (or times out); the
+        // body is discarded — only the wait matters.
+        let _ = ureq::get(&format!("{url}/snapshot?wait=stable&timeout={timeout_ms}"))
+            .timeout(std::time::Duration::from_millis(timeout_ms + 5_000))
+            .call()
+            .map_err(|e| anyhow!("waiting for a stable frame failed: {e}"))?;
+    }
+    ureq::get(&format!("{url}/ocr"))
+        .timeout(std::time::Duration::from_secs(30))
+        .call()
+        .map_err(|e| anyhow!("OCR failed: {e}"))?
+        .into_string()
+        .map_err(|e| anyhow!("reading the OCR response failed: {e}"))
+}
+
 /// Start the hdmicap daemon for `device`, detached; caller polls discovery.
 pub fn start_daemon(device: &str, port: u16, target_name: Option<&str>) -> Result<()> {
     let binary = daemons::find_binary(DAEMON)

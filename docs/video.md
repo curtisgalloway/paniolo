@@ -49,7 +49,7 @@ device is present, and lists id alternatives when there are several.
 ```bash
 paniolo video watch [target-machine]   # start hdmicap daemon for a target
 paniolo video watch --restart          # force-restart a running (stalled) daemon
-paniolo video stop                     # stop it (no target — one daemon per host)
+paniolo video stop  [target-machine]   # stop it (on the target's host)
 paniolo video show  [target-machine]   # show daemon URL and status
 ```
 
@@ -77,17 +77,15 @@ wait for the screen to change.
 
 ## OCR
 
-There is no `video read` subcommand in the Rust CLI (it's tracked as deferred
-in [config-redesign.md](config-redesign.md)); OCR runs in the daemon, exposed
-two ways:
-
 ```bash
-curl -s "$(paniolo video preview)/ocr"     # OCR the current frame, text to stdout
+paniolo video read [target-machine]            # OCR the current frame, text to stdout
+paniolo video read --stable [--timeout <ms>]   # wait for a steady frame first
 ```
 
-or the OCR button on the [web dashboard](dashboard.md). On macOS this uses
-Apple Vision's `VNRecognizeTextRequest` — on-device, no network, no model
-download required.
+`read` wraps the running daemon's `GET /ocr` endpoint (also reachable directly
+— `curl -s "$(paniolo video preview)/ocr"` — and via the OCR button on the
+[web dashboard](dashboard.md)). On macOS this uses Apple Vision's
+`VNRecognizeTextRequest` — on-device, no network, no model download required.
 
 `paniolo setup` compiles `ocr/visionocr.swift` with `swiftc` into the private
 libexec dir (`~/.local/libexec/paniolo/bin/visionocr`); the hdmicap daemon

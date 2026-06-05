@@ -116,15 +116,9 @@ paniolo video preview                 # print the daemon's dashboard URL (no bro
 paniolo video shot [target] [--stable] [--out frame.png]   # one lossless PNG
 paniolo video shot --changed-since <hex-hash> --timeout <ms>   # block until the
                                            #   frame differs from a previous shot's hash
+paniolo video read [target] [--stable]   # OCR the current screen, print text
 paniolo video show [target]           # device + daemon status
-paniolo video stop                    # (no target — one daemon per host)
-```
-
-**OCR the current screen** (there is NO `video read` subcommand — OCR goes
-through the running daemon's HTTP endpoint):
-
-```
-curl -s "$(paniolo video preview)/ocr"
+paniolo video stop [target]           # stop the daemon (on the target's host)
 ```
 
 - The **dashboard** (the video daemon's URL — ports are OS-assigned, printed by
@@ -142,10 +136,10 @@ curl -s "$(paniolo video preview)/ocr"
 - `--stable` waits for a steady frame before capturing (useful right after a mode
   switch or reboot). `video shot` prints `signal=… hash=…` on stderr — feed that
   hash to `--changed-since` to wait efficiently for the screen to change.
-- **OCR** (the `/ocr` endpoint and the dashboard button) is on-device (Apple
-  Vision on macOS, Tesseract on Linux). It reads large boot-screen / BIOS text
-  well; very small console fonts can produce a few character confusions
-  (e.g. `1`/`l`, `2`/`Z`).
+- **OCR** (`video read`, which wraps the daemon's `GET /ocr`; also the
+  dashboard button) is on-device (Apple Vision on macOS, Tesseract on Linux).
+  It reads large boot-screen / BIOS text well; very small console fonts can
+  produce a few character confusions (e.g. `1`/`l`, `2`/`Z`).
 
 ## Serial console
 
@@ -161,21 +155,22 @@ paniolo serial rm <name> -t <target>                      # drop a named interfa
 paniolo serial connect [target] [-i name]      # interactive terminal (tio) in your shell
 paniolo serial watch [target]                  # run the daemon for ALL interfaces;
                                                #   they appear in the dashboard pane
-paniolo serial send [-t target] [-i name] "text"   # send one line of input through
+paniolo serial send [target] "text"            # send one line of input through
                                                #   the running daemon (see below)
-paniolo serial log [-t target] [-i name] [options] # print captured output (timestamped)
+paniolo serial log [target] [-i name] [options] # print captured output (timestamped)
 paniolo serial show [target]                   # list interfaces + daemon status
-paniolo serial stop                            # release the ports (no target)
+paniolo serial stop [target]                   # release the ports (on the target's host)
 paniolo serial devices                         # list serial devices on the host
 paniolo serial dtr [target] [-i name] [--ms N] # pulse DTR line (J2 power button header)
 paniolo serial reset [target] [-i name]        # soft reset via brief DTR pulse
 ```
 
-**Argument convention:** runtime commands take the target as an optional
-positional (`serial watch pi5`), but `serial send` and `serial log` take it
-via `-t` — their positional slot is the text/none (`paniolo serial log pi5`
-is an error; use `paniolo serial log -t pi5`). Channel-config commands
-(`add`/`set`/`rm`) always use `-t`. `serial stop` takes no target at all.
+**Argument convention:** every runtime command takes the target as an
+optional positional (omit it when the lab has one target); channel-config
+commands (`add`/`set`/`rm`) take `-t`. `serial send`/`serial log` accept
+`-t` too — `serial send` reads two positionals as `<target> <text>`, one as
+just the text. The sole `-t`-only runtime command is `hid send`, whose
+positional tail belongs to the helper.
 
 `--name` defaults to `console`, so a single-interface setup needs no flags. With
 one interface, `-i`/`--interface` can be omitted everywhere. Don't run `connect`
@@ -199,8 +194,8 @@ paniolo serial log --raw              # keep ANSI colors / control bytes
 ```
 
 With more than one interface configured, pass `-i <name>` to choose one (omitting
-it errors and lists the names); with more than one target, `-t <target>` (never
-positional). Each line is shown as `[<UTC timestamp>] #<seq>
+it errors and lists the names); with more than one target, name it
+(`serial log pi5 …` or `-t pi5`). Each line is shown as `[<UTC timestamp>] #<seq>
 <text>`. The `seq` is a stable, monotonic line number — note it, then come back
 later with `--since <seq>` to get only what's new, or `--from/--to` to re-read an
 exact span. Output is ANSI-stripped by default; a `*` after the sequence number
@@ -213,7 +208,8 @@ marks the current unterminated line (e.g. a `login:` prompt with no newline yet)
 target echoes both land in the log:
 
 ```
-paniolo serial send -t <target> "reboot"             # CR appended by default
+paniolo serial send <target> "reboot"                # CR appended by default
+paniolo serial send "reboot"                         # sole-target lab: text only
 paniolo serial send --no-newline "partial input"     # suppress the CR
 paniolo serial send --pace-ms 8 "long command"       # per-byte pacing for slow
                                                      #   polled consoles

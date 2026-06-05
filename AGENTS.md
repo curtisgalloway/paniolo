@@ -73,7 +73,7 @@ Current capabilities:
   one daemon owns several named interfaces, each with a timestamped rolling capture
   log queryable by line range (`paniolo serial log -i <name>`)
 - Combined video+serial web dashboard (hdmicap's `GET /`: video on top, xterm.js terminal below)
-- On-device OCR of the captured screen (hdmicap's `GET /ocr` — `curl -s "$(paniolo video preview)/ocr"` — and the dashboard OCR button; there is no `video read` subcommand in the Rust CLI): Apple Vision on macOS, Tesseract on Linux
+- On-device OCR of the captured screen (`paniolo video read [target] [--stable]`, which wraps hdmicap's `GET /ocr`; also the dashboard OCR button): Apple Vision on macOS, Tesseract on Linux
 - USB HID input (keyboard/mouse injection) via a generic helper hook (`paniolo hid send`); the `hidrig` helper drives the KB2040 injector over its control UART (HID serial protocol, docs/hid-serial-protocol.md). `hidrig serve` runs a daemon that owns the UART and re-exposes the protocol over a WebSocket, so `paniolo console` works as a **KVM** — stream the browser's keyboard + absolute mouse (`moveabs`) to the target, intermixed with CLI injection on the one wire
 - Power control via DTR (J2 wiring) or generic shell-command hooks (`on_cmd`, `off_cmd`, `cycle_cmd`, `state_cmd`): `paniolo serial dtr`, `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`. Helpers that wire into the hooks: `cambrionix` (USB hub port power) and `zigplug` (Zigbee smart plugs via a CC2652 coordinator dongle)
 
@@ -116,12 +116,13 @@ Python tree below:
   `~/.cargo/bin`; hook commands (`*_cmd`, hid `cmd`) run via `sh -c` with
   libexec prepended to PATH, so lab files keep referencing helpers by bare
   name. `paniolo helper [NAME] [ARGS…]` lists or runs them directly.
-- **CLI argument convention**: runtime commands take the target as an
-  optional positional (`netboot start pi5`, `hid serve pi5`); channel-config
-  commands (`set`/`add`/`rm`) take `-t/--target`; `serial send`, `serial
-  log`, and `hid send` also take `-t` because their positional slots carry
-  text/args; `serial stop` and `video stop` take no target (one daemon per
-  host). There is no `video read` — OCR is the daemon's `GET /ocr`.
+- **CLI argument convention**: every runtime command takes the target as an
+  optional positional (`netboot start pi5`, `serial log pi5`, `video stop
+  pi5`); channel-config commands (`set`/`add`/`rm`) take `-t/--target`.
+  `serial send` and `serial log` accept `-t` as well (`serial send` reads two
+  positionals as `<target> <text>`, one as just the text); `hid send` is the
+  one runtime command that takes `-t` only, because its positional tail is
+  the helper's args.
 
 ```
 cli/src/
@@ -148,7 +149,7 @@ cli/src/
                 (uv tool, shim in libexec), Linux groups; --rust-only fast path
 ```
 
-Deferred (tracked in docs/config-redesign.md): OCR (`video read`), the
+Deferred (tracked in docs/config-redesign.md): the
 Openterface CH9329 HID backend (clean-room spec at docs/ch9329-spec.md — a shim
 speaking the HID serial protocol would plug into the existing `hid` channel),
 legacy Python removal.
@@ -356,8 +357,9 @@ cycle on every page load — the probe is now the read-only `GET /power`.)
 ## OCR
 
 Two entry points, both feeding the same warm frame:
-- **`paniolo video read`** (legacy Python CLI only; deferred in the Rust CLI) —
-  fetches a snapshot (via `hdmicap shot`) and OCRs it.
+- **`paniolo video read [target] [--stable]`** — OCRs the current frame (in
+  the Rust CLI it wraps the daemon's `GET /ocr`; the legacy Python CLI
+  fetched a snapshot via `hdmicap shot` and OCR'd it client-side).
 - **Dashboard button + hdmicap `GET /ocr`** — the daemon PNG-encodes the current
   frame and pipes it to the OCR tool (`tokio::process`), returning the text. The
   daemon finds the tool via `PANIOLO_VISIONOCR` (the installed path, set by
