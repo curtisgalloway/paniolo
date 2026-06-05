@@ -89,6 +89,7 @@ are separated by single spaces.
 | `mdown <button>` | `OK` | Press and hold a mouse button |
 | `mup <button>` | `OK` | Release a held mouse button |
 | `scroll <amount>` | `OK` | Scroll wheel; signed decimal integer, positive = up |
+| `baud <rate>` | `OK` | Switch the serial link to `<rate>` baud (capability `baud`) |
 | `ping` | `OK` | No-op liveness check |
 | `version` | `OK <ver> <impl> [caps...]` | Protocol version + implementation id + capability tokens |
 
@@ -108,11 +109,21 @@ are separated by single spaces.
   spaces and `#`; no quoting or escaping exists. Characters outside the
   device's keyboard layout (reference: US) may be typed approximately or
   rejected with `ERR`.
+- `baud <rate>` renegotiates the serial link's speed mid-session (optional,
+  capability `baud`) — for a carrier where it makes sense (a UART; meaningless
+  on a TCP/WebSocket carrier). The **device boots at the default 9600/115200**
+  (see §2) so a naive connection always works; a throughput-sensitive host then
+  raises it. **Handshake:** the device replies `OK` **at the current rate**,
+  then switches to `<rate>`; the host, after reading that `OK`, switches its
+  port to `<rate>`, waits briefly for the device to switch, and confirms with a
+  `ping` (reverting on no reply). The device SHOULD return to its boot default
+  on power-cycle so a later naive connect re-syncs. A device that does not
+  implement it MUST reply `ERR` and stay at the current rate.
 - `version` replies `OK <ver> <impl> [caps...]`, e.g.
-  `OK 1 kb2040-circuitpython/1.0 moveabs`. `<ver>` is the protocol version
+  `OK 1 kb2040-circuitpython/1.0 moveabs baud`. `<ver>` is the protocol version
   (decimal integer) hosts use for compatibility; `<impl>` is an informational
   free-form id; each remaining whitespace-separated token is an **optional
-  capability** the device supports (currently `moveabs`). Absence of a token
+  capability** the device supports (e.g. `moveabs`, `baud`). Absence of a token
   means the corresponding command will `ERR`.
 
 ### Key names

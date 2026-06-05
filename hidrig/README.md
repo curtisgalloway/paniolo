@@ -89,6 +89,11 @@ console never contend for the port. `paniolo console` starts this daemon on
 demand and the dashboard streams keyboard + absolute-mouse events to it — see
 [`docs/hid.md`](../docs/hid.md).
 
+For throughput, the daemon **negotiates the UART up** from the 115200 boot rate
+to 460800 (the firmware advertises a `baud` capability and switches only after
+acking at the old rate, so a naive connect always works and a power-cycle
+re-syncs). `hidrig -d <device> baud <rate>` exercises the switch by hand.
+
 Command files take one protocol command per line; blank lines and
 `# comments` are skipped, and `delay <ms>` / `sleep <seconds>` pause between
 commands (sequencing lives on the host; the firmware stays dumb).

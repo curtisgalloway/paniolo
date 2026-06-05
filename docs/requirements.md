@@ -92,7 +92,8 @@
 | HID-3 | Generic `hid` lab channel: `paniolo hid set/rm/send` appends args to an opaque helper cmd | S | ☑ | mirrors power hooks; SSH dispatch |
 | HID-4 | Absolute mouse (`moveabs`, advertised capability) for click-where-you-point | S | ☑ | abs-pointer HID descriptor in firmware |
 | HID-5 | `hidrig serve` daemon: owns the UART, re-exposes the protocol over a WebSocket; one-shots route through it | S | ☑ | `paniolo hid serve/stop` |
-| HID-6 | KVM in `paniolo console`: stream web keyboard + absolute mouse, intermixed with CLI injection | S | ☑ | dashboard capture toggle; bench-unverified |
+| HID-6 | KVM in `paniolo console`: stream web keyboard + absolute mouse, intermixed with CLI injection | S | ☑ | hardware-verified on pi5 Linux desktop |
+| HID-7 | KVM latency: coalesce mouse moves (per-frame), 1 ms firmware poll, daemon negotiates UART up to 460800 (boots 115200) | S | ☑ | `baud` capability; one-shots stay 115200 |
 
 ## 7. Dashboard
 

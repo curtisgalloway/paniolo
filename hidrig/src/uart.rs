@@ -31,7 +31,7 @@ use std::thread;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{info, warn};
 
-use crate::proto::{open_port, send_command};
+use crate::proto::{open_synced, send_command, FAST_BAUD};
 
 const REQ_CAP: usize = 256;
 const TRANSCRIPT_CAP: usize = 256;
@@ -115,8 +115,13 @@ fn run(device: String, mut req_rx: mpsc::Receiver<Request>, transcript: broadcas
 
     while let Some(req) = req_rx.blocking_recv() {
         if port.is_none() {
-            match open_port(&device) {
-                Ok(p) => port = Some(p),
+            // Open and negotiate up to FAST_BAUD for KVM-streaming throughput
+            // (the device boots at the safe default and re-syncs on power-cycle).
+            match open_synced(&device, FAST_BAUD) {
+                Ok((p, baud)) => {
+                    info!("hid UART open at {baud} baud for {device}");
+                    port = Some(p);
+                }
                 Err(e) => {
                     let msg = e.to_string();
                     broadcast_event(&transcript, &req.line, &Err(msg.clone()));

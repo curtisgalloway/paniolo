@@ -47,6 +47,7 @@ for the authoritative definition):
   mdown <left|right|middle>   Press and hold a mouse button
   mup <left|right|middle>     Release a mouse button
   scroll <amount>        Scroll wheel (positive = up, negative = down)
+  baud <rate>            Switch the UART to <rate> after acking at the old rate
   ping                   No-op health check
   version                Report protocol version + implementation id + caps
 
@@ -76,7 +77,7 @@ BAUD = 115200
 PROTOCOL_VERSION = 1
 IMPL_ID = "kb2040-circuitpython/1.0"
 # Capability tokens advertised in the `version` reply (see the protocol spec).
-CAPS = "moveabs"
+CAPS = "moveabs baud"
 
 BUTTONS = {"left": 1, "right": 2, "middle": 4}
 
@@ -129,6 +130,10 @@ _my = ABS_MAX // 2
 _buttons = 0
 _report = bytearray(6)
 
+# Set by the `baud` command; the main loop applies it AFTER replying OK at the
+# current rate (so the host reads the ack before either side switches).
+_pending_baud = None
+
 
 def keycode_for(name):
     return getattr(Keycode, name.upper())
@@ -151,7 +156,7 @@ def send_mouse(wheel=0):
 
 def handle_line(line):
     """Execute one command line; return extra OK-reply data or None."""
-    global _mx, _my, _buttons
+    global _mx, _my, _buttons, _pending_baud
     parts = line.strip().split(" ")
     cmd = parts[0].lower()
     if not cmd:
@@ -196,6 +201,12 @@ def handle_line(line):
         send_mouse()
     elif cmd == "scroll":
         send_mouse(wheel=clamp(int(parts[1]), -127, 127))
+    elif cmd == "baud":
+        new = int(parts[1])
+        if not 1200 <= new <= 2000000:
+            raise ValueError("baud out of range")
+        # Defer the actual switch to the main loop, after OK is sent.
+        _pending_baud = new
     elif cmd == "ping":
         pass
     elif cmd == "version":
@@ -205,8 +216,10 @@ def handle_line(line):
     return None
 
 
+# A 1 ms read timeout keeps per-command latency low (the host streams mouse
+# moves); the read returns as soon as bytes arrive.
 uart = busio.UART(
-    board.TX, board.RX, baudrate=BAUD, timeout=0.01, receiver_buffer_size=512
+    board.TX, board.RX, baudrate=BAUD, timeout=0.001, receiver_buffer_size=512
 )
 
 status(0, 16, 0)  # green: up and listening
@@ -215,7 +228,7 @@ status(0, 0, 0)
 
 buf = b""
 while True:
-    data = uart.read(64)
+    data = uart.read(128)
     if not data:
         continue
     buf += data
@@ -231,3 +244,12 @@ while True:
         except Exception as e:  # report back instead of dropping the line
             uart.write(b"ERR " + str(e).encode("utf-8") + b"\n")
             status(16, 0, 0)
+    # Apply a `baud` switch only after its OK has been acked at the old rate.
+    if _pending_baud is not None:
+        time.sleep(0.05)  # let the OK fully drain at the current baud
+        uart.deinit()
+        uart = busio.UART(
+            board.TX, board.RX, baudrate=_pending_baud,
+            timeout=0.001, receiver_buffer_size=512,
+        )
+        _pending_baud = None

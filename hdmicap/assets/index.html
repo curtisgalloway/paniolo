@@ -428,10 +428,27 @@
       }
       const BTN = ['left', 'middle', 'right']; // MouseEvent.button order
       let skipNextUp = false;
+
+      // Coalesce mouse moves: a fast mouse fires 60–125 mousemove/sec, and each
+      // moveabs is a serial round-trip to the board — sending them all backs up
+      // the queue and the cursor lags. Instead keep only the *latest* position
+      // and flush at most one per animation frame (~60 Hz). Clicks flush
+      // immediately so the press lands where you clicked.
+      let pendingMove = null;
+      function flushMove() {
+        if (captured && pendingMove) {
+          send('moveabs ' + pendingMove[0] + ' ' + pendingMove[1]);
+          pendingMove = null;
+        }
+        requestAnimationFrame(flushMove);
+      }
+      requestAnimationFrame(flushMove);
+      function moveNow(p) { send('moveabs ' + p[0] + ' ' + p[1]); pendingMove = null; }
+
       videoEl.addEventListener('mousemove', ev => {
         if (!captured) return;
         const p = toLogical(ev);
-        if (p) send('moveabs ' + p[0] + ' ' + p[1]);
+        if (p) pendingMove = p; // newest position wins; flushed on the next frame
       });
       videoEl.addEventListener('mousedown', ev => {
         ev.preventDefault();
@@ -440,11 +457,11 @@
           // First click grabs control and parks the cursor where you clicked;
           // it is NOT forwarded as a click (so nothing fires on the target yet).
           engage();
-          if (p) send('moveabs ' + p[0] + ' ' + p[1]);
+          if (p) moveNow(p);
           skipNextUp = true;
           return;
         }
-        if (p) send('moveabs ' + p[0] + ' ' + p[1]);
+        if (p) moveNow(p); // land the press exactly where clicked, not a frame late
         send('mdown ' + (BTN[ev.button] || 'left'));
       });
       window.addEventListener('mouseup', ev => {

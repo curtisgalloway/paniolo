@@ -217,11 +217,14 @@ ocr/             OCR helpers (compiled/installed binaries are gitignored):
 hidrig/          USB HID injector: host CLI + daemon (Rust) + KB2040 firmware
   src/main.rs      `hidrig` CLI — one-shot subcommands mirroring the HID serial
                    protocol (type/key/.../moveabs/ping/version) + `run` command
-                   files; `serve`/`stop` for the daemon. A `Sender` routes each
-                   one-shot through a running daemon (POST /send) when one owns
-                   the same device, else opens the UART directly
+                   files; `serve`/`stop` for the daemon; `baud` (test the link
+                   speed switch). A `Sender` routes each one-shot through a
+                   running daemon (POST /send) when one owns the same device,
+                   else opens the UART directly (at 115200)
   src/proto.rs     line protocol client (send/OK-ERR parse) + sequence parser
-                   + clamp_abs (moveabs range)
+                   + clamp_abs; baud helpers: negotiate_baud (switch + confirm)
+                   and open_synced (probe 115200, else the elevated rate; the
+                   daemon negotiates up to FAST_BAUD)
   src/uart.rs      the UART owner: a dedicated *blocking-serialport* thread
                    (NOT tokio-serial — its async reads don't get read-readiness
                    on a macOS tty, so they timed out), bridged to the async
@@ -265,9 +268,17 @@ same), then it streams `down`/`up`/`moveabs`/`scroll` to the daemon. The mouse
 is absolute (the firmware's custom HID descriptor), so the cursor follows where
 you point in the video; right-Ctrl releases. paniolo discovers the daemon by the
 channel name `hid` (`daemons::daemon_port("hid")`), staying agnostic to the
-helper. (Hardware-verified end-to-end on the pi5 Linux desktop, 2026-06-04; the
-text protocol is one synchronous round-trip per command, which is the current
-KVM latency bottleneck — see the perf TODO.)
+helper. Hardware-verified end-to-end on the pi5 Linux desktop (2026-06-04).
+
+**Latency.** Each command is a serial round-trip, so streaming is sensitive to
+event rate × per-command cost. Mitigations: the dashboard **coalesces mouse
+moves** to one `moveabs` per `requestAnimationFrame` (newest position only); the
+firmware read loop polls at 1 ms (was 10 ms); and the daemon **negotiates the
+UART up** to `FAST_BAUD` (460800) via `proto::open_synced` — the device boots at
+115200 (`BAUD`) and advertises a `baud` capability, switching only after acking
+at the old rate (`proto::negotiate_baud`), so a naive connect always works and a
+power-cycle re-syncs. One-shots stay at 115200. Still TODO if needed:
+fire-and-forget moves (no per-move round-trip).
 
 ## Combined dashboard (video + serial)
 
