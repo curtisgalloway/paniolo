@@ -11,6 +11,7 @@ and power-cycle it without a person at the bench each iteration. See the root
 |---|---|
 | [**Architecture**](architecture.md) | The whole system in its current state: deployment model, the CLI + per-subsystem daemons, config/state model, data flows, host-OS differences. **Read this first.** |
 | [Requirements & progress](requirements.md) | Project-wide requirements tracker (shipped capabilities + planned work + decisions), with status per item. |
+| [Tested hardware](hardware.md) | The bench hardware each subsystem is verified with, by category, with purchase links. |
 
 ## Subsystem guides
 
