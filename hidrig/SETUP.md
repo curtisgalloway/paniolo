@@ -82,13 +82,13 @@ blip when it starts serving.
 
 ## 5. Drive it
 
-Directly:
+Directly (hidrig lives in paniolo's libexec dir, not on PATH — `make
+install` puts it there):
 
 ```
-cargo install --path hidrig          # once
-hidrig -d /dev/cu.usbserial-XXXX ping
-hidrig -d /dev/cu.usbserial-XXXX version     # expect: 1 kb2040-circuitpython/1.0
-hidrig -d /dev/cu.usbserial-XXXX type "hello"
+paniolo helper hidrig -d /dev/cu.usbserial-XXXX ping
+paniolo helper hidrig -d /dev/cu.usbserial-XXXX version     # expect: 1 kb2040-circuitpython/1.0
+paniolo helper hidrig -d /dev/cu.usbserial-XXXX type "hello"
 ```
 
 Through paniolo (lab file is the source of truth):

@@ -53,11 +53,13 @@ green blip = up and serving; solid red = last command failed.
 
 ## Host CLI
 
-`hidrig` (this crate) drives any conforming injector:
+`hidrig` (this crate) drives any conforming injector. It installs into
+paniolo's private libexec dir (off PATH) — `make install` does this, or
+manually with `cargo install --path hidrig --root ~/.local/libexec/paniolo`.
+Run it directly via `paniolo helper hidrig …`, or bare inside a `paniolo hid
+set --cmd` hook string:
 
 ```bash
-cargo install --path hidrig
-
 hidrig -d /dev/cu.usbserial-XXXX ping            # liveness
 hidrig -d /dev/cu.usbserial-XXXX version         # protocol + impl + capabilities
 hidrig -d /dev/cu.usbserial-XXXX type "hello world"

@@ -80,9 +80,9 @@ Fetches the current frame and runs Apple Vision's `VNRecognizeTextRequest` on
 it, printing the recognized text to stdout. On-device — no network, no model
 download required.
 
-`paniolo setup` compiles `ocr/visionocr.swift` into `~/.cargo/bin/visionocr`
-with `swiftc`. The OCR tool is also accessible from the [web dashboard](dashboard.md)
-via the OCR button.
+`paniolo setup` compiles `ocr/visionocr.swift` with `swiftc` into the private
+libexec dir (`~/.local/libexec/paniolo/bin/visionocr`). The OCR tool is also
+accessible from the [web dashboard](dashboard.md) via the OCR button.
 
 **OCR tuning notes:**
 - `.fast` recognition level is used (not `.accurate` — the latter misses small

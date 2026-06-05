@@ -24,10 +24,13 @@ make install               # cargo-installs the `paniolo` CLI, then `paniolo set
 ```
 
 Run once per machine; re-run after pulling or editing (it's a full rebuild).
-Everything lands in `~/.cargo/bin` — make sure it's on `PATH`. If a `paniolo`
-from the retired Python CLI shadows it (uv-tools shim in `~/.local/bin`),
-remove it with `uv tool uninstall paniolo`; `make install` warns when it
-detects a shadow.
+Only the `paniolo` CLI lands in `~/.cargo/bin` — make sure that's on `PATH`.
+The helpers (hdmicap, serialcap, netbootd, cambrionix, hidrig, zigplug, the
+OCR tool) live in the private libexec dir `~/.local/libexec/paniolo/bin`,
+off PATH; paniolo resolves them itself, and `paniolo helper [NAME] [ARGS…]`
+lists or runs one directly. If a `paniolo` from the retired Python CLI
+shadows the CLI (uv-tools shim in `~/.local/bin`), remove it with
+`uv tool uninstall paniolo`; `make install` warns when it detects a shadow.
 
 ## Configure a target
 
@@ -343,8 +346,10 @@ daemons there over an ssh PTY.)
 ## Quick reference — gotchas
 
 - Serial port is exclusive: one of `connect` / `watch` / external `tio`/`screen`.
-- `~/.cargo/bin` (the CLI and daemons) must be on `PATH`; a stale Python
-  `paniolo` in `~/.local/bin` shadows it (`uv tool uninstall paniolo`).
+- `~/.cargo/bin` (the CLI) must be on `PATH`; a stale Python `paniolo` in
+  `~/.local/bin` shadows it (`uv tool uninstall paniolo`). The helper
+  binaries are *not* on PATH — they live in `~/.local/libexec/paniolo/bin`
+  (`paniolo helper <name> …` to run one by hand).
 - `paniolo console` auto-starts both daemons if they aren't running. Local
   `console` passes the serialcap daemon's OS-assigned port as `?serial=PORT`
   so the dashboard's serial pane connects correctly.

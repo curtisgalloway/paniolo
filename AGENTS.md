@@ -110,6 +110,12 @@ Python tree below:
   `daemon.json` discovery files — fixed defaults collided with stale tunnels.
 - **Netboot is rust-engine only** (netbootd); the pure-Python DHCP/TFTP engine
   exists only in the legacy tree.
+- **Helpers live off PATH** in the private libexec dir
+  (`~/.local/libexec/paniolo/bin`): only `paniolo` itself installs to
+  `~/.cargo/bin`. `daemons::find_binary` resolves libexec → PATH → legacy
+  `~/.cargo/bin`; hook commands (`*_cmd`, hid `cmd`) run via `sh -c` with
+  libexec prepended to PATH, so lab files keep referencing helpers by bare
+  name. `paniolo helper [NAME] [ARGS…]` lists or runs them directly.
 
 ```
 cli/src/
@@ -119,7 +125,8 @@ cli/src/
   dispatch.rs   per-channel re-exec: slice building/shipping, maybe_dispatch,
                 run_subcommand, remote_daemon_port
   ssh.rs        SSH transport: ControlMaster run/passthrough/interactive, forward (tunnels)
-  daemons.rs    shared daemon contract: find_binary, daemon.json discovery, wait
+  daemons.rs    shared daemon contract: find_binary (libexec → PATH →
+                legacy ~/.cargo/bin), hook_path, daemon.json discovery, wait
   serial.rs     serialcap orchestration + tio exec + /input + device listing
   video.rs      hdmicap orchestration (daemon start/stop, client passthrough)
   netboot.rs    netbootd lifecycle (spawn with log, stop, status)
@@ -129,8 +136,10 @@ cli/src/
   state.rs      netboot state files (JSON-compatible with the Python's)
   doctor.rs     config-vs-reality probing (local + over SSH)
   discover.rs   hardware inventory + the configure proposal block
-  setup.rs      installer: cargo install daemons + the paniolo CLI, bpf-helper
-                setuid, OCR helpers, Linux groups
+  setup.rs      installer: paniolo CLI onto PATH (~/.cargo/bin); helpers into
+                the private libexec dir (~/.local/libexec/paniolo/bin) via
+                cargo install --root; bpf-helper setuid, OCR helpers, zigplug
+                (uv tool, shim in libexec), Linux groups; --rust-only fast path
 ```
 
 Deferred (tracked in docs/config-redesign.md): OCR (`video read`), the
@@ -200,7 +209,8 @@ zigplug/         Python (uv) helper: Zigbee smart plug control via a CC2652 (ZNP
                  `list`, `on/off/state/cycle <ieee>`, `remove <ieee>`;
                  `state <ieee>` prints exactly `on` or `off` (state_cmd contract).
                  Device DB at ~/.config/paniolo/zigbee.db. Installed by
-                 `paniolo setup` via `uv tool install` when uv is present.
+                 `paniolo setup` via `uv tool install` when uv is present
+                 (shim in the libexec dir via UV_TOOL_BIN_DIR, off PATH).
                  See docs/power.md for pairing + hook wiring.
 
 serialcap/       Rust crate: serial console daemon (parallels hdmicap)
@@ -344,16 +354,17 @@ Two entry points, both feeding the same warm frame:
 - **Dashboard button + hdmicap `GET /ocr`** — the daemon PNG-encodes the current
   frame and pipes it to the OCR tool (`tokio::process`), returning the text. The
   daemon finds the tool via `PANIOLO_VISIONOCR` (the installed path, set by
-  `paniolo video watch`), falling back to PATH; if absent, `/ocr` returns 501 and
-  the button shows an error.
+  `paniolo video watch`), then a `visionocr`/`linuxocr` sibling of its own
+  executable (both live in the libexec dir), then bare PATH; if absent, `/ocr`
+  returns 501 and the button shows an error.
 
-`_ocr.ocr_binary()` returns the platform-appropriate tool; `paniolo setup`
-installs it. `PANIOLO_VISIONOCR` is set to the resolved path when the daemon
-starts, so the daemon always uses the installed binary (never a stale PATH hit).
+`paniolo setup` installs the platform-appropriate tool. `PANIOLO_VISIONOCR` is
+set to the resolved path when the daemon starts, so the daemon always uses the
+installed binary (never a stale PATH hit).
 
 **macOS — `ocr/visionocr.swift`** (`VNRecognizeTextRequest`, Apple Vision):
 on-device, no network, no model download. `paniolo setup` compiles it (`swiftc`)
-into `~/.cargo/bin`.
+into the libexec dir (`~/.local/libexec/paniolo/bin`).
 
 Tuning that matters for small console text:
 - `recognitionLevel = .fast` is the default, not `.accurate`. `.accurate` is
@@ -364,7 +375,7 @@ Tuning that matters for small console text:
   1/32 skips ~16px console text).
 
 **Linux — `ocr/linuxocr`** (Tesseract via `tesseract-ocr` system package):
-`paniolo setup` copies the script to `~/.cargo/bin/linuxocr`. Requires
+`paniolo setup` copies the script into the libexec dir. Requires
 `sudo apt-get install tesseract-ocr`; Pillow (`pip install Pillow`) is optional
 but enables the same 2×-upscale + black-pad preprocessing as visionocr.
 
@@ -794,11 +805,13 @@ Top-level commands:
 
 `make install` (repo root) is the one-step build-and-install: it bootstraps
 the CLI with `cargo install --path cli`, then runs `paniolo setup` (by its
-installed `~/.cargo/bin` path, immune to PATH shadows) for everything else.
+installed `~/.cargo/bin` path, immune to PATH shadows) for everything else —
+the CLI onto PATH, the helpers into `~/.local/libexec/paniolo/bin`.
 Re-run it after editing anything; it warns if another `paniolo` shadows the
 installed one (e.g. the retired Python CLI's uv-tools shim — remove with
-`uv tool uninstall paniolo`). Narrower target: `make rust` (cargo-install the
-crates only, skipping OCR/setuid); `make help` lists all.
+`uv tool uninstall paniolo`). Narrower target: `make rust` (build + install
+the Rust crates only via `paniolo setup --rust-only`, skipping
+OCR/setuid/zigplug); `make help` lists all.
 
 ## Runtime paths
 

@@ -39,14 +39,17 @@ pub fn daemon_url() -> Option<String> {
 /// Start the hdmicap daemon for `device`, detached; caller polls discovery.
 pub fn start_daemon(device: &str, port: u16, target_name: Option<&str>) -> Result<()> {
     let binary = daemons::find_binary(DAEMON)
-        .ok_or_else(|| anyhow!("hdmicap not found (PATH or ~/.cargo/bin) — run `paniolo setup`"))?;
+        .ok_or_else(|| anyhow!("hdmicap not found (libexec or PATH) — run `paniolo setup`"))?;
     let mut cmd = Command::new(binary);
     cmd.arg("daemon")
         .arg("--device")
         .arg(device)
         .arg("--port")
         .arg(port.to_string());
-    if let Some(ocr) = daemons::find_binary("visionocr") {
+    // visionocr on macOS, linuxocr (same interface) on Linux.
+    if let Some(ocr) =
+        daemons::find_binary("visionocr").or_else(|| daemons::find_binary("linuxocr"))
+    {
         cmd.env("PANIOLO_VISIONOCR", ocr);
     }
     if let Some(name) = target_name {

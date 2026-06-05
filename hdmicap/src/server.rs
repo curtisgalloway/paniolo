@@ -311,9 +311,29 @@ async fn preview(State(s): State<AppState>) -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// Locate the OCR tool: `PANIOLO_VISIONOCR` (paniolo sets this) wins, then a
+/// `visionocr` installed next to our own executable (`paniolo setup` puts both
+/// in the libexec dir), then a bare name resolved via PATH.
+fn visionocr_bin() -> std::ffi::OsString {
+    if let Some(bin) = std::env::var_os("PANIOLO_VISIONOCR") {
+        return bin;
+    }
+    if let Ok(me) = std::env::current_exe() {
+        if let Some(dir) = me.parent() {
+            for name in ["visionocr", "linuxocr"] {
+                let sibling = dir.join(name);
+                if sibling.is_file() {
+                    return sibling.into();
+                }
+            }
+        }
+    }
+    "visionocr".into()
+}
+
 /// OCR the current warm frame by shelling out to the `visionocr` tool (Apple
-/// Vision). The daemon doesn't link Vision itself — it pipes a PNG to whatever
-/// `PANIOLO_VISIONOCR` points at (paniolo sets this), falling back to PATH.
+/// Vision). The daemon doesn't link Vision itself — it pipes a PNG to the
+/// tool located by [`visionocr_bin`].
 async fn ocr(State(s): State<AppState>) -> Response {
     let f = s.frames.borrow().clone();
     if f.signal == Signal::NoDevice || f.width == 0 {
@@ -324,7 +344,7 @@ async fn ocr(State(s): State<AppState>) -> Response {
         None => return (StatusCode::INTERNAL_SERVER_ERROR, "png encode failed").into_response(),
     };
 
-    let bin = std::env::var("PANIOLO_VISIONOCR").unwrap_or_else(|_| "visionocr".to_string());
+    let bin = visionocr_bin();
     let mut child = match tokio::process::Command::new(&bin)
         .arg("-")
         .stdin(Stdio::piped())
@@ -336,7 +356,7 @@ async fn ocr(State(s): State<AppState>) -> Response {
         Err(e) => {
             return (
                 StatusCode::NOT_IMPLEMENTED,
-                format!("visionocr unavailable ({bin}): {e}"),
+                format!("visionocr unavailable ({}): {e}", bin.to_string_lossy()),
             )
                 .into_response()
         }

@@ -148,6 +148,19 @@ enum Command {
         /// paniolo CLI + source already on the host).
         #[arg(long)]
         host: Option<String>,
+        /// Only build + install the Rust crates (skip the OCR, setuid, and
+        /// zigplug steps) — the fast path for iterating on the Rust code.
+        #[arg(long)]
+        rust_only: bool,
+    },
+    /// Run a helper binary from paniolo's private libexec dir (omit NAME to
+    /// list the installed helpers).
+    Helper {
+        /// Helper name (e.g. hdmicap, hidrig, zigplug).
+        name: Option<String>,
+        /// Arguments passed through to the helper.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 }
 
@@ -556,8 +569,47 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Discover { json } => cmd_discover(json),
         Command::Configure { target, host } => cmd_configure(lab_flag, &target, &host),
-        Command::Setup { host } => cmd_setup(lab_flag, host.as_deref()),
+        Command::Setup { host, rust_only } => cmd_setup(lab_flag, host.as_deref(), rust_only),
+        Command::Helper { name, args } => cmd_helper(name.as_deref(), &args),
     }
+}
+
+// ── helper passthrough ──────────────────────────────────────────────────────
+
+/// Run a libexec helper with stdio passed through, propagating its exit code;
+/// with no name, list the installed helpers.
+fn cmd_helper(name: Option<&str>, args: &[String]) -> Result<()> {
+    let Some(name) = name else {
+        let dir = daemons::libexec_dir()
+            .ok_or_else(|| anyhow!("could not determine the home directory"))?;
+        let mut names: Vec<String> = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_file())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        if names.is_empty() {
+            println!(
+                "No helpers installed in {} — run `paniolo setup`.",
+                dir.display()
+            );
+            return Ok(());
+        }
+        names.sort();
+        for n in names {
+            println!("{n}");
+        }
+        return Ok(());
+    };
+    let binary = daemons::find_binary(name)
+        .ok_or_else(|| anyhow!("helper '{name}' not found — run `paniolo setup`"))?;
+    let status = std::process::Command::new(binary).args(args).status()?;
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
 }
 
 // ── discover / configure / setup ────────────────────────────────────────────
@@ -699,13 +751,16 @@ fn cmd_configure(lab_flag: Option<&str>, target: &str, host: &str) -> Result<()>
     Ok(())
 }
 
-fn cmd_setup(lab_flag: Option<&str>, host: Option<&str>) -> Result<()> {
+fn cmd_setup(lab_flag: Option<&str>, host: Option<&str>, rust_only: bool) -> Result<()> {
     if let Some(name) = host {
         let resolved = resolve_host(lab_flag, name)?;
         if !resolved.is_local(name) {
             eprintln!("Running paniolo setup on {name} ({})…", resolved.ssh);
-            let code =
-                ssh::run_interactive(&resolved, &[resolved.paniolo(), "setup".to_string()], &[])?;
+            let mut argv = vec![resolved.paniolo(), "setup".to_string()];
+            if rust_only {
+                argv.push("--rust-only".to_string());
+            }
+            let code = ssh::run_interactive(&resolved, &argv, &[])?;
             std::process::exit(code);
         }
         eprintln!("'{name}' is the local machine; setting up here.");
@@ -717,7 +772,7 @@ fn cmd_setup(lab_flag: Option<&str>, host: Option<&str>) -> Result<()> {
              (e.g. `make install`). cd into the paniolo repo and try again."
         )
     })?;
-    setup::run(&repo)
+    setup::run(&repo, rust_only)
 }
 
 /// Resolve a runtime command's target: the given name, or the sole target.
@@ -1447,13 +1502,15 @@ fn local_power(lab: &Lab, target: &str) -> Result<model::PowerChannel> {
     Ok(p)
 }
 
-/// Run an opaque shell hook via `sh -c`, propagating its exit code.
+/// Run an opaque shell hook via `sh -c`, propagating its exit code. The
+/// libexec dir is prepended to PATH so lab files can name helpers bare.
 /// `label` is a human-readable description shown in the progress message.
 fn run_power_hook(cmd: &str, label: &str, target: &str) -> Result<()> {
     eprintln!("{label} '{target}' via {cmd}");
     let status = std::process::Command::new("sh")
         .arg("-c")
         .arg(cmd)
+        .env("PATH", daemons::hook_path())
         .status()?;
     if status.success() {
         Ok(())
@@ -1557,6 +1614,7 @@ fn cmd_power_state(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
         let out = std::process::Command::new("sh")
             .arg("-c")
             .arg(&cmd)
+            .env("PATH", daemons::hook_path())
             .output()?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -2329,6 +2387,7 @@ fn ensure_hid_daemon_local(lab: &Lab, target: &str) -> Result<Option<u16>> {
     command
         .arg("-c")
         .arg(format!("exec {cmd} serve --port 0"))
+        .env("PATH", daemons::hook_path())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(log);
@@ -2388,6 +2447,7 @@ fn cmd_hid_stop(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
     let status = std::process::Command::new("sh")
         .arg("-c")
         .arg(format!("{cmd} stop"))
+        .env("PATH", daemons::hook_path())
         .status()?;
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
@@ -2432,6 +2492,7 @@ fn cmd_hid_send(lab_flag: Option<&str>, target: Option<&str>, args: &[String]) -
     let status = std::process::Command::new("sh")
         .arg("-c")
         .arg(&full)
+        .env("PATH", daemons::hook_path())
         .status()?;
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));

@@ -28,8 +28,8 @@ microcontroller, a CH9329 shim) drops in without touching paniolo.
 ## Setup
 
 ```bash
-# Build and install the helper (once per control host)
-cargo install --path hidrig
+# Build and install the helper (once per control host; libexec, off PATH)
+cargo install --path hidrig --root ~/.local/libexec/paniolo   # or just `make install`
 
 # Bind the helper to the target in the lab file
 paniolo hid set -t pi5 --cmd "hidrig -d /dev/cu.usbserial-XXXX"
@@ -41,8 +41,12 @@ paniolo hid set -t pi5 --cmd "hidrig -d /dev/ttyUSB0" --host bench1
 paniolo hid rm -t pi5
 ```
 
-`paniolo doctor` checks the channel: an absolute-path helper is probed for
-existence on the channel's host; bare names are assumed to be on PATH.
+The bare `hidrig` in the cmd string resolves because paniolo prepends its
+libexec dir (`~/.local/libexec/paniolo/bin`) to PATH when running the hook;
+run the helper by hand with `paniolo helper hidrig …`. `paniolo doctor`
+checks the channel: an absolute-path helper is probed for existence on the
+channel's host; bare names are probed with `command -v` under the same
+libexec-then-PATH resolution.
 
 ---
 

@@ -17,6 +17,12 @@ Use this skill when you need to:
 
 ## Crates / top-level packages
 
+Install layout: only the `paniolo` CLI goes on PATH (`~/.cargo/bin`). Every
+other binary below installs into the private libexec dir
+(`~/.local/libexec/paniolo/bin`); paniolo resolves them itself (libexec →
+PATH; hook commands run with libexec prepended to PATH) and
+`paniolo helper [NAME] [ARGS…]` lists or runs one directly.
+
 | Crate | Purpose |
 |-------|---------|
 | `cli/` | Main `paniolo` binary — all commands, lab file, dispatch, SSH |

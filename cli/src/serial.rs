@@ -57,9 +57,8 @@ pub fn interface_arg(ch: &SerialChannel) -> String {
 /// Start the serialcap daemon (owning every given interface), detached.
 /// The caller polls [`daemon_url`] for readiness.
 pub fn start_daemon(ifaces: &[SerialChannel], port: u16) -> Result<()> {
-    let binary = daemons::find_binary(DAEMON).ok_or_else(|| {
-        anyhow!("serialcap not found (PATH or ~/.cargo/bin) — run `paniolo setup`")
-    })?;
+    let binary = daemons::find_binary(DAEMON)
+        .ok_or_else(|| anyhow!("serialcap not found (libexec or PATH) — run `paniolo setup`"))?;
     let mut cmd = Command::new(binary);
     cmd.arg("daemon").arg("--port").arg(port.to_string());
     for ch in ifaces {
