@@ -204,8 +204,9 @@ The dashboard is the **only** place two subsystems interlock, and they stay deco
 **serves the page** but references serialcap **only by URL** (`ws://<host>:8724/stream` by
 default; override via `?serial=` / `?serialws=`). The page fetches serialcap's `/interfaces` and
 builds one xterm.js terminal per interface. xterm.js is **vendored, not CDN**, so the dashboard
-works on an isolated lab network. The amber power-cycle button appears only when hdmicap was
-started with a target (so it is safe on shared dashboards).
+works on an isolated lab network. The power on/off toggle and cycle button appear only when
+hdmicap was started with a target (so they are safe on shared dashboards); their availability
+probe (`GET /power`) performs no power action.
 
 ## 8. Host-OS differences (macOS vs Linux)
 
