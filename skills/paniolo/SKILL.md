@@ -376,6 +376,25 @@ paniolo --lab mylab.toml setup --host bench1       # runs `paniolo setup` on ben
 (The host needs the paniolo CLI + source already present; this builds the Rust
 daemons there over an ssh PTY.)
 
+## Background daemons — one view of everything
+
+Paniolo runs several per-subsystem daemons (serialcap, hdmicap, the hid
+injector, zigplug, netbootd). `paniolo daemons` shows all of them at once,
+plus **stray helper processes** running out of the libexec dir (e.g. wedged
+one-shot hooks — the thing to check when a serial-port-owning helper
+misbehaves):
+
+```
+paniolo daemons                          # list: name, pid, port, detail + strays
+paniolo daemons stop zigplug serialcap   # stop specific daemons (SIGTERM)
+paniolo daemons stop --all               # stop every daemon + TERM strays
+paniolo daemons stop --all --force       # …and SIGKILL whatever survives 3 s
+```
+
+netbootd is stopped via its proper teardown (interface cleanup), everything
+else by signal. Per-subsystem `stop` commands still work; this is the
+sweep-the-bench view.
+
 ## Quick reference — gotchas
 
 - Serial port is exclusive: one of `connect` / `watch` / external `tio`/`screen`.

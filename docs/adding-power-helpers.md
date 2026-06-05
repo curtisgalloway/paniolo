@@ -171,10 +171,18 @@ A helper PR touches more than the helper directory:
 - **Verify the library API against the installed version**, not memory or
   old examples — device libraries (zigpy et al.) break their APIs across
   majors.
-- **Prefer one-shot over daemon.** A daemon is justified only when the
-  transport needs a persistent owner shared by concurrent clients (cf.
-  `hidrig serve` for the KVM WebSocket). For power switching, per-invocation
-  startup cost of a few seconds is fine and removes a service to install,
-  supervise, and debug.
+- **One-shot for stateless transports; a daemon for stateful ones.** When
+  each invocation is a self-contained request/response over a dumb transport
+  (the `cambrionix` UART), one-shot is right: a few seconds of per-invocation
+  cost removes a service to install, supervise, and debug. But a transport
+  with *session state* needs a persistent owner: zigplug's one-shot first cut
+  was unreliable by construction — every serial open toggled the CC2652's
+  auto-bootloader lines and reset the radio (occasionally *into* the
+  bootloader, hanging the client), and two concurrent hooks interleaving on
+  one ZNP session wedged the coordinator for hours and cost it its NVRAM.
+  The fix is the zigplug pattern: an auto-spawned daemon owns the port and
+  serializes operations with hard timeouts, while the CLI proxies
+  transparently — hook strings stay one-shot-shaped either way (cf. `hidrig
+  serve` for the same pattern on the KVM path).
 - **Make `state` cheap and honest.** It's the hook agents poll; never cache
   on the helper side, and fail loudly rather than report a guess.

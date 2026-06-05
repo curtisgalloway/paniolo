@@ -30,7 +30,7 @@ PATH; hook commands run with libexec prepended to PATH) and
 | `serialcap/` | Serial console daemon (multi-interface, WebSocket, capture log) |
 | `netbootd/` | DHCP + TFTP netboot engine (single binary) |
 | `cambrionix/` | Standalone helper: Cambrionix USB hub control UART driver. Wired into paniolo via generic power hooks (`--on-cmd`, `--off-cmd`, `--cycle-cmd`, `--state-cmd`). `state <port>` prints `on`/`off`. |
-| `zigplug/` | Standalone helper (Python/uv, zigpy-znp): Zigbee smart plug control via a CC2652 coordinator dongle. One-shot CLI (`form`/`permit`/`list`/`on`/`off`/`state`/`cycle`/`remove`), wired into paniolo via generic power hooks like cambrionix. `state <ieee>` prints `on`/`off`. Device DB: `~/.config/paniolo/zigbee.db`. |
+| `zigplug/` | Standalone helper (Python/uv, zigpy-znp): Zigbee smart plug control via a CC2652 coordinator dongle. CLI (`form`/`permit`/`list`/`on`/`off`/`state`/`cycle`/`remove`/`serve`/`stop`/`status`/`backup`/`restore`) wired into paniolo via generic power hooks like cambrionix; ops proxy through an auto-spawned daemon (`_daemon.py`) that owns the ZNP session — one-shots reset the CC2652 on every port open and collide on the stateful session. `state <ieee>` prints `on`/`off`. `restore` rebuilds coordinator NVRAM from zigpy's auto-backups (no re-pairing). Device DB: `~/.config/paniolo/zigbee.db`. |
 | `hidrig/` | Standalone helper: `hidrig` CLI + daemon for the KB2040 USB HID injector (HID serial protocol v1, spec at `docs/hid-serial-protocol.md`). One-shots + `serve` daemon (owns the UART, WebSocket `/hid` for KVM). Firmware in `hidrig/firmware/`. Wired into paniolo via the generic `hid` channel. |
 | `ocr/` | OCR helpers: `visionocr` (Swift/Apple Vision, macOS) + `linuxocr` (Tesseract, Linux) |
 

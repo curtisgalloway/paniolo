@@ -27,9 +27,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 from pathlib import Path
 from typing import AsyncIterator
 
+import zigpy.backups
 import zigpy.device
 import zigpy.exceptions
 import zigpy.types
@@ -165,3 +167,76 @@ async def set_on_off(cluster: Cluster, state: bool) -> None:
         want = "on" if state else "off"
         got = "on" if actual else "off"
         raise ZigplugError(f"commanded {want} but plug reports {got}")
+
+
+# ── network backup / restore ────────────────────────────────────────────────
+
+
+def latest_db_backup(db_path: Path) -> dict:
+    """The newest network backup zigpy auto-saved into the device DB.
+
+    zigpy snapshots the full network state (PAN, channel, network key, frame
+    counters) into a `network_backups*` table on every startup; this is what
+    makes coordinator NVRAM loss recoverable without re-pairing.
+    """
+    import sqlite3  # pylint: disable=import-outside-toplevel
+
+    if not db_path.is_file():
+        raise ZigplugError(f"no device database at {db_path}")
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        tables = [
+            row[0]
+            for row in con.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name LIKE 'network_backups%'"
+            )
+        ]
+        if not tables:
+            raise ZigplugError(f"{db_path} has no network_backups table")
+
+        def version(name: str) -> int:
+            suffix = name.rsplit("_v", 1)
+            return int(suffix[1]) if len(suffix) == 2 and suffix[1].isdigit() else 0
+
+        table = max(tables, key=version)
+        rows = [
+            json.loads(row[0])
+            for row in con.execute(f"SELECT backup_json FROM {table}")  # nosec B608
+        ]
+    finally:
+        con.close()
+    if not rows:
+        raise ZigplugError(f"{db_path} contains no network backups")
+    return max(rows, key=lambda b: b.get("backup_time", ""))
+
+
+def backup_summary(backup: dict) -> str:
+    """One-line summary of a backup dict (channel, PAN, time)."""
+    info = backup.get("network_info", {})
+    return (
+        f"channel {info.get('channel')}, PAN 0x{info.get('pan_id')}, "
+        f"taken {backup.get('backup_time')}"
+    )
+
+
+async def restore_network(
+    device: str, db_path: Path, backup: dict, *, counter_increment: int = 10000
+) -> None:
+    """Write a network backup into the coordinator's NVRAM.
+
+    The frame counter is bumped past anything the old network could have
+    used, so joined devices accept the restored coordinator. Must own the
+    port exclusively — refuse to run while the daemon does.
+    """
+    network_backup = zigpy.backups.NetworkBackup.from_dict(backup)
+    config = build_config(device, db_path)
+    # The constructor applies SCHEMA itself — don't validate twice.
+    app = ControllerApplication(config)
+    await app.connect()
+    try:
+        await app.backups.restore_backup(
+            network_backup, counter_increment=counter_increment
+        )
+    finally:
+        await app.disconnect()
