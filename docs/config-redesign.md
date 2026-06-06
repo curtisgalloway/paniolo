@@ -249,8 +249,8 @@ without reshaping it.
 5. **Per-channel dispatch.** Reusable primitive; per-host slice; composite
    co-location guard; remove the multi-host rejection in resolution.
 6. **Retire legacy + docs/tests.** Delete the `~/.config/paniolo/targets` path
-   and the user-facing `_to_toml`; migrate tests; update `AGENTS.md`, the
-   `paniolo-reference` skill, `docs/`, and `README`.
+   and the user-facing `_to_toml`; migrate tests; update `AGENTS.md`, `docs/`,
+   and `README`.
 
 ## Dispatch design (Stage 5 — specified, to be built in Rust)
 
@@ -332,7 +332,7 @@ superseded `_dhcp`/`_tftp`).
   (`netboot`, `netif`, `serial`, `video`, `power`, `ocr`, `state`). Drop legacy
   `_dhcp`/`_tftp`.
 - **R4 — HID, polish, cutover.** Port `_hid` (or keep short-term), finish docs
-  (`AGENTS.md`, `paniolo-reference` skill, `docs/`, `README`), retire the Python tree.
+  (`AGENTS.md`, `docs/`, `README`), retire the Python tree.
 
 ### Open structural decisions (R1)
 
