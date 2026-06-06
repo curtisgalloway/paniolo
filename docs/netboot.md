@@ -20,7 +20,7 @@ networksetup -listallhardwareports
 
 ## Target configuration
 
-Config lives in the lab file (see [config-redesign.md](config-redesign.md));
+Config lives in the lab file (see [config-redesign.md](https://github.com/curtisgalloway/paniolo/blob/main/docs/config-redesign.md));
 the netboot link is a per-target `netboot` channel:
 
 ```bash
@@ -64,15 +64,15 @@ paniolo netboot stop  [target-machine]
 ```
 
 `start` assigns the static `host_ip` to the interface, then launches paniolo's
-own **pure-Python DHCP and TFTP servers** as background subprocesses
-(`python -m paniolo._dhcp` and `python -m paniolo._tftp`). No external daemons
-(`dnsmasq`, `tftp-now`) are required at runtime. `stop` sends SIGTERM to both
-and clears the state file.
+own **DHCP and TFTP server** — the single `netbootd` binary (Rust), serving both
+protocols from one background process. No external daemons (`dnsmasq`,
+`tftp-now`) are required at runtime. `stop` sends SIGTERM and clears the state
+file.
 
 **Privileged ports (67/69):** macOS 10.14+ allows binding `0.0.0.0` on
 privileged ports without root, so on macOS the only step needing sudo is
 assigning the static IP. On **Linux**, ports 67/69 require root, so `start`
-auto-prepends `sudo` when spawning the two servers, and interface configuration
+auto-prepends `sudo` when spawning `netbootd`, and interface configuration
 (`ip addr add`) uses sudo as well. Configure **NOPASSWD sudo** on the control
 host for unattended agent use.
 
@@ -81,17 +81,11 @@ default route (a primary NIC). netboot reconfigures the interface to the static
 `host_ip`, which would break your real networking — the netboot link must be a
 dedicated USB-Ethernet adapter.
 
-### Netboot engines (rust default, python legacy)
+### The netbootd engine
 
-```bash
-paniolo netboot start [target-machine]                  # rust netbootd (default)
-paniolo netboot start --engine python [target-machine]  # legacy DHCP+TFTP pair
-```
-
-`start` launches a single `netbootd` binary (Rust) by default, serving DHCP and
-TFTP from one process. `--engine python` selects the legacy implementation: the
-`_dhcp`/`_tftp` subprocess pair the Rust daemon was ported from, kept as a
-fallback. `stop`/`status`/`logs` follow whichever engine `start` recorded.
+`netbootd` was ported from a pure-Python `_dhcp`/`_tftp` subprocess pair, which
+survives only in the legacy Python CLI (`src/paniolo/`, being retired) — the
+Rust `paniolo` always runs `netbootd`.
 
 On macOS, netbootd's raw-frame send path (the Sequoia delivery workaround) needs
 a `/dev/bpf` descriptor. Rather than run the daemon as root, `paniolo setup`
@@ -166,7 +160,7 @@ combined log at `~/.local/share/paniolo/<name>/netboot.log`.
 
 | Purpose | Path |
 |---|---|
-| Daemon state (DHCP/TFTP PIDs, uptime) | `~/.local/share/paniolo/<name>/netboot.json` |
+| Daemon state (netbootd PID, uptime) | `~/.local/share/paniolo/<name>/netboot.json` |
 | Combined log | `~/.local/share/paniolo/<name>/netboot.log` |
 
 ---

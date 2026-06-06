@@ -60,9 +60,9 @@ the abstraction is the right call.
 
 - **Power** — labgrid is broader: discrete on/off/cycle via many `*PowerDriver`s (network PDUs,
   YKUSH/USB-port power, GPIO, Tasmota/MQTT, `ManualPowerDriver`, and `ExternalPowerDriver` for
-  custom scripts). paniolo today has `power-cycle` (script) + DTR power-button + read-only sense;
-  its CI design adds the discrete `power on/off/reset` verbs labgrid already has. labgrid's
-  `ExternalPowerDriver` ≈ paniolo's `power_cycle_cmd`.
+  custom scripts). paniolo has `power-cycle` plus the discrete `power on/off` verbs (generic
+  `[power]` hook commands, with `cambrionix`/`zigplug` helpers), DTR power-button, and
+  `power-state`. labgrid's `ExternalPowerDriver` ≈ paniolo's power hooks.
 - **Serial (the key alignment)** — labgrid exposes serial as a **`NetworkSerialPort`**: the
   exporter runs **ser2net** to publish the UART as a **raw TCP / RFC2217 bidirectional stream**,
   which CI binds a `SerialDriver` to over SSH forwarding. **This is the same shape paniolo is

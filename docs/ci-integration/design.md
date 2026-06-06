@@ -69,6 +69,11 @@ reset_cmd = "pdu --port 3 cycle"   # falls back to off+sleep+on if unset
 Backward-compat: keep `power_cycle_cmd` working (maps to `reset`/`script`). Exit codes stay
 `0`/`1`.
 
+*As shipped (see §8 and `power.md`): the `[power]` block landed as plain generic hooks —
+`cycle_cmd`/`on_cmd`/`off_cmd`/`state_cmd`, no `backend` enum, no `power_cycle_cmd` alias —
+with `power on`/`power off` subcommands and the existing top-level `power-cycle`/`power-state`
+verbs (no separate `power reset`/`power state`).*
+
 ### 2.2 Serial (the core work)
 
 `serialcap` stays the single exclusive owner of the UART and gains, off the same supervisor:
@@ -241,8 +246,10 @@ test orchestrator or result producer.
    stubs now; OpenOCD backend is a follow-on.
 5. **CI host OS** — **Linux-only** for the CI control host; macOS remains a first-class
    interactive-bringup host.
-6. **First milestone** — *not started yet.* Owner wants to discuss implementation specifics
-   (see §8) before any code.
+6. **First milestone** — *partially landed* (via the Rust control-plane port): `paniolo serial
+   send`, the `[power]` hook block (`cycle_cmd`/`on_cmd`/`off_cmd`/`state_cmd`), and `power
+   on`/`off` are shipped. The PTY proxy, write arbiter/`--exclusive`, raw TCP listener, CI
+   stand-down guard, and `[jtag]` stubs remain (see the slicing in §8).
 
 ## 8. Implementation decisions (resolved 2026-05-29)
 
@@ -265,8 +272,9 @@ Fuchsia-critical path (PTY + power); the LAVA TCP listener follows in the same m
 need not block first hardware bring-up of the Fuchsia target.
 
 1. serialcap: **PTY** proxy (SER-2) + `serial attach --pty` — *Fuchsia `DeviceConfig.serial`.*
-2. `paniolo serial send` (SER-4) — agent write-to-serial, same `write_tx` channel.
-3. `[power]` config block + `power on/off/reset` verbs (PWR-1..6) + `AGENTS.md` update (PWR-7).
+2. ~~`paniolo serial send` (SER-4)~~ — **shipped** (agent write-to-serial via `POST /input`).
+3. ~~`[power]` config block + `power on/off` verbs (PWR-1..6) + `AGENTS.md` update (PWR-7)~~ —
+   **shipped** (the cycle verb stayed `power-cycle`; no separate `power reset`).
 4. Write arbiter: advisory lock, `/status` holder, `--exclusive` + auto-release (SER-5).
 5. serialcap: raw **TCP** listener (SER-1) + `serial attach --tcp` — *LAVA; can trail.*
 6. netboot CI stand-down guard (DEP-1); `[jtag]`/`debug` verb stubs (JTAG-1).

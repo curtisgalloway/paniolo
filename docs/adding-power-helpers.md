@@ -3,8 +3,8 @@
 How to add paniolo support for a new power-switching device — a PDU, a relay
 board, a smart plug family, a USB-PD hub, a BMC, anything that can turn a
 target's power on and off. Two shipped helpers serve as exemplars:
-[`cambrionix/`](../cambrionix/) (Rust, Cambrionix USB hub control UART) and
-[`zigplug/`](../zigplug/) (Python, Zigbee smart plugs via a CC2652 coordinator
+[`cambrionix/`](https://github.com/curtisgalloway/paniolo/tree/main/cambrionix) (Rust, Cambrionix USB hub control UART) and
+[`zigplug/`](https://github.com/curtisgalloway/paniolo/tree/main/zigplug) (Python, Zigbee smart plugs via a CC2652 coordinator
 dongle).
 
 **The design principle** (from [power.md](power.md)): device-specific control
@@ -100,7 +100,7 @@ including lazy migration from a pre-API path).
 1. `cargo new <helper> --bin` at the repo root; Apache 2.0 headers; `clap`
    (derive) + `anyhow` + whatever transport crate (`serialport`, `ureq`).
 2. `main.rs` = CLI surface + command logic; `proto.rs` = transport/protocol.
-3. Add the crate name to `CRATES` in [`Makefile`](../Makefile) **and** to
+3. Add the crate name to `CRATES` in [`Makefile`](https://github.com/curtisgalloway/paniolo/blob/main/Makefile) **and** to
    `HELPER_CRATES` in `cli/src/setup.rs` so `make install` / `paniolo setup`
    build and install it into the libexec dir (`cargo install --root`).
 

@@ -159,14 +159,15 @@ with the raw bytes as the request body (see HTTP API below).
 
 ## Integration with the video dashboard
 
-`paniolo console` opens the combined hdmicap dashboard in a browser. That page
-embeds an xterm.js terminal that connects cross-port to serialcap's WebSocket
-(`/stream`). For the terminal to work, both daemons must be running:
+`paniolo console` opens the combined hdmicap dashboard in a browser, starting
+both daemons if they aren't already running. That page embeds an xterm.js
+terminal that connects cross-port to serialcap's WebSocket (`/stream`). The
+daemons can also be started individually:
 
 ```bash
 paniolo video watch [target-machine]    # hdmicap — serves the page
 paniolo serial watch [target-machine]   # serialcap — backs the terminal
-paniolo console [-i <interface>] # open in browser
+paniolo console [-i <interface>] # open in browser (auto-starts both)
 ```
 
 When the dashboard page loads, serialcap replays up to 64 KB of scrollback

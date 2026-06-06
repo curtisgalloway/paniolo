@@ -4,9 +4,12 @@
 > Shipped: the SSH transport, the one-file lab model (`--lab` / `PANIOLO_LAB`),
 > transparent re-exec of one-shot commands on a target's host, a tunnelled
 > `console` for a remote target, remote `setup --host`, and discovery-assisted
-> `configure`. Still design-only: multi-host targets, `console --detach`, and
-> multi-user locking (see the [implementation plan](distributed-control-plan.md)
-> for the phasing). Compare [related work: paniolo vs. labgrid](ci-integration/related-work.md),
+> `configure`. Channels of one target may live on different control hosts —
+> each command routes per-channel; only the composite `console` still requires
+> its channels co-located. Still design-only: cross-host composite commands,
+> `console --detach`, and multi-user locking (see the
+> [implementation plan](https://github.com/curtisgalloway/paniolo/blob/main/docs/distributed-control-plan.md) for the phasing). Compare
+> [related work: paniolo vs. labgrid](ci-integration/related-work.md),
 > whose distributed model directly informs this.
 
 ## The problem
@@ -14,7 +17,7 @@
 Today paniolo assumes the machine you run it on is the machine wired to the
 target. When your dev machine isn't the control host — the common case — you
 SSH into the control host by hand and run `paniolo …` there (the remote-control
-pattern in the root [README](../README.md)). That works, but it leaks the host
+pattern in the root [README](https://github.com/curtisgalloway/paniolo/blob/main/README.md)). That works, but it leaks the host
 boundary into every workflow: you manage SSH sessions yourself, and anything
 that serves a port (the dashboard, `serial watch`, `video preview`) means
 hand-rolling `ssh -L` port forwards. The friction is acute for the console —
@@ -114,10 +117,10 @@ device = "0x8300000534d2109"      # USB Video — stable, port-derived id
 
 - `host = "local"` (or unset, on a single-host lab) means the dev machine — i.e.
   today's behavior, no SSH involved.
-- Existing `~/.config/paniolo/targets/*.toml` files are effectively an *implicit
-  local lab*. Backward compatibility: with no `--lab`/`PANIOLO_LAB`, paniolo uses
-  those exactly as now. The migration path is to fold them into a lab file; it is
-  opt-in, not forced.
+- With no `--lab`/`PANIOLO_LAB`, paniolo reads the default lab at
+  `~/.config/paniolo/lab.toml`; if none exists it errors and points at
+  `paniolo init`. (The legacy Python CLI's per-target
+  `~/.config/paniolo/targets/*.toml` files are not read by the Rust CLI.)
 
 ## Transport (the "Fork B" model)
 
@@ -254,13 +257,13 @@ a single git-tracked lab file plus SSH, preserving paniolo's zero-infrastructure
 agent-in-the-loop niche. See [related work](ci-integration/related-work.md) for
 the full comparison.
 
-## Open questions
+## Open questions (all since resolved)
 
-- Exact spelling of "point paniolo at the lab" (`--lab` flag, `PANIOLO_LAB`,
-  default path, or a `[lab]` pointer in user config) and how it composes with the
-  legacy `~/.config/paniolo/targets/*.toml` during migration.
-- Whether the per-command config slice shipped to a host travels as CLI args, a
-  temp file over SSH, or stdin — a mechanism choice, not an architecture one.
-- How `paniolo setup` is invoked per remote host (`setup --host bench1` re-execing
-  over SSH is the obvious answer, since building daemons must happen on the host
-  wired to the hardware).
+- *Exact spelling of "point paniolo at the lab"* → `--lab` flag, then
+  `PANIOLO_LAB`, then the default `~/.config/paniolo/lab.toml`. The legacy
+  `~/.config/paniolo/targets/*.toml` files were dropped rather than composed —
+  the Rust CLI never reads them.
+- *How the per-command config slice travels* → a temp file copied over SSH,
+  re-invoking with `--lab <path>` (`cli/src/dispatch.rs`).
+- *How `paniolo setup` is invoked per remote host* → `setup --host bench1`
+  re-execs over SSH, as predicted.

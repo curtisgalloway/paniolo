@@ -16,8 +16,14 @@ limitations under the License.
 
 # CH9329 USB-HID bridge — clean-room driver spec
 
-**Target:** the Rust serial driver at `cli/src/ch9329.rs` (paniolo's `hid` channel
-backend). **Device:** WCH CH9329 UART→USB-HID bridge, behind a CH340 USB-serial
+> **Status: deferred — reference material only.** Nothing in the tree speaks
+> CH9329 today; the shipped injector is the KB2040 (`hidrig`). If built, the
+> integration point would be an **external helper** speaking the
+> [HID serial protocol](hid-serial-protocol.md), wired in through the generic
+> `hid` channel like any other injector — not a driver inside `cli/` (no
+> device-specific code lives in the core).
+
+**Device:** WCH CH9329 UART→USB-HID bridge, behind a CH340 USB-serial
 bridge in the Openterface Mini-KVM. The host sends framed serial commands; the
 CH9329 emulates a USB HID keyboard/mouse to the *target*.
 

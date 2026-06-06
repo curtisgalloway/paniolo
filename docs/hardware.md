@@ -31,12 +31,12 @@ See the [serial guide](serial.md).
 
 ## HID injection
 
-See the [HID guide](hid.md) and [`hidrig/README.md`](../hidrig/README.md).
+See the [HID guide](hid.md) and [`hidrig/README.md`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md).
 
 | Device | Role |
 |---|---|
-| Adafruit KB2040 | Reference HID injector (CircuitPython firmware in [`hidrig/`](../hidrig/README.md)); any CircuitPython-capable RP2040 board with free UART pins works with minor pin edits. |
-| 3.3 V USB-serial adapter (FTDI) | Control UART to the KB2040 — e.g. the DSD TECH cable above. The `hidrig` daemon applies its macOS low-latency fix when opening FTDI adapters, so prefer FTDI here. |
+| Adafruit KB2040 | Reference HID injector (CircuitPython firmware in [`hidrig/`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md)); any CircuitPython-capable RP2040 board with free UART pins works with minor pin edits. |
+| 3.3 V USB-serial adapter (FTDI) | Control UART to the KB2040 — e.g. the DSD TECH cable above. `hidrig` applies its macOS low-latency fix to every serial port it opens; it matters most for FTDI (whose default latency timer is high), so FTDI is a safe choice here. |
 
 ## Video capture
 

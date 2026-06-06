@@ -9,11 +9,11 @@
 > video, HID). It deliberately does **not** own test orchestration or result production — when
 > integrated with hardware-CI ecosystems, those stay above paniolo (see §9).
 >
-> Companion design docs live under [`docs/ci-integration/`](ci-integration/) (gap analysis +
-> integration design) and per-feature docs under [`docs/`](.). **Update the Status column as
+> Companion design docs live under [`docs/ci-integration/`](ci-integration/gap-analysis.md) (gap analysis +
+> integration design) and per-feature docs under [`docs/`](README.md). **Update the Status column as
 > work lands.**
 >
-> Last updated: 2026-05-29.
+> Last updated: 2026-06-05.
 
 ## Status legend
 
@@ -33,27 +33,27 @@
 
 | ID | Requirement | Pri | Status | Notes |
 |---|---|---|---|---|
-| CORE-1 | Per-target config in `~/.config/paniolo/targets/<name>.toml`; one file per target, no daemon required | M | ☑ | `_config.py`; single target is the default |
+| CORE-1 | Daemonless target config readable by every command; single target is the default | M | ☑ | *originally per-target `targets/<name>.toml` files (`_config.py`); superseded by the one-file lab model — CORE-7* |
 | CORE-2 | CLI (`paniolo`) over subcommands; SSH-drivable from a dev machine into the control host | M | ☑ | Remote-control pattern (README) |
 | CORE-3 | Run on macOS 10.14+ and Linux (x86-64/arm64) | M | ☑ | `paniolo setup` installs daemons/tools |
 | CORE-4 | Rust daemons (`hdmicap`, `serialcap`) + Swift `visionocr` helper build & install | M | ☑ | `paniolo setup` |
-| CORE-5 | Predictable runtime paths (configs, daemon discovery, capture logs) | M | ☑ | README "Runtime paths" |
+| CORE-5 | Predictable runtime paths (configs, daemon discovery, capture logs) | M | ☑ | [architecture.md §4](architecture.md#4-configuration-and-state-model) |
 | CORE-6 | Agent-oriented guidance kept current (`AGENTS.md`) as the surface changes | M | ◐ | Must track power/serial changes in §9 |
-| CORE-7 | One-file **lab** model (`--lab`/`PANIOLO_LAB`): hosts + targets, per-resource host binding; legacy targets dir as fallback | S | ☑ | `_lab.py`; [distributed-control](distributed-control.md) |
-| CORE-8 | Transparent re-exec of host-operating commands on a target's **remote control host** over SSH | S | ☑ | `_remote.py`, `@remote_capable`; `_ssh.py` transport |
-| CORE-9 | Tunnelled `console` for a remote target (dashboard reachable locally) | S | ☑ | `_cli._remote_console`; `?serialws=` stitch |
-| CORE-10 | Multi-host targets (one target spanning control hosts) | C | ☐ | schema ready (per-resource host); single-host enforced for now |
-| CORE-11 | Remote `setup --host` + discovery-assisted `configure` (Phases 4–5) | C | ☐ | [plan](distributed-control-plan.md) |
+| CORE-7 | One-file **lab** model (`--lab`/`PANIOLO_LAB`): hosts + targets, per-channel host binding | S | ☑ | `cli/src/model.rs`, `labfile.rs`; [distributed-control](distributed-control.md) (the Rust CLI reads no legacy targets dir) |
+| CORE-8 | Transparent re-exec of host-operating commands on a target's **remote control host** over SSH | S | ☑ | `cli/src/dispatch.rs` (ships a lab slice + `--lab`); `cli/src/ssh.rs` transport |
+| CORE-9 | Tunnelled `console` for a remote target (dashboard reachable locally) | S | ☑ | `remote_console` in `cli/src/main.rs`; `?serialws=` stitch |
+| CORE-10 | Multi-host targets (one target spanning control hosts) | C | ◐ | per-channel dispatch routes each command to its channel's host (`dispatch.rs`); composite `console` still requires co-located channels |
+| CORE-11 | Remote `setup --host` + discovery-assisted `configure` | C | ☑ | `paniolo setup --host`, `discover`, `configure` (`cli/src/main.rs`) |
 
 ## 2. Netboot / deploy
 
 | ID | Requirement | Pri | Status | Notes |
 |---|---|---|---|---|
-| NET-1 | Built-in DHCP + TFTP over a direct USB-Ethernet link | M | ☑ | `_dhcp.py`, `_tftp.py`; `192.168.99.1/24` |
-| NET-2 | `netboot start/stop/status`, `tftp-root`, `logs` (filterable, followable) | M | ☑ | `_cli.py`; `_netboot.py` |
+| NET-1 | Built-in DHCP + TFTP over a direct USB-Ethernet link | M | ☑ | `netbootd/` (Rust engine, default); `192.168.99.1/24` |
+| NET-2 | `netboot start/stop/status`, `tftp-root`, `logs` (filterable, followable) | M | ☑ | `cli/src/netboot.rs` |
 | NET-3 | `netboot link-up/down/status` for interface configuration | M | ☑ | |
 | NET-4 | TFTP root configurable per target (`--tftp-root`) | M | ☑ | required for `netboot start` |
-| NET-5 | `netif mode netboot\|ffx\|off` — atomic, idempotent link-mode switch; stops netboot before SD boot, sets up host `fe80::1`/64 for ffx; `netif status` probes the active mode | S | ☑ | `_netif.py`; from rpi5-bringup ffx-over-network bring-up |
+| NET-5 | `netif mode netboot\|ffx\|off` — atomic, idempotent link-mode switch; stops netboot before SD boot, sets up host `fe80::1`/64 for ffx; `netif status` probes the active mode | S | ☑ | `cli/src/netif.rs`; from rpi5-bringup ffx-over-network bring-up |
 
 ## 3. Serial console
 
@@ -64,7 +64,7 @@
 | SER-C | Interactive terminal via `tio` (`serial connect`) | M | ☑ | |
 | SER-D | Bidirectional live `/stream` (WebSocket) — read + write-back | M | ☑ | `server.rs` (used by dashboard) |
 | SER-E | `serial add/set/rm/devices/show`, multi-interface per target | M | ☑ | |
-| SER-F | DTR control: `serial dtr`, `serial reset` (soft-reset semantics) | M | ☑ | `_power.py` |
+| SER-F | DTR control: `serial dtr`, `serial reset` (soft-reset semantics) | M | ☑ | `cli/src/power.rs` |
 | SER-G | Power-sense read via modem-control input (`--power-sense cts\|dsr\|dcd\|ri`) | S | ☑ | `/status` → `power_on` |
 
 ## 4. Power control
@@ -73,7 +73,7 @@
 |---|---|---|---|---|
 | PWR-A | `power-cycle` via configurable script (`--power-cycle-cmd`) | M | ☑ | *superseded by the `[power]` hook block (`--cycle-cmd` et al.) — PWR-5 in §9* |
 | PWR-B | `power-state` (read-only on/off via sense signal) | M | ☑ | `power-state` |
-| PWR-C | DTR-based hardware power-button toggling (J2 header): ≤500ms soft / ≥3s hard | M | ☑ | `_power.py` |
+| PWR-C | DTR-based hardware power-button toggling (J2 header): ≤500ms soft / ≥3s hard | M | ☑ | `cli/src/power.rs` |
 
 ## 5. Video / OCR
 
@@ -81,7 +81,7 @@
 |---|---|---|---|---|
 | VID-1 | HDMI/USB capture via warm-stream `hdmicap` daemon | M | ☑ | `hdmicap/`; Linux V4L2 + macOS |
 | VID-2 | `video watch/preview/shot/read/devices/show/stop`; stable & changed-since capture | M | ☑ | |
-| VID-3 | On-device OCR (`video read`): Apple Vision (macOS), Tesseract (Linux); `--json` | S | ☑ | `_ocr.py` |
+| VID-3 | On-device OCR (`video read`): Apple Vision (macOS), Tesseract (Linux) | S | ☑ | `ocr/` helpers via hdmicap `GET /ocr` (the legacy `--json` flag was not carried into the Rust CLI) |
 
 ## 6. HID injection
 

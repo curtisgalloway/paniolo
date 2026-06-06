@@ -26,7 +26,7 @@ This document is **normative**. Implementations:
 | Implementation | Status |
 |---|---|
 | `hidrig/firmware/` — Adafruit KB2040, CircuitPython | Reference implementation |
-| WCH CH9329 bridge (see [ch9329-spec.md](ch9329-spec.md)) | Deferred — would need a host-side shim speaking this protocol |
+| WCH CH9329 bridge (see [ch9329-spec.md](https://github.com/curtisgalloway/paniolo/blob/main/docs/ch9329-spec.md)) | Deferred — would need a host-side shim speaking this protocol |
 
 The host-side client is the `hidrig` CLI (`hidrig/src/`), which works against
 any conforming device.
@@ -44,12 +44,15 @@ any conforming device.
 - **WebSocket carrier (for the daemon / KVM path).** The `hidrig serve` daemon
   owns the device's serial link and re-exposes the *same* line protocol over a
   WebSocket (`GET /hid`): each client text frame is one command line (no
-  trailing `\n` needed), and the daemon answers with one text frame per command
-  (`OK`/`OK <data>`/`ERR <message>`). Many clients may connect at once — the
-  daemon serializes their commands onto the single device link, one in flight,
-  which is exactly how CLI-injected and browser-injected events intermix. This
-  is a carrier binding, not a different protocol: the command grammar below is
-  identical on the UART and the WebSocket.
+  trailing `\n` needed). Results are **broadcast to all connected clients** as
+  transcript frames — `evt ok <line> :: <reply>` / `evt err <line> :: <reply>` —
+  so an issuer reads its own result off the shared stream (the daemon's
+  `POST /send` one-shot endpoint returns the raw `OK`/`ERR` reply directly).
+  Many clients may connect at once — the daemon serializes their commands onto
+  the single device link, one in flight, which is exactly how CLI-injected and
+  browser-injected events intermix. This is a carrier binding, not a different
+  protocol: the command grammar below is identical on the UART and the
+  WebSocket.
 
 ## 2. Framing and flow control
 
@@ -111,9 +114,9 @@ are separated by single spaces.
   rejected with `ERR`.
 - `baud <rate>` renegotiates the serial link's speed mid-session (optional,
   capability `baud`) — for a carrier where it makes sense (a UART; meaningless
-  on a TCP/WebSocket carrier). The **device boots at the default 9600/115200**
-  (see §2) so a naive connection always works; a throughput-sensitive host then
-  raises it. **Handshake:** the device replies `OK` **at the current rate**,
+  on a TCP/WebSocket carrier). The **device boots at its default rate** —
+  115200 for the reference firmware (see §2) — so a naive connection always
+  works; a throughput-sensitive host then raises it. **Handshake:** the device replies `OK` **at the current rate**,
   then switches to `<rate>`; the host, after reading that `OK`, switches its
   port to `<rate>`, waits briefly for the device to switch, and confirms with a
   `ping` (reverting on no reply). The device SHOULD return to its boot default

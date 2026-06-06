@@ -9,3 +9,4 @@ build/
 .pytest_cache/
 hidrig/host/hid_seize_reports
 hidrig/host/hid_capture_usb
+site/
