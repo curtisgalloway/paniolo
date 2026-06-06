@@ -172,7 +172,6 @@ A helper PR touches more than the helper directory:
       and the `make install` paragraph) + the manual install command block
 - [ ] `Makefile` — `CRATES` (Rust) or the header comment (other)
 - [ ] `docs/README.md` — the Power row in the subsystem guide table
-- [ ] `.claude/skills/paniolo-reference/SKILL.md` — crates table
 - [ ] Apache 2.0 headers on all new source files
 
 ## 7. Field notes (earned the hard way)

@@ -16,11 +16,6 @@ limitations under the License.
 
 # Paniolo — Agent Instructions
 
-## Skill
-
-A Repomix-generated reference skill lives at `.claude/skills/paniolo-reference/`.
-Load it at the start of any session to get a full structural map of the codebase.
-
 ## Before opening a PR
 
 Run through this checklist before calling `gh pr create`:
@@ -35,8 +30,7 @@ Run through this checklist before calling `gh pr create`:
    Include doc updates in the same PR, not a follow-up.
 
 2. **Update the usage skill (`skills/paniolo/SKILL.md`).** This is the
-   agent-facing skill for *driving* a target — distinct from the
-   `paniolo-reference` codebase skill regenerated below. If the PR adds, removes,
+   agent-facing skill for *driving* a target. If the PR adds, removes,
    or changes a user-facing command, flag, or workflow, update the relevant
    section (and the "gotchas" list) so an agent using paniolo sees the new
    surface. The repo copy at `skills/paniolo/SKILL.md` is the canonical source;
@@ -44,20 +38,7 @@ Run through this checklist before calling `gh pr create`:
    directory). Purely internal changes that don't alter the CLI surface can skip
    this.
 
-3. **Regenerate the reference skill.** Use the Repomix CLI (`brew install repomix`,
-   or `npx -y repomix@latest`) from the repo root:
-
-   ```
-   repomix --skill-generate paniolo-reference \
-       --skill-output .claude/skills/paniolo-reference --force \
-       -i "captures/**,.git/**,.claude/skills/**"
-   ```
-
-   `target/` dirs and `ocr/visionocr` are gitignored, so Repomix skips them.
-   Excluding `.claude/skills/**` prevents the old skill from being packed into
-   the new one. Stage the updated skill files in the same commit.
-
-4. **Open the PR; do not merge it.** Push the branch and create the PR with
+3. **Open the PR; do not merge it.** Push the branch and create the PR with
    `gh pr create`, then stop. The merge decision belongs to the user.
 
 ## Purpose
