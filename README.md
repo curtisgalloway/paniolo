@@ -126,33 +126,6 @@ ssh control-mac "paniolo power-cycle target-machine"
 
 ---
 
-## Concepts
-
-### Target
-
-A *target* is a named machine you want to control. Configuration lives in a
-single CLI-managed **lab file** (`~/.config/paniolo/lab.toml`, or `--lab` /
-`PANIOLO_LAB`): hosts plus targets, each target's hardware described as
-*channels* (`netboot`, `serial`, `power`, `video`, `hid`) bound to the host they're
-physically attached to. No daemon required. If exactly one target is
-configured it is the default and can be omitted from every command.
-
-See [docs/config-redesign.md](docs/config-redesign.md) for the model and
-[Target configuration](docs/netboot.md#target-configuration) for the fields.
-
-### Runtime paths
-
-| Purpose | Path |
-|---|---|
-| Target configs | `~/.config/paniolo/targets/<name>.toml` |
-| Video config | `~/.config/paniolo/video.toml` |
-| Netboot daemon state | `~/.local/share/paniolo/<name>/netboot.json` |
-| hdmicap discovery | `/tmp/paniolo-<uid>/hdmicap/daemon.json` |
-| serialcap discovery | `/tmp/paniolo-<uid>/serialcap/daemon.json` |
-| Serial capture logs | `/tmp/paniolo-<uid>/serialcap/capture/<name>/serial.jsonl` |
-
----
-
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).

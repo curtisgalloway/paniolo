@@ -38,7 +38,7 @@ The `--device` value may be:
 - a **`/dev/video*` path** (Linux): accepted, but not stable across reboots.
 
 The device lives on the target's `video` channel in the lab file (see
-[config-redesign.md](config-redesign.md)); `paniolo configure` proposes the
+[config-redesign.md](https://github.com/curtisgalloway/paniolo/blob/main/docs/config-redesign.md)); `paniolo configure` proposes the
 stable id (with the human name as a comment) when one non-built-in capture
 device is present, and lists id alternatives when there are several.
 

@@ -2,7 +2,7 @@
 
 paniolo can inject keyboard and mouse events into the target through any
 helper tool that drives a USB HID injector — by default the KB2040 rig in
-[`hidrig/`](../hidrig/README.md). The integration is a generic per-target
+[`hidrig/`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md). The integration is a generic per-target
 **hid channel**, an opaque command prefix exactly like the power hooks:
 paniolo appends arguments to it and runs it, staying agnostic to the device.
 
@@ -29,7 +29,8 @@ microcontroller, a CH9329 shim) drops in without touching paniolo.
 
 ```bash
 # Build and install the helper (once per control host; libexec, off PATH)
-cargo install --path hidrig --root ~/.local/libexec/paniolo   # or just `make install`
+cargo install --path hidrig --root ~/.local/libexec/paniolo   # or `make install`, which
+                                                              # rebuilds everything via `paniolo setup`
 
 # Bind the helper to the target in the lab file
 paniolo hid set -t pi5 --cmd "hidrig -d /dev/cu.usbserial-XXXX"
@@ -107,7 +108,7 @@ Sequencing and timing live on the host; the firmware stays dumb.
 
 ---
 
-## KVM mode — type and click from the web console
+## KVM mode: type and click from the web console
 
 `paniolo console` turns the dashboard into a KVM when the target has a `hid`
 channel. Click the **⌨ Capture input** button in the video overlay to engage
@@ -171,7 +172,7 @@ To exercise the full pipeline without a target, plug the injector's USB into
 the same Mac that drives the UART and capture its HID reports while injecting.
 Build with `cd hidrig/host && make`.
 
-`hidrig/host/hid_capture_usb.c` (`.m`) is the **leak-safe** tool: it detaches
+`hidrig/host/hid_capture_usb.m` is the **leak-safe** tool: it detaches
 the injector from the macOS HID stack via IOUSBHost whole-device capture and
 prints timestamped interrupt-IN reports, so injected input reaches only the
 tool — not the focused app or the real cursor.

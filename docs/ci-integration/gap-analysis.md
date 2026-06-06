@@ -64,7 +64,7 @@ moved. (`docs.kernelci.org/kcidb/submitter_guide`.)
 
 | Primitive | LAVA wants | Fuchsia/botanist wants | paniolo today | Gap |
 |---|---|---|---|---|
-| **Power** | `power_on`/`power_off`/`hard_reset` shell cmds (string *or* list); **boot must start on power-up alone** | power **not** in device config — `botanist/power` method or bot-host/recipe hook | `power-cycle` (user script), DTR button pulses (≤500ms soft / ≥3s hard), read-only `power-state`; **no discrete on/off verbs** | **Need discrete `power on`/`off`/`reset` verbs**; reset/off via DTR or PDU script |
+| **Power** | `power_on`/`power_off`/`hard_reset` shell cmds (string *or* list); **boot must start on power-up alone** | power **not** in device config — `botanist/power` method or bot-host/recipe hook | `power-cycle`, **discrete `power on`/`off`** (generic `[power]` hooks: `cycle_cmd`/`on_cmd`/`off_cmd`/`state_cmd` — *landed*), DTR button pulses (≤500ms soft / ≥3s hard), `power-state` | **Mostly closed** — remaining: a dedicated reset verb if `hard_reset` ≠ `power-cycle` semantics |
 | **Serial** | **raw, bidirectional, persistent TCP stream** via `connection_command` = `telnet host port` (ser2net) | **raw device-file path** (`DeviceConfig.serial`); botanist opens it & makes the socket | serialcap owns port; exposes **HTTP + bidirectional WebSocket** `/stream`, JSONL log, `tio` — **no raw TCP socket, no PTY** | **Two different shapes:** raw **TCP listener** (LAVA) + **PTY device path** (Fuchsia). Both absent. |
 | **Deploy** | **LAVA owns** download+TFTP serving (standard `tftp` method) | **botanist owns** pave/zedboot (+ CIPD/CAS) | built-in DHCP+TFTP netboot (start/stop together, no selective disable) | **Orchestrator owns deploy in both.** paniolo netboot must *stand down* in CI to avoid DHCP/TFTP contention |
 | **Boot/detect** | `boot` action matches `prompts:` on the serial stream | botanist boots/paves, polls for `summary.json` | netboot + serial JSONL/WebSocket; **no prompt-match / wait-for built in** | Detection is the orchestrator's job once it has the serial stream → low-priority for paniolo |
@@ -82,17 +82,19 @@ Plus a **future cross-cutting primitive** the owner wants: **JTAG** (see §6).
 - *Fuchsia:* not in device config; power lives in `botanist/power` or the bot-host/recipe layer.
 
 **paniolo today.**
-- `power-cycle` runs an arbitrary user shell command (`power_cycle_cmd`, run via
-  `subprocess.run(..., shell=True)`) — `_cli.py:756`, `_power.py`. ≈ `hard_reset`.
+- `power-cycle`, `power on`, `power off` run arbitrary hook commands from the target's
+  `[power]` block (`cycle_cmd`/`on_cmd`/`off_cmd` — `cli/src/main.rs`, `model.rs`); helpers
+  (`cambrionix`, `zigplug`) ship for USB-hub and Zigbee-plug switching. ≈ `hard_reset` + the
+  discrete verbs.
 - DTR "power button" pulses on a J2 header: `serial dtr`/`serial reset`, ≤500 ms = soft reset,
-  ≥3 s = hard power-off — `_power.py:31-33`, `_cli.py:917-957`.
-- `power-state` is **read-only** (sense signal via daemon `/status` → `power_on`) — `_cli.py:784-812`.
+  ≥3 s = hard power-off — `cli/src/power.rs`.
+- `power-state` reads `state_cmd` (first token `on`/`off`) or falls back to the sense signal via
+  daemon `/status` → `power_on`.
 
-**Delta.** No standalone `power on` / `power off`. LAVA needs all three verbs as separate
-commands, and crucially a `power_on` that *starts the boot*. paniolo can satisfy this if the
-target's power path supports it (PDU script with on/off, or a board that boots on power
-application + a DTR/long-press for off), but the **CLI verbs and the config to express them
-don't exist yet**. Effort: **small** (new verbs over existing mechanisms).
+**Delta (closed 2026-06).** The discrete verbs and the `[power]` hook config shipped with the
+Rust control plane (PWR-1..6 in `requirements.md` §9). What remains is semantic, per-target:
+LAVA's `power_on` must *start the boot*, which depends on the target's power path (PDU/smart
+plug with on/off, or boot-on-power + DTR long-press for off), not on missing CLI surface.
 
 ---
 
@@ -202,9 +204,8 @@ point in the v1 design, implemented later** (unless the owner wants it in the fi
 - **Fuchsia Swarming bots** run on Linux in practice (the bot is Python + host tools); macOS
   bots exist for macOS *build* tasks but a Fuchsia-device bot host is Linux.
 - **paniolo's core power/serial/netboot path is clean on Linux** (per the surface map): the
-  macOS-specific machinery is OCR (Apple Vision), TFTP BPF raw-frame workarounds, and
-  `tftp-now` — all **irrelevant to headless CI**. Serial/power/DTR are platform-agnostic
-  (pyserial; Rust daemon).
+  macOS-specific machinery is OCR (Apple Vision) and the TFTP BPF raw-frame workaround — both
+  **irrelevant to headless CI**. Serial/power/DTR are platform-agnostic (Rust CLI + daemons).
 
 **Conclusion:** keep macOS as a first-class **interactive bringup** host, but treat **Linux as
 the only supported CI control-host OS**. This is a documentation/positioning decision, not new
@@ -217,10 +218,10 @@ code — but it must be stated plainly so nobody tries to run a LAVA worker on a
 | # | Change | Primitive | Effort | Required by |
 |---|---|---|---|---|
 | 1 | Don't run paniolo netboot under CI (orchestrator owns deploy) | Deploy | trivial (docs) | LAVA, Fuchsia |
-| 2 | Discrete `power on` / `power off` / `reset` CLI verbs + config | Power | small | LAVA |
+| 2 | ~~Discrete `power on` / `power off` CLI verbs + config~~ — **shipped** (`[power]` hooks) | Power | done | LAVA |
 | 3 | Raw **TCP** serial passthrough listener (ser2net-equivalent) off serialcap | Serial | medium | LAVA |
 | 4 | **PTY** serial proxy (device-file path) for botanist + write arbitration | Serial | medium | Fuchsia |
-| 5 | `paniolo serial send` (agent write-to-serial; same write channel) | Serial | small | owner feature; helps both |
+| 5 | ~~`paniolo serial send` (agent write-to-serial)~~ — **shipped** | Serial | done | owner feature; helps both |
 | 6 | LAVA device-type template + device dictionary generator (adapter) | — | small–medium | LAVA |
 | 7 | botanist device-config emitter + bot-host power/recipe hook (adapter) | — | medium | Fuchsia |
 | 8 | `serial wait --match` boot-detect helper | Boot | small (optional) | neither (ergonomics) |

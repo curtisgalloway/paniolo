@@ -79,7 +79,8 @@ Lab
                          ├── netboot   (singleton)
                          ├── serial[]  (collection, named)
                          ├── power     (singleton)
-                         └── video     (singleton)
+                         ├── video     (singleton)
+                         └── hid       (singleton; added after this design — opaque injector cmd)
 ```
 
 - **Host** — a machine paniolo reaches over SSH. Fields: `ssh` (required;
@@ -92,6 +93,9 @@ Lab
   (they always have): `netboot` (interface, host_ip, tftp_root), `serial`
   (name, device, baud, power_sense_signal), `power` (cycle_cmd,
   serial_interface), `video` (device). Every channel may carry `host =`.
+  *Since this design: `power` grew `on_cmd`/`off_cmd`/`state_cmd` (the generic
+  hook block) and a `hid` channel (`cmd`) was added — see
+  [power.md](power.md) and [hid.md](hid.md) for the current shapes.*
 
 ### Identity & uniqueness rules
 
@@ -127,15 +131,17 @@ stack trace.
 The lab file is git-tracked and human-authored, so the CLI must edit it
 **politely**: preserve hand-written comments, ordering, and formatting anywhere
 in the file, touching only the tables it changes. This rules out
-parse-then-regenerate. We use **`tomlkit`** (new dependency) for surgical
-document edits.
+parse-then-regenerate. The Python design used **`tomlkit`**; the shipped Rust
+CLI uses **`toml_edit`** (`cli/src/labfile.rs`) for the same surgical document
+edits.
 
 - The lab is parsed into typed dataclasses for *reading* (resolution,
   validation, display).
 - Mutations go through a thin `tomlkit`-backed document layer that edits the
   live `TOMLDocument` and writes it back, preserving trivia.
-- The machine-generated remote slice (`PANIOLO_TARGET_CONFIG`, shipped over SSH,
-  never hand-edited) keeps using a plain dump — no round-trip concern there.
+- The machine-generated remote slice (shipped over SSH as a temp lab file +
+  `--lab`, never hand-edited) keeps using a plain dump — no round-trip concern
+  there.
 
 ## Command surface
 
@@ -167,6 +173,10 @@ write   paniolo init
         paniolo video   set -t TARGET --device ... [--host]
         paniolo video   rm  -t TARGET
 ```
+
+*Since this design, the surface also grew `paniolo hid set/rm` (the `hid`
+channel), `power set --on-cmd/--off-cmd/--state-cmd`, and the runtime verbs
+that consume them (`power on/off`, `power-state`, `hid send/serve/stop`).*
 
 ### Two read views, two purposes
 

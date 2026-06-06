@@ -66,7 +66,7 @@ POST to `#ComputerSystem.Reset` at `/redfish/v1/Systems/<id>/Actions/ComputerSys
 ForceRestart, Nmi, ForceOn, PushPowerButton, PowerCycle, Suspend, Pause, Resume, FullPowerCycle,
 Sleep, Hibernate`. `PowerState` read-back: `On, Off, PoweringOn, PoweringOff, Paused, Sleeping,
 Hibernating`. Paniolo's mapping: `On`→`power on`; `ForceOff`→`power off`; `PowerCycle`/
-`ForceRestart`/`GracefulRestart`→`power reset`; `GracefulShutdown`→`power off` (graceful if the
+`ForceRestart`/`GracefulRestart`→`power-cycle`; `GracefulShutdown`→`power off` (graceful if the
 backend supports it). Paniolo advertises only the supported subset per node via
 `ResetType@Redfish.AllowableValues` / an `ActionInfo` resource — **honesty about capability is a
 requirement** (RF-6), not all values are implementable on a relay/DTR board.

@@ -80,8 +80,8 @@ paniolo power-state [target-machine]
 | ≤ 500 ms | Soft power-button event — OS responds (graceful reboot or halt) |
 | ≥ 3000 ms | Hard PMIC power-off (equivalent to holding the physical button) |
 
-If no `-i` is given, DTR commands use `power_serial_interface` from the target
-config. If that's not set, they fall back to the target's only configured
+If no `-i` is given, DTR commands use `serial_interface` from the target's
+power channel. If that's not set, they fall back to the target's only configured
 serial interface (or fail if multiple are configured without an explicit choice).
 
 ---
