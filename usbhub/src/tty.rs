@@ -102,7 +102,6 @@ fn print_help() {
          port <n>                       map physical port n, then plug the probe into it\n  \
          verify <n>                     cut power on port n; you confirm if it died\n  \
          verify <n> --result dead|alive [--reason \"...\"]   record without the prompt\n  \
-         verify <n> --allow-single-side verify a port mapped on only one side\n  \
          status                         progress and the suggested next step\n  \
          finish --model <name>          write the profile and print the wiring\n  \
          abort                          discard the session (restores power if mid-verify)\n\n\
@@ -242,9 +241,8 @@ fn dispatch(session: &mut Session, sd: &Path, profile_dir: &Path, cmd: LearnCmd)
             physical,
             result,
             reason,
-            allow_single_side,
         } => {
-            verify(session, sd, physical, result, reason, allow_single_side)?;
+            verify(session, sd, physical, result, reason)?;
             Ok(true)
         }
         LearnCmd::Status => {
@@ -296,7 +294,6 @@ fn verify(
     physical: u16,
     result: Option<ResultArg>,
     reason: Option<String>,
-    allow_single_side: bool,
 ) -> Result<()> {
     let (_, mut table) = DeviceTable::snapshot()?;
     match result {
@@ -306,7 +303,7 @@ fn verify(
                 ResultArg::Alive => VerifyResult::Alive,
             };
             if session.pending_verify != Some(physical) {
-                match session.begin_verify(physical, &mut table, allow_single_side, VERIFY_SETTLE) {
+                match session.begin_verify(physical, &mut table, VERIFY_SETTLE) {
                     Ok(m) => println!("{m}"),
                     Err(e) => {
                         println!("error: {e:#}");
@@ -321,7 +318,7 @@ fn verify(
             learn::save_session(sd, session)?;
         }
         None => {
-            match session.begin_verify(physical, &mut table, allow_single_side, VERIFY_SETTLE) {
+            match session.begin_verify(physical, &mut table, VERIFY_SETTLE) {
                 Ok(m) => println!("{m}"),
                 Err(e) => {
                     println!("error: {e:#}");

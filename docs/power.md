@@ -476,20 +476,27 @@ exits.
 
 Probe-device tips:
 
-- A small **USB 3 hub makes the best probe**: it enumerates on both sides at
-  once, mapping a physical port's USB 3 and USB 2 locations in one plug. A
-  flash drive maps only its own side; re-run `learn port <n>` with an
-  other-speed device to fill in the gap (verify refuses single-side mappings
-  by default, since cutting one side can leave the device powered via the
-  other — `--allow-single-side` when the port genuinely has only one).
+- Any probe that enumerates on **either** bus is enough — the two buses are
+  controlled in tandem (see the limitation below), so you map and verify a port
+  once regardless of which bus the probe shows up on.
 - Use a probe **whose power state you can see** — a power LED, or a phone
-  (watch the charging indicator; note a phone usually enumerates USB 2.0, so
-  it maps only that side). "Did it lose power" is the question, and the verify
-  step's enumeration check only narrows it: a probe still on the bus proves
-  the port did *not* cut power, but a probe that vanished could be either real
-  power loss or a mere data disconnect.
+  (watch the charging indicator). "Did it lose power" is the question, and the
+  verify step's enumeration check only narrows it: a probe still on the bus
+  proves the port did *not* cut power, but a probe that vanished could be either
+  real power loss or a mere data disconnect.
 - Ports already occupied by permanent bench fixtures can be mapped by
   unplugging and replugging the fixture itself during `learn port <n>`.
+
+**Limitation — the two buses are controlled in tandem.** A USB 3 port is two
+logical devices (a USB 3 hub and its USB 2 companion) sharing one physical
+VBUS; on real hubs the power usually only drops when both sides' power bits are
+cleared. usbhub therefore treats a physical port as one unit — mapped/verified
+once, and `on`/`off`/`cycle` act on the same `(chip, port)` location on both
+buses together. This assumes the USB 2 companion mirrors the USB 3 port
+numbering for a given physical port (true for the cascaded Realtek-style hubs
+this targets). Hubs with independent per-bus VBUS, or mismatched port numbering
+between the two buses, are not supported. (`--side usb3|usb2` targets one bus
+for debugging, not for independent power control.)
 
 ### Wiring into paniolo power hooks
 

@@ -155,9 +155,6 @@ pub(crate) enum LearnCmd {
         /// Why the port is not controllable (recorded with --result alive).
         #[arg(long)]
         reason: Option<String>,
-        /// Permit verifying a port mapped on only one side.
-        #[arg(long)]
-        allow_single_side: bool,
     },
     /// Show session progress and the suggested next step.
     Status,
@@ -538,14 +535,11 @@ fn cmd_learn(cmd: LearnCmd, profile_dir: &std::path::Path) -> Result<()> {
             physical,
             result,
             reason,
-            allow_single_side,
         } => {
             let mut session = learn::load_session(&sd)?;
             let (_, mut table) = DeviceTable::snapshot()?;
             let msg = match result {
-                None => {
-                    session.begin_verify(physical, &mut table, allow_single_side, VERIFY_SETTLE)?
-                }
+                None => session.begin_verify(physical, &mut table, VERIFY_SETTLE)?,
                 Some(r) => {
                     let vr = match r {
                         ResultArg::Dead => VerifyResult::Dead,

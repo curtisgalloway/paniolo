@@ -88,16 +88,16 @@ and `quit` to leave (the session is saved; resume any time).
 
 **Picking a probe device.** The verify step cuts a port's power and asks you
 whether the device *actually* lost power — so use something whose power state
-you can see:
+you can see. Any probe that enumerates on *either* bus is enough (see the
+limitation below); pick one with a visible power state:
 
-- A **USB 3 hub with a power LED** is the ideal probe: it enumerates on both
-  the USB 3 and USB 2 sides at once, mapping both in a single plug, and its LED
-  answers the "did it really lose power?" question.
-- A **phone** is also excellent — its charging indicator is the signal. When
-  the port really cuts VBUS, charging stops (visible on screen) and the phone
-  drops off the bus. (A phone almost always enumerates as USB 2.0, so it maps
-  only the USB 2 side; use the USB 3 hub if you want both sides in one plug.)
-- A flash drive works but maps only its own side and has no power indicator.
+- A device with a **power LED** is ideal — the LED answers the "did it really
+  lose power?" question directly.
+- A **phone** is excellent — its charging indicator is the signal. When the
+  port really cuts VBUS, charging stops (visible on screen) and the phone drops
+  off the bus.
+- A flash drive works but has no power indicator, so you're relying on the
+  enumeration check alone.
 
 To help, the verify step **re-enumerates the bus after cutting power** and tells
 you whether the probe disappeared: if it's *still* on the bus, the port did not
@@ -162,6 +162,22 @@ Profiles are plain TOML under `profiles/<model>.toml` — version them, share
 them, or hand-edit them (a `controllable = true` you add by hand is just as
 valid as one `learn` recorded, as long as *you* verified it). `--profile-dir`
 overrides the location per command.
+
+## Limitation: the two buses are controlled in tandem
+
+A USB 3 port is two logical devices — a USB 3 hub and its USB 2 companion —
+but they share one physical VBUS, and on real hubs the power usually only
+drops when *both* sides' power bits are cleared. usbhub therefore treats a
+physical port as a single unit: you map and verify it once (with a probe on
+whichever bus it happens to enumerate), and `on`/`off`/`cycle` act on the same
+`(chip, port)` location on **both** buses together.
+
+This assumes the USB 2 companion mirrors the USB 3 side's port numbering for a
+given physical port — true for the cascaded Realtek-style hubs this was built
+for. **Not supported:** hubs whose two buses expose independent VBUS, or number
+their ports differently between the USB 2 and USB 3 sides. (`--side usb3|usb2`
+on the control commands can target one bus for debugging, but it isn't a way to
+power the two halves independently.)
 
 ## License
 

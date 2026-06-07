@@ -265,8 +265,11 @@ impl Session {
         }
     }
 
-    /// Record where the probe arrived for a physical port. Re-running the
-    /// walk for the same port (e.g. with the other-speed probe) merges.
+    /// Record where the probe arrived for a physical port. Seeing the probe on
+    /// either bus is enough: the USB 2 and USB 3 halves of a port share VBUS,
+    /// so power control acts on the same (chip path, port) on both buses in
+    /// tandem (see the limitation in docs/power.md). Re-running the walk for
+    /// the same port merges (e.g. to also record the other bus's probe key).
     pub fn record_port(&mut self, physical: u16, findings: &[PortFinding]) -> Result<String> {
         self.expect_stage(Stage::Captured, "run the capture steps first")?;
         let entry = self.ports.entry(physical).or_default();
@@ -287,62 +290,55 @@ impl Session {
                 }
             }
         }
-        if entry.usb3.is_none() || entry.usb2.is_none() {
-            let missing = if entry.usb3.is_none() { "usb3" } else { "usb2" };
-            msg.push_str(&format!(
-                "  ({missing} side still unmapped — re-run `usbhub learn port \
-                 {physical}` with a {missing}-speed probe to map it)\n"
-            ));
-        }
         msg.push_str(&format!(
             "Next: `usbhub learn verify {physical}` (leave the probe plugged \
-             in), or map another port"
+             in) — power control acts on both buses in tandem, so one mapping \
+             is enough; or map another port"
         ));
         Ok(msg)
     }
 
-    fn cascade_chip(&self, side: Side, path: &str) -> Result<&DevRecord> {
-        self.cascades
-            .iter()
-            .find(|c| c.side == side)
-            .and_then(|c| c.chip(path))
-            .with_context(|| format!("no captured {side} chip at path {path:?}"))
-    }
-
-    /// Mapped sides of a physical port, with their chip records.
+    /// The chip locations to act on for a physical port. The USB 2 and USB 3
+    /// halves of a port share VBUS, so a port maps to ONE (chip path, port)
+    /// and we act on that location on *every* cascade bus that has such a chip
+    /// — controlling the two buses in tandem. The canonical location comes
+    /// from whichever bus the probe was seen on; the assumption that both
+    /// buses mirror that location is the documented limitation.
     fn mapped_sides(&self, physical: u16) -> Result<Vec<(Side, DevRecord, u8)>> {
         let entry = self.ports.get(&physical).with_context(|| {
             format!(
                 "physical port {physical} not mapped — run `usbhub learn port {physical}` first"
             )
         })?;
-        let mut out = Vec::new();
-        if let Some(sp) = &entry.usb3 {
-            out.push((
-                Side::Usb3,
-                self.cascade_chip(Side::Usb3, &sp.path)?.clone(),
-                sp.port,
-            ));
-        }
-        if let Some(sp) = &entry.usb2 {
-            out.push((
-                Side::Usb2,
-                self.cascade_chip(Side::Usb2, &sp.path)?.clone(),
-                sp.port,
-            ));
+        let canonical = entry
+            .usb3
+            .as_ref()
+            .or(entry.usb2.as_ref())
+            .with_context(|| format!("physical port {physical} has no mapping recorded"))?;
+        let out: Vec<(Side, DevRecord, u8)> = self
+            .cascades
+            .iter()
+            .filter_map(|c| {
+                c.chip(&canonical.path)
+                    .map(|chip| (c.side, chip.clone(), canonical.port))
+            })
+            .collect();
+        if out.is_empty() {
+            bail!(
+                "no captured chip at path {:?} for port {physical}",
+                canonical.path
+            );
         }
         Ok(out)
     }
 
     /// Cut power on a mapped port so the human can observe whether the probe
-    /// actually dies. Refuses to run with another verify pending, and — by
-    /// default — refuses single-side mappings, where "off" can mean "fell
-    /// back to the other topology, still powered".
+    /// actually dies. Acts on both buses in tandem (see [`Session::mapped_sides`]).
+    /// Refuses to run with another verify already pending.
     pub fn begin_verify(
         &mut self,
         physical: u16,
         hw: &mut dyn PortSwitch,
-        allow_single_side: bool,
         settle: Duration,
     ) -> Result<String> {
         self.expect_stage(Stage::Captured, "run the capture steps first")?;
@@ -353,16 +349,6 @@ impl Session {
             );
         }
         let sides = self.mapped_sides(physical)?;
-        let both = self.cascades.len() < 2
-            || (self.ports[&physical].usb3.is_some() && self.ports[&physical].usb2.is_some());
-        if !both && !allow_single_side {
-            bail!(
-                "physical port {physical} is mapped on only one side; cutting \
-                 one side can leave the device powered on the other. Map the \
-                 other side first, or pass --allow-single-side if this port \
-                 (or the uplink) genuinely has only this side."
-            );
-        }
 
         // Snapshot the bus before cutting power, so the after-shot can tell us
         // whether the probe device actually dropped off.
@@ -579,13 +565,27 @@ impl Session {
         let ports = self
             .ports
             .iter()
-            .map(|(physical, p)| PortEntry {
-                physical: *physical,
-                usb3: p.usb3.clone(),
-                usb2: p.usb2.clone(),
-                controllable: p.result.map(|r| r == VerifyResult::Dead),
-                reason: p.reason.clone(),
-                note: None,
+            .map(|(physical, p)| {
+                // Mirror the one canonical (path, port) — from whichever bus
+                // the probe was seen on — onto every bus that has a chip there,
+                // so the profile drives both buses in tandem.
+                let canonical = p.usb3.clone().or_else(|| p.usb2.clone());
+                let on_bus = |side: Side| -> Option<SidePort> {
+                    let loc = canonical.as_ref()?;
+                    self.cascades
+                        .iter()
+                        .find(|c| c.side == side)
+                        .and_then(|c| c.chip(&loc.path))
+                        .map(|_| loc.clone())
+                };
+                PortEntry {
+                    physical: *physical,
+                    usb3: on_bus(Side::Usb3),
+                    usb2: on_bus(Side::Usb2),
+                    controllable: p.result.map(|r| r == VerifyResult::Dead),
+                    reason: p.reason.clone(),
+                    note: None,
+                }
             })
             .collect();
 
@@ -919,7 +919,8 @@ mod tests {
             panic!()
         };
         let msg = s.record_port(7, &f1).unwrap();
-        assert!(msg.contains("usb2 side still unmapped"), "{msg}");
+        assert!(msg.contains("Next:"), "{msg}");
+        assert!(s.ports[&7].usb3.is_some() && s.ports[&7].usb2.is_none());
 
         let mut now2 = hub_snap();
         now2.push(rec("1", &[3, 4, 1], 0x0951, 0x1666, 0, "high"));
@@ -957,7 +958,7 @@ mod tests {
     fn verify_dead_records_controllable_and_restores() {
         let mut s = mapped_session();
         let mut hw = hw_port7(false);
-        let msg = s.begin_verify(7, &mut hw, false, Duration::ZERO).unwrap();
+        let msg = s.begin_verify(7, &mut hw, Duration::ZERO).unwrap();
         assert!(msg.contains("status bit now reads off"), "{msg}");
         // The probe really dropped off the bus when power was cut.
         assert!(msg.contains("dropped off the bus"), "{msg}");
@@ -980,7 +981,7 @@ mod tests {
         // A lying hub: PORT_POWER clears but the probe never leaves the bus.
         let mut s = mapped_session();
         let mut hw = hw_port7(true);
-        let msg = s.begin_verify(7, &mut hw, false, Duration::ZERO).unwrap();
+        let msg = s.begin_verify(7, &mut hw, Duration::ZERO).unwrap();
         assert!(msg.contains("STILL on the bus"), "{msg}");
         assert_eq!(s.pending_recommendation(), Some(VerifyResult::Alive));
 
@@ -996,7 +997,7 @@ mod tests {
     fn verify_alive_records_reason() {
         let mut s = mapped_session();
         let mut hw = MockHw::default();
-        s.begin_verify(7, &mut hw, false, Duration::ZERO).unwrap();
+        s.begin_verify(7, &mut hw, Duration::ZERO).unwrap();
         s.record_verify(7, VerifyResult::Alive, None, &mut hw)
             .unwrap();
         assert_eq!(s.ports[&7].result, Some(VerifyResult::Alive));
@@ -1008,17 +1009,19 @@ mod tests {
     }
 
     #[test]
-    fn verify_single_side_refused_without_flag() {
+    fn single_side_mapping_cuts_both_buses_in_tandem() {
+        // The probe was only seen on the USB 3 bus (path "4", port 1), but
+        // verify must still cut the USB 2 companion chip at the same location.
         let mut s = captured_session();
         s.record_port(7, &[finding(Side::Usb3, "4", 1, probe_u3())])
             .unwrap();
         let mut hw = MockHw::default();
-        let err = s
-            .begin_verify(7, &mut hw, false, Duration::ZERO)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("only one side"), "{err}");
-        assert!(s.begin_verify(7, &mut hw, true, Duration::ZERO).is_ok());
+        s.begin_verify(7, &mut hw, Duration::ZERO).unwrap();
+        assert_eq!(
+            hw.calls,
+            vec!["usb3 1.4 p1 off", "usb2 3.4 p1 off"],
+            "both buses' chip at path 4 / port 1 should be cut"
+        );
     }
 
     #[test]
@@ -1043,9 +1046,9 @@ mod tests {
         )
         .unwrap();
         let mut hw = MockHw::default();
-        s.begin_verify(7, &mut hw, false, Duration::ZERO).unwrap();
+        s.begin_verify(7, &mut hw, Duration::ZERO).unwrap();
         let err = s
-            .begin_verify(8, &mut hw, false, Duration::ZERO)
+            .begin_verify(8, &mut hw, Duration::ZERO)
             .unwrap_err()
             .to_string();
         assert!(err.contains("still powered off"), "{err}");
@@ -1055,7 +1058,7 @@ mod tests {
     fn restore_failure_is_loud() {
         let mut s = mapped_session();
         let mut hw = MockHw::default();
-        s.begin_verify(7, &mut hw, false, Duration::ZERO).unwrap();
+        s.begin_verify(7, &mut hw, Duration::ZERO).unwrap();
         hw.fail_restore = true;
         let msg = s
             .record_verify(7, VerifyResult::Dead, None, &mut hw)
@@ -1068,7 +1071,7 @@ mod tests {
     fn finish_compiles_profile() {
         let mut s = mapped_session();
         let mut hw = MockHw::default();
-        s.begin_verify(7, &mut hw, false, Duration::ZERO).unwrap();
+        s.begin_verify(7, &mut hw, Duration::ZERO).unwrap();
         s.record_verify(7, VerifyResult::Dead, None, &mut hw)
             .unwrap();
         // Port 8 mapped but never verified; port 9 verified alive.
@@ -1100,7 +1103,7 @@ mod tests {
             ],
         )
         .unwrap();
-        s.begin_verify(9, &mut hw, false, Duration::ZERO).unwrap();
+        s.begin_verify(9, &mut hw, Duration::ZERO).unwrap();
         s.record_verify(9, VerifyResult::Alive, Some("ganged rail".into()), &mut hw)
             .unwrap();
 
@@ -1124,7 +1127,7 @@ mod tests {
     fn finish_blocked_with_pending_verify() {
         let mut s = mapped_session();
         let mut hw = MockHw::default();
-        s.begin_verify(7, &mut hw, false, Duration::ZERO).unwrap();
+        s.begin_verify(7, &mut hw, Duration::ZERO).unwrap();
         let err = s.finish("x", None).unwrap_err().to_string();
         assert!(err.contains("awaiting its verdict"), "{err}");
     }
