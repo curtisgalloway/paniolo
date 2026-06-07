@@ -148,14 +148,14 @@ observation or records one human report, persists the session, and prints what
 to do next:
 
 ```
-usbhub learn start                    snapshot the bus; then unplug the hub
+usbhub learn edit                     snapshot the bus; then unplug the hub
 usbhub learn unplugged                snapshot; then plug the hub back in
 usbhub learn plugged                  diff → capture the hub's chip cascade
 usbhub learn port <n>                 then plug the probe into physical port n
 usbhub learn verify <n>               cut power; look at the probe
 usbhub learn verify <n> --result dead|alive [--reason "..."]
 usbhub learn status                   progress + suggested next step
-usbhub learn finish --model <name>    write the profile, print the commands
+usbhub learn save --model <name>      write the profile, print the commands
 usbhub learn abort                    discard (restores power if mid-verify)
 ```
 

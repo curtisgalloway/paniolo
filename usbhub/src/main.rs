@@ -116,9 +116,9 @@ enum Cmd {
 
 #[derive(Subcommand)]
 pub(crate) enum LearnCmd {
-    /// Begin a session: snapshot the bus as-is.
-    Start {
-        /// Discard an existing unfinished session.
+    /// Open a session to build (or rebuild) a profile: snapshot the bus as-is.
+    Edit {
+        /// Discard an existing unsaved session.
         #[arg(long)]
         force: bool,
     },
@@ -149,8 +149,8 @@ pub(crate) enum LearnCmd {
     Status,
     /// Abandon the session (restores power if a verify was pending).
     Abort,
-    /// Compile the session into a profile and write it to the profiles dir.
-    Finish {
+    /// Save the session as a profile (writes it to the profiles dir).
+    Save {
         #[arg(long)]
         model: String,
         #[arg(long)]
@@ -477,12 +477,12 @@ fn cmd_cycle(ctx: &mut Ctx, physical: u16, delay_ms: u64, side: SideArg) -> Resu
 fn cmd_learn(cmd: LearnCmd, profile_dir: &std::path::Path) -> Result<()> {
     let sd = profile::state_dir();
     match cmd {
-        LearnCmd::Start { force } => {
+        LearnCmd::Edit { force } => {
             if let Ok(existing) = learn::load_session(&sd) {
                 if existing.stage != Stage::Finished && !force {
                     bail!(
-                        "an unfinished learn session exists (stage {:?}) — resume it \
-                         (`usbhub learn status`), or discard with `usbhub learn start --force`",
+                        "an unsaved learn session exists (stage {:?}) — resume it \
+                         (`usbhub learn status`), or discard with `usbhub learn edit --force`",
                         existing.stage
                     );
                 }
@@ -490,7 +490,7 @@ fn cmd_learn(cmd: LearnCmd, profile_dir: &std::path::Path) -> Result<()> {
             let session = Session::start(topo::snapshot()?);
             learn::save_session(&sd, &session)?;
             println!(
-                "Session started: {} device(s) on the bus.\n\
+                "Editing a new profile: {} device(s) on the bus.\n\
                  Next: unplug the hub from the host, then run `usbhub learn unplugged`",
                 session.snap_start.len()
             );
@@ -559,7 +559,7 @@ fn cmd_learn(cmd: LearnCmd, profile_dir: &std::path::Path) -> Result<()> {
             println!("Session discarded.");
             Ok(())
         }
-        LearnCmd::Finish { model, description } => {
+        LearnCmd::Save { model, description } => {
             let mut session = learn::load_session(&sd)?;
             let msg = finish_session(&mut session, &model, description, profile_dir)?;
             learn::save_session(&sd, &session)?;
@@ -620,8 +620,7 @@ pub(crate) fn walk_port(session: &mut Session, physical: u16, timeout_secs: u64)
     }
 }
 
-/// Compile and write the profile; shared by `learn finish` and the TTY
-/// harness.
+/// Compile and write the profile; shared by `learn save` and the wizard.
 pub(crate) fn finish_session(
     session: &mut Session,
     model: &str,

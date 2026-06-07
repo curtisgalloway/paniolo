@@ -184,7 +184,7 @@ impl Session {
 
     /// Record the snapshot taken after the hub was unplugged.
     pub fn unplugged(&mut self, snap: Vec<DevRecord>) -> Result<String> {
-        self.expect_stage(Stage::Started, "run `usbhub learn start` first")?;
+        self.expect_stage(Stage::Started, "run `usbhub learn edit` first")?;
         let removed = diff_removed(&self.snap_start, &snap);
         let mut msg = String::new();
         if removed.is_empty() {
@@ -522,7 +522,7 @@ impl Session {
                 VerifyResult::Alive => "is NOT controllable",
             }
         ));
-        msg.push_str("Next: map/verify another port, or `usbhub learn finish --model <name>`");
+        msg.push_str("Next: map/verify another port, or `usbhub learn save --model <name>`");
         Ok(msg)
     }
 
@@ -530,10 +530,10 @@ impl Session {
     pub fn finish(&mut self, model: &str, description: Option<String>) -> Result<Profile> {
         self.expect_stage(Stage::Captured, "nothing captured yet")?;
         if let Some(p) = self.pending_verify {
-            bail!("port {p} is still awaiting its verdict — report it before finishing");
+            bail!("port {p} is still awaiting its verdict — report it before saving");
         }
         if self.ports.is_empty() {
-            bail!("no ports mapped — walk at least one port before finishing");
+            bail!("no ports mapped — walk at least one port before saving");
         }
 
         // One chip entry per internal path; sides sharing a path share an
@@ -695,10 +695,10 @@ impl Session {
                     "`usbhub learn port <n>` to map your first physical port"
                 } else {
                     "`usbhub learn port <n>`, `usbhub learn verify <n>`, or \
-                     `usbhub learn finish --model <name>`"
+                     `usbhub learn save --model <name>`"
                 }
             }
-            Stage::Finished => "`usbhub learn start --force` to begin a new session",
+            Stage::Finished => "`usbhub learn edit --force` to begin a new session",
         }
     }
 }
@@ -715,7 +715,7 @@ pub fn load_session(state_dir: &Path) -> Result<Session> {
     let path = session_path(state_dir);
     let text = std::fs::read_to_string(&path).with_context(|| {
         format!(
-            "no learn session at {} — start one with `usbhub learn start`",
+            "no learn session at {} — start one with `usbhub learn edit`",
             path.display()
         )
     })?;

@@ -454,7 +454,7 @@ still comes from a human watching the probe lose power.
 Agent-driven (each step prints what happened and a `Next:` line):
 
 ```bash
-usbhub learn start            # snapshot; then unplug the hub
+usbhub learn edit             # snapshot; then unplug the hub
 usbhub learn unplugged        # snapshot; then plug the hub back in
 usbhub learn plugged          # diff → the hub's full chip cascade, both sides
 usbhub learn port 7           # then plug the probe into physical port 7;
@@ -463,7 +463,7 @@ usbhub learn verify 7         # cuts power; look at the probe device
 usbhub learn verify 7 --result dead         # probe died → controllable
 usbhub learn verify 7 --result alive --reason "ganged rail"   # → not controllable
 usbhub learn status           # progress + suggested next step
-usbhub learn finish --model rsh-st10c-6     # write the profile, print wiring
+usbhub learn save --model rsh-st10c-6       # write the profile, print wiring
 usbhub learn abort            # discard (restores power if a verify is pending)
 ```
 
@@ -511,7 +511,7 @@ paniolo power set -t pi5 \
     --state-cmd "usbhub --model rsh-st10c-6 state 9"
 ```
 
-`learn finish` prints exactly this block for the model it just wrote. Add
+`learn save` prints exactly this block for the model it just wrote. Add
 `--at usb3=BUS:CHAIN,usb2=BUS:CHAIN` to each command only if several
 identical hubs share the control host.
 
