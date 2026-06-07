@@ -76,15 +76,23 @@ each port and asks you to confirm the device actually died:
 usbhub learn run
 ```
 
-`run` is a guided wizard: it asks for the model name and how many physical
-ports the hub has, walks you through unplugging/replugging it once (to capture
-the chip cascade), then for **each port** has you plug the probe in, detects
-where it landed, cuts the power, and asks whether it actually died — finally
-writing the profile and printing the commands to drive the hub. Prompts have
-↑/↓ history and line editing, and the session is saved as you go, so you can
-quit (Ctrl-D) and resume any time. Everything it does is also available as the
-discrete `usbhub learn <step>` subcommands (below) if you'd rather drive it by
-hand.
+`run` is a guided wizard. It asks for a model name:
+
+- **A new name** → it asks how many physical ports the hub has, walks you
+  through unplugging/replugging it once (to capture the chip cascade), then for
+  **each port** has you plug the probe in, detects where it landed, cuts the
+  power, and asks whether it actually died.
+- **An existing profile's name** → it loads that profile (resolving its chips
+  against the live hub, no replug needed) and drops you straight into the
+  review step, where you can re-verify or add any port.
+
+Either way you finish at a **review** screen showing every port's verdict;
+type a port number to (re)do it, or `save` to write the profile and print the
+commands to drive the hub. Prompts have ↑/↓ history and line editing, and the
+session is saved as you go, so you can quit (Ctrl-D) and resume any time.
+Everything it does is also available as the discrete `usbhub learn <step>`
+subcommands (below) — including `usbhub learn edit <model>` to load an existing
+profile for hand editing.
 
 **Picking a probe device.** The verify step cuts a port's power and asks you
 whether the device *actually* lost power — so use something whose power state
@@ -148,7 +156,8 @@ observation or records one human report, persists the session, and prints what
 to do next:
 
 ```
-usbhub learn edit                     snapshot the bus; then unplug the hub
+usbhub learn edit [model]             load <model>'s profile to edit if it exists,
+                                      else snapshot the bus to capture anew
 usbhub learn unplugged                snapshot; then plug the hub back in
 usbhub learn plugged                  diff → capture the hub's chip cascade
 usbhub learn port <n>                 then plug the probe into physical port n

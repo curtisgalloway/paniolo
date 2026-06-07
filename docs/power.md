@@ -454,7 +454,7 @@ still comes from a human watching the probe lose power.
 Agent-driven (each step prints what happened and a `Next:` line):
 
 ```bash
-usbhub learn edit             # snapshot; then unplug the hub
+usbhub learn edit [model]     # load <model> to edit if it exists, else capture anew
 usbhub learn unplugged        # snapshot; then plug the hub back in
 usbhub learn plugged          # diff → the hub's full chip cascade, both sides
 usbhub learn port 7           # then plug the probe into physical port 7;
@@ -467,9 +467,11 @@ usbhub learn save --model rsh-st10c-6       # write the profile, print wiring
 usbhub learn abort            # discard (restores power if a verify is pending)
 ```
 
-Human-driven: `usbhub learn run` is a guided wizard over the same steps — it
-asks for the model name and port count, walks the unplug/replug capture, then
-maps-and-verifies each port in turn and writes the profile at the end. Prompts
+Human-driven: `usbhub learn run` is a guided wizard over the same steps. Name a
+new model and it asks the port count, walks the unplug/replug capture, then
+maps-and-verifies each port; name an **existing profile** and it loads it
+(resolved against the live hub, no replug) for editing. Either way it ends at a
+review screen — type a port number to (re)do it, or `save` to write. Prompts
 have ↑/↓ history and line editing (rustyline), the session is saved as you go
 (Ctrl-D to quit and resume later), and a session started by the wizard can be
 finished with the discrete steps and vice versa.

@@ -171,6 +171,31 @@ impl Session {
         }
     }
 
+    /// An already-captured session reconstructed from a saved profile, ready
+    /// to edit: the `cascades` come from resolving the profile's chips against
+    /// the live hub, the `ports` from its existing entries. The probe keys are
+    /// unknown (so a re-verify's enumeration check reports `Unknown` until the
+    /// probe is re-walked), which is fine — the human still confirms.
+    pub fn for_edit(
+        model: &str,
+        port_count: u16,
+        cascades: Vec<Cascade>,
+        ports: BTreeMap<u16, PortLearn>,
+    ) -> Session {
+        Session {
+            version: 1,
+            stage: Stage::Captured,
+            model: Some(model.to_string()),
+            port_count: Some(port_count),
+            snap_start: Vec::new(),
+            snap_unplugged: None,
+            cascades,
+            ports,
+            pending_verify: None,
+            pending_liveness: None,
+        }
+    }
+
     fn expect_stage(&self, want: Stage, hint: &str) -> Result<()> {
         if self.stage != want {
             bail!(

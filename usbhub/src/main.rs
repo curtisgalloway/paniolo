@@ -116,8 +116,12 @@ enum Cmd {
 
 #[derive(Subcommand)]
 pub(crate) enum LearnCmd {
-    /// Open a session to build (or rebuild) a profile: snapshot the bus as-is.
+    /// Open a session to build or edit a profile. With a model that already
+    /// has a profile, loads it (resolved against the live hub) so you can
+    /// re-verify or add ports; otherwise snapshots the bus to capture anew.
     Edit {
+        /// Existing profile to edit, or the name for a new one.
+        model: Option<String>,
         /// Discard an existing unsaved session.
         #[arg(long)]
         force: bool,
@@ -477,7 +481,7 @@ fn cmd_cycle(ctx: &mut Ctx, physical: u16, delay_ms: u64, side: SideArg) -> Resu
 fn cmd_learn(cmd: LearnCmd, profile_dir: &std::path::Path) -> Result<()> {
     let sd = profile::state_dir();
     match cmd {
-        LearnCmd::Edit { force } => {
+        LearnCmd::Edit { model, force } => {
             if let Ok(existing) = learn::load_session(&sd) {
                 if existing.stage != Stage::Finished && !force {
                     bail!(
@@ -487,10 +491,31 @@ fn cmd_learn(cmd: LearnCmd, profile_dir: &std::path::Path) -> Result<()> {
                     );
                 }
             }
-            let session = Session::start(topo::snapshot()?);
+            // If the model already has a profile, load it for editing.
+            if let Some(model) = &model {
+                let profile_path = profile_dir.join(format!("{model}.toml"));
+                if profile_path.exists() {
+                    let session = tty::reconstruct_session(profile_dir, model)?;
+                    learn::save_session(&sd, &session)?;
+                    println!(
+                        "Editing profile {model:?} ({} port(s) recorded). Re-verify a port with \
+                         `usbhub learn verify <n>`, map a new one with `usbhub learn port <n>`, \
+                         then `usbhub learn save --model {model}`.",
+                        session.ports.len()
+                    );
+                    return Ok(());
+                }
+            }
+            // Otherwise begin a fresh capture (carrying the model name if given).
+            let mut session = Session::start(topo::snapshot()?);
+            session.model = model.clone();
             learn::save_session(&sd, &session)?;
+            let label = match &model {
+                Some(m) => format!("new profile {m:?}"),
+                None => "a new profile".to_string(),
+            };
             println!(
-                "Editing a new profile: {} device(s) on the bus.\n\
+                "Editing {label}: {} device(s) on the bus.\n\
                  Next: unplug the hub from the host, then run `usbhub learn unplugged`",
                 session.snap_start.len()
             );
