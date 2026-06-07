@@ -309,20 +309,25 @@ pub fn relative_path(root: &DevRecord, dev: &DevRecord) -> Result<String> {
     Ok(chain_str(&dev.port_chain[root.port_chain.len()..]))
 }
 
-/// Given a device that arrived during a port walk, attribute it to a chip
-/// port: the device (or its topmost arrived ancestor, for compound probe
-/// devices that contain their own hub) must be an immediate child of one of
-/// the cascade's chips. Returns (chip path, port number on that chip, and the
-/// key of that topmost device — so the verify step can later check whether it
-/// disappears when the port's power is cut).
+/// Given the devices that arrived during a port walk, attribute one to a chip
+/// port on this cascade: the device (or its topmost arrived ancestor, for a
+/// compound probe that contains its own hub) must be an immediate child of one
+/// of the cascade's chips. Returns (chip path, port number on that chip, and
+/// the key of that topmost device — so the verify step can later check whether
+/// it disappears when the port's power is cut).
+///
+/// Matching is purely by bus topology (same bus, immediate child of a chip's
+/// port chain) — deliberately NOT by USB speed. The cascade already pins each
+/// bus to specific chip positions, so a device's chain falls under exactly one
+/// cascade regardless of the speed the OS reports. This is what lets a probe
+/// whose connection speed the OS doesn't surface (e.g. an adb phone reported
+/// with no speed) still be detected, instead of being dropped because
+/// [`DevRecord::side`] is `None`.
 pub fn attribute_arrival(cascade: &Cascade, added: &[DevRecord]) -> Option<(String, u8, DevKey)> {
     // Topmost first: shorter chains are closer to the root.
-    let mut on_side: Vec<&DevRecord> = added
-        .iter()
-        .filter(|d| d.side() == Some(cascade.side))
-        .collect();
-    on_side.sort_by_key(|d| d.port_chain.len());
-    for dev in on_side {
+    let mut arrivals: Vec<&DevRecord> = added.iter().collect();
+    arrivals.sort_by_key(|d| d.port_chain.len());
+    for dev in arrivals {
         for chip in &cascade.chips {
             let c = &chip.dev;
             if dev.bus_id == c.bus_id
@@ -492,6 +497,29 @@ mod tests {
         assert_eq!(
             attribute_arrival(usb3, &added),
             Some(("".to_string(), 6, probe.key()))
+        );
+    }
+
+    #[test]
+    fn arrival_attribution_ignores_unknown_speed() {
+        // An adb phone whose connection speed the OS doesn't report still has
+        // a valid topology position, so it must be attributed by position.
+        let cascades = derive_cascades(&rsh_arrival()).unwrap();
+        let usb2 = cascades.iter().find(|c| c.side == Side::Usb2).unwrap();
+        let probe = DevRecord {
+            bus_id: "1".to_string(),
+            port_chain: vec![3, 4, 1],
+            vid: 0x18d1,
+            pid: 0x4ee7,
+            class: 0,
+            speed: None,
+            product: Some("Pixel".to_string()),
+            serial: None,
+        };
+        let added = vec![probe.clone()];
+        assert_eq!(
+            attribute_arrival(usb2, &added),
+            Some(("4".to_string(), 1, probe.key()))
         );
     }
 

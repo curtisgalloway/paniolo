@@ -467,18 +467,21 @@ usbhub learn finish --model rsh-st10c-6     # write the profile, print wiring
 usbhub learn abort            # discard (restores power if a verify is pending)
 ```
 
-Human-driven: `usbhub learn run` wraps the same steps in an interactive TTY
-loop, so a session started by an agent can be finished by hand and vice versa.
-Its `learn>` prompt takes the **same commands as `usbhub learn <cmd>`** (the
-`usbhub learn` prefix optional, names abbreviatable — `ver 7`), so the printed
-`Next:` hints are typeable verbatim; `help` lists them and `quit` saves and
-exits.
+Human-driven: `usbhub learn run` is a guided wizard over the same steps — it
+asks for the model name and port count, walks the unplug/replug capture, then
+maps-and-verifies each port in turn and writes the profile at the end. Prompts
+have ↑/↓ history and line editing (rustyline), the session is saved as you go
+(Ctrl-D to quit and resume later), and a session started by the wizard can be
+finished with the discrete steps and vice versa.
 
 Probe-device tips:
 
-- Any probe that enumerates on **either** bus is enough — the two buses are
-  controlled in tandem (see the limitation below), so you map and verify a port
-  once regardless of which bus the probe shows up on.
+- Any probe that enumerates on **either** bus is enough — detection is by bus
+  topology, not USB speed, and the two buses are controlled in tandem (see the
+  limitation below), so you map and verify a port once regardless of which bus
+  the probe shows up on or whether the OS reports its speed. (An adb-enabled
+  Android enumerates fine; a charge-only phone that presents no data device
+  won't be seen — unlock it or use another probe.)
 - Use a probe **whose power state you can see** — a power LED, or a phone
   (watch the charging indicator). "Did it lose power" is the question, and the
   verify step's enumeration check only narrows it: a probe still on the bus

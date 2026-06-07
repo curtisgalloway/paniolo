@@ -214,9 +214,10 @@ usbhub/          Rust crate: standalone helper for per-port USB hub power contro
                  resolution of the internal chip cascade, both USB3 + USB2 sides);
                  ports by physical silkscreen number. Switching refused unless a
                  human verified the port cuts power — profiles are built with the
-                 resumable `usbhub learn` step commands (agent-drivable; `learn run`
-                 is the interactive TTY wrapper). `state <port>` prints exactly
-                 `on`/`off` (state_cmd contract). See docs/power.md.
+                 resumable `usbhub learn` step commands (agent-drivable) or the
+                 `learn run` guided wizard (rustyline prompts, history). Probe
+                 detection is by bus topology, not speed. `state <port>` prints
+                 exactly `on`/`off` (state_cmd contract). See docs/power.md.
 
 zigplug/         Python (uv) helper: Zigbee smart plug control via a CC2652 (ZNP)
                  coordinator dongle, using zigpy-znp. CLI wired into paniolo

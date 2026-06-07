@@ -120,6 +120,12 @@ pub struct PortFinding {
 pub struct Session {
     pub version: u32,
     pub stage: Stage,
+    /// Model name for the profile (asked up front by the `run` wizard).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Number of physical (silkscreen) ports the wizard will walk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port_count: Option<u16>,
     pub snap_start: Vec<DevRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snap_unplugged: Option<Vec<DevRecord>>,
@@ -154,6 +160,8 @@ impl Session {
         Session {
             version: 1,
             stage: Stage::Started,
+            model: None,
+            port_count: None,
             snap_start: snap,
             snap_unplugged: None,
             cascades: Vec::new(),

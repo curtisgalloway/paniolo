@@ -114,17 +114,6 @@ enum Cmd {
     },
 }
 
-/// One line typed at the `usbhub learn run` prompt, parsed as the same
-/// vocabulary as the `usbhub learn <cmd>` CLI subcommands (with
-/// `infer_subcommands`, so abbreviations like `ver 3` work). `no_binary_name`
-/// means the first token is the subcommand, not a program name.
-#[derive(Parser)]
-#[command(no_binary_name = true, infer_subcommands = true)]
-pub(crate) struct LearnLine {
-    #[command(subcommand)]
-    pub cmd: LearnCmd,
-}
-
 #[derive(Subcommand)]
 pub(crate) enum LearnCmd {
     /// Begin a session: snapshot the bus as-is.

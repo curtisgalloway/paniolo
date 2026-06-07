@@ -76,15 +76,15 @@ each port and asks you to confirm the device actually died:
 usbhub learn run
 ```
 
-It guides you through unplugging/replugging the hub (to capture its chip
-cascade), plugging a probe device into each physical port (to map them), and a
-power-off check per port (to verify controllability). At the end it writes a
-profile and prints the exact commands to drive the hub.
-
-The `learn>` prompt takes the **same commands as `usbhub learn <cmd>`** (the
-`usbhub learn` prefix is optional and names can be abbreviated — `ver 7` works),
-so the `Next:` hints it prints are typeable verbatim. Type `help` for the list
-and `quit` to leave (the session is saved; resume any time).
+`run` is a guided wizard: it asks for the model name and how many physical
+ports the hub has, walks you through unplugging/replugging it once (to capture
+the chip cascade), then for **each port** has you plug the probe in, detects
+where it landed, cuts the power, and asks whether it actually died — finally
+writing the profile and printing the commands to drive the hub. Prompts have
+↑/↓ history and line editing, and the session is saved as you go, so you can
+quit (Ctrl-D) and resume any time. Everything it does is also available as the
+discrete `usbhub learn <step>` subcommands (below) if you'd rather drive it by
+hand.
 
 **Picking a probe device.** The verify step cuts a port's power and asks you
 whether the device *actually* lost power — so use something whose power state
@@ -95,9 +95,16 @@ limitation below); pick one with a visible power state:
   lose power?" question directly.
 - A **phone** is excellent — its charging indicator is the signal. When the
   port really cuts VBUS, charging stops (visible on screen) and the phone drops
-  off the bus.
+  off the bus. It just has to *enumerate* as a USB device: an Android with USB
+  debugging (adb) on works well; an iPhone (or any phone) sitting in
+  charge-only mode may not present a data device, so the walk won't see it —
+  unlock it / pick a data mode, or use a different probe.
 - A flash drive works but has no power indicator, so you're relying on the
   enumeration check alone.
+
+Detection is by **bus topology**, not USB speed, so a probe whose connection
+speed the OS doesn't report still maps correctly — that was the fix for phones
+that enumerate without a speed.
 
 To help, the verify step **re-enumerates the bus after cutting power** and tells
 you whether the probe disappeared: if it's *still* on the bus, the port did not
@@ -135,9 +142,10 @@ hubs share the host — the ambiguity error prints the exact pins to paste.
 
 ### Scriptable learn steps
 
-`learn run` is a wrapper over discrete, resumable subcommands you can also
-drive from a script or an agent — each does one observation or records one
-human report, persists the session, and prints what to do next:
+`learn run` drives the same discrete, resumable subcommands the wizard uses;
+you can also run them directly from a script or an agent. Each does one
+observation or records one human report, persists the session, and prints what
+to do next:
 
 ```
 usbhub learn start                    snapshot the bus; then unplug the hub
