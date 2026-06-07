@@ -444,9 +444,12 @@ command.
 
 A profile is built at the bench with `usbhub learn` — a resumable session of
 discrete steps. The division of labor: **the tool observes enumeration, the
-human observes physics.** The tool can see a device appear at chip port 2; it
-cannot see whether VBUS actually dropped — so every controllability record
-comes from a human watching the probe device's LED.
+human observes physics.** The tool can see a device appear at chip port 2, and
+after cutting power it re-enumerates to see whether that device dropped off the
+bus — but it cannot see whether VBUS actually dropped (a self-powered device,
+or a data-only disconnect, vanishes from the bus without losing power). So the
+tool offers the enumeration result as a hint, and every controllability record
+still comes from a human watching the probe lose power.
 
 Agent-driven (each step prints what happened and a `Next:` line):
 
@@ -465,8 +468,11 @@ usbhub learn abort            # discard (restores power if a verify is pending)
 ```
 
 Human-driven: `usbhub learn run` wraps the same steps in an interactive TTY
-loop, so a session started by an agent can be finished by hand and vice
-versa.
+loop, so a session started by an agent can be finished by hand and vice versa.
+Its `learn>` prompt takes the **same commands as `usbhub learn <cmd>`** (the
+`usbhub learn` prefix optional, names abbreviatable — `ver 7`), so the printed
+`Next:` hints are typeable verbatim; `help` lists them and `quit` saves and
+exits.
 
 Probe-device tips:
 
@@ -476,9 +482,12 @@ Probe-device tips:
   other-speed device to fill in the gap (verify refuses single-side mappings
   by default, since cutting one side can leave the device powered via the
   other — `--allow-single-side` when the port genuinely has only one).
-- Use something with a **power LED** (or a USB power meter) for the verify
-  pass — "did it lose power" is the question, and enumeration loss alone
-  does not answer it.
+- Use a probe **whose power state you can see** — a power LED, or a phone
+  (watch the charging indicator; note a phone usually enumerates USB 2.0, so
+  it maps only that side). "Did it lose power" is the question, and the verify
+  step's enumeration check only narrows it: a probe still on the bus proves
+  the port did *not* cut power, but a probe that vanished could be either real
+  power loss or a mere data disconnect.
 - Ports already occupied by permanent bench fixtures can be mapped by
   unplugging and replugging the fixture itself during `learn port <n>`.
 

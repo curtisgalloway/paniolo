@@ -16,15 +16,24 @@
 //! steps the agent-facing subcommands use. The state machine lives in
 //! learn.rs; this file only prompts, relays, and persists, so a session
 //! started here can be finished from the step commands and vice versa.
+//!
+//! The prompt accepts the **same vocabulary as `usbhub learn <cmd>`** — parsed
+//! through the shared [`LearnLine`] clap parser — so the `Next:` hints the
+//! state machine prints (e.g. `usbhub learn verify 7`) are typeable verbatim
+//! here, with the `usbhub learn` prefix optional and subcommands abbreviatable
+//! (`ver 7`). Plus two session-only controls, `help` and `quit`.
 
 use std::io::{BufRead, Write};
 use std::path::Path;
 
 use anyhow::Result;
+use clap::Parser;
 
 use crate::act::DeviceTable;
 use crate::learn::{self, Session, Stage, VerifyResult};
-use crate::{finish_session, profile, topo, walk_port};
+use crate::{
+    finish_session, profile, topo, walk_port, LearnCmd, LearnLine, ResultArg, VERIFY_SETTLE,
+};
 
 /// Read one line; None on EOF.
 fn prompt(text: &str) -> Result<Option<String>> {
@@ -43,6 +52,64 @@ fn prompt_enter(text: &str) -> Result<bool> {
         None => Ok(false),
         Some(s) => Ok(s != "q"),
     }
+}
+
+/// Split a line into tokens, honoring single/double quotes so a quoted
+/// `--reason "ganged rail"` arrives as one argument.
+fn tokenize(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_token = false;
+    let mut quote: Option<char> = None;
+    for c in line.chars() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            } else {
+                cur.push(c);
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                in_token = true;
+            }
+            c if c.is_whitespace() => {
+                if in_token {
+                    out.push(std::mem::take(&mut cur));
+                    in_token = false;
+                }
+            }
+            _ => {
+                cur.push(c);
+                in_token = true;
+            }
+        }
+    }
+    if in_token {
+        out.push(cur);
+    }
+    out
+}
+
+fn print_help() {
+    println!(
+        "\nThis prompt takes the same commands as `usbhub learn <cmd>` — the \
+         `usbhub learn` prefix is optional and commands may be abbreviated \
+         (e.g. `ver 7`).\n\n\
+         Mapping & verifying:\n  \
+         port <n>                       map physical port n, then plug the probe into it\n  \
+         verify <n>                     cut power on port n; you confirm if it died\n  \
+         verify <n> --result dead|alive [--reason \"...\"]   record without the prompt\n  \
+         verify <n> --allow-single-side verify a port mapped on only one side\n  \
+         status                         progress and the suggested next step\n  \
+         finish --model <name>          write the profile and print the wiring\n  \
+         abort                          discard the session (restores power if mid-verify)\n\n\
+         Session controls:\n  \
+         help, ?                        show this help\n  \
+         quit, q                        leave — the session is saved; resume any time\n"
+    );
 }
 
 pub fn run(profile_dir: &Path) -> Result<()> {
@@ -102,90 +169,219 @@ pub fn run(profile_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The captured-stage menu. Returns false to leave the harness.
+/// The captured-stage command loop. Returns false to leave the harness.
 fn menu(session: &mut Session, sd: &Path, profile_dir: &Path) -> Result<bool> {
-    println!(
-        "\nCommands:\n  <port#>      map a physical port (then plug the probe into it)\n  \
-         v <port#>    verify a mapped port (cuts power; you report dead/alive)\n  \
-         vf <port#>   verify a single-side-mapped port (see learn docs)\n  \
-         s            session status\n  \
-         f <model>    finish: write the profile\n  \
-         q            quit (session persists; resume any time)"
-    );
+    println!("\nCaptured the hub. Type `help` for commands, `quit` to leave.");
     loop {
         let Some(line) = prompt("learn> ")? else {
-            return Ok(false);
+            return quit(session, sd);
         };
-        let words: Vec<&str> = line.split_whitespace().collect();
-        match words.as_slice() {
-            [] => continue,
-            ["q"] => return Ok(false),
-            ["s"] => println!("{}", session.status_text()),
-            ["f", model] => match finish_session(session, model, None, profile_dir) {
-                Ok(m) => {
-                    learn::save_session(sd, session)?;
-                    println!("{m}");
+        let mut args = tokenize(&line);
+        // Accept a pasted `usbhub learn ...` Next: hint verbatim.
+        if args
+            .first()
+            .is_some_and(|s| s.eq_ignore_ascii_case("usbhub"))
+        {
+            args.remove(0);
+        }
+        if args
+            .first()
+            .is_some_and(|s| s.eq_ignore_ascii_case("learn"))
+        {
+            args.remove(0);
+        }
+        let Some(first) = args.first() else { continue };
+        match first.to_ascii_lowercase().as_str() {
+            "help" | "h" | "?" => {
+                print_help();
+                continue;
+            }
+            "quit" | "q" | "exit" => return quit(session, sd),
+            _ => {}
+        }
+        match LearnLine::try_parse_from(&args) {
+            Ok(LearnLine { cmd }) => {
+                if !dispatch(session, sd, profile_dir, cmd)? {
                     return Ok(false);
                 }
-                Err(e) => println!("error: {e:#}"),
-            },
-            ["v", n] | ["vf", n] => {
-                let force = words[0] == "vf";
-                match n.parse::<u16>() {
-                    Ok(physical) => verify_flow(session, sd, physical, force)?,
-                    Err(_) => println!("bad port number {n:?}"),
-                }
             }
-            [n] => match n.parse::<u16>() {
-                Ok(physical) => {
-                    match walk_port(session, physical, 120) {
-                        Ok(m) => println!("{m}"),
-                        Err(e) => println!("error: {e:#}"),
-                    }
-                    learn::save_session(sd, session)?;
-                }
-                Err(_) => println!("unknown command {n:?}"),
-            },
-            _ => println!("unknown command {line:?}"),
+            // Covers parse errors and `<cmd> --help`; clap renders both.
+            Err(e) => print!("{e}"),
         }
     }
 }
 
-fn verify_flow(session: &mut Session, sd: &Path, physical: u16, force: bool) -> Result<()> {
-    let (_, mut table) = DeviceTable::snapshot()?;
-    match session.begin_verify(physical, &mut table, force) {
-        Ok(m) => println!("{m}"),
-        Err(e) => {
-            println!("error: {e:#}");
-            return Ok(());
+/// Leave the loop, restoring power if a verify was left pending (the session
+/// itself is kept — resume later).
+fn quit(session: &mut Session, sd: &Path) -> Result<bool> {
+    if session.pending_verify.is_some() {
+        let (_, mut table) = DeviceTable::snapshot()?;
+        if let Some(m) = session.abort_restore(&mut table) {
+            println!("{m}");
+        }
+        learn::save_session(sd, session)?;
+    }
+    Ok(false)
+}
+
+/// Run one parsed command. Returns false to leave the loop (finish/abort).
+fn dispatch(session: &mut Session, sd: &Path, profile_dir: &Path, cmd: LearnCmd) -> Result<bool> {
+    match cmd {
+        LearnCmd::Port {
+            physical,
+            timeout_secs,
+        } => {
+            match walk_port(session, physical, timeout_secs) {
+                Ok(m) => println!("{m}"),
+                Err(e) => println!("error: {e:#}"),
+            }
+            learn::save_session(sd, session)?;
+            Ok(true)
+        }
+        LearnCmd::Verify {
+            physical,
+            result,
+            reason,
+            allow_single_side,
+        } => {
+            verify(session, sd, physical, result, reason, allow_single_side)?;
+            Ok(true)
+        }
+        LearnCmd::Status => {
+            println!("{}", session.status_text());
+            Ok(true)
+        }
+        LearnCmd::Finish { model, description } => {
+            match finish_session(session, &model, description, profile_dir) {
+                Ok(m) => {
+                    learn::save_session(sd, session)?;
+                    println!("{m}");
+                    Ok(false)
+                }
+                Err(e) => {
+                    println!("error: {e:#}");
+                    Ok(true)
+                }
+            }
+        }
+        LearnCmd::Abort => {
+            let (_, mut table) = DeviceTable::snapshot()?;
+            if let Some(m) = session.abort_restore(&mut table) {
+                println!("{m}");
+            }
+            learn::delete_session(sd)?;
+            println!("Session discarded.");
+            Ok(false)
+        }
+        LearnCmd::Start { .. } => {
+            println!("Already in a session. `quit`, then `usbhub learn start --force` to restart.");
+            Ok(true)
+        }
+        LearnCmd::Unplugged | LearnCmd::Plugged => {
+            println!("That capture step is already done (stage: Captured). Try `status`.");
+            Ok(true)
+        }
+        LearnCmd::Run => {
+            println!("Already in the interactive session.");
+            Ok(true)
         }
     }
-    learn::save_session(sd, session)?;
+}
 
+/// `verify` from the prompt: with `--result`, record directly (beginning the
+/// power-off first if needed); without it, cut power and ask interactively.
+fn verify(
+    session: &mut Session,
+    sd: &Path,
+    physical: u16,
+    result: Option<ResultArg>,
+    reason: Option<String>,
+    allow_single_side: bool,
+) -> Result<()> {
+    let (_, mut table) = DeviceTable::snapshot()?;
+    match result {
+        Some(r) => {
+            let vr = match r {
+                ResultArg::Dead => VerifyResult::Dead,
+                ResultArg::Alive => VerifyResult::Alive,
+            };
+            if session.pending_verify != Some(physical) {
+                match session.begin_verify(physical, &mut table, allow_single_side, VERIFY_SETTLE) {
+                    Ok(m) => println!("{m}"),
+                    Err(e) => {
+                        println!("error: {e:#}");
+                        return Ok(());
+                    }
+                }
+            }
+            match session.record_verify(physical, vr, reason, &mut table) {
+                Ok(m) => println!("{m}"),
+                Err(e) => println!("error: {e:#}"),
+            }
+            learn::save_session(sd, session)?;
+        }
+        None => {
+            match session.begin_verify(physical, &mut table, allow_single_side, VERIFY_SETTLE) {
+                Ok(m) => println!("{m}"),
+                Err(e) => {
+                    println!("error: {e:#}");
+                    return Ok(());
+                }
+            }
+            learn::save_session(sd, session)?;
+            interactive_verdict(session, sd, physical, &mut table)?;
+        }
+    }
+    Ok(())
+}
+
+/// Ask the human for the verdict, defaulting to `alive` when the enumeration
+/// check already showed the probe never left the bus.
+fn interactive_verdict(
+    session: &mut Session,
+    sd: &Path,
+    physical: u16,
+    table: &mut DeviceTable,
+) -> Result<()> {
+    let default_alive = session.pending_recommendation() == Some(VerifyResult::Alive);
+    let prompt_str = if default_alive {
+        "Verdict — did it lose power (charging stopped / LED off)? \
+         [d]ead / [a]live / [x] cancel [default: alive]: "
+    } else {
+        "Verdict — did it lose power (charging stopped / LED off)? \
+         [d]ead / [a]live / [x] cancel: "
+    };
     loop {
-        let ans = prompt("Did the probe lose power? [d]ead / [a]live / [x] cancel: ")?;
-        let verdict = match ans.as_deref() {
-            Some("d") => Some((VerifyResult::Dead, None)),
-            Some("a") => {
+        let ans = prompt(prompt_str)?;
+        let Some(s) = ans else {
+            // EOF: cancel and restore.
+            if let Some(m) = session.abort_restore(table) {
+                println!("{m}");
+            }
+            break;
+        };
+        let (result, reason) = match s.to_ascii_lowercase().as_str() {
+            "d" | "dead" => (VerifyResult::Dead, None),
+            "a" | "alive" => {
                 let reason =
                     prompt("Reason, if known (Enter to skip): ")?.filter(|s| !s.is_empty());
-                Some((VerifyResult::Alive, reason))
+                (VerifyResult::Alive, reason)
             }
-            Some("x") | None => None,
-            _ => continue,
-        };
-        match verdict {
-            Some((result, reason)) => {
-                match session.record_verify(physical, result, reason, &mut table) {
-                    Ok(m) => println!("{m}"),
-                    Err(e) => println!("error: {e:#}"),
-                }
-            }
-            None => {
-                if let Some(m) = session.abort_restore(&mut table) {
+            "" if default_alive => (VerifyResult::Alive, None),
+            "x" | "cancel" => {
+                if let Some(m) = session.abort_restore(table) {
                     println!("{m}");
                 }
+                break;
             }
+            _ => {
+                println!("Please answer 'd' (dead), 'a' (alive), or 'x' (cancel).");
+                continue;
+            }
+        };
+        match session.record_verify(physical, result, reason, table) {
+            Ok(m) => println!("{m}"),
+            Err(e) => println!("error: {e:#}"),
         }
         break;
     }

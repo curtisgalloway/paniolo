@@ -79,9 +79,32 @@ usbhub learn run
 It guides you through unplugging/replugging the hub (to capture its chip
 cascade), plugging a probe device into each physical port (to map them), and a
 power-off check per port (to verify controllability). At the end it writes a
-profile and prints the exact commands to drive the hub. A USB 3 hub with a
-power LED makes the ideal probe — it maps both the USB 3 and USB 2 sides in one
-plug, and its LED answers the "did it really lose power?" question.
+profile and prints the exact commands to drive the hub.
+
+The `learn>` prompt takes the **same commands as `usbhub learn <cmd>`** (the
+`usbhub learn` prefix is optional and names can be abbreviated — `ver 7` works),
+so the `Next:` hints it prints are typeable verbatim. Type `help` for the list
+and `quit` to leave (the session is saved; resume any time).
+
+**Picking a probe device.** The verify step cuts a port's power and asks you
+whether the device *actually* lost power — so use something whose power state
+you can see:
+
+- A **USB 3 hub with a power LED** is the ideal probe: it enumerates on both
+  the USB 3 and USB 2 sides at once, mapping both in a single plug, and its LED
+  answers the "did it really lose power?" question.
+- A **phone** is also excellent — its charging indicator is the signal. When
+  the port really cuts VBUS, charging stops (visible on screen) and the phone
+  drops off the bus. (A phone almost always enumerates as USB 2.0, so it maps
+  only the USB 2 side; use the USB 3 hub if you want both sides in one plug.)
+- A flash drive works but maps only its own side and has no power indicator.
+
+To help, the verify step **re-enumerates the bus after cutting power** and tells
+you whether the probe disappeared: if it's *still* on the bus, the port did not
+cut VBUS (it recommends "alive / not controllable"). If it vanished, that's
+consistent with power loss — but a data-only disconnect, or a self-powered
+device (phone, powered hub) losing only its data link, looks identical, so your
+eyes on the charging icon / LED / power meter remain the deciding vote.
 
 **3. Drive it** by physical port number:
 

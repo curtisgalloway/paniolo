@@ -312,8 +312,10 @@ pub fn relative_path(root: &DevRecord, dev: &DevRecord) -> Result<String> {
 /// Given a device that arrived during a port walk, attribute it to a chip
 /// port: the device (or its topmost arrived ancestor, for compound probe
 /// devices that contain their own hub) must be an immediate child of one of
-/// the cascade's chips. Returns (chip path, port number on that chip).
-pub fn attribute_arrival(cascade: &Cascade, added: &[DevRecord]) -> Option<(String, u8)> {
+/// the cascade's chips. Returns (chip path, port number on that chip, and the
+/// key of that topmost device — so the verify step can later check whether it
+/// disappears when the port's power is cut).
+pub fn attribute_arrival(cascade: &Cascade, added: &[DevRecord]) -> Option<(String, u8, DevKey)> {
     // Topmost first: shorter chains are closer to the root.
     let mut on_side: Vec<&DevRecord> = added
         .iter()
@@ -327,7 +329,11 @@ pub fn attribute_arrival(cascade: &Cascade, added: &[DevRecord]) -> Option<(Stri
                 && dev.port_chain.len() == c.port_chain.len() + 1
                 && dev.port_chain.starts_with(&c.port_chain)
             {
-                return Some((chip.path.clone(), *dev.port_chain.last().unwrap()));
+                return Some((
+                    chip.path.clone(),
+                    *dev.port_chain.last().unwrap(),
+                    dev.key(),
+                ));
             }
         }
     }
@@ -451,8 +457,12 @@ mod tests {
         let cascades = derive_cascades(&rsh_arrival()).unwrap();
         let usb3 = cascades.iter().find(|c| c.side == Side::Usb3).unwrap();
         // Probe flash drive appears below the leaf chip, port 2.
-        let added = vec![rec("2", &[1, 4, 2], 0x0781, 0x5581, 0, "super")];
-        assert_eq!(attribute_arrival(usb3, &added), Some(("4".to_string(), 2)));
+        let probe = rec("2", &[1, 4, 2], 0x0781, 0x5581, 0, "super");
+        let added = vec![probe.clone()];
+        assert_eq!(
+            attribute_arrival(usb3, &added),
+            Some(("4".to_string(), 2, probe.key()))
+        );
     }
 
     #[test]
@@ -461,11 +471,15 @@ mod tests {
         // port 3, its child below it. Attribution must pick the topmost.
         let cascades = derive_cascades(&rsh_arrival()).unwrap();
         let usb3 = cascades.iter().find(|c| c.side == Side::Usb3).unwrap();
+        let inner_hub = rec("2", &[1, 4, 3], 0x05e3, 0x0626, 9, "super");
         let added = vec![
             rec("2", &[1, 4, 3, 1], 0x046d, 0xc52b, 0, "super"),
-            rec("2", &[1, 4, 3], 0x05e3, 0x0626, 9, "super"),
+            inner_hub.clone(),
         ];
-        assert_eq!(attribute_arrival(usb3, &added), Some(("4".to_string(), 3)));
+        assert_eq!(
+            attribute_arrival(usb3, &added),
+            Some(("4".to_string(), 3, inner_hub.key()))
+        );
     }
 
     #[test]
@@ -473,8 +487,12 @@ mod tests {
         let cascades = derive_cascades(&rsh_arrival()).unwrap();
         let usb3 = cascades.iter().find(|c| c.side == Side::Usb3).unwrap();
         // Probe directly on the root chip, port 6.
-        let added = vec![rec("2", &[1, 6], 0x0781, 0x5581, 0, "super")];
-        assert_eq!(attribute_arrival(usb3, &added), Some(("".to_string(), 6)));
+        let probe = rec("2", &[1, 6], 0x0781, 0x5581, 0, "super");
+        let added = vec![probe.clone()];
+        assert_eq!(
+            attribute_arrival(usb3, &added),
+            Some(("".to_string(), 6, probe.key()))
+        );
     }
 
     #[test]

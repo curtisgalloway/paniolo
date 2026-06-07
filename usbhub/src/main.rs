@@ -45,6 +45,11 @@ use learn::{Session, Stage, VerifyResult, WalkOutcome};
 use profile::{parse_at, AtSpec, Instance, PortEntry, Profile};
 use topo::{DevRecord, Side};
 
+/// How long to wait after clearing a port's power before re-enumerating to see
+/// whether the probe device dropped off the bus. Devices (phones especially)
+/// can take most of a second to disconnect.
+pub(crate) const VERIFY_SETTLE: Duration = Duration::from_millis(800);
+
 #[derive(Parser)]
 #[command(name = "usbhub", version, about = "Per-port USB hub power control")]
 struct Cli {
@@ -109,8 +114,19 @@ enum Cmd {
     },
 }
 
+/// One line typed at the `usbhub learn run` prompt, parsed as the same
+/// vocabulary as the `usbhub learn <cmd>` CLI subcommands (with
+/// `infer_subcommands`, so abbreviations like `ver 3` work). `no_binary_name`
+/// means the first token is the subcommand, not a program name.
+#[derive(Parser)]
+#[command(no_binary_name = true, infer_subcommands = true)]
+pub(crate) struct LearnLine {
+    #[command(subcommand)]
+    pub cmd: LearnCmd,
+}
+
 #[derive(Subcommand)]
-enum LearnCmd {
+pub(crate) enum LearnCmd {
     /// Begin a session: snapshot the bus as-is.
     Start {
         /// Discard an existing unfinished session.
@@ -166,7 +182,7 @@ enum SideArg {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
-enum ResultArg {
+pub(crate) enum ResultArg {
     Dead,
     Alive,
 }
@@ -527,7 +543,9 @@ fn cmd_learn(cmd: LearnCmd, profile_dir: &std::path::Path) -> Result<()> {
             let mut session = learn::load_session(&sd)?;
             let (_, mut table) = DeviceTable::snapshot()?;
             let msg = match result {
-                None => session.begin_verify(physical, &mut table, allow_single_side)?,
+                None => {
+                    session.begin_verify(physical, &mut table, allow_single_side, VERIFY_SETTLE)?
+                }
                 Some(r) => {
                     let vr = match r {
                         ResultArg::Dead => VerifyResult::Dead,

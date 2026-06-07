@@ -16,19 +16,24 @@
 //! records, and the [`PortSwitch`] abstraction that lets the learn state
 //! machine run against mock hardware in tests.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use nusb::MaybeFuture;
 
 use crate::hub;
-use crate::topo::{snapshot_with_handles, DevKey, DevRecord, Side};
+use crate::topo::{snapshot, snapshot_with_handles, DevKey, DevRecord, Side};
 
 /// Power switching against a chip located by its snapshot record. The learn
 /// state machine and the CLI commands act through this; tests mock it.
 pub trait PortSwitch {
     fn set_power(&mut self, side: Side, chip: &DevRecord, port: u8, on: bool) -> Result<()>;
     fn power_is_on(&mut self, side: Side, chip: &DevRecord, port: u8) -> Result<bool>;
+
+    /// Keys of every device currently enumerated on the bus. The verify step
+    /// snapshots this before and after cutting a port's power to see whether
+    /// the probe device actually dropped off the bus.
+    fn live_keys(&mut self) -> Result<HashSet<DevKey>>;
 }
 
 /// Live topology snapshot plus the handles to open devices from it.
@@ -83,5 +88,9 @@ impl PortSwitch for DeviceTable {
     fn power_is_on(&mut self, side: Side, chip: &DevRecord, port: u8) -> Result<bool> {
         let dev = self.device(chip)?;
         hub::port_power_is_on(dev, side, port)
+    }
+
+    fn live_keys(&mut self) -> Result<HashSet<DevKey>> {
+        Ok(snapshot()?.iter().map(DevRecord::key).collect())
     }
 }
