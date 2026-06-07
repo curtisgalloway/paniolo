@@ -51,7 +51,35 @@ use topo::{DevRecord, Side};
 pub(crate) const VERIFY_SETTLE: Duration = Duration::from_millis(800);
 
 #[derive(Parser)]
-#[command(name = "usbhub", version, about = "Per-port USB hub power control")]
+#[command(
+    name = "usbhub",
+    version,
+    about = "Per-port USB hub power control",
+    long_about = "Per-port USB hub power control — switch VBUS on individual hub ports via \
+USB hub-class requests (the uhubctl mechanism), on macOS and Linux.
+
+MENTAL MODEL
+  - Hubs are addressed by a model PROFILE, resolved by matching the profile's
+    internal chip cascade against the live topology (so it survives replugging
+    the hub into a different host port). Pass --model <name>; --at pins one
+    instance when several identical hubs share a host.
+  - Ports are addressed by their PHYSICAL silkscreen number. on/off/cycle act
+    on both the USB 2 and USB 3 halves of a port together (they share VBUS).
+  - Switching is REFUSED unless a human has verified the port actually cuts
+    power (controllable = true in the profile). Hubs lie about this in their
+    descriptors, so it must be confirmed by watching a device lose power.
+
+TYPICAL WORKFLOW
+  1. usbhub probe                          list hubs + claimed switching (read-only)
+  2. usbhub learn run                      build a new profile, or edit an existing one
+  3. usbhub --model M status               inspect the profile + live power bits
+  4. usbhub --model M state|on|off|cycle <port>
+
+Profiles are TOML files named <model>.toml in the state dir, resolved as
+$USBHUB_STATE_DIR, else $XDG_CONFIG_HOME/usbhub, else ~/.config/usbhub (when
+run under paniolo, $PANIOLO_STATE_DIR). --profile-dir overrides it. List known
+models with `usbhub models`."
+)]
 struct Cli {
     /// Hub model name (a profile in the profiles dir). Required for
     /// status/state/on/off/cycle.
@@ -64,7 +92,8 @@ struct Cli {
     #[arg(long, value_name = "ANCHORS", global = true)]
     at: Option<String>,
 
-    /// Override the profiles directory (default: $PANIOLO_STATE_DIR/profiles).
+    /// Override the profiles dir (default: $USBHUB_STATE_DIR / $XDG_CONFIG_HOME
+    /// /usbhub / ~/.config/usbhub, or $PANIOLO_STATE_DIR under paniolo).
     #[arg(long, value_name = "DIR", global = true)]
     profile_dir: Option<PathBuf>,
 
@@ -86,12 +115,14 @@ enum Cmd {
     /// Power a physical port on (hook: on_cmd). Refused without a verified
     /// `controllable = true` assertion in the profile.
     On {
+        /// Physical (silkscreen) port number on the hub.
         physical: u16,
         #[arg(long, value_enum, default_value_t = SideArg::Both)]
         side: SideArg,
     },
     /// Power a physical port off (hook: off_cmd). Same refusal rule.
     Off {
+        /// Physical (silkscreen) port number on the hub.
         physical: u16,
         #[arg(long, value_enum, default_value_t = SideArg::Both)]
         side: SideArg,
@@ -99,6 +130,7 @@ enum Cmd {
     /// Power-cycle a physical port: off → delay → on → confirm (hook:
     /// cycle_cmd). Same refusal rule.
     Cycle {
+        /// Physical (silkscreen) port number on the hub.
         physical: u16,
         /// Milliseconds to hold the port off before restoring.
         #[arg(long, default_value_t = 3000)]
@@ -106,8 +138,9 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = SideArg::Both)]
         side: SideArg,
     },
-    /// Build a model profile from physical actions at the bench: discrete,
-    /// resumable steps an agent can drive, or `learn run` for a TTY loop.
+    /// Build or edit a model profile from physical actions at the bench.
+    /// `learn run` is the guided wizard (recommended); the other subcommands
+    /// are discrete, resumable steps an agent can drive one at a time.
     Learn {
         #[command(subcommand)]
         cmd: LearnCmd,
@@ -134,6 +167,7 @@ pub(crate) enum LearnCmd {
     /// Map a physical port: run this, then plug the probe device into that
     /// port; blocks until the probe is seen (or times out).
     Port {
+        /// Physical (silkscreen) port number on the hub.
         physical: u16,
         #[arg(long, default_value_t = 120)]
         timeout_secs: u64,
@@ -141,6 +175,7 @@ pub(crate) enum LearnCmd {
     /// Without --result: power the port off so a human can look at the
     /// probe. With --result: record the human's verdict and restore power.
     Verify {
+        /// Physical (silkscreen) port number on the hub.
         physical: u16,
         /// What the human observed: did the probe actually lose power?
         #[arg(long, value_enum)]
@@ -160,7 +195,9 @@ pub(crate) enum LearnCmd {
         #[arg(long)]
         description: Option<String>,
     },
-    /// Interactive TTY harness over the same steps.
+    /// Guided interactive wizard (recommended): asks a model name, then either
+    /// edits that profile if it exists or captures a new one, mapping and
+    /// verifying each port, and writes the profile at the end.
     Run,
 }
 
