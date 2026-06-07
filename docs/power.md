@@ -363,3 +363,172 @@ hooks serialize safely on its single session, and every operation has a hard
 timeout — a wedged radio fails a hook fast instead of hanging it. `form`,
 `restore`, and `backup` (when no daemon runs) open the port directly and
 refuse to run while the daemon does (`zigplug stop` first).
+
+---
+
+## Per-port USB hub power control (usbhub)
+
+The `usbhub` standalone helper switches VBUS on individual ports of
+off-the-shelf USB hubs by issuing hub-class control requests
+(`SET_FEATURE`/`CLEAR_FEATURE` `PORT_POWER` — the same mechanism as
+[uhubctl](https://github.com/mvp/uhubctl)), in pure Rust via
+[nusb](https://crates.io/crates/nusb). No kernel driver is displaced and no
+interface is claimed; it works on macOS and Linux.
+
+It differs from uhubctl in how hubs and ports are addressed:
+
+- **Hubs are addressed by model profile, not bus location.** A profile
+  describes the product's internal chip cascade (consumer hubs are usually
+  2–3 cascaded hub chips, each appearing twice: a USB 3 device and its USB 2
+  companion). Resolution is signature-first: the profile's chip tree is
+  matched against the live topology, so the hook string survives replugging
+  the hub into a different host port. Only when several identical hubs share
+  one host is an `--at` pin needed (the ambiguity error prints ready-to-paste
+  pins).
+- **Ports are addressed by the physical silkscreen number.** The profile maps
+  each physical port to its (chip, chip-port) location on both the USB 3 and
+  USB 2 sides; `on`/`off`/`cycle` act on both sides, since cutting only one
+  lets the device fall back to the other, still powered.
+- **Switching is refused unless a human has verified the port.** Hub chips
+  routinely claim per-port power switching with no VBUS MOSFETs behind it
+  (the port "turns off" in the status word while the device keeps drawing
+  5 V). A profile port entry needs `controllable = true` — recorded by the
+  `learn` verification flow below, or hand-written by someone who physically
+  verified — before `on`/`off`/`cycle` will act. `controllable = false`
+  entries refuse with the recorded reason; unlisted ports refuse outright.
+
+### Installation
+
+`usbhub` is built and installed by `make install` / `paniolo setup` alongside
+the other crates, into the private libexec dir. Run it by hand via
+`paniolo helper usbhub …`.
+
+It also builds and runs entirely standalone — useful for sharing the hub
+control without the rest of paniolo (its own
+[README](https://github.com/curtisgalloway/paniolo/tree/main/usbhub) covers
+this audience):
+
+```bash
+cargo install --git https://github.com/curtisgalloway/paniolo usbhub
+```
+
+Standalone, profiles and learn sessions go under `$USBHUB_STATE_DIR`, else
+`$XDG_CONFIG_HOME/usbhub`, else `~/.config/usbhub`. Under paniolo, the
+helper honors `$PANIOLO_STATE_DIR` like every other helper, so its state
+lives in `~/.config/paniolo/helpers/usbhub/` — no change to the paniolo path.
+
+On Linux, sending control requests to a hub needs write access to its
+`/dev/bus/usb/...` node: install a udev rule (uhubctl's rule works — match
+the hub VID or `bDeviceClass==09` and grant your bench group write access),
+or run as root. macOS needs nothing.
+
+### Commands
+
+```bash
+usbhub probe                              # read-only topology dump: every hub, its
+                                          # claimed switching mode, and port chains
+usbhub models                             # list known model profiles
+usbhub --model <m> status                 # per-port table: mappings, assertions, live bits
+usbhub --model <m> state <port>           # print exactly "on" or "off" (state_cmd contract)
+usbhub --model <m> on <port>              # switch + read-back confirm (refused if unverified)
+usbhub --model <m> off <port>
+usbhub --model <m> cycle <port> [--delay-ms 3000]
+```
+
+Profiles live in `<state-dir>/profiles/<model>.toml` (state-dir resolution
+above; `~/.config/paniolo/helpers/usbhub/profiles/` under paniolo,
+`~/.config/usbhub/profiles/` standalone). `--profile-dir` overrides per
+command.
+
+### Building a profile: the learn workflow
+
+A profile is built at the bench with `usbhub learn` — a resumable session of
+discrete steps. The division of labor: **the tool observes enumeration, the
+human observes physics.** The tool can see a device appear at chip port 2, and
+after cutting power it re-enumerates to see whether that device dropped off the
+bus — but it cannot see whether VBUS actually dropped (a self-powered device,
+or a data-only disconnect, vanishes from the bus without losing power). So the
+tool offers the enumeration result as a hint, and every controllability record
+still comes from a human watching the probe lose power.
+
+Agent-driven (each step prints what happened and a `Next:` line):
+
+```bash
+usbhub learn edit [model]     # load <model> to edit if it exists, else capture anew
+usbhub learn unplugged        # snapshot; then plug the hub back in
+usbhub learn plugged          # diff → the hub's full chip cascade, both sides
+usbhub learn port 7           # then plug the probe into physical port 7;
+                              # blocks until seen (--timeout-secs 120)
+usbhub learn verify 7         # cuts power; look at the probe device
+usbhub learn verify 7 --result dead         # probe died → controllable
+usbhub learn verify 7 --result alive --reason "ganged rail"   # → not controllable
+usbhub learn status           # progress + suggested next step
+usbhub learn save --model rsh-st10c-6       # write the profile, print wiring
+usbhub learn abort            # discard (restores power if a verify is pending)
+```
+
+Human-driven: `usbhub learn run` is a guided wizard over the same steps. Name a
+new model and it asks the port count, walks the unplug/replug capture, then
+maps-and-verifies each port; name an **existing profile** and it loads it
+(resolved against the live hub, no replug) for editing. Either way it ends at a
+review screen — type a port number to (re)do it, or `save` to write. Prompts
+have ↑/↓ history and line editing (rustyline), the session is saved as you go
+(Ctrl-D to quit and resume later), and a session started by the wizard can be
+finished with the discrete steps and vice versa.
+
+Probe-device tips:
+
+- Any probe that enumerates on **either** bus is enough — detection is by bus
+  topology, not USB speed, and the two buses are controlled in tandem (see the
+  limitation below), so you map and verify a port once regardless of which bus
+  the probe shows up on or whether the OS reports its speed. (An adb-enabled
+  Android enumerates fine; a charge-only phone that presents no data device
+  won't be seen — unlock it or use another probe.)
+- Use a probe **whose power state you can see** — a power LED, or a phone
+  (watch the charging indicator). "Did it lose power" is the question, and the
+  verify step's enumeration check only narrows it: a probe still on the bus
+  proves the port did *not* cut power, but a probe that vanished could be either
+  real power loss or a mere data disconnect.
+- Ports already occupied by permanent bench fixtures can be mapped by
+  unplugging and replugging the fixture itself during `learn port <n>`.
+
+**Limitation — the two buses are controlled in tandem.** A USB 3 port is two
+logical devices (a USB 3 hub and its USB 2 companion) sharing one physical
+VBUS; on real hubs the power usually only drops when both sides' power bits are
+cleared. usbhub therefore treats a physical port as one unit — mapped/verified
+once, and `on`/`off`/`cycle` act on the same `(chip, port)` location on both
+buses together. This assumes the USB 2 companion mirrors the USB 3 port
+numbering for a given physical port (true for the cascaded Realtek-style hubs
+this targets). Hubs with independent per-bus VBUS, or mismatched port numbering
+between the two buses, are not supported. (`--side usb3|usb2` targets one bus
+for debugging, not for independent power control.)
+
+### Wiring into paniolo power hooks
+
+```bash
+paniolo power set -t pi5 \
+    --cycle-cmd "usbhub --model rsh-st10c-6 cycle 9" \
+    --on-cmd    "usbhub --model rsh-st10c-6 on 9" \
+    --off-cmd   "usbhub --model rsh-st10c-6 off 9" \
+    --state-cmd "usbhub --model rsh-st10c-6 state 9"
+```
+
+`learn save` prints exactly this block for the model it just wrote. Add
+`--at usb3=BUS:CHAIN,usb2=BUS:CHAIN` to each command only if several
+identical hubs share the control host.
+
+### Gotchas
+
+- **Hub descriptors lie.** `usbhub probe` prints each hub's claimed power
+  switching mode as a hint for where verification is worth trying; "per-port
+  (claimed)" does not mean the MOSFETs exist. Only the learn verify pass (or
+  a multimeter) settles it.
+- **USB 3 hubs are two hubs.** Every physical port has independent PORT_POWER
+  state on the USB 3 chip and its USB 2 companion. `usbhub` acts on both
+  mapped sides by default; `--side usb3|usb2` exists for debugging.
+- **Cut power means re-enumeration.** Anything on the port disconnects; a
+  port that hosts the control path for the very hub being switched would saw
+  off its own branch. Mark such ports `controllable = false` with a reason
+  during learn.
+- **Port power state does not survive the hub losing power.** Replugging or
+  power-cycling the whole hub turns every port back on (chip default).

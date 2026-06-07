@@ -5,7 +5,10 @@ board, a smart plug family, a USB-PD hub, a BMC, anything that can turn a
 target's power on and off. Two shipped helpers serve as exemplars:
 [`cambrionix/`](https://github.com/curtisgalloway/paniolo/tree/main/cambrionix) (Rust, Cambrionix USB hub control UART) and
 [`zigplug/`](https://github.com/curtisgalloway/paniolo/tree/main/zigplug) (Python, Zigbee smart plugs via a CC2652 coordinator
-dongle).
+dongle). A third, [`usbhub/`](https://github.com/curtisgalloway/paniolo/tree/main/usbhub) (Rust, per-port VBUS switching on
+off-the-shelf hubs via USB hub-class requests), shows the pattern for a
+helper that needs its own device profiles and a guided setup workflow
+(`usbhub learn`) on top of the same four hooks.
 
 **The design principle** (from [power.md](power.md)): device-specific control
 logic never goes in the core crates. It lives in a standalone helper binary,

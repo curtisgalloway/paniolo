@@ -31,7 +31,14 @@ use anyhow::{anyhow, bail, Result};
 
 /// The helper crates `setup` builds and installs into libexec, in order. The
 /// `cli` crate (the `paniolo` binary itself) installs separately onto PATH.
-const HELPER_CRATES: [&str; 5] = ["hdmicap", "serialcap", "netbootd", "cambrionix", "hidrig"];
+const HELPER_CRATES: [&str; 6] = [
+    "hdmicap",
+    "serialcap",
+    "netbootd",
+    "cambrionix",
+    "hidrig",
+    "usbhub",
+];
 
 fn is_repo_root(d: &Path) -> bool {
     d.join("pyproject.toml").is_file()
