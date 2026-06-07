@@ -332,21 +332,22 @@ fn verify(
     Ok(())
 }
 
-/// Ask the human for the verdict, defaulting to `alive` when the enumeration
-/// check already showed the probe never left the bus.
+/// Ask the human the yes/no question "did it lose power?" and record the
+/// verdict. Defaults to "no" (the device stayed powered → not controllable)
+/// when the enumeration check already showed the probe never left the bus.
 fn interactive_verdict(
     session: &mut Session,
     sd: &Path,
     physical: u16,
     table: &mut DeviceTable,
 ) -> Result<()> {
-    let default_alive = session.pending_recommendation() == Some(VerifyResult::Alive);
-    let prompt_str = if default_alive {
-        "Verdict — did it lose power (charging stopped / LED off)? \
-         [d]ead / [a]live / [x] cancel [default: alive]: "
+    // The probe never dropped off the bus → it almost certainly stayed
+    // powered, so default the yes/no answer to "no".
+    let default_no = session.pending_recommendation() == Some(VerifyResult::Alive);
+    let prompt_str = if default_no {
+        "Did it lose power (charging stopped / LED off)? [y]es / [n]o / [c]ancel [default: no]: "
     } else {
-        "Verdict — did it lose power (charging stopped / LED off)? \
-         [d]ead / [a]live / [x] cancel: "
+        "Did it lose power (charging stopped / LED off)? [y]es / [n]o / [c]ancel: "
     };
     loop {
         let ans = prompt(prompt_str)?;
@@ -357,22 +358,24 @@ fn interactive_verdict(
             }
             break;
         };
+        // "yes, it lost power" => controllable (Dead); "no" => not (Alive).
+        // d/dead and a/alive are accepted as silent aliases.
         let (result, reason) = match s.to_ascii_lowercase().as_str() {
-            "d" | "dead" => (VerifyResult::Dead, None),
-            "a" | "alive" => {
+            "y" | "yes" | "d" | "dead" => (VerifyResult::Dead, None),
+            "n" | "no" | "a" | "alive" => {
                 let reason =
                     prompt("Reason, if known (Enter to skip): ")?.filter(|s| !s.is_empty());
                 (VerifyResult::Alive, reason)
             }
-            "" if default_alive => (VerifyResult::Alive, None),
-            "x" | "cancel" => {
+            "" if default_no => (VerifyResult::Alive, None),
+            "c" | "cancel" | "x" => {
                 if let Some(m) = session.abort_restore(table) {
                     println!("{m}");
                 }
                 break;
             }
             _ => {
-                println!("Please answer 'd' (dead), 'a' (alive), or 'x' (cancel).");
+                println!("Please answer 'y' (lost power), 'n' (stayed powered), or 'c' (cancel).");
                 continue;
             }
         };
