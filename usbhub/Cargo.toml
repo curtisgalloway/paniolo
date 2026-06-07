@@ -18,6 +18,10 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Per-port USB hub power control via hub-class requests (pure Rust, nusb)"
+repository = "https://github.com/curtisgalloway/paniolo"
+readme = "README.md"
+keywords = ["usb", "hub", "power", "uhubctl", "vbus"]
+categories = ["command-line-utilities", "hardware-support"]
 
 [[bin]]
 name = "usbhub"

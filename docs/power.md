@@ -403,6 +403,20 @@ It differs from uhubctl in how hubs and ports are addressed:
 the other crates, into the private libexec dir. Run it by hand via
 `paniolo helper usbhub …`.
 
+It also builds and runs entirely standalone — useful for sharing the hub
+control without the rest of paniolo (its own
+[README](https://github.com/curtisgalloway/paniolo/tree/main/usbhub) covers
+this audience):
+
+```bash
+cargo install --git https://github.com/curtisgalloway/paniolo usbhub
+```
+
+Standalone, profiles and learn sessions go under `$USBHUB_STATE_DIR`, else
+`$XDG_CONFIG_HOME/usbhub`, else `~/.config/usbhub`. Under paniolo, the
+helper honors `$PANIOLO_STATE_DIR` like every other helper, so its state
+lives in `~/.config/paniolo/helpers/usbhub/` — no change to the paniolo path.
+
 On Linux, sending control requests to a hub needs write access to its
 `/dev/bus/usb/...` node: install a udev rule (uhubctl's rule works — match
 the hub VID or `bDeviceClass==09` and grant your bench group write access),
@@ -421,9 +435,10 @@ usbhub --model <m> off <port>
 usbhub --model <m> cycle <port> [--delay-ms 3000]
 ```
 
-Profiles live in `$PANIOLO_STATE_DIR/profiles/<model>.toml`
-(`~/.config/paniolo/helpers/usbhub/profiles/` standalone; `--profile-dir`
-overrides).
+Profiles live in `<state-dir>/profiles/<model>.toml` (state-dir resolution
+above; `~/.config/paniolo/helpers/usbhub/profiles/` under paniolo,
+`~/.config/usbhub/profiles/` standalone). `--profile-dir` overrides per
+command.
 
 ### Building a profile: the learn workflow
 

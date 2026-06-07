@@ -185,17 +185,33 @@ impl Profile {
 // Profile storage
 // ---------------------------------------------------------------------------
 
-/// Durable state dir: $PANIOLO_STATE_DIR (set by paniolo for hook and
-/// `paniolo helper` invocations), with the literal fallback for standalone
-/// runs, per the helper contract in docs/adding-power-helpers.md.
+/// Durable state dir (profiles + learn sessions), resolved in priority order:
+///
+///  1. `$PANIOLO_STATE_DIR` — set by paniolo when it runs usbhub as a power
+///     helper, so the helper shares paniolo's per-helper state dir
+///     (`~/.config/paniolo/helpers/usbhub`); see the helper contract in
+///     docs/adding-power-helpers.md.
+///  2. `$USBHUB_STATE_DIR` — explicit override for standalone use.
+///  3. `$XDG_CONFIG_HOME/usbhub`, else `~/.config/usbhub` — the standalone
+///     default for users who have never heard of paniolo.
+///
+/// The literal `~/.config` fallback keeps it working with no environment at
+/// all.
 pub fn state_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("PANIOLO_STATE_DIR") {
-        if !d.is_empty() {
-            return PathBuf::from(d);
+    for var in ["PANIOLO_STATE_DIR", "USBHUB_STATE_DIR"] {
+        if let Ok(d) = std::env::var(var) {
+            if !d.is_empty() {
+                return PathBuf::from(d);
+            }
+        }
+    }
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return Path::new(&xdg).join("usbhub");
         }
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    Path::new(&home).join(".config/paniolo/helpers/usbhub")
+    Path::new(&home).join(".config/usbhub")
 }
 
 pub fn profiles_dir(override_dir: Option<&Path>) -> PathBuf {
