@@ -19,6 +19,7 @@ See the [power guide](power.md).
 | [ThirdReality Zigbee Smart Plug (15 A, energy monitoring)](https://www.amazon.com/dp/B0BPY5D1KC) | Switched mains outlet for target power, driven by `zigplug` through the generic power hooks. |
 | [AINOPE USB 3.0 extension cable (6.6 ft)](https://www.amazon.com/dp/B07RQRMGKB) | Distances the Zigbee dongle from USB 3 devices. RF noise from USB 3 hardware (especially video capture) can break Zigbee network formation and joining; an extension cable is the fix. |
 | Cambrionix programmable USB hub | Per-port USB power switching via the [`cambrionix` helper](power.md#cambrionix-hub-control) (control UART, 115200 8N1). |
+| [Shelly Plug US Gen4 (S4PL-00116US, Wi-Fi, energy monitoring)](https://www.amazon.com/dp/B0G2YY8TCJ) | Wi-Fi switched mains outlet for target power, driven by the [`shellyplug` helper](power.md#shelly-smart-plug-control-shellyplug) over the device's local HTTP RPC API — no cloud, Home Assistant, or Matter. Any Shelly Gen2+ device works. |
 
 ## Serial console
 

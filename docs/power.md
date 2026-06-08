@@ -532,3 +532,86 @@ identical hubs share the control host.
   during learn.
 - **Port power state does not survive the hub losing power.** Replugging or
   power-cycling the whole hub turns every port back on (chip default).
+
+---
+
+## Shelly smart plug control (shellyplug)
+
+The `shellyplug` standalone helper switches **Shelly Gen2+ smart plugs and
+relays** (Plus, Pro, Gen3, Gen4) over each device's **local HTTP RPC API** —
+no cloud account, no Home Assistant, no Matter controller. Pure Rust via
+[ureq](https://crates.io/crates/ureq). Because the transport is a stateless
+HTTP request/response, it is a plain **one-shot** helper (no daemon, unlike
+`zigplug`): each invocation makes one `GET /rpc/<Method>` call and exits.
+
+- **Supported:** Gen2/3/4 devices, which speak the JSON-RPC API
+  (`Switch.Set`, `Switch.GetStatus`, `Shelly.GetDeviceInfo`). The original
+  Gen1 devices use a different REST API (`/relay/0?turn=on`) and are **not**
+  supported.
+- **Auth:** only devices with authentication **disabled** (`auth_en: false`,
+  the factory default) are supported for now. An auth-enabled device answers
+  HTTP 401; the helper reports that clearly rather than guessing.
+
+### Installation
+
+`shellyplug` is built and installed by `make install` / `paniolo setup`
+alongside the other crates, into the private libexec dir
+(`~/.local/libexec/paniolo/bin`), not on PATH — hook strings reference it by
+bare name (paniolo resolves libexec first). Run it by hand via
+`paniolo helper shellyplug …`.
+
+### Addressing
+
+- **`-d <host>`** is the device's address on your network: a bare IP or
+  hostname (`10.0.0.5`, `shelly.local`), optionally with a scheme or port
+  (`http://10.0.0.5:8080`). A Shelly advertises an mDNS name like
+  `shellyplugusg4-<mac>.local`; either pin its IP with a **DHCP reservation**
+  or use that `.local` name in the hook string so a DHCP lease change doesn't
+  break the hook.
+- **`[id]`** is the switch component id, default `0`. Single-outlet plugs only
+  have switch `0`; multi-channel devices (e.g. a Pro 4PM) use `0..N`.
+
+### Commands
+
+```bash
+shellyplug -d <host> status [id]          # device info + switch state and power metering
+shellyplug -d <host> state  [id]          # print exactly "on" or "off" (state_cmd contract)
+shellyplug -d <host> on     [id]          # switch on, confirm by read-back
+shellyplug -d <host> off    [id]          # switch off, confirm by read-back
+shellyplug -d <host> cycle  [id] [--delay-ms 3000]
+                                          # off → delay → on → confirm
+```
+
+### Wiring into paniolo power hooks
+
+```bash
+paniolo power set -t target-machine \
+    --cycle-cmd "shellyplug -d 10.0.0.5 cycle 0" \
+    --on-cmd    "shellyplug -d 10.0.0.5 on 0" \
+    --off-cmd   "shellyplug -d 10.0.0.5 off 0" \
+    --state-cmd "shellyplug -d 10.0.0.5 state 0"
+```
+
+After this, `paniolo power on/off`, `paniolo power-cycle`, and
+`paniolo power-state` drive the plug with no further setup.
+
+### Gotchas
+
+- **macOS Local Network privacy gates the helper (the big one).** Every other
+  paniolo helper talks over a serial port or to a `127.0.0.1` daemon —
+  loopback is exempt from macOS's Local Network privacy gate. `shellyplug` is
+  the **first helper to reach a device on the LAN**, so it is the first to hit
+  that gate. On macOS (Sequoia and later) access to the local subnet is
+  permitted **per-binary**, attributed to the controlling app. Symptom: the
+  helper fails with **`No route to host` (EHOSTUNREACH)** even though a browser
+  and `curl` reach the same device fine — Apple-signed system binaries like
+  `curl` are exempt; a freshly built `shellyplug` is not. Fix: grant the app
+  that launches the hook **Local Network** access (System Settings → Privacy &
+  Security → Local Network — enable your terminal, e.g. iTerm2/Terminal). The
+  first LAN access from that app usually triggers the one-time prompt. The
+  binary connecting to the public internet but not the LAN is the tell.
+- **A plug's IP can change.** Use a DHCP reservation or the device's `.local`
+  mDNS name in the hook string (see Addressing).
+- **`state` is cheap and honest.** It reads `Switch.GetStatus` live every call
+  (no caching) and fails loudly if the device is unreachable, rather than
+  reporting a stale guess — it is the hook agents poll.
