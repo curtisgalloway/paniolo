@@ -70,7 +70,11 @@ import busio
 import digitalio
 import neopixel_write
 import usb_hid
+import usb_cdc
 from adafruit_hid.keycode import Keycode
+
+import config
+
 
 BAUD = 115200
 
@@ -95,44 +99,44 @@ def status(r, g, b):
 
 
 # --- HID devices -------------------------------------------------------------
-def _find_abs_mouse():
-    """The absolute-pointer Device registered in boot.py (usage page 1, mouse)."""
-    for dev in usb_hid.devices:
-        if dev.usage_page == 0x01 and dev.usage == 0x02:
-            return dev
-    raise RuntimeError("absolute-mouse HID device not found — check boot.py")
-
-
-# Constructing Keyboard() probes the host with a no-op report, which raises
-# OSError until the target has enumerated us. Powered from the target's USB
-# port we boot in parallel with it, so retry instead of crashing.
-def make_devices():
-    from adafruit_hid.keyboard import Keyboard
-    from adafruit_hid.keyboard_layout_us import KeyboardLayoutUS
-
-    while True:
-        try:
-            kbd = Keyboard(usb_hid.devices)
-            return kbd, KeyboardLayoutUS(kbd), _find_abs_mouse()
-        except OSError:
-            status(16, 0, 0)
-            time.sleep(0.25)
-            status(0, 0, 0)
-            time.sleep(0.25)
-
-
-kbd, layout, abs_mouse = make_devices()
-
-# Virtual cursor state for the absolute pointer. Relative `move` accumulates
-# into this; `moveabs` sets it directly. Start centered.
+kbd = None
+layout = None
+abs_mouse = None
 _mx = ABS_MAX // 2
 _my = ABS_MAX // 2
 _buttons = 0
 _report = bytearray(6)
-
-# Set by the `baud` command; the main loop applies it AFTER replying OK at the
-# current rate (so the host reads the ack before either side switches).
 _pending_baud = None
+
+if config.ROLE in ("single", "target"):
+    def _find_abs_mouse():
+        """The absolute-pointer Device registered in boot.py (usage page 1, mouse)."""
+        for dev in usb_hid.devices:
+            if dev.usage_page == 0x01 and dev.usage == 0x02:
+                return dev
+        raise RuntimeError("absolute-mouse HID device not found — check boot.py")
+
+
+    # Constructing Keyboard() probes the host with a no-op report, which raises
+    # OSError until the target has enumerated us. Powered from the target's USB
+    # port we boot in parallel with it, so retry instead of crashing.
+    def make_devices():
+        from adafruit_hid.keyboard import Keyboard
+        from adafruit_hid.keyboard_layout_us import KeyboardLayoutUS
+
+        while True:
+            try:
+                kbd_dev = Keyboard(usb_hid.devices)
+                return kbd_dev, KeyboardLayoutUS(kbd_dev), _find_abs_mouse()
+            except OSError:
+                status(16, 0, 0)
+                time.sleep(0.25)
+                status(0, 0, 0)
+                time.sleep(0.25)
+
+
+    kbd, layout, abs_mouse = make_devices()
+
 
 
 def keycode_for(name):
@@ -206,7 +210,8 @@ def handle_line(line):
         if not 1200 <= new <= 2000000:
             raise ValueError("baud out of range")
         # Defer the actual switch to the main loop, after OK is sent.
-        _pending_baud = new
+        if config.CONNECTION == "serial" or config.ROLE == "single":
+            _pending_baud = new
     elif cmd == "ping":
         pass
     elif cmd == "version":
@@ -216,40 +221,194 @@ def handle_line(line):
     return None
 
 
-# A 1 ms read timeout keeps per-command latency low (the host streams mouse
-# moves); the read returns as soon as bytes arrive.
-uart = busio.UART(
-    board.TX, board.RX, baudrate=BAUD, timeout=0.001, receiver_buffer_size=512
-)
+# --- Setup and Main loop -----------------------------------------------------
 
-status(0, 16, 0)  # green: up and listening
-time.sleep(0.2)
-status(0, 0, 0)
-
-buf = b""
-while True:
-    data = uart.read(128)
-    if not data:
-        continue
-    buf += data
-    while b"\n" in buf:
-        line, buf = buf.split(b"\n", 1)
-        try:
-            extra = handle_line(line.decode("utf-8"))
-            if extra:
-                uart.write(b"OK " + extra.encode("utf-8") + b"\n")
-            else:
-                uart.write(b"OK\n")
-            status(0, 0, 0)
-        except Exception as e:  # report back instead of dropping the line
-            uart.write(b"ERR " + str(e).encode("utf-8") + b"\n")
+if config.ROLE == "control":
+    # -------------------------------------------------------------------------
+    # CONTROL BOARD
+    # -------------------------------------------------------------------------
+    if usb_cdc.data is None:
+        # Blink red to indicate missing USB CDC data channel configuration in boot.py
+        while True:
             status(16, 0, 0)
-    # Apply a `baud` switch only after its OK has been acked at the old rate.
-    if _pending_baud is not None:
-        time.sleep(0.05)  # let the OK fully drain at the current baud
-        uart.deinit()
+            time.sleep(0.1)
+            status(0, 0, 0)
+            time.sleep(0.1)
+
+    host_serial = usb_cdc.data
+
+    # Initialize the downstream link to the Target board
+    if config.CONNECTION == "serial":
         uart = busio.UART(
-            board.TX, board.RX, baudrate=_pending_baud,
-            timeout=0.001, receiver_buffer_size=512,
+            board.TX, board.RX, baudrate=BAUD, timeout=0.001, receiver_buffer_size=512
         )
-        _pending_baud = None
+    elif config.CONNECTION == "i2c0":
+        i2c = board.STEMMA_I2C()
+    elif config.CONNECTION == "i2c1":
+        # A1 is SCL, A0 is SDA for I2C1 on KB2040
+        i2c = busio.I2C(board.A1, board.A0)
+    else:
+        raise ValueError("Unknown connection type: " + config.CONNECTION)
+
+    def send_to_target(line_bytes):
+        global _pending_baud
+        if config.CONNECTION == "serial":
+            # Drain any stale data in UART
+            if uart.in_waiting:
+                uart.read(uart.in_waiting)
+            uart.write(line_bytes)
+            # Read reply
+            reply = b""
+            while True:
+                b = uart.read(1)
+                if b:
+                    reply += b
+                    if b == b"\n":
+                        break
+                else:
+                    time.sleep(0.001)
+
+            # If the command was a baud switch and reply is OK, defer changing our own UART baud
+            parts = line_bytes.strip().split(b" ")
+            if parts[0].lower() == b"baud" and reply.startswith(b"OK"):
+                _pending_baud = int(parts[1])
+            return reply
+        else:
+            # I2C connection (i2c0 or i2c1)
+            while not i2c.try_lock():
+                time.sleep(0.001)
+            try:
+                i2c.writeto(config.I2C_ADDRESS, line_bytes)
+            finally:
+                i2c.unlock()
+
+            # Read response
+            buf = bytearray(128)
+            while not i2c.try_lock():
+                time.sleep(0.001)
+            try:
+                i2c.readfrom_into(config.I2C_ADDRESS, buf)
+            finally:
+                i2c.unlock()
+
+            if b"\n" in buf:
+                return buf.split(b"\n", 1)[0] + b"\n"
+            else:
+                return bytes(buf).rstrip(b"\x00\xff") + b"\n"
+
+    status(0, 16, 0)  # green: up and listening
+    time.sleep(0.2)
+    status(0, 0, 0)
+
+    buf = b""
+    while True:
+        if host_serial.in_waiting:
+            buf += host_serial.read(host_serial.in_waiting)
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                try:
+                    reply = send_to_target(line + b"\n")
+                    host_serial.write(reply)
+                    if reply.startswith(b"OK"):
+                        status(0, 0, 0)
+                    else:
+                        status(16, 0, 0)
+                except Exception as e:
+                    host_serial.write(b"ERR " + str(e).encode("utf-8") + b"\n")
+                    status(16, 0, 0)
+
+        if _pending_baud is not None:
+            time.sleep(0.05)  # let OK drain
+            uart.deinit()
+            uart = busio.UART(
+                board.TX, board.RX, baudrate=_pending_baud,
+                timeout=0.001, receiver_buffer_size=512,
+            )
+            _pending_baud = None
+
+elif config.ROLE == "target" and config.CONNECTION in ("i2c0", "i2c1"):
+    # -------------------------------------------------------------------------
+    # TARGET BOARD (I2C)
+    # -------------------------------------------------------------------------
+    from i2ctarget import I2CTarget
+
+    def get_i2c_target():
+        if config.CONNECTION == "i2c0":
+            return I2CTarget(board.SCL, board.SDA, (config.I2C_ADDRESS,))
+        elif config.CONNECTION == "i2c1":
+            return I2CTarget(board.A1, board.A0, (config.I2C_ADDRESS,))
+        else:
+            raise ValueError("Unknown I2C connection type: " + config.CONNECTION)
+
+    device = get_i2c_target()
+    reply_buffer = b"OK\n"
+
+    status(0, 16, 0)  # green: up and listening
+    time.sleep(0.2)
+    status(0, 0, 0)
+
+    while True:
+        req = device.request()
+        if not req:
+            continue
+        if req.is_read:
+            req.write(reply_buffer)
+        else:
+            data = bytearray()
+            while True:
+                chunk = req.read(64)
+                if not chunk:
+                    break
+                data.extend(chunk)
+                time.sleep(0.001)
+            try:
+                extra = handle_line(bytes(data).decode("utf-8"))
+                if extra:
+                    reply_buffer = b"OK " + extra.encode("utf-8") + b"\n"
+                else:
+                    reply_buffer = b"OK\n"
+                status(0, 0, 0)
+            except Exception as e:
+                reply_buffer = b"ERR " + str(e).encode("utf-8") + b"\n"
+                status(16, 0, 0)
+
+else:
+    # -------------------------------------------------------------------------
+    # SINGLE BOARD or TARGET BOARD (SERIAL)
+    # -------------------------------------------------------------------------
+    uart = busio.UART(
+        board.TX, board.RX, baudrate=BAUD, timeout=0.001, receiver_buffer_size=512
+    )
+
+    status(0, 16, 0)  # green: up and listening
+    time.sleep(0.2)
+    status(0, 0, 0)
+
+    buf = b""
+    while True:
+        data = uart.read(128)
+        if not data:
+            continue
+        buf += data
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            try:
+                extra = handle_line(line.decode("utf-8"))
+                if extra:
+                    uart.write(b"OK " + extra.encode("utf-8") + b"\n")
+                else:
+                    uart.write(b"OK\n")
+                status(0, 0, 0)
+            except Exception as e:  # report back instead of dropping the line
+                uart.write(b"ERR " + str(e).encode("utf-8") + b"\n")
+                status(16, 0, 0)
+        # Apply a `baud` switch only after its OK has been acked at the old rate.
+        if _pending_baud is not None:
+            time.sleep(0.05)  # let the OK fully drain at the current baud
+            uart.deinit()
+            uart = busio.UART(
+                board.TX, board.RX, baudrate=_pending_baud,
+                timeout=0.001, receiver_buffer_size=512,
+            )
+            _pending_baud = None
+

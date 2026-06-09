@@ -91,14 +91,26 @@ ABS_MOUSE = usb_hid.Device(
     out_report_lengths=(0,),
 )
 
+import config
+
 _jumper = digitalio.DigitalInOut(board.D2)
 _jumper.switch_to_input(pull=digitalio.Pull.UP)
 DEV_MODE = not _jumper.value  # D2 grounded -> keep dev interfaces
 _jumper.deinit()
 
 usb_midi.disable()
-usb_hid.enable((usb_hid.Device.KEYBOARD, ABS_MOUSE))
 
-if not DEV_MODE:
-    storage.disable_usb_drive()
-    usb_cdc.disable()
+if config.ROLE == "control":
+    # Control board doesn't need to emulate HID keyboard/mouse.
+    # We always enable CDC data + console so it can receive commands and offer REPL/logs.
+    usb_hid.disable()
+    usb_cdc.enable(console=True, data=True)
+    if not DEV_MODE:
+        storage.disable_usb_drive()
+else:
+    # Target or single-board setups need the absolute mouse and keyboard HID.
+    usb_hid.enable((usb_hid.Device.KEYBOARD, ABS_MOUSE))
+    if not DEV_MODE:
+        storage.disable_usb_drive()
+        usb_cdc.disable()
+

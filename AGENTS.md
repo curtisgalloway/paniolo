@@ -311,6 +311,8 @@ hidrig/          USB HID injector: host CLI + daemon (Rust) + KB2040 firmware
   firmware/boot.py USB identity: HID-only toward the target (keyboard + custom
                    absolute-pointer descriptor, 0..32767 axes); D2->GND jumper
                    at boot re-enables CIRCUITPY + REPL for development
+  firmware/config.py connection type and role configuration shared by boot.py and code.py
+
   host/hid_seize_reports.c  macOS IOKit tool: seizes the HID device exclusively
                    and prints raw input reports — for pipeline testing without
                    keystrokes reaching the focused app. Build with host/Makefile.
@@ -748,9 +750,8 @@ host tooling drives any conforming microcontroller implementation). The
 firmware (`firmware/code.py`) is the reference implementation; `hidrig`
 (`src/main.rs`, `src/proto.rs`) is the host client.
 
-An earlier two-board design (USB-CDC control board relaying binary I2C packets
-to a USB-HID target board) lives only in git history (`hidrig/control/`,
-`hidrig/target/`, `HANDOFF.md`).
+A dual-board configuration is also supported (configurable in `firmware/config.py`), where the host-facing Control board acts as a bridge receiving commands over USB CDC and forwarding them over I2C1 (A0/A1), I2C0 (STEMMA/QT), or serial (UART) to the target-facing Target board.
+
 
 ### USB identity (`firmware/boot.py`)
 

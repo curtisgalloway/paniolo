@@ -6,6 +6,10 @@ the target as a plain USB HID keyboard + mouse; the control host drives it
 with line-based text commands over a UART on the board's TX/RX pins,
 typically through a USB-serial adapter.
 
+### Single-Board Configuration (Serial/UART)
+
+In the standard single-board configuration, the control host connects to the KB2040 via a USB-serial adapter. The KB2040's native USB port connects to the target machine to act as the HID device:
+
 ```
 [Control host] --USB-serial adapter--+
                                      | UART (TX/RX/GND, 115200 8N1, 3.3 V)
@@ -13,11 +17,33 @@ typically through a USB-serial adapter.
                                  [KB2040] --built-in USB (HID device)--> [Target]
 ```
 
+### Dual-Board Configuration (I2C or Serial)
+
+To avoid needing a USB-serial hardware adapter, you can connect two KB2040s. The host-facing **Control KB2040** connects to the control host via its native USB (exposed as a USB CDC serial device) and acts as a bridge. The target-facing **Target KB2040** connects to the target machine via its native USB to act as the HID device.
+
+The two boards can be connected in one of three ways:
+1. **I2C1** (default for two boards): connected via GPIO pins `A0`/`A1` (`A0` = SDA, `A1` = SCL).
+2. **I2C0 (STEMMA/QT)**: connected via the built-in STEMMA QT/Qwiic ports.
+3. **Serial**: connected via the standard UART `TX`/`RX` pins.
+
+```
+[Control host]
+      |
+      | USB (CDC Serial)
+      v
+[Control KB2040]
+      |
+      | I2C1 (A0/A1), I2C0 (STEMMA/QT), or UART (TX/RX)
+      v
+[Target KB2040] --built-in USB (HID device)--> [Target]
+```
+
 The wire protocol is the **HID serial protocol v1** — see
 [`docs/hid-serial-protocol.md`](../docs/hid-serial-protocol.md) for the
 normative spec. This directory holds the reference firmware implementation
 (CircuitPython) and the host-side CLI (`hidrig`, Rust), which works against
 any device implementing the spec.
+
 
 ## Hardware
 
