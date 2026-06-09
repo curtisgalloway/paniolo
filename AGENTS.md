@@ -56,7 +56,7 @@ Current capabilities:
 - Combined video+serial web dashboard (hdmicap's `GET /`: video on top, xterm.js terminal below)
 - On-device OCR of the captured screen (`paniolo video read [target] [--stable]`, which wraps hdmicap's `GET /ocr`; also the dashboard OCR button): Apple Vision on macOS, Tesseract on Linux
 - USB HID input (keyboard/mouse injection) via a generic helper hook (`paniolo hid send`); the `hidrig` helper drives the KB2040 injector over its control UART (HID serial protocol, docs/hid-serial-protocol.md). `hidrig serve` runs a daemon that owns the UART and re-exposes the protocol over a WebSocket, so `paniolo console` works as a **KVM** — stream the browser's keyboard + absolute mouse (`moveabs`) to the target, intermixed with CLI injection on the one wire
-- Power control via DTR (J2 wiring) or generic shell-command hooks (`on_cmd`, `off_cmd`, `cycle_cmd`, `state_cmd`): `paniolo serial dtr`, `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`. Helpers that wire into the hooks: `cambrionix` (Cambrionix hub port power via control UART), `zigplug` (Zigbee smart plugs via a CC2652 coordinator dongle), and `usbhub` (per-port VBUS switching on off-the-shelf USB hubs via hub-class requests, with human-verified port profiles built by `usbhub learn`)
+- Power control via DTR (J2 wiring) or generic shell-command hooks (`on_cmd`, `off_cmd`, `cycle_cmd`, `state_cmd`): `paniolo serial dtr`, `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`. Helpers that wire into the hooks: `cambrionix` (Cambrionix hub port power via control UART), `zigplug` (Zigbee smart plugs via a CC2652 coordinator dongle), `usbhub` (per-port VBUS switching on off-the-shelf USB hubs via hub-class requests, with human-verified port profiles built by `usbhub learn`), and `shellyplug` (Shelly Gen2+ smart plugs/relays over the device's local HTTP RPC API — no cloud/HA/Matter)
 
 ## Architecture
 
@@ -218,6 +218,16 @@ usbhub/          Rust crate: standalone helper for per-port USB hub power contro
                  `learn run` guided wizard (rustyline prompts, history). Probe
                  detection is by bus topology, not speed. `state <port>` prints
                  exactly `on`/`off` (state_cmd contract). See docs/power.md.
+
+shellyplug/      Rust crate: standalone helper for Shelly Gen2+ smart plugs/
+                 relays (Plus/Pro/Gen3/Gen4) over the device's local HTTP RPC
+                 API (Switch.Set/GetStatus; ureq). One-shot, stateless — no
+                 daemon. Addressed by `-d <ip|host>` and `[id]` switch (default
+                 0). Commands: `status [id]`, `state [id]`, `on/off [id]`,
+                 `cycle [id]`; `on/off/cycle` confirm by read-back. Gen2+ only
+                 (no Gen1 REST); auth-disabled devices only for now. NB: first
+                 helper to reach a LAN device, so first to hit the macOS
+                 Local Network privacy gate — see docs/power.md gotchas.
 
 zigplug/         Python (uv) helper: Zigbee smart plug control via a CC2652 (ZNP)
                  coordinator dongle, using zigpy-znp. CLI wired into paniolo
@@ -899,7 +909,8 @@ ssh control-mac "paniolo netboot stop target-machine"
 a standalone helper binary wired in via the generic power hooks. Follow
 [docs/adding-power-helpers.md](docs/adding-power-helpers.md) (hook contract,
 helper CLI conventions, Rust/Python skeletons, verification ladder, PR
-checklist); `cambrionix/`, `zigplug/`, and `usbhub/` are the exemplars.
+checklist); `cambrionix/`, `zigplug/`, `usbhub/`, and `shellyplug/` (the
+simplest one — a stateless HTTP one-shot) are the exemplars.
 
 The steps below describe the legacy Python tree:
 
