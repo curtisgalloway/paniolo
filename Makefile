@@ -22,7 +22,7 @@
 # `make install` from a fresh clone is the only command you need; re-run it
 # after editing anything to rebuild and reinstall.
 
-CRATES = cli hdmicap serialcap netbootd cambrionix hidrig usbhub shellyplug
+CRATES = cli hdmicap serialcap netbootd cambrionix hidrig ch9329 usbhub shellyplug
 
 # The installed CLI, by absolute path: immune to a stale `paniolo` shadowing
 # ~/.cargo/bin earlier in PATH (e.g. the retired Python CLI's uv-tools shim).

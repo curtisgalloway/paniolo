@@ -783,7 +783,7 @@ fn cmd_helper(name: Option<&str>, args: &[String]) -> Result<()> {
     // whose discovery name is the channel (any conforming helper may serve
     // it): hidrig publishes under "hid".
     let env_name = match name {
-        "hidrig" => HID_DAEMON,
+        "hidrig" | "ch9329" => HID_DAEMON,
         n => n,
     };
     let status = std::process::Command::new(binary)

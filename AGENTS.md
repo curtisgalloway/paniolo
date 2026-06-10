@@ -36,7 +36,10 @@ Run through this checklist before calling `gh pr create`:
    surface. The repo copy at `skills/paniolo/SKILL.md` is the canonical source;
    edit it here (however you install or link it into your agent's skills
    directory). Purely internal changes that don't alter the CLI surface can skip
-   this.
+   this. A companion skill, `skills/kvm-puppeting/SKILL.md`, teaches the
+   GUI-puppeting *doctrine* (the look-act-settle-verify loop, keyboard-first
+   navigation, pixel→logical mouse scaling) on top of the `video`+`hid`
+   commands; update it too if you change the surface it relies on.
 
 3. **Open the PR; do not merge it.** Push the branch and create the PR with
    `gh pr create`, then stop. The merge decision belongs to the user.
