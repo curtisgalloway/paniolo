@@ -31,12 +31,13 @@ use anyhow::{anyhow, bail, Result};
 
 /// The helper crates `setup` builds and installs into libexec, in order. The
 /// `cli` crate (the `paniolo` binary itself) installs separately onto PATH.
-const HELPER_CRATES: [&str; 7] = [
+const HELPER_CRATES: [&str; 8] = [
     "hdmicap",
     "serialcap",
     "netbootd",
     "cambrionix",
     "hidrig",
+    "ch9329",
     "usbhub",
     "shellyplug",
 ];
