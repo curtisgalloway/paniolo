@@ -17,16 +17,22 @@
 //!
 //! This is a sibling of `hidrig` (the KB2040 injector client): same CLI surface
 //! — `type`, `key`, `combo`, `down`, `up`, `releaseall`, `move`, `moveabs`,
-//! `click`, `mdown`, `mup`, `scroll`, `ping`, `version`, `run` — so it drops
-//! into a paniolo `hid` channel (`paniolo hid set --cmd "ch9329 -d <uart>"`).
-//! Unlike hidrig there is no microcontroller running firmware: the CH9329 chip
-//! is itself the USB HID device, so this client speaks the chip's binary frame
-//! protocol directly (see `session.rs`). The `serve`/`stop` daemon path (the
-//! `paniolo console` KVM) is a later milestone.
+//! `click`, `mdown`, `mup`, `scroll`, `ping`, `version`, `run`, plus `serve`/
+//! `stop` for the KVM daemon — so it drops into a paniolo `hid` channel
+//! (`paniolo hid set --cmd "ch9329 -d <uart>"`). Unlike hidrig there is no
+//! microcontroller running firmware: the CH9329 chip is itself the USB HID
+//! device, so this client speaks the chip's binary frame protocol directly (see
+//! `session.rs`). `serve` runs a daemon that owns the UART and re-exposes the
+//! protocol over a WebSocket so the web console can stream events that intermix
+//! with CLI injections; when a daemon is running for the same device, one-shots
+//! route through it automatically.
 
+mod daemon;
 mod keys;
 mod proto;
+mod server;
 mod session;
+mod uart;
 
 use std::io::Read;
 use std::thread::sleep;
@@ -128,12 +134,16 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         delay_ms: u64,
     },
-    /// (Not yet implemented) Run the KVM daemon for `paniolo console`.
+    /// Run the KVM daemon: own the UART and re-expose the protocol over a
+    /// localhost WebSocket (the `paniolo console` path). Blocks until stopped.
+    /// One-shots for the same device route through this daemon automatically.
     Serve {
+        /// TCP port to listen on (0 = OS-assigned; the port is published in the
+        /// discovery file paniolo reads).
         #[arg(long, default_value_t = 0)]
         port: u16,
     },
-    /// (Not yet implemented) Stop a running daemon.
+    /// Stop a running hid daemon (SIGTERM to the recorded pid).
     Stop,
     /// (Not yet implemented) Renegotiate the serial link baud.
     Baud { rate: u32 },
@@ -142,54 +152,56 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Daemon/baud paths are a later milestone; fail clearly rather than silently.
-    if let Cmd::Serve { .. } | Cmd::Stop | Cmd::Baud { .. } = cli.cmd {
-        return Err(anyhow!(
-            "this CH9329 helper implements one-shot injection only; the \
-             serve/stop/baud (KVM daemon) path is not yet built"
-        ));
+    // Commands that don't take the one-shot UART path.
+    match &cli.cmd {
+        Cmd::Serve { port } => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "info".into()),
+                )
+                .init();
+            let device = require_device(&cli)?;
+            return daemon::run(device.to_string(), *port);
+        }
+        Cmd::Stop => return cmd_stop(),
+        Cmd::Baud { .. } => {
+            return Err(anyhow!(
+                "baud renegotiation is not implemented for this CH9329 helper"
+            ));
+        }
+        _ => {}
     }
 
     let device = require_device(&cli)?;
-    let mut s = Session::open(device, cli.baud)?;
+    let mut tx = Sender::open(device, cli.baud)?;
 
     match cli.cmd {
-        Cmd::Type { text } => one(&mut s, &format!("type {}", text.join(" "))),
-        Cmd::Key { name } => one(&mut s, &format!("key {name}")),
-        Cmd::Combo { names } => one(&mut s, &format!("combo {}", names.join(" "))),
-        Cmd::Down { name } => one(&mut s, &format!("down {name}")),
-        Cmd::Up { name } => one(&mut s, &format!("up {name}")),
-        Cmd::Releaseall => one(&mut s, "releaseall"),
-        Cmd::Move { dx, dy } => one(&mut s, &format!("move {dx} {dy}")),
+        Cmd::Type { text } => one(&mut tx, &format!("type {}", text.join(" "))),
+        Cmd::Key { name } => one(&mut tx, &format!("key {name}")),
+        Cmd::Combo { names } => one(&mut tx, &format!("combo {}", names.join(" "))),
+        Cmd::Down { name } => one(&mut tx, &format!("down {name}")),
+        Cmd::Up { name } => one(&mut tx, &format!("up {name}")),
+        Cmd::Releaseall => one(&mut tx, "releaseall"),
+        Cmd::Move { dx, dy } => one(&mut tx, &format!("move {dx} {dy}")),
         Cmd::Moveabs { x, y } => one(
-            &mut s,
+            &mut tx,
             &format!("moveabs {} {}", proto::clamp_abs(x), proto::clamp_abs(y)),
         ),
-        Cmd::Click { button } => one(&mut s, &format!("click {button}")),
-        Cmd::Mdown { button } => one(&mut s, &format!("mdown {button}")),
-        Cmd::Mup { button } => one(&mut s, &format!("mup {button}")),
-        Cmd::Scroll { amount } => one(&mut s, &format!("scroll {amount}")),
-        Cmd::Ping => one(&mut s, "ping"),
+        Cmd::Click { button } => one(&mut tx, &format!("click {button}")),
+        Cmd::Mdown { button } => one(&mut tx, &format!("mdown {button}")),
+        Cmd::Mup { button } => one(&mut tx, &format!("mup {button}")),
+        Cmd::Scroll { amount } => one(&mut tx, &format!("scroll {amount}")),
+        Cmd::Ping => one(&mut tx, "ping"),
         Cmd::Version => {
-            let reply = execute_line(&mut s, "version")?;
-            println!("{reply}");
+            println!("{}", tx.run_line("version")?);
             Ok(())
         }
         Cmd::Info => {
-            let info = s.get_info()?;
-            println!(
-                "chip_version={:#04x} target_connected={} num_lock={} caps_lock={} \
-                 scroll_lock={} baud={}",
-                info.chip_version,
-                info.target_connected,
-                info.num_lock,
-                info.caps_lock,
-                info.scroll_lock,
-                s.baud(),
-            );
+            println!("{}", tx.run_line("info")?);
             Ok(())
         }
-        Cmd::Run { file, delay_ms } => cmd_run(&mut s, &file, delay_ms),
+        Cmd::Run { file, delay_ms } => cmd_run(&mut tx, &file, delay_ms),
         Cmd::Serve { .. } | Cmd::Stop | Cmd::Baud { .. } => unreachable!("handled above"),
     }
 }
@@ -200,14 +212,66 @@ fn require_device(cli: &Cli) -> Result<&str> {
         .ok_or_else(|| anyhow!("required argument '--device <DEVICE>' (-d) was not provided"))
 }
 
-/// Execute one command line and acknowledge with `OK` on stdout.
-fn one(s: &mut Session, line: &str) -> Result<()> {
-    execute_line(s, line)?;
+/// One command line, executed either through a running daemon or directly on
+/// the UART, depending on what owns the device.
+enum Sender {
+    /// A hid daemon owns this device; route commands through its HTTP API.
+    Daemon { base: String },
+    /// No daemon for this device; we hold the UART ourselves.
+    Direct { session: Session },
+}
+
+impl Sender {
+    /// Choose the transport: if a hid daemon is running for `device`, route
+    /// through it (it holds the port, so a direct open would fail anyway);
+    /// otherwise open the UART directly.
+    fn open(device: &str, baud: Option<u32>) -> Result<Sender> {
+        if let Some(d) = daemon::discover() {
+            if d.device == device {
+                return Ok(Sender::Daemon {
+                    base: format!("http://127.0.0.1:{}", d.port),
+                });
+            }
+        }
+        Ok(Sender::Direct {
+            session: Session::open(device, baud)?,
+        })
+    }
+
+    /// Execute one command line, returning the `OK` reply data (empty for a
+    /// bare `OK`, the capability/info string for `version`/`info`).
+    fn run_line(&mut self, line: &str) -> Result<String> {
+        match self {
+            Sender::Daemon { base } => post_send(base, line),
+            Sender::Direct { session } => execute_line(session, line),
+        }
+    }
+}
+
+/// POST one command line to a running daemon's `/send`; return the reply body.
+fn post_send(base: &str, line: &str) -> Result<String> {
+    match ureq::post(&format!("{base}/send"))
+        .timeout(Duration::from_secs(15))
+        .send_string(line)
+    {
+        Ok(resp) => Ok(resp.into_string().unwrap_or_default().trim().to_string()),
+        // A 503 carries the board's ERR / transport message in the body.
+        Err(ureq::Error::Status(_, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            Err(anyhow!("{}", body.trim()))
+        }
+        Err(e) => Err(anyhow!("hid daemon /send failed: {e}")),
+    }
+}
+
+/// Execute a single command and acknowledge with `OK` on stdout.
+fn one(tx: &mut Sender, line: &str) -> Result<()> {
+    tx.run_line(line)?;
     println!("OK");
     Ok(())
 }
 
-fn cmd_run(s: &mut Session, file: &str, delay_ms: u64) -> Result<()> {
+fn cmd_run(tx: &mut Sender, file: &str, delay_ms: u64) -> Result<()> {
     let text = if file == "-" {
         let mut buf = String::new();
         std::io::stdin()
@@ -223,7 +287,7 @@ fn cmd_run(s: &mut Session, file: &str, delay_ms: u64) -> Result<()> {
         match step {
             Step::Delay(secs) => sleep(Duration::from_secs_f64(secs)),
             Step::Cmd(cmd) => {
-                execute_line(s, &cmd)?;
+                tx.run_line(&cmd)?;
                 sent += 1;
                 if delay_ms > 0 {
                     sleep(Duration::from_millis(delay_ms));
@@ -233,4 +297,24 @@ fn cmd_run(s: &mut Session, file: &str, delay_ms: u64) -> Result<()> {
     }
     println!("OK ({sent} commands)");
     Ok(())
+}
+
+/// Stop a running hid daemon by sending SIGTERM to its recorded pid.
+fn cmd_stop() -> Result<()> {
+    match daemon::discover() {
+        Some(d) => {
+            // Safe: kill with SIGTERM to a pid we just confirmed alive.
+            let rc = unsafe { libc::kill(d.pid as i32, libc::SIGTERM) };
+            if rc == 0 {
+                println!("hid daemon (pid {}) stopped", d.pid);
+                Ok(())
+            } else {
+                Err(anyhow!("failed to signal hid daemon pid {}", d.pid))
+            }
+        }
+        None => {
+            println!("no hid daemon running");
+            Ok(())
+        }
+    }
 }

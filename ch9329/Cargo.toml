@@ -27,9 +27,23 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 serialport = "4"
-
-[target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+
+# --- serve (daemon) mode: async runtime + HTTP/WebSocket --------------------
+# The CH9329 UART is driven by the blocking `serialport` path on a dedicated
+# thread (see uart.rs) — tokio-serial's async reads are unreliable on a macOS
+# tty — bridged to the async server via tokio channels.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "net", "io-util"] }
+axum = { version = "0.7", features = ["ws"] }
+futures-util = "0.3"
+
+# --- daemon plumbing + client ----------------------------------------------
+fs2 = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "2"
 
 [profile.release]
 opt-level = 3

@@ -94,6 +94,17 @@ pub fn execute_line(s: &mut Session, line: &str) -> Result<String> {
             s.get_info()?;
         }
         "version" => return Ok(VERSION_REPLY.to_string()),
+        "info" => {
+            // CH9329-specific extension (not part of the HID serial protocol):
+            // chip firmware version, target-USB enumeration, lock LEDs, baud.
+            let i = s.get_info()?;
+            let baud = s.baud();
+            return Ok(format!(
+                "chip_version={:#04x} target_connected={} num_lock={} \
+                 caps_lock={} scroll_lock={} baud={}",
+                i.chip_version, i.target_connected, i.num_lock, i.caps_lock, i.scroll_lock, baud
+            ));
+        }
         "baud" => bail!("baud renegotiation not supported by this CH9329 helper"),
         other => bail!("unknown command: {other}"),
     }

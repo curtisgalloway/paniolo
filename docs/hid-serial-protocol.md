@@ -26,7 +26,7 @@ This document is **normative**. Implementations:
 | Implementation | Status |
 |---|---|
 | `hidrig/firmware/` — Adafruit KB2040, CircuitPython | Reference implementation |
-| WCH CH9329 bridge (see [ch9329-spec.md](https://github.com/curtisgalloway/paniolo/blob/main/docs/ch9329-spec.md)) | Implemented — the host-side [`ch9329`](https://github.com/curtisgalloway/paniolo/blob/main/ch9329/README.md) crate speaks this protocol (one-shot; no daemon yet) |
+| WCH CH9329 bridge (see [ch9329-spec.md](https://github.com/curtisgalloway/paniolo/blob/main/docs/ch9329-spec.md)) | Implemented — the host-side [`ch9329`](https://github.com/curtisgalloway/paniolo/blob/main/ch9329/README.md) crate speaks this protocol (one-shot CLI + `serve` daemon) |
 
 The host-side client is the `hidrig` CLI (`hidrig/src/`), which works against
 any conforming device.

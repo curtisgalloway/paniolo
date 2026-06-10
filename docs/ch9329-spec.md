@@ -22,9 +22,9 @@ limitations under the License.
 > <uart>"`), with no device-specific code in `cli/`. It exposes the same CLI
 > surface as the KB2040 `hidrig`, translating each
 > [HID serial protocol](hid-serial-protocol.md) command into the binary frames
-> below. One-shot injection is hardware-verified; the `serve`/`stop` KVM-daemon
-> path (for `paniolo console`) is not yet built. The facts below remain the
-> clean-room reference the implementation is built from.
+> below. Both one-shot injection and the `serve`/`stop` KVM daemon (for
+> `paniolo console`) are implemented and hardware-verified. The facts below
+> remain the clean-room reference the implementation is built from.
 
 **Device:** WCH CH9329 UART→USB-HID bridge, behind a CH340 USB-serial
 bridge in the Openterface Mini-KVM. The host sends framed serial commands; the

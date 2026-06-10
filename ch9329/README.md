@@ -91,16 +91,23 @@ works), but not `baud` renegotiation.
     whose coordinates equal its previous one, so re-sending the same position
     after a relative move was a no-op (the cursor wouldn't snap back). Sending a
     one-unit-off report then the exact target forces a real move.
-- **`serve`/`stop` (the `paniolo console` KVM daemon) is not yet built.** The
-  web-console "Capture input" KVM needs a helper daemon re-exposing the protocol
-  over a WebSocket, as `hidrig serve` does. One-shot `paniolo hid send` works
-  without it.
-- **`down`/`up` hold across separate process invocations is best-effort.** The
-  CH9329 only remembers its last report and there is no "read current report"
-  command, so a one-shot `ch9329 down A` can't know what a previous invocation
-  left held. Held-key state is tracked *within* a process (so `combo` and a
-  `run` sequence compose correctly); multi-invocation holds want the daemon
-  (above), which keeps one long-lived session.
+- **The KVM daemon (`serve`/`stop`) is implemented and hardware-verified.**
+  `ch9329 serve` owns the UART and re-exposes the protocol over a localhost
+  WebSocket (`GET /hid`) plus a `POST /send` one-shot endpoint, publishing the
+  `/tmp/paniolo-<uid>/hid/daemon.json` discovery file paniolo's `console` reads
+  — so the web-console "Capture input" KVM works with the Openterface. While a
+  daemon runs, one-shot `paniolo hid send` invocations route through it
+  automatically, so the CLI and the browser never contend for the UART and
+  their injections intermix. (The UART is driven by the blocking `serialport`
+  path on a dedicated thread bridged to the async server — tokio-serial's async
+  reads are unreliable on a macOS tty.)
+- **Held state (`down`/`up`/`mdown`/drag) persists across commands through the
+  daemon**, because its one long-lived session carries the report — verified by
+  holding `LEFT_SHIFT` across three separate CLI invocations and getting
+  uppercase output. *Without* a daemon, a direct one-shot `ch9329 down A` resets
+  per process (the CH9329 has no "read current report" command), so held state
+  is per-invocation there; `combo` and `run` sequences still compose within one
+  process.
 - **`baud` renegotiation** (the protocol's optional fast-link capability) is not
   implemented; it needs the CH9329 `SET_PARA_CFG` flash-and-reset procedure
   (`docs/ch9329-spec.md` §5).
