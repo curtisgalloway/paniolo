@@ -145,7 +145,10 @@ enum Cmd {
     },
     /// Stop a running hid daemon (SIGTERM to the recorded pid).
     Stop,
-    /// (Not yet implemented) Renegotiate the serial link baud.
+    /// Persistently set the CH9329's serial baud (SET_PARA_CFG flash + reset),
+    /// then reconnect at the new rate. The datasheet range is 1200..=115200
+    /// (Openterface default 115200; factory chips 9600). Unlike the protocol's
+    /// transient `baud`, this is stored in flash and survives a power-cycle.
     Baud { rate: u32 },
 }
 
@@ -165,11 +168,6 @@ fn main() -> Result<()> {
             return daemon::run(device.to_string(), *port);
         }
         Cmd::Stop => return cmd_stop(),
-        Cmd::Baud { .. } => {
-            return Err(anyhow!(
-                "baud renegotiation is not implemented for this CH9329 helper"
-            ));
-        }
         _ => {}
     }
 
@@ -202,7 +200,11 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Run { file, delay_ms } => cmd_run(&mut tx, &file, delay_ms),
-        Cmd::Serve { .. } | Cmd::Stop | Cmd::Baud { .. } => unreachable!("handled above"),
+        Cmd::Baud { rate } => {
+            println!("{}", tx.run_line(&format!("baud {rate}"))?);
+            Ok(())
+        }
+        Cmd::Serve { .. } | Cmd::Stop => unreachable!("handled above"),
     }
 }
 

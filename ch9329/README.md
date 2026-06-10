@@ -59,18 +59,28 @@ The full [HID serial protocol](../docs/hid-serial-protocol.md) §3 surface:
 sequences. Key names are `adafruit_hid` Keycode names (`A`–`Z`, `ENTER`,
 `LEFT_CONTROL`, `FORWARD_SLASH`, `F1`…`F12`); `type` assumes a **US layout**.
 
-Two extras beyond hidrig's surface:
+Extras beyond hidrig's surface:
 
 - `ch9329 -d <dev> info` — CH9329 `GET_INFO`: firmware version, whether the
   target has enumerated the emulated HID (`target_connected`), lock-LED state,
   and the negotiated baud. Useful for `paniolo doctor`-style checks; the KB2040
   can't report target enumeration, the CH9329 can.
-- `-b/--baud <rate>` — force the link rate (default: autodetect 115200 then
-  9600; Openterface units ship at 115200, a factory CH9329 at 9600).
+- `ch9329 -d <dev> baud <rate>` — **persistently** set the chip's serial baud
+  (`SET_PARA_CFG` → flash → `RESET` to activate), then reconnect at the new
+  rate. Datasheet range 1200..=115200 (Openterface default 115200; factory
+  chips 9600). Use it to bring a factory-9600 chip up to 115200, for example.
+  Note the `RESET` makes the chip re-enumerate its USB HID, so the target
+  briefly sees the keyboard/mouse disconnect and reconnect.
+- `-b/--baud <rate>` — force the link rate for *this* connection without
+  changing the chip (default: autodetect 115200 then 9600). Needed to reconnect
+  after `baud` set a rate other than 115200/9600.
 
 `version` reports `1 ch9329/0.1.0 moveabs` — it advertises the **`moveabs`**
 capability (the CH9329 has a true absolute pointer, so click-where-you-point
-works), but not `baud` renegotiation.
+works). It deliberately does *not* advertise `baud`: the protocol's `baud` is a
+*transient* renegotiation that reverts on power-cycle, but the CH9329's is
+persistent (above), so a host should not auto-invoke it expecting transient
+behavior.
 
 ## Status and limitations
 
@@ -108,9 +118,12 @@ works), but not `baud` renegotiation.
   per process (the CH9329 has no "read current report" command), so held state
   is per-invocation there; `combo` and `run` sequences still compose within one
   process.
-- **`baud` renegotiation** (the protocol's optional fast-link capability) is not
-  implemented; it needs the CH9329 `SET_PARA_CFG` flash-and-reset procedure
-  (`docs/ch9329-spec.md` §5).
+- **Baud changing is implemented and hardware-verified** via the `baud`
+  command (the `SET_PARA_CFG` flash-and-reset procedure, `docs/ch9329-spec.md`
+  §5) — round-tripped 115200 → 9600 → 115200 on real hardware, the change
+  surviving a fresh process (it's persisted to flash). It is *persistent*, not
+  the protocol's transient renegotiation, so it is not advertised as a `baud`
+  capability and the daemon never auto-invokes it.
 
 ## License
 

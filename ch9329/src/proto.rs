@@ -27,8 +27,11 @@ use crate::session::Session;
 
 /// `version` reply data (the part after `OK`): protocol version, impl id, and
 /// the optional capabilities this injector advertises. The CH9329 has a true
-/// absolute pointer, so it offers `moveabs`; `baud` renegotiation is not yet
-/// implemented (would need the SET_PARA_CFG flash dance, see ch9329-spec §5).
+/// absolute pointer, so it offers `moveabs`. It deliberately does **not**
+/// advertise `baud`: the protocol's `baud` is a *transient* link renegotiation
+/// that reverts on power-cycle, but the CH9329 only has a *persistent*
+/// flash-stored rate (the `baud` command below performs it, but a host should
+/// not auto-invoke it expecting transient behavior).
 pub const VERSION_REPLY: &str = "1 ch9329/0.1.0 moveabs";
 
 /// The `moveabs` logical maximum (matches hidrig's ABS_MAX).
@@ -105,7 +108,16 @@ pub fn execute_line(s: &mut Session, line: &str) -> Result<String> {
                 i.chip_version, i.target_connected, i.num_lock, i.caps_lock, i.scroll_lock, baud
             ));
         }
-        "baud" => bail!("baud renegotiation not supported by this CH9329 helper"),
+        "baud" => {
+            let rate: u32 = one_arg(rest, "baud")?
+                .parse()
+                .map_err(|_| anyhow!("baud rate must be an integer: {rest:?}"))?;
+            s.set_baud(rate)?;
+            return Ok(format!(
+                "link persisted to {rate} baud (CH9329 flash; auto-detect probes \
+                 115200 then 9600 — for other rates reconnect with -b {rate})"
+            ));
+        }
         other => bail!("unknown command: {other}"),
     }
     Ok(String::new())

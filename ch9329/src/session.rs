@@ -43,6 +43,14 @@ const CMD_GET_INFO: u8 = 0x01;
 const CMD_KB_GENERAL: u8 = 0x02;
 const CMD_MS_ABS: u8 = 0x04;
 const CMD_MS_REL: u8 = 0x05;
+const CMD_GET_PARA_CFG: u8 = 0x08;
+const CMD_SET_PARA_CFG: u8 = 0x09;
+const CMD_RESET: u8 = 0x0F;
+
+/// Length of the CH9329 parameter-config block (`docs/ch9329-spec.md` §5).
+const PARA_CFG_LEN: usize = 50;
+/// Byte offset of the 4-byte big-endian baud field within the config block.
+const PARA_CFG_BAUD: usize = 3;
 
 /// CH9329 absolute coordinate full-scale (12-bit, in a 4096×4096 grid).
 const ABS_FULL: i64 = 4096;
@@ -209,8 +217,9 @@ impl Session {
         if rcmd != cmd | 0x80 {
             bail!("unexpected reply cmd {rcmd:#04x} to {cmd:#04x}");
         }
-        // For non-GET_INFO commands the first payload byte is a status code.
-        if cmd != CMD_GET_INFO {
+        // Most ACKs carry a status byte first; GET_INFO and GET_PARA_CFG
+        // instead return a data block whose first byte is real data.
+        if cmd != CMD_GET_INFO && cmd != CMD_GET_PARA_CFG {
             if let Some(&status) = payload.first() {
                 if status != 0x00 {
                     bail!("cmd {cmd:#04x} failed: {}", status_name(status));
@@ -234,6 +243,61 @@ impl Session {
             caps_lock: p[2] & 0x02 != 0,
             scroll_lock: p[2] & 0x04 != 0,
         })
+    }
+
+    /// Persistently change the CH9329's serial baud (`docs/ch9329-spec.md` §5).
+    ///
+    /// Unlike the HID serial protocol's *transient* `baud` renegotiation, the
+    /// CH9329 stores its rate in flash: read the 50-byte parameter block, rewrite
+    /// only the 4-byte big-endian baud field, `SET_PARA_CFG` (persist), `RESET`
+    /// (activate), then reopen the host port at the new rate and confirm with
+    /// `GET_INFO`. The reset clears the chip's HID state, so held keys/buttons
+    /// are dropped. The datasheet supported range is 1200..=115200 (the
+    /// Openterface default is already 115200; a factory chip is 9600).
+    pub fn set_baud(&mut self, rate: u32) -> Result<()> {
+        let mut cfg = self.send(CMD_GET_PARA_CFG, &[])?;
+        if cfg.len() != PARA_CFG_LEN {
+            bail!(
+                "GET_PARA_CFG returned {} bytes, expected {PARA_CFG_LEN}",
+                cfg.len()
+            );
+        }
+        // Rewrite only the baud field; preserve working mode, USB IDs, etc.
+        cfg[PARA_CFG_BAUD..PARA_CFG_BAUD + 4].copy_from_slice(&rate.to_be_bytes());
+        self.send(CMD_SET_PARA_CFG, &cfg)?; // persist to flash (expect 0x89/0x00)
+        self.send(CMD_RESET, &[])?; // activate (expect 0x8F/0x00)
+
+        // The chip reboots at the new rate with its HID state cleared.
+        self.mods = 0;
+        self.keys.clear();
+        self.buttons = 0;
+        sleep(Duration::from_millis(400));
+
+        self.port
+            .set_baud_rate(rate)
+            .map_err(|e| anyhow!("set host port to {rate} baud: {e}"))?;
+        sleep(Duration::from_millis(80));
+
+        // First frames after a reset can be lost; retry GET_INFO a few times.
+        let mut last: Option<anyhow::Error> = None;
+        for _ in 0..3 {
+            match self.get_info() {
+                Ok(_) => {
+                    self.baud = rate;
+                    return Ok(());
+                }
+                Err(e) => {
+                    last = Some(e);
+                    sleep(Duration::from_millis(80));
+                }
+            }
+        }
+        Err(anyhow!(
+            "CH9329 did not respond at {rate} baud after reset (the rate is \
+             persisted; reconnect with -b {rate}, or factory-reset via the DEF \
+             pin): {}",
+            last.map(|e| e.to_string()).unwrap_or_default()
+        ))
     }
 
     // -- keyboard ------------------------------------------------------------
@@ -483,6 +547,14 @@ mod tests {
             Session::frame(CMD_GET_INFO, &[]),
             vec![0x57, 0xAB, 0x00, 0x01, 0x00, 0x03]
         );
+    }
+
+    #[test]
+    fn baud_field_encoding_matches_spec() {
+        // docs/ch9329-spec.md §5: the 4-byte big-endian baud field is
+        // 115200 = 00 01 C2 00, 9600 = 00 00 25 80.
+        assert_eq!(115_200u32.to_be_bytes(), [0x00, 0x01, 0xC2, 0x00]);
+        assert_eq!(9_600u32.to_be_bytes(), [0x00, 0x00, 0x25, 0x80]);
     }
 
     #[test]
