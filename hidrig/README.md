@@ -1,5 +1,18 @@
 # KB2040 HID Injector
 
+> **Architecture note (2026-06):** the `hidrig` Rust CLI/daemon now drives the
+> **dual-board "dumb pipe" rig** — it composes HID reports in Rust
+> (`src/compose.rs`) and writes binary frames to the control board's data CDC
+> endpoint; the boards relay raw report bytes, doing no HID interpretation. The
+> current design and bring-up live in
+> [`firmware/dual/README.md`](firmware/dual/README.md) and
+> [`../docs/hid-dual-board-design.md`](../docs/hid-dual-board-design.md). The
+> single-board / smart-firmware description below is **historical** (the
+> line-based UART protocol and `adafruit_hid` composition it documents have been
+> retired from the Rust tool); the single board can later be rebuilt as a dumb
+> device using the same Rust composition. The I2C pins are now **GP10 (SDA) /
+> GP19 (SCL)**, not the A0/A1 shown below.
+
 A USB keyboard/mouse injector for automated testing of a target machine
 (SBC, e.g. a Raspberry Pi). A single **Adafruit KB2040** presents itself to
 the target as a plain USB HID keyboard + mouse; the control host drives it

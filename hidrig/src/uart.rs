@@ -31,7 +31,8 @@ use std::thread;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{info, warn};
 
-use crate::proto::{open_synced, send_command, FAST_BAUD};
+use crate::compose::Composer;
+use crate::proto::{open_port, run_command};
 
 const REQ_CAP: usize = 256;
 const TRANSCRIPT_CAP: usize = 256;
@@ -111,15 +112,14 @@ fn is_transport_error(msg: &str) -> bool {
 /// reply, broadcast the outcome. Reuses the proven blocking `serialport` path.
 fn run(device: String, mut req_rx: mpsc::Receiver<Request>, transcript: broadcast::Sender<Event>) {
     let mut port: Option<Box<dyn serialport::SerialPort>> = None;
-    info!("hid UART owner started for {device}");
+    let mut composer = Composer::new();
+    info!("hid control link owner started for {device}");
 
     while let Some(req) = req_rx.blocking_recv() {
         if port.is_none() {
-            // Open and negotiate up to FAST_BAUD for KVM-streaming throughput
-            // (the device boots at the safe default and re-syncs on power-cycle).
-            match open_synced(&device, FAST_BAUD) {
-                Ok((p, baud)) => {
-                    info!("hid UART open at {baud} baud for {device}");
+            match open_port(&device) {
+                Ok(p) => {
+                    info!("hid control link open for {device}");
                     port = Some(p);
                 }
                 Err(e) => {
@@ -131,17 +131,18 @@ fn run(device: String, mut req_rx: mpsc::Receiver<Request>, transcript: broadcas
             }
         }
 
-        let result = send_command(port.as_mut().unwrap(), &req.line).map_err(|e| e.to_string());
+        let result = run_command(&mut composer, port.as_mut().unwrap(), &req.line)
+            .map_err(|e| e.to_string());
         if let Err(ref msg) = result {
             if is_transport_error(msg) {
-                warn!("hid UART transport error, will reopen: {msg}");
+                warn!("hid control link transport error, will reopen: {msg}");
                 port = None;
             }
         }
         broadcast_event(&transcript, &req.line, &result);
         let _ = req.reply.send(result);
     }
-    info!("hid UART owner stopped for {device}");
+    info!("hid control link owner stopped for {device}");
 }
 
 fn broadcast_event(tx: &broadcast::Sender<Event>, line: &str, result: &Result<String, String>) {

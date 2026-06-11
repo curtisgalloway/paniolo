@@ -17,7 +17,7 @@ name = "hidrig"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "CLI for the KB2040 USB HID injector: keyboard/mouse injection over a control UART"
+description = "CLI for the dual-board KB2040 USB-HID injector: composes HID reports and frames them to the control board's CDC link"
 
 [[bin]]
 name = "hidrig"

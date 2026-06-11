@@ -118,9 +118,22 @@ uv run --with pyserial python host_send.py --port /dev/cu.usbmodemXXXX type "hel
 range across the full screen, so `mouse 16383 16383` parks the cursor dead
 center. Add a button name (`mouse <x> <y> left`) to click at that point.
 
-## Next: milestone 3
+## Milestone 3 — Rust composition (done)
 
-The Rust `hidrig serve` daemon gains the composition layer (v1 ASCII → HID report
-bytes → frames), so `paniolo hid send` drives the rig unchanged. The external
-paniolo interface stays the same; only the daemon↔rig wire format becomes these
-binary frames.
+The Rust `hidrig` CLI/daemon (`hidrig/src/compose.rs`) now owns HID composition:
+each command (`type`/`key`/`moveabs`/…) is turned into report bytes and framed in
+Rust, then written to the control board's **data CDC endpoint** — no Python in
+the loop. `host_send.py` above remains as a dependency-free poke tool, but the
+real driver is `hidrig`:
+
+```bash
+hidrig -d /dev/cu.usbmodemXXXX moveabs 16383 16383   # cursor to centre
+hidrig -d /dev/cu.usbmodemXXXX type "hello"
+hidrig -d /dev/cu.usbmodemXXXX serve                  # daemon: holds state, KVM WS
+```
+
+`-d` is the control board's data CDC port. `serve` runs the daemon that holds the
+composition state (held keys, virtual cursor) and re-exposes the command protocol
+over a localhost WebSocket, so `paniolo console` and `paniolo hid send` drive the
+rig unchanged. The single-board rig can later adopt the same composition against a
+dumb single-board firmware (frames over its UART).
