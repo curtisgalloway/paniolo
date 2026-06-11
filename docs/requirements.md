@@ -87,13 +87,13 @@
 
 | ID | Requirement | Pri | Status | Notes |
 |---|---|---|---|---|
-| HID-1 | USB keyboard/mouse injection via single-board KB2040 injector (UART control link) | S | ☑ | `hidrig/` crate + firmware |
+| HID-1 | USB keyboard/mouse injection via KB2040 injector (dual-board "dumb pipe": host composes, control board CDC → I2C1 → target HID) | S | ☑ | `hidrig/` crate + `firmware/dual/` |
 | HID-2 | Device-independent HID serial protocol (v1) so other microcontrollers can implement the injector | S | ☑ | `docs/hid-serial-protocol.md` |
 | HID-3 | Generic `hid` lab channel: `paniolo hid set/rm/send` appends args to an opaque helper cmd | S | ☑ | mirrors power hooks; SSH dispatch |
 | HID-4 | Absolute mouse (`moveabs`, advertised capability) for click-where-you-point | S | ☑ | abs-pointer HID descriptor in firmware |
-| HID-5 | `hidrig serve` daemon: owns the UART, re-exposes the protocol over a WebSocket; one-shots route through it | S | ☑ | `paniolo hid serve/stop` |
+| HID-5 | `hidrig serve` daemon: owns the control link, re-exposes the command vocabulary over a WebSocket; one-shots route through it | S | ☑ | `paniolo hid serve/stop` |
 | HID-6 | KVM in `paniolo console`: stream web keyboard + absolute mouse, intermixed with CLI injection | S | ☑ | hardware-verified on pi5 Linux desktop |
-| HID-7 | KVM latency: coalesce mouse moves (per-frame), 1 ms firmware poll, daemon negotiates UART up to 460800 (boots 115200) | S | ☑ | `baud` capability; one-shots stay 115200 |
+| HID-7 | KVM latency: HID frames fire-and-forget over USB-CDC (no per-frame round-trip), coalesce mouse moves (per-frame); floor is the target's USB `bInterval` (~8 ms) | S | ☑ | macOS `IOSSDATALAT` floored for control-frame replies |
 
 ## 7. Dashboard
 

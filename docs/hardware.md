@@ -36,8 +36,8 @@ See the [HID guide](hid.md) and [`hidrig/README.md`](https://github.com/curtisga
 
 | Device | Role |
 |---|---|
-| Adafruit KB2040 | Reference HID injector (CircuitPython firmware in [`hidrig/`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md)); any CircuitPython-capable RP2040 board with free UART pins works with minor pin edits. |
-| 3.3 V USB-serial adapter (FTDI) | Control UART to the KB2040 — e.g. the DSD TECH cable above. `hidrig` applies its macOS low-latency fix to every serial port it opens; it matters most for FTDI (whose default latency timer is high), so FTDI is a safe choice here. |
+| 2× Adafruit KB2040 | Reference HID injector — the dual-board "dumb pipe" (CircuitPython firmware in [`hidrig/`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md)): a **control** board (host USB-CDC, I2C1 controller) and a **target** board (DUT USB-HID, I2C1 peripheral), joined by I2C1 (GP10 SDA / GP19 SCL, 4.7 kΩ pull-ups). Any CircuitPython-capable RP2040 board with a free I2C1 works with minor pin edits. |
+| 2× 4.7 kΩ resistors | I2C1 pull-ups (SDA→3.3 V, SCL→3.3 V) between the two KB2040 boards — required; the control board won't open the bus without them. No USB-serial adapter is needed (the control link is the control board's native USB-CDC). |
 
 ## Video capture
 

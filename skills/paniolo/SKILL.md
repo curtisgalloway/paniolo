@@ -263,13 +263,15 @@ See `docs/power.md` for the full `cambrionix` command surface.
 
 ## HID injection — type and click into the target
 
-A KB2040 injector presents a USB keyboard + mouse to the target; the control
-host drives it over a UART (USB-serial adapter). The `hid` channel stores an
-opaque helper command (the `hidrig` CLI by default); `paniolo hid send`
-appends its arguments to it and runs it on the channel's host:
+The default injector is the dual-board KB2040 "dumb pipe": the host-side
+`hidrig` composes HID reports and writes binary frames to the **control**
+board's USB-CDC port, which relays them over I2C1 to the **target** board that
+presents a USB keyboard + mouse to the DUT. The `hid` channel stores an opaque
+helper command (the `hidrig` CLI by default); `paniolo hid send` appends its
+arguments to it and runs it on the channel's host:
 
 ```
-paniolo hid set -t <name> --cmd "hidrig -d /dev/cu.usbserial-XXXX" [--host <labhost>]
+paniolo hid set -t <name> --cmd "hidrig -d /dev/cu.usbmodemXXXX" [--host <labhost>]
 paniolo hid send -t <name> type hello world   # type a string
 paniolo hid send -t <name> key ENTER          # tap a key (adafruit_hid Keycode names)
 paniolo hid send -t <name> combo LEFT_CONTROL C
@@ -284,16 +286,18 @@ the screen (the KB2040 firmware advertises the `moveabs` capability).
 
 Sequences: `hidrig run <file>` runs a command file (one command per line,
 `# comments`, `delay <ms>` / `sleep <seconds>`) — the file must be on the
-channel's host. The injector is powered by the target's USB port, so it is
-silent while the target is off and reboots with it. Protocol spec (for new
-injector implementations): `docs/hid-serial-protocol.md`.
+channel's host. The target board is powered by the DUT's USB port, so its HID
+goes silent while the DUT is off and reboots with it; the control board is
+host-powered and independent. Command vocabulary:
+`docs/hid-serial-protocol.md`; dual-board design + frame format:
+`docs/hid-dual-board-design.md`.
 
 **KVM in the console.** `paniolo console <name>` shows a **⌨ Capture input**
 toggle button over the video when the target has a `hid` channel: click it to
 drive the target with your own keyboard + mouse (absolute — the cursor follows
 where you point; your local cursor stays visible as a crosshair), click again to
-release. It auto-starts the hid daemon (`hidrig serve`), which owns the UART and
-re-exposes the protocol over a WebSocket; `paniolo hid send` injections intermix
+release. It auto-starts the hid daemon (`hidrig serve`), which owns the control
+link and re-exposes the command vocabulary over a WebSocket; `paniolo hid send` injections intermix
 with what you type in the browser. Manual daemon control: `paniolo hid
 serve [target]` / `paniolo hid stop [target]` (positional target — only
 `hid send` and `hid set/rm` use `-t`). When the target also has a `power` channel, the overlay
