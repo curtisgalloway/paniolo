@@ -13,37 +13,40 @@
 # limitations under the License.
 
 """
-Dual-board rig — CONTROL firmware (milestone 1: self-driving link test).
+Dual-board rig — CONTROL firmware (milestone 2: host-driven relay).
 
-This board is the I2C *controller* on I2C1 (D10 = GP10 = SDA, MOSI = GP19 = SCL).
-To prove the inter-board link before any host/daemon exists, it composes a
-canned HID frame and writes it to the target board (address 0x41) once a second.
+Reads binary frames from the host over usb_cdc.data and routes them by type:
+  - 0x01 HID report frames are relayed VERBATIM over I2C1 to the target board
+    (0x41), which injects them as USB-HID into the DUT. This board never
+    interprets HID semantics — it is a routing relay.
+  - 0x02 control frames are handled locally (ping, version) and answered on
+    usb_cdc.data.
 
-Pick the stimulus with TEST below:
-  "mouse" — absolute-mouse wiggle between two points (VISIBLE: it moves the
-            cursor on whatever the target board is plugged into — only use this
-            if the target's USB is on a spare machine you don't mind twitching)
-  "noop"  — an all-zero keyboard report (proves send_report with NO visible
-            effect; rely on the NeoPixels for the success signal)
+Uniform frame format (length-prefixed for byte-stream parsing, same shape the
+target uses):
+    [type][b1][len][payload .. len bytes]
+      0x01: b1 = report-id, payload = HID report bytes
+      0x02: b1 = cmd,       payload = args
 
-Status NeoPixel:
-    green blip = target ACKed the I2C write (link OK)
-    red blip   = no ACK (pull-ups? target code not running? wrong addr/pins?)
+The host composes the report bytes (see host_send.py, the M2 test driver; the
+Rust `hidrig serve` daemon owns composition in M3).
 
-In milestone 2 this loop is replaced by "read a frame from usb_cdc.data, route
-by the type byte, relay HID frames over I2C" — the host daemon composes them.
+I2C1 controller on D10 (GP10, SDA) / MOSI (GP19, SCL); target peripheral 0x41.
 """
-
-import time
 
 import board
 import busio
 import digitalio
 import neopixel_write
+import usb_cdc
 
 I2C_ADDR = 0x41
-ABS_MAX = 32767
-TEST = "noop"  # "noop" (no visible effect; safe default) or "mouse" (cursor wiggle)
+DEBUG = True
+
+# Control-frame commands (type 0x02).
+CMD_PING = 0x01
+CMD_VERSION = 0x02
+IMPL_ID = b"dual-control/1"
 
 # --- Status NeoPixel (core neopixel_write; WS2812 is GRB) --------------------
 _px = digitalio.DigitalInOut(board.NEOPIXEL)
@@ -54,58 +57,80 @@ def status(r, g, b):
     neopixel_write.neopixel_write(_px, bytearray((g, r, b)))
 
 
-def hid_mouse_frame(x, y, buttons=0, wheel=0):
-    """type 0x01, report id 2 (abs mouse), 6-byte payload."""
-    payload = bytes(
-        (
-            buttons & 0x07,
-            x & 0xFF,
-            (x >> 8) & 0xFF,
-            y & 0xFF,
-            (y >> 8) & 0xFF,
-            wheel & 0xFF,
-        )
-    )
-    return bytes((0x01, 0x02, len(payload))) + payload
-
-
-def hid_keyboard_noop_frame():
-    """type 0x01, report id 1 (keyboard), 8 zero bytes — no keys pressed."""
-    payload = bytes(8)
-    return bytes((0x01, 0x01, len(payload))) + payload
-
-
 # scl = MOSI (GP19), sda = D10 (GP10)  ->  I2C1, the inter-board link.
 i2c = busio.I2C(board.MOSI, board.D10, frequency=100000)
 
-_mid = ABS_MAX // 2
-_points = [_mid - 2000, _mid + 2000]
-_idx = 0
+data = usb_cdc.data  # binary frame channel from the host (None if not enabled)
 
-print("control: I2C1 controller up, poking target 0x%02X every 1s (TEST=%s)" % (I2C_ADDR, TEST))
 
-while True:
-    if TEST == "mouse":
-        frame = hid_mouse_frame(_points[_idx], _mid)
-        _idx ^= 1
-    else:
-        frame = hid_keyboard_noop_frame()
-
+def relay_hid(frame):
+    """Forward an HID frame verbatim over I2C to the target board."""
     while not i2c.try_lock():
         pass
     try:
         i2c.writeto(I2C_ADDR, frame)
-        status(0, 16, 0)  # green: target ACKed
-        ok = True
+        status(0, 16, 0)  # green: relayed + ACKed
     except OSError as e:
-        status(16, 0, 0)  # red: no ACK
-        ok = False
-        print("control: write failed:", e)
+        status(16, 0, 0)  # red: I2C relay failed
+        if DEBUG:
+            print("control: I2C relay failed:", e)
     finally:
         i2c.unlock()
 
-    if ok:
-        print("control: sent", bytes(frame))
-    time.sleep(0.5)
-    status(0, 0, 0)
-    time.sleep(0.5)
+
+def handle_control(frame):
+    """Answer a local control frame on usb_cdc.data."""
+    cmd = frame[1]
+    if cmd == CMD_PING:
+        if data is not None:
+            data.write(bytes((0x02, CMD_PING, 0)))  # ping ack
+    elif cmd == CMD_VERSION:
+        if data is not None:
+            data.write(bytes((0x02, CMD_VERSION, len(IMPL_ID))) + IMPL_ID)
+    if DEBUG:
+        print("control: ctrl cmd 0x%02X" % cmd)
+
+
+_rxbuf = bytearray()
+
+
+def route_frames():
+    # Walk an index and reassign the tail (MicroPython bytearray has no
+    # slice-delete). Same length-prefixed parse as the target.
+    global _rxbuf
+    i = 0
+    n = len(_rxbuf)
+    while n - i >= 1:
+        ftype = _rxbuf[i]
+        if ftype == 0x01 or ftype == 0x02:
+            if n - i < 3:
+                break  # header incomplete
+            need = 3 + _rxbuf[i + 2]
+            if n - i < need:
+                break  # payload incomplete
+            frame = bytes(_rxbuf[i:i + need])
+            i += need
+            if ftype == 0x01:
+                relay_hid(frame)
+            else:
+                handle_control(frame)
+        else:
+            i += 1  # unframed/unknown byte — resync
+    if i:
+        _rxbuf = _rxbuf[i:]
+
+
+if data is not None:
+    data.timeout = 0  # non-blocking reads
+
+status(0, 0, 16)  # blue: up, waiting for host frames
+if DEBUG:
+    print("control: M2 relay up — reading usb_cdc.data, target 0x%02X" % I2C_ADDR)
+
+while True:
+    if data is not None:
+        n = data.in_waiting
+        if n:
+            _rxbuf.extend(data.read(n))
+            route_frames()
+            status(0, 0, 16)  # back to blue between bursts

@@ -18,8 +18,9 @@ DUT (USB-HID). They are joined by **I2C1** — `D10 = GP10 = SDA`,
 address **0x41**.
 
 ```
-control/   -> firmware for the board on the CONTROL HOST's USB (I2C controller)
-target/    -> firmware for the board on the DUT's USB          (I2C peripheral, HID)
+control/      -> firmware for the board on the CONTROL HOST's USB (I2C controller)
+target/       -> firmware for the board on the DUT's USB          (I2C peripheral, HID)
+host_send.py  -> host-side test driver (push frames to the control board, M2)
 ```
 
 ## Wiring (proto board)
@@ -36,26 +37,27 @@ target/    -> firmware for the board on the DUT's USB          (I2C peripheral, 
   USB). Fine while both are powered for bench bring-up; see design §6 for the
   back-powering caution before this goes near a real DUT power cycle.
 
-## Milestone 1 — prove the link (current)
-
-The control board self-drives a canned HID frame to the target once a second;
-the target relays it to `send_report`. No host or daemon yet.
+## Bring-up
 
 1. Flash both boards with CircuitPython 9.x.
 2. Copy `target/boot.py` + `target/code.py` to the **target** board's CIRCUITPY.
    It needs to be in **dev mode** to mount the drive — see [Mode switching](#mode-switching-target-board-dev-vs-hid-only).
 3. Copy `control/boot.py` + `control/code.py` to the **control** board's CIRCUITPY.
-4. Reset both (boot.py only runs on hard reset). Watch the NeoPixels:
-   - **both blink green in lock-step** → I2C link works.
-   - **control blinks red** → target not ACKing (pull-ups / wiring / addr / target
-     code not running).
-   - the default `TEST = "noop"` has no visible HID effect (so it won't hijack
-     the cursor if the target is on your own Mac). Flip to `TEST = "mouse"` in
-     `control/code.py` for a visible cursor wiggle once the NeoPixels confirm the
-     link.
+4. Reset both (boot.py only runs on hard reset).
 
 Watch debug prints on either board's REPL console (`tio`, `screen`, or Mu) — both
-firmwares print what they send/receive when `DEBUG`/prints are on.
+firmwares print what they send/receive when `DEBUG` is on. The target's NeoPixel
+blips green per frame received; the control's blips green per frame relayed (red
+on I2C failure). **Control blinking red** = target not ACKing (pull-ups / wiring /
+addr / target code not running).
+
+## Milestone 1 — link proven (historical)
+
+The first control firmware self-drove a canned HID frame to the target once a
+second to prove the I2C1 link before any host existed. That is now superseded by
+the milestone-2 host-driven control (the self-driving version lives in git
+history). The bring-up surfaced three CircuitPython 9.2.9 `i2ctarget` gotchas —
+see the comments in `target/code.py` and the minimal `target/min_i2ctarget_test.py`.
 
 ### Sanity check: is `i2ctarget` available?
 
@@ -87,10 +89,38 @@ the flag, so a wedged `code.py` can never strand the board. This is also how you
 recover a board running *old* firmware that predates the button logic (e.g. to
 install this firmware the first time).
 
-## Next milestones (not built yet)
+## Milestone 2 — host-driven relay (current)
 
-- **M2:** control board reads binary frames from `usb_cdc.data` and routes by the
-  type byte (relay `0x01` HID frames over I2C; handle `0x02` control frames). A
-  host-side test script pushes frames.
-- **M3:** the Rust `hidrig serve` daemon gains the composition layer (v1 ASCII →
-  HID report bytes → frames), so `paniolo hid send` drives the rig unchanged.
+The control board reads length-prefixed binary frames from `usb_cdc.data` and
+routes them by type byte: `0x01` HID frames are relayed **verbatim** over I2C1 to
+the target (which injects them as USB-HID); `0x02` control frames are handled
+locally (ping, version). The host composes the report bytes.
+
+Uniform frame format (byte-stream parseable on both the CDC and I2C legs):
+
+```
+[type][b1][len][payload .. len bytes]
+  0x01  rid  N    N HID report bytes   (rid 1 = keyboard / 8 B, 2 = abs mouse / 6 B)
+  0x02  cmd  N    N arg bytes          (cmd 1 = ping, 2 = version)
+```
+
+Drive it from the host with `host_send.py`, pointed at the control board's
+**data** CDC interface (the *second* `usbmodem` of its pair; the first is the
+REPL console):
+
+```bash
+uv run --with pyserial python host_send.py --port /dev/cu.usbmodemXXXX ping
+uv run --with pyserial python host_send.py --port /dev/cu.usbmodemXXXX mouse 16383 16383
+uv run --with pyserial python host_send.py --port /dev/cu.usbmodemXXXX type "hello"
+```
+
+`mouse <x> <y>` takes absolute coordinates in `0..32767`; the host OS maps that
+range across the full screen, so `mouse 16383 16383` parks the cursor dead
+center. Add a button name (`mouse <x> <y> left`) to click at that point.
+
+## Next: milestone 3
+
+The Rust `hidrig serve` daemon gains the composition layer (v1 ASCII → HID report
+bytes → frames), so `paniolo hid send` drives the rig unchanged. The external
+paniolo interface stays the same; only the daemon↔rig wire format becomes these
+binary frames.
