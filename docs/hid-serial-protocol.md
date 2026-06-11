@@ -16,20 +16,33 @@ limitations under the License.
 
 # HID serial protocol, version 1
 
-A device-independent text protocol for USB HID input injectors: a
-microcontroller (or bridge chip wrapper) that presents a USB HID keyboard +
-mouse to a *target* machine and accepts injection commands from a *control
-host* over a serial byte stream.
+A device-independent text protocol for USB HID input injectors: the command
+vocabulary (`type`, `key`, `combo`, `move`, `moveabs`, `click`, …) and the
+`OK`/`ERR` reply convention for driving a USB HID keyboard + mouse attached to
+a *target* machine from a *control host*.
 
-This document is **normative**. Implementations:
+> **Where this protocol lives now (2026-06).** The default rig — the dual-board
+> KB2040 "dumb pipe" ([hid-dual-board-design.md](hid-dual-board-design.md)) —
+> keeps **this command vocabulary as its external interface** (the `hidrig` CLI,
+> `paniolo hid send`, the daemon's WebSocket §2 carrier), but `hidrig` now
+> **composes** the commands into HID report bytes host-side and sends **binary
+> frames** to the boards — the line protocol no longer travels on the device
+> wire. The §1 "line commands over a serial byte stream to the device" transport
+> below describes the **retired single-board** path; treat §1's device-side
+> framing as historical and the **command vocabulary (§3+) as still normative**.
 
-| Implementation | Status |
+This document is **normative for the command vocabulary**. Consumers:
+
+| Consumer | Status |
 |---|---|
-| `hidrig/firmware/` — Adafruit KB2040, CircuitPython | Reference implementation |
-| WCH CH9329 bridge (see [ch9329-spec.md](https://github.com/curtisgalloway/paniolo/blob/main/docs/ch9329-spec.md)) | Implemented — the host-side [`ch9329`](https://github.com/curtisgalloway/paniolo/blob/main/ch9329/README.md) crate speaks this protocol (one-shot CLI + `serve` daemon) |
+| `hidrig` CLI / `serve` daemon (`hidrig/src/`) | Reference host implementation — composes the vocabulary into HID reports |
+| `hidrig/firmware/dual/` — dual-board KB2040 "dumb pipe" | Default rig: relays composed report bytes, does **not** parse this protocol |
+| `hidrig/firmware/` — single-board KB2040 line-protocol firmware | **Retired** reference device implementation (spoke this over a UART) |
+| WCH CH9329 bridge (see [ch9329-spec.md](https://github.com/curtisgalloway/paniolo/blob/main/docs/ch9329-spec.md)) | Implemented — the host-side [`ch9329`](https://github.com/curtisgalloway/paniolo/blob/main/ch9329/README.md) crate speaks this protocol (one-shot CLI + `serve` daemon); a separate helper backend that drops into the same `hid` channel |
 
-The host-side client is the `hidrig` CLI (`hidrig/src/`), which works against
-any conforming device.
+The host-side client is the `hidrig` CLI (`hidrig/src/`); above it, paniolo and
+the dashboard speak only this vocabulary, so any injector behind the generic
+`hid` channel works unchanged.
 
 ---
 

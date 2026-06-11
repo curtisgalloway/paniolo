@@ -14,20 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# HID injector bring-up
+# Dual-board HID injector bring-up
 
-Step-by-step for flashing and provisioning the KB2040 injector, then driving
-it with `hidrig` / `paniolo hid`. Linux differs from macOS only in device
-paths (`/dev/ttyUSB*` for the adapter, CIRCUITPY under
-`/media|/run/media/<user>/`).
+Step-by-step for flashing and provisioning the **two-board KB2040 rig**, then
+driving it with `hidrig` / `paniolo hid`. Linux differs from macOS only in
+device paths (CIRCUITPY under `/media|/run/media/<user>/`; the control board's
+data port is `/dev/ttyACM*` instead of `/dev/cu.usbmodem*`).
 
-See `README.md` for wiring and the protocol; this file is the install
-runbook.
+See [`README.md`](README.md) for the topology and wire protocol and
+[`firmware/dual/README.md`](firmware/dual/README.md) for the firmware-side
+detail; this file is the install runbook. The two boards are the **control**
+board (host-facing, USB-CDC, I2C1 controller) and the **target** board
+(DUT-facing, USB-HID, I2C1 peripheral).
 
-## 1. CircuitPython
+## 1. CircuitPython (both boards)
 
 Match the firmware's target: **CircuitPython 9.x** (10.x unverified). Latest
-9.x at time of writing: **9.2.9**.
+9.x at time of writing: **9.2.9**. Do this for each board.
 
 1. The KB2040's board id is `adafruit_kb2040`. UF2 URL pattern:
    ```
@@ -46,81 +49,113 @@ Match the firmware's target: **CircuitPython 9.x** (10.x unverified). Latest
 4. The board reboots into CircuitPython and `CIRCUITPY` mounts (~5–10 s).
    `cat /Volumes/CIRCUITPY/boot_out.txt` shows the version + board id.
 
-## 2. adafruit_hid
+The **target** board needs CircuitPython's `i2ctarget` module — confirm at its
+REPL: `import i2ctarget; print(i2ctarget.I2CTarget)`. If that raises
+`ImportError`, this build lacks I2C-target support (the dumb relay can't run).
+The relay uses only core `usb_hid`, so **`adafruit_hid` is not required**.
 
-`circup` reads the board's CP version and installs the matching build:
+## 2. Firmware
 
+**Target board** (must be in dev mode to mount CIRCUITPY — see §4):
 ```
-uvx circup --path /Volumes/CIRCUITPY install adafruit_hid
+cp hidrig/firmware/dual/target/boot.py /Volumes/CIRCUITPY/boot.py
+cp hidrig/firmware/dual/target/code.py /Volumes/CIRCUITPY/code.py
 ```
 
-## 3. Firmware
-
+**Control board:**
 ```
-cp hidrig/firmware/boot.py /Volumes/CIRCUITPY/boot.py
-cp hidrig/firmware/code.py /Volumes/CIRCUITPY/code.py
+cp hidrig/firmware/dual/control/boot.py /Volumes/CIRCUITPY/boot.py
+cp hidrig/firmware/dual/control/code.py /Volumes/CIRCUITPY/code.py
 ```
 
 `boot.py` only takes effect on a **hard reset** (replug); a code save's soft
-reload does not re-run it. After the reset the board is **HID-only**: no
-CIRCUITPY drive, no REPL, no serial ports on its USB. That's correct — the
-USB now faces the target.
+reload does not re-run it.
 
-**To get CIRCUITPY back** (firmware updates): jumper `D2` to GND (adjacent
-pins on the KB2040 edge), plug into the dev machine, and the drive + REPL
-re-enumerate. Remove the jumper and replug for normal operation.
+## 3. Wiring (I2C1)
 
-## 4. Wiring
+Three wires between the boards, **straight, not crossed** (I2C is a bus):
 
-1. Plug the KB2040's USB into the **target** — it enumerates as a USB
-   keyboard + mouse and powers the board.
-2. Wire the control host's 3.3 V USB-serial adapter to the board:
-   adapter **TX -> RX**, adapter **RX -> TX**, **GND -> GND**.
+| control board | target board | note |
+|---|---|---|
+| `D10` / GP10 (SDA) | `D10` / GP10 (SDA) | straight |
+| `MOSI` / GP19 (SCL) | `MOSI` / GP19 (SCL) | straight |
+| GND | GND | common ground |
 
-NeoPixel: blinking red until the target enumerates the board, then a green
-blip when it starts serving.
+**Pull-ups are required:** ~4.7 kΩ from SDA→3.3 V and SCL→3.3 V (one set, on
+either board). Without them the control board's controller-mode `busio.I2C`
+rejects the bus ("No pull up found") and blinks red. The target peripheral
+address is **0x41**.
+
+Then plug each board's native USB into its host:
+- **Target** board → the **DUT** (it enumerates as a USB keyboard + mouse and
+  is powered by the DUT, so it reboots with the DUT).
+- **Control** board → the **control host** (it enumerates as a USB-CDC pair:
+  a REPL console and a data endpoint).
+
+## 4. Target mode switching (dev vs HID-only)
+
+The target's `boot.py` configures USB once at reset from a 1-byte **NVM flag**:
+
+- **dev** (the erased-flash default): CIRCUITPY drive + REPL + HID — use this
+  to copy firmware and watch debug prints.
+- **HID-only**: only the keyboard + mouse the DUT sees; no drive, no console
+  (production).
+
+**Tap the BOOT button (GP11)** while running to flip the flag and reset — one
+press toggles dev ↔ HID-only. **Hardware fallback:** grounding **D2 at reset**
+forces dev mode regardless of the flag, so a wedged `code.py` can never strand
+the board (also how to recover a board running pre-button firmware).
 
 ## 5. Drive it
 
-Directly (hidrig lives in paniolo's libexec dir, not on PATH — `make
+The control board's **data** CDC port is the *second* `usbmodem` of its pair
+(the first is the REPL console); on Linux it is the higher-numbered
+`/dev/ttyACM*`. `hidrig` lives in paniolo's libexec dir (not on PATH — `make
 install` puts it there):
 
 ```
-paniolo helper hidrig -d /dev/cu.usbserial-XXXX ping
-paniolo helper hidrig -d /dev/cu.usbserial-XXXX version     # expect: 1 kb2040-circuitpython/1.0
-paniolo helper hidrig -d /dev/cu.usbserial-XXXX type "hello"
+paniolo helper hidrig -d /dev/cu.usbmodemXXXX ping
+paniolo helper hidrig -d /dev/cu.usbmodemXXXX version     # expect: dual-control/1
+paniolo helper hidrig -d /dev/cu.usbmodemXXXX type "hello"
 ```
 
 Through paniolo (lab file is the source of truth):
 
 ```
-paniolo hid set -t <target> --cmd "hidrig -d /dev/cu.usbserial-XXXX"
+paniolo hid set -t <target> --cmd "hidrig -d /dev/cu.usbmodemXXXX"
 paniolo hid send -t <target> type hello
 paniolo hid send -t <target> key ENTER
 ```
 
-## 6. Validate end-to-end without a target
+## 6. Validate end-to-end without a DUT
 
-Plug the injector's USB into the same dev machine that drives the UART, then
-run the IOKit capture tool (macOS):
+Plug the **target** board's USB into the same dev machine that drives the
+control link, then run the leak-safe IOKit capture tool (macOS):
 
 ```
 cd hidrig/host && make
-sudo ./hid_seize_reports     # grant Input Monitoring when prompted
+sudo ./hid_capture_usb       # start BEFORE injecting
 ```
 
-In a second terminal, `hidrig -d <adapter> type test` — the raw HID reports
-print in the first terminal and nothing reaches the focused app.
+In a second terminal, `hidrig -d /dev/cu.usbmodemXXXX moveabs 16383 16383` —
+the raw HID reports print in the first terminal and nothing reaches the focused
+app or the real cursor (the device is detached from the macOS HID stack).
 
 ## Gotchas
 
 - **`boot.py` needs a hard reset** (replug) to take effect; a soft reload
   won't re-run it.
-- **No serial ports on the board's USB is normal** — the control path is the
-  UART via the adapter. If you need the REPL, use the D2 dev jumper.
-- **Crossed wiring:** no reply to `ping` usually means TX/RX not crossed, a
-  missing ground, or the target (and therefore the board) is powered off.
-- **3.3 V adapters only** — a 5 V-logic adapter can damage the RP2040.
+- **Pull-ups required, and a live target is not proof of them** — `i2ctarget`
+  doesn't check for pull-ups, so the target can come up while the control
+  board still can't open the bus. If the control board blinks red, suspect
+  pull-ups / wiring / address / the target's `code.py` not running.
+- **Wiring is straight, not crossed** (I2C bus): SDA→SDA, SCL→SCL.
+- **No ASCII on the wire:** `hidrig` composes HID and sends binary frames; the
+  control board is USB-CDC, so there is no baud rate to set and no `OK`/`ERR`
+  text protocol (only `ping`/`version` control frames draw a reply).
+- **HID-only target "vanishes":** in HID-only mode the target drops its
+  CIRCUITPY drive and console, so a power blip that hard-resets it can look
+  like a dead board — tap BOOT (or ground D2 at reset) to get dev mode back.
 - **FAT32 `cp` error on macOS is benign** (extended attributes); the
   UF2/file copy still succeeds.
 - **CircuitPython 9.x**, not 10.x, until the firmware is verified on 10.

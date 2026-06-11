@@ -58,7 +58,7 @@ Current capabilities:
   log queryable by line range (`paniolo serial log -i <name>`)
 - Combined video+serial web dashboard (hdmicap's `GET /`: video on top, xterm.js terminal below)
 - On-device OCR of the captured screen (`paniolo video read [target] [--stable]`, which wraps hdmicap's `GET /ocr`; also the dashboard OCR button): Apple Vision on macOS, Tesseract on Linux
-- USB HID input (keyboard/mouse injection) via a generic helper hook (`paniolo hid send`); the `hidrig` helper drives the KB2040 injector over its control UART (HID serial protocol, docs/hid-serial-protocol.md). `hidrig serve` runs a daemon that owns the UART and re-exposes the protocol over a WebSocket, so `paniolo console` works as a **KVM** — stream the browser's keyboard + absolute mouse (`moveabs`) to the target, intermixed with CLI injection on the one wire
+- USB HID input (keyboard/mouse injection) via a generic helper hook (`paniolo hid send`); the `hidrig` helper drives the dual-board KB2040 injector — it composes HID reports in Rust and writes binary frames to the control board's USB-CDC endpoint, which relays them over I2C1 to the target board (the "dumb pipe", docs/hid-dual-board-design.md; command vocabulary in docs/hid-serial-protocol.md). `hidrig serve` runs a daemon that owns the control link and re-exposes the command vocabulary over a WebSocket, so `paniolo console` works as a **KVM** — stream the browser's keyboard + absolute mouse (`moveabs`) to the target, intermixed with CLI injection on the one wire
 - Power control via DTR (J2 wiring) or generic shell-command hooks (`on_cmd`, `off_cmd`, `cycle_cmd`, `state_cmd`): `paniolo serial dtr`, `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`. Helpers that wire into the hooks: `cambrionix` (Cambrionix hub port power via control UART), `zigplug` (Zigbee smart plugs via a CC2652 coordinator dongle), `usbhub` (per-port VBUS switching on off-the-shelf USB hubs via hub-class requests, with human-verified port profiles built by `usbhub learn`), and `shellyplug` (Shelly Gen2+ smart plugs/relays over the device's local HTTP RPC API — no cloud/HA/Matter)
 
 ## Architecture
@@ -279,18 +279,22 @@ ocr/             OCR helpers (compiled/installed binaries are gitignored):
                    visionocr.swift  Apple Vision OCR (macOS); built by paniolo setup via swiftc
                    linuxocr         Tesseract OCR wrapper (Linux); copied by paniolo setup
 
-hidrig/          USB HID injector: host CLI + daemon (Rust) + KB2040 firmware
-  src/main.rs      `hidrig` CLI — one-shot subcommands mirroring the HID serial
-                   protocol (type/key/.../moveabs/ping/version) + `run` command
-                   files; `serve`/`stop` for the daemon; `baud` (test the link
-                   speed switch). A `Sender` routes each one-shot through a
-                   running daemon (POST /send) when one owns the same device,
-                   else opens the UART directly (at 115200)
-  src/proto.rs     line protocol client (send/OK-ERR parse) + sequence parser
-                   + clamp_abs; baud helpers: negotiate_baud (switch + confirm)
-                   and open_synced (probe 115200, else the elevated rate; the
-                   daemon negotiates up to FAST_BAUD)
-  src/uart.rs      the UART owner: a dedicated *blocking-serialport* thread
+hidrig/          USB HID injector: host CLI + daemon (Rust) + dual-board KB2040 firmware
+  src/main.rs      `hidrig` CLI — one-shot subcommands of the HID command
+                   vocabulary (type/key/.../moveabs/ping/version) + `run` command
+                   files; `serve`/`stop` for the daemon. A `Sender` routes each
+                   one-shot through a running daemon (POST /send) when one owns
+                   the same device, else opens the control CDC link and composes
+                   frames in-process
+  src/compose.rs   HID composition: turns each command into HID report bytes and
+                   wraps them in the binary frames the boards relay (F_HID 0x01 /
+                   F_CTRL 0x02). Holds the held-key + virtual-cursor state so
+                   relative `move` and `moveabs` share one absolute-pointer device
+  src/proto.rs     control-link transport: writes binary frames to the control
+                   board's data CDC endpoint (no baud negotiation — CDC; nominal
+                   115200), reads `0x02` control-frame replies (ping/version);
+                   command-file sequence parser + clamp_abs
+  src/uart.rs      the control-link owner: a dedicated *blocking-serialport* thread
                    (NOT tokio-serial — its async reads don't get read-readiness
                    on a macOS tty, so they timed out), bridged to the async
                    server via tokio channels (blocking_recv); an mpsc<(line,
@@ -304,25 +308,31 @@ hidrig/          USB HID injector: host CLI + daemon (Rust) + KB2040 firmware
   src/daemon.rs    advisory lock, discovery file at /tmp/paniolo-<uid>/hid/
                    (the channel name, not "hidrig", so paniolo finds it without
                    knowing the helper), tokio runtime, graceful shutdown
-  firmware/code.py reference implementation of the protocol: UART line commands
-                   -> USB HID keyboard/abs-mouse (CircuitPython 9.x). Tracks a
-                   virtual cursor so relative `move` and `moveabs` share one
-                   absolute-pointer device
-  firmware/boot.py USB identity: HID-only toward the target (keyboard + custom
-                   absolute-pointer descriptor, 0..32767 axes); D2->GND jumper
-                   at boot re-enables CIRCUITPY + REPL for development
+  firmware/dual/control/  control board (CircuitPython 9.x): USB-CDC <-> I2C1
+                   controller; reads framed input from usb_cdc.data, relays 0x01
+                   HID frames verbatim over I2C1 to the target, answers 0x02
+                   control frames (ping/version -> dual-control/1) locally
+  firmware/dual/target/   target board (CircuitPython 9.x): I2C1 peripheral that
+                   relays report bytes to usb_hid send_report — no adafruit_hid,
+                   no parsing. boot.py holds the HID descriptor (keyboard + custom
+                   absolute-pointer, 0..32767 axes) and the dev/HID-only NVM flag
+                   (BOOT button GP11 toggles; D2->GND at reset forces dev)
+  firmware/{boot,code,config}.py  retired single-board "smart" firmware (line
+                   protocol + adafruit_hid); kept for the future dumb single-board
   host/hid_seize_reports.c  macOS IOKit tool: seizes the HID device exclusively
                    and prints raw input reports — for pipeline testing without
                    keystrokes reaching the focused app. Build with host/Makefile.
-  README.md        wiring, firmware setup, CLI usage; the protocol spec is
-                   docs/hid-serial-protocol.md (normative, device-independent)
+  README.md        topology, wiring, frame protocol, CLI usage. The command
+                   vocabulary spec is docs/hid-serial-protocol.md; the dual-board
+                   design + frame format is docs/hid-dual-board-design.md
 ```
 
 ### hid daemon + KVM (`hidrig serve`)
 
-The UART can have only one owner, so KVM streaming and CLI injection can't both
-open it. `hidrig serve` resolves this: it owns the UART and re-exposes the line
-protocol over a WebSocket (`GET /hid`) and `POST /send`. Every command — from a
+The control link can have only one owner, so KVM streaming and CLI injection
+can't both open it. `hidrig serve` resolves this: it owns the link and
+re-exposes the command vocabulary over a WebSocket (`GET /hid`) and `POST
+/send`. Every command — from a
 browser, from `paniolo hid send`, from another script — flows through one
 `mpsc` queue in `uart.rs`, one in flight, request/reply; that single queue is
 what makes events intermix correctly. `paniolo console` starts the daemon when
@@ -338,15 +348,14 @@ discovers the daemon by the
 channel name `hid` (`daemons::daemon_port("hid")`), staying agnostic to the
 helper. Hardware-verified end-to-end on the pi5 Linux desktop (2026-06-04).
 
-**Latency.** Each command is a serial round-trip, so streaming is sensitive to
-event rate × per-command cost. Mitigations: the dashboard **coalesces mouse
-moves** to one `moveabs` per `requestAnimationFrame` (newest position only); the
-firmware read loop polls at 1 ms (was 10 ms); and the daemon **negotiates the
-UART up** to `FAST_BAUD` (460800) via `proto::open_synced` — the device boots at
-115200 (`BAUD`) and advertises a `baud` capability, switching only after acking
-at the old rate (`proto::negotiate_baud`), so a naive connect always works and a
-power-cycle re-syncs. One-shots stay at 115200. Still TODO if needed:
-fire-and-forget moves (no per-move round-trip).
+**Latency.** HID frames are **fire-and-forget** over the USB-CDC link (no
+per-frame round-trip), so streaming stays responsive without a baud
+negotiation — the control board is USB-CDC and USB sets the rate. The dashboard
+also **coalesces mouse moves** to one `moveabs` per `requestAnimationFrame`
+(newest position only). The remaining floor is the target board's USB interrupt
+`bInterval` (~8 ms per report on the CircuitPython firmware). Only `0x02`
+control frames (ping/version) draw a reply; macOS drops the `IOSSDATALAT` read
+timer on open to keep those round trips prompt.
 
 ## Combined dashboard (video + serial)
 
@@ -703,9 +712,10 @@ purely additive and runs on a separate thread so disk I/O can't stall the fan-ou
 
 ## _hid.py
 
-**Superseded** by the `hidrig` crate + the Rust CLI's `hid` channel (the rig's
-control link moved from a USB CDC data port to a UART; see
-`docs/hid-serial-protocol.md`). Kept only until the Python tree is retired.
+**Superseded** by the `hidrig` crate + the Rust CLI's `hid` channel (HID
+composition moved host-side into Rust, and the rig is now the dual-board "dumb
+pipe"; see `docs/hid-dual-board-design.md`). Kept only until the Python tree is
+retired.
 
 Host client for the original two-board USB HID injection rig. `paniolo hid` is
 a **thin text-command client**: it sends line commands (`type ...`, `key
@@ -728,29 +738,35 @@ test suite needs neither pyserial nor hardware.
 
 ## hidrig (USB HID injector)
 
-The `hidrig/` directory is the USB HID injector: a Rust host CLI plus
-CircuitPython 9.x firmware for a single Adafruit KB2040.
+The `hidrig/` directory is the USB HID injector: a Rust host CLI/daemon plus
+CircuitPython 9.x firmware for the **dual-board "dumb pipe"** KB2040 rig.
 
 ### Architecture
 
 ```
 [control host]
-  |-- USB-serial adapter -- UART (TX/RX/GND, 115200 8N1) --> [KB2040]
-                                                                |-- USB HID -->
-                                                                       [target / DUT]
+  |-- USB-CDC (hidrig writes binary HID frames) --> [Control KB2040]
+                                                      |-- I2C1 (GP10 SDA / GP19 SCL,
+                                                      |   addr 0x41, 4.7k pull-ups) -->
+                                                    [Target KB2040]
+                                                      |-- USB HID --> [target / DUT]
 ```
 
-The board's built-in USB port faces the **target** as a device-mode HID
-keyboard + mouse (and powers the board, so it reboots with the target); the
-control link is the UART. The wire protocol is the **HID serial protocol v1**
-(`docs/hid-serial-protocol.md` — normative and device-independent, so the same
-host tooling drives any conforming microcontroller implementation). The
-firmware (`firmware/code.py`) is the reference implementation; `hidrig`
-(`src/main.rs`, `src/proto.rs`) is the host client.
+The host composes HID reports (`src/compose.rs`) and writes binary frames to the
+**control** board's data CDC endpoint; the control board relays `0x01` HID
+frames verbatim over I2C1 to the **target** board, which calls `send_report` —
+neither board parses HID semantics (the "dumb pipe", `docs/hid-dual-board-design.md`).
+The target board's USB faces the DUT as a device-mode HID keyboard + absolute
+mouse (and is DUT-powered, so it reboots with the DUT); the control board is
+independently host-powered. The command vocabulary (`type`/`key`/`moveabs`/…)
+is the device-independent **HID serial protocol v1** (`docs/hid-serial-protocol.md`),
+but it is the *external* interface only — `hidrig` consumes it and composes; the
+line protocol never reaches a wire. `hidrig` (`src/main.rs`, `src/compose.rs`,
+`src/proto.rs`) is the host client; `firmware/dual/{control,target}/` are the
+reference firmware. The retired single-board "smart" firmware
+(`firmware/{boot,code,config}.py`, line protocol + `adafruit_hid`) is kept for a
+future dumb single-board on the same composition.
 
-An earlier two-board design (USB-CDC control board relaying binary I2C packets
-to a USB-HID target board) lives only in git history (`hidrig/control/`,
-`hidrig/target/`, `HANDOFF.md`).
 
 ### USB identity (`firmware/boot.py`)
 

@@ -23,6 +23,12 @@ package = true
 [tool.pyink]
 line-length = 88
 
+[tool.pytest.ini_options]
+# All host tests live in tests/. Scope collection there so pytest does not sweep
+# up CircuitPython firmware (e.g. hidrig/firmware/**/*_test.py, which `import
+# board` and can't be collected off-device).
+testpaths = ["tests"]
+
 [build-system]
 requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"

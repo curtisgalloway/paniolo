@@ -10,18 +10,36 @@ paniolo appends arguments to it and runs it, staying agnostic to the device.
 
 ## Architecture
 
+The default injector is the **dual-board KB2040 "dumb pipe"** rig: two KB2040s
+where the host composes the HID report bytes and the boards relay them without
+interpreting any HID semantics. The host-facing **control** board faces the
+control host over USB-CDC and is the I2C1 controller; the **target** board
+faces the DUT over USB-HID and is the I2C1 peripheral.
+
 ```
-[Control host] --USB-serial adapter--+
-                                     | UART (TX/RX/GND, 115200 8N1)
-                                     v
-                                 [KB2040] --built-in USB (HID device)--> [Target / DUT]
+[Control host]
+      |  USB-CDC (hidrig writes binary HID frames to the data endpoint)
+      v
+[Control KB2040]  -- I2C1 controller, routes frames by type byte
+      |  I2C1: GP10 = SDA, GP19 = SCL, GND   (target addr 0x41, 4.7 kΩ pull-ups)
+      v
+[Target KB2040]   -- I2C1 peripheral; relays report bytes to send_report
+      |  built-in USB (HID keyboard + absolute mouse)
+      v
+[Target / DUT]
 ```
 
-The injector implements the [HID serial protocol](hid-serial-protocol.md)
-(line-based text commands, `OK`/`ERR` replies). The `hidrig` CLI is the
-host-side client; the KB2040 CircuitPython firmware is the reference device
-implementation, and anything else that conforms to the spec (another
-microcontroller, a CH9329 shim) drops in without touching paniolo.
+The command vocabulary (`type`, `key`, `moveabs`, …) is the device-independent
+[HID serial protocol](hid-serial-protocol.md), but in this rig it is the
+*external* interface only: `hidrig` consumes it and composes HID reports
+itself, then writes binary frames to the control board's data CDC endpoint —
+the line protocol never travels on a wire. See
+[`hid-dual-board-design.md`](hid-dual-board-design.md) for the design and the
+frame format, and [`../hidrig/README.md`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md) for wiring and bring-up.
+Because the interface above `hidrig` is just the helper's CLI, any other
+injector (another microcontroller, a CH9329 shim) drops in through the same
+generic `hid` channel without touching paniolo.
+
 
 ---
 
@@ -33,10 +51,11 @@ cargo install --path hidrig --root ~/.local/libexec/paniolo   # or `make install
                                                               # rebuilds everything via `paniolo setup`
 
 # Bind the helper to the target in the lab file
-paniolo hid set -t pi5 --cmd "hidrig -d /dev/cu.usbserial-XXXX"
+# -d is the control board's DATA CDC port (the second usbmodem of its pair)
+paniolo hid set -t pi5 --cmd "hidrig -d /dev/cu.usbmodemXXXX"
 
 # Channel on a remote control host
-paniolo hid set -t pi5 --cmd "hidrig -d /dev/ttyUSB0" --host bench1
+paniolo hid set -t pi5 --cmd "hidrig -d /dev/ttyACM1" --host bench1
 
 # Remove the channel
 paniolo hid rm -t pi5
@@ -100,8 +119,8 @@ sleep 1.5        # wait 1.5 seconds
 Run a sequence (the file must exist on the host that owns the channel):
 
 ```bash
-hidrig -d /dev/cu.usbserial-XXXX run boot-sequence.txt
-hidrig -d /dev/cu.usbserial-XXXX run - < boot-sequence.txt   # via stdin
+hidrig -d /dev/cu.usbmodemXXXX run boot-sequence.txt
+hidrig -d /dev/cu.usbmodemXXXX run - < boot-sequence.txt   # via stdin
 ```
 
 Sequencing and timing live on the host; the firmware stays dumb.
@@ -121,8 +140,8 @@ pointer. Clicking the video sends a real click to the target; the overlay
 buttons themselves never inject. Losing window focus auto-releases and clears
 held keys so nothing sticks on the target.
 
-Under the hood this is the **hid daemon**: the helper owns the UART and
-re-exposes the protocol over a localhost WebSocket (the
+Under the hood this is the **hid daemon**: the helper owns the control link and
+re-exposes the command vocabulary over a localhost WebSocket (the
 [HID serial protocol](hid-serial-protocol.md) §2 carrier). `paniolo console`
 starts it on demand; the browser streams `moveabs`/`down`/`up`/`scroll`
 commands to it. Because the daemon serializes every command — from the browser
@@ -145,14 +164,13 @@ When a daemon is running for a device, `hidrig -d <device> …` one-shots route
 through it automatically (the UART has a single owner), so the CLI and the web
 console never contend for the port.
 
-**Latency.** Each command is a serial round-trip, so cursor streaming is
-sensitive to per-command cost and event rate. Two things keep it responsive:
-the dashboard **coalesces mouse moves** to one `moveabs` per animation frame
-(newest position only, instead of every `mousemove`), and the daemon
-**negotiates the UART up** from the 115200 boot rate to 460800 when the device
-advertises the `baud` capability (the firmware boots at 115200 so a naive
-connect always works, and returns to it on power-cycle). One-shots stay at
-115200 — a single command doesn't need the speed.
+**Latency.** HID frames are fire-and-forget over the USB-CDC link (no
+per-frame round-trip), so cursor streaming stays responsive; the dashboard also
+**coalesces mouse moves** to one `moveabs` per animation frame (newest position
+only, instead of every `mousemove`). The control board is a USB-CDC device, so
+there is no baud negotiation — USB sets the rate. The remaining floor is the
+target's USB interrupt `bInterval` (~8 ms per report on the CircuitPython
+firmware).
 
 ---
 
@@ -160,7 +178,7 @@ connect always works, and returns to it on power-cycle). One-shots stay at
 
 ```toml
 [targets.pi5.hid]
-cmd = "hidrig -d /dev/cu.usbserial-XXXX"
+cmd = "hidrig -d /dev/cu.usbmodemXXXX"
 # host = "bench1"            # if the injector hangs off a remote control host
 ```
 
@@ -168,19 +186,19 @@ cmd = "hidrig -d /dev/cu.usbserial-XXXX"
 
 ## Host testing tools (macOS)
 
-To exercise the full pipeline without a target, plug the injector's USB into
-the same Mac that drives the UART and capture its HID reports while injecting.
-Build with `cd hidrig/host && make`.
+To exercise the full pipeline without a DUT, plug the **target** board's USB
+into the same Mac that drives the control link and capture its HID reports while
+injecting. Build with `cd hidrig/host && make`.
 
 `hidrig/host/hid_capture_usb.m` is the **leak-safe** tool: it detaches
-the injector from the macOS HID stack via IOUSBHost whole-device capture and
+the target board from the macOS HID stack via IOUSBHost whole-device capture and
 prints timestamped interrupt-IN reports, so injected input reaches only the
 tool — not the focused app or the real cursor.
 
 ```bash
 sudo ./hid_capture_usb         # start this BEFORE injecting
 # second terminal:
-hidrig -d <adapter> moveabs 16000 8000
+hidrig -d /dev/cu.usbmodemXXXX moveabs 16383 16383
 ```
 
 > The older `hid_seize_reports.c` (`IOHIDDeviceOpen(..SeizeDevice)`) is
@@ -191,6 +209,8 @@ hidrig -d <adapter> moveabs 16000 8000
 ### Latency note
 
 On macOS the daemon drops the serial read-latency timer (`IOSSDATALAT`) to its
-floor on open; the default added ~230 ms per command, which had dominated the
-felt KVM latency. With the fix a mouse move injects in ~8 ms (the USB endpoint's
-8 ms `bInterval` is the floor); `ping` is ~3 ms.
+floor when it opens the control CDC endpoint; the default added ~230 ms to each
+control-frame round trip (`ping`/`version`). HID frames are fire-and-forget so
+they don't pay it, but the floor keeps liveness checks prompt (`ping` ~3 ms). A
+mouse move injects in ~8 ms — the target's USB interrupt endpoint's 8 ms
+`bInterval` is the floor.

@@ -65,7 +65,7 @@ and persist between CLI invocations. State lives in plain files, not memory.
 | `zigplug` | Python (uv tool, zigpy-znp) | Standalone power helper: Zigbee smart-plug control through a CC2652 coordinator; one-shots proxy through an auto-spawned daemon that owns the ZNP session. |
 | `hidrig` | Rust | HID-injection helper: protocol client + `serve` daemon for the KB2040 injector, wired in via the generic `hid` channel. |
 | `visionocr` / `linuxocr` | Swift / shell+Tesseract | On-device OCR helpers invoked by `hdmicap` (`GET /ocr`, wrapped by `paniolo video read` and the dashboard OCR button). |
-| HID rig firmware | CircuitPython | A single KB2040 board that turns text commands into USB HID keyboard + mouse events (see [`hidrig/`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md)). |
+| HID rig firmware | CircuitPython | Two KB2040 boards — the dual-board "dumb pipe" that relays host-composed HID reports to the DUT as USB keyboard + mouse events (see [`hidrig/`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md)). |
 
 Only `paniolo` itself lands on PATH (`~/.cargo/bin`); every helper and daemon installs into the
 private libexec dir `~/.local/libexec/paniolo/bin`, where paniolo resolves them itself —
@@ -203,11 +203,14 @@ reopen latency) and serves the current frame as PNG/MJPEG plus the dashboard ove
 `.fast`/lowered min text height).
 
 ### HID injection ([`hid.md`](hid.md))
-A single KB2040 presents as a USB HID keyboard + mouse to the DUT; the control host drives it
-over a UART (USB-serial adapter) speaking the device-independent
-[HID serial protocol](hid-serial-protocol.md). The `hidrig` helper CLI is the protocol client,
-and paniolo integrates it through the generic per-target `hid` channel — an opaque command
-prefix (`paniolo hid send` appends arguments), exactly like the power hooks.
+The dual-board "dumb pipe" rig presents as a USB HID keyboard + mouse to the DUT: `hidrig`
+composes HID reports on the host and writes binary frames to the **control** board's USB-CDC
+port, which relays them over I2C1 to the **target** board that injects them
+([hid-dual-board-design.md](hid-dual-board-design.md)). The command vocabulary is the
+device-independent [HID serial protocol](hid-serial-protocol.md), but it is the *external*
+interface only — `hidrig` consumes and composes it. paniolo integrates the helper through the
+generic per-target `hid` channel — an opaque command prefix (`paniolo hid send` appends
+arguments), exactly like the power hooks.
 
 ### Dashboard ([`dashboard.md`](dashboard.md))
 `paniolo console` opens hdmicap's `GET /` — a two-pane web UI (live video on top, xterm.js

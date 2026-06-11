@@ -13,29 +13,33 @@
 # limitations under the License.
 
 """
-HID injector boot.py (Adafruit KB2040, CircuitPython 9.x)
+Dual-board rig — TARGET board boot.py (Adafruit KB2040, CircuitPython 9.x).
 
-The board's built-in USB port faces the *target* machine, so in normal
-operation it must look like a plain keyboard + mouse: this file disables the
-CIRCUITPY mass-storage drive, the CDC REPL console, and MIDI, leaving only
-the HID keyboard + mouse interfaces.
+This is the board whose USB faces the *DUT*. It must look like a plain
+keyboard + absolute-pointer mouse, so this file registers the HID descriptor
+(the host↔rig contract, per docs/hid-dual-board-design.md §5) and — outside
+dev mode — strips the CIRCUITPY drive, the CDC console, and MIDI.
 
-The mouse is an **absolute pointer** (two 16-bit axes over a 0..32767 logical
-range) instead of the default relative mouse, so the host can move the cursor
-to an exact screen position — this is what makes the paniolo web console work
-like a KVM (move-where-you-point). The firmware also tracks a virtual cursor
-so relative `move` still works (it accumulates into the absolute position).
+The descriptor here is identical to the single-board firmware's boot.py: report
+id 1 = keyboard, report id 2 = absolute mouse (0..32767 in each axis). The host
+daemon composes report bytes to match it exactly; this board never interprets
+them — it just relays them to send_report (see code.py).
 
-Dev mode: jumper D2 to GND (they are adjacent on the KB2040 edge) before
-reset/power-on to keep CIRCUITPY + the REPL enabled for firmware updates.
-Plug the board into a dev machine (not the target) for that.
+Mode selection (no jumper needed in normal use):
+  - The mode lives in NVM byte 0: 0 = HID-only (production), anything else =
+    dev (CIRCUITPY + REPL + HID). Erased NVM reads 0xFF, so a fresh board boots
+    in dev mode — safe for editing.
+  - Tap the BOOT button (GP11) while running and code.py flips the flag and
+    resets, so a press toggles dev <-> HID-only with no jumper.
+  - Grounding D2 at reset forces dev mode regardless of the flag — a hardware
+    fallback so a wedged code.py can never strand the board in HID-only.
 
-boot.py only runs on a hard reset / power cycle — a soft reload (code save)
-does not re-run it.
+boot.py only runs on a hard reset / power cycle — a soft reload does not re-run it.
 """
 
 import board
 import digitalio
+import microcontroller
 import storage
 import usb_cdc
 import usb_hid
@@ -91,26 +95,17 @@ ABS_MOUSE = usb_hid.Device(
     out_report_lengths=(0,),
 )
 
-import config
-
-_jumper = digitalio.DigitalInOut(board.D2)
-_jumper.switch_to_input(pull=digitalio.Pull.UP)
-DEV_MODE = not _jumper.value  # D2 grounded -> keep dev interfaces
-_jumper.deinit()
+# Mode flag in NVM byte 0 (0 = HID-only, else dev), with D2-to-GND as a
+# hardware override that forces dev mode even if code.py is wedged.
+_d2 = digitalio.DigitalInOut(board.D2)
+_d2.switch_to_input(pull=digitalio.Pull.UP)
+_d2_forces_dev = not _d2.value
+_d2.deinit()
+DEV_MODE = (microcontroller.nvm[0] != 0) or _d2_forces_dev
 
 usb_midi.disable()
+usb_hid.enable((usb_hid.Device.KEYBOARD, ABS_MOUSE))
 
-if config.ROLE == "control":
-    # Control board doesn't need to emulate HID keyboard/mouse.
-    # We always enable CDC data + console so it can receive commands and offer REPL/logs.
-    usb_hid.disable()
-    usb_cdc.enable(console=True, data=True)
-    if not DEV_MODE:
-        storage.disable_usb_drive()
-else:
-    # Target or single-board setups need the absolute mouse and keyboard HID.
-    usb_hid.enable((usb_hid.Device.KEYBOARD, ABS_MOUSE))
-    if not DEV_MODE:
-        storage.disable_usb_drive()
-        usb_cdc.disable()
-
+if not DEV_MODE:
+    storage.disable_usb_drive()
+    usb_cdc.disable()

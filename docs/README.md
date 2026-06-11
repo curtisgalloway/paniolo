@@ -24,7 +24,7 @@ and power-cycle it without a person at the bench each iteration. See the root
 | [Video](video.md) | `paniolo video` | `hdmicap` warm-stream HDMI capture + on-device OCR. |
 | [Dashboard](dashboard.md) | `paniolo console` | Combined video + serial web UI. |
 | [HID injection](hid.md) | `paniolo hid` | USB keyboard/mouse injection via a generic helper hook; `hidrig` KB2040 injector; KVM input from the web console. |
-| [HID serial protocol](hid-serial-protocol.md) | — | Normative device-independent spec for HID injectors (v1); implement it on any microcontroller. |
+| [HID serial protocol](hid-serial-protocol.md) | — | Normative command vocabulary (v1) — the external interface `hidrig` composes from; the dual-board device wire is in [hid-dual-board-design.md](hid-dual-board-design.md). |
 
 ## Distributed control (Phases 0–5 shipped)
 

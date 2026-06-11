@@ -12,19 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! hidrig — drive the KB2040 USB HID injector over its control UART.
+//! hidrig — drive the dual-board KB2040 USB-HID injector.
 //!
-//! The injector's built-in USB port is a device-mode HID keyboard + mouse
-//! plugged into the target machine; this tool talks the board's line-based
-//! text protocol over the TX/RX UART (via a USB-serial adapter).
+//! hidrig owns HID *composition*: each subcommand (type, key, combo, down, up,
+//! releaseall, move, moveabs, click, mdown, mup, scroll, ping, version) is
+//! turned into HID report bytes (see [`compose`]) and wrapped in the binary
+//! frames the control board relays over I2C to the target board, which injects
+//! them as USB-HID into the DUT — the "dumb pipe" rig in `firmware/dual/`. The
+//! control board is a USB-CDC device; hidrig writes frames to its data endpoint.
 //!
-//! One-shot subcommands mirror the firmware protocol one-to-one (type, key,
-//! combo, down, up, releaseall, move, moveabs, click, mdown, mup, scroll,
-//! ping, version), plus `run` for command files. `serve` runs a daemon that
-//! owns the UART and re-exposes the protocol over a WebSocket so the web
-//! console can stream events that intermix with CLI injections; when a daemon
-//! is running for the same device, one-shots route through it automatically.
+//! `run` executes a command file. `serve` runs a daemon that owns the control
+//! link, holds the composition state (held keys, virtual cursor), and re-exposes
+//! the command protocol over a localhost WebSocket so the web console intermixes
+//! with CLI injections; when a daemon is running for the same device, one-shots
+//! route through it automatically.
 
+mod compose;
 mod daemon;
 mod proto;
 mod server;
@@ -37,16 +40,17 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 
-use proto::{open_port, parse_sequence, send_command, Step};
+use compose::Composer;
+use proto::{open_port, parse_sequence, run_command, Step};
 
 #[derive(Parser)]
 #[command(
     name = "hidrig",
     version,
-    about = "KB2040 USB HID injector: keyboard/mouse injection over a control UART"
+    about = "Dual-board KB2040 USB-HID injector: keyboard/mouse via the control board's CDC link"
 )]
 struct Cli {
-    /// Injector control UART (the USB-serial adapter, e.g. /dev/cu.usbserial-XXXX). Required.
+    /// Control board data CDC endpoint (e.g. /dev/cu.usbmodemXXXX). Required.
     // Option<String> because clap does not permit global required args; main()
     // validates presence before dispatch.
     #[arg(short = 'd', long = "device", value_name = "DEVICE", global = true)]
@@ -141,12 +145,6 @@ enum Cmd {
     },
     /// Stop a running hid daemon (SIGTERM to the recorded pid).
     Stop,
-    /// Negotiate the link up to <RATE> baud (for testing; the device boots at
-    /// 115200 and re-syncs on power-cycle, the daemon does this automatically).
-    Baud {
-        /// New baud rate (e.g. 460800).
-        rate: u32,
-    },
 }
 
 fn main() -> Result<()> {
@@ -165,13 +163,6 @@ fn main() -> Result<()> {
             return daemon::run(device.to_string(), *port);
         }
         Cmd::Stop => return cmd_stop(),
-        Cmd::Baud { rate } => {
-            let device = require_device(&cli)?;
-            let mut port = open_port(device)?;
-            proto::negotiate_baud(&mut port, *rate)?;
-            println!("OK (link now at {rate} baud)");
-            return Ok(());
-        }
         _ => {}
     }
 
@@ -186,10 +177,7 @@ fn main() -> Result<()> {
         Cmd::Up { name } => one(&mut tx, &format!("up {name}")),
         Cmd::Releaseall => one(&mut tx, "releaseall"),
         Cmd::Move { dx, dy } => one(&mut tx, &format!("move {dx} {dy}")),
-        Cmd::Moveabs { x, y } => one(
-            &mut tx,
-            &format!("moveabs {} {}", proto::clamp_abs(x), proto::clamp_abs(y)),
-        ),
+        Cmd::Moveabs { x, y } => one(&mut tx, &format!("moveabs {x} {y}")),
         Cmd::Click { button } => one(&mut tx, &format!("click {button}")),
         Cmd::Mdown { button } => one(&mut tx, &format!("mdown {button}")),
         Cmd::Mup { button } => one(&mut tx, &format!("mup {button}")),
@@ -201,7 +189,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Run { file, delay_ms } => cmd_run(&mut tx, &file, delay_ms),
-        Cmd::Serve { .. } | Cmd::Stop | Cmd::Baud { .. } => unreachable!("handled above"),
+        Cmd::Serve { .. } | Cmd::Stop => unreachable!("handled above"),
     }
 }
 
@@ -216,8 +204,10 @@ fn require_device(cli: &Cli) -> Result<&str> {
 enum Sender {
     /// A hid daemon owns this device; route commands through its HTTP API.
     Daemon { base: String },
-    /// No daemon for this device; we hold the UART ourselves.
+    /// No daemon for this device; we hold the control link ourselves and
+    /// compose frames in-process (held-key / cursor state lasts one process).
     Direct {
+        composer: Composer,
         port: Box<dyn serialport::SerialPort>,
     },
 }
@@ -235,6 +225,7 @@ impl Sender {
             }
         }
         Ok(Sender::Direct {
+            composer: Composer::new(),
             port: open_port(device)?,
         })
     }
@@ -244,7 +235,7 @@ impl Sender {
     fn send(&mut self, line: &str) -> Result<String> {
         match self {
             Sender::Daemon { base } => post_send(base, line),
-            Sender::Direct { port } => send_command(port, line),
+            Sender::Direct { composer, port } => run_command(composer, port, line),
         }
     }
 }
