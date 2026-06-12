@@ -47,13 +47,41 @@ pub fn system_libexec_dir() -> PathBuf {
     PathBuf::from("/usr/libexec/paniolo/bin")
 }
 
+/// Helper dirs relative to the running CLI binary, after resolving symlinks
+/// (Homebrew links `<prefix>/bin/paniolo` into the versioned keg):
+/// `../libexec/bin` (Homebrew keg layout) and `../libexec/paniolo/bin`
+/// (FHS-style prefix). A relocated install is self-locating without
+/// enumerating package managers. Deliberately NOT the exe's own dir: for a
+/// `make install` CLI that is `~/.cargo/bin`, the legacy location that must
+/// stay a last-resort fallback.
+fn exe_relative_dirs() -> Vec<PathBuf> {
+    let Ok(exe) = std::env::current_exe() else {
+        return Vec::new();
+    };
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    let Some(prefix) = exe.parent().and_then(|d| d.parent()) else {
+        return Vec::new();
+    };
+    vec![
+        prefix.join("libexec/bin"),
+        prefix.join("libexec/paniolo/bin"),
+    ]
+}
+
 /// Find an installed binary: the paniolo libexec dirs first (per-user, then
+/// relative to the running CLI — Homebrew keg or other prefix install — then
 /// the system package's `/usr/libexec/paniolo/bin`), then $PATH, then
 /// ~/.cargo/bin (the pre-libexec install location, kept as a transitional
 /// fallback). Never the in-repo build tree, so a running daemon can't point
 /// at an ephemeral build artifact.
 pub fn find_binary(name: &str) -> Option<PathBuf> {
     if let Some(p) = libexec_dir().map(|d| d.join(name)) {
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    for dir in exe_relative_dirs() {
+        let p = dir.join(name);
         if p.is_file() {
             return Some(p);
         }
@@ -81,6 +109,7 @@ pub fn find_binary(name: &str) -> Option<PathBuf> {
 pub fn hook_path() -> std::ffi::OsString {
     let current = std::env::var_os("PATH").unwrap_or_default();
     let mut paths: Vec<PathBuf> = libexec_dir().into_iter().collect();
+    paths.extend(exe_relative_dirs());
     paths.push(system_libexec_dir());
     paths.extend(std::env::split_paths(&current));
     std::env::join_paths(paths).unwrap_or(current)
