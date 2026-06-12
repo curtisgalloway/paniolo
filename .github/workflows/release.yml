@@ -1,0 +1,169 @@
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Build Linux packages (.deb + tarball) for amd64 and arm64 and attach them
+# to a GitHub Release when a v* tag is pushed. workflow_dispatch builds the
+# packages as artifacts only (no Release), for testing the pipeline.
+#
+# Builds run inside a debian:bookworm container so binaries link against
+# glibc 2.36 — the packages then run on Debian 12+, 13, and current
+# Raspberry Pi OS. Building bare on the ubuntu-24.04 runners (glibc 2.39)
+# would silently exclude bookworm machines.
+
+name: Release packages
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NFPM_VERSION: 2.46.3
+  HELPERS: hdmicap serialcap netbootd cambrionix hidrig ch9329 usbhub shellyplug
+
+jobs:
+  package:
+    name: package (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    container: debian:bookworm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      # Same package list `make check-deps` enforces, plus the toolchain
+      # bootstrap bits the container lacks. git must precede checkout so the
+      # action does a real clone (the REST-download fallback has no .git).
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config libudev-dev libclang-dev clang \
+            cmake nasm curl ca-certificates git
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
+          workspaces: |
+            cli
+            hdmicap
+            serialcap
+            netbootd
+            cambrionix
+            hidrig
+            ch9329
+            usbhub
+            shellyplug
+
+      - name: Build release binaries
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+        run: |
+          for crate in cli $HELPERS; do
+            echo "==> cargo build --release ($crate)"
+            cargo build --release --manifest-path "$crate/Cargo.toml"
+          done
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0~dev.$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stage package tree
+        run: |
+          mkdir -p packaging/stage/bin packaging/stage/libexec
+          install -m 0755 cli/target/release/paniolo packaging/stage/bin/
+          for helper in $HELPERS; do
+            install -m 0755 "$helper/target/release/$helper" packaging/stage/libexec/
+          done
+          install -m 0755 ocr/linuxocr packaging/stage/libexec/
+
+      - name: Install nfpm
+        run: |
+          curl -fsSL -o /tmp/nfpm.deb \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_${{ matrix.arch }}.deb"
+          apt-get install -y /tmp/nfpm.deb
+
+      - name: Build .deb
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p dist
+          nfpm package -f packaging/nfpm.yaml -p deb \
+            -t "dist/paniolo_${VERSION}_${ARCH}.deb"
+
+      - name: Build tarball
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          tardir="paniolo-${VERSION}-linux-${ARCH}"
+          mkdir -p "dist/$tardir"
+          cp packaging/stage/bin/paniolo packaging/stage/libexec/* \
+            LICENSE README.md "dist/$tardir/"
+          tar -C dist -czf "dist/$tardir.tar.gz" "$tardir"
+          rm -r "dist/$tardir"
+
+      # We're already root inside the bookworm container: install the deb for
+      # real and check the layout + helper discovery end to end.
+      - name: Smoke-test the .deb
+        run: |
+          apt-get install -y ./dist/paniolo_*.deb
+          test -x /usr/bin/paniolo
+          test -x /usr/libexec/paniolo/bin/hdmicap
+          test -x /usr/libexec/paniolo/bin/linuxocr
+          /usr/bin/paniolo --help
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: attach to GitHub Release
+    if: github.ref_type == 'tag'
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

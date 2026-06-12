@@ -40,7 +40,15 @@ pub fn libexec_dir() -> Option<PathBuf> {
     libexec_root().map(|r| r.join("bin"))
 }
 
-/// Find an installed binary: the paniolo libexec dir first, then $PATH, then
+/// Helper dir used by the Linux system packages (.deb/tarball installs to a
+/// system prefix): `/usr/libexec/paniolo/bin`. Searched after the per-user
+/// libexec dir, so a `make install` build overrides an installed package.
+pub fn system_libexec_dir() -> PathBuf {
+    PathBuf::from("/usr/libexec/paniolo/bin")
+}
+
+/// Find an installed binary: the paniolo libexec dirs first (per-user, then
+/// the system package's `/usr/libexec/paniolo/bin`), then $PATH, then
 /// ~/.cargo/bin (the pre-libexec install location, kept as a transitional
 /// fallback). Never the in-repo build tree, so a running daemon can't point
 /// at an ephemeral build artifact.
@@ -49,6 +57,10 @@ pub fn find_binary(name: &str) -> Option<PathBuf> {
         if p.is_file() {
             return Some(p);
         }
+    }
+    let p = system_libexec_dir().join(name);
+    if p.is_file() {
+        return Some(p);
     }
     if let Some(paths) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&paths) {
@@ -68,14 +80,10 @@ pub fn find_binary(name: &str) -> Option<PathBuf> {
 /// resolving without the helpers being user-visible on PATH.
 pub fn hook_path() -> std::ffi::OsString {
     let current = std::env::var_os("PATH").unwrap_or_default();
-    match libexec_dir() {
-        Some(dir) => {
-            let mut paths = vec![dir];
-            paths.extend(std::env::split_paths(&current));
-            std::env::join_paths(paths).unwrap_or(current)
-        }
-        None => current,
-    }
+    let mut paths: Vec<PathBuf> = libexec_dir().into_iter().collect();
+    paths.push(system_libexec_dir());
+    paths.extend(std::env::split_paths(&current));
+    std::env::join_paths(paths).unwrap_or(current)
 }
 
 /// Stable per-user runtime base: `/tmp/paniolo-<uid>`, identical in every
