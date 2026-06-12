@@ -68,27 +68,34 @@ fn exe_relative_dirs() -> Vec<PathBuf> {
     ]
 }
 
-/// Find an installed binary: the paniolo libexec dirs first (per-user, then
+/// The paniolo helper directories, in resolution order: the per-user libexec
+/// dir (`~/.local/libexec/paniolo/bin`), then dirs relative to the running CLI
+/// (Homebrew keg / prefix install — see [`exe_relative_dirs`]), then the
+/// system package dir (`/usr/libexec/paniolo/bin`). These are the only places
+/// paniolo ships helpers into: [`find_binary`] searches them (before falling
+/// back to `$PATH` and `~/.cargo/bin`), [`hook_path`] prepends them, and
+/// `paniolo helper` lists them. A per-user `make install` thus shadows an
+/// installed system package. The system dir is always present, so this is
+/// never empty.
+pub fn helper_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = libexec_dir().into_iter().collect();
+    dirs.extend(exe_relative_dirs());
+    dirs.push(system_libexec_dir());
+    dirs
+}
+
+/// Find an installed binary: the paniolo helper dirs first (per-user, then
 /// relative to the running CLI — Homebrew keg or other prefix install — then
-/// the system package's `/usr/libexec/paniolo/bin`), then $PATH, then
-/// ~/.cargo/bin (the pre-libexec install location, kept as a transitional
-/// fallback). Never the in-repo build tree, so a running daemon can't point
-/// at an ephemeral build artifact.
+/// the system package's `/usr/libexec/paniolo/bin`; see [`helper_dirs`]), then
+/// $PATH, then ~/.cargo/bin (the pre-libexec install location, kept as a
+/// transitional fallback). Never the in-repo build tree, so a running daemon
+/// can't point at an ephemeral build artifact.
 pub fn find_binary(name: &str) -> Option<PathBuf> {
-    if let Some(p) = libexec_dir().map(|d| d.join(name)) {
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    for dir in exe_relative_dirs() {
+    for dir in helper_dirs() {
         let p = dir.join(name);
         if p.is_file() {
             return Some(p);
         }
-    }
-    let p = system_libexec_dir().join(name);
-    if p.is_file() {
-        return Some(p);
     }
     if let Some(paths) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&paths) {
@@ -108,9 +115,7 @@ pub fn find_binary(name: &str) -> Option<PathBuf> {
 /// resolving without the helpers being user-visible on PATH.
 pub fn hook_path() -> std::ffi::OsString {
     let current = std::env::var_os("PATH").unwrap_or_default();
-    let mut paths: Vec<PathBuf> = libexec_dir().into_iter().collect();
-    paths.extend(exe_relative_dirs());
-    paths.push(system_libexec_dir());
+    let mut paths: Vec<PathBuf> = helper_dirs();
     paths.extend(std::env::split_paths(&current));
     std::env::join_paths(paths).unwrap_or(current)
 }
@@ -283,10 +288,10 @@ pub fn list_discovered() -> Vec<DaemonInfo> {
 /// Processes executing out of the libexec dir that are NOT in `exclude_pids` —
 /// stray helper invocations (e.g. wedged one-shots holding a serial port).
 pub fn list_stray_helpers(exclude_pids: &[i32]) -> Vec<(i32, String)> {
-    let Some(libexec) = libexec_dir() else {
-        return Vec::new();
-    };
-    let needle = libexec.to_string_lossy().into_owned();
+    let needles: Vec<String> = helper_dirs()
+        .iter()
+        .map(|d| d.to_string_lossy().into_owned())
+        .collect();
     let Ok(out) = std::process::Command::new("ps")
         .args(["-axo", "pid=,args="])
         .output()
@@ -300,7 +305,8 @@ pub fn list_stray_helpers(exclude_pids: &[i32]) -> Vec<(i32, String)> {
             let line = line.trim_start();
             let (pid_s, args) = line.split_once(' ')?;
             let pid: i32 = pid_s.parse().ok()?;
-            if !args.contains(&needle) || pid == me || exclude_pids.contains(&pid) {
+            let from_libexec = needles.iter().any(|n| args.contains(n.as_str()));
+            if !from_libexec || pid == me || exclude_pids.contains(&pid) {
                 return None;
             }
             Some((pid, args.trim().to_string()))
