@@ -59,7 +59,7 @@ jobs:
             build-essential pkg-config libudev-dev libclang-dev clang \
             cmake nasm curl ca-certificates git
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         run: |
@@ -90,13 +90,17 @@ jobs:
             cargo build --release --manifest-path "$crate/Cargo.toml"
           done
 
+      # GITHUB_SHA, not `git rev-parse`: the container's uid differs from the
+      # workspace owner, so git refuses with "dubious ownership" (and the
+      # failure hides inside the command substitution). printf is POSIX —
+      # container steps run under sh, where ${VAR:0:7} would not parse.
       - name: Determine version
         id: version
         run: |
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           else
-            echo "version=0.0.0~dev.$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+            echo "version=0.0.0~dev.$(printf '%.7s' "$GITHUB_SHA")" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Stage package tree
@@ -145,7 +149,7 @@ jobs:
           test -x /usr/libexec/paniolo/bin/linuxocr
           /usr/bin/paniolo --help
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: packages-${{ matrix.arch }}
           path: dist/*
@@ -159,7 +163,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true

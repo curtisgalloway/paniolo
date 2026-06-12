@@ -32,7 +32,7 @@ jobs:
     name: python (pytest)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
@@ -67,7 +67,7 @@ jobs:
       run:
         working-directory: serialcap
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev
       - uses: dtolnay/rust-toolchain@stable
@@ -90,7 +90,7 @@ jobs:
       run:
         working-directory: netbootd
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -111,7 +111,7 @@ jobs:
       run:
         working-directory: hdmicap
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libclang-dev clang cmake nasm libturbojpeg0-dev
       - uses: dtolnay/rust-toolchain@stable
@@ -135,7 +135,7 @@ jobs:
     name: macos (hdmicap, visionocr)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
