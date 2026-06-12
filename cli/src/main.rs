@@ -754,24 +754,36 @@ fn cmd_daemons_stop(names: &[String], all: bool, force: bool) -> Result<()> {
 /// with no name, list the installed helpers.
 fn cmd_helper(name: Option<&str>, args: &[String]) -> Result<()> {
     let Some(name) = name else {
-        let dir = daemons::libexec_dir()
-            .ok_or_else(|| anyhow!("could not determine the home directory"))?;
-        let mut names: Vec<String> = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().is_file())
-                .filter_map(|e| e.file_name().into_string().ok())
-                .collect(),
-            Err(_) => Vec::new(),
-        };
+        // Search every dir `find_binary` resolves helpers from — per-user
+        // libexec, CLI-relative (Homebrew/prefix), and the system package's
+        // /usr/libexec/paniolo/bin — not just the per-user dir, so a packaged
+        // (.deb/tarball) install with no per-user build still lists helpers.
+        let dirs = daemons::helper_dirs();
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for dir in &dirs {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.filter_map(|e| e.ok()) {
+                if entry.path().is_file() {
+                    if let Ok(n) = entry.file_name().into_string() {
+                        names.insert(n);
+                    }
+                }
+            }
+        }
         if names.is_empty() {
+            let searched = dirs
+                .iter()
+                .map(|d| d.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
             println!(
-                "No helpers installed in {} — run `paniolo setup`.",
-                dir.display()
+                "No helpers found (searched {searched}) — install the paniolo \
+                 package or run `paniolo setup` from a source checkout."
             );
             return Ok(());
         }
-        names.sort();
         for n in names {
             println!("{n}");
         }
