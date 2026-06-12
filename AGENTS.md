@@ -915,11 +915,14 @@ artifacts without a Release for testing.
   `uvx pyink src tests` and `uvx pylint src tests` clean. Single quotes nested in
   double-quoted f-strings are required on the 3.11 floor, so `inconsistent-quotes`
   is disabled per-file where that pattern appears (not worked around).
-- **`paniolo setup` builds the native components from the source tree**, so it
-  must run from a clone — `make install` (which invokes the *installed* CLI)
+- **`paniolo setup` builds the native components from the source tree** when
+  run from a clone — `make install` (which invokes the *installed* CLI)
   resolves the checkout by walking up from the cwd (`setup::find_repo_root`).
-  Run from outside a checkout, setup errors clearly instead of silently
-  skipping.
+  Outside a checkout (a packaged install: Homebrew, .deb, tarball), it runs
+  the platform-finish steps only (`setup::run_packaged`): setuid the
+  installed `netbootd-bpf-helper` on macOS, group membership on Linux — no
+  builds. `--rust-only` still requires a clone and errors clearly without
+  one.
 
 ## Remote control pattern
 
