@@ -949,14 +949,17 @@ fn cmd_setup(lab_flag: Option<&str>, host: Option<&str>, rust_only: bool) -> Res
         }
         eprintln!("'{name}' is the local machine; setting up here.");
     }
-    let repo = setup::find_repo_root().ok_or_else(|| {
-        anyhow!(
-            "paniolo source checkout not found. `paniolo setup` rebuilds the daemons \
-             and OCR helper from source, so it must run from inside a clone \
-             (e.g. `make install`). cd into the paniolo repo and try again."
-        )
-    })?;
-    setup::run(&repo, rust_only)
+    match setup::find_repo_root() {
+        Some(repo) => setup::run(&repo, rust_only),
+        None if rust_only => Err(anyhow!(
+            "paniolo source checkout not found. `paniolo setup --rust-only` rebuilds \
+             the Rust crates from source, so it must run from inside a clone \
+             (e.g. `make rust`). cd into the paniolo repo and try again."
+        )),
+        // Packaged install (Homebrew, .deb, tarball): no sources to build —
+        // just finish the platform steps against the installed binaries.
+        None => setup::run_packaged(),
+    }
 }
 
 /// Resolve a runtime command's target: the given name, or the sole target.

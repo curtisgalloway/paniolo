@@ -23,6 +23,10 @@
 //! only root component) and compiles the visionocr OCR helper; on Linux it
 //! checks dialout/video group membership and installs linuxocr. The legacy
 //! `tftp-now` brew step is gone — netbootd serves TFTP.
+//!
+//! Without a checkout (a packaged install — Homebrew, .deb, tarball),
+//! `setup` skips the builds and runs just the platform steps against the
+//! installed binaries: see [`run_packaged`].
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -116,6 +120,71 @@ fn ensure_linux_groups() -> bool {
         }
     }
     changed
+}
+
+/// netbootd's macOS raw-frame send path needs a /dev/bpf descriptor, which
+/// only root can open. The setuid bpf-helper is the ONLY root component; its
+/// sole job is opening /dev/bpf and handing the fd to the unprivileged
+/// netbootd. Installs and upgrades (cargo and packages alike) reset the mode,
+/// so the setuid bit must be re-applied after each one.
+fn setuid_bpf_helper(helper: &Path) {
+    println!("  … installing netbootd-bpf-helper setuid-root (one-time sudo)");
+    let chown = Command::new("sudo")
+        .args(["chown", "root:wheel"])
+        .arg(helper)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let chmod = Command::new("sudo")
+        .args(["chmod", "4755"])
+        .arg(helper)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if chown && chmod {
+        println!("  ✓ {:12} setuid-root  {}", "bpf-helper", helper.display());
+    } else {
+        eprintln!(
+            "  ! could not setuid netbootd-bpf-helper; the netboot send path \
+             falls back to the kernel (broken on macOS 15+). Re-run \
+             `paniolo setup` with sudo access to fix."
+        );
+    }
+}
+
+/// Finish platform setup for a packaged install (Homebrew, .deb, tarball) —
+/// no source checkout, so no builds: setuid the installed bpf-helper on
+/// macOS (located via `find_binary`, which knows the per-user libexec, the
+/// Homebrew keg, and `/usr/libexec/paniolo/bin`), and check group
+/// membership on Linux. Building or refreshing the daemons, OCR helper, and
+/// zigplug still needs a clone (`make install`).
+pub fn run_packaged() -> Result<()> {
+    println!("No source checkout found — finishing setup for the installed paniolo.");
+    if cfg!(target_os = "macos") {
+        match crate::daemons::find_binary("netbootd-bpf-helper") {
+            Some(helper) => setuid_bpf_helper(&helper),
+            None => println!("  … netbootd-bpf-helper not found; skipping setuid install"),
+        }
+    } else {
+        println!("\nChecking group membership…");
+        if ensure_linux_groups() {
+            println!(
+                "\nNote: group changes take effect after you log out and back in \
+                 (or run `newgrp dialout` in the current shell)."
+            );
+        }
+        if crate::daemons::find_binary("tesseract").is_none() {
+            println!(
+                "  ! tesseract not found — install it for OCR:\n\
+                 \x20   sudo apt-get install tesseract-ocr"
+            );
+        }
+    }
+    println!(
+        "\nSetup complete. (Rebuilding the daemons, OCR helper, or zigplug \
+         needs a source checkout — see `make install` in the repo.)"
+    );
+    Ok(())
 }
 
 /// Run the local setup from a source checkout at `repo`. With `rust_only`,
@@ -218,36 +287,10 @@ pub fn run(repo: &Path, rust_only: bool) -> Result<()> {
         }
     }
 
-    // netbootd's macOS raw-frame send path needs a /dev/bpf descriptor, which
-    // only root can open. The setuid bpf-helper is the ONLY root component; its
-    // sole job is opening /dev/bpf and handing the fd to the unprivileged
-    // netbootd. cargo install resets the mode, so the setuid bit is re-applied
-    // after every (re)install.
     if cfg!(target_os = "macos") {
         let helper = libexec.join("netbootd-bpf-helper");
         if helper.is_file() {
-            println!("  … installing netbootd-bpf-helper setuid-root (one-time sudo)");
-            let chown = Command::new("sudo")
-                .args(["chown", "root:wheel"])
-                .arg(&helper)
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            let chmod = Command::new("sudo")
-                .args(["chmod", "4755"])
-                .arg(&helper)
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if chown && chmod {
-                println!("  ✓ {:12} setuid-root  {}", "bpf-helper", helper.display());
-            } else {
-                eprintln!(
-                    "  ! could not setuid netbootd-bpf-helper; the netboot send path \
-                     falls back to the kernel (broken on macOS 15+). Re-run \
-                     `paniolo setup` with sudo access to fix."
-                );
-            }
+            setuid_bpf_helper(&helper);
         } else {
             println!("  … netbootd-bpf-helper not found; skipping setuid install");
         }
