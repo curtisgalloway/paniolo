@@ -136,7 +136,7 @@ pub fn run(repo: &Path, rust_only: bool) -> Result<()> {
         } else {
             println!(
                 "  ℹ Linux: before building, ensure system packages are installed:\n\
-                 \x20   sudo apt-get install build-essential pkg-config libudev-dev libclang-dev"
+                 \x20   sudo apt-get install build-essential pkg-config libudev-dev libclang-dev cmake nasm"
             );
             println!("\nChecking group membership…");
             if ensure_linux_groups() {
