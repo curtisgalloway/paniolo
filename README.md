@@ -40,10 +40,19 @@ Fuchsia/botanist) design and the project requirements tracker are under
 - macOS 10.14 (Mojave) or later, or Linux (x86-64 / arm64)
 - [Homebrew](https://brew.sh) (macOS only — Linux uses the system package manager)
 - Rust toolchain (`brew install rustup` on macOS, or `rustup.rs` on Linux)
+- On Linux: `sudo apt-get install pkg-config libudev-dev libclang-dev cmake nasm`
+  (`make install` checks for these and tells you what's missing)
 
 ---
 
 ## Installation
+
+On Linux, prebuilt packages (amd64/arm64 `.deb` and tarball, Debian 12+ /
+Raspberry Pi OS) are attached to each
+[GitHub Release](https://github.com/curtisgalloway/paniolo/releases) —
+`sudo apt install ./paniolo_<version>_<arch>.deb`, then run `paniolo setup`
+once for group membership and the optional zigplug helper. Or build from
+source:
 
 ```bash
 git clone https://github.com/curtisgalloway/paniolo ~/src/paniolo

@@ -871,6 +871,17 @@ installed one (e.g. the retired Python CLI's uv-tools shim — remove with
 the Rust crates only via `paniolo setup --rust-only`, skipping
 OCR/setuid/zigplug); `make help` lists all.
 
+**Linux packages** (`.github/workflows/release.yml`): pushing a `v*` tag
+builds amd64 + arm64 `.deb`s and tarballs (all 9 Rust binaries + `linuxocr`;
+manifest in `packaging/nfpm.yaml`) and attaches them to a GitHub Release.
+Builds run in a `debian:bookworm` container so binaries work on Debian 12+
+and Raspberry Pi OS (glibc 2.36 baseline). The deb installs `paniolo` to
+`/usr/bin` and helpers to `/usr/libexec/paniolo/bin` — `find_binary` in
+`cli/src/daemons.rs` searches that dir after the per-user libexec, so a
+`make install` build always overrides an installed package. zigplug and
+group setup stay per-user via `paniolo setup`. `workflow_dispatch` builds
+artifacts without a Release for testing.
+
 ## Runtime paths
 
 | Purpose | Path |
@@ -967,7 +978,11 @@ Paniolo runs on Linux as well as macOS. Platform differences:
   `netbootd-bpf-helper` and stays unprivileged (see the **netbootd** section).
 - **hdmicap build deps on Linux.** Building hdmicap requires system packages:
   `build-essential pkg-config libclang-dev clang` (for V4L2 bindgen via
-  `v4l2-sys-mit`). `paniolo setup` prints a reminder.
+  `v4l2-sys-mit`) plus `cmake nasm` (the `turbojpeg` crate builds a vendored
+  libjpeg-turbo — Debian's system libturbojpeg is too old for its pkg-config
+  path, and the crate's `require-simd` default makes nasm mandatory on
+  x86-64). `make install` fails early with a hint if any are missing
+  (`check-deps` in the Makefile); `paniolo setup` prints a reminder.
 - **Interface listing uses sysfs on Linux.** `list_usb_ethernet_interfaces()`
   reads `/sys/class/net/` (type, carrier) instead of `networksetup`.
 - **Serial device paths use by-path symlinks on Linux.** `list_serial_devices()`

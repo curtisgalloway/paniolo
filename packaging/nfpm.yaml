@@ -1,0 +1,56 @@
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# nfpm manifest for the Linux .deb (built by .github/workflows/release.yml).
+# VERSION and ARCH are injected as environment variables by the workflow;
+# binaries are pre-staged under packaging/stage/ by the workflow's stage step.
+#
+# Layout mirrors the per-user install (`make install`): only `paniolo` lands
+# on PATH; the helpers live in the private libexec dir, found via
+# `system_libexec_dir()` in cli/src/daemons.rs.
+#
+# Not packaged (still done per-user by `paniolo setup`): group membership
+# (dialout etc.), the zigplug uv tool, and netbootd-bpf-helper (macOS-only).
+
+name: paniolo
+arch: ${ARCH}
+version: ${VERSION}
+platform: linux
+section: utils
+priority: optional
+maintainer: Curtis Galloway <4055365+curtisgalloway@users.noreply.github.com>
+homepage: https://github.com/curtisgalloway/paniolo
+license: Apache-2.0
+description: |
+  Agent-controlled target machine wrangler — distributed bring-up control over SSH.
+  Installs the paniolo CLI plus its helper daemons (hdmicap, serialcap,
+  netbootd, cambrionix, hidrig, ch9329, usbhub, shellyplug) and the
+  linuxocr OCR helper. Run `paniolo setup` once per user for group
+  membership and the optional zigplug Zigbee helper.
+depends:
+  - libudev1
+  - python3
+recommends:
+  - tesseract-ocr
+contents:
+  - src: packaging/stage/bin/paniolo
+    dst: /usr/bin/paniolo
+    file_info:
+      mode: 0o755
+  - src: packaging/stage/libexec/*
+    dst: /usr/libexec/paniolo/bin/
+    file_info:
+      mode: 0o755
+  - src: LICENSE
+    dst: /usr/share/doc/paniolo/LICENSE
