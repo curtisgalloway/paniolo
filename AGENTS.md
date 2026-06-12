@@ -877,8 +877,10 @@ manifest in `packaging/nfpm.yaml`) and attaches them to a GitHub Release.
 Builds run in a `debian:bookworm` container so binaries work on Debian 12+
 and Raspberry Pi OS (glibc 2.36 baseline). The deb installs `paniolo` to
 `/usr/bin` and helpers to `/usr/libexec/paniolo/bin` — `find_binary` in
-`cli/src/daemons.rs` searches that dir after the per-user libexec, so a
-`make install` build always overrides an installed package. zigplug and
+`cli/src/daemons.rs` searches that dir (and `../libexec/{bin,paniolo/bin}`
+relative to the resolved CLI binary, which covers Homebrew kegs and other
+prefix installs) after the per-user libexec, so a `make install` build
+always overrides an installed package. zigplug and
 group setup stay per-user via `paniolo setup`. `workflow_dispatch` builds
 artifacts without a Release for testing.
 
