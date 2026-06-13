@@ -39,7 +39,12 @@ Run through this checklist before calling `gh pr create`:
    this. A companion skill, `skills/kvm-puppeting/SKILL.md`, teaches the
    GUI-puppeting *doctrine* (the look-act-settle-verify loop, keyboard-first
    navigation, pixel→logical mouse scaling) on top of the `video`+`hid`
-   commands; update it too if you change the surface it relies on.
+   commands; update it too if you change the surface it relies on. These
+   skills ship with paniolo and are reachable via `paniolo skill` (see the
+   Rust control-plane notes). **Adding or removing a skill** also means a new
+   `contents` entry in `packaging/nfpm.yaml` (one explicit file→dst line per
+   skill) and a copy line is unnecessary for `setup.rs`/the tarball (both
+   enumerate `skills/` automatically).
 
 3. **Open the PR; do not merge it.** Push the branch and create the PR with
    `gh pr create`, then stop. The merge decision belongs to the user.
@@ -100,6 +105,13 @@ Python tree below:
   `~/.cargo/bin`; hook commands (`*_cmd`, hid `cmd`) run via `sh -c` with
   libexec prepended to PATH, so lab files keep referencing helpers by bare
   name. `paniolo helper [NAME] [ARGS…]` lists or runs them directly.
+- **Bundled skills are self-describing**: the agent skills under `skills/`
+  (`paniolo`, `kvm-puppeting`, `usbhub`) install to
+  `~/.local/share/paniolo/skills` (and `/usr/share/paniolo/skills` for the
+  Linux packages). `paniolo skill [NAME]` lists them with their frontmatter
+  descriptions, or prints one `SKILL.md` (`--path` for the file path) — the
+  share/ analogue of `paniolo helper`, so an agent can discover and read them
+  without the harness pre-loading them (skills.rs).
 - **CLI argument convention**: every runtime command takes the target as an
   optional positional (`netboot start pi5`, `serial log pi5`, `video stop
   pi5`); channel-config commands (`set`/`add`/`rm`) take `-t/--target`.
@@ -136,7 +148,13 @@ cli/src/
   setup.rs      installer: paniolo CLI onto PATH (~/.cargo/bin); helpers into
                 the private libexec dir (~/.local/libexec/paniolo/bin) via
                 cargo install --root; bpf-helper setuid, OCR helpers, zigplug
-                (uv tool, shim in libexec), Linux groups; --rust-only fast path
+                (uv tool, shim in libexec), Linux groups; --rust-only fast path;
+                installs the bundled skills into ~/.local/share/paniolo/skills
+  skills.rs     `paniolo skill`: discover + read the bundled agent skills
+                (skills_dirs: repo checkout → ~/.local/share → CLI-relative
+                share → /usr/share/paniolo/skills, like daemons.rs helper_dirs
+                but under share/), list with frontmatter descriptions, print
+                one SKILL.md (or --path), install_bundled() for setup.rs
 ```
 
 Deferred (tracked in docs/config-redesign.md): the
@@ -872,15 +890,19 @@ the Rust crates only via `paniolo setup --rust-only`, skipping
 OCR/setuid/zigplug); `make help` lists all.
 
 **Linux packages** (`.github/workflows/release.yml`): pushing a `v*` tag
-builds amd64 + arm64 `.deb`s and tarballs (all 9 Rust binaries + `linuxocr`;
-manifest in `packaging/nfpm.yaml`) and attaches them to a GitHub Release.
+builds amd64 + arm64 `.deb`s and tarballs (all 9 Rust binaries + `linuxocr`
++ the bundled skills; manifest in `packaging/nfpm.yaml`) and attaches them to
+a GitHub Release.
 Builds run in a `debian:bookworm` container so binaries work on Debian 12+
 and Raspberry Pi OS (glibc 2.36 baseline). The deb installs `paniolo` to
-`/usr/bin` and helpers to `/usr/libexec/paniolo/bin` — `find_binary` in
-`cli/src/daemons.rs` searches that dir (and `../libexec/{bin,paniolo/bin}`
+`/usr/bin`, helpers to `/usr/libexec/paniolo/bin`, and skills to
+`/usr/share/paniolo/skills` (one explicit nfpm entry per skill — a glob would
+collide all three `SKILL.md` at one dst) — `find_binary` in
+`cli/src/daemons.rs` searches the libexec dir (and `../libexec/{bin,paniolo/bin}`
 relative to the resolved CLI binary, which covers Homebrew kegs and other
-prefix installs) after the per-user libexec, so a `make install` build
-always overrides an installed package. zigplug and
+prefix installs) after the per-user libexec, and `skills_dirs` in
+`cli/src/skills.rs` searches the share dir the same way, so a `make install`
+build always overrides an installed package. zigplug and
 group setup stay per-user via `paniolo setup`. `workflow_dispatch` builds
 artifacts without a Release for testing.
 

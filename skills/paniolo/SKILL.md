@@ -303,6 +303,23 @@ serve [target]` / `paniolo hid stop [target]` (positional target — only
 `hid send` and `hid set/rm` use `-t`). When the target also has a `power` channel, the overlay
 adds an on/off toggle switch + a separate cycle button (each confirms first).
 
+For *operating a GUI* through the `video` + `hid` channels — clicking, typing,
+and navigating a desktop/app/installer/BIOS you can only see over the capture
+and only touch through emulated HID — read the companion **`kvm-puppeting`**
+skill (the look-act-settle-verify discipline): `paniolo skill kvm-puppeting`.
+
+## Companion skills
+
+Paniolo ships its own agent skills; list them and read any one from the CLI,
+even on a packaged install:
+
+```
+paniolo skill                  # list bundled skills with their descriptions
+paniolo skill kvm-puppeting    # print a skill's SKILL.md (e.g. GUI puppeting)
+paniolo skill usbhub           # per-port USB-hub power control
+paniolo skill paniolo --path   # the file path, to open or Read it
+```
+
 ## Targets on a remote control host (a "lab")
 
 When the machine wired to the target isn't the one you're running paniolo on,

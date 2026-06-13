@@ -30,6 +30,7 @@ mod netif;
 mod power;
 mod serial;
 mod setup;
+mod skills;
 mod ssh;
 mod state;
 mod video;
@@ -161,6 +162,16 @@ enum Command {
         /// Arguments passed through to the helper.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// List the agent skills bundled with paniolo, or print one's SKILL.md
+    /// (the guides that teach an agent how to drive a target). Omit NAME to
+    /// list them.
+    Skill {
+        /// Skill to print (e.g. paniolo, kvm-puppeting, usbhub).
+        name: Option<String>,
+        /// Print the SKILL.md file path instead of its contents.
+        #[arg(long)]
+        path: bool,
     },
     /// List or stop paniolo's background daemons on this host.
     Daemons {
@@ -618,6 +629,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Configure { target, host } => cmd_configure(lab_flag, &target, &host),
         Command::Setup { host, rust_only } => cmd_setup(lab_flag, host.as_deref(), rust_only),
         Command::Helper { name, args } => cmd_helper(name.as_deref(), &args),
+        Command::Skill { name, path } => skills::run(name.as_deref(), path),
         Command::Daemons { cmd } => match cmd.unwrap_or(DaemonsCmd::List) {
             DaemonsCmd::List => cmd_daemons_list(),
             DaemonsCmd::Stop { names, all, force } => cmd_daemons_stop(&names, all, force),

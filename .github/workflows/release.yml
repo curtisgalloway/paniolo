@@ -136,6 +136,7 @@ jobs:
           mkdir -p "dist/$tardir"
           cp packaging/stage/bin/paniolo packaging/stage/libexec/* \
             LICENSE README.md "dist/$tardir/"
+          cp -r skills "dist/$tardir/skills"
           tar -C dist -czf "dist/$tardir.tar.gz" "$tardir"
           rm -r "dist/$tardir"
 
@@ -147,7 +148,11 @@ jobs:
           test -x /usr/bin/paniolo
           test -x /usr/libexec/paniolo/bin/hdmicap
           test -x /usr/libexec/paniolo/bin/linuxocr
+          test -f /usr/share/paniolo/skills/paniolo/SKILL.md
           /usr/bin/paniolo --help
+          # Run outside the checkout so `skill` resolves the packaged copy
+          # under /usr/share rather than the repo's skills/ dir.
+          ( cd /tmp && /usr/bin/paniolo skill )
 
       - uses: actions/upload-artifact@v7
         with:
