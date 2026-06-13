@@ -906,6 +906,18 @@ build always overrides an installed package. zigplug and
 group setup stay per-user via `paniolo setup`. `workflow_dispatch` builds
 artifacts without a Release for testing.
 
+After the Release publishes, a `bump-tap` job fires a `repository_dispatch`
+(`event_type: paniolo-release`, `client_payload.tag`) at the
+`curtisgalloway/homebrew-tap` repo, whose `bump-formula.yml` re-pins
+`Formula/paniolo.rb` (source-tarball URL + sha256) to the new tag and commits
+with its own `GITHUB_TOKEN`. The dispatch needs a cross-repo credential the
+default `GITHUB_TOKEN` lacks: a fine-grained PAT with **Contents: write on
+`curtisgalloway/homebrew-tap`**, stored as the `HOMEBREW_TAP_DISPATCH_TOKEN`
+repo secret. If the secret is missing the job warns and skips (releases never
+fail on it). The tap workflow also has a `workflow_dispatch` (optional `tag`
+input, default = latest release) for a manual re-pin without cutting a
+release.
+
 ## Runtime paths
 
 | Purpose | Path |
