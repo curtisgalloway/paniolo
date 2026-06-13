@@ -50,6 +50,11 @@ const OPT_END: u8 = 255;
 /// offer as "not a valid HTTP boot offer".
 const HTTP_CLIENT_CLASS: &str = "HTTPClient";
 
+/// Vendor-class prefix a UEFI/legacy PXE client sends (option 60), e.g.
+/// `PXEClient:Arch:00011:UNDI:003000` (arch 11 = ARM64 UEFI). Echoing it back is
+/// often required for the UEFI PXE driver to accept a single-server offer.
+const PXE_CLIENT_CLASS: &str = "PXEClient";
+
 const DHCP_DISCOVER: u8 = 1;
 const DHCP_OFFER: u8 = 2;
 const DHCP_REQUEST: u8 = 3;
@@ -78,6 +83,13 @@ impl Request {
         self.vendor_class
             .as_deref()
             .is_some_and(|c| c.starts_with(HTTP_CLIENT_CLASS))
+    }
+
+    /// True when this is a PXE client (option 60 begins `PXEClient`).
+    fn is_pxe_client(&self) -> bool {
+        self.vendor_class
+            .as_deref()
+            .is_some_and(|c| c.starts_with(PXE_CLIENT_CLASS))
     }
 }
 
@@ -180,6 +192,15 @@ impl<'a> BootAdvert<'a> {
             boot_file: url,
             tftp: false,
             vendor_class: Some(HTTP_CLIENT_CLASS),
+        }
+    }
+
+    /// PXE: the legacy TFTP advertisement plus the `PXEClient` option-60 echo.
+    fn pxe(boot_file: &'a str) -> Self {
+        Self {
+            boot_file,
+            tftp: true,
+            vendor_class: Some(PXE_CLIENT_CLASS),
         }
     }
 }
@@ -316,15 +337,19 @@ pub async fn serve(
         // unreliable for TFTP regardless — that's what the BPF send path covers.
         netcfg::set_arp(ASSIGNED_IP, &mac, interface.as_deref());
 
-        // Branch on the client's vendor class: a UEFI HTTP Boot client gets a
-        // self-contained http:// URL (option 67) + the required HTTPClient echo;
-        // everyone else (the Pi, generic TFTP) gets the legacy next-server reply.
+        // Branch on the client's vendor class (option 60):
+        //   * HTTPClient → self-contained http:// URL in option 67 + the required
+        //     HTTPClient echo, served over HTTP;
+        //   * PXEClient  → the legacy TFTP reply plus a PXEClient option-60 echo;
+        //   * neither (the silent Pi, generic TFTP) → the legacy reply unchanged.
         let url;
-        let advert = if req.is_http_client() {
+        let (advert, style) = if req.is_http_client() {
             url = http_boot_url(host_ip, http_port, &boot_file);
-            BootAdvert::http(&url)
+            (BootAdvert::http(&url), "http-boot")
+        } else if req.is_pxe_client() {
+            (BootAdvert::pxe(&boot_file), "pxe")
         } else {
-            BootAdvert::tftp(&boot_file)
+            (BootAdvert::tftp(&boot_file), "tftp")
         };
 
         let reply = build_reply(&req, reply_type, host_ip, &advert);
@@ -336,17 +361,10 @@ pub async fn serve(
             DHCP_OFFER => "DHCPOFFER",
             _ => "DHCPACK",
         };
-        if advert.tftp {
-            info!(
-                "{what} -> {mac}  ip={ASSIGNED_IP}  tftp={host_ip}  file={}",
-                advert.boot_file
-            );
-        } else {
-            info!(
-                "{what} -> {mac}  ip={ASSIGNED_IP}  http-boot  arch={:?}  url={}",
-                req.arch, advert.boot_file
-            );
-        }
+        info!(
+            "{what} -> {mac}  ip={ASSIGNED_IP}  {style}  arch={:?}  boot={}",
+            req.arch, advert.boot_file
+        );
     }
 }
 
@@ -621,5 +639,42 @@ mod tests {
             "http://192.168.99.1:8080/boot.efi",
             "non-default port kept"
         );
+    }
+
+    // ── PXE path ─────────────────────────────────────────────────────────────
+
+    /// Trailing option TLVs for an ARM64 UEFI PXE client: option 60 vendor class
+    /// + option 93 arch = 0x000B (11).
+    fn pxe_client_opts() -> Vec<u8> {
+        let class = b"PXEClient:Arch:00011:UNDI:003000";
+        let mut t = vec![OPT_VENDOR_CLASS, class.len() as u8];
+        t.extend_from_slice(class);
+        t.extend_from_slice(&[OPT_CLIENT_ARCH, 2, 0x00, 0x0B]);
+        t
+    }
+
+    #[test]
+    fn parse_classifies_pxe_client() {
+        let pkt = request_packet(BOOTREQUEST, Some(DHCP_DISCOVER), &pxe_client_opts());
+        let req = parse_request(&pkt).expect("PXEClient DISCOVER parses");
+        assert_eq!(req.arch, Some(0x000B));
+        assert!(req.is_pxe_client());
+        assert!(!req.is_http_client(), "PXE is not HTTP");
+    }
+
+    #[test]
+    fn pxe_reply_echoes_class_and_keeps_tftp_fields() {
+        let req = parse_request(&request_packet(BOOTREQUEST, Some(DHCP_DISCOVER), &[])).unwrap();
+        let server = Ipv4Addr::new(192, 168, 99, 1);
+        let reply = build_reply(&req, DHCP_OFFER, server, &BootAdvert::pxe("ipxe.efi"));
+        let opts = reply_options(&reply);
+        let get = |tag: u8| opts.iter().find(|(t, _)| *t == tag).map(|(_, v)| v.clone());
+
+        // PXEClient echo, alongside the legacy TFTP next-server fields.
+        assert_eq!(get(OPT_VENDOR_CLASS), Some(b"PXEClient".to_vec()));
+        assert_eq!(get(OPT_TFTP_SERVER), Some(b"192.168.99.1".to_vec()));
+        assert_eq!(get(OPT_BOOTFILE), Some(b"ipxe.efi".to_vec()));
+        assert_eq!(&reply[20..24], &server.octets(), "siaddr = next-server");
+        assert_eq!(&reply[108..116], b"ipxe.efi", "bootfile in the file field");
     }
 }
