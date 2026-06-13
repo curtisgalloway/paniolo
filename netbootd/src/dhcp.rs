@@ -309,7 +309,20 @@ fn pin_socket_to_interface(sock: &Socket, iface: &str) -> std::io::Result<()> {
 
 #[cfg(target_os = "linux")]
 fn pin_socket_to_interface(sock: &Socket, iface: &str) -> std::io::Result<()> {
-    sock.bind_device(Some(iface.as_bytes()))
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            iface.as_ptr() as *const libc::c_void,
+            iface.len() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
