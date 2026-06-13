@@ -76,6 +76,14 @@ pub struct NetbootChannel {
     pub interface: Option<String>,
     pub host_ip: Option<String>,
     pub tftp_root: Option<String>,
+    /// Boot program served to UEFI clients: a bare filename relative to
+    /// `tftp_root` (e.g. `grubaa64.efi`). Advertised as a TFTP filename to PXE
+    /// clients and wrapped in an `http://` URL for HTTP Boot clients.
+    pub boot_file: Option<String>,
+    /// HTTP server port, also embedded in the HTTP Boot URL (default 80).
+    pub http_port: Option<String>,
+    /// `Content-Type` for HTTP responses (default `application/octet-stream`).
+    pub content_type: Option<String>,
     pub host: Option<String>,
 }
 
@@ -223,6 +231,9 @@ impl Lab {
             push_opt(&mut f, "interface", &nb.interface);
             push_opt(&mut f, "host_ip", &nb.host_ip);
             push_opt(&mut f, "tftp_root", &nb.tftp_root);
+            push_opt(&mut f, "boot_file", &nb.boot_file);
+            push_opt(&mut f, "http_port", &nb.http_port);
+            push_opt(&mut f, "content_type", &nb.content_type);
             channels.push(ResolvedChannel {
                 kind: ChannelKind::Netboot,
                 name: "netboot".into(),

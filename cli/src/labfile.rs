@@ -312,12 +312,16 @@ impl LabFile {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn set_netboot(
         &mut self,
         target: &str,
         interface: Option<&str>,
         host_ip: Option<&str>,
         tftp_root: Option<&str>,
+        boot_file: Option<&str>,
+        http_port: Option<&str>,
+        content_type: Option<&str>,
         host: Option<&str>,
     ) -> Result<(), LabError> {
         self.set_singleton(
@@ -327,6 +331,9 @@ impl LabFile {
                 ("interface", interface),
                 ("host_ip", host_ip),
                 ("tftp_root", tftp_root),
+                ("boot_file", boot_file),
+                ("http_port", http_port),
+                ("content_type", content_type),
                 ("host", host),
             ],
         )
@@ -442,8 +449,17 @@ mod tests {
             .unwrap();
         lf.add_target("fortune", Some("bench1"), Some("note"))
             .unwrap();
-        lf.set_netboot("fortune", Some("en0"), None, Some("/srv/tftp"), None)
-            .unwrap();
+        lf.set_netboot(
+            "fortune",
+            Some("en0"),
+            None,
+            Some("/srv/tftp"),
+            Some("grubaa64.efi"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         lf.add_serial("fortune", "console", "/dev/ttyUSB0", 115200, None, None)
             .unwrap();
         lf.add_serial("fortune", "bmc", "/dev/ttyUSB1", 9600, Some("cts"), None)
@@ -456,6 +472,11 @@ mod tests {
         assert_eq!(
             t.netboot.as_ref().unwrap().interface.as_deref(),
             Some("en0")
+        );
+        assert_eq!(
+            t.netboot.as_ref().unwrap().boot_file.as_deref(),
+            Some("grubaa64.efi"),
+            "boot_file round-trips through save/load"
         );
         assert_eq!(t.serial.len(), 2);
         assert_eq!(t.serial[1].baud, 9600);

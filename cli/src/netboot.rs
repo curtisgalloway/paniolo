@@ -34,6 +34,16 @@ fn resolve_netbootd() -> Result<std::path::PathBuf> {
         .ok_or_else(|| anyhow!("netbootd not found — build and install it with `paniolo setup`"))
 }
 
+/// Optional UEFI boot parameters forwarded to `netbootd` as flags. All default
+/// inside `netbootd` when unset (boot_file → `kernel_2712.img`, http_port → 80,
+/// content_type → `application/octet-stream`).
+#[derive(Default, Clone)]
+pub struct BootOptions {
+    pub boot_file: Option<String>,
+    pub http_port: Option<String>,
+    pub content_type: Option<String>,
+}
+
 /// Kill any lingering netbootd from a previous crashed session for `target`.
 fn cleanup_stale(target: &str) {
     if let Some(s) = state::load_netboot_state(target) {
@@ -45,7 +55,13 @@ fn cleanup_stale(target: &str) {
 }
 
 /// Start netbootd for `target` on `interface`, serving `tftp_root` at `host_ip`.
-pub fn start(target: &str, interface: &str, host_ip: &str, tftp_root: &str) -> Result<()> {
+pub fn start(
+    target: &str,
+    interface: &str,
+    host_ip: &str,
+    tftp_root: &str,
+    opts: &BootOptions,
+) -> Result<()> {
     if state::is_netboot_running(target) {
         bail!("netboot already running for '{target}'");
     }
@@ -95,6 +111,16 @@ pub fn start(target: &str, interface: &str, host_ip: &str, tftp_root: &str) -> R
         .arg(tftp_root)
         .arg("--interface")
         .arg(interface);
+    // Optional UEFI boot params; netbootd defaults each when the flag is absent.
+    if let Some(bf) = &opts.boot_file {
+        cmd.arg("--boot-file").arg(bf);
+    }
+    if let Some(p) = &opts.http_port {
+        cmd.arg("--http-port").arg(p);
+    }
+    if let Some(ct) = &opts.content_type {
+        cmd.arg("--content-type").arg(ct);
+    }
     cmd.stdin(Stdio::null()).stdout(log).stderr(log_err);
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let child = cmd.spawn()?;

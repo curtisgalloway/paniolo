@@ -54,6 +54,9 @@ pub fn build_slice(lab: &Lab, target: &str, host: &str) -> Result<String, LabErr
                 nb.interface.as_deref(),
                 nb.host_ip.as_deref(),
                 nb.tftp_root.as_deref(),
+                nb.boot_file.as_deref(),
+                nb.http_port.as_deref(),
+                nb.content_type.as_deref(),
                 None,
             )?;
         }
