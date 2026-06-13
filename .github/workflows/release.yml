@@ -13,8 +13,10 @@
 # limitations under the License.
 
 # Build Linux packages (.deb + tarball) for amd64 and arm64 and attach them
-# to a GitHub Release when a v* tag is pushed. workflow_dispatch builds the
-# packages as artifacts only (no Release), for testing the pipeline.
+# to a GitHub Release when a v* tag is pushed, then fire a repository_dispatch
+# at the Homebrew tap so it re-pins its formula to the new tag.
+# workflow_dispatch builds the packages as artifacts only (no Release, no tap
+# bump), for testing the pipeline.
 #
 # Builds run inside a debian:bookworm container so binaries link against
 # glibc 2.36 — the packages then run on Debian 12+, 13, and current
@@ -176,3 +178,33 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+
+  bump-tap:
+    name: bump Homebrew tap
+    if: github.ref_type == 'tag'
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      # Tell the tap to re-pin its formula. The tap workflow does the actual
+      # edit (sha256 of the source tarball, commit) with its OWN GITHUB_TOKEN —
+      # all this needs is permission to fire the dispatch, which the default
+      # GITHUB_TOKEN can't do cross-repo. HOMEBREW_TAP_DISPATCH_TOKEN is a
+      # fine-grained PAT with Contents:write on curtisgalloway/homebrew-tap.
+      # Absent (or on a fork), skip rather than fail the release.
+      - name: Dispatch formula bump to homebrew-tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_DISPATCH_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::warning::HOMEBREW_TAP_DISPATCH_TOKEN not set — skipping tap bump." \
+                 "Add a fine-grained PAT (Contents:write on curtisgalloway/homebrew-tap)."
+            exit 0
+          fi
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer ${TAP_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/curtisgalloway/homebrew-tap/dispatches \
+            -d "{\"event_type\":\"paniolo-release\",\"client_payload\":{\"tag\":\"${TAG}\"}}"
+          echo "Dispatched paniolo-release (${TAG}) to homebrew-tap."
