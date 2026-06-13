@@ -21,6 +21,7 @@ and power-cycle it without human intervention at each iteration.
 | [Power control](docs/power.md) | `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`, `paniolo serial dtr/reset` | DTR-based hardware power button (J2 header) and generic shell-command hooks (on/off/cycle/state); helpers: `cambrionix` (Cambrionix hub ports), `usbhub` (off-the-shelf USB hub ports), `zigplug` (Zigbee smart plugs), `shellyplug` (Shelly Gen2+ plugs/relays over local HTTP RPC) |
 | [HID injection](docs/hid.md) | `paniolo hid` | USB keyboard/mouse injection via a generic helper hook (`hidrig` KB2040 injector); KVM input from the web console |
 | [Dashboard](docs/dashboard.md) | `paniolo console` | Combined video + serial web UI; auto-starts daemons; `-i <name>` preselects a serial interface |
+| Agent skills | `paniolo skill` | List the bundled agent guides (driving a target, GUI puppeting, USB-hub power), or print one's `SKILL.md` for an agent to read |
 
 ---
 
@@ -71,7 +72,10 @@ them without polluting your PATH — run one directly with
 `paniolo helper <name> [args…]` (no name lists them). One static binary per
 component; the core needs no Python environment. (The optional `zigplug`
 Zigbee smart-plug helper is the one Python component — `setup` installs it as
-a uv tool with its shim in the libexec dir.) Netboot is served by the
+a uv tool with its shim in the libexec dir.) `setup` also installs the bundled
+agent skills into `~/.local/share/paniolo/skills` (the `.deb`/tarball ship
+them under `/usr/share/paniolo/skills`); `paniolo skill [NAME]` lists them or
+prints one for an agent to read. Netboot is served by the
 single-binary `netbootd` (Rust) engine. (On macOS, `setup` also installs
 `netbootd-bpf-helper` setuid-root — one sudo — for the `netbootd` raw-frame
 send path.) Configuration is one CLI-managed lab file

@@ -58,6 +58,7 @@ orchestration or results.
 
 ## For contributors / agents
 
+- **Bundled agent skills** — paniolo ships agent guides under [`skills/`](https://github.com/curtisgalloway/paniolo/tree/main/skills) (`paniolo` for driving a target, `kvm-puppeting` for GUI puppeting, `usbhub` for hub power). They install alongside the CLI; `paniolo skill` lists them (with descriptions) and `paniolo skill <name>` prints one's `SKILL.md` — so an agent can discover and read them straight from the CLI, without the harness pre-loading them.
 - [`AGENTS.md`](https://github.com/curtisgalloway/paniolo/blob/main/AGENTS.md) — module-by-module internals, source constraints, and how to add a subsystem.
 - [Adding a power-control helper](adding-power-helpers.md) — recipe for supporting new power-switching hardware: the hook contract, helper CLI conventions, implementation skeletons (Rust/Python), verification ladder, and PR checklist.
 - [`hidrig/README.md`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md) — HID injector wiring, firmware, and host CLI.

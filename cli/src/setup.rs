@@ -184,6 +184,7 @@ pub fn run_packaged() -> Result<()> {
         "\nSetup complete. (Rebuilding the daemons, OCR helper, or zigplug \
          needs a source checkout — see `make install` in the repo.)"
     );
+    println!("Agent skills shipped with the package — list them with `paniolo skill`.");
     Ok(())
 }
 
@@ -373,11 +374,28 @@ pub fn run(repo: &Path, rust_only: bool) -> Result<()> {
         println!("  … zigplug: uv not found (https://docs.astral.sh/uv), skipped");
     }
 
+    // Agent skills: copy the bundled SKILL.md guides into the per-user data
+    // dir so `paniolo skill` finds them when the installed CLI runs outside
+    // this tree. From a checkout the repo copy is used directly, so this keeps
+    // an installed paniolo in sync. (Linux packages ship them to /usr/share.)
+    match crate::skills::install_bundled(repo) {
+        Ok(0) => println!(
+            "  … skills: none found under {}",
+            repo.join("skills").display()
+        ),
+        Ok(n) => {
+            let dst = crate::skills::user_skills_dir().unwrap_or_default();
+            println!("  ✓ {:12} {n} installed → {}", "skills", dst.display());
+        }
+        Err(e) => eprintln!("  ! skills: {e}"),
+    }
+
     println!("\nSetup complete.");
     println!(
         "Helpers live in {} — list or run them via `paniolo helper`.",
         libexec.display()
     );
+    println!("Agent skills are bundled too — list them with `paniolo skill`.");
     let on_path = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|d| d == bin_dir))
         .unwrap_or(false);
