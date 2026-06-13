@@ -368,12 +368,18 @@ fn del_host_ip(interface: &str, host_ip: &str) {
 pub const MODES: [&str; 3] = ["netboot", "ffx", "off"];
 
 /// netboot mode: tear down ffx, start DHCP+TFTP (idempotent).
-pub fn mode_netboot(target: &str, interface: &str, host_ip: &str, tftp_root: &str) -> Result<()> {
+pub fn mode_netboot(
+    target: &str,
+    interface: &str,
+    host_ip: &str,
+    tftp_root: &str,
+    opts: &crate::netboot::BootOptions,
+) -> Result<()> {
     del_host_ll(interface);
     if crate::state::is_netboot_running(target) {
         return Ok(());
     }
-    crate::netboot::start(target, interface, host_ip, tftp_root)
+    crate::netboot::start(target, interface, host_ip, tftp_root, opts)
 }
 
 /// ffx mode: stop netboot first, then add the host IPv6 link-local.

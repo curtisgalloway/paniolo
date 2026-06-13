@@ -58,6 +58,7 @@ exclude_docs: |
   config-redesign.md
   ch9329-spec.md
   distributed-control-plan.md
+  uefi-http-boot-design.md
 
 markdown_extensions:
   - admonition

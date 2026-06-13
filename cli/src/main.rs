@@ -411,6 +411,17 @@ enum NetbootCmd {
         host_ip: Option<String>,
         #[arg(long, short = 'r')]
         tftp_root: Option<String>,
+        /// Boot program served to UEFI clients (filename under tftp_root, e.g.
+        /// grubaa64.efi). Bare TFTP filename for PXE; wrapped in an http:// URL
+        /// for HTTP Boot.
+        #[arg(long)]
+        boot_file: Option<String>,
+        /// HTTP server port, also embedded in the HTTP Boot URL (default 80).
+        #[arg(long)]
+        http_port: Option<String>,
+        /// Content-Type for HTTP responses (default application/octet-stream).
+        #[arg(long)]
+        content_type: Option<String>,
         #[arg(long)]
         host: Option<String>,
     },
@@ -2282,6 +2293,9 @@ fn netboot_cmd(lab_flag: Option<&str>, cmd: NetbootCmd) -> Result<()> {
             interface,
             host_ip,
             tftp_root,
+            boot_file,
+            http_port,
+            content_type,
             host,
         } => {
             edit_lab(lab_flag, |lf| {
@@ -2290,6 +2304,9 @@ fn netboot_cmd(lab_flag: Option<&str>, cmd: NetbootCmd) -> Result<()> {
                     interface.as_deref(),
                     host_ip.as_deref(),
                     tftp_root.as_deref(),
+                    boot_file.as_deref(),
+                    http_port.as_deref(),
+                    content_type.as_deref(),
                     host.as_deref(),
                 )
             })?;
@@ -2302,25 +2319,31 @@ fn netboot_cmd(lab_flag: Option<&str>, cmd: NetbootCmd) -> Result<()> {
             Ok(())
         }
         NetbootCmd::Start { target } => {
-            let (target, iface, host_ip, tftp_root) = netboot_runtime(lab_flag, target.as_deref())?;
+            let NetbootRuntime {
+                target,
+                interface: iface,
+                host_ip,
+                tftp_root,
+                boot,
+            } = netboot_runtime(lab_flag, target.as_deref())?;
             let root = tftp_root.ok_or_else(|| {
                 anyhow!(
                     "no tftp_root configured \
                      (paniolo netboot set -t {target} --tftp-root <path>)"
                 )
             })?;
-            netboot::start(&target, &iface, &host_ip, &root)?;
+            netboot::start(&target, &iface, &host_ip, &root, &boot)?;
             println!("netboot started for '{target}' on {iface} ({host_ip}, tftp {root}).");
             Ok(())
         }
         NetbootCmd::Stop { target } => {
-            let (target, ..) = netboot_runtime(lab_flag, target.as_deref())?;
+            let NetbootRuntime { target, .. } = netboot_runtime(lab_flag, target.as_deref())?;
             netboot::stop(&target)?;
             println!("netboot stopped for '{target}'.");
             Ok(())
         }
         NetbootCmd::Status { target } => {
-            let (target, ..) = netboot_runtime(lab_flag, target.as_deref())?;
+            let NetbootRuntime { target, .. } = netboot_runtime(lab_flag, target.as_deref())?;
             let st = netboot::status(&target);
             match st.state {
                 None => println!("netboot\tnot running (no state)"),
@@ -2348,11 +2371,11 @@ fn netboot_cmd(lab_flag: Option<&str>, cmd: NetbootCmd) -> Result<()> {
             tail,
             follow,
         } => {
-            let (target, ..) = netboot_runtime(lab_flag, target.as_deref())?;
+            let NetbootRuntime { target, .. } = netboot_runtime(lab_flag, target.as_deref())?;
             cmd_netboot_logs(&target, tail, follow)
         }
         NetbootCmd::TftpRoot { target } => {
-            let (_t, _i, _ip, tftp_root) = netboot_runtime(lab_flag, target.as_deref())?;
+            let NetbootRuntime { tftp_root, .. } = netboot_runtime(lab_flag, target.as_deref())?;
             match tftp_root {
                 Some(r) => {
                     println!("{r}");
@@ -2377,7 +2400,11 @@ fn netboot_cmd(lab_flag: Option<&str>, cmd: NetbootCmd) -> Result<()> {
             Ok(())
         }
         NetbootCmd::LinkUp { target } => {
-            let (_t, iface, host_ip, _r) = netboot_runtime(lab_flag, target.as_deref())?;
+            let NetbootRuntime {
+                interface: iface,
+                host_ip,
+                ..
+            } = netboot_runtime(lab_flag, target.as_deref())?;
             netif::configure_interface(&iface, &host_ip)?;
             let active = netif::is_interface_active(&iface);
             println!(
@@ -2387,13 +2414,17 @@ fn netboot_cmd(lab_flag: Option<&str>, cmd: NetbootCmd) -> Result<()> {
             Ok(())
         }
         NetbootCmd::LinkDown { target } => {
-            let (_t, iface, ..) = netboot_runtime(lab_flag, target.as_deref())?;
+            let NetbootRuntime {
+                interface: iface, ..
+            } = netboot_runtime(lab_flag, target.as_deref())?;
             netif::restore_interface(&iface);
             println!("Link down  {iface}");
             Ok(())
         }
         NetbootCmd::LinkStatus { target } => {
-            let (_t, iface, ..) = netboot_runtime(lab_flag, target.as_deref())?;
+            let NetbootRuntime {
+                interface: iface, ..
+            } = netboot_runtime(lab_flag, target.as_deref())?;
             let (inet, inet6) = netif::iface_addresses(&iface);
             println!("interface\t{iface}");
             println!(
@@ -2419,13 +2450,18 @@ fn netboot_cmd(lab_flag: Option<&str>, cmd: NetbootCmd) -> Result<()> {
     }
 }
 
+/// The resolved local netboot channel for a runtime command.
+struct NetbootRuntime {
+    target: String,
+    interface: String,
+    host_ip: String,
+    tftp_root: Option<String>,
+    boot: netboot::BootOptions,
+}
+
 /// Common preamble for netboot/netif runtime commands: resolve, dispatch to the
-/// netboot channel's host if remote, and return (target, interface, host_ip,
-/// tftp_root) from the local channel.
-fn netboot_runtime(
-    lab_flag: Option<&str>,
-    target: Option<&str>,
-) -> Result<(String, String, String, Option<String>)> {
+/// netboot channel's host if remote, and return the local channel's runtime.
+fn netboot_runtime(lab_flag: Option<&str>, target: Option<&str>) -> Result<NetbootRuntime> {
     let lab = load_for_read(lab_flag)?;
     let target = resolve_single_target(&lab, target)?;
     if let Some(code) = dispatch::maybe_dispatch(
@@ -2448,13 +2484,23 @@ fn netboot_runtime(
     if nb.host.as_deref().unwrap_or(&dh) != model::LOCAL {
         bail!("netboot channel for '{target}' is not on this host");
     }
-    let iface = nb
+    let interface = nb
         .interface
         .ok_or_else(|| anyhow!("netboot channel for '{target}' has no interface set"))?;
     let host_ip = nb
         .host_ip
         .unwrap_or_else(|| model::DEFAULT_HOST_IP.to_string());
-    Ok((target, iface, host_ip, nb.tftp_root))
+    Ok(NetbootRuntime {
+        target,
+        interface,
+        host_ip,
+        tftp_root: nb.tftp_root,
+        boot: netboot::BootOptions {
+            boot_file: nb.boot_file,
+            http_port: nb.http_port,
+            content_type: nb.content_type,
+        },
+    })
 }
 
 fn cmd_netboot_logs(target: &str, tail: usize, follow: bool) -> Result<()> {
@@ -2497,13 +2543,19 @@ fn netif_cmd(lab_flag: Option<&str>, cmd: NetifCmd) -> Result<()> {
                     netif::MODES.join(", ")
                 );
             }
-            let (target, iface, host_ip, tftp_root) = netboot_runtime(lab_flag, target.as_deref())?;
+            let NetbootRuntime {
+                target,
+                interface: iface,
+                host_ip,
+                tftp_root,
+                boot,
+            } = netboot_runtime(lab_flag, target.as_deref())?;
             match mode.as_str() {
                 "netboot" => {
                     let root = tftp_root.clone().ok_or_else(|| {
                         anyhow!("no tftp_root configured — netboot mode needs one")
                     })?;
-                    netif::mode_netboot(&target, &iface, &host_ip, &root)?;
+                    netif::mode_netboot(&target, &iface, &host_ip, &root, &boot)?;
                 }
                 "ffx" => netif::mode_ffx(&target, &iface)?,
                 _ => netif::mode_off(&target, &iface, &host_ip)?,
@@ -2512,7 +2564,12 @@ fn netif_cmd(lab_flag: Option<&str>, cmd: NetifCmd) -> Result<()> {
             Ok(())
         }
         NetifCmd::Status { target } => {
-            let (target, iface, host_ip, _r) = netboot_runtime(lab_flag, target.as_deref())?;
+            let NetbootRuntime {
+                target,
+                interface: iface,
+                host_ip,
+                ..
+            } = netboot_runtime(lab_flag, target.as_deref())?;
             print_netif_status(&target, &iface, &host_ip);
             Ok(())
         }

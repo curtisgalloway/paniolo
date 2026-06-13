@@ -38,9 +38,22 @@ const OPT_ROUTER: u8 = 3;
 const OPT_LEASE: u8 = 51;
 const OPT_MSG_TYPE: u8 = 53;
 const OPT_SERVER_ID: u8 = 54;
+const OPT_VENDOR_CLASS: u8 = 60;
 const OPT_TFTP_SERVER: u8 = 66;
 const OPT_BOOTFILE: u8 = 67;
+const OPT_CLIENT_ARCH: u8 = 93;
 const OPT_END: u8 = 255;
+
+/// Vendor-class prefix a UEFI HTTP Boot client sends (option 60), e.g.
+/// `HTTPClient:Arch:00019:UNDI:003000`. We branch on the prefix, not the full
+/// string. The reply must echo a class beginning with this or EDK2 rejects the
+/// offer as "not a valid HTTP boot offer".
+const HTTP_CLIENT_CLASS: &str = "HTTPClient";
+
+/// Vendor-class prefix a UEFI/legacy PXE client sends (option 60), e.g.
+/// `PXEClient:Arch:00011:UNDI:003000` (arch 11 = ARM64 UEFI). Echoing it back is
+/// often required for the UEFI PXE driver to accept a single-server offer.
+const PXE_CLIENT_CLASS: &str = "PXEClient";
 
 const DHCP_DISCOVER: u8 = 1;
 const DHCP_OFFER: u8 = 2;
@@ -56,6 +69,28 @@ struct Request {
     xid: [u8; 4],
     chaddr: [u8; 16],
     msg_type: u8,
+    /// Option 60 vendor class identifier (e.g. `HTTPClient:Arch:00019:…`), used
+    /// to distinguish a UEFI HTTP Boot client from the legacy Pi bootloader.
+    vendor_class: Option<String>,
+    /// Option 93 client system architecture (e.g. 19 = ARM64 UEFI HTTP). Parsed
+    /// for logging / future multi-arch use; the reply branches on `vendor_class`.
+    arch: Option<u16>,
+}
+
+impl Request {
+    /// True when this is a UEFI HTTP Boot client (option 60 begins `HTTPClient`).
+    fn is_http_client(&self) -> bool {
+        self.vendor_class
+            .as_deref()
+            .is_some_and(|c| c.starts_with(HTTP_CLIENT_CLASS))
+    }
+
+    /// True when this is a PXE client (option 60 begins `PXEClient`).
+    fn is_pxe_client(&self) -> bool {
+        self.vendor_class
+            .as_deref()
+            .is_some_and(|c| c.starts_with(PXE_CLIENT_CLASS))
+    }
 }
 
 fn parse_request(data: &[u8]) -> Option<Request> {
@@ -73,6 +108,8 @@ fn parse_request(data: &[u8]) -> Option<Request> {
         return None;
     }
     let mut msg_type = 0u8;
+    let mut vendor_class = None;
+    let mut arch = None;
     let mut i = 4;
     while i < opts.len() {
         let tag = opts[i];
@@ -92,8 +129,14 @@ fn parse_request(data: &[u8]) -> Option<Request> {
         if val_end > opts.len() {
             break;
         }
-        if tag == OPT_MSG_TYPE && len >= 1 {
-            msg_type = opts[val_start];
+        let val = &opts[val_start..val_end];
+        match tag {
+            OPT_MSG_TYPE if len >= 1 => msg_type = val[0],
+            OPT_VENDOR_CLASS if len >= 1 => {
+                vendor_class = Some(String::from_utf8_lossy(val).into_owned());
+            }
+            OPT_CLIENT_ARCH if len >= 2 => arch = Some(u16::from_be_bytes([val[0], val[1]])),
+            _ => {}
         }
         i = val_end;
     }
@@ -104,6 +147,8 @@ fn parse_request(data: &[u8]) -> Option<Request> {
         xid,
         chaddr,
         msg_type,
+        vendor_class,
+        arch,
     })
 }
 
@@ -113,7 +158,66 @@ fn encode_option(buf: &mut Vec<u8>, tag: u8, value: &[u8]) {
     buf.extend_from_slice(value);
 }
 
-fn build_reply(req: &Request, msg_type: u8, server_ip: Ipv4Addr, boot_file: &str) -> Vec<u8> {
+/// What to advertise as the boot source in a reply. The legacy Pi/TFTP path and
+/// the UEFI HTTP Boot path differ only here.
+struct BootAdvert<'a> {
+    /// Option 67 value (and, for `tftp`, the BOOTP `file` field): a bare filename
+    /// for TFTP, a full `http://…` URL for HTTP Boot.
+    boot_file: &'a str,
+    /// Advertise the host as the TFTP next-server — option 66 (dotted-quad
+    /// string) + a non-zero `siaddr` + the bootfile copied into the fixed `file`
+    /// field. False for HTTP Boot (the URL in option 67 is self-contained, and
+    /// it may overrun the 128-byte `file` field).
+    tftp: bool,
+    /// Echo a vendor class in option 60. UEFI HTTP Boot **requires** the reply's
+    /// class to begin `HTTPClient` or EDK2 rejects the offer. None on the legacy
+    /// Pi path.
+    vendor_class: Option<&'a str>,
+}
+
+impl<'a> BootAdvert<'a> {
+    /// Legacy Raspberry Pi / generic TFTP advertisement.
+    fn tftp(boot_file: &'a str) -> Self {
+        Self {
+            boot_file,
+            tftp: true,
+            vendor_class: None,
+        }
+    }
+
+    /// UEFI HTTP Boot: a `http://…` URL in option 67, `HTTPClient` echoed in
+    /// option 60, no TFTP next-server.
+    fn http(url: &'a str) -> Self {
+        Self {
+            boot_file: url,
+            tftp: false,
+            vendor_class: Some(HTTP_CLIENT_CLASS),
+        }
+    }
+
+    /// PXE: the legacy TFTP advertisement plus the `PXEClient` option-60 echo.
+    fn pxe(boot_file: &'a str) -> Self {
+        Self {
+            boot_file,
+            tftp: true,
+            vendor_class: Some(PXE_CLIENT_CLASS),
+        }
+    }
+}
+
+/// Construct the `http://host[:port]/file` URL advertised to a UEFI HTTP Boot
+/// client in option 67. The port is omitted when it is the default 80, keeping
+/// the common URL clean.
+fn http_boot_url(host_ip: Ipv4Addr, port: u16, boot_file: &str) -> String {
+    let file = boot_file.trim_start_matches('/');
+    if port == 80 {
+        format!("http://{host_ip}/{file}")
+    } else {
+        format!("http://{host_ip}:{port}/{file}")
+    }
+}
+
+fn build_reply(req: &Request, msg_type: u8, server_ip: Ipv4Addr, advert: &BootAdvert) -> Vec<u8> {
     let server_b = server_ip.octets();
     let client_b = ASSIGNED_IP.octets();
 
@@ -124,9 +228,17 @@ fn build_reply(req: &Request, msg_type: u8, server_ip: Ipv4Addr, boot_file: &str
     encode_option(&mut opts, OPT_LEASE, &LEASE_SECONDS.to_be_bytes());
     encode_option(&mut opts, OPT_SUBNET, &[255, 255, 255, 0]);
     encode_option(&mut opts, OPT_ROUTER, &server_b);
-    encode_option(&mut opts, OPT_TFTP_SERVER, server_ip.to_string().as_bytes());
-    encode_option(&mut opts, OPT_BOOTFILE, boot_file.as_bytes());
+    if advert.tftp {
+        encode_option(&mut opts, OPT_TFTP_SERVER, server_ip.to_string().as_bytes());
+    }
+    if let Some(vc) = advert.vendor_class {
+        encode_option(&mut opts, OPT_VENDOR_CLASS, vc.as_bytes());
+    }
+    encode_option(&mut opts, OPT_BOOTFILE, advert.boot_file.as_bytes());
     opts.push(OPT_END);
+
+    // siaddr (next-server) only for the TFTP path; HTTP carries the full URL.
+    let siaddr = if advert.tftp { server_b } else { [0u8; 4] };
 
     let mut pkt = Vec::with_capacity(236 + opts.len());
     pkt.extend_from_slice(&[BOOTREPLY, HTYPE_ETHERNET, 6, 0]); // op, htype, hlen, hops
@@ -135,14 +247,16 @@ fn build_reply(req: &Request, msg_type: u8, server_ip: Ipv4Addr, boot_file: &str
     pkt.extend_from_slice(&[0x80, 0x00]); // flags: broadcast
     pkt.extend_from_slice(&[0; 4]); // ciaddr
     pkt.extend_from_slice(&client_b); // yiaddr
-    pkt.extend_from_slice(&server_b); // siaddr (next-server = TFTP)
+    pkt.extend_from_slice(&siaddr); // siaddr (next-server = TFTP, else 0)
     pkt.extend_from_slice(&[0; 4]); // giaddr
     pkt.extend_from_slice(&req.chaddr); // chaddr (16)
     pkt.extend_from_slice(&[0; 64]); // sname
     let mut file = [0u8; 128]; // file (null-padded)
-    let fb = boot_file.as_bytes();
-    let n = fb.len().min(127);
-    file[..n].copy_from_slice(&fb[..n]);
+    if advert.tftp {
+        let fb = advert.boot_file.as_bytes();
+        let n = fb.len().min(127);
+        file[..n].copy_from_slice(&fb[..n]);
+    }
     pkt.extend_from_slice(&file);
     pkt.extend_from_slice(&opts);
     pkt
@@ -182,6 +296,7 @@ pub async fn serve(
     boot_file: String,
     interface: Option<String>,
     port: u16,
+    http_port: u16,
     mac_tx: watch::Sender<Option<[u8; 6]>>,
 ) -> Result<()> {
     let bcast = {
@@ -222,17 +337,34 @@ pub async fn serve(
         // unreliable for TFTP regardless — that's what the BPF send path covers.
         netcfg::set_arp(ASSIGNED_IP, &mac, interface.as_deref());
 
-        let reply = build_reply(&req, reply_type, host_ip, &boot_file);
+        // Branch on the client's vendor class (option 60):
+        //   * HTTPClient → self-contained http:// URL in option 67 + the required
+        //     HTTPClient echo, served over HTTP;
+        //   * PXEClient  → the legacy TFTP reply plus a PXEClient option-60 echo;
+        //   * neither (the silent Pi, generic TFTP) → the legacy reply unchanged.
+        let url;
+        let (advert, style) = if req.is_http_client() {
+            url = http_boot_url(host_ip, http_port, &boot_file);
+            (BootAdvert::http(&url), "http-boot")
+        } else if req.is_pxe_client() {
+            (BootAdvert::pxe(&boot_file), "pxe")
+        } else {
+            (BootAdvert::tftp(&boot_file), "tftp")
+        };
+
+        let reply = build_reply(&req, reply_type, host_ip, &advert);
         if let Err(e) = sock.send_to(&reply, (bcast, 68)).await {
             warn!("DHCP send_to {bcast}:68 failed: {e}");
             continue;
         }
-        match reply_type {
-            DHCP_OFFER => {
-                info!("DHCPOFFER -> {mac}  ip={ASSIGNED_IP}  tftp={host_ip}  file={boot_file}")
-            }
-            _ => info!("DHCPACK -> {mac}  ip={ASSIGNED_IP}"),
-        }
+        let what = match reply_type {
+            DHCP_OFFER => "DHCPOFFER",
+            _ => "DHCPACK",
+        };
+        info!(
+            "{what} -> {mac}  ip={ASSIGNED_IP}  {style}  arch={:?}  boot={}",
+            req.arch, advert.boot_file
+        );
     }
 }
 
@@ -349,7 +481,12 @@ mod tests {
     fn build_offer_header_fields() {
         let req = parse_request(&request_packet(BOOTREQUEST, Some(DHCP_DISCOVER), &[])).unwrap();
         let server = Ipv4Addr::new(192, 168, 99, 1);
-        let reply = build_reply(&req, DHCP_OFFER, server, "kernel_2712.img");
+        let reply = build_reply(
+            &req,
+            DHCP_OFFER,
+            server,
+            &BootAdvert::tftp("kernel_2712.img"),
+        );
 
         assert_eq!(reply[0], BOOTREPLY, "op = BOOTREPLY");
         assert_eq!(reply[1], HTYPE_ETHERNET);
@@ -368,7 +505,7 @@ mod tests {
     fn build_offer_options_match_spec() {
         let req = parse_request(&request_packet(BOOTREQUEST, Some(DHCP_DISCOVER), &[])).unwrap();
         let server = Ipv4Addr::new(10, 0, 0, 5);
-        let reply = build_reply(&req, DHCP_OFFER, server, "boot.img");
+        let reply = build_reply(&req, DHCP_OFFER, server, &BootAdvert::tftp("boot.img"));
         let opts = reply_options(&reply);
 
         let get = |tag: u8| opts.iter().find(|(t, _)| *t == tag).map(|(_, v)| v.clone());
@@ -386,7 +523,12 @@ mod tests {
     #[test]
     fn request_yields_ack_type() {
         let req = parse_request(&request_packet(BOOTREQUEST, Some(DHCP_REQUEST), &[])).unwrap();
-        let reply = build_reply(&req, DHCP_ACK, Ipv4Addr::new(192, 168, 99, 1), "k.img");
+        let reply = build_reply(
+            &req,
+            DHCP_ACK,
+            Ipv4Addr::new(192, 168, 99, 1),
+            &BootAdvert::tftp("k.img"),
+        );
         let opts = reply_options(&reply);
         let mt = opts.iter().find(|(t, _)| *t == OPT_MSG_TYPE).unwrap();
         assert_eq!(mt.1, vec![DHCP_ACK]);
@@ -396,7 +538,12 @@ mod tests {
     fn build_reply_truncates_overlong_bootfile_in_file_field() {
         let req = parse_request(&request_packet(BOOTREQUEST, Some(DHCP_DISCOVER), &[])).unwrap();
         let long = "a".repeat(200);
-        let reply = build_reply(&req, DHCP_OFFER, Ipv4Addr::new(1, 2, 3, 4), &long);
+        let reply = build_reply(
+            &req,
+            DHCP_OFFER,
+            Ipv4Addr::new(1, 2, 3, 4),
+            &BootAdvert::tftp(&long),
+        );
         // The fixed 128-byte file field holds at most 127 chars + a NUL terminator.
         assert_eq!(reply[108..108 + 127], long.as_bytes()[..127]);
         assert_eq!(reply[108 + 127], 0, "127th byte reserved for the NUL");
@@ -414,5 +561,120 @@ mod tests {
         let mut buf = Vec::new();
         encode_option(&mut buf, OPT_LEASE, &[0, 0, 0x0e, 0x10]);
         assert_eq!(buf, vec![OPT_LEASE, 4, 0, 0, 0x0e, 0x10]);
+    }
+
+    // ── UEFI HTTP Boot path ──────────────────────────────────────────────────
+
+    /// Trailing option TLVs for an ARM64 UEFI HTTP Boot client: option 60
+    /// vendor class + option 93 arch = 0x0013.
+    fn http_client_opts() -> Vec<u8> {
+        let class = b"HTTPClient:Arch:00019:UNDI:003000";
+        let mut t = vec![OPT_VENDOR_CLASS, class.len() as u8];
+        t.extend_from_slice(class);
+        t.extend_from_slice(&[OPT_CLIENT_ARCH, 2, 0x00, 0x13]);
+        t
+    }
+
+    #[test]
+    fn parse_extracts_vendor_class_and_arch() {
+        let pkt = request_packet(BOOTREQUEST, Some(DHCP_DISCOVER), &http_client_opts());
+        let req = parse_request(&pkt).expect("HTTPClient DISCOVER parses");
+        assert_eq!(
+            req.vendor_class.as_deref(),
+            Some("HTTPClient:Arch:00019:UNDI:003000")
+        );
+        assert_eq!(req.arch, Some(0x0013));
+        assert!(req.is_http_client());
+    }
+
+    #[test]
+    fn classless_request_is_not_http_client() {
+        let req = parse_request(&request_packet(BOOTREQUEST, Some(DHCP_DISCOVER), &[])).unwrap();
+        assert_eq!(req.vendor_class, None);
+        assert_eq!(req.arch, None);
+        assert!(!req.is_http_client(), "the Pi/legacy path is not HTTP");
+    }
+
+    #[test]
+    fn http_reply_echoes_class_and_url_without_tftp_fields() {
+        let req = parse_request(&request_packet(BOOTREQUEST, Some(DHCP_DISCOVER), &[])).unwrap();
+        let server = Ipv4Addr::new(192, 168, 99, 1);
+        let url = http_boot_url(server, 80, "grubaa64.efi");
+        let reply = build_reply(&req, DHCP_OFFER, server, &BootAdvert::http(&url));
+        let opts = reply_options(&reply);
+        let get = |tag: u8| opts.iter().find(|(t, _)| *t == tag).map(|(_, v)| v.clone());
+
+        // The mandatory HTTPClient echo (EDK2 rejects the offer without it) and
+        // the full URL as the bootfile.
+        assert_eq!(get(OPT_VENDOR_CLASS), Some(b"HTTPClient".to_vec()));
+        assert_eq!(
+            get(OPT_BOOTFILE),
+            Some(b"http://192.168.99.1/grubaa64.efi".to_vec())
+        );
+        // No TFTP next-server: option 66 absent, siaddr zeroed, file field empty.
+        assert_eq!(
+            get(OPT_TFTP_SERVER),
+            None,
+            "HTTP path must not set option 66"
+        );
+        assert_eq!(&reply[20..24], &[0, 0, 0, 0], "siaddr zero on HTTP path");
+        assert_eq!(reply[108], 0, "file field empty for HTTP boot");
+    }
+
+    #[test]
+    fn http_boot_url_formats() {
+        let ip = Ipv4Addr::new(192, 168, 99, 1);
+        assert_eq!(
+            http_boot_url(ip, 80, "boot.efi"),
+            "http://192.168.99.1/boot.efi",
+            "port 80 omitted"
+        );
+        assert_eq!(
+            http_boot_url(ip, 80, "/boot.efi"),
+            "http://192.168.99.1/boot.efi",
+            "leading slash trimmed"
+        );
+        assert_eq!(
+            http_boot_url(ip, 8080, "boot.efi"),
+            "http://192.168.99.1:8080/boot.efi",
+            "non-default port kept"
+        );
+    }
+
+    // ── PXE path ─────────────────────────────────────────────────────────────
+
+    /// Trailing option TLVs for an ARM64 UEFI PXE client: option 60 vendor class
+    /// + option 93 arch = 0x000B (11).
+    fn pxe_client_opts() -> Vec<u8> {
+        let class = b"PXEClient:Arch:00011:UNDI:003000";
+        let mut t = vec![OPT_VENDOR_CLASS, class.len() as u8];
+        t.extend_from_slice(class);
+        t.extend_from_slice(&[OPT_CLIENT_ARCH, 2, 0x00, 0x0B]);
+        t
+    }
+
+    #[test]
+    fn parse_classifies_pxe_client() {
+        let pkt = request_packet(BOOTREQUEST, Some(DHCP_DISCOVER), &pxe_client_opts());
+        let req = parse_request(&pkt).expect("PXEClient DISCOVER parses");
+        assert_eq!(req.arch, Some(0x000B));
+        assert!(req.is_pxe_client());
+        assert!(!req.is_http_client(), "PXE is not HTTP");
+    }
+
+    #[test]
+    fn pxe_reply_echoes_class_and_keeps_tftp_fields() {
+        let req = parse_request(&request_packet(BOOTREQUEST, Some(DHCP_DISCOVER), &[])).unwrap();
+        let server = Ipv4Addr::new(192, 168, 99, 1);
+        let reply = build_reply(&req, DHCP_OFFER, server, &BootAdvert::pxe("ipxe.efi"));
+        let opts = reply_options(&reply);
+        let get = |tag: u8| opts.iter().find(|(t, _)| *t == tag).map(|(_, v)| v.clone());
+
+        // PXEClient echo, alongside the legacy TFTP next-server fields.
+        assert_eq!(get(OPT_VENDOR_CLASS), Some(b"PXEClient".to_vec()));
+        assert_eq!(get(OPT_TFTP_SERVER), Some(b"192.168.99.1".to_vec()));
+        assert_eq!(get(OPT_BOOTFILE), Some(b"ipxe.efi".to_vec()));
+        assert_eq!(&reply[20..24], &server.octets(), "siaddr = next-server");
+        assert_eq!(&reply[108..116], b"ipxe.efi", "bootfile in the file field");
     }
 }

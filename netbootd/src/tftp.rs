@@ -29,7 +29,7 @@
 //!     UDP reply socket. If BPF is unavailable we fall back to `send_to`.
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,6 +41,7 @@ use tokio::time::timeout;
 use tracing::{info, warn};
 
 use crate::bpf::BpfSender;
+use crate::served::resolve;
 
 const OP_RRQ: u16 = 1;
 const OP_WRQ: u16 = 2;
@@ -114,15 +115,6 @@ fn error_packet(code: u16, msg: &str) -> Vec<u8> {
     p.extend_from_slice(msg.as_bytes());
     p.push(0);
     p
-}
-
-/// Resolve a requested filename inside `root`, rejecting traversal outside it.
-fn resolve(root: &Path, filename: &str) -> Option<PathBuf> {
-    let rel = filename.trim_start_matches('/');
-    let candidate = root.join(rel);
-    let canon = candidate.canonicalize().ok()?;
-    let root_canon = root.canonicalize().ok()?;
-    canon.starts_with(&root_canon).then_some(canon)
 }
 
 /// macOS: pin a socket's traffic to `iface` via `IP_BOUND_IF`. This is the
@@ -557,50 +549,7 @@ mod tests {
         assert_eq!(*p.last().unwrap(), 0, "error message is NUL-terminated");
     }
 
-    #[test]
-    fn resolve_accepts_file_inside_root() {
-        let root = tmp();
-        fs::write(root.join("kernel.img"), b"x").unwrap();
-        let got = resolve(&root, "kernel.img").expect("file in root resolves");
-        assert!(got.ends_with("kernel.img"));
-        fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn resolve_strips_leading_slash() {
-        let root = tmp();
-        fs::write(root.join("boot.img"), b"x").unwrap();
-        // An absolute-looking request is treated as relative to root, never as
-        // a host filesystem path.
-        assert!(resolve(&root, "/boot.img").is_some());
-        fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn resolve_rejects_traversal_outside_root() {
-        // Lay out  base/secret  and serve from  base/served . A "../secret"
-        // request must be rejected even though the target genuinely exists.
-        let base = tmp();
-        let served = base.join("served");
-        fs::create_dir_all(&served).unwrap();
-        fs::write(base.join("secret"), b"top secret").unwrap();
-
-        assert!(
-            resolve(&served, "../secret").is_none(),
-            "must not escape root"
-        );
-        assert!(resolve(&served, "../../etc/passwd").is_none());
-        fs::remove_dir_all(&base).ok();
-    }
-
-    #[test]
-    fn resolve_rejects_missing_file() {
-        let root = tmp();
-        // canonicalize() fails for a nonexistent path -> None (no info leak about
-        // whether a sibling outside root exists).
-        assert!(resolve(&root, "nope.img").is_none());
-        fs::remove_dir_all(&root).ok();
-    }
+    // Path resolution (the shared `resolve`) is tested in the `served` module.
 
     // ── Loopback transfer tests ──────────────────────────────────────────────
     //

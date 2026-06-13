@@ -32,7 +32,9 @@
 
 mod bpf;
 mod dhcp;
+mod http;
 mod netcfg;
+mod served;
 mod tftp;
 
 use std::net::Ipv4Addr;
@@ -68,6 +70,17 @@ struct Cli {
 
     #[arg(long, default_value_t = 69)]
     tftp_port: u16,
+
+    /// HTTP server port, also embedded in the UEFI HTTP Boot URL advertised in
+    /// DHCP option 67. Defaults to 80 (omitted from the URL); choose an
+    /// unprivileged high port to avoid needing root for the bind.
+    #[arg(long, default_value_t = 80)]
+    http_port: u16,
+
+    /// `Content-Type` for HTTP responses. UEFI HTTP Boot treats
+    /// `application/octet-stream` as an EFI application (the default).
+    #[arg(long)]
+    content_type: Option<String>,
 }
 
 #[tokio::main]
@@ -129,6 +142,7 @@ async fn main() -> Result<()> {
         cli.boot_file.clone(),
         cli.interface.clone(),
         cli.dhcp_port,
+        cli.http_port,
         mac_tx,
     ));
     let tftp = tokio::spawn(tftp::serve(
@@ -139,9 +153,17 @@ async fn main() -> Result<()> {
         bpf,
         mac_rx,
     ));
+    // HTTP serves UEFI HTTP Boot clients over ordinary kernel TCP — no BPF, no
+    // ARP pin (a UEFI client answers ARP, unlike the silent Pi). Always on; the
+    // client picks TFTP vs HTTP by how it DHCPs.
+    let http = tokio::spawn(http::serve(
+        cli.tftp_root.clone(),
+        cli.http_port,
+        cli.content_type.clone(),
+    ));
 
-    // Either server task exiting (always an error — they loop forever) or
-    // Ctrl-C brings the whole daemon down.
+    // Any server task exiting (always an error — they loop forever) or Ctrl-C
+    // brings the whole daemon down.
     tokio::select! {
         r = dhcp => match r {
             Ok(Ok(())) => {}
@@ -152,6 +174,11 @@ async fn main() -> Result<()> {
             Ok(Ok(())) => {}
             Ok(Err(e)) => { error!("TFTP server failed: {e:#}"); return Err(e); }
             Err(e) => return Err(e).context("TFTP task panicked"),
+        },
+        r = http => match r {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => { error!("HTTP server failed: {e:#}"); return Err(e); }
+            Err(e) => return Err(e).context("HTTP task panicked"),
         },
         _ = tokio::signal::ctrl_c() => {
             info!("netbootd shutting down");
