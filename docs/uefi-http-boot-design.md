@@ -386,3 +386,59 @@ Per the repo's standing PR checklist, the implementation PR must also update:
 - **mkdocs.yml** — this design record is added to `exclude_docs` (a point-in-time
   design doc, like `config-redesign.md`); the *user-facing* HTTP Boot
   documentation lives in `netboot.md`, which is already in the nav.
+
+---
+
+## 11. Hardware findings — Indiedroid Nova / EDK2 (2026-06-13)
+
+First real-silicon bring-up against a Tianocore EDK2 board (Indiedroid Nova,
+RK3588S). The plain-HTTP design met three obstacles a loopback test could never
+surface; netbootd was fixed for two of them, and **PXE/IPv4 is now verified
+end-to-end** (the firmware netbooted a UEFI Shell). Status by method:
+
+| Method | Result |
+|---|---|
+| **PXE / IPv4** | ✅ verified end-to-end (TFTP'd a 1 MB UEFI Shell, dropped to `Shell>`) |
+| **HTTP / IPv4** | ⛔ blocked by firmware policy (HTTPS-only), see #3 — the netbootd side is correct up to that wall |
+
+### 1. DHCP must use the limited broadcast `255.255.255.255` (fixed)
+
+netbootd originally broadcast replies to the *subnet-directed* address
+(`192.168.99.255`). A strict UEFI IP4 stack sits at `0.0.0.0` with no address on
+that subnet and **drops the packet at the IP layer** — it only accepts the limited
+broadcast `255.255.255.255` (which RFC 2131 §4.1 mandates here anyway). The Pi
+firmware is lenient and accepted the directed broadcast, so this never showed up
+before. Symptom: endless `DISCOVER → OFFER` with no `REQUEST`. **Fix:** reply to
+`255.255.255.255`, with the DHCP socket pinned to the netboot interface
+(`IP_BOUND_IF` / `SO_BINDTODEVICE`) so it still egresses the right link.
+
+### 2. UEFI PXE needs DHCP option 43 (fixed)
+
+A `PXEClient` offer with just the bootfile + `PXEClient` echo makes EDK2 complete
+DHCP and then go hunting for a boot server (BINL, port 4011); netbootd doesn't
+answer, so the client prints *"no valid offer returned."* **Fix:** add option 43
+(vendor-specific) with `PXE_DISCOVERY_CONTROL=0x08` (`06 01 08 ff`), which tells
+the client to boot the bootfile named in this very offer and skip discovery. With
+that, the Nova TFTP'd the NBP and booted. (Minor: the client requested RFC 7440
+`windowsize`, which netbootd doesn't negotiate; it retried once without it and
+completed — a possible future TFTP enhancement, not a blocker.)
+
+### 3. EDK2 HTTP Boot enforces HTTPS-only (firmware policy — not fixed here)
+
+EDK2's HTTP Boot ships with `PcdAllowHttpConnections=FALSE`, so the firmware
+**rejects a plain `http://` URL and demands `https://`** ("HTTPS only"). On the
+Nova there was no runtime toggle to allow HTTP. netbootd serves plain HTTP (TLS
+was explicitly out of scope, §4), so HTTP Boot is unreachable on such firmware.
+This makes **PXE the reliable UEFI path on locked-down EDK2**, and re-frames the
+original "HTTP Boot recommended" stance: prefer HTTP only where the firmware
+permits plain HTTP, otherwise PXE. Adding HTTPS would mean a TLS listener *plus*
+enrolling a CA/cert into the firmware's UEFI TLS trust store — a real subsystem,
+deferred with IPv6.
+
+### 4. Board prerequisite: the NIC MAC eFuse (not a netbootd issue)
+
+The Nova's RTL8168H shipped with a **blank MAC eFuse** → UEFI read `00:00:00:00:00:00`
+→ DHCP completed but the zero MAC broke unicast (ARP/TCP), so even fixes #1–#2
+stalled until a real MAC was burned into the eFuse. That's a board bring-up step,
+documented in the companion `nova-bringup` repo (`docs/ethernet-mac-efuse.md`,
+`scripts/nova-macburn.sh`), not in paniolo.

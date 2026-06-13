@@ -12,10 +12,12 @@ the client's DHCP vendor class (option 60):
 | UEFI **PXE** client (e.g. EDK2 on an Indiedroid Nova) | `PXEClient` → bootfile + `PXEClient` echo | TFTP |
 | UEFI **HTTP Boot** client | `HTTPClient` → `http://` URL + `HTTPClient` echo | HTTP |
 
-For UEFI clients, **HTTP Boot is preferred**: it runs over kernel TCP (fast,
-loss-tolerant, robust under host load) and needs none of the macOS raw-frame
-delivery machinery the silent Pi bootloader requires. See
-[UEFI clients](#uefi-clients-pxe--http-boot) below.
+For UEFI clients, HTTP Boot is the nicer transport (kernel TCP — fast,
+loss-tolerant, robust under host load, and none of the macOS raw-frame machinery
+the silent Pi bootloader needs) **where the firmware allows plain HTTP**. Many
+EDK2 builds enforce HTTPS-only and reject our `http://` URL; on those, use **PXE**
+(verified end-to-end on the Nova). See [UEFI clients](#uefi-clients-pxe--http-boot)
+below.
 
 ---
 
@@ -174,27 +176,39 @@ paniolo netboot set -t nova \
 paniolo netboot start nova
 ```
 
-**HTTP Boot (recommended).** A client whose option 60 begins `HTTPClient`
-(arch 19 = ARM64 UEFI HTTP) is answered with the required `HTTPClient` class
-echo and an `http://<host_ip>[:<http_port>]/<boot_file>` URL in option 67, then
-served the file over HTTP. In the EDK2 boot menu choose **HTTP Boot (IPv4)**.
-`paniolo netboot logs -f nova` shows the `DISCOVER` (carrying
-`HTTPClient:Arch:00019`), the offer, then `HEAD` + `GET /grubaa64.efi`. Any
-follow-on fetches the NBP makes (GRUB reading `grub.cfg`, an iPXE script) are
-ordinary HTTP GETs from the same root.
+**HTTP Boot.** A client whose option 60 begins `HTTPClient` (arch 19 = ARM64
+UEFI HTTP) is answered with the required `HTTPClient` class echo and an
+`http://<host_ip>[:<http_port>]/<boot_file>` URL in option 67, then served the
+file over HTTP. In the EDK2 boot menu choose **HTTP Boot (IPv4)**. Where the
+firmware allows plain HTTP it is the better transport — kernel TCP, fast, robust
+under host load. `paniolo netboot logs -f nova` shows the `DISCOVER` (carrying
+`HTTPClient:Arch:00019`), the offer, then `HEAD` + `GET /grubaa64.efi`.
 
-**PXE.** A client whose option 60 begins `PXEClient` (arch 11 = ARM64 UEFI) gets
-the legacy TFTP reply plus a `PXEClient` echo, and fetches `boot_file` over TFTP.
-This works but inherits TFTP's lock-step transfer; prefer HTTP Boot for UEFI.
+> **Many EDK2 builds reject plain HTTP.** UEFI HTTP Boot ships with
+> `PcdAllowHttpConnections=FALSE`, so the firmware demands `https://` and refuses
+> netbootd's `http://` URL (it reports *"HTTPS only"*) — observed on the
+> Indiedroid Nova, with no runtime toggle exposed. netbootd serves plain HTTP (no
+> TLS), so on such firmware **use PXE** (below); HTTP Boot works only where the
+> firmware permits plain HTTP.
+
+**PXE (hardware-verified).** A client whose option 60 begins `PXEClient` (arch 11
+= ARM64 UEFI) gets the TFTP reply, a `PXEClient` echo, **and DHCP option 43**
+carrying `PXE_DISCOVERY_CONTROL=0x08` — which tells the client to boot the offered
+`boot_file` directly over TFTP rather than hunting for a boot server (BINL).
+Without option 43, strict EDK2 completes DHCP but then prints *"no valid offer
+returned"*. Pick **UEFI PXEv4** in the boot menu; the log shows
+`RRQ <boot_file> … completed`. This path is verified end-to-end on the Nova.
 
 Because a UEFI client has a full IP/TCP/ARP stack (it answers ARP, unlike the
 silent Pi bootloader), the HTTP transfer uses ordinary kernel TCP — **no
 `/dev/bpf` raw-frame path, no setuid helper, no static ARP entry** — and behaves
 identically on macOS and Linux.
 
-> **IPv6 and HTTPS** are not yet supported — netboot is IPv4 + plain HTTP over
-> the private point-to-point link. See `docs/uefi-http-boot-design.md` for the
-> design and the IPv6 future work.
+> **Verified end-to-end via PXE/IPv4** on an Indiedroid Nova (RK3588S / EDK2),
+> netbooting a UEFI Shell. **IPv6 and HTTPS are not supported** — netboot is IPv4
+> + plain HTTP/TFTP over the private point-to-point link. See
+> [`docs/uefi-http-boot-design.md`](https://github.com/curtisgalloway/paniolo/blob/main/docs/uefi-http-boot-design.md)
+> for the design, the hardware findings, and the IPv6 future work.
 
 ---
 
@@ -203,9 +217,15 @@ identically on macOS and Linux.
 The DHCP server hands the target a fixed lease and sets **both** `siaddr` (the
 BOOTP next-server) and **DHCP option 66** (TFTP server name) to `host_ip`. The
 Pi 5 EEPROM reads option 66 preferentially, but setting both ensures
-compatibility with older EEPROM firmware. The TFTP server is **read-only**
-(RFC 1350) and negotiates `blksize`/`tsize` options. Both servers log to the
-combined log at `~/.local/share/paniolo/<name>/netboot.log`.
+compatibility with older EEPROM firmware. Replies are broadcast to the **limited
+broadcast `255.255.255.255`** (per RFC 2131), not the subnet-directed `.255`
+broadcast, and the DHCP socket is pinned to the netboot interface so they still
+egress it. This matters for strict clients: a UEFI IP4 stack sitting at `0.0.0.0`
+drops a packet addressed to a subnet it has no address on, so it never sees a
+*directed*-broadcast offer — the Pi firmware is lenient and accepts either, but
+EDK2 is not. The TFTP server is **read-only** (RFC 1350) and negotiates
+`blksize`/`tsize` options. Both servers log to the combined log at
+`~/.local/share/paniolo/<name>/netboot.log`.
 
 > **Switching to ffx-over-network?** With NET-first boot order, leaving netboot
 > running means the next power-cycle TFTP-boots instead of falling through to
