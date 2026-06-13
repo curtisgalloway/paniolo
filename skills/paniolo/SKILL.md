@@ -39,7 +39,7 @@ Config lives in one CLI-managed **lab file** (`~/.config/paniolo/lab.toml`, or
 
 ```
 paniolo target add <name> [--host <labhost>] [--note <text>]
-paniolo netboot set -t <name> --interface <iface> [--tftp-root <dir>] [--host-ip <ip>]
+paniolo netboot set -t <name> --interface <iface> [--tftp-root <dir>] [--host-ip <ip>] [--boot-file grubaa64.efi] [--http-port 80]
 paniolo serial add console -t <name> --device <path> [--baud 115200] [--sense cts]
 paniolo power set -t <name> [--cycle-cmd C] [--on-cmd C] [--off-cmd C] [--state-cmd C] [--serial-interface console]
 paniolo video set -t <name> --device "<capture id or name>"
@@ -55,12 +55,12 @@ paniolo hid set -t <name> --cmd "hidrig -d <uart>"   # USB HID injection helper
 - `paniolo doctor` probes every configured channel against reality (devices
   exist, over SSH for remote hosts).
 
-## Netboot (DHCP + TFTP)
+## Netboot (DHCP + TFTP + HTTP)
 
 Boot a board over the direct USB-Ethernet link:
 
 ```
-paniolo netboot start [target]            # serve DHCP + TFTP (netbootd)
+paniolo netboot start [target]            # serve DHCP + TFTP + HTTP (netbootd)
 paniolo netboot tftp-root [target]        # print where to drop boot files
 paniolo netboot status [target]
 paniolo netboot logs -f [target]          # follow the combined log
@@ -76,6 +76,14 @@ BPF send path uses the setuid `netbootd-bpf-helper` installed by `paniolo setup`
 Put boot files in the target's TFTP root (for a Raspberry Pi 5, the kernel goes
 in as `kernel_2712.img`). Needs passwordless `sudo` for `ifconfig` (it assigns
 the interface's static IP).
+
+**UEFI clients (PXE / HTTP Boot over IPv4).** netbootd reads the client's DHCP
+vendor class and serves the matching path from one config: a `PXEClient` gets
+the bootfile over TFTP (with a `PXEClient` echo); an `HTTPClient` gets an
+`http://…/<boot_file>` URL and the file over HTTP. Set `--boot-file` to the UEFI
+NBP (e.g. `grubaa64.efi`, `ipxe.efi`). **HTTP Boot is preferred** for UEFI — it
+runs over kernel TCP (robust under load) and skips the macOS BPF/ARP machinery
+the silent Pi bootloader needs. IPv4 + plain HTTP only (no IPv6/HTTPS yet).
 
 ## Link mode — switch between netboot and ffx
 

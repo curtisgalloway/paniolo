@@ -56,7 +56,9 @@ during low-level software development (bootloader, firmware, OS bring-up).
 "Paniolo" is the Hawaiian word for cowboy — the agent wrangles the target.
 
 Current capabilities:
-- DHCP + TFTP netboot over a direct USB-Ethernet link (`paniolo netboot`)
+- DHCP + TFTP + HTTP netboot over a direct USB-Ethernet link (`paniolo netboot`) —
+  Raspberry Pi (TFTP) plus UEFI **PXE** and **HTTP Boot** (IPv4) for EDK2 boards,
+  selected per-request by DHCP vendor class (option 60)
 - HDMI/USB capture via hdmicap warm-stream daemon (`paniolo video`)
 - Serial console — interactive (tio) or daemon-backed for the web dashboard (`paniolo serial`);
   one daemon owns several named interfaces, each with a timestamped rolling capture

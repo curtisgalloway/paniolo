@@ -1,7 +1,21 @@
 # Netboot
 
-paniolo netboots a target by running a minimal DHCP + TFTP server over a
+paniolo netboots a target by running a minimal DHCP + TFTP + HTTP server over a
 direct USB-Ethernet link. No router, switch, or upstream DHCP server is involved.
+
+It serves three kinds of client from one configuration, selecting the path from
+the client's DHCP vendor class (option 60):
+
+| Client | How it boots | Served over |
+|---|---|---|
+| Raspberry Pi 5 bootloader | no vendor class → legacy reply | TFTP |
+| UEFI **PXE** client (e.g. EDK2 on an Indiedroid Nova) | `PXEClient` → bootfile + `PXEClient` echo | TFTP |
+| UEFI **HTTP Boot** client | `HTTPClient` → `http://` URL + `HTTPClient` echo | HTTP |
+
+For UEFI clients, **HTTP Boot is preferred**: it runs over kernel TCP (fast,
+loss-tolerant, robust under host load) and needs none of the macOS raw-frame
+delivery machinery the silent Pi bootloader requires. See
+[UEFI clients](#uefi-clients-pxe--http-boot) below.
 
 ---
 
@@ -47,8 +61,11 @@ netboot channel fields:
 | Field | Default | Description |
 |---|---|---|
 | `--interface` | (required) | USB-Ethernet interface name (e.g. `en3`) |
-| `--host-ip` | `192.168.99.1` | Static IP assigned to the interface; also the TFTP server address |
-| `--tftp-root` | (none) | Directory whose contents are served over TFTP |
+| `--host-ip` | `192.168.99.1` | Static IP assigned to the interface; also the TFTP/HTTP server address |
+| `--tftp-root` | (none) | Directory whose contents are served over TFTP **and** HTTP |
+| `--boot-file` | `kernel_2712.img` | Boot program (filename under the root, e.g. `grubaa64.efi`); served as a TFTP filename to PXE and wrapped in an `http://` URL for HTTP Boot |
+| `--http-port` | `80` | HTTP server port; also embedded in the HTTP Boot URL (omitted from the URL when 80) |
+| `--content-type` | `application/octet-stream` | `Content-Type` for HTTP responses (UEFI treats octet-stream as an EFI application) |
 | `--host` | target default | Lab host the channel lives on |
 
 Power-cycle and DTR control are configured on the `power` channel
@@ -64,17 +81,19 @@ paniolo netboot stop  [target-machine]
 ```
 
 `start` assigns the static `host_ip` to the interface, then launches paniolo's
-own **DHCP and TFTP server** — the single `netbootd` binary (Rust), serving both
-protocols from one background process. No external daemons (`dnsmasq`,
+own **DHCP + TFTP + HTTP server** — the single `netbootd` binary (Rust), serving
+all three protocols from one background process. No external daemons (`dnsmasq`,
 `tftp-now`) are required at runtime. `stop` sends SIGTERM and clears the state
 file.
 
-**Privileged ports (67/69):** macOS 10.14+ allows binding `0.0.0.0` on
-privileged ports without root, so on macOS the only step needing sudo is
-assigning the static IP. On **Linux**, ports 67/69 require root, so `start`
-auto-prepends `sudo` when spawning `netbootd`, and interface configuration
-(`ip addr add`) uses sudo as well. Configure **NOPASSWD sudo** on the control
-host for unattended agent use.
+**Privileged ports (67/69, and 80 by default):** macOS 10.14+ allows binding
+`0.0.0.0` on privileged ports without root, so on macOS the only step needing
+sudo is assigning the static IP. On **Linux**, ports 67/69 (and 80) require
+root, so `start` auto-prepends `sudo` when spawning `netbootd`, and interface
+configuration (`ip addr add`) uses sudo as well. Configure **NOPASSWD sudo** on
+the control host for unattended agent use. To avoid privileged-port binds for
+HTTP entirely, set `--http-port` to an unprivileged high port (e.g. `8080`) — it
+is embedded in the boot URL, so the UEFI client follows it.
 
 **Interface safety:** `start` **refuses** an interface that carries your system
 default route (a primary NIC). netboot reconfigures the interface to the static
@@ -140,6 +159,45 @@ and `kernel_2712.img`.
 
 ---
 
+## UEFI clients (PXE / HTTP Boot)
+
+UEFI firmware (e.g. Tianocore EDK2 on an Indiedroid Nova, RK3588S) can netboot
+over IPv4 by **PXE** or **HTTP Boot**. `netbootd` serves both from the same
+channel — it reads the client's DHCP vendor class (option 60) and replies in the
+matching style. You only configure the boot program:
+
+```bash
+paniolo netboot set -t nova \
+    --interface en7 \
+    --tftp-root ~/nova/boot-root \
+    --boot-file grubaa64.efi      # any UEFI NBP: grubaa64.efi, ipxe.efi, a UKI…
+paniolo netboot start nova
+```
+
+**HTTP Boot (recommended).** A client whose option 60 begins `HTTPClient`
+(arch 19 = ARM64 UEFI HTTP) is answered with the required `HTTPClient` class
+echo and an `http://<host_ip>[:<http_port>]/<boot_file>` URL in option 67, then
+served the file over HTTP. In the EDK2 boot menu choose **HTTP Boot (IPv4)**.
+`paniolo netboot logs -f nova` shows the `DISCOVER` (carrying
+`HTTPClient:Arch:00019`), the offer, then `HEAD` + `GET /grubaa64.efi`. Any
+follow-on fetches the NBP makes (GRUB reading `grub.cfg`, an iPXE script) are
+ordinary HTTP GETs from the same root.
+
+**PXE.** A client whose option 60 begins `PXEClient` (arch 11 = ARM64 UEFI) gets
+the legacy TFTP reply plus a `PXEClient` echo, and fetches `boot_file` over TFTP.
+This works but inherits TFTP's lock-step transfer; prefer HTTP Boot for UEFI.
+
+Because a UEFI client has a full IP/TCP/ARP stack (it answers ARP, unlike the
+silent Pi bootloader), the HTTP transfer uses ordinary kernel TCP — **no
+`/dev/bpf` raw-frame path, no setuid helper, no static ARP entry** — and behaves
+identically on macOS and Linux.
+
+> **IPv6 and HTTPS** are not yet supported — netboot is IPv4 + plain HTTP over
+> the private point-to-point link. See `docs/uefi-http-boot-design.md` for the
+> design and the IPv6 future work.
+
+---
+
 ## DHCP / TFTP behavior notes
 
 The DHCP server hands the target a fixed lease and sets **both** `siaddr` (the
@@ -182,3 +240,9 @@ the default, so this is the right place to fix it permanently.)
 Status 2026-06-04: netbootd carried a full real boot (Pi 5 firmware DHCP +
 TFTP, 20 MB ZBI at ~3.9 MB/s) on an idle host; the deliberate under-load
 re-test is still to be done.
+
+For **UEFI** clients this is largely moot: prefer [HTTP
+Boot](#uefi-clients-pxe--http-boot), which runs over kernel TCP with real flow
+control and loss recovery, so it stays robust under host load without the
+lock-step per-block ACKs that make TFTP fragile. The starvation concern applies
+to TFTP clients (the Pi, and UEFI PXE) only.
