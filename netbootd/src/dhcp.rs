@@ -35,6 +35,7 @@ const MAGIC: [u8; 4] = [0x63, 0x82, 0x53, 0x63];
 
 const OPT_SUBNET: u8 = 1;
 const OPT_ROUTER: u8 = 3;
+const OPT_VENDOR_SPECIFIC: u8 = 43;
 const OPT_LEASE: u8 = 51;
 const OPT_MSG_TYPE: u8 = 53;
 const OPT_SERVER_ID: u8 = 54;
@@ -234,6 +235,14 @@ fn build_reply(req: &Request, msg_type: u8, server_ip: Ipv4Addr, advert: &BootAd
     if let Some(vc) = advert.vendor_class {
         encode_option(&mut opts, OPT_VENDOR_CLASS, vc.as_bytes());
     }
+    // PXE: option 43 (vendor-specific) carrying PXE_DISCOVERY_CONTROL (tag 6) with
+    // bit 3 (0x08) set tells the UEFI PXE client to download the bootfile named in
+    // this very offer and skip boot-server (BINL) discovery. Without it EDK2 hunts
+    // for a boot server on port 4011, gets no answer, and reports "no valid offer
+    // returned". (`0xff` ends the option-43 sub-option list.)
+    if advert.vendor_class == Some(PXE_CLIENT_CLASS) {
+        encode_option(&mut opts, OPT_VENDOR_SPECIFIC, &[6, 1, 8, 0xff]);
+    }
     encode_option(&mut opts, OPT_BOOTFILE, advert.boot_file.as_bytes());
     opts.push(OPT_END);
 
@@ -270,14 +279,76 @@ fn mac_string(chaddr: &[u8; 16]) -> String {
         .join(":")
 }
 
-/// Bind a broadcast-capable UDP socket on `0.0.0.0:67`.
+/// Pin a socket to `iface` so limited-broadcast (255.255.255.255) replies
+/// egress the netboot link rather than the host's default-route interface.
+/// macOS uses `IP_BOUND_IF`; Linux uses `SO_BINDTODEVICE` (needs root, which the
+/// daemon already has on Linux). A no-op elsewhere.
+#[cfg(target_os = "macos")]
+fn pin_socket_to_interface(sock: &Socket, iface: &str) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let cname = std::ffi::CString::new(iface)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "iface has NUL"))?;
+    let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+    if idx == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let rc = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_BOUND_IF,
+            &idx as *const libc::c_uint as *const libc::c_void,
+            std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn pin_socket_to_interface(sock: &Socket, iface: &str) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            iface.as_ptr() as *const libc::c_void,
+            iface.len() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn pin_socket_to_interface(_sock: &Socket, _iface: &str) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Bind a broadcast-capable UDP socket on `0.0.0.0:67`, pinned to the netboot
+/// interface.
 ///
 /// Wildcard bind keeps this rootless on macOS 14+; on Linux port 67 still
-/// needs root or `CAP_NET_BIND_SERVICE`.
-fn bind_server(port: u16) -> Result<UdpSocket> {
+/// needs root or `CAP_NET_BIND_SERVICE`. The interface pin makes replies sent to
+/// the limited broadcast `255.255.255.255` leave via the netboot link (the
+/// kernel would otherwise pick the default-route interface for that address).
+fn bind_server(port: u16, interface: Option<&str>) -> Result<UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_reuse_address(true)?;
     sock.set_broadcast(true)?;
+    if let Some(iface) = interface {
+        if let Err(e) = pin_socket_to_interface(&sock, iface) {
+            warn!(
+                "pin DHCP socket to {iface} failed: {e}; \
+                 255.255.255.255 replies may egress the wrong interface"
+            );
+        }
+    }
     let addr: std::net::SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
     sock.bind(&addr.into()).with_context(|| {
         format!("bind DHCP port {port} (need root/CAP_NET_BIND_SERVICE on Linux)")
@@ -299,12 +370,11 @@ pub async fn serve(
     http_port: u16,
     mac_tx: watch::Sender<Option<[u8; 6]>>,
 ) -> Result<()> {
-    let bcast = {
-        let o = host_ip.octets();
-        Ipv4Addr::new(o[0], o[1], o[2], 255)
-    };
-    let sock = bind_server(port)?;
-    info!(%host_ip, %bcast, boot_file, "DHCP listening on 0.0.0.0:{port}");
+    let sock = bind_server(port, interface.as_deref())?;
+    info!(
+        %host_ip, boot_file,
+        "DHCP listening on 0.0.0.0:{port} (replies broadcast to 255.255.255.255)"
+    );
 
     let mut buf = vec![0u8; 4096];
     loop {
@@ -353,8 +423,14 @@ pub async fn serve(
         };
 
         let reply = build_reply(&req, reply_type, host_ip, &advert);
-        if let Err(e) = sock.send_to(&reply, (bcast, 68)).await {
-            warn!("DHCP send_to {bcast}:68 failed: {e}");
+        // RFC 2131: with the broadcast flag set and giaddr=0 (our single-client
+        // direct link), reply to the limited broadcast 255.255.255.255 — not the
+        // subnet-directed broadcast. A strict UEFI client (EDK2) at 0.0.0.0 drops
+        // a packet addressed to a subnet it has no address on; the lenient Pi
+        // firmware accepts either. The socket is pinned to the netboot interface
+        // so this still egresses the netboot link.
+        if let Err(e) = sock.send_to(&reply, (Ipv4Addr::BROADCAST, 68)).await {
+            warn!("DHCP send_to 255.255.255.255:68 failed: {e}");
             continue;
         }
         let what = match reply_type {
@@ -672,6 +748,9 @@ mod tests {
 
         // PXEClient echo, alongside the legacy TFTP next-server fields.
         assert_eq!(get(OPT_VENDOR_CLASS), Some(b"PXEClient".to_vec()));
+        // Option 43: PXE_DISCOVERY_CONTROL=0x08 (use this offer's bootfile, skip
+        // boot-server discovery), terminated by 0xff.
+        assert_eq!(get(OPT_VENDOR_SPECIFIC), Some(vec![6, 1, 8, 0xff]));
         assert_eq!(get(OPT_TFTP_SERVER), Some(b"192.168.99.1".to_vec()));
         assert_eq!(get(OPT_BOOTFILE), Some(b"ipxe.efi".to_vec()));
         assert_eq!(&reply[20..24], &server.octets(), "siaddr = next-server");
