@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """
-Dual-board rig — CONTROL firmware (milestone 2: host-driven relay).
+Dual-board rig — CONTROL firmware: HID relay + DUT power + console bridge.
 
 Reads binary frames from the host over usb_cdc.data and routes them by type:
   - 0x01 HID report frames are relayed VERBATIM over I2C1 to the target board
@@ -22,15 +22,20 @@ Reads binary frames from the host over usb_cdc.data and routes them by type:
   - 0x02 control frames are handled locally (ping, version, power) and answered
     on usb_cdc.data. `power` drives a relay/load-switch on the DUT's 5 V so the
     rig can power-cycle a wedged target.
+  - 0x03 console frames are a byte-pipe to/from the DUT's serial console on the
+    hardware UART (TX=GP0 / RX=GP1): inbound payloads are written to the UART,
+    and bytes read from the UART are framed back to the host. This board never
+    interprets console content — the hidrig daemon re-exports it as a PTY.
 
 Uniform frame format (length-prefixed for byte-stream parsing, same shape the
 target uses):
     [type][b1][len][payload .. len bytes]
       0x01: b1 = report-id, payload = HID report bytes
       0x02: b1 = cmd,       payload = args
+      0x03: b1 = port (0),  payload = raw DUT console bytes
 
-The host composes the report bytes (see host_send.py, the M2 test driver; the
-Rust `hidrig serve` daemon owns composition in M3).
+The host composes the report bytes and demuxes the console (the Rust
+`hidrig serve` daemon); host_send.py is the M2 test driver.
 
 I2C1 controller on D10 (GP10, SDA) / MOSI (GP19, SCL); target peripheral 0x41.
 """
@@ -66,6 +71,13 @@ POWER_CYCLE = 2
 RELAY_PIN = board.D5
 RELAY_ACTIVE_HIGH = True
 DEFAULT_CYCLE_OFF_S = 2
+
+# DUT serial console on the hardware UART (UART0: TX=GP0, RX=GP1). Bridged to
+# the host as 0x03 frames. A larger RX ring absorbs DUT boot-log bursts while
+# the loop is busy relaying HID over I2C.
+CONSOLE_BAUD = 115200
+CONSOLE_RX_BUF = 256
+CONSOLE_PORT = 0  # frame selector (leaves room for a second UART later)
 
 # --- Status NeoPixel (core neopixel_write; WS2812 is GRB) --------------------
 _px = digitalio.DigitalInOut(board.NEOPIXEL)
@@ -106,6 +118,20 @@ i2c = busio.I2C(board.MOSI, board.D10, frequency=100000)
 
 data = usb_cdc.data  # binary frame channel from the host (None if not enabled)
 
+# DUT serial console — hardware UART0 (TX=GP0, RX=GP1).
+try:
+    uart = busio.UART(
+        board.TX,
+        board.RX,
+        baudrate=CONSOLE_BAUD,
+        timeout=0,  # non-blocking reads
+        receiver_buffer_size=CONSOLE_RX_BUF,
+    )
+except (ValueError, RuntimeError) as e:
+    uart = None
+    if DEBUG:
+        print("control: DUT console UART unavailable:", e)
+
 
 def relay_hid(frame):
     """Forward an HID frame verbatim over I2C to the target board."""
@@ -141,6 +167,25 @@ def handle_control(frame):
         print("control: ctrl cmd 0x%02X" % cmd)
 
 
+def relay_console_tx(frame):
+    """Write a host->DUT console frame's payload to the DUT UART (verbatim)."""
+    if uart is not None and len(frame) > 3:
+        uart.write(frame[3:])
+
+
+def pump_console_rx():
+    """Drain the DUT UART and frame received bytes up to the host as 0x03."""
+    if uart is None or data is None:
+        return
+    pending = uart.in_waiting
+    while pending:
+        chunk = uart.read(pending if pending < 255 else 255)
+        if not chunk:
+            break
+        data.write(bytes((0x03, CONSOLE_PORT, len(chunk))) + chunk)
+        pending = uart.in_waiting
+
+
 _rxbuf = bytearray()
 
 
@@ -152,7 +197,7 @@ def route_frames():
     n = len(_rxbuf)
     while n - i >= 1:
         ftype = _rxbuf[i]
-        if ftype == 0x01 or ftype == 0x02:
+        if ftype == 0x01 or ftype == 0x02 or ftype == 0x03:
             if n - i < 3:
                 break  # header incomplete
             need = 3 + _rxbuf[i + 2]
@@ -162,8 +207,10 @@ def route_frames():
             i += need
             if ftype == 0x01:
                 relay_hid(frame)
-            else:
+            elif ftype == 0x02:
                 handle_control(frame)
+            else:
+                relay_console_tx(frame)
         else:
             i += 1  # unframed/unknown byte — resync
     if i:
@@ -175,7 +222,8 @@ if data is not None:
 
 status(0, 0, 16)  # blue: up, waiting for host frames
 if DEBUG:
-    print("control: M2 relay up — reading usb_cdc.data, target 0x%02X" % I2C_ADDR)
+    print("control: relay up — target 0x%02X, console %s"
+          % (I2C_ADDR, "on" if uart is not None else "off"))
 
 while True:
     if data is not None:
@@ -184,3 +232,4 @@ while True:
             _rxbuf.extend(data.read(n))
             route_frames()
             status(0, 0, 16)  # back to blue between bursts
+    pump_console_rx()
