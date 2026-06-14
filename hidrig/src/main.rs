@@ -30,6 +30,7 @@
 mod compose;
 mod daemon;
 mod proto;
+mod pty;
 mod server;
 mod uart;
 
