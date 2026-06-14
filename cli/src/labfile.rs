@@ -398,6 +398,24 @@ impl LabFile {
         self.remove_singleton(target, "hid")
     }
 
+    pub fn set_adb(
+        &mut self,
+        target: &str,
+        serial: Option<&str>,
+        adb: Option<&str>,
+        host: Option<&str>,
+    ) -> Result<(), LabError> {
+        self.set_singleton(
+            target,
+            "adb",
+            &[("serial", serial), ("adb", adb), ("host", host)],
+        )
+    }
+
+    pub fn remove_adb(&mut self, target: &str) -> Result<(), LabError> {
+        self.remove_singleton(target, "adb")
+    }
+
     fn target_mut(&mut self, name: &str) -> Result<&mut Table, LabError> {
         self.doc
             .get_mut("targets")
@@ -591,6 +609,25 @@ mod tests {
         lf.save().unwrap();
         let lab = model::load(&path).unwrap();
         assert!(lab.targets["t"].hid.is_none());
+    }
+
+    #[test]
+    fn set_adb_round_trips_and_removes() {
+        let (_d, path) = tmp();
+        let mut lf = LabFile::create(&path);
+        lf.add_target("pixel", None, None).unwrap();
+        lf.set_adb("pixel", Some("39021FDH200xyz"), None, None)
+            .unwrap();
+        lf.save().unwrap();
+        let lab = model::load(&path).unwrap();
+        let a = lab.targets["pixel"].adb.as_ref().unwrap();
+        assert_eq!(a.serial.as_deref(), Some("39021FDH200xyz"));
+        assert!(a.adb.is_none());
+
+        lf.remove_adb("pixel").unwrap();
+        lf.save().unwrap();
+        let lab = model::load(&path).unwrap();
+        assert!(lab.targets["pixel"].adb.is_none());
     }
 
     #[test]

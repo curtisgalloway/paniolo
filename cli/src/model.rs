@@ -122,6 +122,17 @@ pub struct HidChannel {
     pub host: Option<String>,
 }
 
+/// adb transport to an Android target (DUT). The device is named by its
+/// `adb -s <serial>` id (omit for the sole attached device); `adb` overrides
+/// the binary. Like SSH this is a generic transport, not a device-specific
+/// helper, so `paniolo adb …` shells out to it directly on the bound host.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct AdbChannel {
+    pub serial: Option<String>,
+    pub adb: Option<String>,
+    pub host: Option<String>,
+}
+
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct Target {
     pub host: Option<String>,
@@ -132,6 +143,7 @@ pub struct Target {
     pub power: Option<PowerChannel>,
     pub video: Option<VideoChannel>,
     pub hid: Option<HidChannel>,
+    pub adb: Option<AdbChannel>,
 }
 
 impl Target {
@@ -157,6 +169,7 @@ pub enum ChannelKind {
     Power,
     Video,
     Hid,
+    Adb,
 }
 
 impl ChannelKind {
@@ -167,6 +180,7 @@ impl ChannelKind {
             ChannelKind::Power => "power",
             ChannelKind::Video => "video",
             ChannelKind::Hid => "hid",
+            ChannelKind::Adb => "adb",
         }
     }
 }
@@ -282,6 +296,17 @@ impl Lab {
                 kind: ChannelKind::Hid,
                 name: "hid".into(),
                 host: host_of(&h.host),
+                fields: f,
+            });
+        }
+        if let Some(a) = &t.adb {
+            let mut f = Vec::new();
+            push_opt(&mut f, "serial", &a.serial);
+            push_opt(&mut f, "adb", &a.adb);
+            channels.push(ResolvedChannel {
+                kind: ChannelKind::Adb,
+                name: "adb".into(),
+                host: host_of(&a.host),
                 fields: f,
             });
         }
@@ -404,6 +429,10 @@ pub fn validate(lab: &Lab) -> Result<(), LabError> {
         if let Some(hid) = &t.hid {
             let h = hid.host.as_deref().unwrap_or(default_host);
             check_host_ref(h, &declared, &format!("target '{name}' hid"))?;
+        }
+        if let Some(adb) = &t.adb {
+            let h = adb.host.as_deref().unwrap_or(default_host);
+            check_host_ref(h, &declared, &format!("target '{name}' adb"))?;
         }
         let mut seen: BTreeSet<&str> = BTreeSet::new();
         for s in &t.serial {
@@ -539,6 +568,34 @@ mod tests {
         assert_eq!(on2.len(), 1);
         assert_eq!(on2[0].0, "fortune");
         assert_eq!(on2[0].1.kind, ChannelKind::Video);
+    }
+
+    #[test]
+    fn resolves_adb_channel() {
+        let lab = parse(
+            r#"
+            [hosts.bench1]
+            ssh = "u@bench1"
+            [targets.pixel]
+            host = "bench1"
+            [targets.pixel.adb]
+            serial = "39021FDH200xyz"
+            "#,
+        )
+        .unwrap();
+        let rt = lab.resolved_target("pixel").unwrap();
+        let adb = rt
+            .channels
+            .iter()
+            .find(|c| c.kind == ChannelKind::Adb)
+            .expect("adb channel");
+        assert_eq!(adb.host, "bench1");
+        assert_eq!(
+            adb.fields.iter().find(|(k, _)| *k == "serial").unwrap().1,
+            "39021FDH200xyz"
+        );
+        // The device id is plumbed via channel_host like any singleton kind.
+        assert_eq!(channel_host(&rt, ChannelKind::Adb, None).unwrap(), "bench1");
     }
 
     #[test]

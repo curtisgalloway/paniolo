@@ -80,7 +80,7 @@ link (§7) is the only cross-subsystem coupling today.
 **All configuration lives in one CLI-managed lab file** — `~/.config/paniolo/lab.toml`, or
 `--lab` / `PANIOLO_LAB` to point elsewhere (e.g. a git-tracked file). It names the **hosts** and
 the **targets**, each target's hardware described as *channels* (`netboot`, `serial`, `power`,
-`video`, `hid`) bound to the host they're physically attached to. No daemon is needed to read
+`video`, `hid`, `adb`) bound to the host they're physically attached to. No daemon is needed to read
 it; if exactly one target is configured it is the default and may be omitted from every command.
 The schema (`cli/src/model.rs`):
 
@@ -110,6 +110,9 @@ device = "USB Video"             # HDMI capture device for hdmicap
 
 [targets.target-machine.hid]
 cmd = "hidrig -d /dev/…"         # opaque helper prefix; `paniolo hid send` appends args
+
+[targets.target-machine.adb]     # an Android DUT reached over adb
+serial = "33271JEGR02033"        # `adb -s <serial>`; omit for the sole device
 ```
 
 Every channel also takes an optional `host = "<name>"` to bind it to a remote control host
@@ -211,6 +214,15 @@ device-independent [HID serial protocol](hid-serial-protocol.md), but it is the 
 interface only — `hidrig` consumes and composes it. paniolo integrates the helper through the
 generic per-target `hid` channel — an opaque command prefix (`paniolo hid send` appends
 arguments), exactly like the power hooks.
+
+### adb / Android targets ([`adb.md`](adb.md))
+When the target is an Android device, the per-target `adb` channel binds it (by `adb -s <serial>`)
+to the control host it's plugged into and gives paniolo the same verbs over one transport:
+console (`paniolo adb shell` interactive, `adb run` one-shot), screen (`adb screencap`, via
+`adb exec-out screencap -p` → PNG), and input (`adb input` → `adb shell input`). adb is a generic
+transport like SSH — not a device-specific helper — so it lives in the core CLI (`cli/src/adb.rs`)
+and shells out to the host's `adb` binary, routed per-channel by the same dispatch as every other
+channel. Reboot/power needs no new code: wire `adb reboot` through the generic power hooks.
 
 ### Dashboard ([`dashboard.md`](dashboard.md))
 `paniolo console` opens hdmicap's `GET /` — a two-pane web UI (live video on top, xterm.js

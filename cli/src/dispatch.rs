@@ -96,6 +96,11 @@ pub fn build_slice(lab: &Lab, target: &str, host: &str) -> Result<String, LabErr
             lf.set_hid(target, h.cmd.as_deref(), None)?;
         }
     }
+    if let Some(a) = &t.adb {
+        if on(&a.host) {
+            lf.set_adb(target, a.serial.as_deref(), a.adb.as_deref(), None)?;
+        }
+    }
     Ok(lf.doc.to_string())
 }
 

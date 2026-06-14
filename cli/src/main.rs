@@ -19,6 +19,7 @@
 //! channels that connect them. This module is the CLI surface; the model and
 //! editor live in [`model`] and [`labfile`].
 
+mod adb;
 mod daemons;
 mod discover;
 mod dispatch;
@@ -109,6 +110,11 @@ enum Command {
     Hid {
         #[command(subcommand)]
         cmd: HidCmd,
+    },
+    /// Drive an Android target over adb (console, screencap, input).
+    Adb {
+        #[command(subcommand)]
+        cmd: AdbCmd,
     },
     /// Open the combined video+serial dashboard, starting daemons if needed.
     Console {
@@ -539,6 +545,62 @@ enum HidCmd {
 }
 
 #[derive(Subcommand)]
+enum AdbCmd {
+    /// Configure the target's adb channel (one per target).
+    Set {
+        #[arg(long, short)]
+        target: String,
+        /// `adb -s <serial>` device id (omit for the sole attached device).
+        #[arg(long)]
+        serial: Option<String>,
+        /// Override the adb binary (default: adb on PATH).
+        #[arg(long)]
+        adb: Option<String>,
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Remove the target's adb channel.
+    Rm {
+        #[arg(long, short)]
+        target: String,
+    },
+    /// Show the target's adb channel config and device state.
+    Show { target: Option<String> },
+    /// Open an interactive `adb shell` on the channel's host.
+    Shell { target: Option<String> },
+    /// Run a one-shot command on the device, e.g.
+    /// `paniolo adb run -t pixel getprop ro.build.version.release`.
+    Run {
+        #[arg(long, short)]
+        target: Option<String>,
+        /// Command (and args) run via `adb shell`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        args: Vec<String>,
+    },
+    /// Capture one PNG screenshot (`adb exec-out screencap`).
+    Screencap {
+        target: Option<String>,
+        /// Output path; "-" for stdout.
+        #[arg(long, short, default_value = "-")]
+        out: String,
+    },
+    /// Inject input events, e.g.
+    /// `paniolo adb input -t pixel keyevent KEYCODE_HOME`.
+    Input {
+        #[arg(long, short)]
+        target: Option<String>,
+        /// Arguments to `adb shell input` (keyevent/text/tap/swipe …).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        args: Vec<String>,
+    },
+    /// List adb devices visible on a host (default: local).
+    Devices {
+        #[arg(long, short = 'H')]
+        host: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum VideoCmd {
     /// Configure the target's video channel (one per target).
     Set {
@@ -628,6 +690,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Power { cmd } => power_cmd(lab_flag, cmd),
         Command::Video { cmd } => video_cmd(lab_flag, cmd),
         Command::Hid { cmd } => hid_cmd(lab_flag, cmd),
+        Command::Adb { cmd } => adb_cmd(lab_flag, cmd),
         Command::Console { target, interface } => {
             cmd_console(lab_flag, target.as_deref(), interface.as_deref())
         }
@@ -901,6 +964,28 @@ fn cmd_discover(json: bool) -> Result<()> {
             "(none)".to_string()
         } else {
             captures.join("\n\t")
+        }
+    );
+    let adbs: Vec<String> = inv["adb"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|d| {
+                    let serial = d["serial"].as_str().unwrap_or("");
+                    match d["model"].as_str() {
+                        Some(m) => format!("{serial}  ({m})"),
+                        None => serial.to_string(),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    println!(
+        "adb\t{}",
+        if adbs.is_empty() {
+            "(none)".to_string()
+        } else {
+            adbs.join("\n\t")
         }
     );
     println!("(* = carrier up)");
@@ -2813,6 +2898,135 @@ fn cmd_hid_send(lab_flag: Option<&str>, target: Option<&str>, args: &[String]) -
         std::process::exit(status.code().unwrap_or(1));
     }
     Ok(())
+}
+
+// ── adb runtime bodies ──────────────────────────────────────────────────────
+
+/// The target's adb channel as visible on *this* host.
+fn local_adb(lab: &Lab, target: &str) -> Result<model::AdbChannel> {
+    let t = lab
+        .targets
+        .get(target)
+        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+    let dh = t.default_host().to_string();
+    let a = t.adb.clone().ok_or_else(|| {
+        anyhow!("target '{target}' has no adb channel (paniolo adb set -t {target} --serial <id>)")
+    })?;
+    if a.host.as_deref().unwrap_or(&dh) != model::LOCAL {
+        bail!("adb channel for '{target}' is not on this host");
+    }
+    Ok(a)
+}
+
+/// Common preamble for adb runtime commands: resolve the target, dispatch to
+/// the adb channel's host if remote, and return the local channel. `mode`
+/// selects the SSH transport when remote (`Interactive` for `adb shell`).
+fn adb_runtime(
+    lab_flag: Option<&str>,
+    target: Option<&str>,
+    mode: dispatch::Mode,
+) -> Result<model::AdbChannel> {
+    let lab = load_for_read(lab_flag)?;
+    let target = resolve_single_target(&lab, target)?;
+    if let Some(code) =
+        dispatch::maybe_dispatch(&lab, &target, model::ChannelKind::Adb, None, mode)?
+    {
+        std::process::exit(code);
+    }
+    local_adb(&lab, &target)
+}
+
+fn adb_cmd(lab_flag: Option<&str>, cmd: AdbCmd) -> Result<()> {
+    match cmd {
+        AdbCmd::Set {
+            target,
+            serial,
+            adb,
+            host,
+        } => {
+            edit_lab(lab_flag, |lf| {
+                lf.set_adb(&target, serial.as_deref(), adb.as_deref(), host.as_deref())
+            })?;
+            println!("adb channel set for '{target}'.");
+            Ok(())
+        }
+        AdbCmd::Rm { target } => {
+            edit_lab(lab_flag, |lf| lf.remove_adb(&target))?;
+            println!("adb channel removed from '{target}'.");
+            Ok(())
+        }
+        AdbCmd::Show { target } => cmd_adb_show(lab_flag, target.as_deref()),
+        AdbCmd::Shell { target } => {
+            let a = adb_runtime(lab_flag, target.as_deref(), dispatch::Mode::Interactive)?;
+            adb::exec_shell(a.adb.as_deref(), a.serial.as_deref())
+        }
+        AdbCmd::Run { target, args } => {
+            let a = adb_runtime(lab_flag, target.as_deref(), dispatch::Mode::Reexec)?;
+            let mut rest = vec!["shell".to_string()];
+            rest.extend(args);
+            std::process::exit(adb::run_passthrough(
+                a.adb.as_deref(),
+                a.serial.as_deref(),
+                &rest,
+            )?);
+        }
+        AdbCmd::Screencap { target, out } => {
+            let a = adb_runtime(lab_flag, target.as_deref(), dispatch::Mode::Reexec)?;
+            adb::screencap(a.adb.as_deref(), a.serial.as_deref(), &out)
+        }
+        AdbCmd::Input { target, args } => {
+            let a = adb_runtime(lab_flag, target.as_deref(), dispatch::Mode::Reexec)?;
+            let mut rest = vec!["shell".to_string(), "input".to_string()];
+            rest.extend(args);
+            std::process::exit(adb::run_passthrough(
+                a.adb.as_deref(),
+                a.serial.as_deref(),
+                &rest,
+            )?);
+        }
+        AdbCmd::Devices { host } => cmd_adb_devices(lab_flag, host.as_deref()),
+    }
+}
+
+fn cmd_adb_show(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
+    let a = adb_runtime(lab_flag, target, dispatch::Mode::Reexec)?;
+    println!("serial\t{}", a.serial.as_deref().unwrap_or("(sole device)"));
+    println!("adb\t{}", a.adb.as_deref().unwrap_or(adb::DEFAULT_ADB));
+    // Best-effort device state — don't fail `show` when the device is offline.
+    let av = adb::argv(
+        a.adb.as_deref(),
+        a.serial.as_deref(),
+        &["get-state".to_string()],
+    );
+    match std::process::Command::new(&av[0]).args(&av[1..]).output() {
+        Ok(o) if o.status.success() => {
+            println!("state\t{}", String::from_utf8_lossy(&o.stdout).trim());
+        }
+        Ok(o) => {
+            let msg = String::from_utf8_lossy(&o.stderr);
+            let msg = msg.trim();
+            println!(
+                "state\t{}",
+                if msg.is_empty() { "unreachable" } else { msg }
+            );
+        }
+        Err(_) => println!("state\t(adb not installed)"),
+    }
+    Ok(())
+}
+
+/// `adb devices -l` on a host (local by default) — discovery for lab authoring,
+/// so it doesn't require a configured adb channel.
+fn cmd_adb_devices(lab_flag: Option<&str>, host: Option<&str>) -> Result<()> {
+    let rest = vec!["devices".to_string(), "-l".to_string()];
+    let host = host.unwrap_or(model::LOCAL);
+    let resolved = resolve_host(lab_flag, host)?;
+    if resolved.is_local(host) {
+        std::process::exit(adb::run_passthrough(None, None, &rest)?);
+    }
+    let mut argv = vec![adb::DEFAULT_ADB.to_string()];
+    argv.extend(rest);
+    std::process::exit(ssh::run_passthrough(&resolved, &argv, &[])?);
 }
 
 // ── rendering helpers ───────────────────────────────────────────────────────

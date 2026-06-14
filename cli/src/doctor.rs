@@ -189,6 +189,27 @@ fn check_channel(lab: &Lab, ch: &ResolvedChannel, rt: &ResolvedTarget) -> (Statu
                 interpret(probe(lab, &ch.host, &script), prog)
             }
         },
+        ChannelKind::Adb => {
+            // adb is a system tool (PATH), not a paniolo libexec helper. Exit 3
+            // distinguishes "adb not installed" from "device not reachable".
+            let adb_bin = field(ch, "adb").unwrap_or("adb");
+            let serial = field(ch, "serial");
+            let q_bin = ssh::shell_quote(adb_bin);
+            let find = if adb_bin.starts_with('/') {
+                format!("test -x {q_bin}")
+            } else {
+                format!("command -v {q_bin} >/dev/null")
+            };
+            let sel = match serial {
+                Some(s) => format!("-s {} ", ssh::shell_quote(s)),
+                None => String::new(),
+            };
+            let script = format!("{find} || exit 3; {q_bin} {sel}get-state >/dev/null 2>&1");
+            match probe(lab, &ch.host, &script) {
+                Some(3) => (Status::Missing, format!("{adb_bin} (adb not installed)")),
+                rc => interpret(rc, serial.unwrap_or("device")),
+            }
+        }
     }
 }
 
