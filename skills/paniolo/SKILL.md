@@ -44,6 +44,7 @@ paniolo serial add console -t <name> --device <path> [--baud 115200] [--sense ct
 paniolo power set -t <name> [--cycle-cmd C] [--on-cmd C] [--off-cmd C] [--state-cmd C] [--serial-interface console]
 paniolo video set -t <name> --device "<capture id or name>"
 paniolo hid set -t <name> --cmd "hidrig -d <uart>"   # USB HID injection helper
+paniolo adb set -t <name> [--serial <adb-id>]        # an Android DUT over adb
 ```
 
 - `paniolo netboot devices` lists candidate USB-Ethernet interfaces (the
@@ -51,7 +52,7 @@ paniolo hid set -t <name> --cmd "hidrig -d <uart>"   # USB HID injection helper
   `paniolo configure <name> -H <host>` proposes a whole block to paste in.
 - Inspect: `paniolo config show` (whole lab) / `paniolo target show <name>`.
 - Remove: `paniolo target rm <name>`, or per channel (`netboot rm`,
-  `serial rm <iface> -t <name>`, `power rm`, `video rm`, `hid rm`).
+  `serial rm <iface> -t <name>`, `power rm`, `video rm`, `hid rm`, `adb rm`).
 - `paniolo doctor` probes every configured channel against reality (devices
   exist, over SSH for remote hosts).
 
@@ -225,6 +226,33 @@ paniolo serial send --pace-ms 8 "long command"       # per-byte pacing for slow
 
 Note the input only reaches the target if its console actually reads the UART
 (a kernel with a broken serial driver logs output but ignores input).
+
+## adb (Android targets)
+
+When the target is an Android device, the `adb` channel gives you console,
+screen, and input over one transport (see `docs/adb.md`). adb runs
+on the control host the device is plugged into; paniolo routes per-channel like
+any other.
+
+```
+paniolo adb devices [-H <host>]          # list attached devices (their serials)
+paniolo adb set -t <target> [--serial <id>]   # bind a device (omit --serial = sole device)
+paniolo adb show [target]                # config + live device state
+paniolo adb shell [target]               # interactive `adb shell` in your terminal
+paniolo adb run -t <target> <cmd...>     # one-shot command, output captured (agent path)
+paniolo adb screencap [target] [-o frame.png]   # one PNG (exec-out screencap; -o - = stdout)
+paniolo adb input -t <target> <args...>  # adb shell input: keyevent/text/tap/swipe
+```
+
+- `run`/`input` take `-t` (not a positional) because their tail is free-form;
+  put `-t` first and use `--` before a leading-dash argument
+  (`paniolo adb run -t pixel -- logcat -d -t 50`).
+- `adb run -t <t> getprop ro.product.model` is the read workhorse for agents;
+  `adb screencap -o -` pipes a PNG back (works on a remote control host too).
+- Reboot/power: no adb-specific command — wire `adb reboot` through the power
+  hooks (`paniolo power set -t <t> --cycle-cmd "adb -s <id> reboot"`).
+- The device must be authorized (`adb devices` shows it as `device`, not
+  `unauthorized`/`offline`); paniolo does not manage pairing.
 
 ## Power control
 

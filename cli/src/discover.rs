@@ -15,7 +15,7 @@
 //! Hardware discovery for lab authoring.
 //!
 //! `paniolo discover` lists this host's lab-relevant hardware (USB-Ethernet,
-//! serial, capture devices); `paniolo configure` runs it over SSH on a lab host
+//! serial, capture devices, adb devices); `paniolo configure` runs it over SSH on a lab host
 //! and renders a proposed `[targets.<name>]` block for review. The proposal is
 //! never written — the human approves it by adding it to the lab and committing.
 
@@ -28,7 +28,8 @@ const BUILTIN_CAPTURE: [&str; 5] = ["FaceTime", "Capture screen", "iSight", "iPh
 
 /// This host's lab-relevant hardware, in the same JSON shape the Python CLI
 /// emits (so mixed-version labs interoperate during the migration; the video
-/// entries' `id` field is a Rust-side addition).
+/// entries' `id` field and the `adb` array are Rust-side additions, ignored by
+/// older consumers).
 pub fn local_inventory() -> Value {
     let ethernet: Vec<Value> = netif::list_usb_ethernet_interfaces()
         .iter()
@@ -38,7 +39,12 @@ pub fn local_inventory() -> Value {
         .into_iter()
         .map(Value::String)
         .collect();
-    json!({"ethernet": ethernet, "serial": serial, "video": list_capture_devices()})
+    json!({
+        "ethernet": ethernet,
+        "serial": serial,
+        "video": list_capture_devices(),
+        "adb": list_adb_devices(),
+    })
 }
 
 /// Capture devices from `hdmicap devices --json`:
@@ -58,6 +64,48 @@ fn list_capture_devices() -> Vec<Value> {
         return Vec::new();
     }
     serde_json::from_slice(&out.stdout).unwrap_or_default()
+}
+
+/// Authorized adb devices as `[{serial, model}, ...]` from `adb devices -l`.
+/// Empty when adb isn't installed/answering. Devices not in the `device` state
+/// (unauthorized/offline) are skipped — they can't be driven yet.
+fn list_adb_devices() -> Vec<Value> {
+    let Ok(out) = std::process::Command::new("adb")
+        .args(["devices", "-l"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    parse_adb_devices(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse `adb devices -l` text into `[{serial, model?}]`, keeping only devices
+/// in the `device` state. Pure (no I/O) so it can be unit-tested.
+fn parse_adb_devices(text: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        // Skip the header and adb-server startup chatter.
+        if line.is_empty() || line.starts_with("List of devices") || line.starts_with('*') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let (Some(serial), Some(state)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if state != "device" {
+            continue;
+        }
+        // `-l` adds `model:Pixel_6a` etc.; underscores stand in for spaces.
+        match parts.find_map(|p| p.strip_prefix("model:")) {
+            Some(model) => out.push(json!({"serial": serial, "model": model.replace('_', " ")})),
+            None => out.push(json!({"serial": serial})),
+        }
+    }
+    out
 }
 
 fn str_at<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
@@ -160,6 +208,42 @@ pub fn propose_target_block(name: &str, host: &str, inv: &Value) -> String {
         }
     }
     out.push(String::new());
+
+    // adb: propose the one authorized device; multiple → pick-one comments.
+    let adb_line = |serial: &str, model: &str| {
+        let note = if model.is_empty() {
+            String::new()
+        } else {
+            format!("  # {model}")
+        };
+        format!("serial = \"{serial}\"{note}")
+    };
+    let adbs: Vec<(&str, &str)> = inv
+        .get("adb")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|d| Some((str_at(d, "serial")?, str_at(d, "model").unwrap_or(""))))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let [(serial, model)] = adbs.as_slice() {
+        out.push(format!("[targets.{name}.adb]"));
+        out.push(adb_line(serial, model));
+    } else if adbs.is_empty() {
+        out.push(format!(
+            "# [targets.{name}.adb]  # no adb devices discovered"
+        ));
+    } else {
+        out.push(format!(
+            "# [targets.{name}.adb]  # multiple adb devices — pick one:"
+        ));
+        for (serial, model) in &adbs {
+            out.push(format!("# {}", adb_line(serial, model)));
+        }
+    }
+    out.push(String::new());
+
     out.push(format!("# [targets.{name}.power]"));
     out.push("# cycle_cmd = \"/path/to/power-cycle.sh\"  # not discoverable".to_string());
 
@@ -248,10 +332,54 @@ mod tests {
 
     #[test]
     fn propose_with_empty_inventory_is_all_stubs() {
+        // No `adb` key at all — the missing-key path must still stub it out.
         let inv = json!({"ethernet": [], "serial": [], "video": []});
         let block = propose_target_block("t", "local", &inv);
         assert!(block.contains("# interface = \"\""), "{block}");
         assert!(block.contains("# [[targets.t.serial]]"), "{block}");
         assert!(block.contains("# [targets.t.video]"), "{block}");
+        assert!(
+            block.contains("# [targets.t.adb]  # no adb devices discovered"),
+            "{block}"
+        );
+    }
+
+    #[test]
+    fn propose_includes_single_adb_device() {
+        let inv = json!({
+            "ethernet": [], "serial": [], "video": [],
+            "adb": [{"serial": "33271JEGR02033", "model": "Pixel 6a"}],
+        });
+        let block = propose_target_block("pixel", "bench1", &inv);
+        assert!(block.contains("[targets.pixel.adb]"), "{block}");
+        assert!(
+            block.contains("serial = \"33271JEGR02033\"  # Pixel 6a"),
+            "{block}"
+        );
+    }
+
+    #[test]
+    fn propose_lists_multiple_adb_devices_as_alternatives() {
+        let inv = json!({
+            "ethernet": [], "serial": [], "video": [],
+            "adb": [{"serial": "AAA", "model": "Pixel 6a"}, {"serial": "BBB"}],
+        });
+        let block = propose_target_block("t", "local", &inv);
+        assert!(block.contains("multiple adb devices"), "{block}");
+        assert!(block.contains("# serial = \"AAA\"  # Pixel 6a"), "{block}");
+        assert!(block.contains("# serial = \"BBB\""), "{block}");
+    }
+
+    #[test]
+    fn parse_adb_devices_keeps_only_authorized() {
+        let text = "List of devices attached\n\
+             * daemon not running; starting now at tcp:5037\n\
+             33271JEGR02033         device usb:8-3.4 product:bluejay model:Pixel_6a transport_id:1\n\
+             EMULATOR30            offline\n\
+             FA6population          unauthorized\n";
+        let devs = parse_adb_devices(text);
+        assert_eq!(devs.len(), 1);
+        assert_eq!(devs[0]["serial"], "33271JEGR02033");
+        assert_eq!(devs[0]["model"], "Pixel 6a");
     }
 }

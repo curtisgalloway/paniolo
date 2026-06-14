@@ -25,6 +25,7 @@ and power-cycle it without a person at the bench each iteration. See the root
 | [Dashboard](dashboard.md) | `paniolo console` | Combined video + serial web UI. |
 | [HID injection](hid.md) | `paniolo hid` | USB keyboard/mouse injection via a generic helper hook; `hidrig` KB2040 injector; KVM input from the web console. |
 | [HID serial protocol](hid-serial-protocol.md) | — | Normative command vocabulary (v1) — the external interface `hidrig` composes from; the dual-board device wire is in [hid-dual-board-design.md](hid-dual-board-design.md). |
+| [adb (Android targets)](adb.md) | `paniolo adb` | Drive an Android DUT over adb — console (`adb shell`/`run`), screen (`screencap`), and input (`adb input`); one transport, no capture/HID/serial rig. |
 
 ## Distributed control (Phases 0–5 shipped)
 

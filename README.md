@@ -20,6 +20,7 @@ and power-cycle it without human intervention at each iteration.
 | [Serial](docs/serial.md) | `paniolo serial` | Serial console — interactive (tio) or daemon-backed with timestamped rolling log |
 | [Power control](docs/power.md) | `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`, `paniolo serial dtr/reset` | DTR-based hardware power button (J2 header) and generic shell-command hooks (on/off/cycle/state); helpers: `cambrionix` (Cambrionix hub ports), `usbhub` (off-the-shelf USB hub ports), `zigplug` (Zigbee smart plugs), `shellyplug` (Shelly Gen2+ plugs/relays over local HTTP RPC) |
 | [HID injection](docs/hid.md) | `paniolo hid` | USB keyboard/mouse injection via a generic helper hook (`hidrig` KB2040 injector); KVM input from the web console |
+| [adb (Android targets)](docs/adb.md) | `paniolo adb` | Drive an Android DUT over adb — console (`shell`/`run`), screen (`screencap`), and input — one USB cable, no capture/HID/serial rig |
 | [Dashboard](docs/dashboard.md) | `paniolo console` | Combined video + serial web UI; auto-starts daemons; `-i <name>` preselects a serial interface |
 | Agent skills | `paniolo skill` | List the bundled agent guides (driving a target, GUI puppeting, USB-hub power), or print one's `SKILL.md` for an agent to read |
 

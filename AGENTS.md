@@ -90,7 +90,8 @@ Python tree below:
 
 - **Config is one CLI-managed lab file** (`~/.config/paniolo/lab.toml`, or
   `--lab`/`PANIOLO_LAB`): hosts + targets, each target's hardware as *channels*
-  (`netboot`, `serial[]`, `power`, `video`, `hid`) with per-channel host binding.
+  (`netboot`, `serial[]`, `power`, `video`, `hid`, `adb`) with per-channel host
+  binding.
   Edited surgically via `toml_edit` (hand-comments survive); validated on load
   and before every save. The legacy `~/.config/paniolo/targets/*.toml` files are
   not used by the Rust CLI.
@@ -118,9 +119,9 @@ Python tree below:
   optional positional (`netboot start pi5`, `serial log pi5`, `video stop
   pi5`); channel-config commands (`set`/`add`/`rm`) take `-t/--target`.
   `serial send` and `serial log` accept `-t` as well (`serial send` reads two
-  positionals as `<target> <text>`, one as just the text); `hid send` is the
-  one runtime command that takes `-t` only, because its positional tail is
-  the helper's args.
+  positionals as `<target> <text>`, one as just the text); `hid send`, `adb
+  run`, and `adb input` take `-t` only, because their positional tail is the
+  helper's / `adb`'s args.
 - **`paniolo daemons`** is the unified daemon inventory: every discovery-file
   daemon under `/tmp/paniolo-<uid>/` (serialcap, hdmicap, hid, zigplug),
   netbootd via its state files, plus *stray* helper processes running out of
@@ -140,6 +141,8 @@ cli/src/
                 legacy ~/.cargo/bin), hook_path, daemon.json discovery, wait
   serial.rs     serialcap orchestration + tio exec + /input + device listing
   video.rs      hdmicap orchestration (daemon start/stop, client passthrough)
+  adb.rs        adb transport (argv build, shell exec, run/input passthrough,
+                exec-out screencap → PNG) — a generic transport in core, no helper
   netboot.rs    netbootd lifecycle (spawn with log, stop, status)
   netif.rs      interface discovery/config (sudo), netboot/ffx/off modes
   power.rs      generic power hooks (on/off/cycle/state_cmd via sh -c), DTR via
