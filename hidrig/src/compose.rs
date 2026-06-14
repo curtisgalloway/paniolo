@@ -249,10 +249,8 @@ impl Composer {
     fn kbd(&self, extra_mods: u8, extra_keys: &[u8]) -> Frame {
         let mut report = [0u8; 8];
         report[0] = self.held_mods | extra_mods;
-        let mut slot = 0;
-        for &k in self.held_keys.iter().chain(extra_keys).take(6) {
+        for (slot, &k) in self.held_keys.iter().chain(extra_keys).take(6).enumerate() {
             report[2 + slot] = k;
-            slot += 1;
         }
         frame(F_HID, RID_KBD, &report)
     }
@@ -417,7 +415,12 @@ impl Composer {
         match head.to_ascii_lowercase().as_str() {
             "type" => Ok(self.type_text(rest)),
             "key" => self.key(rest),
-            "combo" => self.combo(&rest.split_whitespace().map(str::to_string).collect::<Vec<_>>()),
+            "combo" => self.combo(
+                &rest
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+            ),
             "down" => self.down(rest),
             "up" => self.up(rest),
             "releaseall" => Ok(self.releaseall()),
@@ -478,7 +481,10 @@ mod tests {
         let mut c = Composer::new();
         // 0x1234 = 4660; lo=0x34 hi=0x12.
         let f = c.moveabs(0x1234, 0x0056).pop().unwrap();
-        assert_eq!(f, vec![0x01, 0x02, 0x06, 0x00, 0x34, 0x12, 0x56, 0x00, 0x00]);
+        assert_eq!(
+            f,
+            vec![0x01, 0x02, 0x06, 0x00, 0x34, 0x12, 0x56, 0x00, 0x00]
+        );
     }
 
     #[test]
@@ -494,7 +500,10 @@ mod tests {
         let c = Composer::new();
         let frames = c.type_text("A");
         // press: shift modifier + 'a' usage 0x04; release: all zero.
-        assert_eq!(frames[0], vec![0x01, 0x01, 0x08, 0x02, 0, 0x04, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            frames[0],
+            vec![0x01, 0x01, 0x08, 0x02, 0, 0x04, 0, 0, 0, 0, 0]
+        );
         assert_eq!(frames[1], vec![0x01, 0x01, 0x08, 0, 0, 0, 0, 0, 0, 0, 0]);
     }
 
@@ -510,7 +519,10 @@ mod tests {
         let c = Composer::new();
         let frames = c.combo(&["LEFT_CONTROL".into(), "C".into()]).unwrap();
         // press: ctrl bit 0x01, key 'c' = 0x06.
-        assert_eq!(frames[0], vec![0x01, 0x01, 0x08, 0x01, 0, 0x06, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            frames[0],
+            vec![0x01, 0x01, 0x08, 0x01, 0, 0x06, 0, 0, 0, 0, 0]
+        );
         assert_eq!(frames[1], vec![0x01, 0x01, 0x08, 0x00, 0, 0, 0, 0, 0, 0, 0]);
     }
 
@@ -531,7 +543,7 @@ mod tests {
         let frames = c.click("left").unwrap();
         assert_eq!(frames[0][3], 0x01); // button bit set
         assert_eq!(frames[1][3], 0x00); // released
-        // both at the same position (x lo/hi)
+                                        // both at the same position (x lo/hi)
         assert_eq!(&frames[0][4..6], &frames[1][4..6]);
     }
 
@@ -546,15 +558,24 @@ mod tests {
     fn power_frames() {
         let mut c = Composer::new();
         // [0x02][CMD_POWER=3][len][action] — off=0, on=1, cycle=2.
-        assert_eq!(c.dispatch("power off").unwrap(), vec![vec![0x02, 0x03, 0x01, 0x00]]);
-        assert_eq!(c.dispatch("power on").unwrap(), vec![vec![0x02, 0x03, 0x01, 0x01]]);
+        assert_eq!(
+            c.dispatch("power off").unwrap(),
+            vec![vec![0x02, 0x03, 0x01, 0x00]]
+        );
+        assert_eq!(
+            c.dispatch("power on").unwrap(),
+            vec![vec![0x02, 0x03, 0x01, 0x01]]
+        );
         // cycle with an explicit off-time carries a second payload byte.
         assert_eq!(
             c.dispatch("power cycle 5").unwrap(),
             vec![vec![0x02, 0x03, 0x02, 0x02, 0x05]]
         );
         // bare cycle omits the off-time (firmware default).
-        assert_eq!(c.dispatch("power cycle").unwrap(), vec![vec![0x02, 0x03, 0x01, 0x02]]);
+        assert_eq!(
+            c.dispatch("power cycle").unwrap(),
+            vec![vec![0x02, 0x03, 0x01, 0x02]]
+        );
         assert!(c.dispatch("power sideways").is_err());
     }
 
