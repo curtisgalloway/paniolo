@@ -23,7 +23,7 @@
 //! ```text
 //! [type][b1][len][payload .. len bytes]
 //!   0x01  rid  N    N report bytes  (rid 1 = keyboard / 8 B, 2 = abs mouse / 6 B)
-//!   0x02  cmd  N    N arg bytes     (cmd 1 = ping, 2 = version)
+//!   0x02  cmd  N    N arg bytes     (cmd 1 = ping, 2 = version, 3 = power)
 //! ```
 //! Reports match the descriptor in `hidrig/firmware/dual/target/boot.py`:
 //! keyboard report id 1 (`[modifier, 0, k1..k6]`), absolute pointer report id 2
@@ -37,6 +37,12 @@ pub const RID_KBD: u8 = 1;
 pub const RID_MOUSE: u8 = 2;
 pub const CMD_PING: u8 = 1;
 pub const CMD_VERSION: u8 = 2;
+pub const CMD_POWER: u8 = 3;
+
+/// Power-relay actions, carried as payload byte 0 of a `power` control frame.
+const POWER_OFF: u8 = 0;
+const POWER_ON: u8 = 1;
+const POWER_CYCLE: u8 = 2;
 
 /// Absolute-pointer logical maximum (`moveabs` axis range is `0..=ABS_MAX`).
 pub const ABS_MAX: i32 = 32_767;
@@ -380,6 +386,24 @@ impl Composer {
         frame(F_CTRL, CMD_VERSION, &[])
     }
 
+    /// `power off|on|cycle [secs]`: a control frame the control board acts on by
+    /// driving the DUT power relay (a hard-cut load switch). `secs` applies only
+    /// to `cycle` — the off-time before power returns; omitted/0 uses the
+    /// firmware default. The board answers with an ack.
+    pub fn power(&self, action: &str, secs: Option<u8>) -> Result<Frame> {
+        let a = match action.to_ascii_lowercase().as_str() {
+            "off" => POWER_OFF,
+            "on" => POWER_ON,
+            "cycle" => POWER_CYCLE,
+            other => return Err(anyhow!("unknown power action: {other} (use off|on|cycle)")),
+        };
+        let payload: Vec<u8> = match secs {
+            Some(s) if a == POWER_CYCLE => vec![a, s],
+            _ => vec![a],
+        };
+        Ok(frame(F_CTRL, CMD_POWER, &payload))
+    }
+
     /// Compose one v1 ASCII command line into the frames to send. The single
     /// composition entry point shared by the one-shot CLI and the daemon (it
     /// replaces the firmware's `handle_line`).
@@ -416,6 +440,18 @@ impl Composer {
             }
             "ping" => Ok(vec![self.ping()]),
             "version" => Ok(vec![self.version()]),
+            "power" => {
+                let mut it = rest.split_whitespace();
+                let action = it
+                    .next()
+                    .ok_or_else(|| anyhow!("power needs an action: off|on|cycle"))?;
+                let secs = it
+                    .next()
+                    .map(|t| t.parse::<u8>())
+                    .transpose()
+                    .map_err(|_| anyhow!("power cycle seconds must be 0..=255"))?;
+                Ok(vec![self.power(action, secs)?])
+            }
             "" => Ok(Vec::new()),
             other => Err(anyhow!("unknown command: {other}")),
         }
@@ -504,6 +540,22 @@ mod tests {
         let c = Composer::new();
         assert_eq!(c.ping(), vec![0x02, 0x01, 0x00]);
         assert_eq!(c.version(), vec![0x02, 0x02, 0x00]);
+    }
+
+    #[test]
+    fn power_frames() {
+        let mut c = Composer::new();
+        // [0x02][CMD_POWER=3][len][action] — off=0, on=1, cycle=2.
+        assert_eq!(c.dispatch("power off").unwrap(), vec![vec![0x02, 0x03, 0x01, 0x00]]);
+        assert_eq!(c.dispatch("power on").unwrap(), vec![vec![0x02, 0x03, 0x01, 0x01]]);
+        // cycle with an explicit off-time carries a second payload byte.
+        assert_eq!(
+            c.dispatch("power cycle 5").unwrap(),
+            vec![vec![0x02, 0x03, 0x02, 0x02, 0x05]]
+        );
+        // bare cycle omits the off-time (firmware default).
+        assert_eq!(c.dispatch("power cycle").unwrap(), vec![vec![0x02, 0x03, 0x01, 0x02]]);
+        assert!(c.dispatch("power sideways").is_err());
     }
 
     #[test]
