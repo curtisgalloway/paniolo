@@ -11,6 +11,10 @@ HID semantics.
 - The **target** board faces the device-under-test (DUT) over **USB-HID** and
   is the I2C1 **peripheral**.
 
+The control board also bridges the DUT's **serial console** (its hardware UART)
+and switches **DUT power** through a relay, so one USB-attached device drives the
+target's HID, console, *and* power together (design §6–§7).
+
 `hidrig` turns each command (`type`, `key`, `moveabs`, …) into HID report
 bytes, wraps them in binary frames, and writes them to the control board's
 data CDC endpoint. The control board relays HID frames verbatim over I2C1 to
@@ -24,8 +28,10 @@ firmware bring-up runbook is in
 [Control host]
       |  USB-CDC (hidrig writes binary HID frames to the data endpoint)
       v
-[Control KB2040]  -- I2C1 controller, routes frames by type byte
-      |  I2C1: GP10 = SDA, GP19 = SCL, GND   (target addr 0x41, 4.7 kΩ pull-ups)
+[Control KB2040]  -- routes frames by type byte; UART console bridge; power relay
+      |  I2C1:  GP10 = SDA, GP19 = SCL, GND   (target addr 0x41, 4.7 kΩ pull-ups)
+      |  UART0: GP0 = TX, GP1 = RX         <--->  DUT serial console
+      |  GP5  -> relay / load-switch        --->  DUT power
       v
 [Target KB2040]   -- I2C1 peripheral; relays report bytes to send_report
       |  built-in USB (HID keyboard + absolute mouse)
@@ -49,14 +55,20 @@ uniform frame format on both legs:
 ```
 [type][b1][len][payload .. len bytes]
   0x01  rid  N   N HID report bytes   (rid 1 = keyboard / 8 B, 2 = abs mouse / 6 B)
-  0x02  cmd  N   N arg bytes          (cmd 1 = ping, 2 = version)
+  0x02  cmd  N   N arg bytes          (cmd 1 = ping, 2 = version, 3 = power)
+  0x03  port N   N raw console bytes  (DUT serial console, both directions)
 ```
 
 - **HID frames (`0x01`) are fire-and-forget** — no per-frame ack. `hidrig`
   paces them to the downstream USB poll interval (`bInterval`).
-- **Control frames (`0x02`) are request/reply** — `ping` and `version` draw a
-  `[0x02][cmd][len][payload]` reply. `version` returns the control board's
-  implementation id (`dual-control/1`).
+- **Control frames (`0x02`) are request/reply** — `ping`, `version`, and
+  `power` draw a `[0x02][cmd][len][payload]` reply. `version` returns the
+  control board's implementation id (`dual-control/1`); `power` acks before
+  acting (a `power cycle` blocks the board only for its off-time).
+- **Console frames (`0x03`) are a bidirectional byte pipe** to/from the DUT's
+  serial console on the control board's hardware UART. They are fire-and-forget;
+  the `serve` daemon demuxes inbound console output and re-exports it as a PTY
+  (see *DUT serial console* below).
 
 Because the host composes reports, its composer must match the target board's
 HID **descriptor** exactly (report IDs, field order, the 0..32767 absolute
@@ -78,10 +90,20 @@ host↔rig contract. See `src/compose.rs` for the composition and framing.
 I2C1 pins (KB2040 labels): **`D10` = GP10 = SDA**, **`MOSI` = GP19 = SCL**.
 Target peripheral address **0x41**.
 
+**DUT serial console** (control board): hardware **UART0**, **`TX` = GP0**,
+**`RX` = GP1** — wire `TX → DUT RX`, `RX → DUT TX`, common `GND`, at the DUT's
+console logic level (3.3 V; never RS-232 voltages without a level shifter).
+
+**DUT power** (control board): a free GPIO, **`D5` = GP5** by default, drives a
+relay / load-switch on the DUT's 5 V — a Pi 5 pulls ~5 A, so this is a real
+switch, not the GPIO driving the rail. Active-high by default (`RELAY_PIN` /
+`RELAY_ACTIVE_HIGH` in `control/code.py`).
+
 The two boards sit in **different power domains** — the control board is
 host-USB powered, the target board is DUT-USB powered. That's fine while both
-are powered for bench bring-up; see design §6 for the back-powering caution
-before this goes near a real DUT power cycle.
+are powered for bench bring-up; see design §7 for the back-powering caution
+before this goes near a real DUT power cycle. Because the target board is
+DUT-powered, a `power cycle` also resets it — it re-enumerates as the DUT boots.
 
 ## Firmware setup
 
@@ -129,6 +151,8 @@ hidrig -d /dev/cu.usbmodemXXXX move 300 -50       # relative
 hidrig -d /dev/cu.usbmodemXXXX moveabs 16383 16383 # absolute (0..32767 logical; centre)
 hidrig -d /dev/cu.usbmodemXXXX click right
 hidrig -d /dev/cu.usbmodemXXXX scroll -3
+hidrig -d /dev/cu.usbmodemXXXX power cycle         # DUT power off/on via the relay
+hidrig -d /dev/cu.usbmodemXXXX power off           # off | on | cycle [secs]
 hidrig -d /dev/cu.usbmodemXXXX run boot-seq.txt   # command file; '-' = stdin
 ```
 
@@ -165,6 +189,36 @@ demand and the dashboard streams keyboard + absolute-mouse events to it — see
 > negotiation** — USB sets the real rate and the nominal "baud" is ignored.
 > (The retired single-board UART path used a 115200→460800 negotiation; that is
 > gone.)
+
+### DUT power and serial console
+
+`hidrig power off|on|cycle [secs]` switches the DUT through the control board's
+relay; it surfaces to paniolo as a normal power-helper behind the `power` hook,
+and a `cycle` acks immediately, then the board holds power off for the given
+seconds (firmware default 2 s).
+
+When the `serve` daemon runs, it also bridges the DUT's serial console (control
+board UART0) and **re-exports it as a PTY**, so paniolo's existing `serial`
+channel attaches with no special handling. The daemon publishes a stable symlink
+and records it in its discovery file; point a `serial` channel's `device =` at
+that path (`/tmp/paniolo-<uid>/hid/console`):
+
+```toml
+[[targets.pi5.serial]]
+name   = "console"
+device = "/tmp/paniolo-501/hid/console"   # the hidrig daemon's console PTY
+baud   = 115200                            # nominal; the UART rate is fixed in firmware
+# no power_sense_signal — a PTY has no modem-control lines (use `hidrig power` instead)
+```
+
+Then `paniolo serial watch/connect/send/log` work as usual. The console exists
+only while the daemon is serving, so bring the hid daemon up first (any
+`paniolo hid …` or `paniolo console` for the target starts it). A PTY has no
+DTR/CTS, so `serial dtr`/`reset` and `power_sense_signal` don't apply.
+
+> **Status:** the console bridge and relay are not yet hardware-verified — in
+> particular the PTY round trip through `tio`/serialcap should be confirmed on
+> the bench before relying on it (design §6).
 
 ## paniolo integration
 
@@ -229,10 +283,11 @@ hidrig/
   src/main.rs       # `hidrig` CLI: one-shots, `run`, `serve`/`stop`
   src/compose.rs    # HID composition: command vocabulary -> report bytes -> binary frames
   src/proto.rs      # control-link transport (binary frames over CDC) + command-file parser
-  src/uart.rs       # daemon: the single control-link owner (serializes all commands)
+  src/uart.rs       # daemon: the single control-link owner (HID/control + console demux)
+  src/pty.rs        # daemon: PTY that re-exports the DUT console into paniolo's serial channel
   src/server.rs     # daemon: axum WebSocket /hid + POST /send
-  src/daemon.rs     # daemon: lock, discovery file, lifecycle
-  firmware/dual/control/   # control board: USB-CDC <-> I2C1 controller, routes by type byte
+  src/daemon.rs     # daemon: lock, discovery file, console PTY symlink, lifecycle
+  firmware/dual/control/   # control board: routes by type byte; UART console bridge; power relay
   firmware/dual/target/    # target board: I2C1 peripheral -> USB-HID send_report (dumb relay)
   firmware/dual/host_send.py  # dependency-free poke tool (push raw frames to the control board)
   firmware/dual/README.md     # firmware bring-up runbook

@@ -34,8 +34,18 @@ host_send.py  -> host-side test driver (push frames to the control board, M2)
 - **Pull-ups are required:** ~4.7 kΩ from SDA→3.3 V and SCL→3.3 V (one set, on
   either board). Without them the link silently fails (control board blinks red).
 - The boards sit in **different power domains** (control = host USB, target = DUT
-  USB). Fine while both are powered for bench bring-up; see design §6 for the
+  USB). Fine while both are powered for bench bring-up; see design §7 for the
   back-powering caution before this goes near a real DUT power cycle.
+
+**DUT-side wiring (control board → DUT)** for the serial-console bridge and the
+power relay:
+
+| control board | DUT | note |
+|---|---|---|
+| TX / GP0 | DUT console **RX** | UART0; 3.3 V logic (level-shift true RS-232) |
+| RX / GP1 | DUT console **TX** | UART0 |
+| GND | DUT GND | common ground for the console |
+| D5 / GP5 | relay / load-switch control | switches the DUT's 5 V — a real switch, not the GPIO driving the rail |
 
 ## Bring-up
 
@@ -68,7 +78,7 @@ The target needs CircuitPython's `i2ctarget` module. Confirm at the target's REP
 ```
 
 If that raises `ImportError`, this CircuitPython build lacks I2C-target support and
-the transport decision tips to UART (design §8.1).
+the transport decision tips to UART (design §9.1).
 
 ## Mode switching (target board): dev vs HID-only
 
@@ -94,14 +104,16 @@ install this firmware the first time).
 The control board reads length-prefixed binary frames from `usb_cdc.data` and
 routes them by type byte: `0x01` HID frames are relayed **verbatim** over I2C1 to
 the target (which injects them as USB-HID); `0x02` control frames are handled
-locally (ping, version). The host composes the report bytes.
+locally (ping, version, power); `0x03` console frames bridge the DUT UART (see
+Milestone 4). The host composes the report bytes.
 
 Uniform frame format (byte-stream parseable on both the CDC and I2C legs):
 
 ```
 [type][b1][len][payload .. len bytes]
   0x01  rid  N    N HID report bytes   (rid 1 = keyboard / 8 B, 2 = abs mouse / 6 B)
-  0x02  cmd  N    N arg bytes          (cmd 1 = ping, 2 = version)
+  0x02  cmd  N    N arg bytes          (cmd 1 = ping, 2 = version, 3 = power)
+  0x03  port N    N raw console bytes  (DUT serial console, both directions)
 ```
 
 Drive it from the host with `host_send.py`, pointed at the control board's
@@ -137,3 +149,30 @@ composition state (held keys, virtual cursor) and re-exposes the command protoco
 over a localhost WebSocket, so `paniolo console` and `paniolo hid send` drive the
 rig unchanged. The single-board rig can later adopt the same composition against a
 dumb single-board firmware (frames over its UART).
+
+## Milestone 4 — DUT console bridge + power relay (added)
+
+The control board gained two DUT-facing capabilities (design §6–§7), both wired
+on the control side (see *Wiring*):
+
+- **Serial console.** Hardware UART0 (`TX = GP0`, `RX = GP1`) bridges the DUT's
+  console: inbound `0x03` frames are written to the UART, and UART RX bytes are
+  framed back to the host as `0x03`. The `hidrig serve` daemon demuxes that
+  stream and re-exports it as a **PTY**, which paniolo's `serial` channel opens
+  (`device = /tmp/paniolo-<uid>/hid/console`). The board never interprets console
+  bytes — the same dumb-pipe rule as HID.
+- **Power.** `D5 = GP5` drives a relay / load-switch on the DUT's 5 V.
+  `hidrig power off|on|cycle [secs]` sends a `0x02` power frame; the board acks,
+  then acts (`cycle` holds power off for `secs`, default 2 s). The relay pin and
+  polarity are `RELAY_PIN` / `RELAY_ACTIVE_HIGH` at the top of `control/code.py`.
+
+```bash
+hidrig -d /dev/cu.usbmodemXXXX power cycle            # power-cycle the DUT
+hidrig -d /dev/cu.usbmodemXXXX serve                  # also bridges the console as a PTY
+paniolo serial watch -t pi5                           # attach to the PTY console
+```
+
+> **Not yet hardware-verified.** Confirm on the bench: the UART console round
+> trip (host ↔ DUT), the relay polarity/sizing, and that `tio`/serialcap behave
+> on the daemon's PTY (design §6). Watch the control board's loop headroom when a
+> DUT boot-log streams while HID is relaying (design §9.5).
