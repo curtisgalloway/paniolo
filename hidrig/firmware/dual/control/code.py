@@ -45,6 +45,7 @@ import time
 import board
 import busio
 import digitalio
+import microcontroller
 import neopixel_write
 import usb_cdc
 
@@ -71,6 +72,12 @@ POWER_CYCLE = 2
 RELAY_PIN = board.D5
 RELAY_ACTIVE_HIGH = True
 DEFAULT_CYCLE_OFF_S = 2
+# Persist the relay state across control-board resets (replug / code reload /
+# host reboot) in this board's NVM, so a control-board glitch doesn't surprise-
+# toggle DUT power. Byte: 0 = off, anything else (incl. erased 0xFF) = on, so a
+# fresh board defaults to powered-on. (Brief caveat: GP5 floats at its reset
+# state for ~300 ms before code.py restores this — a momentary blip on reset.)
+NVM_POWER_BYTE = 0
 
 # DUT serial console on the hardware UART (UART0: TX=GP0, RX=GP1). Bridged to
 # the host as 0x03 frames. A larger RX ring absorbs DUT boot-log bursts while
@@ -95,6 +102,12 @@ _relay.direction = digitalio.Direction.OUTPUT
 
 def set_power(on):
     _relay.value = on if RELAY_ACTIVE_HIGH else (not on)
+    microcontroller.nvm[NVM_POWER_BYTE] = 1 if on else 0
+
+
+def restore_power():
+    """Drive the relay to its last persisted state (default on if NVM erased)."""
+    set_power(microcontroller.nvm[NVM_POWER_BYTE] != 0)
 
 
 def apply_power(action, secs):
@@ -110,11 +123,21 @@ def apply_power(action, secs):
         set_power(True)
 
 
-set_power(True)  # DUT powered by default when the rig comes up
+restore_power()  # resume the last relay state across a control-board reset
 
 
 # scl = MOSI (GP19), sda = D10 (GP10)  ->  I2C1, the inter-board link.
-i2c = busio.I2C(board.MOSI, board.D10, frequency=100000)
+# Non-fatal: the power relay and DUT console live on THIS board and must come up
+# even when the target/HID side (and its pull-ups) isn't wired — and a power
+# cycle deliberately drops the DUT-powered target board, so requiring I2C here
+# would crash the control board every time power is off. HID relay is skipped
+# while i2c is None.
+try:
+    i2c = busio.I2C(board.MOSI, board.D10, frequency=100000)
+except (RuntimeError, ValueError) as e:
+    i2c = None
+    if DEBUG:
+        print("control: I2C1 unavailable, HID relay disabled:", e)
 
 data = usb_cdc.data  # binary frame channel from the host (None if not enabled)
 
@@ -135,6 +158,9 @@ except (ValueError, RuntimeError) as e:
 
 def relay_hid(frame):
     """Forward an HID frame verbatim over I2C to the target board."""
+    if i2c is None:
+        status(16, 8, 0)  # amber: HID frame dropped, I2C link down
+        return
     while not i2c.try_lock():
         pass
     try:
