@@ -316,6 +316,14 @@ paniolo hid send -t <name> click left | scroll -3 | releaseall
 paniolo hid send -t <name> ping               # injector liveness check
 ```
 
+The same dual-board control board can also back this target's **serial** and
+**power** channels: when `hidrig serve` runs it bridges the DUT's serial console
+and re-exports it as a PTY (point a `serial` channel's `device =` at
+`/tmp/paniolo-<uid>/hid/console`), and `hidrig power off|on|cycle` switches DUT
+power via a relay (behind the `power` hook) — one USB device for HID, console,
+and power. (The relay/power path is hardware-verified, incl. state persistence
+across a control-board reset; the console bridge is new and not yet verified.)
+
 Absolute mouse (click-where-you-point): `paniolo hid send -t <name> moveabs
 <x> <y>` positions the cursor in a 0..32767 logical space the OS maps across
 the screen (the KB2040 firmware advertises the `moveabs` capability).

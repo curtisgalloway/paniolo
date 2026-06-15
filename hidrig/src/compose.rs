@@ -23,7 +23,7 @@
 //! ```text
 //! [type][b1][len][payload .. len bytes]
 //!   0x01  rid  N    N report bytes  (rid 1 = keyboard / 8 B, 2 = abs mouse / 6 B)
-//!   0x02  cmd  N    N arg bytes     (cmd 1 = ping, 2 = version)
+//!   0x02  cmd  N    N arg bytes     (cmd 1 = ping, 2 = version, 3 = power)
 //! ```
 //! Reports match the descriptor in `hidrig/firmware/dual/target/boot.py`:
 //! keyboard report id 1 (`[modifier, 0, k1..k6]`), absolute pointer report id 2
@@ -37,6 +37,12 @@ pub const RID_KBD: u8 = 1;
 pub const RID_MOUSE: u8 = 2;
 pub const CMD_PING: u8 = 1;
 pub const CMD_VERSION: u8 = 2;
+pub const CMD_POWER: u8 = 3;
+
+/// Power-relay actions, carried as payload byte 0 of a `power` control frame.
+const POWER_OFF: u8 = 0;
+const POWER_ON: u8 = 1;
+const POWER_CYCLE: u8 = 2;
 
 /// Absolute-pointer logical maximum (`moveabs` axis range is `0..=ABS_MAX`).
 pub const ABS_MAX: i32 = 32_767;
@@ -243,10 +249,8 @@ impl Composer {
     fn kbd(&self, extra_mods: u8, extra_keys: &[u8]) -> Frame {
         let mut report = [0u8; 8];
         report[0] = self.held_mods | extra_mods;
-        let mut slot = 0;
-        for &k in self.held_keys.iter().chain(extra_keys).take(6) {
+        for (slot, &k) in self.held_keys.iter().chain(extra_keys).take(6).enumerate() {
             report[2 + slot] = k;
-            slot += 1;
         }
         frame(F_HID, RID_KBD, &report)
     }
@@ -380,6 +384,24 @@ impl Composer {
         frame(F_CTRL, CMD_VERSION, &[])
     }
 
+    /// `power off|on|cycle [secs]`: a control frame the control board acts on by
+    /// driving the DUT power relay (a hard-cut load switch). `secs` applies only
+    /// to `cycle` — the off-time before power returns; omitted/0 uses the
+    /// firmware default. The board answers with an ack.
+    pub fn power(&self, action: &str, secs: Option<u8>) -> Result<Frame> {
+        let a = match action.to_ascii_lowercase().as_str() {
+            "off" => POWER_OFF,
+            "on" => POWER_ON,
+            "cycle" => POWER_CYCLE,
+            other => return Err(anyhow!("unknown power action: {other} (use off|on|cycle)")),
+        };
+        let payload: Vec<u8> = match secs {
+            Some(s) if a == POWER_CYCLE => vec![a, s],
+            _ => vec![a],
+        };
+        Ok(frame(F_CTRL, CMD_POWER, &payload))
+    }
+
     /// Compose one v1 ASCII command line into the frames to send. The single
     /// composition entry point shared by the one-shot CLI and the daemon (it
     /// replaces the firmware's `handle_line`).
@@ -393,7 +415,12 @@ impl Composer {
         match head.to_ascii_lowercase().as_str() {
             "type" => Ok(self.type_text(rest)),
             "key" => self.key(rest),
-            "combo" => self.combo(&rest.split_whitespace().map(str::to_string).collect::<Vec<_>>()),
+            "combo" => self.combo(
+                &rest
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+            ),
             "down" => self.down(rest),
             "up" => self.up(rest),
             "releaseall" => Ok(self.releaseall()),
@@ -416,6 +443,18 @@ impl Composer {
             }
             "ping" => Ok(vec![self.ping()]),
             "version" => Ok(vec![self.version()]),
+            "power" => {
+                let mut it = rest.split_whitespace();
+                let action = it
+                    .next()
+                    .ok_or_else(|| anyhow!("power needs an action: off|on|cycle"))?;
+                let secs = it
+                    .next()
+                    .map(|t| t.parse::<u8>())
+                    .transpose()
+                    .map_err(|_| anyhow!("power cycle seconds must be 0..=255"))?;
+                Ok(vec![self.power(action, secs)?])
+            }
             "" => Ok(Vec::new()),
             other => Err(anyhow!("unknown command: {other}")),
         }
@@ -442,7 +481,10 @@ mod tests {
         let mut c = Composer::new();
         // 0x1234 = 4660; lo=0x34 hi=0x12.
         let f = c.moveabs(0x1234, 0x0056).pop().unwrap();
-        assert_eq!(f, vec![0x01, 0x02, 0x06, 0x00, 0x34, 0x12, 0x56, 0x00, 0x00]);
+        assert_eq!(
+            f,
+            vec![0x01, 0x02, 0x06, 0x00, 0x34, 0x12, 0x56, 0x00, 0x00]
+        );
     }
 
     #[test]
@@ -458,7 +500,10 @@ mod tests {
         let c = Composer::new();
         let frames = c.type_text("A");
         // press: shift modifier + 'a' usage 0x04; release: all zero.
-        assert_eq!(frames[0], vec![0x01, 0x01, 0x08, 0x02, 0, 0x04, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            frames[0],
+            vec![0x01, 0x01, 0x08, 0x02, 0, 0x04, 0, 0, 0, 0, 0]
+        );
         assert_eq!(frames[1], vec![0x01, 0x01, 0x08, 0, 0, 0, 0, 0, 0, 0, 0]);
     }
 
@@ -474,7 +519,10 @@ mod tests {
         let c = Composer::new();
         let frames = c.combo(&["LEFT_CONTROL".into(), "C".into()]).unwrap();
         // press: ctrl bit 0x01, key 'c' = 0x06.
-        assert_eq!(frames[0], vec![0x01, 0x01, 0x08, 0x01, 0, 0x06, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            frames[0],
+            vec![0x01, 0x01, 0x08, 0x01, 0, 0x06, 0, 0, 0, 0, 0]
+        );
         assert_eq!(frames[1], vec![0x01, 0x01, 0x08, 0x00, 0, 0, 0, 0, 0, 0, 0]);
     }
 
@@ -495,7 +543,7 @@ mod tests {
         let frames = c.click("left").unwrap();
         assert_eq!(frames[0][3], 0x01); // button bit set
         assert_eq!(frames[1][3], 0x00); // released
-        // both at the same position (x lo/hi)
+                                        // both at the same position (x lo/hi)
         assert_eq!(&frames[0][4..6], &frames[1][4..6]);
     }
 
@@ -504,6 +552,31 @@ mod tests {
         let c = Composer::new();
         assert_eq!(c.ping(), vec![0x02, 0x01, 0x00]);
         assert_eq!(c.version(), vec![0x02, 0x02, 0x00]);
+    }
+
+    #[test]
+    fn power_frames() {
+        let mut c = Composer::new();
+        // [0x02][CMD_POWER=3][len][action] — off=0, on=1, cycle=2.
+        assert_eq!(
+            c.dispatch("power off").unwrap(),
+            vec![vec![0x02, 0x03, 0x01, 0x00]]
+        );
+        assert_eq!(
+            c.dispatch("power on").unwrap(),
+            vec![vec![0x02, 0x03, 0x01, 0x01]]
+        );
+        // cycle with an explicit off-time carries a second payload byte.
+        assert_eq!(
+            c.dispatch("power cycle 5").unwrap(),
+            vec![vec![0x02, 0x03, 0x02, 0x02, 0x05]]
+        );
+        // bare cycle omits the off-time (firmware default).
+        assert_eq!(
+            c.dispatch("power cycle").unwrap(),
+            vec![vec![0x02, 0x03, 0x01, 0x02]]
+        );
+        assert!(c.dispatch("power sideways").is_err());
     }
 
     #[test]

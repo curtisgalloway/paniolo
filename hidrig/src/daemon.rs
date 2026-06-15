@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::server::{self, AppState};
 use crate::uart::HidHandle;
@@ -44,6 +44,11 @@ pub struct Discovery {
     pub port: u16,
     /// The control UART this daemon owns (so a CLI one-shot can match its -d).
     pub device: String,
+    /// The DUT serial-console PTY (a stable symlink to the slave device) that
+    /// paniolo's `serial` channel points its `device =` at, when the console
+    /// bridge is up. Absent if PTY allocation failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console: Option<String>,
 }
 
 /// The daemon's runtime dir. Paniolo passes the canonical location as
@@ -111,7 +116,38 @@ pub fn run(device: String, port: u16) -> Result<()> {
         .build()?;
 
     rt.block_on(async move {
-        let hid = HidHandle::spawn(device.clone());
+        // Bring up the DUT serial-console PTY and publish a stable symlink that
+        // paniolo's `serial` channel points its `device =` at. Best-effort: if
+        // PTY allocation fails the daemon still serves HID/control, just without
+        // a console. `console_link` is set only when we created a symlink, so
+        // shutdown removes ours and never the /dev/pts node itself.
+        let mut console_master = None;
+        let mut console_path = None;
+        let mut console_link = None;
+        match crate::pty::open() {
+            Ok(p) => {
+                let link = runtime_dir()?.join("console");
+                let _ = fs::remove_file(&link);
+                match std::os::unix::fs::symlink(&p.slave_path, &link) {
+                    Ok(()) => {
+                        console_path = Some(link.to_string_lossy().into_owned());
+                        console_link = Some(link);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "console symlink failed ({e}); exposing {} directly",
+                            p.slave_path
+                        );
+                        console_path = Some(p.slave_path.clone());
+                    }
+                }
+                info!("DUT console bridge at {}", console_path.as_deref().unwrap());
+                console_master = Some(p.master);
+            }
+            Err(e) => warn!("DUT console bridge unavailable: {e}"),
+        }
+
+        let hid = HidHandle::spawn(device.clone(), console_master);
 
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -121,6 +157,7 @@ pub fn run(device: String, port: u16) -> Result<()> {
             pid: std::process::id(),
             port: bound.port(),
             device: device.clone(),
+            console: console_path,
         };
         let mut f = File::create(discovery_path()?).context("writing discovery file")?;
         f.write_all(serde_json::to_string(&disc)?.as_bytes())?;
@@ -133,11 +170,15 @@ pub fn run(device: String, port: u16) -> Result<()> {
         // (the OS releases the UART).
         let disc_p = discovery_path()?;
         let lock_p = lock_path()?;
+        let console_link_p = console_link;
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
                 shutdown_signal().await;
                 let _ = fs::remove_file(&disc_p);
                 let _ = fs::remove_file(&lock_p);
+                if let Some(link) = &console_link_p {
+                    let _ = fs::remove_file(link);
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 info!("hid daemon shut down");
                 std::process::exit(0);

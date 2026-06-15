@@ -31,6 +31,13 @@ a *target* machine from a *control host*.
 > below describes the **retired single-board** path; treat §1's device-side
 > framing as historical and the **command vocabulary (§3+) as still normative**.
 
+> The dual-board rig's `hidrig` also offers two **rig-specific** features that
+> are *not* part of this device-independent vocabulary: DUT **power** control
+> (`hidrig power off|on|cycle`) and a **serial-console** bridge. They surface
+> through paniolo's separate `power` and `serial` channels — not the `hid`
+> channel — so other HID backends need not implement them. See
+> [hid-dual-board-design.md](hid-dual-board-design.md) §6–§7.
+
 This document is **normative for the command vocabulary**. Consumers:
 
 | Consumer | Status |

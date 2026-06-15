@@ -30,6 +30,7 @@
 mod compose;
 mod daemon;
 mod proto;
+mod pty;
 mod server;
 mod uart;
 
@@ -125,6 +126,14 @@ enum Cmd {
     Ping,
     /// Print the board's protocol version, implementation id, and capabilities.
     Version,
+    /// Power the DUT off/on, or power-cycle it, via the control board's relay.
+    Power {
+        /// off | on | cycle
+        action: String,
+        /// For `cycle`: seconds to stay off before powering back on (the
+        /// firmware default is used if omitted).
+        secs: Option<u8>,
+    },
     /// Run a command file: one protocol command per line; blank lines and
     /// `# comments` are skipped; `delay <ms>` / `sleep <seconds>` pause.
     Run {
@@ -187,6 +196,13 @@ fn main() -> Result<()> {
             let reply = tx.send("version")?;
             println!("{reply}");
             Ok(())
+        }
+        Cmd::Power { action, secs } => {
+            let line = match secs {
+                Some(s) => format!("power {action} {s}"),
+                None => format!("power {action}"),
+            };
+            one(&mut tx, &line)
         }
         Cmd::Run { file, delay_ms } => cmd_run(&mut tx, &file, delay_ms),
         Cmd::Serve { .. } | Cmd::Stop => unreachable!("handled above"),

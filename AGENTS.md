@@ -65,8 +65,8 @@ Current capabilities:
   log queryable by line range (`paniolo serial log -i <name>`)
 - Combined video+serial web dashboard (hdmicap's `GET /`: video on top, xterm.js terminal below)
 - On-device OCR of the captured screen (`paniolo video read [target] [--stable]`, which wraps hdmicap's `GET /ocr`; also the dashboard OCR button): Apple Vision on macOS, Tesseract on Linux
-- USB HID input (keyboard/mouse injection) via a generic helper hook (`paniolo hid send`); the `hidrig` helper drives the dual-board KB2040 injector — it composes HID reports in Rust and writes binary frames to the control board's USB-CDC endpoint, which relays them over I2C1 to the target board (the "dumb pipe", docs/hid-dual-board-design.md; command vocabulary in docs/hid-serial-protocol.md). `hidrig serve` runs a daemon that owns the control link and re-exposes the command vocabulary over a WebSocket, so `paniolo console` works as a **KVM** — stream the browser's keyboard + absolute mouse (`moveabs`) to the target, intermixed with CLI injection on the one wire
-- Power control via DTR (J2 wiring) or generic shell-command hooks (`on_cmd`, `off_cmd`, `cycle_cmd`, `state_cmd`): `paniolo serial dtr`, `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`. Helpers that wire into the hooks: `cambrionix` (Cambrionix hub port power via control UART), `zigplug` (Zigbee smart plugs via a CC2652 coordinator dongle), `usbhub` (per-port VBUS switching on off-the-shelf USB hubs via hub-class requests, with human-verified port profiles built by `usbhub learn`), and `shellyplug` (Shelly Gen2+ smart plugs/relays over the device's local HTTP RPC API — no cloud/HA/Matter)
+- USB HID input (keyboard/mouse injection) via a generic helper hook (`paniolo hid send`); the `hidrig` helper drives the dual-board KB2040 injector — it composes HID reports in Rust and writes binary frames to the control board's USB-CDC endpoint, which relays them over I2C1 to the target board (the "dumb pipe", docs/hid-dual-board-design.md; command vocabulary in docs/hid-serial-protocol.md). `hidrig serve` runs a daemon that owns the control link and re-exposes the command vocabulary over a WebSocket, so `paniolo console` works as a **KVM** — stream the browser's keyboard + absolute mouse (`moveabs`) to the target, intermixed with CLI injection on the one wire. The same control board can also **bridge the DUT serial console** (its hardware UART, re-exported by the daemon as a PTY into the `serial` channel) and **switch DUT power** via a relay (`hidrig power off|on|cycle`), so one USB device backs the target's HID, console, and power (design §6–§7; the relay/power path is hardware-verified, incl. NVM state persistence across a control-board reset — the console bridge is not yet)
+- Power control via DTR (J2 wiring) or generic shell-command hooks (`on_cmd`, `off_cmd`, `cycle_cmd`, `state_cmd`): `paniolo serial dtr`, `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`. Helpers that wire into the hooks: `cambrionix` (Cambrionix hub port power via control UART), `zigplug` (Zigbee smart plugs via a CC2652 coordinator dongle), `usbhub` (per-port VBUS switching on off-the-shelf USB hubs via hub-class requests, with human-verified port profiles built by `usbhub learn`), and `shellyplug` (Shelly Gen2+ smart plugs/relays over the device's local HTTP RPC API — no cloud/HA/Matter). The dual-board `hidrig` control board can also drive a DUT power relay (`hidrig power off|on|cycle`) as a power-helper backend, consolidating HID + console + power on one USB device
 
 ## Architecture
 
@@ -313,28 +313,38 @@ hidrig/          USB HID injector: host CLI + daemon (Rust) + dual-board KB2040 
                    wraps them in the binary frames the boards relay (F_HID 0x01 /
                    F_CTRL 0x02). Holds the held-key + virtual-cursor state so
                    relative `move` and `moveabs` share one absolute-pointer device
-  src/proto.rs     control-link transport: writes binary frames to the control
-                   board's data CDC endpoint (no baud negotiation — CDC; nominal
-                   115200), reads `0x02` control-frame replies (ping/version);
-                   command-file sequence parser + clamp_abs
-  src/uart.rs      the control-link owner: a dedicated *blocking-serialport* thread
-                   (NOT tokio-serial — its async reads don't get read-readiness
-                   on a macOS tty, so they timed out), bridged to the async
-                   server via tokio channels (blocking_recv); an mpsc<(line,
-                   reply)> queue serializes every command (CLI + web) onto the
-                   one wire, with a broadcast transcript; lazy open + reopen-on-
-                   transport-error
+  src/proto.rs     control-link transport for the *direct one-shot* path: writes
+                   binary frames to the control board's data CDC endpoint (no baud
+                   negotiation — CDC; nominal 115200), reads `0x02` control-frame
+                   replies (ping/version/power); command-file sequence parser +
+                   clamp_abs
+  src/uart.rs      the control-link owner (daemon path): a dedicated *blocking-
+                   serialport* thread (NOT tokio-serial — its async reads don't
+                   get read-readiness on a macOS tty) running a full-duplex poll
+                   loop. It drains an mpsc command queue (CLI + web, serialized
+                   onto one wire), pumps PTY console input down as 0x03, then
+                   reads + demuxes inbound frames: 0x02 replies fulfil the in-
+                   flight control request (deadline-tracked), 0x03 payloads go to
+                   the console PTY master. HID is fire-and-forget; broadcast
+                   transcript; lazy open + reopen-on-transport-error
+  src/pty.rs       allocates a PTY (libc posix_openpt) for the DUT serial-console
+                   bridge: the owner holds the master; paniolo's serial channel
+                   opens the slave via the stable symlink the daemon publishes
   src/server.rs    axum: GET /hid (WebSocket carrier), POST /send, /status,
                    /version. WS clients send command lines; all results are
                    broadcast as `evt ok|err …` frames so observers see the
                    intermixed stream
   src/daemon.rs    advisory lock, discovery file at /tmp/paniolo-<uid>/hid/
                    (the channel name, not "hidrig", so paniolo finds it without
-                   knowing the helper), tokio runtime, graceful shutdown
+                   knowing the helper); brings up the console PTY + publishes its
+                   stable symlink (recorded as discovery `console`); tokio
+                   runtime, graceful shutdown (also removes the symlink)
   firmware/dual/control/  control board (CircuitPython 9.x): USB-CDC <-> I2C1
                    controller; reads framed input from usb_cdc.data, relays 0x01
                    HID frames verbatim over I2C1 to the target, answers 0x02
-                   control frames (ping/version -> dual-control/1) locally
+                   control frames (ping/version/power -> dual-control/1; power
+                   drives a DUT relay on D5) locally, and bridges 0x03 console
+                   frames to/from the DUT UART (TX=GP0/RX=GP1)
   firmware/dual/target/   target board (CircuitPython 9.x): I2C1 peripheral that
                    relays report bytes to usb_hid send_report — no adafruit_hid,
                    no parsing. boot.py holds the HID descriptor (keyboard + custom
