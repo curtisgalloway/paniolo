@@ -172,7 +172,9 @@ hidrig -d /dev/cu.usbmodemXXXX serve                  # also bridges the console
 paniolo serial watch -t pi5                           # attach to the PTY console
 ```
 
-> **Not yet hardware-verified.** Confirm on the bench: the UART console round
-> trip (host ↔ DUT), the relay polarity/sizing, and that `tio`/serialcap behave
-> on the daemon's PTY (design §6). Watch the control board's loop headroom when a
-> DUT boot-log streams while HID is relaying (design §9.5).
+> **Status.** The **relay/power** path is hardware-verified — `power off|on|cycle`
+> actuate the relay, and the state persists across a control-board reset (NVM).
+> The **console** is **not yet** verified: confirm the UART round trip
+> (host ↔ DUT) and that `tio`/serialcap behave on the daemon's PTY (design §6),
+> and watch the control board's loop headroom when a DUT boot-log streams while
+> HID is relaying (design §9.5).

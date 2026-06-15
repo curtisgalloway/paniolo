@@ -195,7 +195,11 @@ demand and the dashboard streams keyboard + absolute-mouse events to it — see
 `hidrig power off|on|cycle [secs]` switches the DUT through the control board's
 relay; it surfaces to paniolo as a normal power-helper behind the `power` hook,
 and a `cycle` acks immediately, then the board holds power off for the given
-seconds (firmware default 2 s).
+seconds (firmware default 2 s). The relay **state persists across a control-board
+reset** (stored in NVM; default on if unset), so a replug or reload doesn't
+surprise-re-power the DUT. The control board's I2C init is non-fatal, so power
+and console work even when the target/HID side (and its pull-ups) isn't wired —
+which a `power off`/`cycle` deliberately causes.
 
 When the `serve` daemon runs, it also bridges the DUT's serial console (control
 board UART0) and **re-exports it as a PTY**, so paniolo's existing `serial`
@@ -216,9 +220,10 @@ only while the daemon is serving, so bring the hid daemon up first (any
 `paniolo hid …` or `paniolo console` for the target starts it). A PTY has no
 DTR/CTS, so `serial dtr`/`reset` and `power_sense_signal` don't apply.
 
-> **Status:** the console bridge and relay are not yet hardware-verified — in
-> particular the PTY round trip through `tio`/serialcap should be confirmed on
-> the bench before relying on it (design §6).
+> **Status:** the **relay/power** path is hardware-verified (off/on/cycle actuate
+> the relay; the state persists across a control-board reset). The **console
+> bridge** is **not yet** verified — confirm the PTY round trip through
+> `tio`/serialcap on the bench before relying on it (design §6).
 
 ## paniolo integration
 

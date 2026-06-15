@@ -16,9 +16,10 @@ limitations under the License.
 
 # HID rig — dual-board "dumb pipe" design
 
-> **Status:** the core HID dumb-pipe firmware (control + target relays) is on this branch;
-> the **serial-console bridge** and **relay power-cut** described here are this revision's
-> design extension, not yet built.
+> **Status:** the core HID dumb-pipe firmware is on this branch. The **relay
+> power-cut** is built and **hardware-verified** (off/on/cycle actuate the relay;
+> the state persists across a control-board reset via NVM). The **serial-console
+> bridge** is built but **not yet hardware-verified**.
 > **Branch:** `i2c-kb2040-dual-board`. **Date:** 2026-06-09, rev. 2026-06-14.
 > This captures the architecture we converged on for the two-board KB2040 rig so the
 > thinking crosses cleanly into implementation. It supersedes the role-based ASCII
@@ -292,7 +293,15 @@ reliability upgrade and collapses the rig toward one cable.
 - **HID-board coupling.** Because the target board is DUT-powered, a power-cut also drops the
   HID board; it re-enumerates as the DUT boots. This is acceptable and even realistic (the
   DUT sees its keyboard/mouse appear as it powers up), but note that "power cycle" implies
-  "HID re-enumerate."
+  "HID re-enumerate." A consequence the firmware must handle: dropping the target board also
+  removes any target-side I2C pull-ups, so the control board's **I2C init is non-fatal** —
+  the relay and console come up regardless and the HID relay simply pauses while the bus is
+  down. (Verified on the bench: without this, a `power off` crashed the control firmware.)
+- **State persistence.** The relay state is stored in the control board's **NVM** and
+  restored at boot, so a control-board reset (replug / code reload / host reboot) does not
+  force the DUT back on — it resumes the last commanded state (default on if NVM is erased).
+  A *hardware* reset still briefly floats the GPIO (~300 ms) before restore; glitch-free hold
+  would need a latching relay or a de-energized-default that matches the safe state.
 
 **Target-board reset (DEFERRED, §10).** A control-board GPIO → target board `RUN` pin would
 re-enumerate the HID board *without* rebooting the DUT, and works out-of-band even when that
