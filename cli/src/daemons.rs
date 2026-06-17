@@ -25,7 +25,7 @@
 //! (default `/tmp`; see [`runtime_root`]). Liveness is "the recorded pid
 //! still exists".
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -294,6 +294,95 @@ fn pid_alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+// ── binary staleness ─────────────────────────────────────────────────────────
+//
+// A daemon is a long-lived process running a snapshot of its helper binary. An
+// upgrade (`apt install`, `make install`) or a dev rebuild (`cargo install`)
+// replaces that binary on disk, but the running process keeps the old code —
+// and its on-disk runtime/protocol contract can diverge from the new CLI's
+// (the per-target-daemon move did exactly this, stranding old daemons that
+// held capture devices while the new CLI couldn't see them). The package can't
+// reap these (they're per-user processes, not packaged services), so the CLI
+// records the binary's identity at spawn and flags a running daemon as stale
+// once the binary changes underneath it.
+
+/// Identity of the binary a daemon was spawned from. Written next to the
+/// daemon's discovery file as `binmeta.json` by [`record_binmeta`].
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BinMeta {
+    /// Helper basename, used to re-resolve the *current* install for comparison.
+    bin: String,
+    /// Absolute path the daemon was launched from.
+    path: String,
+    /// Modification time, nanoseconds since the Unix epoch.
+    mtime_ns: u128,
+    /// Size in bytes.
+    size: u64,
+}
+
+/// `(mtime_ns, size)` for `path`, or `None` if it can't be stat'd.
+fn stat_identity(path: &Path) -> Option<(u128, u64)> {
+    let md = std::fs::metadata(path).ok()?;
+    let mtime = md
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((mtime, md.len()))
+}
+
+/// True when the binary now at `current` differs from what `meta` recorded —
+/// a different path, or the same path with a changed mtime/size. Pure, so the
+/// comparison is unit-testable without spawning anything.
+fn meta_differs(meta: &BinMeta, current: &Path) -> bool {
+    match stat_identity(current) {
+        Some((mtime_ns, size)) => {
+            current.to_string_lossy() != meta.path || mtime_ns != meta.mtime_ns || size != meta.size
+        }
+        // The recorded binary is gone — definitely not what's running now.
+        None => true,
+    }
+}
+
+/// Record the identity of the binary `bin` we are about to spawn for the daemon
+/// instance, so [`binary_is_stale`] can later tell whether it changed. Best
+/// effort: on any failure staleness simply reports "unknown" (never a false
+/// positive), so a stamping hiccup can't block a daemon from starting.
+pub fn record_binmeta(bin: &Path, name: &str, instance: Option<&str>) {
+    let Some((mtime_ns, size)) = stat_identity(bin) else {
+        return;
+    };
+    let meta = BinMeta {
+        bin: bin
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        path: bin.to_string_lossy().into_owned(),
+        mtime_ns,
+        size,
+    };
+    if let Ok(dir) = ensure_runtime_dir(name, instance) {
+        if let Ok(text) = serde_json::to_string(&meta) {
+            let _ = std::fs::write(dir.join("binmeta.json"), text);
+        }
+    }
+}
+
+/// Whether the daemon instance's binary has changed on disk since it started
+/// (an upgrade or rebuild left the running process stale). `None` when it can't
+/// be determined — no recorded identity, e.g. a daemon started by an older CLI;
+/// callers treat unknown as "not stale" so the signal never cries wolf.
+pub fn binary_is_stale(name: &str, instance: Option<&str>) -> Option<bool> {
+    let dir = runtime_base().join(runtime_rel(name, instance));
+    let text = std::fs::read_to_string(dir.join("binmeta.json")).ok()?;
+    let meta: BinMeta = serde_json::from_str(&text).ok()?;
+    // Compare against the binary the CLI would resolve today; fall back to the
+    // recorded path when the helper no longer resolves by name.
+    let current = find_binary(&meta.bin).unwrap_or_else(|| PathBuf::from(&meta.path));
+    Some(meta_differs(&meta, &current))
+}
+
 /// One live daemon found via its discovery file under the runtime base.
 pub struct DaemonInfo {
     /// Discovery dir name (serialcap, hdmicap, hid, zigplug, …).
@@ -305,6 +394,10 @@ pub struct DaemonInfo {
     pub port: Option<u16>,
     /// Daemon-specific detail (e.g. zigplug's serial device), if published.
     pub detail: String,
+    /// `Some(true)` if the binary changed on disk since the daemon started
+    /// (upgrade/rebuild — the running process is stale), `Some(false)` if it
+    /// matches, `None` if unknown (no recorded identity).
+    pub stale: Option<bool>,
 }
 
 /// Parse `<dir>/daemon.json` into a live [`DaemonInfo`], or `None` if the file
@@ -320,6 +413,7 @@ fn read_discovery(
     if !pid_alive(pid as i32) {
         return None;
     }
+    let stale = binary_is_stale(name, instance.as_deref());
     Some(DaemonInfo {
         name: name.to_string(),
         instance,
@@ -330,6 +424,7 @@ fn read_discovery(
             .and_then(|d| d.as_str())
             .unwrap_or_default()
             .to_string(),
+        stale,
     })
 }
 
@@ -423,6 +518,17 @@ pub fn daemon_port(name: &str, instance: Option<&str>) -> Option<u16> {
     u16::try_from(port).ok()
 }
 
+/// PID of the named running daemon instance, or None if it isn't running.
+pub fn daemon_pid(name: &str, instance: Option<&str>) -> Option<i32> {
+    let path = runtime_base()
+        .join(runtime_rel(name, instance))
+        .join("daemon.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let pid = v.get("pid")?.as_i64()? as i32;
+    pid_alive(pid).then_some(pid)
+}
+
 /// Base URL of the named running daemon instance, or None if it isn't running.
 pub fn daemon_url(name: &str, instance: Option<&str>) -> Option<String> {
     daemon_port(name, instance).map(|port| format!("http://127.0.0.1:{port}"))
@@ -476,6 +582,33 @@ mod tests {
         assert_eq!(runtime_rel("hdmicap", Some("../x")), "hdmicap/.._x");
         assert_eq!(runtime_rel("hid", Some("")), "hid/_");
         assert_eq!(runtime_rel("hid", Some("nova-1.2")), "hid/nova-1.2");
+    }
+
+    #[test]
+    fn meta_differs_detects_a_changed_binary() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("paniolo-binmeta-test-{}", std::process::id()));
+        std::fs::write(&path, b"v1").unwrap();
+        let (mtime_ns, size) = stat_identity(&path).unwrap();
+        let meta = BinMeta {
+            bin: "test-bin".to_string(),
+            path: path.to_string_lossy().into_owned(),
+            mtime_ns,
+            size,
+        };
+        // Unchanged file: not stale.
+        assert!(!meta_differs(&meta, &path));
+        // A different path (even if it exists) counts as changed.
+        let other = dir.join(format!("paniolo-binmeta-other-{}", std::process::id()));
+        std::fs::write(&other, b"v1").unwrap();
+        assert!(meta_differs(&meta, &other));
+        // Replacing the file (new size, new mtime) is stale.
+        std::fs::write(&path, b"v2-larger").unwrap();
+        assert!(meta_differs(&meta, &path));
+        // A vanished binary is stale.
+        std::fs::remove_file(&path).unwrap();
+        assert!(meta_differs(&meta, &path));
+        std::fs::remove_file(&other).ok();
     }
 
     #[test]

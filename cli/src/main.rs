@@ -202,6 +202,19 @@ enum DaemonsCmd {
         #[arg(long)]
         force: bool,
     },
+    /// Restart capture daemons (serialcap, hdmicap) from their current
+    /// binary — the clean fix after an upgrade leaves stale ones running.
+    Restart {
+        /// Daemon names to restart (e.g. serialcap, hdmicap); empty with
+        /// --all restarts every restartable daemon.
+        names: Vec<String>,
+        /// Restart every running serialcap/hdmicap daemon.
+        #[arg(long)]
+        all: bool,
+        /// Restart only daemons whose binary changed since they started.
+        #[arg(long)]
+        stale: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -714,6 +727,9 @@ fn run(cli: Cli) -> Result<()> {
         Command::Daemons { cmd } => match cmd.unwrap_or(DaemonsCmd::List) {
             DaemonsCmd::List => cmd_daemons_list(),
             DaemonsCmd::Stop { names, all, force } => cmd_daemons_stop(&names, all, force),
+            DaemonsCmd::Restart { names, all, stale } => {
+                cmd_daemons_restart(lab_flag, &names, all, stale)
+            }
         },
     }
 }
@@ -751,13 +767,24 @@ fn cmd_daemons_list() -> Result<()> {
         println!("No paniolo daemons running.");
         return Ok(());
     }
+    let mut any_stale = false;
     for d in &discovered {
         let port = d.port.map_or("-".to_string(), |p| p.to_string());
         let name = match &d.instance {
             Some(inst) => format!("{}[{inst}]", d.name),
             None => d.name.clone(),
         };
-        println!("{name}\tpid {}\tport {}\t{}", d.pid, port, d.detail);
+        let stale = if d.stale == Some(true) {
+            any_stale = true;
+            "\t(stale: binary changed since start)"
+        } else {
+            ""
+        };
+        println!("{name}\tpid {}\tport {}\t{}{stale}", d.pid, port, d.detail);
+    }
+    if any_stale {
+        println!("\nStale daemons run an older binary than what's installed now.");
+        println!("Restart them from the current binary with `paniolo daemons restart --stale`.");
     }
     for (target, st) in &netboots {
         println!(
@@ -843,6 +870,122 @@ fn cmd_daemons_stop(names: &[String], all: bool, force: bool) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Restart the per-target capture daemons (serialcap, hdmicap) from their
+/// current on-disk binary. This is the safe heal after an upgrade or rebuild
+/// leaves stale daemons running: the package can't reap per-user daemons, so
+/// the operator restarts them, reusing the lab's channel config so the new
+/// daemon owns the same devices. netbootd is intentionally excluded — restart
+/// it via `paniolo netboot start/stop`, since that touches an in-flight boot.
+fn cmd_daemons_restart(
+    lab_flag: Option<&str>,
+    names: &[String],
+    all: bool,
+    stale_only: bool,
+) -> Result<()> {
+    if !all && !stale_only && names.is_empty() {
+        bail!("name one or more daemons (serialcap, hdmicap), or pass --all / --stale");
+    }
+    let lab = load_for_read(lab_flag)?;
+    let restartable = [serial::DAEMON, video::DAEMON];
+    for n in names {
+        if !restartable.contains(&n.as_str()) {
+            eprintln!(
+                "warning: '{n}' is not a restartable capture daemon \
+                 (serialcap, hdmicap); skipping"
+            );
+        }
+    }
+
+    let selected: Vec<(String, String)> = daemons::list_discovered()
+        .into_iter()
+        .filter(|d| restartable.contains(&d.name.as_str()))
+        .filter(|d| all || stale_only || names.iter().any(|w| w == &d.name))
+        .filter(|d| !stale_only || d.stale == Some(true))
+        .filter_map(|d| d.instance.map(|inst| (d.name, inst)))
+        .collect();
+    if selected.is_empty() {
+        println!("No matching capture daemons to restart.");
+        return Ok(());
+    }
+
+    let mut failures = 0;
+    for (name, target) in selected {
+        if !lab.targets.contains_key(&target) {
+            eprintln!("warning: {name}[{target}] has no matching lab target; skipping");
+            failures += 1;
+            continue;
+        }
+        match restart_capture_daemon(&lab, &name, &target) {
+            Ok(url) => println!("{name}[{target}] restarted — {url}"),
+            Err(e) => {
+                eprintln!("{name}[{target}] restart failed: {e:#}");
+                failures += 1;
+            }
+        }
+    }
+    if failures > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Stop one capture daemon and start it again from the lab's channel config,
+/// returning the new daemon's URL. Waits for the *old process* to exit before
+/// starting — not just for its discovery file to clear, which a daemon releases
+/// while still shutting down — so the replacement never races it for an
+/// exclusive device (a V4L2 capture node can't be opened twice). A process that
+/// overstays the grace period is SIGKILLed to free the device.
+fn restart_capture_daemon(lab: &Lab, name: &str, target: &str) -> Result<String> {
+    // Resolve start parameters up front so a stop failure can't strand us.
+    enum Start {
+        Serial(Vec<model::SerialChannel>),
+        Video(String),
+    }
+    let start = if name == serial::DAEMON {
+        let serials = local_serials(lab, target)?;
+        if serials.is_empty() {
+            bail!("no serial interfaces for '{target}' in the lab");
+        }
+        Start::Serial(serials)
+    } else if name == video::DAEMON {
+        let device = local_video(lab, target)?
+            .device
+            .ok_or_else(|| anyhow!("video channel for '{target}' has no device set"))?;
+        Start::Video(device)
+    } else {
+        bail!("'{name}' is not a restartable capture daemon");
+    };
+
+    let old_pid = daemons::daemon_pid(name, Some(target));
+    match &start {
+        Start::Serial(_) => {
+            let _ = serial::stop_daemon(target);
+        }
+        Start::Video(_) => {
+            let _ = video::stop_daemon(target);
+        }
+    }
+    // Wait for the old process to actually exit (it owns the device until then).
+    if let Some(pid) = old_pid {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state::is_pid_alive(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if state::is_pid_alive(pid) {
+            daemons::signal_pid(pid, libc::SIGKILL);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+    }
+
+    match start {
+        Start::Serial(serials) => serial::start_daemon(&serials, 0, target)?,
+        Start::Video(device) => video::start_daemon(&device, 0, target)?,
+    }
+    daemons::wait_for_daemon(name, Some(target), std::time::Duration::from_secs(5)).ok_or_else(
+        || daemons::start_failure(name, Some(target), std::time::Duration::from_secs(5)),
+    )
 }
 
 // ── helper passthrough ──────────────────────────────────────────────────────
@@ -1865,6 +2008,16 @@ fn remote_console(lab: &Lab, target: &str, host_name: &str, interface: Option<&s
 
 // ── power runtime bodies ────────────────────────────────────────────────────
 
+/// True when a channel whose optional `host` field defaults to `default_host`
+/// resolves to *this* machine. Uses the same self-identification the dispatch
+/// layer does ([`model::Host::is_local`] — the `local` sentinel or a matching
+/// FQDN), so a host that is local by FQDN is recognized here too. Comparing the
+/// host name against the bare `local` sentinel instead would reject it.
+fn channel_is_local(lab: &Lab, channel_host: Option<&str>, default_host: &str) -> bool {
+    let name = channel_host.unwrap_or(default_host);
+    lab.host(name).is_local(name)
+}
+
 /// The target's power channel as visible on *this* host.
 fn local_power(lab: &Lab, target: &str) -> Result<model::PowerChannel> {
     let t = lab
@@ -1875,7 +2028,7 @@ fn local_power(lab: &Lab, target: &str) -> Result<model::PowerChannel> {
     let p = t.power.clone().ok_or_else(|| {
         anyhow!("target '{target}' has no power channel (paniolo power set -t {target} ...)")
     })?;
-    if p.host.as_deref().unwrap_or(&dh) != model::LOCAL {
+    if !channel_is_local(lab, p.host.as_deref(), &dh) {
         bail!("power channel for '{target}' is not on this host");
     }
     Ok(p)
@@ -2070,7 +2223,7 @@ fn local_serials(lab: &Lab, target: &str) -> Result<Vec<model::SerialChannel>> {
     let dh = t.default_host().to_string();
     Ok(t.serial
         .iter()
-        .filter(|s| s.host.as_deref().unwrap_or(&dh) == model::LOCAL)
+        .filter(|s| channel_is_local(lab, s.host.as_deref(), &dh))
         .cloned()
         .collect())
 }
@@ -2138,8 +2291,14 @@ fn cmd_serial_watch(lab_flag: Option<&str>, target: Option<&str>, port: u16) -> 
         bail!("no serial interfaces configured (paniolo serial add ...)");
     }
     if let Some(url) = serial::daemon_url(&target) {
-        println!("Serial daemon for '{target}' already running at {url}");
-        return Ok(());
+        if daemons::binary_is_stale(serial::DAEMON, Some(&target)) == Some(true) {
+            eprintln!("Serial daemon for '{target}' was built from an older binary; restarting…");
+            let _ = serial::stop_daemon(&target);
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        } else {
+            println!("Serial daemon for '{target}' already running at {url}");
+            return Ok(());
+        }
     }
     serial::start_daemon(&serials, port, &target)?;
     let names: Vec<&str> = serials.iter().map(|s| s.name.as_str()).collect();
@@ -2273,10 +2432,23 @@ fn cmd_serial_show(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
         println!("{}\t{} @ {}{sense}", ch.name, ch.device, ch.baud);
     }
     match serial::daemon_url(&target) {
-        Some(url) => println!("daemon\trunning at {url}"),
+        Some(url) => println!(
+            "daemon\trunning at {url}{}",
+            stale_note(serial::DAEMON, &target)
+        ),
         None => println!("daemon\tstopped"),
     }
     Ok(())
+}
+
+/// Suffix noting a running daemon's binary is stale (changed since it started),
+/// empty otherwise — appended to `serial show` / `video show` status lines.
+fn stale_note(daemon: &str, target: &str) -> &'static str {
+    if daemons::binary_is_stale(daemon, Some(target)) == Some(true) {
+        "  (stale — `paniolo daemons restart`)"
+    } else {
+        ""
+    }
 }
 
 // ── video runtime bodies ────────────────────────────────────────────────────
@@ -2293,7 +2465,7 @@ fn local_video(lab: &Lab, target: &str) -> Result<model::VideoChannel> {
             "target '{target}' has no video channel (paniolo video set -t {target} --device ...)"
         )
     })?;
-    if v.host.as_deref().unwrap_or(&dh) != model::LOCAL {
+    if !channel_is_local(lab, v.host.as_deref(), &dh) {
         bail!("video channel for '{target}' is not on this host");
     }
     Ok(v)
@@ -2346,9 +2518,15 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
                 .device
                 .ok_or_else(|| anyhow!("video channel for '{target}' has no device set"))?;
             if let Some(url) = video::daemon_url(&target) {
-                if !restart {
+                let stale = daemons::binary_is_stale(video::DAEMON, Some(&target)) == Some(true);
+                if !restart && !stale {
                     println!("Video daemon for '{target}' already running at {url}");
                     return Ok(());
+                }
+                if stale && !restart {
+                    eprintln!(
+                        "Video daemon for '{target}' was built from an older binary; restarting…"
+                    );
                 }
                 let _ = video::stop_daemon(&target);
                 std::thread::sleep(std::time::Duration::from_secs(1));
@@ -2437,7 +2615,12 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
             let (target, v) = video_runtime(lab_flag, target.as_deref())?;
             println!("device\t{}", v.device.as_deref().unwrap_or("(not set)"));
             match video::daemon_url(&target) {
-                Some(url) => println!("daemon\trunning at {url}"),
+                Some(url) => {
+                    println!(
+                        "daemon\trunning at {url}{}",
+                        stale_note(video::DAEMON, &target)
+                    )
+                }
                 None => println!("daemon\tstopped"),
             }
             Ok(())
@@ -2640,7 +2823,7 @@ fn netboot_runtime(lab_flag: Option<&str>, target: Option<&str>) -> Result<Netbo
     let nb = t.netboot.clone().ok_or_else(|| {
         anyhow!("target '{target}' has no netboot channel (paniolo netboot set -t {target} ...)")
     })?;
-    if nb.host.as_deref().unwrap_or(&dh) != model::LOCAL {
+    if !channel_is_local(&lab, nb.host.as_deref(), &dh) {
         bail!("netboot channel for '{target}' is not on this host");
     }
     let interface = nb
@@ -2842,7 +3025,7 @@ fn ensure_hid_daemon_local(lab: &Lab, target: &str) -> Result<Option<u16>> {
         Some(h) => h,
         None => return Ok(None),
     };
-    if h.host.as_deref().unwrap_or(&dh) != model::LOCAL {
+    if !channel_is_local(lab, h.host.as_deref(), &dh) {
         return Ok(None);
     }
     if let Some(port) = daemons::daemon_port(HID_DAEMON, Some(target)) {
@@ -2956,7 +3139,7 @@ fn cmd_hid_send(lab_flag: Option<&str>, target: Option<&str>, args: &[String]) -
     let h = t.hid.clone().ok_or_else(|| {
         anyhow!("target '{target}' has no hid channel (paniolo hid set -t {target} --cmd ...)")
     })?;
-    if h.host.as_deref().unwrap_or(&dh) != model::LOCAL {
+    if !channel_is_local(&lab, h.host.as_deref(), &dh) {
         bail!("hid channel for '{target}' is not on this host");
     }
     let cmd = h.cmd.ok_or_else(|| {
@@ -2991,7 +3174,7 @@ fn local_adb(lab: &Lab, target: &str) -> Result<model::AdbChannel> {
     let a = t.adb.clone().ok_or_else(|| {
         anyhow!("target '{target}' has no adb channel (paniolo adb set -t {target} --serial <id>)")
     })?;
-    if a.host.as_deref().unwrap_or(&dh) != model::LOCAL {
+    if !channel_is_local(lab, a.host.as_deref(), &dh) {
         bail!("adb channel for '{target}' is not on this host");
     }
     Ok(a)
@@ -3176,5 +3359,52 @@ fn print_resolved_target(rt: &ResolvedTarget) {
         for ch in &rt.channels {
             println!("  channel       {}", channel_label(ch));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: the per-channel runtime helpers must use the same
+    // self-identification as the dispatch layer ([`model::Host::is_local`]).
+    // A host that is local only by FQDN (not the bare `local` sentinel) was
+    // rejected by an earlier raw `host != "local"` compare, which broke every
+    // runtime command (power/serial/video/netboot/hid/adb) on an
+    // FQDN-identified control host even though `doctor` reported it healthy.
+    #[test]
+    fn channel_is_local_recognizes_fqdn_host() {
+        let Some(fqdn) = model::local_fqdn() else {
+            return; // hostname -f unavailable; covered by model's own tests
+        };
+        let lab = model::parse(&format!(
+            "[hosts.dev]\n\
+             ssh = \"dev.ssh.alias\"\n\
+             hostname = \"{fqdn}\"\n\
+             [targets.t]\n\
+             host = \"dev\"\n\
+             [targets.t.video]\n\
+             device = \"/dev/video0\"\n"
+        ))
+        .unwrap();
+        // The video channel inherits the target's default host "dev", which is
+        // local by FQDN even though its ssh field is an alias, not "local".
+        assert!(channel_is_local(&lab, None, "dev"));
+    }
+
+    #[test]
+    fn channel_is_local_rejects_remote_host() {
+        let lab = model::parse("[hosts.bench]\nssh = \"u@bench\"\n[targets.t]\nhost = \"bench\"\n")
+            .unwrap();
+        assert!(!channel_is_local(&lab, None, "bench"));
+        // An explicit per-channel host overrides the target default.
+        assert!(!channel_is_local(&lab, Some("bench"), "local"));
+    }
+
+    #[test]
+    fn channel_is_local_honors_local_sentinel() {
+        let lab = model::Lab::default();
+        assert!(channel_is_local(&lab, Some(model::LOCAL), "somehost"));
+        assert!(channel_is_local(&lab, None, model::LOCAL));
     }
 }

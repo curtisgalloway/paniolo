@@ -129,6 +129,15 @@ Python tree below:
   the libexec dir (wedged one-shots). `paniolo daemons stop [NAME…|--all]
   [--force]` TERMs them (netbootd via its proper interface-restoring stop),
   escalating to KILL with `--force` after a 3 s grace period.
+  A daemon keeps running its binary from when it started; an upgrade or rebuild
+  replaces that binary on disk but not the running process. The CLI stamps each
+  capture daemon's binary identity at spawn (`binmeta.json`) and flags a daemon
+  whose binary has since changed as **stale** in `paniolo daemons` (and on
+  `serial show` / `video show`). `paniolo daemons restart [NAME…|--all|--stale]`
+  cleanly cycles serialcap/hdmicap from the current binary (reusing the lab's
+  channel config; it waits for the old process to exit so the new one doesn't
+  race it for an exclusive device). netbootd is not auto-restarted — cycle it
+  via `paniolo netboot start/stop`, since that touches an in-flight boot.
 
 ```
 cli/src/

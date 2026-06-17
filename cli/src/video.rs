@@ -64,6 +64,9 @@ pub fn ocr(target: &str, stable: bool, timeout_ms: u64) -> Result<String> {
 pub fn start_daemon(device: &str, port: u16, target: &str) -> Result<()> {
     let binary = daemons::find_binary(DAEMON)
         .ok_or_else(|| anyhow!("hdmicap not found (libexec or PATH) — run `paniolo setup`"))?;
+    // Record which binary this daemon runs, so a later upgrade/rebuild can be
+    // detected as stale (see daemons::binary_is_stale).
+    daemons::record_binmeta(&binary, DAEMON, Some(target));
     let mut cmd = Command::new(binary);
     cmd.arg("daemon")
         .arg("--device")
