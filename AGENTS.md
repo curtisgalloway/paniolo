@@ -61,8 +61,8 @@ Current capabilities:
   selected per-request by DHCP vendor class (option 60)
 - HDMI/USB capture via hdmicap warm-stream daemon (`paniolo video`)
 - Serial console — interactive (tio) or daemon-backed for the web dashboard (`paniolo serial`);
-  one daemon owns several named interfaces, each with a timestamped rolling capture
-  log queryable by line range (`paniolo serial log -i <name>`)
+  one daemon **per target** owns that target's several named interfaces, each with a
+  timestamped rolling capture log queryable by line range (`paniolo serial log -i <name>`)
 - Combined video+serial web dashboard (hdmicap's `GET /`: video on top, xterm.js terminal below)
 - On-device OCR of the captured screen (`paniolo video read [target] [--stable]`, which wraps hdmicap's `GET /ocr`; also the dashboard OCR button): Apple Vision on macOS, Tesseract on Linux
 - USB HID input (keyboard/mouse injection) via a generic helper hook (`paniolo hid send`); the `hidrig` helper drives the dual-board KB2040 injector — it composes HID reports in Rust and writes binary frames to the control board's USB-CDC endpoint, which relays them over I2C1 to the target board (the "dumb pipe", docs/hid-dual-board-design.md; command vocabulary in docs/hid-serial-protocol.md). `hidrig serve` runs a daemon that owns the control link and re-exposes the command vocabulary over a WebSocket, so `paniolo console` works as a **KVM** — stream the browser's keyboard + absolute mouse (`moveabs`) to the target, intermixed with CLI injection on the one wire. The same control board can also **bridge the DUT serial console** (its hardware UART, re-exported by the daemon as a PTY into the `serial` channel) and **switch DUT power** via a relay (`hidrig power off|on|cycle`), so one USB device backs the target's HID, console, and power (design §6–§7; the relay/power path is hardware-verified, incl. NVM state persistence across a control-board reset — the console bridge is not yet)
@@ -123,8 +123,9 @@ Python tree below:
   run`, and `adb input` take `-t` only, because their positional tail is the
   helper's / `adb`'s args.
 - **`paniolo daemons`** is the unified daemon inventory: every discovery-file
-  daemon under `/tmp/paniolo-<uid>/` (serialcap, hdmicap, hid, zigplug),
-  netbootd via its state files, plus *stray* helper processes running out of
+  daemon under `/tmp/paniolo-<uid>/` (the per-target capture daemons listed as
+  `serialcap[<target>]`, `hdmicap[<target>]`, `hid[<target>]`; plus host-singleton
+  zigplug), netbootd via its state files, plus *stray* helper processes running out of
   the libexec dir (wedged one-shots). `paniolo daemons stop [NAME…|--all]
   [--force]` TERMs them (netbootd via its proper interface-restoring stop),
   escalating to KILL with `--force` after a 3 s grace period.
@@ -172,7 +173,12 @@ legacy Python removal.
 `PANIOLO_RUNTIME_DIR` (`/tmp/paniolo-<uid>/<name>/`, discovery/locks/logs) —
 directories pre-created — on every helper invocation: hook commands (named by
 the hook's program basename, see `hook_helper_name`), `paniolo helper`
-passthrough, and daemon spawns. Channel daemons use the channel name (hidrig
+passthrough, and daemon spawns. The per-target capture daemons
+(serialcap/hdmicap/hid) append a `/<target>` segment to their runtime dir
+(`/tmp/paniolo-<uid>/<name>/<target>/`) so multiple targets capture concurrently
+on one host; host-singleton helpers (zigplug/cambrionix/netbootd) use the base
+`<name>/` form above. The base honors `$PANIOLO_RUNTIME_BASE` (default `/tmp`).
+Channel daemons use the channel name (hidrig
 publishes under `hid`). Helpers prefer the env vars, falling back to the same
 literal paths standalone; hdmicap/serialcap/hidrig/zigplug all do, and
 zigplug lazily migrates its `zigbee.db` from the legacy top-level
@@ -334,7 +340,7 @@ hidrig/          USB HID injector: host CLI + daemon (Rust) + dual-board KB2040 
                    /version. WS clients send command lines; all results are
                    broadcast as `evt ok|err …` frames so observers see the
                    intermixed stream
-  src/daemon.rs    advisory lock, discovery file at /tmp/paniolo-<uid>/hid/
+  src/daemon.rs    advisory lock, discovery file at /tmp/paniolo-<uid>/hid/<target>/
                    (the channel name, not "hidrig", so paniolo finds it without
                    knowing the helper); brings up the console PTY + publishes its
                    stable symlink (recorded as discovery `console`); tokio
@@ -690,8 +696,9 @@ setup` installs it (`cargo install`).
 `guess_capture_device(devices)` returns the single non-built-in device (filters
 out FaceTime, iSight, iPhone, iPad), or None if ambiguous.
 
-`daemon_url()` reads hdmicap's discovery file (`/tmp/paniolo-<uid>/hdmicap/daemon.json`),
-verifies the PID is alive, and returns `http://127.0.0.1:<port>` or None.
+`daemon_url(target)` reads hdmicap's per-target discovery file
+(`/tmp/paniolo-<uid>/hdmicap/<target>/daemon.json`), verifies the PID is alive,
+and returns `http://127.0.0.1:<port>` or None.
 
 `start_daemon(cfg, port)` spawns `hdmicap daemon --device <name> --port <port>`
 detached (`start_new_session=True`). Caller polls `daemon_url()` to confirm
@@ -707,7 +714,8 @@ Two paths share this module:
 - **Daemon (`paniolo serial watch`):** `serialcap_binary()` resolves the
   installed binary (PATH then `~/.cargo/bin`, never the build tree, same as
   `hdmicap_binary`), `start_daemon(interfaces, port, buffer_lines=None)` spawns
-  one daemon owning *all* the target's interfaces (`daemon_cmd()` builds the argv,
+  one daemon **per target** owning *all* that target's interfaces (so two targets
+  on one host run two serialcap daemons; `daemon_cmd()` builds the argv,
   one repeated `--interface NAME=DEVICE@BAUD` per interface via `interface_arg()`),
   `daemon_url()` reads the discovery file (see Runtime paths) and verifies the PID,
   mirroring `_video.py`. Interfaces come from the target's
@@ -878,7 +886,7 @@ Subcommand groups:
   the dashboard power-cycle button via `PANIOLO_TARGET`), `preview`, `shot`,
   `read` (OCR), `devices`, `show`, `stop`
 - `serial_app` (`paniolo serial`) — `setup` (`--name`), `remove`, `connect` (tio, `-i`),
-  `watch`/`stop` (serialcap daemon, all interfaces), `log` (captured output, `-i`),
+  `watch`/`stop` (per-target serialcap daemon, all of that target's interfaces), `log` (captured output, `-i`),
   `devices`, `show`, `dtr` (`--ms`, `-i` — pulse DTR on any interface), `reset` (`--ms`, `-i`)
 - `hid_app` (`paniolo hid`) — `setup`, `type`, `key`, `releaseall`, `combo`, `down`, `up`, `click`, `mdown`, `mup`, `move`, `scroll`, `run <file>`, `show`
 
@@ -941,14 +949,20 @@ release.
 | Video config | `~/.config/paniolo/video.toml` |
 | Netboot daemon state | `~/.local/share/paniolo/<name>/netboot.json` |
 | Combined netboot log | `~/.local/share/paniolo/<name>/netboot.log` |
-| hdmicap discovery file | `/tmp/paniolo-<uid>/hdmicap/daemon.json` (`{pid, port}`) |
-| hdmicap advisory lock | `/tmp/paniolo-<uid>/hdmicap/daemon.lock` |
-| hdmicap stderr log | `/tmp/paniolo-<uid>/hdmicap/daemon.log` (truncated on each CLI-spawned start) |
-| serialcap discovery file | `/tmp/paniolo-<uid>/serialcap/daemon.json` (`{pid, port, interfaces:[{name, device, baud}]}`) |
-| serialcap advisory lock | `/tmp/paniolo-<uid>/serialcap/daemon.lock` |
-| serialcap stderr log | `/tmp/paniolo-<uid>/serialcap/daemon.log` (truncated on each CLI-spawned start) |
-| serialcap capture log | `/tmp/paniolo-<uid>/serialcap/capture/<name>/serial.jsonl(.1..)` (rotated JSONL, per interface) |
-| serialcap pending line | `/tmp/paniolo-<uid>/serialcap/capture/<name>/pending.json` (current unterminated line) |
+| hdmicap discovery file | `/tmp/paniolo-<uid>/hdmicap/<target>/daemon.json` (`{pid, port}`) |
+| hdmicap advisory lock | `/tmp/paniolo-<uid>/hdmicap/<target>/daemon.lock` |
+| hdmicap stderr log | `/tmp/paniolo-<uid>/hdmicap/<target>/daemon.log` (truncated on each CLI-spawned start) |
+| serialcap discovery file | `/tmp/paniolo-<uid>/serialcap/<target>/daemon.json` (`{pid, port, interfaces:[{name, device, baud}]}`) |
+| serialcap advisory lock | `/tmp/paniolo-<uid>/serialcap/<target>/daemon.lock` |
+| serialcap stderr log | `/tmp/paniolo-<uid>/serialcap/<target>/daemon.log` (truncated on each CLI-spawned start) |
+| serialcap capture log | `/tmp/paniolo-<uid>/serialcap/<target>/capture/<name>/serial.jsonl(.1..)` (rotated JSONL, per interface) |
+| serialcap pending line | `/tmp/paniolo-<uid>/serialcap/<target>/capture/<name>/pending.json` (current unterminated line) |
+| hid daemon discovery file | `/tmp/paniolo-<uid>/hid/<target>/daemon.json` (channel name, any injector) |
+
+The per-target capture daemons (hdmicap/serialcap/hid) add the `<target>`
+segment so multiple targets capture concurrently on one host; host-singleton
+daemons (zigplug/cambrionix/netbootd) have no `<target>` segment. The runtime
+base honors `$PANIOLO_RUNTIME_BASE` (default `/tmp`).
 
 ## Source code constraints
 
@@ -1072,14 +1086,17 @@ Paniolo runs on Linux as well as macOS. Platform differences:
   stack decodes MJPEG before AVFoundation — raw-MJPEG passthrough (the Linux
   tee) is impossible on macOS; frames arrive as NV12 ('420v', video-range)
   and RGB materializes lazily per request.
-- **One daemon instance per user per host.** Discovery, lock, and stderr log
-  live in `/tmp/paniolo-<uid>/<daemon>/` — deliberately env-independent (NOT
-  `$TMPDIR`, which macOS varies per environment so a running daemon was
-  invisible from other shells; NOT `$XDG_RUNTIME_DIR`, which systemd deletes
-  when the user's last session ends, breaking daemons that outlive their SSH
-  session). Corollary: one hdmicap (= one capture device) per user per host —
-  two video targets on one control host would need per-target daemon dirs,
-  which don't exist yet.
+- **Capture daemons are per-target; singleton daemons are per-host.** Discovery,
+  lock, and stderr log live under `${PANIOLO_RUNTIME_BASE:-/tmp}/paniolo-<uid>/`
+  — the base is deliberately env-independent (NOT `$TMPDIR`, which macOS varies
+  per environment so a running daemon was invisible from other shells; NOT
+  `$XDG_RUNTIME_DIR`, which systemd deletes when the user's last session ends,
+  breaking daemons that outlive their SSH session). The capture daemons
+  (serialcap/hdmicap/hid) are **per target** — each gets its own daemon dir
+  `<base>/paniolo-<uid>/<daemon>/<target>/`, so multiple targets capture
+  concurrently on one host (multiple hdmicap = multiple capture devices). The
+  host-singleton daemons (zigplug/cambrionix/netbootd) stay **one per host** at
+  `<base>/paniolo-<uid>/<daemon>/` with no `<target>` segment.
 - **Daemon shutdown hard-exits.** Both hdmicap (`/preview` MJPEG) and serialcap
   (`/stream` WebSocket) serve infinite responses, so a plain axum graceful
   shutdown would block on them forever. On SIGTERM each daemon removes its

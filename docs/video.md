@@ -66,7 +66,7 @@ paniolo video shot [target-machine]              # PNG to stdout (default -o -)
 paniolo video shot --stable -o out.png           # wait for a steady frame first
 paniolo video shot --changed-since <hex-hash> --timeout 10000 -o out.png
                                                  # block until the frame differs
-paniolo video preview                            # print the live-dashboard URL
+paniolo video preview [target-machine]           # print the live-dashboard URL (optional target, like `show`)
 ```
 
 `shot` fetches a single PNG-encoded frame from the running daemon and prints
@@ -105,6 +105,10 @@ finds it there (or via `PANIOLO_VISIONOCR`) and shells out to it per request.
 | Purpose | Path |
 |---|---|
 | Video config | the target's `video` channel in the lab file (`~/.config/paniolo/lab.toml`) |
-| hdmicap discovery | `/tmp/paniolo-<uid>/hdmicap/daemon.json` (`{pid, port}`) |
-| hdmicap advisory lock | `/tmp/paniolo-<uid>/hdmicap/daemon.lock` |
-| hdmicap stderr log | `/tmp/paniolo-<uid>/hdmicap/daemon.log` (truncated on each start; shown on start timeout) |
+| hdmicap discovery | `/tmp/paniolo-<uid>/hdmicap/<target>/daemon.json` (`{pid, port}`) |
+| hdmicap advisory lock | `/tmp/paniolo-<uid>/hdmicap/<target>/daemon.lock` |
+| hdmicap stderr log | `/tmp/paniolo-<uid>/hdmicap/<target>/daemon.log` (truncated on each start; shown on start timeout) |
+
+The hdmicap daemon is **per target** (the `<target>` segment), so multiple
+targets capture concurrently on one host; the runtime base honors
+`$PANIOLO_RUNTIME_BASE` (default `/tmp`).

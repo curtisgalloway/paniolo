@@ -44,15 +44,16 @@ pub struct Discovery {
 
 /// The daemon's runtime dir. Paniolo passes the canonical location as
 /// `PANIOLO_RUNTIME_DIR` (the helper state/runtime-dir API in the CLI's
-/// daemons.rs — the single source of truth); the literal fallback below is
-/// for standalone invocations and matches it byte-for-byte:
-/// `/tmp/paniolo-<uid>/serialcap`, identical in every environment of the
-/// same user. Deliberately NOT `$TMPDIR`/`temp_dir()` (macOS hands each
+/// daemons.rs — the single source of truth; it also adds a per-target segment
+/// so multiple targets' daemons coexist). The fallback below is for standalone
+/// invocations: `<base>/paniolo-<uid>/serialcap`, where `<base>` honors
+/// `$PANIOLO_RUNTIME_BASE` (default `/tmp`), identical in every environment of
+/// the same user. Deliberately NOT `$TMPDIR`/`temp_dir()` (macOS hands each
 /// environment a different TMPDIR — GUI terminal vs SSH vs sandboxed agent
 /// shells — so a running daemon was invisible from the others) and NOT
 /// `$XDG_RUNTIME_DIR` (systemd removes `/run/user/<uid>` when the user's
 /// last session ends, breaking daemons that outlive the SSH session that
-/// started them).
+/// started them). Keep in sync with daemons.rs `runtime_root`/`runtime_base`.
 pub fn runtime_dir() -> Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     if let Some(dir) = std::env::var_os("PANIOLO_RUNTIME_DIR") {
@@ -62,7 +63,10 @@ pub fn runtime_dir() -> Result<PathBuf> {
     }
     // Safe: getuid is always successful.
     let uid = unsafe { libc::getuid() };
-    let base = PathBuf::from(format!("/tmp/paniolo-{uid}"));
+    let root = std::env::var_os("PANIOLO_RUNTIME_BASE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let base = root.join(format!("paniolo-{uid}"));
     match fs::DirBuilder::new().mode(0o700).create(&base) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {

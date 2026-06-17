@@ -209,8 +209,12 @@ pub fn run_subcommand(
 /// Read the TCP port from a daemon's discovery file on `host`, or None.
 /// The path is resolved by a remote shell so the host's own uid applies;
 /// must match `runtime_base()` in daemons.rs (and the daemon crates).
+/// `subdir` is `<name>` for a host-singleton daemon or `<name>/<target>` for a
+/// per-target one — build it with [`crate::daemons::runtime_rel`].
 pub fn remote_daemon_port(host: &crate::model::Host, subdir: &str) -> Option<u16> {
-    let script = format!("cat \"/tmp/paniolo-$(id -u)/{subdir}/daemon.json\" 2>/dev/null");
+    let script = format!(
+        "cat \"${{PANIOLO_RUNTIME_BASE:-/tmp}}/paniolo-$(id -u)/{subdir}/daemon.json\" 2>/dev/null"
+    );
     let out = ssh::run(
         host,
         &["sh".to_string(), "-c".to_string(), script],

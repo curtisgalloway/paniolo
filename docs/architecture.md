@@ -122,10 +122,13 @@ legacy Python per-target files (`~/.config/paniolo/targets/<name>.toml`, `video.
 read by the Rust CLI.
 
 **Runtime state, discovery, and capture** live outside the config tree. Each daemon writes a
-**discovery file** (pid + port) and holds an **advisory lock** so only one runs per host. Helpers
+**discovery file** (pid + port) and holds an **advisory lock**. The per-target capture daemons
+(serialcap/hdmicap/hid) run one instance **per target** — so several targets capture concurrently
+on one host — while host-singleton daemons (zigplug/cambrionix/netbootd) run one per host. Helpers
 additionally receive two environment variables on every invocation — `PANIOLO_STATE_DIR`
 (durable state, `~/.config/paniolo/helpers/<name>`) and `PANIOLO_RUNTIME_DIR`
-(`/tmp/paniolo-<uid>/<name>`), both pre-created (`cli/src/daemons.rs`; contract in
+(`/tmp/paniolo-<uid>/<name>`; the capture daemons append a `/<target>` segment), both pre-created.
+The runtime base honors `$PANIOLO_RUNTIME_BASE` (default `/tmp`) (`cli/src/daemons.rs`; contract in
 [`adding-power-helpers.md`](adding-power-helpers.md)):
 
 | Purpose | Path |
@@ -134,12 +137,12 @@ additionally receive two environment variables on every invocation — `PANIOLO_
 | Helper durable state (`PANIOLO_STATE_DIR`) | `~/.config/paniolo/helpers/<name>/` (e.g. zigplug's `zigbee.db`) |
 | Netboot state (pids, uptime) | `~/.local/share/paniolo/<name>/netboot.json` |
 | Netboot combined log | `~/.local/share/paniolo/<name>/netboot.log` |
-| hdmicap discovery / lock | `/tmp/paniolo-<uid>/hdmicap/{daemon.json, daemon.lock}` |
-| serialcap discovery / lock | `/tmp/paniolo-<uid>/serialcap/{daemon.json, daemon.lock}` |
-| hid daemon discovery (channel name, any injector) | `/tmp/paniolo-<uid>/hid/daemon.json` |
-| zigplug daemon discovery | `/tmp/paniolo-<uid>/zigplug/daemon.json` |
-| serialcap capture log (per interface) | `/tmp/paniolo-<uid>/serialcap/capture/<name>/serial.jsonl(.1..)` |
-| serialcap pending (unterminated) line | `/tmp/paniolo-<uid>/serialcap/capture/<name>/pending.json` |
+| hdmicap discovery / lock (per target) | `/tmp/paniolo-<uid>/hdmicap/<target>/{daemon.json, daemon.lock}` |
+| serialcap discovery / lock (per target) | `/tmp/paniolo-<uid>/serialcap/<target>/{daemon.json, daemon.lock}` |
+| hid daemon discovery (channel name, any injector, per target) | `/tmp/paniolo-<uid>/hid/<target>/daemon.json` |
+| zigplug daemon discovery (host singleton) | `/tmp/paniolo-<uid>/zigplug/daemon.json` |
+| serialcap capture log (per interface) | `/tmp/paniolo-<uid>/serialcap/<target>/capture/<name>/serial.jsonl(.1..)` |
+| serialcap pending (unterminated) line | `/tmp/paniolo-<uid>/serialcap/<target>/capture/<name>/pending.json` |
 
 ## 5. Subsystems
 
@@ -175,8 +178,8 @@ link-local peer (`ip -6 neigh`) as a paste-ready `ffx target add`. Privileged st
 `sudo` path as netboot — no new privilege model.
 
 ### Serial console ([`serial.md`](serial.md))
-The `serialcap` daemon is the heart of the design. One daemon **exclusively owns all of a
-target's serial interfaces**; per interface a *supervisor* task owns the port (with a reconnect
+The `serialcap` daemon is the heart of the design. One daemon **per target exclusively owns all of
+that target's serial interfaces** (two targets on one host run two serialcap daemons); per interface a *supervisor* task owns the port (with a reconnect
 loop) and **fans every byte out three ways**: (1) broadcast to live WebSocket clients
 (`/stream`), (2) a 64 KB scrollback ring for instant replay, and (3) a tee to a capture thread
 that assembles **timestamped, sequence-numbered JSONL** lines on disk (rotating, survives
