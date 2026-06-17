@@ -32,14 +32,14 @@ pub const DAEMON: &str = "hdmicap";
 /// fixed defaults collide with stale dashboard tunnels).
 pub const DEFAULT_PORT: u16 = 0;
 
-pub fn daemon_url() -> Option<String> {
-    daemons::daemon_url(DAEMON)
+pub fn daemon_url(target: &str) -> Option<String> {
+    daemons::daemon_url(DAEMON, Some(target))
 }
 
-/// OCR the daemon's current frame via `GET /ocr` (optionally waiting for a
-/// stable signal first), returning the recognized text.
-pub fn ocr(stable: bool, timeout_ms: u64) -> Result<String> {
-    let url = daemon_url()
+/// OCR the target daemon's current frame via `GET /ocr` (optionally waiting for
+/// a stable signal first), returning the recognized text.
+pub fn ocr(target: &str, stable: bool, timeout_ms: u64) -> Result<String> {
+    let url = daemon_url(target)
         .ok_or_else(|| anyhow!("no video daemon running — start one with `paniolo video watch`"))?;
     if stable {
         // The snapshot blocks until the signal settles (or times out); the
@@ -57,8 +57,11 @@ pub fn ocr(stable: bool, timeout_ms: u64) -> Result<String> {
         .map_err(|e| anyhow!("reading the OCR response failed: {e}"))
 }
 
-/// Start the hdmicap daemon for `device`, detached; caller polls discovery.
-pub fn start_daemon(device: &str, port: u16, target_name: Option<&str>) -> Result<()> {
+/// Start the `target`'s hdmicap daemon for `device`, detached; caller polls
+/// discovery. The target also names the per-target runtime dir (so multiple
+/// targets' daemons coexist) and rides along as `PANIOLO_TARGET` for the
+/// dashboard's power-cycle button.
+pub fn start_daemon(device: &str, port: u16, target: &str) -> Result<()> {
     let binary = daemons::find_binary(DAEMON)
         .ok_or_else(|| anyhow!("hdmicap not found (libexec or PATH) — run `paniolo setup`"))?;
     let mut cmd = Command::new(binary);
@@ -67,36 +70,44 @@ pub fn start_daemon(device: &str, port: u16, target_name: Option<&str>) -> Resul
         .arg(device)
         .arg("--port")
         .arg(port.to_string());
-    cmd.envs(daemons::helper_env(DAEMON));
+    cmd.envs(daemons::helper_env(DAEMON, Some(target)));
     // visionocr on macOS, linuxocr (same interface) on Linux.
     if let Some(ocr) =
         daemons::find_binary("visionocr").or_else(|| daemons::find_binary("linuxocr"))
     {
         cmd.env("PANIOLO_VISIONOCR", ocr);
     }
-    if let Some(name) = target_name {
-        cmd.env("PANIOLO_TARGET", name);
-    }
+    cmd.env("PANIOLO_TARGET", target);
     // Capture stderr (tracing output) so a startup failure is diagnosable;
     // daemons::start_failure() reads the tail on timeout.
-    let log = std::fs::File::create(daemons::ensure_runtime_dir(DAEMON)?.join("daemon.log"))?;
+    let log = std::fs::File::create(
+        daemons::ensure_runtime_dir(DAEMON, Some(target))?.join("daemon.log"),
+    )?;
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     cmd.spawn()?;
     Ok(())
 }
 
-/// Stop the running daemon via `hdmicap stop`.
-pub fn stop_daemon() -> Result<i32> {
+/// Stop the target's running daemon via `hdmicap stop`. The per-target
+/// `helper_env` points `hdmicap stop` at the right instance's discovery file.
+pub fn stop_daemon(target: &str) -> Result<i32> {
     let binary = daemons::find_binary(DAEMON).ok_or_else(|| anyhow!("hdmicap not found"))?;
-    let status = Command::new(binary).arg("stop").status()?;
+    let status = Command::new(binary)
+        .arg("stop")
+        .envs(daemons::helper_env(DAEMON, Some(target)))
+        .status()?;
     Ok(status.code().unwrap_or(1))
 }
 
 /// Run an `hdmicap` client subcommand (shot/devices/…) with stdio passed
-/// through; returns the exit code.
-pub fn passthrough(args: &[String]) -> Result<i32> {
+/// through; returns the exit code. `instance` is the target whose daemon to
+/// reach (`None` for daemon-less subcommands like `devices`).
+pub fn passthrough(args: &[String], instance: Option<&str>) -> Result<i32> {
     let binary = daemons::find_binary(DAEMON).ok_or_else(|| anyhow!("hdmicap not found"))?;
-    let status = Command::new(binary).args(args).status()?;
+    let status = Command::new(binary)
+        .args(args)
+        .envs(daemons::helper_env(DAEMON, instance))
+        .status()?;
     Ok(status.code().unwrap_or(1))
 }

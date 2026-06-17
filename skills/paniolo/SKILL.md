@@ -154,7 +154,9 @@ paniolo video stop [target]           # stop the daemon (on the target's host)
 
 A target can have **several named serial interfaces** (e.g. a main `console` and
 a `bmc`). Each port is **exclusive** — only one consumer can hold it at a time —
-but a single `watch` daemon owns *all* of them at once.
+but a single `watch` daemon **per target** owns *all* of that target's interfaces
+at once. (Each target gets its own daemon, so several targets capture concurrently
+on one host.)
 
 ```
 paniolo serial add console -t <target> --device <path>   # add a named interface
@@ -318,8 +320,9 @@ paniolo hid send -t <name> ping               # injector liveness check
 
 The same dual-board control board can also back this target's **serial** and
 **power** channels: when `hidrig serve` runs it bridges the DUT's serial console
-and re-exports it as a PTY (point a `serial` channel's `device =` at
-`/tmp/paniolo-<uid>/hid/console`), and `hidrig power off|on|cycle` switches DUT
+and re-exports it as a PTY (the hid daemon is per-target, so point a `serial`
+channel's `device =` at `/tmp/paniolo-<uid>/hid/<target>/console`), and `hidrig
+power off|on|cycle` switches DUT
 power via a relay (behind the `power` hook) — one USB device for HID, console,
 and power. (The relay/power path is hardware-verified, incl. state persistence
 across a control-board reset; the console bridge is new and not yet verified.)

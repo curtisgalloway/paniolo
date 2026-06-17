@@ -16,10 +16,14 @@
 //!
 //! Every daemon follows the same contract: it is an installed binary (the
 //! paniolo libexec dir, PATH, or legacy `~/.cargo/bin` — see [`find_binary`]),
-//! binds localhost (port 0 = OS-assigned), and writes a
-//! discovery file `<runtime>/<name>/daemon.json` containing `{pid, port, …}`
-//! where `<runtime>` is `/tmp/paniolo-<uid>` (see [`runtime_base`]). Liveness
-//! is "the recorded pid still exists".
+//! binds localhost (port 0 = OS-assigned), and writes a discovery file
+//! `{pid, port, …}` under `<runtime>/<name>[/<target>]/daemon.json`. The
+//! optional `<target>` segment lets per-target capture daemons (serialcap,
+//! hdmicap, hid) coexist on one host; host-singleton daemons (zigplug,
+//! cambrionix, netbootd) omit it (see [`runtime_rel`]). `<runtime>` is
+//! `<base>/paniolo-<uid>` where `<base>` honors `$PANIOLO_RUNTIME_BASE`
+//! (default `/tmp`; see [`runtime_root`]). Liveness is "the recorded pid
+//! still exists".
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -120,23 +124,70 @@ pub fn hook_path() -> std::ffi::OsString {
     std::env::join_paths(paths).unwrap_or(current)
 }
 
-/// Stable per-user runtime base: `/tmp/paniolo-<uid>`, identical in every
-/// environment of the same user. Deliberately NOT `$TMPDIR`/`temp_dir()`
-/// (macOS hands each environment a different TMPDIR — GUI terminal vs SSH vs
-/// sandboxed agent shells — so a running daemon was invisible from the
-/// others) and NOT `$XDG_RUNTIME_DIR` (systemd removes `/run/user/<uid>`
-/// when the user's last session ends, breaking daemons that outlive the SSH
-/// session that started them). Keep in sync with `runtime_dir()` in
-/// hdmicap/src/daemon.rs and serialcap/src/daemon.rs.
+/// The temp root beneath which paniolo's per-uid runtime base lives. Honors
+/// `$PANIOLO_RUNTIME_BASE` (default `/tmp`), so the location is configurable
+/// without resorting to `$TMPDIR`: macOS hands each environment a different
+/// TMPDIR (GUI terminal vs SSH vs sandboxed agent shells), which would make a
+/// daemon started in one environment invisible to the others — the bug the
+/// hardcoded `/tmp` originally fixed. `$XDG_RUNTIME_DIR` is likewise avoided
+/// (systemd removes `/run/user/<uid>` when the user's last session ends,
+/// breaking daemons that outlive the SSH session that started them).
+pub fn runtime_root() -> PathBuf {
+    std::env::var_os("PANIOLO_RUNTIME_BASE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+/// Stable per-user runtime base: `<root>/paniolo-<uid>`, identical in every
+/// environment of the same user. The per-uid namespace and its 0700 ownership
+/// check (see [`ensure_runtime_dir`]) are always applied beneath the root.
+/// Keep in sync with `runtime_dir()` in hdmicap/src/daemon.rs and
+/// serialcap/src/daemon.rs.
 fn runtime_base() -> PathBuf {
     // Safe: getuid is always successful.
     let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/tmp/paniolo-{uid}"))
+    runtime_root().join(format!("paniolo-{uid}"))
 }
 
-/// Create (0700) and validate the runtime base, then `<base>/<name>`.
+/// Sanitize an instance key (a target name, user-chosen) into a single safe
+/// path component: keep alphanumerics, `-`, `_`, `.`; collapse anything else
+/// to `_`. Mirrors serialcap's interface-name sanitizer. An empty result
+/// falls back to `_`.
+fn sanitize_component(s: &str) -> String {
+    let out: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if out.is_empty() {
+        "_".to_string()
+    } else {
+        out
+    }
+}
+
+/// The runtime subdir for a daemon, relative to the per-uid base: `<name>` for
+/// a single-instance daemon, or `<name>/<sanitized-instance>` for a per-target
+/// (multi-instance) daemon. Both the local path helpers and the remote
+/// discovery lookup (`dispatch::remote_daemon_port`) build paths through this,
+/// so a daemon's writer and reader always agree on the location.
+pub fn runtime_rel(name: &str, instance: Option<&str>) -> String {
+    match instance {
+        Some(i) => format!("{name}/{}", sanitize_component(i)),
+        None => name.to_string(),
+    }
+}
+
+/// Create (0700) and validate the runtime base, then `<base>/<name>[/<inst>]`.
 /// The ownership check guards against a squatter pre-creating the /tmp path.
-pub fn ensure_runtime_dir(name: &str) -> Result<PathBuf> {
+/// `instance` is `Some(target)` for per-target capture daemons (serialcap,
+/// hdmicap, hid), `None` for host-singleton daemons (zigplug, cambrionix, …).
+pub fn ensure_runtime_dir(name: &str, instance: Option<&str>) -> Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     let base = runtime_base();
     match std::fs::DirBuilder::new().mode(0o700).create(&base) {
@@ -153,14 +204,16 @@ pub fn ensure_runtime_dir(name: &str) -> Result<PathBuf> {
         }
         Err(e) => return Err(e.into()),
     }
-    let dir = base.join(name);
+    let dir = base.join(runtime_rel(name, instance));
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
 /// Where a spawned daemon's stderr is captured (truncated on each start).
-pub fn log_path(name: &str) -> PathBuf {
-    runtime_base().join(name).join("daemon.log")
+pub fn log_path(name: &str, instance: Option<&str>) -> PathBuf {
+    runtime_base()
+        .join(runtime_rel(name, instance))
+        .join("daemon.log")
 }
 
 // ── helper state/runtime-dir API ────────────────────────────────────────────
@@ -185,16 +238,18 @@ pub fn state_base() -> Option<PathBuf> {
 }
 
 /// The `(var, value)` environment pairs for invoking helper `name`, with both
-/// directories created. Failures degrade to omitting the affected var — the
+/// directories created. `instance` is `Some(target)` for per-target capture
+/// daemons (so each target gets its own runtime + state dir) and `None` for
+/// host-singleton helpers. Failures degrade to omitting the affected var — the
 /// helper's own fallback then applies.
-pub fn helper_env(name: &str) -> Vec<(&'static str, PathBuf)> {
+pub fn helper_env(name: &str, instance: Option<&str>) -> Vec<(&'static str, PathBuf)> {
     let mut env = Vec::new();
-    if let Some(state) = state_base().map(|b| b.join(name)) {
+    if let Some(state) = state_base().map(|b| b.join(runtime_rel(name, instance))) {
         if std::fs::create_dir_all(&state).is_ok() {
             env.push(("PANIOLO_STATE_DIR", state));
         }
     }
-    if let Ok(runtime) = ensure_runtime_dir(name) {
+    if let Ok(runtime) = ensure_runtime_dir(name, instance) {
         env.push(("PANIOLO_RUNTIME_DIR", runtime));
     }
     env
@@ -216,8 +271,8 @@ pub fn hook_helper_name(cmd: &str) -> Option<String> {
 
 /// Error for a daemon that didn't publish discovery in time, carrying the
 /// tail of its stderr log so the failure is diagnosable.
-pub fn start_failure(name: &str, timeout: Duration) -> anyhow::Error {
-    let log = std::fs::read_to_string(log_path(name)).unwrap_or_default();
+pub fn start_failure(name: &str, instance: Option<&str>, timeout: Duration) -> anyhow::Error {
+    let log = std::fs::read_to_string(log_path(name, instance)).unwrap_or_default();
     let mut tail: Vec<&str> = log.lines().rev().take(5).collect();
     tail.reverse();
     if tail.is_empty() {
@@ -243,45 +298,75 @@ fn pid_alive(pid: i32) -> bool {
 pub struct DaemonInfo {
     /// Discovery dir name (serialcap, hdmicap, hid, zigplug, …).
     pub name: String,
+    /// Target name for per-target (multi-instance) daemons; `None` for
+    /// host-singleton daemons.
+    pub instance: Option<String>,
     pub pid: i32,
     pub port: Option<u16>,
     /// Daemon-specific detail (e.g. zigplug's serial device), if published.
     pub detail: String,
 }
 
+/// Parse `<dir>/daemon.json` into a live [`DaemonInfo`], or `None` if the file
+/// is absent, unparseable, or names a dead pid (stale).
+fn read_discovery(
+    dir: &std::path::Path,
+    name: &str,
+    instance: Option<String>,
+) -> Option<DaemonInfo> {
+    let text = std::fs::read_to_string(dir.join("daemon.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let pid = v.get("pid")?.as_i64()?;
+    if !pid_alive(pid as i32) {
+        return None;
+    }
+    Some(DaemonInfo {
+        name: name.to_string(),
+        instance,
+        pid: pid as i32,
+        port: v.get("port").and_then(|p| p.as_u64()).map(|p| p as u16),
+        detail: v
+            .get("device")
+            .and_then(|d| d.as_str())
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
 /// Every daemon currently publishing a live discovery file. Stale files
-/// (dead pid) are skipped, mirroring [`daemon_port`]'s liveness rule.
+/// (dead pid) are skipped, mirroring [`daemon_port`]'s liveness rule. Handles
+/// both layouts: `<name>/daemon.json` (host-singleton: zigplug, cambrionix,
+/// netbootd) and `<name>/<target>/daemon.json` (per-target: serialcap,
+/// hdmicap, hid).
 pub fn list_discovered() -> Vec<DaemonInfo> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(runtime_base()) else {
         return out;
     };
     for entry in entries.flatten() {
-        let path = entry.path().join("daemon.json");
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-            continue;
-        };
-        let Some(pid) = v.get("pid").and_then(|p| p.as_i64()) else {
-            continue;
-        };
-        if !pid_alive(pid as i32) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let dir = entry.path();
+        // Host-singleton: a discovery file sits directly in <name>/.
+        if let Some(info) = read_discovery(&dir, &name, None) {
+            out.push(info);
             continue;
         }
-        out.push(DaemonInfo {
-            name: entry.file_name().to_string_lossy().into_owned(),
-            pid: pid as i32,
-            port: v.get("port").and_then(|p| p.as_u64()).map(|p| p as u16),
-            detail: v
-                .get("device")
-                .and_then(|d| d.as_str())
-                .unwrap_or_default()
-                .to_string(),
-        });
+        // Otherwise look one level down for per-target instances.
+        let Ok(subs) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for sub in subs.flatten() {
+            let inst = sub.file_name().to_string_lossy().into_owned();
+            if let Some(info) = read_discovery(&sub.path(), &name, Some(inst)) {
+                out.push(info);
+            }
+        }
     }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.instance.cmp(&b.instance))
+    });
     out
 }
 
@@ -322,9 +407,12 @@ pub fn signal_pid(pid: i32, signal: i32) {
     }
 }
 
-/// Listen port of the named running daemon, or None if it isn't running.
-pub fn daemon_port(name: &str) -> Option<u16> {
-    let path = runtime_base().join(name).join("daemon.json");
+/// Listen port of the named running daemon instance, or None if it isn't
+/// running. `instance` selects a per-target daemon (`None` = host-singleton).
+pub fn daemon_port(name: &str, instance: Option<&str>) -> Option<u16> {
+    let path = runtime_base()
+        .join(runtime_rel(name, instance))
+        .join("daemon.json");
     let text = std::fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     let pid = v.get("pid")?.as_i64()? as i32;
@@ -335,16 +423,16 @@ pub fn daemon_port(name: &str) -> Option<u16> {
     u16::try_from(port).ok()
 }
 
-/// Base URL of the named running daemon, or None if it isn't running.
-pub fn daemon_url(name: &str) -> Option<String> {
-    daemon_port(name).map(|port| format!("http://127.0.0.1:{port}"))
+/// Base URL of the named running daemon instance, or None if it isn't running.
+pub fn daemon_url(name: &str, instance: Option<&str>) -> Option<String> {
+    daemon_port(name, instance).map(|port| format!("http://127.0.0.1:{port}"))
 }
 
-/// Block until the named daemon answers discovery, or time out.
-pub fn wait_for_daemon(name: &str, timeout: Duration) -> Option<String> {
+/// Block until the named daemon instance answers discovery, or time out.
+pub fn wait_for_daemon(name: &str, instance: Option<&str>, timeout: Duration) -> Option<String> {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        if let Some(url) = daemon_url(name) {
+        if let Some(url) = daemon_url(name, instance) {
             return Some(url);
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -372,5 +460,30 @@ mod tests {
         );
         assert_eq!(hook_helper_name(""), None);
         assert_eq!(hook_helper_name("   "), None);
+    }
+
+    #[test]
+    fn runtime_rel_singleton_vs_per_target() {
+        assert_eq!(runtime_rel("zigplug", None), "zigplug");
+        assert_eq!(runtime_rel("serialcap", Some("pi5")), "serialcap/pi5");
+    }
+
+    #[test]
+    fn runtime_rel_sanitizes_instance() {
+        // Path separators and other unsafe chars in a target name collapse to
+        // `_`, so the instance is always a single path component.
+        assert_eq!(runtime_rel("hdmicap", Some("a/b")), "hdmicap/a_b");
+        assert_eq!(runtime_rel("hdmicap", Some("../x")), "hdmicap/.._x");
+        assert_eq!(runtime_rel("hid", Some("")), "hid/_");
+        assert_eq!(runtime_rel("hid", Some("nova-1.2")), "hid/nova-1.2");
+    }
+
+    #[test]
+    fn runtime_root_honors_env_default_tmp() {
+        // Default is /tmp; the override is read live, so just assert the
+        // default path shape (the env var is process-global in tests).
+        if std::env::var_os("PANIOLO_RUNTIME_BASE").is_none() {
+            assert_eq!(runtime_root(), PathBuf::from("/tmp"));
+        }
     }
 }

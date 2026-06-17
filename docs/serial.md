@@ -53,9 +53,11 @@ This mode holds the serial port exclusively — it conflicts with the daemon.
 
 ## Daemon mode
 
-The serialcap daemon owns all configured interfaces for a target, provides
-a WebSocket terminal for the [dashboard](dashboard.md), and writes a
-timestamped rolling capture log.
+The serialcap daemon runs **one per target** and owns all of that target's
+configured interfaces, provides a WebSocket terminal for the
+[dashboard](dashboard.md), and writes a timestamped rolling capture log.
+(Each target gets its own daemon, so several targets capture concurrently on
+one host.)
 
 ```bash
 paniolo serial watch [target-machine]   # start serialcap daemon
@@ -98,7 +100,7 @@ log rotation) and a UTC timestamp (`ts_ms`). The `--since` flag polls for lines
 with `seq` greater than the last seen value — safe to re-run from scripts.
 
 Each interface writes to its own capture directory so logs never conflate:
-`/tmp/paniolo-<uid>/serialcap/capture/<name>/serial.jsonl`.
+`/tmp/paniolo-<uid>/serialcap/<target>/capture/<name>/serial.jsonl`.
 
 ---
 
@@ -205,11 +207,14 @@ See [power.md](power.md) for wiring diagrams, the generic power hooks
 
 | Purpose | Path |
 |---|---|
-| serialcap discovery | `/tmp/paniolo-<uid>/serialcap/daemon.json` (`{pid, port, interfaces:[...]}`) |
-| serialcap advisory lock | `/tmp/paniolo-<uid>/serialcap/daemon.lock` |
-| serialcap stderr log | `/tmp/paniolo-<uid>/serialcap/daemon.log` (truncated on each start; shown on start timeout) |
-| Capture log (per interface) | `/tmp/paniolo-<uid>/serialcap/capture/<name>/serial.jsonl(.1..)` |
-| Pending (unterminated) line | `/tmp/paniolo-<uid>/serialcap/capture/<name>/pending.json` |
+| serialcap discovery | `/tmp/paniolo-<uid>/serialcap/<target>/daemon.json` (`{pid, port, interfaces:[...]}`) |
+| serialcap advisory lock | `/tmp/paniolo-<uid>/serialcap/<target>/daemon.lock` |
+| serialcap stderr log | `/tmp/paniolo-<uid>/serialcap/<target>/daemon.log` (truncated on each start; shown on start timeout) |
+| Capture log (per interface) | `/tmp/paniolo-<uid>/serialcap/<target>/capture/<name>/serial.jsonl(.1..)` |
+| Pending (unterminated) line | `/tmp/paniolo-<uid>/serialcap/<target>/capture/<name>/pending.json` |
+
+The serialcap daemon is **per target** (the `<target>` segment); the runtime
+base honors `$PANIOLO_RUNTIME_BASE` (default `/tmp`).
 
 ---
 

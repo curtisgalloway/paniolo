@@ -657,8 +657,8 @@ enum VideoCmd {
         #[arg(long, default_value_t = 2000)]
         timeout: u64,
     },
-    /// Print the live-preview URL of the running daemon.
-    Preview,
+    /// Print the live-preview URL of the target's running daemon.
+    Preview { target: Option<String> },
     /// List available capture devices.
     Devices,
     /// Show the target's video channel and daemon status.
@@ -746,7 +746,11 @@ fn cmd_daemons_list() -> Result<()> {
     }
     for d in &discovered {
         let port = d.port.map_or("-".to_string(), |p| p.to_string());
-        println!("{}\tpid {}\tport {}\t{}", d.name, d.pid, port, d.detail);
+        let name = match &d.instance {
+            Some(inst) => format!("{}[{inst}]", d.name),
+            None => d.name.clone(),
+        };
+        println!("{name}\tpid {}\tport {}\t{}", d.pid, port, d.detail);
     }
     for (target, st) in &netboots {
         println!(
@@ -884,9 +888,12 @@ fn cmd_helper(name: Option<&str>, args: &[String]) -> Result<()> {
         "hidrig" | "ch9329" => HID_DAEMON,
         n => n,
     };
+    // Manual escape hatch: no target context, so use the non-instanced dir.
+    // (Per-target capture daemons are normally launched via their own
+    // subcommands, which supply the target.)
     let status = std::process::Command::new(binary)
         .args(args)
-        .envs(daemons::helper_env(env_name))
+        .envs(daemons::helper_env(env_name, None))
         .status()?;
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
@@ -1470,13 +1477,13 @@ fn serial_cmd(lab_flag: Option<&str>, cmd: SerialCmd) -> Result<()> {
         }
         SerialCmd::Watch { target, port } => cmd_serial_watch(lab_flag, target.as_deref(), port),
         SerialCmd::Stop { target } => {
-            // With a target, route to its serial channel's host (no-op locally).
-            if let Some(t) = target.as_deref() {
-                let _ = serial_runtime(lab_flag, Some(t), None, dispatch::Mode::Reexec)?;
-            }
-            let code = serial::stop_daemon()?;
+            // Resolve the target (routing to its serial channel's host if
+            // remote) so we stop the right per-target daemon instance.
+            let (target, _serials) =
+                serial_runtime(lab_flag, target.as_deref(), None, dispatch::Mode::Reexec)?;
+            let code = serial::stop_daemon(&target)?;
             if code == 0 {
-                println!("Serial daemon stopped.");
+                println!("Serial daemon for '{target}' stopped.");
                 Ok(())
             } else {
                 std::process::exit(code);
@@ -1593,7 +1600,7 @@ fn cmd_serial_dtr(
     }
     let serials = local_serials(&lab, &target)?;
     let ch = pick_serial(&serials, iface.as_deref())?;
-    if let Some(url) = serial::daemon_url() {
+    if let Some(url) = serial::daemon_url(&target) {
         eprintln!("{label} on '{target}' ({ms} ms via serialcap daemon)");
         power::dtr_press_daemon(&url, &ch.name, ms)?;
     } else {
@@ -1680,7 +1687,7 @@ fn cmd_console(
     }
 
     // Local: ensure both daemons (OS-assigned ports; discovery finds them).
-    let video_url = match video::daemon_url() {
+    let video_url = match video::daemon_url(&target) {
         Some(u) => u,
         None => {
             let v = local_video(&lab, &target)?;
@@ -1688,22 +1695,40 @@ fn cmd_console(
                 .device
                 .ok_or_else(|| anyhow!("video channel for '{target}' has no device set"))?;
             eprintln!("Starting video daemon…");
-            video::start_daemon(&device, 0, Some(&target))?;
-            daemons::wait_for_daemon(video::DAEMON, std::time::Duration::from_secs(5)).ok_or_else(
-                || daemons::start_failure(video::DAEMON, std::time::Duration::from_secs(5)),
-            )?
+            video::start_daemon(&device, 0, &target)?;
+            daemons::wait_for_daemon(
+                video::DAEMON,
+                Some(&target),
+                std::time::Duration::from_secs(5),
+            )
+            .ok_or_else(|| {
+                daemons::start_failure(
+                    video::DAEMON,
+                    Some(&target),
+                    std::time::Duration::from_secs(5),
+                )
+            })?
         }
     };
-    if serial::daemon_url().is_none() {
+    if serial::daemon_url(&target).is_none() {
         let serials = local_serials(&lab, &target)?;
         if serials.is_empty() {
             bail!("no serial interfaces configured for '{target}' (paniolo serial add ...)");
         }
         eprintln!("Starting serial daemon…");
-        serial::start_daemon(&serials, 0)?;
-        daemons::wait_for_daemon(serial::DAEMON, std::time::Duration::from_secs(5)).ok_or_else(
-            || daemons::start_failure(serial::DAEMON, std::time::Duration::from_secs(5)),
-        )?;
+        serial::start_daemon(&serials, 0, &target)?;
+        daemons::wait_for_daemon(
+            serial::DAEMON,
+            Some(&target),
+            std::time::Duration::from_secs(5),
+        )
+        .ok_or_else(|| {
+            daemons::start_failure(
+                serial::DAEMON,
+                Some(&target),
+                std::time::Duration::from_secs(5),
+            )
+        })?;
     }
     // Optional KVM leg: if the target has a local hid channel, ensure its
     // daemon and hand the dashboard its port (?hid=PORT). Absent/remote hid
@@ -1715,7 +1740,7 @@ fn cmd_console(
 
     // The dashboard's panes can't discover the daemons' OS-assigned ports
     // themselves — hand them over as ?serial=PORT / ?hid=PORT.
-    let serial_port = daemons::daemon_port(serial::DAEMON);
+    let serial_port = daemons::daemon_port(serial::DAEMON, Some(&target));
     let url = dashboard_url(
         &video_url,
         &DashboardLinks {
@@ -1748,10 +1773,12 @@ fn remote_console(lab: &Lab, target: &str, host_name: &str, interface: Option<&s
             );
         }
     }
-    let video_port = dispatch::remote_daemon_port(&host, "hdmicap")
-        .ok_or_else(|| anyhow!("could not read the hdmicap daemon port on {host_name}"))?;
-    let serial_port = dispatch::remote_daemon_port(&host, "serialcap")
-        .ok_or_else(|| anyhow!("could not read the serialcap daemon port on {host_name}"))?;
+    let video_port =
+        dispatch::remote_daemon_port(&host, &daemons::runtime_rel("hdmicap", Some(target)))
+            .ok_or_else(|| anyhow!("could not read the hdmicap daemon port on {host_name}"))?;
+    let serial_port =
+        dispatch::remote_daemon_port(&host, &daemons::runtime_rel("serialcap", Some(target)))
+            .ok_or_else(|| anyhow!("could not read the serialcap daemon port on {host_name}"))?;
 
     let fwd_video = ssh::forward(&host, video_port)?;
     let fwd_serial = ssh::forward(&host, serial_port)?;
@@ -1772,13 +1799,15 @@ fn remote_console(lab: &Lab, target: &str, host_name: &str, interface: Option<&s
     let mut _fwd_hid = None;
     let hid_ws: Option<String> = if hid_on_host {
         match dispatch::run_subcommand(lab, target, host_name, &["hid", "serve", target]) {
-            Ok(out) if out.status == 0 => dispatch::remote_daemon_port(&host, HID_DAEMON)
-                .and_then(|p| ssh::forward(&host, p).ok())
-                .map(|fwd| {
-                    let url = format!("ws://127.0.0.1:{}/hid", fwd.local_port);
-                    _fwd_hid = Some(fwd);
-                    url
-                }),
+            Ok(out) if out.status == 0 => {
+                dispatch::remote_daemon_port(&host, &daemons::runtime_rel(HID_DAEMON, Some(target)))
+                    .and_then(|p| ssh::forward(&host, p).ok())
+                    .map(|fwd| {
+                        let url = format!("ws://127.0.0.1:{}/hid", fwd.local_port);
+                        _fwd_hid = Some(fwd);
+                        url
+                    })
+            }
             _ => {
                 eprintln!("hid (KVM) disabled: could not start the hid daemon on {host_name}");
                 None
@@ -1827,7 +1856,7 @@ fn local_power(lab: &Lab, target: &str) -> Result<model::PowerChannel> {
 /// hook's program basename); empty when underivable.
 fn hook_envs(cmd: &str) -> Vec<(&'static str, std::path::PathBuf)> {
     daemons::hook_helper_name(cmd)
-        .map(|n| daemons::helper_env(&n))
+        .map(|n| daemons::helper_env(&n, None))
         .unwrap_or_default()
 }
 
@@ -1980,7 +2009,7 @@ fn cmd_power_state(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
                  (paniolo power set -t {target} --serial-interface <name>)"
             )
         })?;
-        let url = serial::daemon_url().ok_or_else(|| {
+        let url = serial::daemon_url(&target).ok_or_else(|| {
             anyhow!("serialcap daemon not running — start it with `paniolo serial watch`")
         })?;
         match power::read_power_state(&url, &si) {
@@ -2051,7 +2080,7 @@ fn serial_runtime(
     target: Option<&str>,
     interface: Option<&str>,
     mode: dispatch::Mode,
-) -> Result<Vec<model::SerialChannel>> {
+) -> Result<(String, Vec<model::SerialChannel>)> {
     let lab = load_for_read(lab_flag)?;
     let target = resolve_single_target(&lab, target)?;
     if let Some(code) =
@@ -2059,7 +2088,8 @@ fn serial_runtime(
     {
         std::process::exit(code);
     }
-    local_serials(&lab, &target)
+    let serials = local_serials(&lab, &target)?;
+    Ok((target, serials))
 }
 
 fn cmd_serial_connect(
@@ -2067,34 +2097,40 @@ fn cmd_serial_connect(
     target: Option<&str>,
     interface: Option<&str>,
 ) -> Result<()> {
-    let serials = serial_runtime(lab_flag, target, interface, dispatch::Mode::Interactive)?;
+    let (_target, serials) =
+        serial_runtime(lab_flag, target, interface, dispatch::Mode::Interactive)?;
     let ch = pick_serial(&serials, interface)?;
     serial::exec_tio(&ch.device, ch.baud)
 }
 
 fn cmd_serial_watch(lab_flag: Option<&str>, target: Option<&str>, port: u16) -> Result<()> {
-    let serials = serial_runtime(lab_flag, target, None, dispatch::Mode::Reexec)?;
+    let (target, serials) = serial_runtime(lab_flag, target, None, dispatch::Mode::Reexec)?;
     if serials.is_empty() {
         bail!("no serial interfaces configured (paniolo serial add ...)");
     }
-    if let Some(url) = serial::daemon_url() {
-        println!("Serial daemon already running at {url}");
+    if let Some(url) = serial::daemon_url(&target) {
+        println!("Serial daemon for '{target}' already running at {url}");
         return Ok(());
     }
-    serial::start_daemon(&serials, port)?;
+    serial::start_daemon(&serials, port, &target)?;
     let names: Vec<&str> = serials.iter().map(|s| s.name.as_str()).collect();
     eprintln!(
-        "Starting serial daemon for {} interface(s): {}…",
+        "Starting serial daemon for '{target}' ({} interface(s): {})…",
         serials.len(),
         names.join(", ")
     );
-    match daemons::wait_for_daemon(serial::DAEMON, std::time::Duration::from_secs(5)) {
+    match daemons::wait_for_daemon(
+        serial::DAEMON,
+        Some(&target),
+        std::time::Duration::from_secs(5),
+    ) {
         Some(url) => {
             println!("Serial daemon started. {url}");
             Ok(())
         }
         None => Err(daemons::start_failure(
             serial::DAEMON,
+            Some(&target),
             std::time::Duration::from_secs(5),
         )),
     }
@@ -2108,9 +2144,9 @@ fn cmd_serial_send(
     pace_ms: u32,
     newline: bool,
 ) -> Result<()> {
-    let serials = serial_runtime(lab_flag, target, interface, dispatch::Mode::Reexec)?;
+    let (target, serials) = serial_runtime(lab_flag, target, interface, dispatch::Mode::Reexec)?;
     let ch = pick_serial(&serials, interface)?;
-    let url = serial::daemon_url().ok_or_else(|| {
+    let url = serial::daemon_url(&target).ok_or_else(|| {
         anyhow!("serialcap daemon not running — start it with `paniolo serial watch`")
     })?;
     let mut payload = text.as_bytes().to_vec();
@@ -2146,12 +2182,14 @@ fn cmd_serial_log(
     no_pending: bool,
 ) -> Result<()> {
     // Dispatch to the channel's host; the capture log lives where the daemon ran.
-    let serials = serial_runtime(lab_flag, target, interface, dispatch::Mode::Reexec)?;
+    let (target, serials) = serial_runtime(lab_flag, target, interface, dispatch::Mode::Reexec)?;
     // serialcap reads its own on-disk log, so this works daemon-up or -down.
+    // The per-target env points it at this target's capture dir.
     let binary = daemons::find_binary(serial::DAEMON)
         .ok_or_else(|| anyhow!("serialcap not found — run `paniolo setup`"))?;
     let mut cmd = std::process::Command::new(binary);
     cmd.arg("log");
+    cmd.envs(daemons::helper_env(serial::DAEMON, Some(&target)));
     // Name the interface explicitly when we can (sole or selected).
     if let Some(name) = interface.or_else(|| {
         if serials.len() == 1 {
@@ -2192,7 +2230,7 @@ fn cmd_serial_log(
 }
 
 fn cmd_serial_show(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
-    let serials = serial_runtime(lab_flag, target, None, dispatch::Mode::Reexec)?;
+    let (target, serials) = serial_runtime(lab_flag, target, None, dispatch::Mode::Reexec)?;
     if serials.is_empty() {
         println!("No serial interfaces configured. (paniolo serial add ...)");
         return Ok(());
@@ -2205,7 +2243,7 @@ fn cmd_serial_show(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
             .unwrap_or_default();
         println!("{}\t{} @ {}{sense}", ch.name, ch.device, ch.baud);
     }
-    match serial::daemon_url() {
+    match serial::daemon_url(&target) {
         Some(url) => println!("daemon\trunning at {url}"),
         None => println!("daemon\tstopped"),
     }
@@ -2278,35 +2316,39 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
             let device = v
                 .device
                 .ok_or_else(|| anyhow!("video channel for '{target}' has no device set"))?;
-            if let Some(url) = video::daemon_url() {
+            if let Some(url) = video::daemon_url(&target) {
                 if !restart {
-                    println!("Video daemon already running at {url}");
+                    println!("Video daemon for '{target}' already running at {url}");
                     return Ok(());
                 }
-                let _ = video::stop_daemon();
+                let _ = video::stop_daemon(&target);
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
-            eprintln!("Starting video daemon for '{device}'…");
-            video::start_daemon(&device, port, Some(&target))?;
-            match daemons::wait_for_daemon(video::DAEMON, std::time::Duration::from_secs(5)) {
+            eprintln!("Starting video daemon for '{target}' ('{device}')…");
+            video::start_daemon(&device, port, &target)?;
+            match daemons::wait_for_daemon(
+                video::DAEMON,
+                Some(&target),
+                std::time::Duration::from_secs(5),
+            ) {
                 Some(url) => {
                     println!("Video daemon started. Preview at {url}");
                     Ok(())
                 }
                 None => Err(daemons::start_failure(
                     video::DAEMON,
+                    Some(&target),
                     std::time::Duration::from_secs(5),
                 )),
             }
         }
         VideoCmd::Stop { target } => {
-            // With a target, route to its video channel's host (no-op locally).
-            if let Some(t) = target.as_deref() {
-                let _ = video_runtime(lab_flag, Some(t))?;
-            }
-            let code = video::stop_daemon()?;
+            // Resolve the target (routing to its video channel's host if
+            // remote) so we stop the right per-target daemon instance.
+            let (target, _v) = video_runtime(lab_flag, target.as_deref())?;
+            let code = video::stop_daemon(&target)?;
             if code == 0 {
-                println!("Video daemon stopped.");
+                println!("Video daemon for '{target}' stopped.");
                 Ok(())
             } else {
                 std::process::exit(code);
@@ -2319,7 +2361,7 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
             timeout,
             out,
         } => {
-            let _ = video_runtime(lab_flag, target.as_deref())?;
+            let (target, _v) = video_runtime(lab_flag, target.as_deref())?;
             let mut args = vec![
                 "shot".to_string(),
                 "--timeout".to_string(),
@@ -2334,35 +2376,38 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
                 args.push("--changed-since".to_string());
                 args.push(h);
             }
-            std::process::exit(video::passthrough(&args)?);
+            std::process::exit(video::passthrough(&args, Some(&target))?);
         }
         VideoCmd::Read {
             target,
             stable,
             timeout,
         } => {
-            let _ = video_runtime(lab_flag, target.as_deref())?;
-            let text = video::ocr(stable, timeout)?;
+            let (target, _v) = video_runtime(lab_flag, target.as_deref())?;
+            let text = video::ocr(&target, stable, timeout)?;
             print!("{text}");
             if !text.ends_with('\n') {
                 println!();
             }
             Ok(())
         }
-        VideoCmd::Preview => match video::daemon_url() {
-            Some(url) => {
-                println!("{url}");
-                Ok(())
+        VideoCmd::Preview { target } => {
+            let (target, _v) = video_runtime(lab_flag, target.as_deref())?;
+            match video::daemon_url(&target) {
+                Some(url) => {
+                    println!("{url}");
+                    Ok(())
+                }
+                None => bail!("no video daemon running — start one with `paniolo video watch`"),
             }
-            None => bail!("no video daemon running — start one with `paniolo video watch`"),
-        },
+        }
         VideoCmd::Devices => {
-            std::process::exit(video::passthrough(&["devices".to_string()])?);
+            std::process::exit(video::passthrough(&["devices".to_string()], None)?);
         }
         VideoCmd::Show { target } => {
-            let (_target, v) = video_runtime(lab_flag, target.as_deref())?;
+            let (target, v) = video_runtime(lab_flag, target.as_deref())?;
             println!("device\t{}", v.device.as_deref().unwrap_or("(not set)"));
-            match video::daemon_url() {
+            match video::daemon_url(&target) {
                 Some(url) => println!("daemon\trunning at {url}"),
                 None => println!("daemon\tstopped"),
             }
@@ -2756,7 +2801,8 @@ const HID_DAEMON: &str = "hid";
 /// Ensure the hid injection daemon is running locally for `target`, returning
 /// its port, or None when the target has no local hid channel. The helper's
 /// `cmd` is run as `<cmd> serve --port 0` via `sh -c`; the contract is that it
-/// daemonizes and publishes `/tmp/paniolo-<uid>/hid/daemon.json`.
+/// daemonizes and publishes `<runtime-base>/hid/<target>/daemon.json` (its
+/// per-target `PANIOLO_RUNTIME_DIR`).
 fn ensure_hid_daemon_local(lab: &Lab, target: &str) -> Result<Option<u16>> {
     let t = lab
         .targets
@@ -2770,31 +2816,35 @@ fn ensure_hid_daemon_local(lab: &Lab, target: &str) -> Result<Option<u16>> {
     if h.host.as_deref().unwrap_or(&dh) != model::LOCAL {
         return Ok(None);
     }
-    if let Some(port) = daemons::daemon_port(HID_DAEMON) {
+    if let Some(port) = daemons::daemon_port(HID_DAEMON, Some(target)) {
         return Ok(Some(port));
     }
     let cmd = h.cmd.clone().ok_or_else(|| {
         anyhow!("hid channel for '{target}' has no cmd (paniolo hid set -t {target} --cmd ...)")
     })?;
-    eprintln!("Starting hid daemon…");
-    let log = std::fs::File::create(daemons::ensure_runtime_dir(HID_DAEMON)?.join("daemon.log"))?;
+    eprintln!("Starting hid daemon for '{target}'…");
+    let log = std::fs::File::create(
+        daemons::ensure_runtime_dir(HID_DAEMON, Some(target))?.join("daemon.log"),
+    )?;
     let mut command = std::process::Command::new("sh");
     command
         .arg("-c")
         .arg(format!("exec {cmd} serve --port 0"))
         .env("PATH", daemons::hook_path())
         // The hid daemon's discovery dir is the channel name ("hid"), not
-        // the helper binary's name — pass it explicitly.
-        .envs(daemons::helper_env(HID_DAEMON))
+        // the helper binary's name — pass it explicitly, namespaced by target.
+        .envs(daemons::helper_env(HID_DAEMON, Some(target)))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(log);
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
     command.spawn()?;
     Ok(Some(
-        daemons::wait_for_daemon(HID_DAEMON, std::time::Duration::from_secs(5))
-            .and_then(|_| daemons::daemon_port(HID_DAEMON))
-            .ok_or_else(|| daemons::start_failure(HID_DAEMON, std::time::Duration::from_secs(5)))?,
+        daemons::wait_for_daemon(HID_DAEMON, Some(target), std::time::Duration::from_secs(5))
+            .and_then(|_| daemons::daemon_port(HID_DAEMON, Some(target)))
+            .ok_or_else(|| {
+                daemons::start_failure(HID_DAEMON, Some(target), std::time::Duration::from_secs(5))
+            })?,
     ))
 }
 
@@ -2846,7 +2896,7 @@ fn cmd_hid_stop(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
         .arg("-c")
         .arg(format!("{cmd} stop"))
         .env("PATH", daemons::hook_path())
-        .envs(daemons::helper_env(HID_DAEMON))
+        .envs(daemons::helper_env(HID_DAEMON, Some(&target)))
         .status()?;
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
@@ -2892,7 +2942,7 @@ fn cmd_hid_send(lab_flag: Option<&str>, target: Option<&str>, args: &[String]) -
         .arg("-c")
         .arg(&full)
         .env("PATH", daemons::hook_path())
-        .envs(daemons::helper_env(HID_DAEMON))
+        .envs(daemons::helper_env(HID_DAEMON, Some(&target)))
         .status()?;
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));

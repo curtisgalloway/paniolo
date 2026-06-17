@@ -17,7 +17,8 @@
 //! accepts input over localhost HTTP so input coexists with capture).
 //!
 //! Ported from the Python `_serial.py`. serialcap's discovery file is
-//! `/tmp/paniolo-<uid>/serialcap/daemon.json` (see daemons.rs), holding
+//! `<runtime-base>/serialcap/<target>/daemon.json` (per-target, so multiple
+//! targets' daemons coexist on one host — see daemons.rs), holding
 //! `{pid, port, …}`; an interface is passed to the daemon as
 //! `NAME=DEVICE@BAUD[:SENSE]`.
 
@@ -36,9 +37,10 @@ pub const DAEMON: &str = "serialcap";
 /// collides with stale `ssh -L` dashboard tunnels squatting the old 8724.
 pub const DEFAULT_PORT: u16 = 0;
 
-/// Base URL of the running serialcap daemon, or None if it isn't running.
-pub fn daemon_url() -> Option<String> {
-    daemons::daemon_url(DAEMON)
+/// Base URL of the target's running serialcap daemon, or None if it isn't
+/// running.
+pub fn daemon_url(target: &str) -> Option<String> {
+    daemons::daemon_url(DAEMON, Some(target))
 }
 
 // ── daemon control ──────────────────────────────────────────────────────────
@@ -54,20 +56,22 @@ pub fn interface_arg(ch: &SerialChannel) -> String {
     arg
 }
 
-/// Start the serialcap daemon (owning every given interface), detached.
-/// The caller polls [`daemon_url`] for readiness.
-pub fn start_daemon(ifaces: &[SerialChannel], port: u16) -> Result<()> {
+/// Start the target's serialcap daemon (owning every given interface),
+/// detached. The caller polls [`daemon_url`] for readiness.
+pub fn start_daemon(ifaces: &[SerialChannel], port: u16, target: &str) -> Result<()> {
     let binary = daemons::find_binary(DAEMON)
         .ok_or_else(|| anyhow!("serialcap not found (libexec or PATH) — run `paniolo setup`"))?;
     let mut cmd = Command::new(binary);
     cmd.arg("daemon").arg("--port").arg(port.to_string());
-    cmd.envs(daemons::helper_env(DAEMON));
+    cmd.envs(daemons::helper_env(DAEMON, Some(target)));
     for ch in ifaces {
         cmd.arg("--interface").arg(interface_arg(ch));
     }
     // Capture stderr (tracing output) so a startup failure is diagnosable;
     // daemons::start_failure() reads the tail on timeout.
-    let log = std::fs::File::create(daemons::ensure_runtime_dir(DAEMON)?.join("daemon.log"))?;
+    let log = std::fs::File::create(
+        daemons::ensure_runtime_dir(DAEMON, Some(target))?.join("daemon.log"),
+    )?;
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
     // Detach into its own process group so it survives this CLI exiting.
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
@@ -75,10 +79,15 @@ pub fn start_daemon(ifaces: &[SerialChannel], port: u16) -> Result<()> {
     Ok(())
 }
 
-/// Stop the running daemon via `serialcap stop` (it owns the clean shutdown).
-pub fn stop_daemon() -> Result<i32> {
+/// Stop the target's running daemon via `serialcap stop` (it owns the clean
+/// shutdown). The per-target `helper_env` points `serialcap stop` at the right
+/// instance's discovery file.
+pub fn stop_daemon(target: &str) -> Result<i32> {
     let binary = daemons::find_binary(DAEMON).ok_or_else(|| anyhow!("serialcap not found"))?;
-    let status = Command::new(binary).arg("stop").status()?;
+    let status = Command::new(binary)
+        .arg("stop")
+        .envs(daemons::helper_env(DAEMON, Some(target)))
+        .status()?;
     Ok(status.code().unwrap_or(1))
 }
 
