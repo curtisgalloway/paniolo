@@ -86,7 +86,9 @@ The schema (`cli/src/model.rs`):
 
 ```toml
 [hosts.mac1]                     # optional — "local" is implicit; entries name remote hosts
-ssh = "user@control-mac"         # identity / paniolo_cmd / control_path optional
+ssh = "user@control-mac"         # how others reach it; identity / paniolo_cmd / control_path optional
+# hostname = "mac1.local"        # this box's FQDN — set it so the host recognizes itself when one
+#                                  shared lab file is run from any machine (matched vs `hostname -f`)
 
 [targets.target-machine]
 [targets.target-machine.netboot]

@@ -53,6 +53,10 @@ fn default_baud() -> i64 {
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct Host {
     pub ssh: String,
+    /// The host's fully-qualified hostname, used to recognize *this* machine
+    /// (see [`Host::is_local`]). Distinct from `ssh`, which is only how *other*
+    /// machines reach it and may be an `~/.ssh/config` alias.
+    pub hostname: Option<String>,
     pub identity: Option<String>,
     pub control_path: Option<String>,
     pub paniolo_cmd: Option<String>,
@@ -60,7 +64,17 @@ pub struct Host {
 
 impl Host {
     pub fn is_local(&self, name: &str) -> bool {
-        self.ssh == LOCAL || name == LOCAL
+        if self.ssh == LOCAL || name == LOCAL {
+            return true;
+        }
+        // A host whose declared `hostname` (FQDN) matches this machine's is
+        // local — so one shared lab file can be run from any box and each
+        // recognizes its own host. `ssh` is intentionally NOT used here: it may
+        // be an ~/.ssh/config alias, not the machine's real name.
+        match (&self.hostname, local_fqdn()) {
+            (Some(h), Some(local)) => h.eq_ignore_ascii_case(local),
+            _ => false,
+        }
     }
 
     /// How to invoke paniolo on this host (bare `paniolo` unless pinned).
@@ -69,6 +83,33 @@ impl Host {
             .clone()
             .unwrap_or_else(|| "paniolo".to_string())
     }
+}
+
+/// This machine's fully-qualified hostname, detected once and cached
+/// (lowercased). [`Host::is_local`] compares it against each host's declared
+/// `hostname` to decide which host is *this* one. `hostname -f` is the most
+/// portable FQDN source across macOS/Linux; fall back to the bare node name,
+/// then give up (None → nothing matches by hostname, so only the `local`
+/// sentinel marks a host local — i.e. today's driver-machine behavior).
+pub fn local_fqdn() -> Option<&'static str> {
+    static FQDN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    FQDN.get_or_init(|| {
+        let run = |args: &[&str]| {
+            std::process::Command::new("hostname")
+                .args(args)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .trim()
+                        .to_ascii_lowercase()
+                })
+                .filter(|s| !s.is_empty())
+        };
+        run(&["-f"]).or_else(|| run(&[]))
+    })
+    .as_deref()
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -523,6 +564,41 @@ pub fn resolve_lab_path(flag: Option<&str>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_local_via_sentinels() {
+        let by_ssh = Host {
+            ssh: "local".into(),
+            ..Default::default()
+        };
+        assert!(by_ssh.is_local("anything"));
+        let by_name = Host {
+            ssh: "u@remote".into(),
+            ..Default::default()
+        };
+        assert!(by_name.is_local("local"));
+    }
+
+    #[test]
+    fn is_local_via_hostname_fqdn() {
+        // A non-matching FQDN is remote.
+        let remote = Host {
+            ssh: "u@x".into(),
+            hostname: Some("nope.invalid.example".into()),
+            ..Default::default()
+        };
+        assert!(!remote.is_local("dev"));
+        // A host whose declared FQDN equals this machine's resolves as local,
+        // case-insensitively. (Skipped when the FQDN can't be detected.)
+        if let Some(fqdn) = local_fqdn() {
+            let me = Host {
+                ssh: "u@x".into(),
+                hostname: Some(fqdn.to_ascii_uppercase()),
+                ..Default::default()
+            };
+            assert!(me.is_local("dev"));
+        }
+    }
 
     fn multihost() -> Lab {
         parse(

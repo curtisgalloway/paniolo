@@ -226,6 +226,10 @@ enum HostCmd {
         /// ssh destination: user@host, an ssh_config alias, or 'local'.
         #[arg(long)]
         ssh: String,
+        /// This host's FQDN, so a machine can recognize itself when the lab
+        /// file is shared across hosts (matched against `hostname -f`).
+        #[arg(long)]
+        hostname: Option<String>,
         #[arg(long)]
         identity: Option<String>,
         #[arg(long)]
@@ -238,6 +242,9 @@ enum HostCmd {
         name: String,
         #[arg(long)]
         ssh: Option<String>,
+        /// This host's FQDN for self-recognition (matched against `hostname -f`).
+        #[arg(long)]
+        hostname: Option<String>,
         #[arg(long)]
         identity: Option<String>,
         #[arg(long)]
@@ -1240,6 +1247,7 @@ fn host_cmd(lab_flag: Option<&str>, cmd: HostCmd) -> Result<()> {
         HostCmd::Add {
             name,
             ssh,
+            hostname,
             identity,
             control_path,
             paniolo_cmd,
@@ -1248,6 +1256,7 @@ fn host_cmd(lab_flag: Option<&str>, cmd: HostCmd) -> Result<()> {
                 lf.add_host(
                     &name,
                     &ssh,
+                    hostname.as_deref(),
                     identity.as_deref(),
                     control_path.as_deref(),
                     paniolo_cmd.as_deref(),
@@ -1259,6 +1268,7 @@ fn host_cmd(lab_flag: Option<&str>, cmd: HostCmd) -> Result<()> {
         HostCmd::Set {
             name,
             ssh,
+            hostname,
             identity,
             control_path,
             paniolo_cmd,
@@ -1267,6 +1277,7 @@ fn host_cmd(lab_flag: Option<&str>, cmd: HostCmd) -> Result<()> {
                 lf.update_host(
                     &name,
                     ssh.as_deref(),
+                    hostname.as_deref(),
                     identity.as_deref(),
                     control_path.as_deref(),
                     paniolo_cmd.as_deref(),
@@ -1290,7 +1301,19 @@ fn host_list(lab_flag: Option<&str>) -> Result<()> {
         return Ok(());
     }
     for (name, h) in &lab.hosts {
-        println!("{name}\t{}\t{}", h.ssh, h.identity.as_deref().unwrap_or(""));
+        let local = if h.is_local(name) {
+            "  (this machine)"
+        } else {
+            ""
+        };
+        println!(
+            "{name}\t{}\t{}{local}",
+            h.ssh,
+            h.hostname.as_deref().unwrap_or("")
+        );
+    }
+    if let Some(fqdn) = model::local_fqdn() {
+        println!("\nthis machine: {fqdn}");
     }
     Ok(())
 }
@@ -1312,6 +1335,9 @@ fn host_show(lab_flag: Option<&str>, name: &str) -> Result<()> {
         Some(h) => {
             println!("Host: {name}");
             println!("  ssh           {}", h.ssh);
+            if let Some(v) = &h.hostname {
+                println!("  hostname      {v}");
+            }
             if let Some(v) = &h.identity {
                 println!("  identity      {v}");
             }
@@ -1320,6 +1346,9 @@ fn host_show(lab_flag: Option<&str>, name: &str) -> Result<()> {
             }
             if let Some(v) = &h.paniolo_cmd {
                 println!("  paniolo_cmd   {v}");
+            }
+            if h.is_local(name) {
+                println!("  -> resolves as LOCAL on this machine");
             }
         }
         None => println!("Host: local  (the dev machine)"),
