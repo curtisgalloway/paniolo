@@ -88,6 +88,7 @@ impl LabFile {
         &mut self,
         name: &str,
         ssh: &str,
+        hostname: Option<&str>,
         identity: Option<&str>,
         control_path: Option<&str>,
         paniolo_cmd: Option<&str>,
@@ -98,6 +99,7 @@ impl LabFile {
         }
         let mut t = Table::new();
         t.insert("ssh", value(ssh));
+        set_opt(&mut t, "hostname", hostname);
         set_opt(&mut t, "identity", identity);
         set_opt(&mut t, "control_path", control_path);
         set_opt(&mut t, "paniolo_cmd", paniolo_cmd);
@@ -109,6 +111,7 @@ impl LabFile {
         &mut self,
         name: &str,
         ssh: Option<&str>,
+        hostname: Option<&str>,
         identity: Option<&str>,
         control_path: Option<&str>,
         paniolo_cmd: Option<&str>,
@@ -121,6 +124,7 @@ impl LabFile {
             .and_then(|i| i.as_table_mut())
             .ok_or_else(|| LabError(format!("no host '{name}'")))?;
         set_opt(t, "ssh", ssh);
+        set_opt(t, "hostname", hostname);
         set_opt(t, "identity", identity);
         set_opt(t, "control_path", control_path);
         set_opt(t, "paniolo_cmd", paniolo_cmd);
@@ -463,7 +467,7 @@ mod tests {
     fn build_round_trips() {
         let (_d, path) = tmp();
         let mut lf = LabFile::create(&path);
-        lf.add_host("bench1", "u@bench1", Some("~/.ssh/id"), None, None)
+        lf.add_host("bench1", "u@bench1", None, Some("~/.ssh/id"), None, None)
             .unwrap();
         lf.add_target("fortune", Some("bench1"), Some("note"))
             .unwrap();
@@ -509,7 +513,7 @@ mod tests {
         )
         .unwrap();
         let mut lf = LabFile::load(&path).unwrap();
-        lf.update_host("bench1", None, Some("~/.ssh/id"), None, None)
+        lf.update_host("bench1", None, None, Some("~/.ssh/id"), None, None)
             .unwrap();
         lf.save().unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -522,7 +526,8 @@ mod tests {
     fn remove_host_blocked_while_referenced() {
         let (_d, path) = tmp();
         let mut lf = LabFile::create(&path);
-        lf.add_host("bench1", "u@b1", None, None, None).unwrap();
+        lf.add_host("bench1", "u@b1", None, None, None, None)
+            .unwrap();
         lf.add_target("fortune", Some("bench1"), None).unwrap();
         let e = lf.remove_host("bench1").unwrap_err();
         assert!(e.0.contains("still used by: fortune"), "{}", e.0);

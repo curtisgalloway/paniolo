@@ -524,7 +524,7 @@ the legacy `~/.config/paniolo/targets/*.toml` (host = `local`) — byte-for-byte
 old behavior.
 
 **`_ssh.py`** is the whole transport — no agent/daemon. A `Host` (ssh dest +
-optional `identity` / `control_path` / `paniolo_cmd`) drives a per-host
+optional `hostname` / `identity` / `control_path` / `paniolo_cmd`) drives a per-host
 **ControlMaster** connection (`ControlPersist=300`), so only the first call to a
 host pays the handshake (and, with an ssh-agent like 1Password, only the first
 triggers one confirmation per window). Provides `run` (captured),
@@ -533,7 +533,14 @@ tio), `forward` (an `ssh -L` tunnel context manager — **non-multiplexed**, so 
 process owns and can tear down the tunnel), and `read_remote_file`. Two
 host-config levers matter operationally: `paniolo_cmd` (pin paniolo's path when
 it isn't on the host's non-interactive ssh PATH) and `identity` (offer one key,
-avoiding agent key-spray that trips `MaxAuthTries`). `_control_dir` keeps the
+avoiding agent key-spray that trips `MaxAuthTries`). A third, `hostname` (the
+box's FQDN), lets **one shared lab file** be run from any machine: the Rust
+`Host::is_local` (`cli/src/model.rs`) matches it against this machine's
+`hostname -f` (cached `local_fqdn()`), so each box treats its own host as local
+and SSH-dispatches the rest. `ssh` is only the *reach* path (it may be an
+`~/.ssh/config` alias); `hostname` is the *self-recognition* key. With no
+`hostname`, only `ssh = "local"` / a host named `local` is local (single-driver).
+`_control_dir` keeps the
 socket path short (XDG_RUNTIME_DIR or `/tmp`, not the long macOS `$TMPDIR`) to
 stay under the ~104-char Unix-socket limit.
 

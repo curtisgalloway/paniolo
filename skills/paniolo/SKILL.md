@@ -374,7 +374,9 @@ commands then run **transparently on that host over SSH** — you don't ssh by h
 ```toml
 # mylab.toml
 [hosts.bench1]
-ssh = "curtisg@bench1.local"     # ssh destination ("local" = this machine)
+ssh = "curtisg@bench1.local"     # ssh destination — how others reach it ("local" = this machine)
+# hostname = "bench1.local"      # this box's FQDN; set it so bench1 recognizes itself when ONE
+#                                  shared lab file is run from any machine (matched vs `hostname -f`)
 # identity = "~/.ssh/lab_key"    # set this if your ssh-agent offers many keys
 #                                  (avoids "Too many authentication failures")
 # paniolo_cmd = "/Users/curtisg/.local/bin/paniolo"  # if paniolo isn't on the

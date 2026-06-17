@@ -84,13 +84,16 @@ reproduces today's single-host behavior exactly.
 # mylab.toml — checked into a git repo; PANIOLO_LAB points here.
 
 [hosts.bench1]
-ssh = "curtisg@bench1.local"      # ssh destination; the only required field
+ssh = "curtisg@bench1.local"      # ssh destination — how OTHER machines reach it; the only required field
+# hostname = "bench1.local"       # this box's FQDN; set it so bench1 recognizes ITSELF when the
+#                                   shared lab file is run on bench1 (matched against `hostname -f`)
 # identity = "~/.ssh/id_lab"      # optional key; set it to avoid agent key-spray (below)
 # control_path = "~/.ssh/cm-%h"   # optional ControlMaster socket (see Transport)
 # paniolo_cmd = "/Users/me/.local/bin/paniolo"  # if paniolo isn't on the host's ssh PATH
 
 [hosts.bench2]
 ssh = "curtisg@bench2.local"
+# hostname = "bench2.local"
 
 # A normal single-host target. Everything inherits host = bench1.
 [targets.fortune]
@@ -117,6 +120,16 @@ device = "0x8300000534d2109"      # USB Video — stable, port-derived id
 
 - `host = "local"` (or unset, on a single-host lab) means the dev machine — i.e.
   today's behavior, no SSH involved.
+- **One shared lab file, run from any machine.** Give each host a `hostname` (its
+  FQDN). At runtime each box compares its own `hostname -f` against every host's
+  `hostname`; the match is treated as **local** (channels run directly there) and
+  every other host is **remote** (dispatched over SSH). So the same git-tracked
+  file works whether you run it on the Mac, on `bench1`, or on `bench2` — each
+  recognizes itself. `ssh` stays the *reach* path (it may be an `~/.ssh/config`
+  alias); `hostname` is the *self-recognition* key. Without a `hostname`, only
+  `ssh = "local"` / `host = "local"` counts as local, so the file is
+  single-driver (run it anywhere else and a host self-dispatches over SSH).
+  `paniolo host list` prints the detected FQDN and marks the matching host.
 - With no `--lab`/`PANIOLO_LAB`, paniolo reads the default lab at
   `~/.config/paniolo/lab.toml`; if none exists it errors and points at
   `paniolo init`. (The legacy Python CLI's per-target
