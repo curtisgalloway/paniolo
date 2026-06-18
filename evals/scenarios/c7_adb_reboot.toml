@@ -1,0 +1,40 @@
+# Copyright 2026 Curtis Galloway — Licensed under the Apache License, Version 2.0.
+id = "c7"
+title = "Bind an Android target and make it reboot"
+tier = "t1"
+core = true
+conditions = ["cold", "warm", "preloaded"]
+capabilities = ["adb", "power"]
+goal = """
+Add my Android tablet as a paniolo target named `tablet`. Its adb serial is
+`ABC123`. Then set things up so that `paniolo power-cycle tablet` reboots it.
+"""
+traps = [
+  "there is NO `paniolo adb reboot` — reboot is wired through the power hook",
+  "the cycle hook should run `adb -s ABC123 reboot`",
+]
+reference = [
+  'paniolo target add tablet',
+  'paniolo adb set -t tablet --serial ABC123',
+  'paniolo power set -t tablet --cycle-cmd "adb -s ABC123 reboot"',
+]
+seed = ""
+
+[grader]
+type = "t1_config"
+allowlist_violation_fails = true
+[[grader.assert]]
+path = "targets.tablet.adb.serial"
+equals = "ABC123"
+[[grader.assert]]
+path = "targets.tablet.power.cycle_cmd"
+contains = "adb"
+[[grader.assert]]
+path = "targets.tablet.power.cycle_cmd"
+contains = "reboot"
+# The serial MUST be passed through (`adb -s ABC123`); bare `adb reboot` would
+# target the wrong device when more than one is attached — which is the whole
+# reason the serial was bound. Without this the trap is untested.
+[[grader.assert]]
+path = "targets.tablet.power.cycle_cmd"
+matches = '-s\s+ABC123'

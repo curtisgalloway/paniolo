@@ -1,0 +1,20 @@
+[targets.pico]
+
+[targets.pico.netboot]
+interface = "en7"
+tftp_root = "/Users/curtisg/tftp/pico"
+
+[[targets.pico.serial]]
+name = "console"
+device = "/dev/cu.usbserial-AAA"
+baud = 115200
+
+[targets.pico.power]
+cycle_cmd = "shellyplug -d 10.66.27.141 cycle"
+
+[targets.tablet]
+
+[targets.tablet.adb]
+serial = "ABC123"
+# paniolo lab — managed by the `paniolo` CLI; hand-edits are preserved
+

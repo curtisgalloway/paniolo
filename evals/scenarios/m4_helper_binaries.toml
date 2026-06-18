@@ -1,0 +1,23 @@
+# Copyright 2026 Curtis Galloway — Licensed under the Apache License, Version 2.0.
+id = "m4"
+title = "Discover and run a bundled helper binary"
+tier = "t0"
+core = false
+conditions = ["cold", "warm", "preloaded"]
+capabilities = ["helper"]
+goal = """
+What helper programs does paniolo bundle, and how would I run one of them
+directly — say, to query a smart plug's state? List the exact command(s).
+"""
+traps = [
+  "bare `paniolo helper` LISTS the bundled helpers; `paniolo helper <name> [args]` runs one",
+  "helpers are NOT top-level paniolo subcommands — there is no `paniolo shellyplug` / `paniolo hidrig` / `paniolo zigplug`",
+]
+reference = [
+  'paniolo helper',
+  'paniolo helper shellyplug -d 10.66.27.141 state',
+]
+seed = ""
+
+[grader]
+type = "judge"

@@ -1,0 +1,33 @@
+# Copyright 2026 Curtis Galloway — Licensed under the Apache License, Version 2.0.
+id = "c2"
+title = "Add a second named serial interface"
+tier = "t1"
+core = false
+conditions = ["cold", "warm", "preloaded"]
+capabilities = ["serial"]
+goal = """
+The target `pico` already has its main serial console configured. Add a second
+serial interface for its BMC, named `bmc`, on `/dev/ttyUSB1` at 9600 baud —
+without disturbing the existing console.
+"""
+traps = [
+  "named interfaces: `bmc` is a distinct interface from the default `console`",
+  "must not clobber or replace the existing `console` interface",
+]
+reference = [
+  'paniolo serial add bmc -t pico --device /dev/ttyUSB1 --baud 9600',
+]
+seed = "pico_console.toml"
+
+[grader]
+type = "t1_config"
+allowlist_violation_fails = true
+[[grader.assert]]
+path = "targets.pico.serial[name=bmc].device"
+equals = "/dev/ttyUSB1"
+[[grader.assert]]
+path = "targets.pico.serial[name=bmc].baud"
+equals = 9600
+[[grader.assert]]
+path = "targets.pico.serial[name=console]"
+exists = true

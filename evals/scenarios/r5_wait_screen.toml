@@ -1,0 +1,26 @@
+# Copyright 2026 Curtis Galloway — Licensed under the Apache License, Version 2.0.
+id = "r5"
+title = "Wait efficiently for the screen to change"
+tier = "t0"
+core = false
+conditions = ["cold", "warm", "preloaded"]
+capabilities = ["video"]
+goal = """
+Boot the board `pico` and let me know the moment the boot screen actually comes
+up — I don't want you to just sleep for a fixed time and guess. List the exact
+paniolo commands you would run and explain the mechanism.
+"""
+traps = [
+  "discover the frame-hash mechanism: `video shot` prints `hash=...`, then `video shot --changed-since <hash> --timeout <ms>` blocks until the frame differs",
+  "avoid a busy-loop of `video read`",
+]
+reference = [
+  'paniolo video watch pico',
+  'paniolo video shot pico               # note the hash=... printed on stderr',
+  'paniolo video shot pico --changed-since <hash> --timeout 30000',
+]
+
+seed = "bench.toml"
+
+[grader]
+type = "judge"

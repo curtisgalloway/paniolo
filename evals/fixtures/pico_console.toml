@@ -1,0 +1,8 @@
+[targets.pico]
+
+[[targets.pico.serial]]
+name = "console"
+device = "/dev/cu.usbserial-AAA"
+baud = 115200
+# paniolo lab — managed by the `paniolo` CLI; hand-edits are preserved
+

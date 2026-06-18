@@ -1,0 +1,30 @@
+# Copyright 2026 Curtis Galloway — Licensed under the Apache License, Version 2.0.
+id = "s8"
+title = "Console port is already in use"
+tier = "t0"
+core = true
+conditions = ["cold", "warm", "preloaded"]
+capabilities = ["serial"]
+goal = """
+`paniolo serial connect dut` fails because the serial port is already in use. As
+an automated agent (not a human at a terminal), how should I read the console and
+send it commands instead? Explain what's happening and the commands to use.
+"""
+traps = [
+  "the serial port is exclusive — only one of `connect` / `watch` / external tio/screen at a time",
+  "a running `watch` daemon already owns the port (it also feeds the dashboard + capture log) — that's a feature, not an obstacle",
+  "the agent path is the daemon: read with `serial log`, send with `serial send` (both coexist with capture); `connect` is the interactive human path",
+  "only if you truly need interactive tio: `serial stop` first to release the port, then `connect`",
+]
+reference = """
+The port is exclusive and a `serial watch` daemon already holds it. Don't use
+interactive `connect` (foreground tio, for a human). Read with
+`paniolo serial log dut --tail/--since/--from/--to` and drive with
+`paniolo serial send dut "..."` — both work alongside the capture daemon. Only
+if you specifically need interactive tio, run `paniolo serial stop dut` to
+release the port first, then `connect`.
+"""
+seed = "dut_console.toml"
+
+[grader]
+type = "judge"

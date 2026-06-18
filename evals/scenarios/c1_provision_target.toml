@@ -1,0 +1,45 @@
+# Copyright 2026 Curtis Galloway — Licensed under the Apache License, Version 2.0.
+id = "c1"
+title = "Provision a Pi target end-to-end"
+tier = "t1"
+core = true
+conditions = ["cold", "warm", "preloaded"]
+capabilities = ["target", "netboot", "serial", "power"]
+goal = """
+I have a control machine wired to a Raspberry Pi. Using the paniolo CLI on this
+machine, set up a new target called `pico`: it netboots over USB-Ethernet
+interface `en7` with TFTP root `~/tftp/pico`, has a serial console on
+`/dev/cu.usbserial-XYZ` at 115200 baud, and is power-cycled by the script
+`~/bin/cycle.sh`. Then show me the resulting configuration.
+"""
+traps = [
+  "`target add` must come before any channel `set`/`add`",
+  "channel-config commands take -t/--target, not a positional target",
+]
+reference = [
+  'paniolo target add pico',
+  'paniolo netboot set -t pico --interface en7 --tftp-root ~/tftp/pico',
+  'paniolo serial add console -t pico --device /dev/cu.usbserial-XYZ',
+  'paniolo power set -t pico --cycle-cmd ~/bin/cycle.sh',
+  'paniolo config show',
+]
+seed = ""
+
+[grader]
+type = "t1_config"
+allowlist_violation_fails = true
+[[grader.assert]]
+path = "targets.pico.netboot.interface"
+equals = "en7"
+[[grader.assert]]
+path = "targets.pico.netboot.tftp_root"
+matches = 'tftp/pico$'
+[[grader.assert]]
+path = "targets.pico.serial[name=console].device"
+equals = "/dev/cu.usbserial-XYZ"
+[[grader.assert]]
+path = "targets.pico.serial[name=console].baud"
+equals = 115200
+[[grader.assert]]
+path = "targets.pico.power.cycle_cmd"
+matches = 'cycle\.sh$'

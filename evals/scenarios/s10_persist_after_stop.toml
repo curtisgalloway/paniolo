@@ -1,0 +1,31 @@
+# Copyright 2026 Curtis Galloway — Licensed under the Apache License, Version 2.0.
+id = "s10"
+title = "Read back the log after stopping capture"
+tier = "t0"
+core = false
+conditions = ["cold", "warm", "preloaded"]
+capabilities = ["serial"]
+goal = """
+When you're done driving `dut`, stop the capture daemon to free up the serial
+port — but I'll still want to read back the boot log afterward. Can I, and how?
+List the exact paniolo commands you would run.
+"""
+traps = [
+  "the timestamped capture is persisted on disk per interface — it survives `stop` and daemon restarts",
+  "`serial log` reads that on-disk log directly (no daemon round-trip), so it works whether or not the daemon is running",
+  "only the live dashboard view needs the daemon up",
+]
+reference = [
+  'paniolo serial watch dut',
+  'paniolo serial stop dut          # releases the port',
+  'paniolo serial log dut --tail 50  # still works — reads the persisted on-disk capture',
+]
+seed = "dut_console.toml"
+
+[grader]
+type = "judge"
+
+[loopback]
+banner = "boot complete\r\nservice started\r\ndut login: "
+mode = "stop_then_log"
+expect = ["boot complete", "service started"]

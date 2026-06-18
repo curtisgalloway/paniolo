@@ -1,0 +1,29 @@
+# Copyright 2026 Curtis Galloway — Licensed under the Apache License, Version 2.0.
+id = "s7"
+title = "Re-read an exact line range as JSON"
+tier = "t0"
+core = false
+conditions = ["cold", "warm", "preloaded"]
+capabilities = ["serial"]
+goal = """
+Earlier you noted a kernel panic around console lines #840–#870 on `dut`. Re-read
+exactly that span in a machine-readable form so I can parse the timestamps. List
+the exact paniolo command you would run.
+"""
+traps = [
+  "`--from N --to M` selects an inclusive seq range",
+  "`--json` emits JSON Lines (seq, ts_ms, text) for parsing",
+  "seq numbers are stable across buffer eviction, so the old range stays valid; add `--raw` if you need the original ANSI",
+]
+reference = [
+  'paniolo serial log dut --from 840 --to 870 --json',
+]
+seed = "dut_console.toml"
+
+[grader]
+type = "judge"
+
+[loopback]
+banner = "line a\r\nline b\r\nKernel panic - not syncing\r\nline d\r\n"
+mode = "json_range"
+expect = ["ts_ms", "seq"]

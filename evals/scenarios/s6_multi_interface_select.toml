@@ -1,0 +1,29 @@
+# Copyright 2026 Curtis Galloway — Licensed under the Apache License, Version 2.0.
+id = "s6"
+title = "Read the right one of two consoles"
+tier = "t0"
+core = false
+conditions = ["cold", "warm", "preloaded"]
+capabilities = ["serial"]
+goal = """
+`dut` has both a main console and a separate BMC console configured. Show me the
+last 20 lines from the BMC console specifically. List the exact paniolo commands
+you would run.
+"""
+traps = [
+  "a single `watch` daemon owns ALL of a target's interfaces at once",
+  "with more than one interface, `-i <name>` is required — omitting it errors and lists the names",
+]
+reference = [
+  'paniolo serial watch dut          # one daemon captures both interfaces',
+  'paniolo serial log dut -i bmc --tail 20',
+]
+seed = "dut_dual_console.toml"
+
+[grader]
+type = "judge"
+
+[loopback]
+interface = "bmc"
+banner = "BMC v1.2 ready\r\nfan1: 4200rpm  temp: 41C\r\n"
+expect = ["BMC v1.2 ready", "fan1: 4200rpm"]

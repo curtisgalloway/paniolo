@@ -1,0 +1,27 @@
+# Copyright 2026 Curtis Galloway — Licensed under the Apache License, Version 2.0.
+id = "r4"
+title = "Type a command into the serial console"
+tier = "t0"
+core = true
+conditions = ["cold", "warm", "preloaded"]
+capabilities = ["serial"]
+goal = """
+On the Pi `pico`, run `uname -a` at the serial console and show me the output.
+List the exact paniolo commands you would run, in order, and note any ordering
+constraints.
+"""
+traps = [
+  "`serial send` injects through the RUNNING `serial watch` daemon — start watch first",
+  "`serial send` takes the target as a positional (two positionals = `<target> <text>`)",
+  "input only lands if the target's console actually reads the UART",
+]
+reference = [
+  'paniolo serial watch pico',
+  'paniolo serial send pico "uname -a"',
+  'paniolo serial log pico --since <seq>   # read back what the target echoed',
+]
+
+seed = "bench.toml"
+
+[grader]
+type = "judge"
