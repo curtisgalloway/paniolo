@@ -69,7 +69,7 @@ and persist between CLI invocations. State lives in plain files, not memory.
 
 Only `paniolo` itself lands on PATH (`~/.cargo/bin`); every helper and daemon installs into the
 private libexec dir `~/.local/libexec/paniolo/bin`, where paniolo resolves them itself —
-`paniolo helper <name>` runs one directly, and `paniolo daemons` lists/stops the running ones.
+`paniolo helper <name>` runs one directly, and `paniolo daemons` lists/stops/restarts the running ones.
 
 A future *Option B* — a single long-running Rust server with socket RPC for inter-subsystem
 coordination — is noted in `AGENTS.md` but **not** implemented; the dashboard's hdmicap→serialcap
@@ -124,7 +124,10 @@ legacy Python per-target files (`~/.config/paniolo/targets/<name>.toml`, `video.
 read by the Rust CLI.
 
 **Runtime state, discovery, and capture** live outside the config tree. Each daemon writes a
-**discovery file** (pid + port) and holds an **advisory lock**. The per-target capture daemons
+**discovery file** (pid + port) and holds an **advisory lock**; at spawn the CLI also records the
+daemon's binary identity (`binmeta.json`), so a daemon still running an older binary after an
+upgrade/rebuild is flagged **stale** in `paniolo daemons` and healed by `paniolo daemons restart`.
+The per-target capture daemons
 (serialcap/hdmicap/hid) run one instance **per target** — so several targets capture concurrently
 on one host — while host-singleton daemons (zigplug/cambrionix/netbootd) run one per host. Helpers
 additionally receive two environment variables on every invocation — `PANIOLO_STATE_DIR`

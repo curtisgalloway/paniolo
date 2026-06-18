@@ -68,6 +68,11 @@ A target with multiple serial interfaces starts a single daemon that manages
 all of them. The daemon's URL is printed on start — it also appears in the
 dashboard.
 
+After an upgrade or rebuild, a daemon still running the old binary is flagged
+**stale** by `paniolo serial show` and `paniolo daemons`. Re-running
+`paniolo serial watch` auto-restarts a stale daemon, or restart it explicitly
+with `paniolo daemons restart serialcap` (see [architecture](architecture.md)).
+
 ---
 
 ## Querying captured output

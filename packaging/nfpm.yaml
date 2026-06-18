@@ -48,6 +48,11 @@ depends:
   - python3
 recommends:
   - tesseract-ocr
+# Advisory post-install notice: running daemons keep the old binary until
+# restarted (`paniolo daemons restart --stale`). Never reaps daemons — they are
+# per-user processes, not packaged services. See packaging/scripts/postinstall.sh.
+scripts:
+  postinstall: packaging/scripts/postinstall.sh
 contents:
   - src: packaging/stage/bin/paniolo
     dst: /usr/bin/paniolo
