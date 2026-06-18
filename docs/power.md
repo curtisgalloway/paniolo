@@ -3,7 +3,10 @@
 paniolo provides two power control mechanisms:
 
 - **DTR via FTDI** — drives the target's J2 power button header directly over the
-  serial cable. Generic and wiring-based; no external services required.
+  serial cable. Generic and wiring-based; no external services required. It is
+  **opt-in per serial interface** (`power_button = true`): wiring the FTDI DTR
+  line to J2 is the rare exception, so `serial dtr` / `serial reset` refuse any
+  interface that hasn't declared it (rather than toggle a possibly-unwired line).
 - **Generic power hooks** — four optional shell commands (`on_cmd`, `off_cmd`,
   `cycle_cmd`, `state_cmd`) wired via `paniolo power set`. Write any command
   or point to a standalone helper binary; paniolo calls it via `sh -c`.
@@ -41,14 +44,25 @@ target. The DTR and sense signals share the same USB serial port.
 ### Setup
 
 ```bash
-# Add a serial interface with power sense
+# Add a serial interface. --power-button declares that this interface's DTR line
+# is wired to the J2 power button (this is what enables `serial dtr`/`reset`);
+# --sense records the modem-control input wired for power sensing (optional).
 paniolo serial add console -t target-machine \
     --device /dev/tty.usbserial-0001 \
     --baud 115200 \
-    --sense cts             # whichever modem-control input is wired
+    --power-button \
+    --sense cts
 
-# Tell the target which interface to use as the default for power commands
+# Only needed when a target has MORE THAN ONE power_button interface: pick which
+# one DTR commands default to.
 paniolo power set -t target-machine --serial-interface console
+```
+
+To enable (or revoke) DTR on an interface you added earlier:
+
+```bash
+paniolo serial set console -t target-machine --power-button         # enable
+paniolo serial set console -t target-machine --power-button false   # revoke
 ```
 
 ### DTR commands
@@ -80,9 +94,20 @@ paniolo power-state [target-machine]
 | ≤ 500 ms | Soft power-button event — OS responds (graceful reboot or halt) |
 | ≥ 3000 ms | Hard PMIC power-off (equivalent to holding the physical button) |
 
-If no `-i` is given, DTR commands use `serial_interface` from the target's
-power channel. If that's not set, they fall back to the target's only configured
-serial interface (or fail if multiple are configured without an explicit choice).
+**DTR is opt-in.** `serial dtr` / `serial reset` only act on an interface whose
+`power_button = true`. Interface resolution is: an explicit `-i`, else the power
+channel's `serial_interface`, else the sole `power_button` interface. If the
+chosen interface hasn't opted in — or none has — the command **errors** with a
+hint (it never falls back to a lone console, which might be unwired and would
+silently no-op) pointing at the target's real power method and the
+console-reboot path.
+
+> **"Reboot over serial" is not a DTR reset.** Typing `reboot` at a logged-in
+> serial console is a *software* reboot: `paniolo serial send <target>
+> "reboot"`. `serial reset` / `serial dtr` are a *hardware* DTR power-button
+> toggle that needs the J2 wiring above. When a request says "use serial to
+> reboot" without naming DTR / the wire / the power button, default to the
+> console `reboot` (or the configured `paniolo power-cycle`) — not DTR.
 
 ---
 
@@ -98,7 +123,7 @@ paniolo power set -t <target> \
     [--on-cmd    <cmd>]   \   # paniolo power on
     [--off-cmd   <cmd>]   \   # paniolo power off
     [--state-cmd <cmd>]   \   # paniolo power-state (stdout: "on" or "off")
-    [--serial-interface <name>]   # default interface for DTR commands
+    [--serial-interface <name>]   # default DTR interface when several opt in
     [--host <labhost>]
 ```
 

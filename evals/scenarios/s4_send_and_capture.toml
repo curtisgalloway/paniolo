@@ -1,0 +1,35 @@
+# Copyright 2026 Curtis Galloway — Licensed under the Apache License, Version 2.0.
+id = "s4"
+title = "Send a command, capture its response"
+tier = "t0"
+core = true
+conditions = ["cold", "warm", "preloaded"]
+capabilities = ["serial"]
+goal = """
+At `dut`'s shell prompt, run `cat /proc/version` over the serial console and
+show me just that command's output. List the exact paniolo commands you would
+run, in order, and note any ordering constraints.
+"""
+traps = [
+  "`serial send` injects through the RUNNING `watch` daemon — start watch first",
+  "`serial send` takes the target as a positional (`send dut \"text\"`); two positionals = <target> <text>",
+  "a carriage return is appended by default (so the shell runs the line)",
+  "input only reaches the target if its console actually reads the UART",
+]
+reference = [
+  'paniolo serial watch dut',
+  'paniolo serial log dut --tail 1            # note the seq before sending',
+  'paniolo serial send dut "cat /proc/version"',
+  'paniolo serial log dut --since <seq>        # read back the echoed command + output',
+]
+seed = "dut_console.toml"
+
+[grader]
+type = "judge"
+
+[loopback]
+banner = "root@dut:~# "
+[[loopback.respond]]
+match = "cat /proc/version"
+reply = "\r\nLinux version 6.6.0 (build@dut) #1 SMP\r\nroot@dut:~# "
+expect = ["Linux version 6.6.0"]

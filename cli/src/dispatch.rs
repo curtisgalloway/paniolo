@@ -46,7 +46,7 @@ pub fn build_slice(lab: &Lab, target: &str, host: &str) -> Result<String, LabErr
     let on = |h: &Option<String>| h.as_deref().unwrap_or(default_host) == host;
 
     let mut lf = LabFile::create(Path::new("slice.toml"));
-    lf.add_target(target, None, t.note.as_deref())?;
+    lf.add_target(target, None, t.description.as_deref())?;
     if let Some(nb) = &t.netboot {
         if on(&nb.host) {
             lf.set_netboot(
@@ -69,6 +69,7 @@ pub fn build_slice(lab: &Lab, target: &str, host: &str) -> Result<String, LabErr
                 &s.device,
                 s.baud,
                 s.power_sense_signal.as_deref(),
+                s.power_button,
                 None,
             )?;
         }

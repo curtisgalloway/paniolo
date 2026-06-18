@@ -20,7 +20,7 @@ and power-cycle it without a person at the bench each iteration. See the root
 | [Netboot](netboot.md) | `paniolo netboot` | DHCP + TFTP over a direct USB-Ethernet link (single-binary Rust `netbootd`). |
 | [Link mode](netif.md) | `paniolo netif` | Atomically switch the link between netboot and ffx-over-IPv6 modes (stops netboot, sets up the host `fe80::1`). |
 | [Serial](serial.md) | `paniolo serial` | `serialcap` daemon (timestamped JSONL log + WebSocket terminal) and interactive `tio`. |
-| [Power](power.md) | `paniolo power on/off`, `power-cycle`, `power-state`, `serial dtr/reset` | DTR power-button wiring (J2) and generic shell-command hooks; `cambrionix` hub, `usbhub` per-port USB hub power, `zigplug` Zigbee smart-plug, and `shellyplug` Shelly Gen2+ plug/relay (local HTTP RPC) helpers. |
+| [Power](power.md) | `paniolo power on/off`, `power-cycle`, `power-state`, `serial dtr/reset` | DTR power-button wiring (J2; opt-in per serial interface) and generic shell-command hooks; `cambrionix` hub, `usbhub` per-port USB hub power, `zigplug` Zigbee smart-plug, and `shellyplug` Shelly Gen2+ plug/relay (local HTTP RPC) helpers. |
 | [Video](video.md) | `paniolo video` | `hdmicap` warm-stream HDMI capture + on-device OCR. |
 | [Dashboard](dashboard.md) | `paniolo console` | Combined video + serial web UI. |
 | [HID injection](hid.md) | `paniolo hid` | USB keyboard/mouse injection via a generic helper hook; `hidrig` KB2040 injector; KVM input from the web console. |
@@ -60,6 +60,7 @@ orchestration or results.
 ## For contributors / agents
 
 - **Bundled agent skills** — paniolo ships agent guides under [`skills/`](https://github.com/curtisgalloway/paniolo/tree/main/skills) (`paniolo` for driving a target, `kvm-puppeting` for GUI puppeting, `usbhub` for hub power). They install alongside the CLI; `paniolo skill` lists them (with descriptions) and `paniolo skill <name>` prints one's `SKILL.md` — so an agent can discover and read them straight from the CLI, without the harness pre-loading them.
+- [Agent discoverability & usage evals](agent-evals.md) — a no-hardware eval suite measuring how well a naive agent goes from a plain-language goal to the right paniolo command via the self-describing surface (`--help` → `paniolo skill` → docs); discovery conditions, stated-command vs config-only tiers, rubric, and scenario catalog.
 - [`AGENTS.md`](https://github.com/curtisgalloway/paniolo/blob/main/AGENTS.md) — module-by-module internals, source constraints, and how to add a subsystem.
 - [Adding a power-control helper](adding-power-helpers.md) — recipe for supporting new power-switching hardware: the hook contract, helper CLI conventions, implementation skeletons (Rust/Python), verification ladder, and PR checklist.
 - [`hidrig/README.md`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md) — HID injector wiring, firmware, and host CLI.

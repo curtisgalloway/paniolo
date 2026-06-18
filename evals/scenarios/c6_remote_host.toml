@@ -1,0 +1,27 @@
+# Copyright 2026 Curtis Galloway — Licensed under the Apache License, Version 2.0.
+id = "c6"
+title = "Author a remote control host"
+tier = "t1"
+core = false
+conditions = ["cold", "warm", "preloaded"]
+capabilities = ["host", "configure"]
+goal = """
+There's a separate control Mac reachable over SSH at `curtisg@bench1.local`,
+with a Pi wired to it. Register that control host in the paniolo lab, and then
+get a proposed target block for the Pi that's attached to it.
+"""
+traps = [
+  "`configure` is propose-only: it prints a block and writes nothing — the human pastes it",
+  "the host is added with `host add ... --ssh user@host`",
+]
+reference = [
+  'paniolo host add bench1 --ssh curtisg@bench1.local',
+]
+seed = ""
+
+[grader]
+type = "t1_config"
+allowlist_violation_fails = true
+[[grader.assert]]
+path = "hosts.bench1.ssh"
+equals = "curtisg@bench1.local"

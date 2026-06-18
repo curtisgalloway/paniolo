@@ -1,0 +1,30 @@
+[targets.pico]
+
+[targets.pico.netboot]
+interface = "en7"
+tftp_root = "/Users/curtisg/tftp/pico"
+
+[[targets.pico.serial]]
+name = "console"
+device = "/dev/cu.usbserial-AA"
+baud = 115200
+
+[targets.pico.video]
+device = "HDMI"
+
+[targets.pico.power]
+cycle_cmd = "shellyplug -d 10.66.27.141 cycle"
+state_cmd = "shellyplug -d 10.66.27.141 state"
+
+[targets.pico.hid]
+cmd = "hidrig -d /dev/cu.usbmodem1234"
+
+[targets.board]
+
+[targets.board.video]
+device = "HDMI2"
+
+[targets.board.hid]
+cmd = "hidrig -d /dev/cu.usbmodem9999"
+# paniolo lab — managed by the `paniolo` CLI; hand-edits are preserved
+

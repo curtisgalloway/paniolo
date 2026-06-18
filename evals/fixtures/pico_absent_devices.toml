@@ -1,0 +1,15 @@
+[targets.pico]
+
+[targets.pico.netboot]
+interface = "en99"
+tftp_root = "/tmp/nope"
+
+[[targets.pico.serial]]
+name = "console"
+device = "/dev/cu.usbserial-DOESNOTEXIST9999"
+baud = 115200
+
+[targets.pico.video]
+device = "NoSuchCam"
+# paniolo lab — managed by the `paniolo` CLI; hand-edits are preserved
+

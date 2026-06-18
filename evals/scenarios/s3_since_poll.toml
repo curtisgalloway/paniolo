@@ -1,0 +1,31 @@
+# Copyright 2026 Curtis Galloway — Licensed under the Apache License, Version 2.0.
+id = "s3"
+title = "Poll efficiently for new console output"
+tier = "t0"
+core = true
+conditions = ["cold", "warm", "preloaded"]
+capabilities = ["serial"]
+goal = """
+I'm about to power-cycle `dut`. After that I want to watch for *new* console
+lines that appear after the ones you've already seen — without re-dumping the
+whole log each time you check. How do you do that with paniolo?
+"""
+traps = [
+  "each captured line has a stable, monotonic `seq`; note the highest, then poll `--since <seq>`",
+  "a `*` after the seq marks the current unterminated line (e.g. a `login:` prompt with no newline yet)",
+  "`seq` stays valid across buffer eviction, so an old `--since`/range query keeps working",
+]
+reference = [
+  'paniolo serial watch dut',
+  'paniolo serial log dut --tail 1        # note the highest seq, e.g. #1840',
+  'paniolo serial log dut --since 1840     # only lines newer than #1840 (repeat to poll)',
+]
+seed = "dut_console.toml"
+
+[grader]
+type = "judge"
+
+[loopback]
+banner = "[   12.34] systemd[1]: Reached target Multi-User\r\ndut login: "
+followup = "[   20.01] new line after the cursor\r\ndut login: "
+expect = ["new line after the cursor"]

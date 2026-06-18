@@ -1,0 +1,29 @@
+# Copyright 2026 Curtis Galloway — Licensed under the Apache License, Version 2.0.
+id = "s2"
+title = "Start capture, read recent boot output"
+tier = "t0"
+core = true
+conditions = ["cold", "warm", "preloaded"]
+capabilities = ["serial"]
+goal = """
+Start capturing `dut`'s serial console and show me the last 30 lines of what
+has scrolled past during boot. List the exact paniolo commands you would run,
+in order.
+"""
+traps = [
+  "the `watch` daemon is what captures — start it before reading",
+  "one configured interface → no `-i` needed",
+  "`serial log` reads the on-disk capture log, so it works even after the daemon stops",
+]
+reference = [
+  'paniolo serial watch dut        # start the capture daemon (owns the port)',
+  'paniolo serial log dut --tail 30',
+]
+seed = "dut_console.toml"
+
+[grader]
+type = "judge"
+
+[loopback]
+banner = "U-Boot 2024.01 (Jun 16 2026)\r\nHit any key to stop autoboot\r\nStarting kernel ...\r\n[    0.00] Linux version 6.6.0\r\ndut login: "
+expect = ["U-Boot 2024.01", "Linux version 6.6.0"]

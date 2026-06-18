@@ -38,7 +38,7 @@ Config lives in one CLI-managed **lab file** (`~/.config/paniolo/lab.toml`, or
 `--lab`/`PANIOLO_LAB`). A target's hardware is described as *channels*:
 
 ```
-paniolo target add <name> [--host <labhost>] [--note <text>]
+paniolo target add <name> [--host <labhost>] [--description <text>]
 paniolo netboot set -t <name> --interface <iface> [--tftp-root <dir>] [--host-ip <ip>] [--boot-file grubaa64.efi] [--http-port 80]
 paniolo serial add console -t <name> --device <path> [--baud 115200] [--sense cts]
 paniolo power set -t <name> [--cycle-cmd C] [--on-cmd C] [--off-cmd C] [--state-cmd C] [--serial-interface console]
@@ -263,8 +263,8 @@ paniolo power on  [target]             # run on_cmd hook (error with hint if uns
 paniolo power off [target]             # run off_cmd hook (error with hint if unset)
 paniolo power-cycle [target]           # run cycle_cmd hook
 paniolo power-state [target]           # state_cmd stdout ("on"/"off") or serial sense-line
-paniolo serial dtr [target] [--ms N]   # pulse DTR line on J2 header (soft/hard press)
-paniolo serial reset [target]          # soft reset via brief DTR pulse
+paniolo serial dtr [target] [--ms N]   # pulse DTR line on J2 header (opt-in; see below)
+paniolo serial reset [target]          # soft reset via brief DTR pulse (opt-in)
 ```
 
 Configure hooks with `paniolo power set`:
@@ -272,17 +272,29 @@ Configure hooks with `paniolo power set`:
 ```
 paniolo power set -t <name> \
     [--cycle-cmd <cmd>] [--on-cmd <cmd>] [--off-cmd <cmd>] [--state-cmd <cmd>] \
-    [--serial-interface console]
+    [--serial-interface console]   # default DTR interface when several opt in
 ```
 
 All four hooks are optional and run via `sh -c`. `power-state` uses `state_cmd`
 if set (first whitespace token of stdout must be `on` or `off`); falls back to
 the serial sense-line otherwise.
 
-DTR commands drive the target's physical power button via an FTDI serial
-adapter wired to the Pi J2 header. A ≤500 ms pulse is a soft button event; ≥3000 ms
-is a hard PMIC power-off. Set the default interface with
-`paniolo power set -t <name> --serial-interface console`.
+**"Reboot over serial" ≠ DTR reset — pick the right one.** Two unrelated things
+share the word "serial/reset":
+
+- **Console reboot (software):** type `reboot` into a logged-in console with
+  `paniolo serial send <target> "reboot"`. This is what "use serial to reboot"
+  almost always means. If you can't log in, use `paniolo power-cycle <target>`.
+- **DTR reset (hardware):** `paniolo serial dtr` / `serial reset` toggle the
+  FTDI DTR line wired to the board's J2 power button. A ≤500 ms pulse is a soft
+  button event; ≥3000 ms is a hard PMIC power-off.
+
+DTR is **opt-in per interface** — it works only where the interface declares
+`power_button = true` (`paniolo serial set <iface> -t <name> --power-button`),
+because DTR-to-J2 wiring is rare. On a target that hasn't opted in, `serial dtr`
+/ `serial reset` **error** with a hint (they never toggle a lone console blindly).
+So: unless DTR wiring is explicitly declared, reboot via the console `reboot` or
+`power-cycle` — do **not** assume `serial reset` power-cycles the board.
 
 ### Cambrionix hub (example)
 
@@ -378,6 +390,7 @@ commands then run **transparently on that host over SSH** — you don't ssh by h
 # mylab.toml
 [hosts.bench1]
 ssh = "curtisg@bench1.local"     # ssh destination — how others reach it ("local" = this machine)
+# description = "bench Mac mini"  # optional free-text label, shown in `config show` / `host show`
 # hostname = "bench1.local"      # this box's FQDN; set it so bench1 recognizes itself when ONE
 #                                  shared lab file is run from any machine (matched vs `hostname -f`)
 # identity = "~/.ssh/lab_key"    # set this if your ssh-agent offers many keys
@@ -387,6 +400,7 @@ ssh = "curtisg@bench1.local"     # ssh destination — how others reach it ("loc
 
 [targets.fortune]
 host = "bench1"
+# description = "Pi 5 under test"  # optional free-text label (legacy key: `note`)
 
 [targets.fortune.netboot]
 interface = "enx00e04c08d9a0"

@@ -1,0 +1,13 @@
+[targets.dut]
+
+[[targets.dut.serial]]
+name = "console"
+device = "/dev/cu.usbserial-AA"
+baud = 115200
+
+[[targets.dut.serial]]
+name = "bmc"
+device = "/dev/ttyUSB1"
+baud = 9600
+# paniolo lab — managed by the `paniolo` CLI; hand-edits are preserved
+

@@ -239,6 +239,9 @@ enum HostCmd {
         /// ssh destination: user@host, an ssh_config alias, or 'local'.
         #[arg(long)]
         ssh: String,
+        /// Free-text description of this control host (its role, location, …).
+        #[arg(long)]
+        description: Option<String>,
         /// This host's FQDN, so a machine can recognize itself when the lab
         /// file is shared across hosts (matched against `hostname -f`).
         #[arg(long)]
@@ -255,6 +258,9 @@ enum HostCmd {
         name: String,
         #[arg(long)]
         ssh: Option<String>,
+        /// Free-text description of this control host (its role, location, …).
+        #[arg(long)]
+        description: Option<String>,
         /// This host's FQDN for self-recognition (matched against `hostname -f`).
         #[arg(long)]
         hostname: Option<String>,
@@ -280,16 +286,18 @@ enum TargetCmd {
         name: String,
         #[arg(long)]
         host: Option<String>,
-        #[arg(long)]
-        note: Option<String>,
+        /// Free-text description of the target (accepts `--note` as an alias).
+        #[arg(long, alias = "note")]
+        description: Option<String>,
     },
-    /// Update a target's default host or note.
+    /// Update a target's default host or description.
     Set {
         name: String,
         #[arg(long)]
         host: Option<String>,
-        #[arg(long)]
-        note: Option<String>,
+        /// Free-text description of the target (accepts `--note` as an alias).
+        #[arg(long, alias = "note")]
+        description: Option<String>,
     },
     /// Remove a target and all its channels.
     Rm { name: String },
@@ -308,6 +316,10 @@ enum SerialCmd {
         baud: i64,
         #[arg(long)]
         sense: Option<String>,
+        /// This interface's FTDI DTR line is wired to the J2 power-button
+        /// header — enables `serial dtr` / `serial reset` on it.
+        #[arg(long)]
+        power_button: bool,
         #[arg(long)]
         host: Option<String>,
     },
@@ -322,6 +334,10 @@ enum SerialCmd {
         baud: Option<i64>,
         #[arg(long)]
         sense: Option<String>,
+        /// Opt this interface in/out of DTR power-button control (`--power-button`
+        /// to enable, `--power-button false` to revoke).
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        power_button: Option<bool>,
         #[arg(long)]
         host: Option<String>,
     },
@@ -1357,6 +1373,9 @@ fn config_show(lab_flag: Option<&str>) -> Result<()> {
                 .map(|i| format!("  identity={i}"))
                 .unwrap_or_default();
             println!("    {name}  {}{id}", h.ssh);
+            if let Some(description) = &h.description {
+                println!("      description: {description}");
+            }
         }
     }
 
@@ -1367,8 +1386,8 @@ fn config_show(lab_flag: Option<&str>) -> Result<()> {
         for name in lab.targets.keys() {
             let rt = lab.resolved_target(name).unwrap();
             println!("    {}", target_headline(&rt));
-            if let Some(note) = &rt.note {
-                println!("      note: {note}");
+            if let Some(description) = &rt.description {
+                println!("      description: {description}");
             }
             for ch in &rt.channels {
                 println!("      {}", channel_label(ch));
@@ -1390,6 +1409,7 @@ fn host_cmd(lab_flag: Option<&str>, cmd: HostCmd) -> Result<()> {
         HostCmd::Add {
             name,
             ssh,
+            description,
             hostname,
             identity,
             control_path,
@@ -1399,6 +1419,7 @@ fn host_cmd(lab_flag: Option<&str>, cmd: HostCmd) -> Result<()> {
                 lf.add_host(
                     &name,
                     &ssh,
+                    description.as_deref(),
                     hostname.as_deref(),
                     identity.as_deref(),
                     control_path.as_deref(),
@@ -1411,6 +1432,7 @@ fn host_cmd(lab_flag: Option<&str>, cmd: HostCmd) -> Result<()> {
         HostCmd::Set {
             name,
             ssh,
+            description,
             hostname,
             identity,
             control_path,
@@ -1420,6 +1442,7 @@ fn host_cmd(lab_flag: Option<&str>, cmd: HostCmd) -> Result<()> {
                 lf.update_host(
                     &name,
                     ssh.as_deref(),
+                    description.as_deref(),
                     hostname.as_deref(),
                     identity.as_deref(),
                     control_path.as_deref(),
@@ -1478,6 +1501,9 @@ fn host_show(lab_flag: Option<&str>, name: &str) -> Result<()> {
         Some(h) => {
             println!("Host: {name}");
             println!("  ssh           {}", h.ssh);
+            if let Some(v) = &h.description {
+                println!("  description   {v}");
+            }
             if let Some(v) = &h.hostname {
                 println!("  hostname      {v}");
             }
@@ -1517,16 +1543,24 @@ fn target_cmd(lab_flag: Option<&str>, cmd: TargetCmd) -> Result<()> {
     match cmd {
         TargetCmd::List => target_list(lab_flag),
         TargetCmd::Show { name } => target_show(lab_flag, name.as_deref()),
-        TargetCmd::Add { name, host, note } => {
+        TargetCmd::Add {
+            name,
+            host,
+            description,
+        } => {
             edit_lab(lab_flag, |lf| {
-                lf.add_target(&name, host.as_deref(), note.as_deref())
+                lf.add_target(&name, host.as_deref(), description.as_deref())
             })?;
             println!("Target '{name}' added.");
             Ok(())
         }
-        TargetCmd::Set { name, host, note } => {
+        TargetCmd::Set {
+            name,
+            host,
+            description,
+        } => {
             edit_lab(lab_flag, |lf| {
-                lf.update_target(&name, host.as_deref(), note.as_deref())
+                lf.update_target(&name, host.as_deref(), description.as_deref())
             })?;
             println!("Target '{name}' updated.");
             Ok(())
@@ -1592,6 +1626,7 @@ fn serial_cmd(lab_flag: Option<&str>, cmd: SerialCmd) -> Result<()> {
             device,
             baud,
             sense,
+            power_button,
             host,
         } => {
             let sense = normalize_sense(sense.as_deref())?;
@@ -1602,6 +1637,7 @@ fn serial_cmd(lab_flag: Option<&str>, cmd: SerialCmd) -> Result<()> {
                     &device,
                     baud,
                     sense.as_deref(),
+                    power_button,
                     host.as_deref(),
                 )
             })?;
@@ -1614,6 +1650,7 @@ fn serial_cmd(lab_flag: Option<&str>, cmd: SerialCmd) -> Result<()> {
             device,
             baud,
             sense,
+            power_button,
             host,
         } => {
             let sense = match sense.as_deref() {
@@ -1633,6 +1670,7 @@ fn serial_cmd(lab_flag: Option<&str>, cmd: SerialCmd) -> Result<()> {
                     device.as_deref(),
                     baud,
                     sense.as_deref(),
+                    power_button,
                     host.as_deref(),
                 )
             })?;
@@ -1745,6 +1783,13 @@ fn serial_cmd(lab_flag: Option<&str>, cmd: SerialCmd) -> Result<()> {
 
 /// Pulse DTR on a target's serial interface — via the serialcap daemon when it
 /// is running (it owns the port), else directly.
+///
+/// DTR power control is opt-in per interface (`power_button = true`): wiring the
+/// FTDI DTR line to the board's J2 header is the rare exception, and toggling an
+/// unwired line silently no-ops. We resolve the interface, then require the
+/// opt-in — never fall back to a lone console — so a "reboot over serial" that
+/// really meant the console `reboot` command fails loudly with a redirect
+/// instead of pretending to power-cycle.
 fn cmd_serial_dtr(
     lab_flag: Option<&str>,
     target: Option<&str>,
@@ -1754,24 +1799,18 @@ fn cmd_serial_dtr(
 ) -> Result<()> {
     let lab = load_for_read(lab_flag)?;
     let target = resolve_single_target(&lab, target)?;
-    // Default interface: the power channel's serial_interface (if configured).
-    let default_iface = lab
-        .targets
-        .get(&target)
-        .and_then(|t| t.power.as_ref())
-        .and_then(|p| p.serial_interface.clone());
-    let iface = interface.map(String::from).or(default_iface);
+    let iface = resolve_dtr_interface(&lab, &target, interface)?;
     if let Some(code) = dispatch::maybe_dispatch(
         &lab,
         &target,
         model::ChannelKind::Serial,
-        iface.as_deref(),
+        Some(&iface),
         dispatch::Mode::Reexec,
     )? {
         std::process::exit(code);
     }
     let serials = local_serials(&lab, &target)?;
-    let ch = pick_serial(&serials, iface.as_deref())?;
+    let ch = pick_serial(&serials, Some(&iface))?;
     if let Some(url) = serial::daemon_url(&target) {
         eprintln!("{label} on '{target}' ({ms} ms via serialcap daemon)");
         power::dtr_press_daemon(&url, &ch.name, ms)?;
@@ -1781,6 +1820,96 @@ fn cmd_serial_dtr(
     }
     println!("Done.");
     Ok(())
+}
+
+/// Resolve which serial interface a DTR power-button command (`serial dtr` /
+/// `serial reset`) acts on, enforcing the `power_button` opt-in.
+///
+/// Selection order: explicit `-i`, then the power channel's `serial_interface`,
+/// then the sole interface that has `power_button = true`. The chosen interface
+/// MUST have `power_button = true`; otherwise this returns a hint that redirects
+/// to the target's real power method and the console `reboot` path rather than
+/// toggling a possibly-unwired DTR line. The full (all-host) interface list is
+/// used so a DTR-wired interface on a remote host is still found pre-dispatch.
+fn resolve_dtr_interface(lab: &Lab, target: &str, interface: Option<&str>) -> Result<String> {
+    let t = lab
+        .targets
+        .get(target)
+        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+    let have = || {
+        t.serial
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let chosen = if let Some(name) = interface {
+        t.serial.iter().find(|s| s.name == name).ok_or_else(|| {
+            anyhow!(
+                "no serial interface '{name}' on '{target}' (have: {})",
+                have()
+            )
+        })?
+    } else if let Some(name) = t.power.as_ref().and_then(|p| p.serial_interface.as_deref()) {
+        t.serial.iter().find(|s| s.name == name).ok_or_else(|| {
+            anyhow!(
+                "power serial_interface '{name}' not found among '{target}' interfaces ({})",
+                have()
+            )
+        })?
+    } else {
+        let buttons: Vec<&model::SerialChannel> =
+            t.serial.iter().filter(|s| s.power_button).collect();
+        match buttons.as_slice() {
+            [one] => *one,
+            [] => bail!("{}", dtr_opt_in_hint(target, t, None)),
+            _ => bail!(
+                "multiple DTR power-button interfaces on '{target}' ({}); pick one with -i",
+                buttons
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    };
+    if !chosen.power_button {
+        bail!("{}", dtr_opt_in_hint(target, t, Some(&chosen.name)));
+    }
+    Ok(chosen.name.clone())
+}
+
+/// The error shown when a DTR power-button command targets an interface that
+/// hasn't opted in. It actively redirects to the three correct paths: the
+/// configured power hook, the console `reboot`, and how to declare DTR wiring.
+fn dtr_opt_in_hint(target: &str, t: &model::Target, iface: Option<&str>) -> String {
+    let mut out = match iface {
+        Some(name) => format!(
+            "serial interface '{name}' on '{target}' is not wired for DTR power \
+             control (no `power_button = true`)."
+        ),
+        None => format!("no DTR power-button interface configured for '{target}'."),
+    };
+    if t.power
+        .as_ref()
+        .and_then(|p| p.cycle_cmd.as_deref())
+        .is_some()
+    {
+        out.push_str(&format!(
+            "\n  • To power-cycle it: paniolo power-cycle {target}"
+        ));
+    }
+    out.push_str(&format!(
+        "\n  • To reboot from a logged-in serial console: paniolo serial send {target} \"reboot\""
+    ));
+    let example = iface
+        .or_else(|| t.serial.first().map(|s| s.name.as_str()))
+        .unwrap_or("console");
+    out.push_str(&format!(
+        "\n  • If the FTDI DTR line really is wired to J2: \
+         paniolo serial set {example} -t {target} --power-button"
+    ));
+    out
 }
 
 // ── console (composite: video + serial dashboard) ───────────────────────────
@@ -3350,8 +3479,8 @@ fn target_headline(rt: &ResolvedTarget) -> String {
 fn print_resolved_target(rt: &ResolvedTarget) {
     println!("Target: {}", target_headline(rt));
     println!("  default host  {}", rt.default_host);
-    if let Some(note) = &rt.note {
-        println!("  note          {note}");
+    if let Some(description) = &rt.description {
+        println!("  description   {description}");
     }
     if rt.channels.is_empty() {
         println!("  channels      (none)");
@@ -3406,5 +3535,69 @@ mod tests {
         let lab = model::Lab::default();
         assert!(channel_is_local(&lab, Some(model::LOCAL), "somehost"));
         assert!(channel_is_local(&lab, None, model::LOCAL));
+    }
+
+    // A target with a console but no DTR opt-in (the pi5 shape: power is a
+    // cycle_cmd hook, J2 DTR unwired) must REFUSE `serial dtr`/`reset` instead
+    // of silently toggling the lone console — and the error must redirect to the
+    // real power method and the console-reboot path.
+    #[test]
+    fn dtr_refuses_target_without_power_button_optin() {
+        let lab = model::parse(
+            "[targets.pi5]\n\
+             [[targets.pi5.serial]]\n\
+             name = \"console\"\n\
+             device = \"/dev/ttyUSB0\"\n\
+             [targets.pi5.power]\n\
+             cycle_cmd = \"zigplug cycle\"\n",
+        )
+        .unwrap();
+        let err = resolve_dtr_interface(&lab, "pi5", None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no DTR power-button interface configured"),
+            "{err}"
+        );
+        assert!(err.contains("power-cycle pi5"), "{err}");
+        assert!(err.contains("serial send pi5"), "{err}");
+        assert!(err.contains("--power-button"), "{err}");
+    }
+
+    // An explicit `-i` does NOT bypass the opt-in: choosing an un-opted-in
+    // interface by name still refuses (with the interface-specific hint).
+    #[test]
+    fn dtr_explicit_interface_still_requires_optin() {
+        let lab = model::parse(
+            "[targets.t]\n\
+             [[targets.t.serial]]\n\
+             name = \"console\"\n\
+             device = \"/dev/ttyUSB0\"\n",
+        )
+        .unwrap();
+        let err = resolve_dtr_interface(&lab, "t", Some("console"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'console'"), "{err}");
+        assert!(err.contains("power_button"), "{err}");
+    }
+
+    // With the opt-in declared, the interface resolves — both as the sole
+    // power_button interface and when selected explicitly.
+    #[test]
+    fn dtr_resolves_opted_in_interface() {
+        let lab = model::parse(
+            "[targets.dut]\n\
+             [[targets.dut.serial]]\n\
+             name = \"console\"\n\
+             device = \"/dev/ttyUSB0\"\n\
+             power_button = true\n",
+        )
+        .unwrap();
+        assert_eq!(resolve_dtr_interface(&lab, "dut", None).unwrap(), "console");
+        assert_eq!(
+            resolve_dtr_interface(&lab, "dut", Some("console")).unwrap(),
+            "console"
+        );
     }
 }

@@ -1,0 +1,26 @@
+# Copyright 2026 Curtis Galloway — Licensed under the Apache License, Version 2.0.
+id = "s5"
+title = "Interrupt a slow polled bootloader"
+tier = "t0"
+core = false
+conditions = ["cold", "warm", "preloaded"]
+capabilities = ["serial"]
+goal = """
+`dut`'s U-Boot prints "Hit any key to stop autoboot" but its console is a slow,
+polled UART with no flow control — bytes get dropped if sent too fast. Stop the
+autoboot by sending a single keypress (not a whole line). List the exact paniolo
+commands you would run.
+"""
+traps = [
+  "`--no-newline` sends a bare keypress with no trailing carriage return",
+  "`--pace-ms N` drips one byte per N ms for a slow polled console with no flow control",
+  "the daemon must be running (`watch`) for `send` to reach the port",
+]
+reference = [
+  'paniolo serial watch dut',
+  'paniolo serial send dut " " --no-newline --pace-ms 8',
+]
+seed = "dut_console.toml"
+
+[grader]
+type = "judge"

@@ -17,6 +17,10 @@ paniolo serial add console -t target-machine \
 
 # Optional: also wire a power sense signal on this interface (see power.md)
 paniolo serial set console -t target-machine --sense cts
+
+# Optional: declare this interface's DTR line is wired to the J2 power button,
+# which enables `serial dtr` / `serial reset` on it (opt-in; see power.md)
+paniolo serial set console -t target-machine --power-button
 ```
 
 A target can have several named interfaces (e.g. `console`, `bmc`). Remove
@@ -196,12 +200,18 @@ See [dashboard.md](dashboard.md) for layout options and other URL parameters.
 
 When an FTDI adapter is wired to the target's J2 power button header, the
 same interface used for serial can also drive the power button via the DTR
-signal. The DTR commands live under `paniolo serial`:
+signal. This is **opt-in**: the interface must declare `power_button = true`
+(`paniolo serial set <iface> --power-button`), or these commands error. The
+DTR commands live under `paniolo serial`:
 
 ```bash
 paniolo serial dtr [--ms 200] [-i console] [target-machine]   # pulse DTR
 paniolo serial reset [-i console] [target-machine]             # soft reset (200 ms)
 ```
+
+> **This is a hardware reset, not a console `reboot`.** "Reboot over the serial
+> console" means typing `reboot` into a logged-in shell — `paniolo serial send
+> <target> "reboot"` — which is unrelated to the DTR power-button toggle above.
 
 See [power.md](power.md) for wiring diagrams, the generic power hooks
 (`cycle_cmd`/`on_cmd`/`off_cmd`/`state_cmd`), and a full command reference.

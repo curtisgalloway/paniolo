@@ -1,0 +1,28 @@
+# Copyright 2026 Curtis Galloway — Licensed under the Apache License, Version 2.0.
+id = "m1"
+title = "Capability mapping: Android vs Raspberry Pi"
+tier = "t0"
+core = false
+conditions = ["cold", "warm", "preloaded"]
+capabilities = ["adb", "overview"]
+goal = """
+What can paniolo do for an Android tablet, and how is that different from what
+it does for a Raspberry Pi? I want to understand which subsystems apply to each.
+"""
+traps = [
+  "Android uses the `adb` channel — console/screencap/input over one USB cable, no netboot/capture/HID/serial rig",
+  "a Pi uses netboot + serial + video + HID + power",
+  "Android reboot is via a power hook (`adb reboot`), not an adb-specific paniolo command",
+  "do not invent capabilities paniolo doesn't have",
+]
+reference = """
+Android (`adb` channel): one USB cable gives console (`adb shell`/`adb run`),
+screen (`adb screencap`), and input (`adb input`: keyevent/text/tap/swipe);
+power/reboot via a power hook running `adb reboot`. No capture dongle, HID
+injector, serial adapter, or netboot link needed.
+Raspberry Pi: the full rig — netboot over USB-Ethernet, serial console, HDMI
+capture + OCR, USB HID injection, and power hooks (DTR / smart plug / hub).
+"""
+
+[grader]
+type = "judge"

@@ -1,0 +1,33 @@
+# Copyright 2026 Curtis Galloway — Licensed under the Apache License, Version 2.0.
+id = "c5"
+title = "Drop one channel, keep the target"
+tier = "t1"
+core = false
+conditions = ["cold", "warm", "preloaded"]
+capabilities = ["serial"]
+goal = """
+We're no longer using `pico`'s BMC serial console. Remove just that `bmc`
+interface, but keep the main `console` interface and everything else about the
+target intact.
+"""
+traps = [
+  "remove the channel (`serial rm bmc`), NOT the whole target (`target rm pico`)",
+  "must leave the `console` interface in place",
+]
+reference = [
+  'paniolo serial rm bmc -t pico',
+]
+seed = "pico_console_bmc.toml"
+
+[grader]
+type = "t1_config"
+allowlist_violation_fails = true
+[[grader.assert]]
+path = "targets.pico.serial[name=bmc]"
+exists = false
+[[grader.assert]]
+path = "targets.pico.serial[name=console]"
+exists = true
+[[grader.assert]]
+path = "targets.pico"
+exists = true

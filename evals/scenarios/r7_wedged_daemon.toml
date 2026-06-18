@@ -1,0 +1,26 @@
+# Copyright 2026 Curtis Galloway — Licensed under the Apache License, Version 2.0.
+id = "r7"
+title = "A wedged daemon holds the serial port"
+tier = "t0"
+core = false
+conditions = ["cold", "warm", "preloaded"]
+capabilities = ["daemons", "serial"]
+goal = """
+I can't open the serial console on `pico` — something already has the port and
+won't let go. Find what's holding it and clear it. List the exact paniolo
+commands you would run.
+"""
+traps = [
+  "serial ports are exclusive: only one of connect / watch / external tio/screen at a time",
+  "`paniolo daemons` lists daemons AND stray libexec helper processes — the thing to check",
+  "clear with `paniolo daemons stop <name>` (or --all / --force), not ps-guessing",
+]
+reference = [
+  'paniolo daemons                      # list daemons + stray helpers holding ports',
+  'paniolo daemons stop serialcap       # or `--all`, escalate with `--force`',
+]
+
+seed = "bench.toml"
+
+[grader]
+type = "judge"

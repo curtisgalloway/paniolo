@@ -1,0 +1,47 @@
+# Copyright 2026 Curtis Galloway — Licensed under the Apache License, Version 2.0.
+id = "c3"
+title = "Power-cycle through a Shelly smart plug"
+tier = "t1"
+core = true
+conditions = ["cold", "warm", "preloaded"]
+capabilities = ["power", "helper:shellyplug"]
+goal = """
+The target `pico` is plugged into a Shelly smart plug reachable at
+`10.66.27.141`. Configure paniolo so that `paniolo power-cycle pico` (and
+power on/off, and power-state) actually switch the plug.
+"""
+traps = [
+  "there is NO `paniolo shelly` command — smart plugs are helpers behind the generic power hooks",
+  "the helper is `shellyplug`; wire it into --cycle-cmd/--on-cmd/--off-cmd/--state-cmd",
+]
+reference = [
+  'paniolo power set -t pico --cycle-cmd "shellyplug -d 10.66.27.141 cycle" --on-cmd "shellyplug -d 10.66.27.141 on" --off-cmd "shellyplug -d 10.66.27.141 off" --state-cmd "shellyplug -d 10.66.27.141 state"',
+]
+seed = "pico_console.toml"
+
+[grader]
+type = "t1_config"
+allowlist_violation_fails = true
+[[grader.assert]]
+path = "targets.pico.power.cycle_cmd"
+contains = "shellyplug"
+[[grader.assert]]
+path = "targets.pico.power.cycle_cmd"
+contains = "10.66.27.141"
+[[grader.assert]]
+path = "targets.pico.power.cycle_cmd"
+contains = "cycle"
+[[grader.assert]]
+path = "targets.pico.power.state_cmd"
+contains = "state"
+# The goal asks for on/off/state too, not just cycle — verify the agent wired
+# all four hooks at the right plug, not only the one the title mentions.
+[[grader.assert]]
+path = "targets.pico.power.state_cmd"
+contains = "10.66.27.141"
+[[grader.assert]]
+path = "targets.pico.power.on_cmd"
+matches = 'shellyplug .* on$'
+[[grader.assert]]
+path = "targets.pico.power.off_cmd"
+matches = 'shellyplug .* off$'
