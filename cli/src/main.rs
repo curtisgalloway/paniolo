@@ -179,7 +179,7 @@ enum Command {
         #[arg(long)]
         path: bool,
     },
-    /// List or stop paniolo's background daemons on this host.
+    /// List, stop, or restart paniolo's background daemons on this host.
     Daemons {
         #[command(subcommand)]
         cmd: Option<DaemonsCmd>,

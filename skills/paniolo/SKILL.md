@@ -459,11 +459,22 @@ paniolo daemons                          # list: name, pid, port, detail + stray
 paniolo daemons stop zigplug serialcap   # stop specific daemons (SIGTERM)
 paniolo daemons stop --all               # stop every daemon + TERM strays
 paniolo daemons stop --all --force       # …and SIGKILL whatever survives 3 s
+paniolo daemons restart --stale          # restart capture daemons on an old binary
+paniolo daemons restart serialcap        # restart a named capture daemon
+paniolo daemons restart --all            # restart every serialcap/hdmicap
 ```
 
 netbootd is stopped via its proper teardown (interface cleanup), everything
 else by signal. Per-subsystem `stop` commands still work; this is the
 sweep-the-bench view.
+
+**Stale daemons after an upgrade.** A daemon keeps the binary it started from;
+`make install` / `apt install` replaces the binary on disk but not the running
+process. `paniolo daemons` flags such a daemon **stale** (also shown on
+`serial show` / `video show`), and `paniolo daemons restart [--all|--stale|NAME]`
+cleanly cycles serialcap/hdmicap from the current binary, reusing the lab's
+channel config. `serial watch` / `video watch` also auto-restart a stale
+instance. netbootd is excluded — cycle it via `paniolo netboot start/stop`.
 
 ## Quick reference — gotchas
 

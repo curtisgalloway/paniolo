@@ -18,7 +18,10 @@ limitations under the License.
 
 ## Before opening a PR
 
-Run through this checklist before calling `gh pr create`:
+**Precondition (hard gate): the PR may not be opened until all documentation
+*and* usage help reflect the change.** A behavioral or surface change with stale
+docs/help is an incomplete PR — bring them current in the *same* PR, never a
+follow-up. Run through this checklist before calling `gh pr create`:
 
 1. **Update docs that the PR affects.** For each changed subsystem, check:
    - `docs/<subsystem>.md` — commands, config fields, workflows
@@ -29,7 +32,14 @@ Run through this checklist before calling `gh pr create`:
    - `AGENTS.md` — module layout, command descriptions, architecture notes
    Include doc updates in the same PR, not a follow-up.
 
-2. **Update the usage skill (`skills/paniolo/SKILL.md`).** This is the
+2. **Update the CLI usage help.** Every new/changed command, subcommand, flag,
+   or argument must have an accurate clap doc comment (the `///` lines that
+   become `--help` text). Verify the rendered output for each touched command
+   (`paniolo <cmd> --help`, `paniolo <cmd> <sub> --help`) — including parent
+   summaries (e.g. a group's one-line description) so they still match the
+   subcommands beneath them.
+
+3. **Update the usage skill (`skills/paniolo/SKILL.md`).** This is the
    agent-facing skill for *driving* a target. If the PR adds, removes,
    or changes a user-facing command, flag, or workflow, update the relevant
    section (and the "gotchas" list) so an agent using paniolo sees the new
@@ -46,7 +56,7 @@ Run through this checklist before calling `gh pr create`:
    skill) and a copy line is unnecessary for `setup.rs`/the tarball (both
    enumerate `skills/` automatically).
 
-3. **Open the PR; do not merge it.** Push the branch and create the PR with
+4. **Open the PR; do not merge it.** Push the branch and create the PR with
    `gh pr create`, then stop. The merge decision belongs to the user.
 
 ## Purpose
