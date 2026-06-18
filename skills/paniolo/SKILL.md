@@ -38,7 +38,7 @@ Config lives in one CLI-managed **lab file** (`~/.config/paniolo/lab.toml`, or
 `--lab`/`PANIOLO_LAB`). A target's hardware is described as *channels*:
 
 ```
-paniolo target add <name> [--host <labhost>] [--note <text>]
+paniolo target add <name> [--host <labhost>] [--description <text>]
 paniolo netboot set -t <name> --interface <iface> [--tftp-root <dir>] [--host-ip <ip>] [--boot-file grubaa64.efi] [--http-port 80]
 paniolo serial add console -t <name> --device <path> [--baud 115200] [--sense cts]
 paniolo power set -t <name> [--cycle-cmd C] [--on-cmd C] [--off-cmd C] [--state-cmd C] [--serial-interface console]
@@ -378,6 +378,7 @@ commands then run **transparently on that host over SSH** — you don't ssh by h
 # mylab.toml
 [hosts.bench1]
 ssh = "curtisg@bench1.local"     # ssh destination — how others reach it ("local" = this machine)
+# description = "bench Mac mini"  # optional free-text label, shown in `config show` / `host show`
 # hostname = "bench1.local"      # this box's FQDN; set it so bench1 recognizes itself when ONE
 #                                  shared lab file is run from any machine (matched vs `hostname -f`)
 # identity = "~/.ssh/lab_key"    # set this if your ssh-agent offers many keys
@@ -387,6 +388,7 @@ ssh = "curtisg@bench1.local"     # ssh destination — how others reach it ("loc
 
 [targets.fortune]
 host = "bench1"
+# description = "Pi 5 under test"  # optional free-text label (legacy key: `note`)
 
 [targets.fortune.netboot]
 interface = "enx00e04c08d9a0"

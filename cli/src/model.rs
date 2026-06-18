@@ -53,6 +53,9 @@ fn default_baud() -> i64 {
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct Host {
     pub ssh: String,
+    /// Free-text description of this control host (its role, location, etc.),
+    /// shown by `host show` / `config show`. Purely informational.
+    pub description: Option<String>,
     /// The host's fully-qualified hostname, used to recognize *this* machine
     /// (see [`Host::is_local`]). Distinct from `ssh`, which is only how *other*
     /// machines reach it and may be an `~/.ssh/config` alias.
@@ -177,7 +180,11 @@ pub struct AdbChannel {
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct Target {
     pub host: Option<String>,
-    pub note: Option<String>,
+    /// Free-text description of this target, shown by `target show` /
+    /// `config show`. The legacy key `note` is accepted as an alias so older
+    /// lab files keep parsing.
+    #[serde(alias = "note")]
+    pub description: Option<String>,
     pub netboot: Option<NetbootChannel>,
     #[serde(default)]
     pub serial: Vec<SerialChannel>,
@@ -242,7 +249,7 @@ pub struct ResolvedChannel {
 pub struct ResolvedTarget {
     pub name: String,
     pub default_host: String,
-    pub note: Option<String>,
+    pub description: Option<String>,
     pub channels: Vec<ResolvedChannel>,
 }
 
@@ -354,7 +361,7 @@ impl Lab {
         Some(ResolvedTarget {
             name: name.to_string(),
             default_host,
-            note: t.note.clone(),
+            description: t.description.clone(),
             channels,
         })
     }
@@ -600,6 +607,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn description_accepts_legacy_note_alias() {
+        // Canonical `description` and the legacy `note` key both land in
+        // Target::description, and a host carries its own description.
+        let lab = parse(
+            r#"
+            [hosts.bench1]
+            ssh = "u@bench1"
+            description = "the bench Mac"
+            [targets.canon]
+            description = "Pi 5 DUT"
+            [targets.legacy]
+            note = "old-style note"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            lab.hosts["bench1"].description.as_deref(),
+            Some("the bench Mac")
+        );
+        assert_eq!(
+            lab.targets["canon"].description.as_deref(),
+            Some("Pi 5 DUT")
+        );
+        assert_eq!(
+            lab.targets["legacy"].description.as_deref(),
+            Some("old-style note"),
+            "legacy `note` key parses into `description` via the serde alias"
+        );
+    }
+
     fn multihost() -> Lab {
         parse(
             r#"
@@ -609,7 +647,7 @@ mod tests {
             ssh = "u@bench2"
             [targets.fortune]
             host = "bench1"
-            note = "n"
+            description = "n"
             [targets.fortune.netboot]
             interface = "en0"
             [[targets.fortune.serial]]

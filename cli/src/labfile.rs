@@ -84,10 +84,12 @@ impl LabFile {
 
     // ── hosts ───────────────────────────────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_host(
         &mut self,
         name: &str,
         ssh: &str,
+        description: Option<&str>,
         hostname: Option<&str>,
         identity: Option<&str>,
         control_path: Option<&str>,
@@ -99,6 +101,7 @@ impl LabFile {
         }
         let mut t = Table::new();
         t.insert("ssh", value(ssh));
+        set_opt(&mut t, "description", description);
         set_opt(&mut t, "hostname", hostname);
         set_opt(&mut t, "identity", identity);
         set_opt(&mut t, "control_path", control_path);
@@ -107,10 +110,12 @@ impl LabFile {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update_host(
         &mut self,
         name: &str,
         ssh: Option<&str>,
+        description: Option<&str>,
         hostname: Option<&str>,
         identity: Option<&str>,
         control_path: Option<&str>,
@@ -124,6 +129,7 @@ impl LabFile {
             .and_then(|i| i.as_table_mut())
             .ok_or_else(|| LabError(format!("no host '{name}'")))?;
         set_opt(t, "ssh", ssh);
+        set_opt(t, "description", description);
         set_opt(t, "hostname", hostname);
         set_opt(t, "identity", identity);
         set_opt(t, "control_path", control_path);
@@ -170,7 +176,7 @@ impl LabFile {
         &mut self,
         name: &str,
         host: Option<&str>,
-        note: Option<&str>,
+        description: Option<&str>,
     ) -> Result<(), LabError> {
         let targets = super_table(&mut self.doc, "targets");
         if targets.contains_key(name) {
@@ -178,7 +184,7 @@ impl LabFile {
         }
         let mut t = Table::new();
         set_opt(&mut t, "host", host);
-        set_opt(&mut t, "note", note);
+        set_opt(&mut t, "description", description);
         targets.insert(name, Item::Table(t));
         Ok(())
     }
@@ -187,11 +193,16 @@ impl LabFile {
         &mut self,
         name: &str,
         host: Option<&str>,
-        note: Option<&str>,
+        description: Option<&str>,
     ) -> Result<(), LabError> {
         let t = self.target_mut(name)?;
         set_opt(t, "host", host);
-        set_opt(t, "note", note);
+        if description.is_some() {
+            // Migrate the legacy `note` key to the canonical `description`:
+            // leaving both would deserialize as a duplicate field (they alias).
+            t.remove("note");
+        }
+        set_opt(t, "description", description);
         Ok(())
     }
 
@@ -467,9 +478,17 @@ mod tests {
     fn build_round_trips() {
         let (_d, path) = tmp();
         let mut lf = LabFile::create(&path);
-        lf.add_host("bench1", "u@bench1", None, Some("~/.ssh/id"), None, None)
-            .unwrap();
-        lf.add_target("fortune", Some("bench1"), Some("note"))
+        lf.add_host(
+            "bench1",
+            "u@bench1",
+            None,
+            None,
+            Some("~/.ssh/id"),
+            None,
+            None,
+        )
+        .unwrap();
+        lf.add_target("fortune", Some("bench1"), Some("a pi"))
             .unwrap();
         lf.set_netboot(
             "fortune",
@@ -513,7 +532,7 @@ mod tests {
         )
         .unwrap();
         let mut lf = LabFile::load(&path).unwrap();
-        lf.update_host("bench1", None, None, Some("~/.ssh/id"), None, None)
+        lf.update_host("bench1", None, None, None, Some("~/.ssh/id"), None, None)
             .unwrap();
         lf.save().unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -526,7 +545,7 @@ mod tests {
     fn remove_host_blocked_while_referenced() {
         let (_d, path) = tmp();
         let mut lf = LabFile::create(&path);
-        lf.add_host("bench1", "u@b1", None, None, None, None)
+        lf.add_host("bench1", "u@b1", None, None, None, None, None)
             .unwrap();
         lf.add_target("fortune", Some("bench1"), None).unwrap();
         let e = lf.remove_host("bench1").unwrap_err();
@@ -633,6 +652,23 @@ mod tests {
         lf.save().unwrap();
         let lab = model::load(&path).unwrap();
         assert!(lab.targets["pixel"].adb.is_none());
+    }
+
+    #[test]
+    fn update_target_migrates_legacy_note_to_description() {
+        // A hand-edited lab using the legacy `note` key must stay mutable:
+        // setting a description replaces `note` rather than colliding with it
+        // (both would deserialize as a duplicate `description` via the alias).
+        let (_d, path) = tmp();
+        std::fs::write(&path, "[targets.oldpi]\nnote = \"legacy\"\n").unwrap();
+        let mut lf = LabFile::load(&path).unwrap();
+        lf.update_target("oldpi", None, Some("modern")).unwrap();
+        lf.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("description = \"modern\""), "{text}");
+        assert!(!text.contains("note ="), "legacy note key removed: {text}");
+        let lab = model::load(&path).unwrap();
+        assert_eq!(lab.targets["oldpi"].description.as_deref(), Some("modern"));
     }
 
     #[test]

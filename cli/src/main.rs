@@ -239,6 +239,9 @@ enum HostCmd {
         /// ssh destination: user@host, an ssh_config alias, or 'local'.
         #[arg(long)]
         ssh: String,
+        /// Free-text description of this control host (its role, location, …).
+        #[arg(long)]
+        description: Option<String>,
         /// This host's FQDN, so a machine can recognize itself when the lab
         /// file is shared across hosts (matched against `hostname -f`).
         #[arg(long)]
@@ -255,6 +258,9 @@ enum HostCmd {
         name: String,
         #[arg(long)]
         ssh: Option<String>,
+        /// Free-text description of this control host (its role, location, …).
+        #[arg(long)]
+        description: Option<String>,
         /// This host's FQDN for self-recognition (matched against `hostname -f`).
         #[arg(long)]
         hostname: Option<String>,
@@ -280,16 +286,18 @@ enum TargetCmd {
         name: String,
         #[arg(long)]
         host: Option<String>,
-        #[arg(long)]
-        note: Option<String>,
+        /// Free-text description of the target (accepts `--note` as an alias).
+        #[arg(long, alias = "note")]
+        description: Option<String>,
     },
-    /// Update a target's default host or note.
+    /// Update a target's default host or description.
     Set {
         name: String,
         #[arg(long)]
         host: Option<String>,
-        #[arg(long)]
-        note: Option<String>,
+        /// Free-text description of the target (accepts `--note` as an alias).
+        #[arg(long, alias = "note")]
+        description: Option<String>,
     },
     /// Remove a target and all its channels.
     Rm { name: String },
@@ -1357,6 +1365,9 @@ fn config_show(lab_flag: Option<&str>) -> Result<()> {
                 .map(|i| format!("  identity={i}"))
                 .unwrap_or_default();
             println!("    {name}  {}{id}", h.ssh);
+            if let Some(description) = &h.description {
+                println!("      description: {description}");
+            }
         }
     }
 
@@ -1367,8 +1378,8 @@ fn config_show(lab_flag: Option<&str>) -> Result<()> {
         for name in lab.targets.keys() {
             let rt = lab.resolved_target(name).unwrap();
             println!("    {}", target_headline(&rt));
-            if let Some(note) = &rt.note {
-                println!("      note: {note}");
+            if let Some(description) = &rt.description {
+                println!("      description: {description}");
             }
             for ch in &rt.channels {
                 println!("      {}", channel_label(ch));
@@ -1390,6 +1401,7 @@ fn host_cmd(lab_flag: Option<&str>, cmd: HostCmd) -> Result<()> {
         HostCmd::Add {
             name,
             ssh,
+            description,
             hostname,
             identity,
             control_path,
@@ -1399,6 +1411,7 @@ fn host_cmd(lab_flag: Option<&str>, cmd: HostCmd) -> Result<()> {
                 lf.add_host(
                     &name,
                     &ssh,
+                    description.as_deref(),
                     hostname.as_deref(),
                     identity.as_deref(),
                     control_path.as_deref(),
@@ -1411,6 +1424,7 @@ fn host_cmd(lab_flag: Option<&str>, cmd: HostCmd) -> Result<()> {
         HostCmd::Set {
             name,
             ssh,
+            description,
             hostname,
             identity,
             control_path,
@@ -1420,6 +1434,7 @@ fn host_cmd(lab_flag: Option<&str>, cmd: HostCmd) -> Result<()> {
                 lf.update_host(
                     &name,
                     ssh.as_deref(),
+                    description.as_deref(),
                     hostname.as_deref(),
                     identity.as_deref(),
                     control_path.as_deref(),
@@ -1478,6 +1493,9 @@ fn host_show(lab_flag: Option<&str>, name: &str) -> Result<()> {
         Some(h) => {
             println!("Host: {name}");
             println!("  ssh           {}", h.ssh);
+            if let Some(v) = &h.description {
+                println!("  description   {v}");
+            }
             if let Some(v) = &h.hostname {
                 println!("  hostname      {v}");
             }
@@ -1517,16 +1535,24 @@ fn target_cmd(lab_flag: Option<&str>, cmd: TargetCmd) -> Result<()> {
     match cmd {
         TargetCmd::List => target_list(lab_flag),
         TargetCmd::Show { name } => target_show(lab_flag, name.as_deref()),
-        TargetCmd::Add { name, host, note } => {
+        TargetCmd::Add {
+            name,
+            host,
+            description,
+        } => {
             edit_lab(lab_flag, |lf| {
-                lf.add_target(&name, host.as_deref(), note.as_deref())
+                lf.add_target(&name, host.as_deref(), description.as_deref())
             })?;
             println!("Target '{name}' added.");
             Ok(())
         }
-        TargetCmd::Set { name, host, note } => {
+        TargetCmd::Set {
+            name,
+            host,
+            description,
+        } => {
             edit_lab(lab_flag, |lf| {
-                lf.update_target(&name, host.as_deref(), note.as_deref())
+                lf.update_target(&name, host.as_deref(), description.as_deref())
             })?;
             println!("Target '{name}' updated.");
             Ok(())
@@ -3350,8 +3376,8 @@ fn target_headline(rt: &ResolvedTarget) -> String {
 fn print_resolved_target(rt: &ResolvedTarget) {
     println!("Target: {}", target_headline(rt));
     println!("  default host  {}", rt.default_host);
-    if let Some(note) = &rt.note {
-        println!("  note          {note}");
+    if let Some(description) = &rt.description {
+        println!("  description   {description}");
     }
     if rt.channels.is_empty() {
         println!("  channels      (none)");
