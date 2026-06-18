@@ -86,7 +86,7 @@ tftp-root/status`, `netif status`, `discover`, `doctor`, `skill`, `configure`,
 `helper` (bare list), `daemons` (bare list). Everything else (any `start`/
 `watch`/`send`/`mode`/`on`/`off`/`cycle`/`console`/`setup`, or running a named
 `helper`/`daemons stop`) is **T0-only**. The authoritative list is
-`SAFE` in [`evals/graders/t1_config.py`](../evals/graders/t1_config.py), and
+`SAFE` in [`evals/graders/t1_config.py`](https://github.com/curtisgalloway/paniolo/blob/main/evals/graders/t1_config.py), and
 `run.py --check` asserts every key there is a real CLI group/subcommand.
 
 ### 2.3 The matrix
@@ -341,7 +341,7 @@ ones runnable for real on Linux (see below).
 
 **Executable on Linux.** `s2`–`s4`, `s6`, `s7`, `s10` carry a `[loopback]`
 fixture (fake-DUT banner + command responses + `expect` substrings).
-[`evals/serial_loopback.py`](../evals/serial_loopback.py) opens a PTY, plays the
+[`evals/serial_loopback.py`](https://github.com/curtisgalloway/paniolo/blob/main/evals/serial_loopback.py) opens a PTY, plays the
 DUT on the far end, drives `serial watch`/`send`/`log` against the near end, and
 asserts on the captured log — turning these from stated-command into
 *executed*, deterministically-graded tests. **macOS limitation:** serialcap's
@@ -445,7 +445,7 @@ weighted rule** rather than a holistic "looks adequate": no hard-fail, D2/D3/D6
 each ≥ 1, no central trap walked into, and a weighted total ≥ 0.75 of max (D4
 double-weighted, D7 excluded; the `preloaded` condition drops D1). This makes
 verdicts reproducible across judge runs. See `RUBRIC` in
-[`evals/graders/judge.py`](../evals/graders/judge.py).
+[`evals/graders/judge.py`](https://github.com/curtisgalloway/paniolo/blob/main/evals/graders/judge.py).
 
 Three implementation lessons (learned the hard way — see `evals/`):
 
@@ -462,7 +462,7 @@ Three implementation lessons (learned the hard way — see `evals/`):
 - **References rot silently — guard them.** The golden self-test and the judge's
   D4 both trust the `reference` lines, so a renamed subcommand or dropped flag
   quietly invalidates the suite. `run.py --check`
-  ([`evals/graders/drift.py`](../evals/graders/drift.py)) re-walks the live
+  ([`evals/graders/drift.py`](https://github.com/curtisgalloway/paniolo/blob/main/evals/graders/drift.py)) re-walks the live
   `--help` tree and fails if any reference path/flag — or any T1-safe allowlist
   entry — no longer exists. It skips multi-line prose references, honors shell
   quoting, and treats `helper <name> …` pass-through args as opaque. Run it in CI.
@@ -511,14 +511,14 @@ Re-check agreement whenever the judge model or the rubric changes.
 
 ## 9. Running the suite (workflow)
 
-> **Runnable implementation:** [`evals/`](../evals/) implements this spec —
+> **Runnable implementation:** [`evals/`](https://github.com/curtisgalloway/paniolo/tree/main/evals/) implements this spec —
 > scenario fixtures (`evals/scenarios/*.toml`), the scripted T1 grader and the
 > T0 judge-prompt builder (`evals/graders/`), and a stdlib-only runner
 > (`evals/run.py`) that builds the sandbox, sets up the discovery condition,
 > runs the reference commands or a headless `claude` agent, and grades. Start
 > with `python3.12 evals/run.py --check` (drift guard: references + allowlist vs
 > the live CLI) then `--all --reference` (the golden self-test) — see
-> [`evals/README.md`](../evals/README.md).
+> [`evals/README.md`](https://github.com/curtisgalloway/paniolo/blob/main/evals/README.md).
 
 1. Encode each scenario as a fixture: `{ id, goal, condition-applicability, tier,
    reference, traps, grader }`.
