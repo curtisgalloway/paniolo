@@ -263,8 +263,8 @@ paniolo power on  [target]             # run on_cmd hook (error with hint if uns
 paniolo power off [target]             # run off_cmd hook (error with hint if unset)
 paniolo power-cycle [target]           # run cycle_cmd hook
 paniolo power-state [target]           # state_cmd stdout ("on"/"off") or serial sense-line
-paniolo serial dtr [target] [--ms N]   # pulse DTR line on J2 header (soft/hard press)
-paniolo serial reset [target]          # soft reset via brief DTR pulse
+paniolo serial dtr [target] [--ms N]   # pulse DTR line on J2 header (opt-in; see below)
+paniolo serial reset [target]          # soft reset via brief DTR pulse (opt-in)
 ```
 
 Configure hooks with `paniolo power set`:
@@ -272,17 +272,29 @@ Configure hooks with `paniolo power set`:
 ```
 paniolo power set -t <name> \
     [--cycle-cmd <cmd>] [--on-cmd <cmd>] [--off-cmd <cmd>] [--state-cmd <cmd>] \
-    [--serial-interface console]
+    [--serial-interface console]   # default DTR interface when several opt in
 ```
 
 All four hooks are optional and run via `sh -c`. `power-state` uses `state_cmd`
 if set (first whitespace token of stdout must be `on` or `off`); falls back to
 the serial sense-line otherwise.
 
-DTR commands drive the target's physical power button via an FTDI serial
-adapter wired to the Pi J2 header. A ≤500 ms pulse is a soft button event; ≥3000 ms
-is a hard PMIC power-off. Set the default interface with
-`paniolo power set -t <name> --serial-interface console`.
+**"Reboot over serial" ≠ DTR reset — pick the right one.** Two unrelated things
+share the word "serial/reset":
+
+- **Console reboot (software):** type `reboot` into a logged-in console with
+  `paniolo serial send <target> "reboot"`. This is what "use serial to reboot"
+  almost always means. If you can't log in, use `paniolo power-cycle <target>`.
+- **DTR reset (hardware):** `paniolo serial dtr` / `serial reset` toggle the
+  FTDI DTR line wired to the board's J2 power button. A ≤500 ms pulse is a soft
+  button event; ≥3000 ms is a hard PMIC power-off.
+
+DTR is **opt-in per interface** — it works only where the interface declares
+`power_button = true` (`paniolo serial set <iface> -t <name> --power-button`),
+because DTR-to-J2 wiring is rare. On a target that hasn't opted in, `serial dtr`
+/ `serial reset` **error** with a hint (they never toggle a lone console blindly).
+So: unless DTR wiring is explicitly declared, reboot via the console `reboot` or
+`power-cycle` — do **not** assume `serial reset` power-cycles the board.
 
 ### Cambrionix hub (example)
 

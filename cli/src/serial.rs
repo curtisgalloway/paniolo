@@ -174,6 +174,7 @@ mod tests {
             device: "/dev/ttyUSB0".into(),
             baud: 115200,
             power_sense_signal: sense.map(String::from),
+            power_button: false,
             host: None,
         }
     }

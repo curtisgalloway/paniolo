@@ -220,6 +220,9 @@ impl LabFile {
 
     // ── serial channels (collection) ─────────────────────────────────────────
 
+    // Mirrors the `[[serial]]` field set one-for-one; a params struct would just
+    // duplicate `SerialChannel` for no clarity gain.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_serial(
         &mut self,
         target: &str,
@@ -227,6 +230,7 @@ impl LabFile {
         device: &str,
         baud: i64,
         sense: Option<&str>,
+        power_button: bool,
         host: Option<&str>,
     ) -> Result<(), LabError> {
         let t = self.target_mut(target)?;
@@ -248,11 +252,15 @@ impl LabFile {
         s.insert("device", value(device));
         s.insert("baud", value(baud));
         set_opt(&mut s, "power_sense_signal", sense);
+        if power_button {
+            s.insert("power_button", value(true));
+        }
         set_opt(&mut s, "host", host);
         aot.push(s);
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update_serial(
         &mut self,
         target: &str,
@@ -260,6 +268,7 @@ impl LabFile {
         device: Option<&str>,
         baud: Option<i64>,
         sense: Option<&str>,
+        power_button: Option<bool>,
         host: Option<&str>,
     ) -> Result<(), LabError> {
         let t = self.target_mut(target)?;
@@ -276,6 +285,17 @@ impl LabFile {
             s.insert("baud", value(b));
         }
         set_opt(s, "power_sense_signal", sense);
+        // Tri-state: `Some(true)` opts in, `Some(false)` revokes (drops the key
+        // back to the default), `None` leaves it unchanged.
+        match power_button {
+            Some(true) => {
+                s.insert("power_button", value(true));
+            }
+            Some(false) => {
+                s.remove("power_button");
+            }
+            None => {}
+        }
         set_opt(s, "host", host);
         Ok(())
     }
@@ -501,10 +521,26 @@ mod tests {
             None,
         )
         .unwrap();
-        lf.add_serial("fortune", "console", "/dev/ttyUSB0", 115200, None, None)
-            .unwrap();
-        lf.add_serial("fortune", "bmc", "/dev/ttyUSB1", 9600, Some("cts"), None)
-            .unwrap();
+        lf.add_serial(
+            "fortune",
+            "console",
+            "/dev/ttyUSB0",
+            115200,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        lf.add_serial(
+            "fortune",
+            "bmc",
+            "/dev/ttyUSB1",
+            9600,
+            Some("cts"),
+            false,
+            None,
+        )
+        .unwrap();
         lf.save().unwrap();
 
         let lab = model::load(&path).unwrap();
@@ -557,10 +593,10 @@ mod tests {
         let (_d, path) = tmp();
         let mut lf = LabFile::create(&path);
         lf.add_target("t", None, None).unwrap();
-        lf.add_serial("t", "console", "/dev/a", 115200, None, None)
+        lf.add_serial("t", "console", "/dev/a", 115200, None, false, None)
             .unwrap();
         let e = lf
-            .add_serial("t", "console", "/dev/b", 115200, None, None)
+            .add_serial("t", "console", "/dev/b", 115200, None, false, None)
             .unwrap_err();
         assert!(e.0.contains("already exists"), "{}", e.0);
     }
@@ -676,7 +712,7 @@ mod tests {
         let (_d, path) = tmp();
         let mut lf = LabFile::create(&path);
         lf.add_target("t", None, None).unwrap();
-        lf.add_serial("t", "console", "/dev/a", 115200, None, None)
+        lf.add_serial("t", "console", "/dev/a", 115200, None, false, None)
             .unwrap();
         lf.remove_serial("t", "console").unwrap();
         lf.save().unwrap();

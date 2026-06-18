@@ -32,7 +32,7 @@ by an LLM judge). Stdlib-only **Python 3.11+** (uses `tomllib`); no
 
 ## Status (2026-06) — what's built and verified
 
-**Built:** 31 scenarios (c1–c8 config, r1–r8 runtime, s1–s10 serial, m1–m5 meta —
+**Built:** 32 scenarios (c1–c8 config, r1–r8 runtime, s1–s11 serial, m1–m5 meta —
 r8 power-state, m3 discover, m4 helper, m5 setup added to cover the last few CLI
 groups); the scripted T1 grader + LLM-judge; a `run.py --check` **drift guard**
 (every scenario reference + the T1-safe allowlist is validated against the live
@@ -72,8 +72,8 @@ enforced (graded on `lab.toml` outcome). See `docs/agent-evals.md` §3.1, §6.2,
 evals/
   run.py                 orchestrator (sandbox + condition + run + grade)
   serial_loopback.py     Linux: execute the 'operating serial' scenarios for real
-  scenarios/*.toml       27 scenarios — c1–c8 config, r1–r7 runtime,
-                         s1–s10 serial, m1–m2 meta
+  scenarios/*.toml       32 scenarios — c1–c8 config, r1–r8 runtime,
+                         s1–s11 serial, m1–m5 meta
   fixtures/*.toml        seed lab files for scenarios that start from a state
   graders/
     t1_config.py         scripted grader: lab.toml assertions + T1-safe allowlist
@@ -161,11 +161,12 @@ mint a fresh token into the sandbox home before the run. See
 ## Serial — the operating workhorse
 
 Driving the serial console is most of how agents use paniolo, so it has a
-dedicated cluster (`s1`–`s10`): `s1` is config (T1, scripted); `s2`–`s10` are
+dedicated cluster (`s1`–`s11`): `s1` is config (T1, scripted); `s2`–`s11` are
 *operating* scenarios — start capture, tail, poll new output with `--since`,
 send a command and read its response, pace a slow polled console, pick one of
 two interfaces with `-i`, re-read an exact `--from/--to --json` range, port
-exclusivity, DTR reset/hard-off, and read-back-after-stop.
+exclusivity, DTR reset/hard-off, read-back-after-stop, and rebooting over the
+console (`serial send "reboot"`) as distinct from a DTR reset.
 
 The operating scenarios are judge-graded as stated commands by default (they
 need a real port). The ones with a `[loopback]` table (marked `exec` in

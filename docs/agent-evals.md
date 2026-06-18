@@ -171,7 +171,7 @@ heavily; D7 lightly). Tune the threshold during calibration (§7).
 Goals are phrased the way a *user* would phrase them — never in paniolo's own
 vocabulary. Each scenario lists the capability exercised, the reference answer,
 the trap it probes, and the grader. **Core set** (highest trap signal, run these
-first): C1, C3, C7, R1, R2, R3, R4, M2.
+first): C1, C3, C7, R1, R2, R3, R4, S11, M2.
 
 ### Config-only (T1 — scripted grader on `lab.toml`)
 
@@ -318,16 +318,16 @@ serial sense line).
 *Trap:* this is a *read* — not `power on`/`power-cycle`; it can only answer when a
 `state_cmd` or a `power_sense_signal` is configured.
 
-### Serial — the operating workhorse (s1–s10): T0 + one T1; executable on Linux
+### Serial — the operating workhorse (s1–s11): T0 + one T1; executable on Linux
 
 Driving the serial console is most of how an agent uses paniolo, so it gets a
-dedicated, detailed cluster. `s1` is config (T1, scripted); `s2`–`s10` are
+dedicated, detailed cluster. `s1` is config (T1, scripted); `s2`–`s11` are
 *operating* scenarios, stated-command/judge by default, with the `[loopback]`
 ones runnable for real on Linux (see below).
 
 | ID | Goal | What it tests | Key traps |
 |---|---|---|---|
-| **s1** | Configure `dut` with a main `console` (CTS sense) + a `bmc` @9600, console as the DTR default | dual named interfaces + power `serial_interface` | `--sense` → `power_sense_signal`; DTR default is `power set --serial-interface` |
+| **s1** | Configure `dut` with a main `console` (CTS sense) + a `bmc` @9600, with DTR enabled on `console` | dual named interfaces + DTR opt-in | `--sense` → `power_sense_signal`; DTR is opt-in via `serial … --power-button`, not `--sense` |
 | **s2** | "Start capturing the console, show the last 30 boot lines." | the capture+read basics | `watch` before `log`; sole interface → no `-i`; `log` reads disk |
 | **s3** | "Poll for *new* lines after the ones you've seen — don't re-dump." | the canonical agent poll loop | note the stable `seq`, then `log --since <seq>`; `*` marks the unterminated current line |
 | **s4** | "Run `cat /proc/version` on the console and show its output." | send + capture response | `send` needs the running `watch` daemon; positional target; CR appended by default; input lands only if the console reads the UART |
@@ -335,8 +335,9 @@ ones runnable for real on Linux (see below).
 | **s6** | "Read the last 20 lines of the BMC console specifically." | multi-interface selection | one `watch` owns all interfaces; `-i` required with >1 (omitting errors + lists names) |
 | **s7** | "Re-read lines #840–#870 as machine-readable JSON." | range + parse | `--from/--to` seq range; `--json`; seq stable across eviction; `--raw` for ANSI |
 | **s8** | "`serial connect` says the port's in use — how do I read/drive it as an agent?" | exclusivity model | one of connect/watch/external tio at a time; agent path = `log`+`send`, not interactive `connect`; `stop` first only if you truly need tio |
-| **s9** | "Console's wedged — soft-reset over the J2 wire, then hard-off." | DTR power button | ≤500 ms soft / ≥3000 ms hard; `serial reset` vs `serial dtr --ms 3000`; uses the power `serial_interface` default |
+| **s9** | "Console's wedged — soft-reset over the J2 wire, then hard-off." | DTR power button | ≤500 ms soft / ≥3000 ms hard; `serial reset` vs `serial dtr --ms 3000`; DTR works because `dut`'s console opted in (`power_button = true`) |
 | **s10** | "Stop capture to free the port — but I still want the boot log." | capture persistence | the timestamped log is on disk; `serial log` works after `stop`/restart; only the live dashboard needs the daemon |
+| **s11** | "I'm logged in at the console — reboot it over the serial console." | console reboot vs DTR reset | central: `serial send "reboot"` (software), NOT `serial reset`/`serial dtr` (hardware DTR); the target hasn't opted into DTR, so `serial reset` errors |
 
 **Executable on Linux.** `s2`–`s4`, `s6`, `s7`, `s10` carry a `[loopback]`
 fixture (fake-DUT banner + command responses + `expect` substrings).

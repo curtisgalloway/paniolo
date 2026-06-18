@@ -69,6 +69,7 @@ pub fn build_slice(lab: &Lab, target: &str, host: &str) -> Result<String, LabErr
                 &s.device,
                 s.baud,
                 s.power_sense_signal.as_deref(),
+                s.power_button,
                 None,
             )?;
         }

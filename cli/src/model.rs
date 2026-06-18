@@ -138,6 +138,13 @@ pub struct SerialChannel {
     #[serde(default = "default_baud")]
     pub baud: i64,
     pub power_sense_signal: Option<String>,
+    /// Opt-in: the FTDI DTR line on this interface is wired to the board's J2
+    /// power-button header, so `serial dtr` / `serial reset` may drive it.
+    /// Off by default — DTR-to-J2 wiring is the rare exception, and toggling an
+    /// unwired line silently no-ops. The DTR commands refuse interfaces that
+    /// haven't set this. See docs/power.md.
+    #[serde(default)]
+    pub power_button: bool,
     pub host: Option<String>,
 }
 
@@ -306,6 +313,9 @@ impl Lab {
         for s in &t.serial {
             let mut f = vec![("device", s.device.clone()), ("baud", s.baud.to_string())];
             push_opt(&mut f, "power_sense_signal", &s.power_sense_signal);
+            if s.power_button {
+                f.push(("power_button", "true".to_string()));
+            }
             channels.push(ResolvedChannel {
                 kind: ChannelKind::Serial,
                 name: s.name.clone(),

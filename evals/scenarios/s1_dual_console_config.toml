@@ -1,6 +1,6 @@
 # Copyright 2026 Curtis Galloway — Licensed under the Apache License, Version 2.0.
 id = "s1"
-title = "Configure dual consoles + DTR default"
+title = "Configure dual consoles + DTR opt-in"
 tier = "t1"
 core = false
 conditions = ["cold", "warm", "preloaded"]
@@ -8,19 +8,19 @@ capabilities = ["serial", "power"]
 goal = """
 Set up target `dut` with two serial consoles: a main `console` on
 `/dev/cu.usbserial-AA` at 115200 baud whose CTS line reports power state, and a
-`bmc` console on `/dev/cu.usbserial-BB` at 9600 baud. Make the main `console`
-the default interface that DTR/power-button commands act on.
+`bmc` console on `/dev/cu.usbserial-BB` at 9600 baud. The main `console` has its
+DTR line wired to the board's power button — enable DTR/power-button control on
+it.
 """
 traps = [
   "named interfaces: `console` and `bmc` are distinct, each with its own baud",
   "`--sense cts` records the power-sense signal on the interface",
-  "the DTR/power default is the power channel's `serial-interface`, set via `power set`",
+  "DTR control is opt-in per interface via `--power-button` (on `serial add`/`set`); it is NOT implied by `--sense`, and `serial dtr`/`reset` error on an interface that lacks it",
 ]
 reference = [
   'paniolo target add dut',
-  'paniolo serial add console -t dut --device /dev/cu.usbserial-AA --sense cts',
+  'paniolo serial add console -t dut --device /dev/cu.usbserial-AA --sense cts --power-button',
   'paniolo serial add bmc -t dut --device /dev/cu.usbserial-BB --baud 9600',
-  'paniolo power set -t dut --serial-interface console',
 ]
 seed = ""
 
@@ -34,8 +34,8 @@ equals = 115200
 path = "targets.dut.serial[name=console].power_sense_signal"
 equals = "cts"
 [[grader.assert]]
+path = "targets.dut.serial[name=console].power_button"
+equals = true
+[[grader.assert]]
 path = "targets.dut.serial[name=bmc].baud"
 equals = 9600
-[[grader.assert]]
-path = "targets.dut.power.serial_interface"
-equals = "console"
