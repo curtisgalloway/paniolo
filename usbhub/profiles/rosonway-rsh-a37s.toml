@@ -1,0 +1,121 @@
+# Rosonway RSH-A37S — 7-port USB 3 hub. Human-verified per-port VBUS switching.
+#
+# All 7 physical ports were verified controllable at the bench: a USB flash
+# drive was plugged into each port in turn and confirmed to physically lose
+# power when PORT_POWER was cleared (verified 2026-06-19).
+#
+# Internal topology: two cascaded Realtek hub chips. The root chip
+# (0bda:0411 USB3 / 0bda:5411 USB2) carries physical ports 1-3; a second
+# identical chip downstream of root port 4 carries physical ports 4-7.
+#
+# NOTE ON REUSE: usbhub resolves this profile by matching the chip cascade
+# (vendor:product ids + internal port topology) against the live hub, so it
+# applies to the same hub model. If a different hardware revision exposes
+# different chips or numbering, re-run `usbhub learn` and re-verify. The
+# `controllable` flags below are human assertions — trust them only as far as
+# you trust the verification above; re-verify if in doubt.
+#
+# Copyright 2026 Curtis Galloway
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0
+
+[model]
+name = "rosonway-rsh-a37s"
+
+[[chip]]
+label = "root"
+usb3_path = ""
+usb3_id = "0bda:0411"
+usb2_path = ""
+usb2_id = "0bda:5411"
+
+[[chip]]
+label = "chip4"
+usb3_path = "4"
+usb3_id = "0bda:0411"
+usb2_path = "4"
+usb2_id = "0bda:5411"
+
+[[port]]
+physical = 1
+controllable = true
+
+[port.usb3]
+path = ""
+port = 1
+
+[port.usb2]
+path = ""
+port = 1
+
+[[port]]
+physical = 2
+controllable = true
+
+[port.usb3]
+path = ""
+port = 2
+
+[port.usb2]
+path = ""
+port = 2
+
+[[port]]
+physical = 3
+controllable = true
+
+[port.usb3]
+path = ""
+port = 3
+
+[port.usb2]
+path = ""
+port = 3
+
+[[port]]
+physical = 4
+controllable = true
+
+[port.usb3]
+path = "4"
+port = 1
+
+[port.usb2]
+path = "4"
+port = 1
+
+[[port]]
+physical = 5
+controllable = true
+
+[port.usb3]
+path = "4"
+port = 2
+
+[port.usb2]
+path = "4"
+port = 2
+
+[[port]]
+physical = 6
+controllable = true
+
+[port.usb3]
+path = "4"
+port = 3
+
+[port.usb2]
+path = "4"
+port = 3
+
+[[port]]
+physical = 7
+controllable = true
+
+[port.usb3]
+path = "4"
+port = 4
+
+[port.usb2]
+path = "4"
+port = 4
