@@ -56,8 +56,20 @@ follow-up. Run through this checklist before calling `gh pr create`:
    skill) and a copy line is unnecessary for `setup.rs`/the tarball (both
    enumerate `skills/` automatically).
 
-4. **Open the PR; do not merge it.** Push the branch and create the PR with
-   `gh pr create`, then stop. The merge decision belongs to the user.
+4. **Validate before pushing.** Build and run the tests for the crates you
+   touched. To catch the Linux-only CI failures without a round-trip, run
+   `scripts/ci-local.sh` — it mirrors the GitHub Linux CI jobs (`cli`,
+   `serialcap`, `netbootd`, `hdmicap`, `pytest`) in a Linux environment, e.g. a
+   Lima VM: `limactl shell <instance> -- bash -l scripts/ci-local.sh`. (The
+   macOS-only job — hdmicap AVFoundation + visionocr — runs on the host.) Note
+   `cli` is the primary control-plane crate; it now has a CI job, so don't let
+   its tests rot.
+
+5. **Push, open the PR, and merge only when asked.** Get the branch ready by
+   committing locally, but treat `git push`, `gh pr create`, and merging as
+   gated on the maintainer's explicit instruction — don't push or open a PR on
+   your own initiative, and never merge. When told to, open with `gh pr create`;
+   the merge decision always belongs to the maintainer.
 
 ## Purpose
 
@@ -1144,3 +1156,19 @@ Paniolo runs on Linux as well as macOS. Platform differences:
   font to work around this — the font is relied upon by other agents (see OCR section).
   On macOS, `VNRecognizeTextRequest` `.accurate` returns nothing on thin console
   fonts; visionocr uses `.fast`.
+- **macOS Local Network privacy gate.** On macOS (Sequoia+), a freshly built,
+  non-Apple-signed helper that reaches a LAN host (e.g. `shellyplug`) fails with
+  `No route to host` (EHOSTUNREACH) until the launching app is granted Local
+  Network access (System Settings → Privacy & Security → Local Network). iTerm's
+  detached server can need an iTerm restart for the grant to take; loopback
+  daemons and Apple-signed `curl` are exempt. The tell: it reaches the internet
+  but not a same-subnet host. See docs/power.md (shellyplug gotchas).
+- **Homebrew tap upgrades.** The tap formula re-pins on each release. A
+  same-version change to install logic won't `brew upgrade` — use `brew
+  reinstall`, or bump the formula `revision`. (After a local `make rust`, the
+  `~/.cargo/bin` paniolo can also be shadowed on PATH by the Homebrew keg.)
+- **Reproducing CI locally.** GitHub's Linux jobs are easiest to mirror with
+  `scripts/ci-local.sh` in a Lima VM; it copies the working tree to the VM's own
+  disk first, because building on the shared virtiofs/9p mount fails (setuptools'
+  editable `egg-info` can't update timestamps there, and cargo would clobber the
+  host `target/`).
