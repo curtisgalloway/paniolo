@@ -79,5 +79,13 @@ contents:
     dst: /usr/share/paniolo/skills/usbhub/SKILL.md
     file_info:
       mode: 0o644
+  # Bundled usbhub hub profiles — human-verified per-port power maps the usbhub
+  # helper searches under /usr/share/paniolo/usbhub/profiles (after the user's
+  # own config dir). Model filenames are unique, so a glob maps cleanly by
+  # basename — no per-file entry needed (unlike SKILL.md above).
+  - src: usbhub/profiles/*.toml
+    dst: /usr/share/paniolo/usbhub/profiles/
+    file_info:
+      mode: 0o644
   - src: LICENSE
     dst: /usr/share/doc/paniolo/LICENSE

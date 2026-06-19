@@ -34,6 +34,7 @@ mod setup;
 mod skills;
 mod ssh;
 mod state;
+mod usbhub_profiles;
 mod video;
 
 use std::path::PathBuf;

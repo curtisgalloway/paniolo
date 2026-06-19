@@ -35,26 +35,31 @@ an assertion of observed reality, never inferred from descriptors. See the
 
 ## Using a profile
 
-usbhub loads profiles from a single directory. Pick whichever fits:
+**Usually nothing — they're already installed.** usbhub searches your own
+profiles dir first, then read-only *shipped library* dirs. These profiles ship
+into that library path:
 
-**Option A — copy it into your usbhub profiles dir** (it's then found with no
-extra flags):
+- `paniolo setup` (or `make install`) copies them into `~/.local/share/paniolo/usbhub/profiles`;
+- Linux packages drop them under `/usr/share/paniolo/usbhub/profiles`;
+- run straight from a checkout, paniolo points usbhub at this very directory.
+
+So for a known hub you can just go:
 
 ```bash
-# standalone usbhub
-cp rosonway-rsh-a37s.toml ~/.config/usbhub/profiles/
-
-# running under paniolo (helper state dir)
-cp rosonway-rsh-a37s.toml ~/.config/paniolo/helpers/usbhub/profiles/
+paniolo helper usbhub --model rosonway-rsh-a37s status
 ```
 
-**Option B — point `--profile-dir` straight at this directory:**
+If you're running usbhub **standalone** without paniolo (no library path set),
+either copy the profile into your own dir or point `--profile-dir` at this one:
 
 ```bash
+cp rosonway-rsh-a37s.toml ~/.config/usbhub/profiles/          # found with no flags
 usbhub --profile-dir /path/to/paniolo/usbhub/profiles --model rosonway-rsh-a37s status
 ```
 
-Then drive power as usual (`status` / `state <port>` / `on` / `off` / `cycle`).
+A same-named profile in your own dir always shadows the shipped copy, so you can
+fork and tweak one. Then drive power as usual (`status` / `state <port>` / `on`
+/ `off` / `cycle`).
 The profile resolves by matching its chip cascade against the live hub, so it
 keeps working after the hub is replugged into a different host port, and pins
 with `--at` only if several identical hubs share one host.

@@ -252,6 +252,22 @@ pub fn helper_env(name: &str, instance: Option<&str>) -> Vec<(&'static str, Path
     if let Ok(runtime) = ensure_runtime_dir(name, instance) {
         env.push(("PANIOLO_RUNTIME_DIR", runtime));
     }
+    // The usbhub helper can't climb to the repo or know the package layout on
+    // its own, so paniolo hands it the resolved shipped-profile search path
+    // (the `share/` analogue of how `paniolo skill` finds bundled skills). Only
+    // existing dirs are passed; usbhub searches them after the user's own
+    // profiles dir, so a locally verified profile still wins.
+    if name == "usbhub" {
+        let dirs: Vec<PathBuf> = crate::usbhub_profiles::library_dirs()
+            .into_iter()
+            .filter(|d| d.is_dir())
+            .collect();
+        if let Ok(joined) = std::env::join_paths(&dirs) {
+            if !joined.is_empty() {
+                env.push(("USBHUB_LIBRARY_PATH", PathBuf::from(joined)));
+            }
+        }
+    }
     env
 }
 

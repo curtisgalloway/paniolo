@@ -230,6 +230,69 @@ pub fn load_profile(dir: &Path, model: &str) -> Result<Profile> {
     Ok(profile)
 }
 
+/// Read-only "shipped" profile directories — the low-priority tail of the
+/// search path. When paniolo invokes usbhub it passes the full list (the repo
+/// checkout, the per-user data dir, a prefix/Homebrew keg, the system package)
+/// as `USBHUB_LIBRARY_PATH`, mirroring how `paniolo skill` resolves bundled
+/// skills. Run standalone (no paniolo), fall back to where a relocated or
+/// packaged usbhub ships them: `<prefix>/share/paniolo/usbhub/profiles` next to
+/// the binary, then the system `/usr/share/paniolo/usbhub/profiles`.
+pub fn library_dirs() -> Vec<PathBuf> {
+    if let Some(path) = std::env::var_os("USBHUB_LIBRARY_PATH") {
+        if !path.is_empty() {
+            return std::env::split_paths(&path).collect();
+        }
+    }
+    let mut dirs = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+        if let Some(prefix) = exe.parent().and_then(|d| d.parent()) {
+            dirs.push(prefix.join("share/paniolo/usbhub/profiles"));
+        }
+    }
+    dirs.push(PathBuf::from("/usr/share/paniolo/usbhub/profiles"));
+    dirs
+}
+
+/// The profile search path, highest priority first. With `--profile-dir` that
+/// directory is the *only* one consulted (an explicit override). Otherwise the
+/// user's own profiles dir — where `learn` writes and the user hand-edits —
+/// shadows the read-only shipped [`library_dirs`], so a profile you verify
+/// locally always wins over a same-named shipped one.
+pub fn search_dirs(override_dir: Option<&Path>) -> Vec<PathBuf> {
+    match override_dir {
+        Some(d) => vec![d.to_path_buf()],
+        None => {
+            let mut dirs = vec![profiles_dir(None)];
+            dirs.extend(library_dirs());
+            dirs
+        }
+    }
+}
+
+/// The first directory in `dirs` that holds `<model>.toml`, or `None`.
+pub fn find_profile_dir<'a>(dirs: &'a [PathBuf], model: &str) -> Option<&'a Path> {
+    let file = format!("{model}.toml");
+    dirs.iter()
+        .find(|d| d.join(&file).is_file())
+        .map(|d| d.as_path())
+}
+
+/// Load `<model>.toml` from the first directory in the search path that has it.
+pub fn load_profile_from(dirs: &[PathBuf], model: &str) -> Result<Profile> {
+    match find_profile_dir(dirs, model) {
+        Some(dir) => load_profile(dir, model),
+        None => {
+            let searched = dirs
+                .iter()
+                .map(|d| d.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("no profile for model {model:?} (searched {searched})")
+        }
+    }
+}
+
 pub fn save_profile(dir: &Path, profile: &Profile) -> Result<PathBuf> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating profile dir {}", dir.display()))?;
@@ -243,14 +306,22 @@ pub fn to_toml(profile: &Profile) -> Result<String> {
     Ok(toml::to_string_pretty(profile)?)
 }
 
-pub fn list_models(dir: &Path) -> Vec<String> {
+/// Every model name found across the search path, deduped (the first/highest-
+/// priority directory wins on a name collision) and sorted.
+pub fn list_models(dirs: &[PathBuf]) -> Vec<String> {
     let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
+    let mut seen = std::collections::BTreeSet::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
         for e in entries.flatten() {
             let p = e.path();
             if p.extension().is_some_and(|x| x == "toml") {
                 if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                    out.push(stem.to_string());
+                    if seen.insert(stem.to_string()) {
+                        out.push(stem.to_string());
+                    }
                 }
             }
         }
@@ -623,5 +694,68 @@ mod tests {
         assert_eq!(at[&Side::Usb2], ("1".to_string(), vec![3, 4]));
         assert!(parse_at("nonsense").is_err());
         assert!(parse_at("usb4=2:1").is_err());
+    }
+
+    #[test]
+    fn search_path_user_shadows_library() {
+        // A "user" dir searched ahead of a shipped "library" dir: a same-named
+        // profile in the user dir shadows the library one, and list_models
+        // unions both without duplicates.
+        let base = std::env::temp_dir().join(format!("usbhub-search-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let user = base.join("user");
+        let lib = base.join("lib");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::create_dir_all(&lib).unwrap();
+
+        let mut shipped = rsh_profile();
+        shipped.model.name = "shared".to_string();
+        shipped.model.description = Some("from-library".to_string());
+        save_profile(&lib, &shipped).unwrap();
+        let mut libonly = rsh_profile();
+        libonly.model.name = "libonly".to_string();
+        save_profile(&lib, &libonly).unwrap();
+
+        let mut user_shared = rsh_profile();
+        user_shared.model.name = "shared".to_string();
+        user_shared.model.description = Some("from-user".to_string());
+        save_profile(&user, &user_shared).unwrap();
+        let mut useronly = rsh_profile();
+        useronly.model.name = "useronly".to_string();
+        save_profile(&user, &useronly).unwrap();
+
+        let dirs = vec![user.clone(), lib.clone()];
+
+        // The user copy of "shared" wins for both lookup and load.
+        assert_eq!(find_profile_dir(&dirs, "shared"), Some(user.as_path()));
+        let loaded = load_profile_from(&dirs, "shared").unwrap();
+        assert_eq!(loaded.model.description.as_deref(), Some("from-user"));
+        // A library-only model still resolves, to the library dir.
+        assert_eq!(find_profile_dir(&dirs, "libonly"), Some(lib.as_path()));
+        // list_models unions both, deduped and sorted.
+        assert_eq!(
+            list_models(&dirs),
+            vec![
+                "libonly".to_string(),
+                "shared".to_string(),
+                "useronly".to_string()
+            ]
+        );
+        // A missing model reports the dirs it searched.
+        let err = load_profile_from(&dirs, "nope").unwrap_err().to_string();
+        assert!(err.contains("searched"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn search_dirs_override_is_exclusive() {
+        let only = PathBuf::from("/some/explicit/dir");
+        assert_eq!(search_dirs(Some(&only)), vec![only]);
+        // Without an override, the user's own profiles dir is searched first,
+        // followed by the shipped library dirs.
+        let dirs = search_dirs(None);
+        assert_eq!(dirs.first(), Some(&profiles_dir(None)));
+        assert!(dirs.len() >= 2, "library dirs should follow the user dir");
     }
 }

@@ -75,10 +75,13 @@ TYPICAL WORKFLOW
   3. usbhub --model M status               inspect the profile + live power bits
   4. usbhub --model M state|on|off|cycle <port>
 
-Profiles are TOML files named <model>.toml in the state dir, resolved as
-$USBHUB_STATE_DIR, else $XDG_CONFIG_HOME/usbhub, else ~/.config/usbhub (when
-run under paniolo, $PANIOLO_STATE_DIR). --profile-dir overrides it. List known
-models with `usbhub models`."
+Profiles are TOML files named <model>.toml. usbhub reads them from your own
+profiles dir first ($USBHUB_STATE_DIR, else $XDG_CONFIG_HOME/usbhub, else
+~/.config/usbhub; $PANIOLO_STATE_DIR under paniolo), then from any read-only
+shipped library dirs ($USBHUB_LIBRARY_PATH, e.g. /usr/share/paniolo/usbhub/
+profiles) — so a profile you verify locally shadows a same-named shipped one.
+--profile-dir replaces the whole search with one dir. List known models with
+`usbhub models`."
 )]
 struct Cli {
     /// Hub model name (a profile in the profiles dir). Required for
@@ -92,7 +95,8 @@ struct Cli {
     #[arg(long, value_name = "ANCHORS", global = true)]
     at: Option<String>,
 
-    /// Override the profiles dir (default: $USBHUB_STATE_DIR / $XDG_CONFIG_HOME
+    /// Search only this dir for profiles, replacing the default user-dir +
+    /// shipped-library search (user dir: $USBHUB_STATE_DIR / $XDG_CONFIG_HOME
     /// /usbhub / ~/.config/usbhub, or $PANIOLO_STATE_DIR under paniolo).
     #[arg(long, value_name = "DIR", global = true)]
     profile_dir: Option<PathBuf>,
@@ -216,13 +220,22 @@ pub(crate) enum ResultArg {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let profile_dir = profile::profiles_dir(cli.profile_dir.as_deref());
+    // Reads consult the whole search path (the user's own profiles dir, then
+    // the read-only shipped library dirs); writes (`learn save`) go to the user
+    // dir alone. With `--profile-dir`, both collapse to that one directory.
+    let search = profile::search_dirs(cli.profile_dir.as_deref());
+    let save_dir = profile::profiles_dir(cli.profile_dir.as_deref());
     match cli.cmd {
         Cmd::Probe => cmd_probe(),
         Cmd::Models => {
-            let models = profile::list_models(&profile_dir);
+            let models = profile::list_models(&search);
             if models.is_empty() {
-                println!("no profiles in {}", profile_dir.display());
+                let searched = search
+                    .iter()
+                    .map(|d| d.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("no profiles found (searched {searched})");
             } else {
                 for m in models {
                     println!("{m}");
@@ -230,20 +243,20 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Status => cmd_status(&load_ctx(&cli, &profile_dir)?),
-        Cmd::State { physical } => cmd_state(&mut load_ctx(&cli, &profile_dir)?, physical),
+        Cmd::Status => cmd_status(&load_ctx(&cli, &search)?),
+        Cmd::State { physical } => cmd_state(&mut load_ctx(&cli, &search)?, physical),
         Cmd::On { physical, side } => {
-            cmd_switch(&mut load_ctx(&cli, &profile_dir)?, physical, side, true)
+            cmd_switch(&mut load_ctx(&cli, &search)?, physical, side, true)
         }
         Cmd::Off { physical, side } => {
-            cmd_switch(&mut load_ctx(&cli, &profile_dir)?, physical, side, false)
+            cmd_switch(&mut load_ctx(&cli, &search)?, physical, side, false)
         }
         Cmd::Cycle {
             physical,
             delay_ms,
             side,
-        } => cmd_cycle(&mut load_ctx(&cli, &profile_dir)?, physical, delay_ms, side),
-        Cmd::Learn { cmd } => cmd_learn(cmd, &profile_dir),
+        } => cmd_cycle(&mut load_ctx(&cli, &search)?, physical, delay_ms, side),
+        Cmd::Learn { cmd } => cmd_learn(cmd, &search, &save_dir),
     }
 }
 
@@ -257,12 +270,12 @@ struct Ctx {
     table: DeviceTable,
 }
 
-fn load_ctx(cli: &Cli, profile_dir: &std::path::Path) -> Result<Ctx> {
+fn load_ctx(cli: &Cli, search: &[PathBuf]) -> Result<Ctx> {
     let model = cli
         .model
         .as_deref()
         .ok_or_else(|| anyhow!("required argument '--model <MODEL>' (-m) was not provided"))?;
-    let profile = profile::load_profile(profile_dir, model)?;
+    let profile = profile::load_profile_from(search, model)?;
     let at: AtSpec = match &cli.at {
         Some(s) => parse_at(s)?,
         None => AtSpec::new(),
@@ -515,7 +528,7 @@ fn cmd_cycle(ctx: &mut Ctx, physical: u16, delay_ms: u64, side: SideArg) -> Resu
 // Learn dispatch (the IO edges around learn.rs's state machine)
 // ---------------------------------------------------------------------------
 
-fn cmd_learn(cmd: LearnCmd, profile_dir: &std::path::Path) -> Result<()> {
+fn cmd_learn(cmd: LearnCmd, search: &[PathBuf], save_dir: &std::path::Path) -> Result<()> {
     let sd = profile::state_dir();
     match cmd {
         LearnCmd::Edit { model, force } => {
@@ -528,11 +541,12 @@ fn cmd_learn(cmd: LearnCmd, profile_dir: &std::path::Path) -> Result<()> {
                     );
                 }
             }
-            // If the model already has a profile, load it for editing.
+            // If the model already has a profile anywhere on the search path
+            // (a local one, or a shipped library profile), load it for editing.
+            // `save` then writes the (possibly amended) profile to the user dir.
             if let Some(model) = &model {
-                let profile_path = profile_dir.join(format!("{model}.toml"));
-                if profile_path.exists() {
-                    let session = tty::reconstruct_session(profile_dir, model)?;
+                if let Some(found) = profile::find_profile_dir(search, model) {
+                    let session = tty::reconstruct_session(found, model)?;
                     learn::save_session(&sd, &session)?;
                     println!(
                         "Editing profile {model:?} ({} port(s) recorded). Re-verify a port with \
@@ -623,12 +637,12 @@ fn cmd_learn(cmd: LearnCmd, profile_dir: &std::path::Path) -> Result<()> {
         }
         LearnCmd::Save { model, description } => {
             let mut session = learn::load_session(&sd)?;
-            let msg = finish_session(&mut session, &model, description, profile_dir)?;
+            let msg = finish_session(&mut session, &model, description, save_dir)?;
             learn::save_session(&sd, &session)?;
             println!("{msg}");
             Ok(())
         }
-        LearnCmd::Run => tty::run(profile_dir),
+        LearnCmd::Run => tty::run(save_dir),
     }
 }
 
