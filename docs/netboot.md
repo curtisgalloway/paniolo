@@ -16,7 +16,7 @@ For UEFI clients, HTTP Boot is the nicer transport (kernel TCP — fast,
 loss-tolerant, robust under host load, and none of the macOS raw-frame machinery
 the silent Pi bootloader needs) **where the firmware allows plain HTTP**. Many
 EDK2 builds enforce HTTPS-only and reject our `http://` URL; on those, use **PXE**
-(verified end-to-end on the Nova). See [UEFI clients](#uefi-clients-pxe--http-boot)
+(verified end-to-end on the Nova). See [UEFI clients](#uefi-clients-pxe-http-boot)
 below.
 
 ---
@@ -262,7 +262,7 @@ TFTP, 20 MB ZBI at ~3.9 MB/s) on an idle host; the deliberate under-load
 re-test is still to be done.
 
 For **UEFI** clients this is largely moot: prefer [HTTP
-Boot](#uefi-clients-pxe--http-boot), which runs over kernel TCP with real flow
+Boot](#uefi-clients-pxe-http-boot), which runs over kernel TCP with real flow
 control and loss recovery, so it stays robust under host load without the
 lock-step per-block ACKs that make TFTP fragile. The starvation concern applies
 to TFTP clients (the Pi, and UEFI PXE) only.
