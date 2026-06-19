@@ -170,20 +170,30 @@ usbhub learn abort                    discard (restores power if mid-verify)
 
 ## Where things are stored
 
-Profiles and the in-progress learn session live in:
+Your own profiles and the in-progress learn session live in your **user dir**:
 
 - `$USBHUB_STATE_DIR` if set, else
 - `$XDG_CONFIG_HOME/usbhub`, else `~/.config/usbhub`
+- (`$PANIOLO_STATE_DIR` when run under paniolo)
 
-Profiles are plain TOML under `profiles/<model>.toml` — version them, share
-them, or hand-edit them (a `controllable = true` you add by hand is just as
-valid as one `learn` recorded, as long as *you* verified it). `--profile-dir`
-overrides the location per command.
+Profiles are plain TOML named `<model>.toml`. `learn save` writes here, and you
+can hand-edit them (a `controllable = true` you add by hand is just as valid as
+one `learn` recorded, as long as *you* verified it).
 
-Verified profiles others have contributed live in [`profiles/`](profiles/) in
-this repo — copy one into your profiles dir (or point `--profile-dir` at it) to
-reuse a hub someone has already mapped, instead of re-running `learn`. See
-[`profiles/README.md`](profiles/README.md).
+**Resolution order.** When you don't pass `--profile-dir`, usbhub reads from
+your user dir **first**, then from any read-only *shipped library* dirs — so a
+profile you verify locally always shadows a same-named shipped one. The shipped
+dirs come from `$USBHUB_LIBRARY_PATH` (paniolo sets this to the bundled
+profiles' search path); standalone, usbhub falls back to
+`<prefix>/share/paniolo/usbhub/profiles` next to the binary and the system
+`/usr/share/paniolo/usbhub/profiles`. `--profile-dir <dir>` replaces the whole
+search with that one directory.
+
+Verified profiles others have contributed are **shipped** in
+[`profiles/`](profiles/) in this repo: `paniolo setup` installs them into your
+data dir and Linux packages drop them under `/usr/share/paniolo/usbhub/profiles`,
+so a known hub Just Works (`usbhub --model <name> status`) without re-running
+`learn`. See [`profiles/README.md`](profiles/README.md) to use or contribute one.
 
 ## Limitation: the two buses are controlled in tandem
 

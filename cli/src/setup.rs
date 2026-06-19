@@ -390,6 +390,23 @@ pub fn run(repo: &Path, rust_only: bool) -> Result<()> {
         Err(e) => eprintln!("  ! skills: {e}"),
     }
 
+    // usbhub hub profiles: same idea as skills — copy the bundled, human-
+    // verified per-port power profiles into the per-user data dir so the usbhub
+    // helper finds them when run outside this tree. (Linux packages ship them
+    // to /usr/share/paniolo/usbhub/profiles.)
+    match crate::usbhub_profiles::install_bundled(repo) {
+        Ok(0) => {}
+        Ok(n) => {
+            let dst = crate::usbhub_profiles::user_dir().unwrap_or_default();
+            println!(
+                "  ✓ {:12} {n} installed → {}",
+                "hub profiles",
+                dst.display()
+            );
+        }
+        Err(e) => eprintln!("  ! usbhub profiles: {e}"),
+    }
+
     println!("\nSetup complete.");
     println!(
         "Helpers live in {} — list or run them via `paniolo helper`.",
