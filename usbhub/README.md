@@ -180,6 +180,11 @@ them, or hand-edit them (a `controllable = true` you add by hand is just as
 valid as one `learn` recorded, as long as *you* verified it). `--profile-dir`
 overrides the location per command.
 
+Verified profiles others have contributed live in [`profiles/`](profiles/) in
+this repo — copy one into your profiles dir (or point `--profile-dir` at it) to
+reuse a hub someone has already mapped, instead of re-running `learn`. See
+[`profiles/README.md`](profiles/README.md).
+
 ## Limitation: the two buses are controlled in tandem
 
 A USB 3 port is two logical devices — a USB 3 hub and its USB 2 companion —
