@@ -357,15 +357,42 @@ fn del_host_ll(interface: &str) {
 
 fn del_host_ip(interface: &str, host_ip: &str) {
     if macos() {
-        return; // macOS teardown goes through networksetup -setdhcp.
+        // Release the static IP by returning the service to DHCP — an
+        // `ifconfig` delete won't unset a `networksetup -setmanual` IP, so
+        // `mode off` from `link` mode (no netboot stop to restore it) would
+        // otherwise leave the host IP assigned.
+        if let Some(service) = find_network_service(interface) {
+            let _ = run(&["sudo", "networksetup", "-setdhcp", &service]);
+        }
+        return;
     }
     let cidr = format!("{host_ip}/24");
     let _ = run(&["sudo", "ip", "addr", "del", &cidr, "dev", interface]);
 }
 
+/// Best-effort: disable Wake-on-LAN so the NIC doesn't keep the PHY (and the
+/// peer's carrier) alive after the interface is taken down. Per-NIC via ethtool
+/// on Linux; macOS WoL is a system-wide pref (`pmset womp`), so there we rely on
+/// admin-down alone (USB-Ethernet adapters drop link on `ifconfig down`).
+fn disable_wol(interface: &str) {
+    if macos() {
+        return;
+    }
+    let _ = run(&["sudo", "ethtool", "-s", interface, "wol", "d"]);
+}
+
+/// Administratively bring the interface down — drops carrier on the peer.
+fn admin_down(interface: &str) {
+    if macos() {
+        let _ = run(&["sudo", "ifconfig", interface, "down"]);
+    } else {
+        let _ = run(&["sudo", "ip", "link", "set", interface, "down"]);
+    }
+}
+
 // ── modes ───────────────────────────────────────────────────────────────────
 
-pub const MODES: [&str; 3] = ["netboot", "ffx", "off"];
+pub const MODES: [&str; 4] = ["netboot", "link", "ffx", "off"];
 
 /// netboot mode: tear down ffx, start DHCP+TFTP (idempotent).
 pub fn mode_netboot(
@@ -380,6 +407,20 @@ pub fn mode_netboot(
         return Ok(());
     }
     crate::netboot::start(target, interface, host_ip, tftp_root, opts)
+}
+
+/// link mode: assign just the IPv4 host IP to the interface — no DHCP/TFTP
+/// daemon and no ffx link-local. This is the bare host side of the link, for
+/// testing it up/down (`mode link` brings the host IP up, `mode off` releases
+/// it). Idempotent. Note `mode off` only releases the IP; it does not force the
+/// physical carrier down (the NIC can hold the link up for Wake-on-LAN — see
+/// docs/netif.md).
+pub fn mode_link(target: &str, interface: &str, host_ip: &str) -> Result<()> {
+    if crate::state::is_netboot_running(target) {
+        crate::netboot::stop(target)?;
+    }
+    del_host_ll(interface);
+    configure_interface(interface, host_ip)
 }
 
 /// ffx mode: stop netboot first, then add the host IPv6 link-local.
@@ -400,23 +441,45 @@ pub fn mode_off(target: &str, interface: &str, host_ip: &str) -> Result<()> {
     Ok(())
 }
 
+/// Force the link down *hard*: do everything `mode off` does (stop netboot,
+/// release the host IP + ffx LL), then disable Wake-on-LAN and admin-down the
+/// interface so the peer sees carrier loss. `mode off` alone only releases the
+/// host IP and can leave the carrier up (a WoL-capable NIC keeps the PHY
+/// energized) — use this when you need the target to actually *detect* link
+/// loss. Bring the link back with `mode link`/`mode netboot`; WoL stays disabled
+/// until re-enabled (`ethtool -s <iface> wol g`) or the adapter is replugged.
+pub fn down_hard(target: &str, interface: &str, host_ip: &str) -> Result<()> {
+    mode_off(target, interface, host_ip)?;
+    disable_wol(interface);
+    admin_down(interface);
+    Ok(())
+}
+
 pub struct NetifStatus {
     pub mode: &'static str,
+    pub carrier: bool,
     pub inet: Vec<String>,
     pub inet6: Vec<String>,
     pub peers: Vec<String>,
 }
 
 /// Probe the active mode (never stored): daemons running → netboot; host LL
-/// present → ffx; else off.
-pub fn get_status(target: &str, interface: &str) -> NetifStatus {
+/// present → ffx; the static host IP present (but no daemon/LL) → link; else
+/// off. `carrier` is the physical link state (independent of the mode — it can
+/// read up in `off` if the NIC keeps the PHY alive for Wake-on-LAN).
+pub fn get_status(target: &str, interface: &str, host_ip: &str) -> NetifStatus {
     let netboot_running = crate::state::is_netboot_running(target);
     let (inet, inet6) = iface_addresses(interface);
     let has_ll = has_host_ll(&inet6);
+    let has_host_ip = inet
+        .iter()
+        .any(|a| a.split('/').next().unwrap_or(a) == host_ip);
     let mode = if netboot_running {
         "netboot"
     } else if has_ll {
         "ffx"
+    } else if has_host_ip {
+        "link"
     } else {
         "off"
     };
@@ -427,6 +490,7 @@ pub fn get_status(target: &str, interface: &str) -> NetifStatus {
     };
     NetifStatus {
         mode,
+        carrier: is_interface_active(interface),
         inet,
         inet6,
         peers,

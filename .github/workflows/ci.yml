@@ -28,38 +28,6 @@ permissions:
   contents: read
 
 jobs:
-  python:
-    name: python (pytest)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-        with:
-          enable-cache: true
-          python-version: "3.11"
-      - name: Sync dependencies
-        run: uv sync
-      - name: Set up passwordless SSH to localhost (transport integration tests)
-        # Lets _ssh.py's integration tier (gated on PANIOLO_SSH_IT) exercise the
-        # real ssh path — run/forward/read_remote_file — against localhost using a
-        # dedicated key and no ssh-agent.
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y openssh-server
-          sudo systemctl enable --now ssh || sudo service ssh start
-          mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          ssh-keygen -t ed25519 -f ~/.ssh/ci_ssh -N "" -q
-          cat ~/.ssh/ci_ssh.pub >> ~/.ssh/authorized_keys
-          chmod 600 ~/.ssh/authorized_keys
-          ssh-keyscan -H localhost >> ~/.ssh/known_hosts 2>/dev/null || true
-          ssh -i ~/.ssh/ci_ssh -o IdentitiesOnly=yes -o BatchMode=yes \
-            -o StrictHostKeyChecking=accept-new localhost true
-          echo "PANIOLO_SSH_IT=localhost" >> "$GITHUB_ENV"
-          echo "PANIOLO_SSH_IT_IDENTITY=$HOME/.ssh/ci_ssh" >> "$GITHUB_ENV"
-      - name: Run tests
-        run: uv run pytest -q
-
   serialcap:
     name: serialcap (fmt, clippy, test)
     runs-on: ubuntu-latest

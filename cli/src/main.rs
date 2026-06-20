@@ -92,7 +92,7 @@ enum Command {
         #[command(subcommand)]
         cmd: NetbootCmd,
     },
-    /// Switch the USB-Ethernet link between netboot and ffx modes.
+    /// Manage the USB-Ethernet link: switch mode (netboot | link | ffx | off).
     Netif {
         #[command(subcommand)]
         cmd: NetifCmd,
@@ -493,23 +493,28 @@ enum NetbootCmd {
     TftpRoot { target: Option<String> },
     /// List candidate USB-Ethernet interfaces on this machine.
     Devices,
-    /// Bring the USB-Ethernet link up with the host IP assigned.
-    LinkUp { target: Option<String> },
-    /// Take the link down and release the host IP.
-    LinkDown { target: Option<String> },
-    /// Show the current state of the USB-Ethernet link.
-    LinkStatus { target: Option<String> },
 }
 
 #[derive(Subcommand)]
 enum NetifCmd {
-    /// Switch the link mode: netboot | ffx | off (idempotent).
+    /// Switch the link mode: netboot | link | ffx | off (idempotent).
+    ///
+    /// `link` brings just the host IP up (no DHCP/TFTP daemon, no ffx
+    /// link-local) and `off` releases it — together they test the bare link
+    /// up/down. `off` releases the IP only; it does not force the carrier down.
     Mode {
-        /// netboot | ffx | off.
+        /// netboot | link | ffx | off.
         mode: String,
         target: Option<String>,
     },
-    /// Show which mode the link is in and its addresses.
+    /// Force the link down hard: release addresses, disable Wake-on-LAN, and
+    /// admin-down the interface so the peer sees carrier loss.
+    ///
+    /// `mode off` only releases the host IP and can leave the carrier up (a NIC
+    /// with Wake-on-LAN keeps the PHY energized) — use this when the target must
+    /// actually detect link loss. Bring it back with `mode link`/`mode netboot`.
+    DownHard { target: Option<String> },
+    /// Show which mode the link is in, its carrier state, and its addresses.
     Status { target: Option<String> },
 }
 
@@ -2871,54 +2876,6 @@ fn netboot_cmd(lab_flag: Option<&str>, cmd: NetbootCmd) -> Result<()> {
             }
             Ok(())
         }
-        NetbootCmd::LinkUp { target } => {
-            let NetbootRuntime {
-                interface: iface,
-                host_ip,
-                ..
-            } = netboot_runtime(lab_flag, target.as_deref())?;
-            netif::configure_interface(&iface, &host_ip)?;
-            let active = netif::is_interface_active(&iface);
-            println!(
-                "Link {}  {iface}  {host_ip}",
-                if active { "up" } else { "not yet up" }
-            );
-            Ok(())
-        }
-        NetbootCmd::LinkDown { target } => {
-            let NetbootRuntime {
-                interface: iface, ..
-            } = netboot_runtime(lab_flag, target.as_deref())?;
-            netif::restore_interface(&iface);
-            println!("Link down  {iface}");
-            Ok(())
-        }
-        NetbootCmd::LinkStatus { target } => {
-            let NetbootRuntime {
-                interface: iface, ..
-            } = netboot_runtime(lab_flag, target.as_deref())?;
-            let (inet, inet6) = netif::iface_addresses(&iface);
-            println!("interface\t{iface}");
-            println!(
-                "carrier\t{}",
-                if netif::is_interface_active(&iface) {
-                    "yes"
-                } else {
-                    "no"
-                }
-            );
-            let mut addrs = inet;
-            addrs.extend(inet6);
-            println!(
-                "addresses\t{}",
-                if addrs.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    addrs.join(" ")
-                }
-            );
-            Ok(())
-        }
     }
 }
 
@@ -3029,9 +2986,21 @@ fn netif_cmd(lab_flag: Option<&str>, cmd: NetifCmd) -> Result<()> {
                     })?;
                     netif::mode_netboot(&target, &iface, &host_ip, &root, &boot)?;
                 }
+                "link" => netif::mode_link(&target, &iface, &host_ip)?,
                 "ffx" => netif::mode_ffx(&target, &iface)?,
                 _ => netif::mode_off(&target, &iface, &host_ip)?,
             }
+            print_netif_status(&target, &iface, &host_ip);
+            Ok(())
+        }
+        NetifCmd::DownHard { target } => {
+            let NetbootRuntime {
+                target,
+                interface: iface,
+                host_ip,
+                ..
+            } = netboot_runtime(lab_flag, target.as_deref())?;
+            netif::down_hard(&target, &iface, &host_ip)?;
             print_netif_status(&target, &iface, &host_ip);
             Ok(())
         }
@@ -3049,10 +3018,11 @@ fn netif_cmd(lab_flag: Option<&str>, cmd: NetifCmd) -> Result<()> {
 }
 
 fn print_netif_status(target: &str, iface: &str, host_ip: &str) {
-    let s = netif::get_status(target, iface);
+    let s = netif::get_status(target, iface, host_ip);
     println!("target\t{target}");
     println!("interface\t{iface}");
     println!("mode\t{}", s.mode);
+    println!("carrier\t{}", if s.carrier { "up" } else { "down" });
     println!(
         "inet\t{}",
         if s.inet.is_empty() {
@@ -3071,6 +3041,9 @@ fn print_netif_status(target: &str, iface: &str, host_ip: &str) {
     );
     if s.mode == "netboot" {
         println!("dhcp+tftp\tserving on {host_ip}/24");
+    }
+    if s.mode == "link" {
+        println!("link\thost IP {host_ip} up, no daemon (bare link)");
     }
     if s.mode == "ffx" {
         if s.peers.is_empty() {

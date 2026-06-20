@@ -34,8 +34,9 @@ Helpers prefer the env vars and fall back to the same literal paths when run
 standalone; hdmicap/serialcap/hidrig/zigplug all read them, and zigplug
 auto-migrated its `zigbee.db` from the top of `~/.config/paniolo/` into its
 namespaced dir. Contract documented in docs/adding-power-helpers.md.
-The Python Stages 1–4 on this branch are the original tested reference; the
-Python tree is retired only after the Rust CLI has proven itself in daily use.
+The Python Stages 1–4 were the original tested reference; the Python tree
+(`src/paniolo/` + its pytest suite) has since been **removed** now that the Rust
+`cli/` crate is the only control-plane implementation.
 
 ## Why
 

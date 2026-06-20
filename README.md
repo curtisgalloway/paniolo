@@ -15,7 +15,7 @@ and power-cycle it without human intervention at each iteration.
 |---|---|---|
 | [Netboot](docs/netboot.md) | `paniolo netboot` | DHCP + TFTP + HTTP netboot over a direct USB-Ethernet link (Raspberry Pi, plus UEFI PXE / HTTP Boot for EDK2 boards) |
 | [Remote labs](docs/distributed-control.md) | `paniolo --lab …` | Drive targets on remote control hosts transparently over SSH; one git-tracked lab file |
-| [Link mode](docs/netif.md) | `paniolo netif` | Atomically switch the link between netboot and ffx-over-IPv6 modes |
+| [Link mode](docs/netif.md) | `paniolo netif` | Atomically switch the link between netboot, ffx-over-IPv6, bare-link (`link`), and `off` modes; toggle `link`/`off` to test the link up/down, or `down-hard` to force a real carrier drop (WoL off + admin-down) |
 | [Video](docs/video.md) | `paniolo video` | HDMI capture via warm-stream daemon; on-device OCR |
 | [Serial](docs/serial.md) | `paniolo serial` | Serial console — interactive (tio) or daemon-backed with timestamped rolling log |
 | [Power control](docs/power.md) | `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`, `paniolo serial dtr/reset` | DTR-based hardware power button (J2 header; opt-in per serial interface) and generic shell-command hooks (on/off/cycle/state); helpers: `cambrionix` (Cambrionix hub ports), `usbhub` (off-the-shelf USB hub ports), `zigplug` (Zigbee smart plugs), `shellyplug` (Shelly Gen2+ plugs/relays over local HTTP RPC) |
@@ -82,11 +82,6 @@ single-binary `netbootd` (Rust) engine. (On macOS, `setup` also installs
 send path.) Configuration is one CLI-managed lab file
 (`~/.config/paniolo/lab.toml`); see
 [docs/config-redesign.md](docs/config-redesign.md).
-
-> **Upgrading from the Python CLI?** The old `make install` registered the
-> Python `paniolo` as a uv tool; its `~/.local/bin/paniolo` shim shadows the
-> Rust binary in `~/.cargo/bin`. Remove it once: `uv tool uninstall paniolo`
-> (`make install` warns if a shadow is detected).
 
 To pick up code changes after pulling or editing, just re-run it:
 
