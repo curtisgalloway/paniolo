@@ -102,11 +102,19 @@ default route (a primary NIC). netboot reconfigures the interface to the static
 `host_ip`, which would break your real networking — the netboot link must be a
 dedicated USB-Ethernet adapter.
 
+**Just the link, no daemon.** `start`/`stop` bring the link up *and* run (or
+stop) the DHCP/TFTP server together. To bring the **bare link** up or down on its
+own — assign or release the host IP without serving anything, e.g. to test that
+the link comes up and drops — use [`paniolo netif mode link`](netif.md) and
+`paniolo netif mode off` instead. Note that "down" only releases the host IP; it
+does not force the physical carrier down (a NIC with Wake-on-LAN enabled keeps
+the link energized) — see [Link mode](netif.md#testing-the-link-up-and-down).
+
 ### The netbootd engine
 
-`netbootd` was ported from a pure-Python `_dhcp`/`_tftp` subprocess pair, which
-survives only in the legacy Python CLI (`src/paniolo/`, being retired) — the
-Rust `paniolo` always runs `netbootd`.
+`netbootd` is the single-binary DHCP + TFTP + HTTP server (Rust); it is the only
+netboot engine. (It was originally ported from a pure-Python `_dhcp`/`_tftp`
+subprocess pair, since removed.)
 
 On macOS, netbootd's raw-frame send path (the Sequoia delivery workaround) needs
 a `/dev/bpf` descriptor. Rather than run the daemon as root, `paniolo setup`
@@ -245,13 +253,14 @@ EDK2 is not. The TFTP server is **read-only** (RFC 1350) and negotiates
 
 ## Known issue: TFTP responsiveness under host load
 
-On a heavily loaded control host the **Python** legacy TFTP server has been
-observed to starve — it doesn't service requests quickly enough and the
-client (e.g. the Pi 5 EEPROM) times out the transfer. A stopgap is to raise the
-server's scheduling priority (`renice` to a negative nice value).
+A heavily loaded control host can starve a TFTP server — it doesn't service
+requests quickly enough and the client (e.g. the Pi 5 EEPROM) times out the
+transfer. This was observed on the original Python TFTP server (since removed);
+the stopgap there was to raise the server's scheduling priority (`renice` to a
+negative nice value).
 
-Future work for the **Rust `netbootd`** default engine: make TFTP serving
-robust to host load by design rather than relying on `renice` — e.g. run the
+Future work for `netbootd`: make TFTP serving robust to host load by design
+rather than relying on `renice` — e.g. run the
 send path on a dedicated/elevated-priority thread, set socket priority, and keep
 the per-request hot path allocation-free so latency stays bounded when the
 machine is busy. (Tracked from a real starvation incident; netbootd is already

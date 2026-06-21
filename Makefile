@@ -24,8 +24,8 @@
 
 CRATES = cli hdmicap serialcap netbootd cambrionix hidrig ch9329 usbhub shellyplug
 
-# The installed CLI, by absolute path: immune to a stale `paniolo` shadowing
-# ~/.cargo/bin earlier in PATH (e.g. the retired Python CLI's uv-tools shim).
+# The installed CLI, by absolute path: immune to a different `paniolo` shadowing
+# ~/.cargo/bin earlier in PATH (e.g. a Homebrew keg from the tap).
 PANIOLO ?= $(HOME)/.cargo/bin/paniolo
 
 .PHONY: help install reinstall rust test fmt clean check-shadow check-deps
@@ -83,15 +83,14 @@ check-deps:
 		[ "$$fail" = "0" ] || exit 1; \
 	fi
 
-# Warn when a different `paniolo` shadows the installed one. The pre-Rust
-# `make install` used to register the Python CLI as a uv tool; anyone who ran
-# it has a ~/.local/bin/paniolo shim that silently wins over ~/.cargo/bin.
+# Warn when a different `paniolo` shadows the freshly installed one — e.g. a
+# Homebrew keg from the tap winning over ~/.cargo/bin earlier in PATH.
 check-shadow:
 	@found=$$(command -v paniolo 2>/dev/null); \
 	if [ -n "$$found" ] && [ "$$found" != "$(PANIOLO)" ]; then \
 		echo "WARNING: 'paniolo' in PATH is $$found, not $(PANIOLO)."; \
-		echo "         If it is the retired Python CLI, remove it:"; \
-		echo "             uv tool uninstall paniolo"; \
+		echo "         Ensure ~/.cargo/bin precedes it in PATH, or remove the"; \
+		echo "         shadowing copy (e.g. 'brew uninstall paniolo')."; \
 	fi
 
 # Fast path for iterating on the Rust code without re-running the full setup

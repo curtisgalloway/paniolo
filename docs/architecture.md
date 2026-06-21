@@ -57,10 +57,10 @@ and persist between CLI invocations. State lives in plain files, not memory.
 
 | Component | Language | Role |
 |---|---|---|
-| `paniolo` CLI | Rust (clap) | The single entry point; spawns/queries daemons, edits the lab file, dispatches remote commands over SSH. Ported from the legacy Python CLI (`src/paniolo/`, being retired). |
+| `paniolo` CLI | Rust (clap) | The single entry point; spawns/queries daemons, edits the lab file, dispatches remote commands over SSH. |
 | `serialcap` | Rust (tokio/axum) | Daemon that **exclusively owns** a target's serial ports; fans output out to a WebSocket + a timestamped capture log; accepts keystrokes back. |
 | `hdmicap` | Rust (tokio/axum; ObjC AVFoundation layer on macOS, v4l on Linux) | "Warm-stream" daemon that keeps the USB HDMI capture device open and serves frames + the combined dashboard over HTTP. |
-| `netbootd` | Rust (tokio) | The single-binary DHCP+TFTP netboot engine. Privilege-separated `/dev/bpf` send path on macOS via a setuid `netbootd-bpf-helper`. (The legacy Python `_dhcp`/`_tftp` pair it was ported from survives in the retired Python CLI only — the Rust CLI always runs `netbootd`.) |
+| `netbootd` | Rust (tokio) | The single-binary DHCP+TFTP+HTTP netboot engine (the only one). Privilege-separated `/dev/bpf` send path on macOS via a setuid `netbootd-bpf-helper`. |
 | `cambrionix` | Rust | Standalone power helper: Cambrionix USB-hub port control, wired in via the generic power hooks. |
 | `zigplug` | Python (uv tool, zigpy-znp) | Standalone power helper: Zigbee smart-plug control through a CC2652 coordinator; one-shots proxy through an auto-spawned daemon that owns the ZNP session. |
 | `hidrig` | Rust | HID-injection helper: protocol client + `serve` daemon for the KB2040 injector, wired in via the generic `hid` channel. |
@@ -120,8 +120,8 @@ serial = "33271JEGR02033"        # `adb -s <serial>`; omit for the sole device
 Every channel also takes an optional `host = "<name>"` to bind it to a remote control host
 (§5 "Distributed control"). The file is edited through the CLI (`paniolo target add`,
 `netboot set`, `serial add`, `power set`, `video set`, `hid set`, …), never by daemons. The
-legacy Python per-target files (`~/.config/paniolo/targets/<name>.toml`, `video.toml`) are not
-read by the Rust CLI.
+old per-target files (`~/.config/paniolo/targets/<name>.toml`, `video.toml`) from the
+pre-lab-file layout are not read.
 
 **Runtime state, discovery, and capture** live outside the config tree. Each daemon writes a
 **discovery file** (pid + port) and holds an **advisory lock**; at spawn the CLI also records the
@@ -166,9 +166,7 @@ dedicated secondary (USB-Ethernet) interface.
 
 On macOS, `netbootd`'s raw-frame send path (the Sequoia workaround) gets a `/dev/bpf` descriptor
 from a setuid-root `netbootd-bpf-helper` over `SCM_RIGHTS`, so the daemon itself stays
-unprivileged — the helper is the only root component, installed by `paniolo setup`. (The legacy
-pure-Python `_dhcp`/`_tftp` pair that `netbootd` was ported from remains in the retired Python
-CLI; the Rust CLI does not run it.)
+unprivileged — the helper is the only root component, installed by `paniolo setup`.
 
 ### Link mode: netboot ↔ ffx ([`netif.md`](netif.md))
 The same USB-Ethernet link serves two **mutually-exclusive** roles: netboot (IPv4 + DHCP + TFTP,

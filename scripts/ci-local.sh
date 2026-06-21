@@ -88,19 +88,9 @@ crate_job "netbootd"  "netbootd"  "cargo test"
 crate_job "hdmicap"   "hdmicap"   "cargo build"
 
 echo
-echo "===== python (pytest) ====="
-(
-  cd "$DST" \
-    && uv sync --quiet \
-    && uv run pytest -q
-)
-RES["pytest"]=$?
-echo "----- pytest exit ${RES[pytest]} -----"
-
-echo
 echo "########## LOCAL CI SUMMARY ##########"
 fail=0
-for k in "cli" "serialcap" "netbootd" "hdmicap" "pytest"; do
+for k in "cli" "serialcap" "netbootd" "hdmicap"; do
   c="${RES[$k]:-NA}"
   if [ "$c" = "0" ]; then printf 'PASS       %s\n' "$k"; else printf 'FAIL(%s)  %s\n' "$c" "$k"; fail=1; fi
 done

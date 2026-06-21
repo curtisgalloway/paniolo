@@ -132,8 +132,8 @@ device = "0x8300000534d2109"      # USB Video — stable, port-derived id
   `paniolo host list` prints the detected FQDN and marks the matching host.
 - With no `--lab`/`PANIOLO_LAB`, paniolo reads the default lab at
   `~/.config/paniolo/lab.toml`; if none exists it errors and points at
-  `paniolo init`. (The legacy Python CLI's per-target
-  `~/.config/paniolo/targets/*.toml` files are not read by the Rust CLI.)
+  `paniolo init`. (Old per-target `~/.config/paniolo/targets/*.toml` files from
+  the pre-lab-file layout are not read.)
 
 ## Transport (the "Fork B" model)
 

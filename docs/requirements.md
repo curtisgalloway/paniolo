@@ -51,9 +51,9 @@
 |---|---|---|---|---|
 | NET-1 | Built-in DHCP + TFTP over a direct USB-Ethernet link | M | ☑ | `netbootd/` (Rust engine, default); `192.168.99.1/24` |
 | NET-2 | `netboot start/stop/status`, `tftp-root`, `logs` (filterable, followable) | M | ☑ | `cli/src/netboot.rs` |
-| NET-3 | `netboot link-up/down/status` for interface configuration | M | ☑ | |
+| NET-3 | Bare-link up/down/status for interface testing | M | ☑ | `netif mode link`/`off` + `netif status` (carrier); `netif down-hard` forces a real carrier drop (WoL off + admin-down) for link-drop-detection tests. Replaced the `netboot link-up/down/status` trio |
 | NET-4 | TFTP root configurable per target (`--tftp-root`) | M | ☑ | required for `netboot start` |
-| NET-5 | `netif mode netboot\|ffx\|off` — atomic, idempotent link-mode switch; stops netboot before SD boot, sets up host `fe80::1`/64 for ffx; `netif status` probes the active mode | S | ☑ | `cli/src/netif.rs`; from rpi5-bringup ffx-over-network bring-up |
+| NET-5 | `netif mode netboot\|link\|ffx\|off` — atomic, idempotent link-mode switch; `link` = bare host IP (no daemon) for link testing; stops netboot before SD boot, sets up host `fe80::1`/64 for ffx; `netif status` probes the active mode + carrier | S | ☑ | `cli/src/netif.rs`; from rpi5-bringup ffx-over-network bring-up |
 
 ## 3. Serial console
 

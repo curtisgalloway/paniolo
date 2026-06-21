@@ -59,11 +59,10 @@ follow-up. Run through this checklist before calling `gh pr create`:
 4. **Validate before pushing.** Build and run the tests for the crates you
    touched. To catch the Linux-only CI failures without a round-trip, run
    `scripts/ci-local.sh` — it mirrors the GitHub Linux CI jobs (`cli`,
-   `serialcap`, `netbootd`, `hdmicap`, `pytest`) in a Linux environment, e.g. a
+   `serialcap`, `netbootd`, `hdmicap`) in a Linux environment, e.g. a
    Lima VM: `limactl shell <instance> -- bash -l scripts/ci-local.sh`. (The
    macOS-only job — hdmicap AVFoundation + visionocr — runs on the host.) Note
-   `cli` is the primary control-plane crate; it now has a CI job, so don't let
-   its tests rot.
+   `cli` is the primary control-plane crate; don't let its tests rot.
 
 5. **Push, open the PR, and merge only when asked.** Get the branch ready by
    committing locally, but treat `git push`, `gh pr create`, and merging as
@@ -176,7 +175,7 @@ cli/src/
   adb.rs        adb transport (argv build, shell exec, run/input passthrough,
                 exec-out screencap → PNG) — a generic transport in core, no helper
   netboot.rs    netbootd lifecycle (spawn with log, stop, status)
-  netif.rs      interface discovery/config (sudo), netboot/ffx/off modes
+  netif.rs      interface discovery/config (sudo), netboot/link/ffx/off modes
   power.rs      generic power hooks (on/off/cycle/state_cmd via sh -c), DTR via
                 serialcap /button (+ direct-serial fallback), power_on sense
   state.rs      netboot state files (JSON-compatible with the Python's)
@@ -196,8 +195,7 @@ cli/src/
 
 Deferred (tracked in docs/config-redesign.md): the
 Openterface CH9329 HID backend (clean-room spec at docs/ch9329-spec.md — a shim
-speaking the HID serial protocol would plug into the existing `hid` channel),
-legacy Python removal.
+speaking the HID serial protocol would plug into the existing `hid` channel).
 
 **Helper state/runtime-dir API** (daemons.rs `helper_env`): paniolo exports
 `PANIOLO_STATE_DIR` (`~/.config/paniolo/helpers/<name>/`, durable) and
@@ -216,36 +214,9 @@ zigplug lazily migrates its `zigbee.db` from the legacy top-level
 `~/.config/paniolo/` location into its namespaced dir. Contract for new
 helpers: docs/adding-power-helpers.md.
 
-## Module layout (legacy Python — being retired)
-
-The Python tree below remains the shipping CLI on `main` until the Rust CLI is
-cut over; its module docs are kept for that transition.
+## Module layout
 
 ```
-src/paniolo/
-  _cli.py       typer CLI — subcommand groups: target, netboot, netif, video, serial, hid
-                            top-level commands: console, power-cycle, power-state, setup
-                            global --lab option; @remote_capable dispatches to remote hosts
-  _config.py    TargetConfig CRUD (+ named SerialInterface list) (~/.config/paniolo/targets/<name>.toml)
-  _state.py     daemon state files (~/.local/share/paniolo/<target>/)
-  _lab.py       one-file lab model (--lab/PANIOLO_LAB): hosts + targets, per-resource host binding
-  _ssh.py       SSH transport for remote control hosts (ControlMaster, run/forward/read)
-  _remote.py    transparent re-exec of a command on a target's remote host (config slice + ssh)
-  _netboot.py   pure-Python DHCP + TFTP subprocess management (_dhcp.py, _tftp.py)
-  _netif.py     netboot↔ffx link-mode switch (atomic netboot teardown + IPv6 LL setup)
-  _dhcp.py      pure-Python DHCP server (run as `python -m paniolo._dhcp`)
-  _tftp.py      pure-Python read-only TFTP server (run as `python -m paniolo._tftp`);
-                macOS BPF raw-frame sender for Sequoia routing
-  _video.py     VideoConfig, hdmicap device discovery, daemon start/stop/URL helpers
-  _serial.py    serial helpers: tio (interactive) + serialcap daemon start/stop/URL
-  _ocr.py       OCR tool discovery + read_text(): visionocr (macOS) or linuxocr (Linux)
-  _paths.py     repo_root(): locates the source checkout (via __file__ or cwd) so
-                `paniolo setup` can build the native components from source
-  _hid.py       HID rig client: text commands over serial, scaling + sequencing
-  _power.py     DTR button-press helpers: dtr_button_press() (via serialcap daemon), dtr_direct_button_press() (pyserial fallback)
-
-tests/           pytest suite (host-side; no hardware) — one test_<module>.py per module
-
 hdmicap/         Rust crate: warm-stream HDMI capture daemon
   build.rs       compiles src/capture_avf.m via cc on macOS, links AVFoundation
   src/
@@ -469,9 +440,8 @@ cycle on every page load — the probe is now the read-only `GET /power`.)
 ## OCR
 
 Two entry points, both feeding the same warm frame:
-- **`paniolo video read [target] [--stable]`** — OCRs the current frame (in
-  the Rust CLI it wraps the daemon's `GET /ocr`; the legacy Python CLI
-  fetched a snapshot via `hdmicap shot` and OCR'd it client-side).
+- **`paniolo video read [target] [--stable]`** — OCRs the current frame (wraps
+  the daemon's `GET /ocr`).
 - **Dashboard button + hdmicap `GET /ocr`** — the daemon PNG-encodes the current
   frame and pipes it to the OCR tool (`tokio::process`), returning the text. The
   daemon finds the tool via `PANIOLO_VISIONOCR` (the installed path, set by
@@ -506,157 +476,12 @@ reads kernel/bootloader output). Character confusions on thin console fonts
 (`1`↔`l`↔`I`, IPv6 colons, etc.) are better addressed by increasing capture
 resolution or adjusting Tesseract's `--psm` mode.
 
-## _config.py
+## netbootd (Rust netboot engine)
 
-`TargetConfig` is a `@dataclass` with fields: `name`, `interface`,
-`host_ip` (default `192.168.99.1`), `tftp_root` (optional),
-`power_cycle_cmd` (optional shell command/script for `paniolo power-cycle`),
-`power_serial_interface` (optional — default interface name for DTR commands),
-and `serial_interfaces` — a list of `SerialInterface(name, device, baud,
-power_sense_signal, power_button)` (`power_button = true` opts the interface into
-DTR power control — `serial dtr`/`reset` refuse interfaces without it). A target
-can have several named serial consoles (e.g.
-`console`, `bmc`); helpers `serial_interface(name=None)` (resolves by name, or
-the sole one when omitted — raising on ambiguity), `upsert_serial_interface()`,
-and `remove_serial_interface()` manage them.
-
-Serialized as TOML using a hand-rolled writer (`_to_toml()` + `_toml_kv()`):
-scalar fields first, then one `[[serial]]` array-of-tables block per interface
-(Python 3.11 `tomllib` reads TOML but does not write it; avoids adding `tomli-w`).
-`_from_dict()` reads it back and **migrates** the legacy single-serial fields
-(`serial_device`/`serial_baud`) into one interface named `console`, and silently
-drops any `ha_power_entity` field from old configs, so older target files keep loading.
-
-Config files live at `~/.config/paniolo/targets/<name>.toml`.
-
-## _state.py
-
-Runtime state for each subsystem daemon. Currently only netboot.
-
-`NetbootState` is a `@dataclass`: `target`, `dhcp_pid`, `tftp_pid`,
-`started_at` (float epoch), `interface`, `tftp_root`. Stored as JSON at
-`~/.local/share/paniolo/<name>/netboot.json`. `is_netboot_running()` confirms
-both children are alive *and* their cmdlines contain `paniolo._dhcp` /
-`paniolo._tftp` (guards against reused stale PIDs).
-
-`is_pid_alive(pid)` uses `os.kill(pid, 0)`: returns `True` if the process
-exists; catches `ProcessLookupError` (dead) and `PermissionError` (exists but
-owned by another user — treat as alive).
-
-## Distributed control (`_lab.py`, `_ssh.py`, `_remote.py`)
-
-Lets a single command on the dev machine drive a target wired to a **remote
-control host**, transparently. Design + rationale: [`docs/distributed-control.md`](docs/distributed-control.md);
-phasing/status: [`docs/distributed-control-plan.md`](docs/distributed-control-plan.md).
-Phases 0–5 are shipped (one-shot re-exec, tunnelled `console`, remote
-`setup --host`, discovery-assisted `configure`); multi-host targets,
-`console --detach`, and multi-user locking are still design-only.
-
-**`_lab.py`** parses the one-file lab (pointed at by the global `--lab` option /
-`PANIOLO_LAB`): `[hosts.*]` (each → an `_ssh.Host`) and `[targets.*]` with nested
-`[netboot]`, `[[serial]]`, `[power]`. Host binding lives **per resource**
-(inheriting a target-level `host`, defaulting to `local`), so the schema is
-multi-host-ready; `Lab.resolve_target` flattens a target to the existing flat
-`TargetConfig` **plus one `Host`** and rejects targets whose resources span more
-than one host (not yet supported). With no lab configured, paniolo falls back to
-the legacy `~/.config/paniolo/targets/*.toml` (host = `local`) — byte-for-byte the
-old behavior.
-
-**`_ssh.py`** is the whole transport — no agent/daemon. A `Host` (ssh dest +
-optional `hostname` / `identity` / `control_path` / `paniolo_cmd`) drives a per-host
-**ControlMaster** connection (`ControlPersist=300`), so only the first call to a
-host pays the handshake (and, with an ssh-agent like 1Password, only the first
-triggers one confirmation per window). Provides `run` (captured),
-`run_passthrough` (inherit stdio, for re-exec), `run_interactive` (`ssh -t`, for
-tio), `forward` (an `ssh -L` tunnel context manager — **non-multiplexed**, so the
-process owns and can tear down the tunnel), and `read_remote_file`. Two
-host-config levers matter operationally: `paniolo_cmd` (pin paniolo's path when
-it isn't on the host's non-interactive ssh PATH) and `identity` (offer one key,
-avoiding agent key-spray that trips `MaxAuthTries`). A third, `hostname` (the
-box's FQDN), lets **one shared lab file** be run from any machine: the Rust
-`Host::is_local` (`cli/src/model.rs`) matches it against this machine's
-`hostname -f` (cached `local_fqdn()`), so each box treats its own host as local
-and SSH-dispatches the rest. `ssh` is only the *reach* path (it may be an
-`~/.ssh/config` alias); `hostname` is the *self-recognition* key. With no
-`hostname`, only `ssh = "local"` / a host named `local` is local (single-driver).
-`_control_dir` keeps the
-socket path short (XDG_RUNTIME_DIR or `/tmp`, not the long macOS `$TMPDIR`) to
-stay under the ~104-char Unix-socket limit.
-
-**`_remote.py`** + the **`@remote_capable`** decorator in `_cli.py` are the
-re-exec mechanism. The decorator wraps a target command, resolves its host via
-`_resolve_with_host`, and — if remote — ships the resolved `TargetConfig` to the
-host as a temp file, re-execs the (lab-stripped) `paniolo …` there with
-`PANIOLO_TARGET_CONFIG` pointed at the slice, passes stdio + exit code through,
-and cleans up. The remote, seeing `PANIOLO_TARGET_CONFIG`, runs against the slice
-locally (host = local), so it never re-dispatches. Applied to host-operating
-one-shot commands (netboot \*, netif \*, power-cycle/state, serial
-dtr/reset/watch/show) and `serial connect` (interactive). **Not** applied to
-config-authoring commands (serial setup/remove, target \*) — they'd write to the
-stateless remote — nor to host-global commands without a target (serial log,
-video shot). Remote `console` (`_cli._remote_console`) starts both daemons on the
-host, forwards their discovery ports, and opens the dashboard at the forwarded
-video port with the terminal aimed at the forwarded serial port via `?serialws=`.
-
-**Host provisioning + authoring.** `setup --host <h>` re-execs `paniolo setup`
-on host `h` over an ssh -t PTY (Phase 4). `discover [--json]` lists a host's
-lab-relevant hardware (USB-Ethernet/serial/capture); `configure <target>
---host <h>` runs `discover` on `h` over SSH and prints a proposed
-`[targets.<target>]` block via `_lab.propose_target_block` (Phase 5) — it writes
-nothing, the human reviews/pastes/commits (the lab is the reviewed source of
-truth).
-
-## _netboot.py
-
-Manages the netboot lifecycle for a target. By default it launches the Rust
-`netbootd` engine; `--engine python` selects the legacy **pure-Python** DHCP and
-TFTP servers (`_dhcp.py`, `_tftp.py`) as backgrounded subprocesses. Either way,
-no external daemons (`dnsmasq`/`tftp-now`) are used at runtime — `check_deps()`
-returns `[]`.
-
-**`_find_bin(name)`** searches `PATH` via `shutil.which`, then falls back to
-`_BREW_PATHS` on macOS / `_LINUX_SBIN_PATHS` (`/usr/sbin`, `/sbin`) on Linux.
-This is needed because SSH non-interactive shells often lack those dirs in PATH.
-
-**`_sudo_prefix()`** is empty on macOS (ports 67/69 bind rootless on 10.14+) and
-`["sudo", "env", "PYTHONUNBUFFERED=1"]` on Linux (privileged ports need root).
-
-**`start(cfg, engine="rust")`** flow: validate engine → guard
-(`is_netboot_running`) → `check_deps` (no-op) → validate `tftp_root` →
-**refuse if `cfg.interface` is a primary NIC** (`_is_primary_interface`, see
-below) → clean up stale pids → configure interface (`ifconfig` on macOS /
-`ip addr` on Linux) → tune ARP for the silent client → spawn the engine →
-save state. The DHCP server sets both `siaddr` and DHCP option 66 to `host_ip`;
-the RPi 5 EEPROM prefers option 66 but both are set for older firmware.
-
-- **`engine="rust"`** (default, `_start_rust`): spawns the single installed
-  `netbootd` binary serving DHCP+TFTP (`NO_COLOR=1` so tracing output stays
-  parseable). Both `*_pid` fields hold the one netbootd PID;
-  `NetbootState.engine="rust"`. Resolved via `_resolve_netbootd()` (PATH then
-  `~/.cargo/bin`). See the **netbootd** section below.
-- **`engine="python"`** (legacy fallback): spawns `python -m paniolo._dhcp …`
-  and `python -m paniolo._tftp …` (with the sudo prefix on Linux), logging both
-  to `netboot.log`. State stores both PIDs.
-
-**Primary-NIC guard.** `_default_route_interface()` reads the default-route
-interface (`route -n get default` on macOS, `ip route show default` on Linux);
-`_is_primary_interface(iface)` is true when they match. `start()` refuses such
-an interface for **both** engines, because reconfiguring it to the static
-`host_ip` would clobber the host's real networking. The netboot link must be a
-dedicated secondary (USB-Ethernet) interface. netbootd enforces the same guard
-itself (see below).
-
-**`stop(target)`** sends SIGTERM to the PID(s) (escalating to `sudo kill` on
-PermissionError), waits up to 3 s, then restores the interface and removes
-state. `_cleanup_stale` matches the process cmdline against `paniolo._dhcp`/
-`paniolo._tftp` (python) or `netbootd` (rust), per `state.engine`.
-
-## netbootd (Rust netboot engine, default)
-
-`netbootd/` is a single-binary Rust port of `_dhcp.py` + `_tftp.py` — DHCP and
-read-only TFTP as tokio tasks in one process. It is the **default** engine for
-`paniolo netboot start`; the Python `_dhcp`/`_tftp` pair it was ported from
-remains available as a fallback via `--engine python`.
+`netbootd/` is a single-binary DHCP + read-only TFTP + HTTP server — all as
+tokio tasks in one process. It is the **only** netboot engine for `paniolo
+netboot start` (originally ported from a pure-Python `_dhcp`/`_tftp` pair, since
+removed).
 
 The pure protocol logic is unit-tested (`dhcp.rs` / `tftp.rs` `#[cfg(test)]`
 modules): packet parse/build, RRQ option negotiation, path-traversal rejection,
@@ -686,136 +511,6 @@ Key differences from the Python servers:
   `handoff` (BPF open + fd passing) so both the `netbootd` and
   `netbootd-bpf-helper` binaries share them. On Linux netbootd uses the kernel
   send path (no BPF), matching the Python behavior.
-
-## _netif.py
-
-Switches the target's USB-Ethernet link between two **mutually-exclusive** modes
-that share the one physical point-to-point link, via
-`paniolo netif mode <netboot|ffx|off>`:
-
-- **netboot** — today's IPv4 `host_ip`/24 + DHCP + TFTP (the Pi TFTP-boots).
-  Delegates to `_netboot.start` (which keeps the primary-NIC guard).
-- **ffx** — IPv6 link-local `fe80::1`/64 (`FFX_HOST_LL`) on the host interface,
-  **no** DHCP/TFTP. The Pi boots from SD and is reached over ffx at
-  `fe80::<dev-slaac>%<iface>`.
-- **off** — tears down both.
-
-The command exists to kill two hand-switching seams: (1) `mode ffx` runs
-`netboot stop` **first**, so the next power-cycle falls through to SD instead of
-silently TFTP-booting a stale image; (2) `mode ffx` adds the host-side
-`fe80::1`/64 that ffx needs and that nothing else sets up (Linux: enable IPv6 via
-`sysctl net/ipv6/conf/<iface>/disable_ipv6=0`, then `ip -6 addr add`; macOS:
-`ifconfig … inet6 … alias`). All privileged steps reuse the same `sudo` path as
-`_netboot` — no new privilege model.
-
-**Idempotent and re-runnable.** The IPv6 link-local is ephemeral (lost on a
-control-host reboot), so `mode ffx` just re-adds it when absent; `mode netboot`
-clears it and skips a redundant start if netboot is already running; `mode off`
-removes only what netif set up (the `fe80::1` LL and a lingering `host_ip`/24),
-never flushing unrelated addresses.
-
-**Mode is probed, not stored** (`get_status`): netboot daemons running →
-`netboot`; else the `fe80::1` host LL present → `ffx`; else `off`. So
-`paniolo netif status` stays correct even after a reboot clears state. In ffx
-mode it also reports IPv6 neighbours on the link (`ip -6 neigh`, Linux) and
-prints a ready-to-paste `ffx target add fe80::…%<iface>` — surfacing the
-device's address without scraping the serial log.
-
-## _video.py
-
-`VideoConfig` dataclass: `device` only. Saved to `~/.config/paniolo/video.toml`.
-
-`hdmicap_binary()` resolves the *installed* binary — PATH, then `~/.cargo/bin`.
-It never points at the in-repo `target/` build tree, so a running daemon can't
-reference an ephemeral build artifact that a checkout/cleanup deletes. `paniolo
-setup` installs it (`cargo install`).
-
-`list_devices()` runs `hdmicap devices` and parses its text output
-(`  <index>  <name>  [<misc>]`) into `[{index, name, misc}]` dicts.
-
-`guess_capture_device(devices)` returns the single non-built-in device (filters
-out FaceTime, iSight, iPhone, iPad), or None if ambiguous.
-
-`daemon_url(target)` reads hdmicap's per-target discovery file
-(`/tmp/paniolo-<uid>/hdmicap/<target>/daemon.json`), verifies the PID is alive,
-and returns `http://127.0.0.1:<port>` or None.
-
-`start_daemon(cfg, port)` spawns `hdmicap daemon --device <name> --port <port>`
-detached (`start_new_session=True`). Caller polls `daemon_url()` to confirm
-startup.
-
-## _serial.py
-
-Two paths share this module:
-
-- **Interactive (`paniolo serial connect`):** `tio_binary()` + `connect_cmd()`
-  build a `tio` invocation; `_cli.py` `os.execvp`s into it for a foreground
-  terminal. Unchanged, dependency-light path.
-- **Daemon (`paniolo serial watch`):** `serialcap_binary()` resolves the
-  installed binary (PATH then `~/.cargo/bin`, never the build tree, same as
-  `hdmicap_binary`), `start_daemon(interfaces, port, buffer_lines=None)` spawns
-  one daemon **per target** owning *all* that target's interfaces (so two targets
-  on one host run two serialcap daemons; `daemon_cmd()` builds the argv,
-  one repeated `--interface NAME=DEVICE@BAUD` per interface via `interface_arg()`),
-  `daemon_url()` reads the discovery file (see Runtime paths) and verifies the PID,
-  mirroring `_video.py`. Interfaces come from the target's
-  `TargetConfig.serial_interfaces`.
-- **Scripted input (`paniolo serial send`):** `send_input()` POSTs raw bytes to
-  the running daemon's `/input` endpoint (`input_url()` builds the URL); the
-  daemon writes them to the port it already owns, so input coexists with capture
-  (no stop/restart). `--pace-ms N` adds per-byte pacing for a slow polled console
-  with no flow control — the daemon's `write_paced()` drips one byte per N ms.
-
-`list_serial_devices()` returns `/dev/serial/by-path/` symlinks on Linux when
-available (stable across USB re-enumeration), falling back to raw `/dev/ttyUSB*`
-/ `/dev/ttyACM*` paths. On macOS it globs `/dev/tty.usb*`. serialcap itself
-enumerates via the cross-platform `serialport` crate (`serialcap devices`), which
-gives richer USB VID/PID info.
-
-`canonical_device_path(device)` upgrades a raw `/dev/ttyUSBX` path to its
-corresponding `/dev/serial/by-path/` symlink when one exists. `serial setup`
-calls this automatically before saving, so the stored config is always stable.
-
-**Captured output (`paniolo serial log`):** `log_cmd()` builds the `serialcap
-log` argv; `_cli.py` resolves the binary and execs it as a passthrough. All the
-buffering, line assembly, timestamping, and range logic live in Rust
-(`serialcap/src/capture.rs`) — the daemon owns the port and is the only thing
-that sees every byte, so it persists timestamped lines to an on-disk JSONL log.
-`serialcap log` reads that log *directly* (no daemon round-trip), so it works
-whether or not the daemon is running. Flags: `--interface/-i NAME` (which
-interface; optional when only one was captured), `--tail N`, `--from/--to` (seq
-range), `--since` (poll for new lines), `--raw` (keep ANSI), `--json`,
-`--no-pending`. Lines carry a monotonic `seq` (stable across eviction, so a
-range/`--since` query stays valid) and a UTC `ts_ms`; output is ANSI-stripped by
-default. Each interface captures into its own `capture/<name>/` dir, so logs
-never conflate. The live WebSocket dashboard view is unchanged — capture is
-purely additive and runs on a separate thread so disk I/O can't stall the fan-out.
-
-## _hid.py
-
-**Superseded** by the `hidrig` crate + the Rust CLI's `hid` channel (HID
-composition moved host-side into Rust, and the rig is now the dual-board "dumb
-pipe"; see `docs/hid-dual-board-design.md`). Kept only until the Python tree is
-retired.
-
-Host client for the original two-board USB HID injection rig. `paniolo hid` is
-a **thin text-command client**: it sends line commands (`type ...`, `key
-ENTER`, `move dx dy`, ...) to the control board's USB CDC *data* port; the
-board parses them and relays HID events. The board owns the wire protocol —
-`_hid.py` does not re-encode packets host-side.
-
-- `HidConfig(port)` saved to `~/.config/paniolo/hid.toml`; `list_serial_ports()`
-  / `guess_data_port()` find the control board's data CDC node (the
-  higher-numbered of the two it exposes).
-- `HidRig` opens the port (lazy `pyserial` import) and `cmd()`s lines, raising on
-  the board's `ERR` reply. Pass `transport=` to drive it without hardware (tests).
-- Host-side sequencing (the board stays dumb): `parse_sequence()` (command files
-  with `# comments` and `delay <ms>` / `sleep <s>` directives), `run_sequence()`,
-  `repeat_key()`, and `scale_to_logical()` (pixel -> 0..32767 for future abs mouse).
-
-`pyserial` is an **optional extra** (`pip install 'paniolo[hid]'` / `uv sync
---extra hid`), imported lazily — the core install stays typer-only and the
-test suite needs neither pyserial nor hardware.
 
 ## hidrig (USB HID injector)
 
@@ -896,91 +591,6 @@ clap treats a token starting with `-` as a potential option flag; the `dx`/
 `hidrig scroll -3` work without a `--` separator (same for `paniolo hid send`,
 whose trailing args allow hyphen values — keep `-t` before them).
 
-## _power.py
-
-Two functions; no new dependencies beyond stdlib `urllib.request` and an optional
-lazy `pyserial` import:
-
-`dtr_button_press(daemon_url, interface_name, duration_ms)` — POSTs to the
-serialcap daemon's `/button?interface=<name>&ms=<N>` endpoint. Blocks until the
-press completes. Raises `RuntimeError` on HTTP error, `OSError` on network
-failure.
-
-`dtr_direct_button_press(device, duration_ms)` — pyserial fallback for when the
-daemon is not running. Opens the port, asserts DTR for the given duration, then
-releases. Raises `RuntimeError` if pyserial is not installed.
-
-## _cli.py
-
-Built with [Typer](https://typer.tiangolo.com/) (rich output included).
-
-**`_resolve(name)`** applies the default-target rule: if `name` is None and
-exactly one target is configured, use it; otherwise require an explicit name.
-
-Subcommand groups:
-- `target_app` (`paniolo target`) — `set`, `show`, `clear`
-- `netboot_app` (`paniolo netboot`) — `start`, `stop`, `status`, `tftp-root`,
-  `logs` (Rich viewer; `--boot` for current session, `--dhcp`/`--tftp`/`--errors`
-  to filter, `--tail N`, `-f` to follow), `link-up`, `link-down`, `link-status`
-- `video_app` (`paniolo video`) — `setup`, `watch [TARGET]` (optional target enables
-  the dashboard power-cycle button via `PANIOLO_TARGET`), `preview`, `shot`,
-  `read` (OCR), `devices`, `show`, `stop`
-- `serial_app` (`paniolo serial`) — `setup` (`--name`), `remove`, `connect` (tio, `-i`),
-  `watch`/`stop` (per-target serialcap daemon, all of that target's interfaces), `log` (captured output, `-i`),
-  `devices`, `show`, `dtr` (`--ms`, `-i` — pulse DTR; opt-in: refuses interfaces without `power_button`), `reset` (`--ms`, `-i` — soft DTR pulse, same opt-in)
-- `hid_app` (`paniolo hid`) — `setup`, `type`, `key`, `releaseall`, `combo`, `down`, `up`, `click`, `mdown`, `mup`, `move`, `scroll`, `run <file>`, `show`
-
-Top-level commands:
-- `paniolo console [TARGET] [-i INTERFACE]` — open the combined video+serial dashboard;
-  starts daemons if needed (using TARGET for power-cycle wiring), opens the hdmicap URL
-- `paniolo power on [TARGET]` / `paniolo power off [TARGET]` — run `on_cmd` / `off_cmd` hook
-- `paniolo power-cycle [TARGET]` — runs `cycle_cmd` hook via `sh -c`
-- `paniolo power-state [TARGET]` — runs `state_cmd` if set (stdout first token `on`/`off`); falls back to serialcap sense-line
-- `paniolo setup` — installs tftp-now (Homebrew) and builds/installs paniolo's
-  own binaries: hdmicap + serialcap + netbootd (`cargo install`), visionocr
-  (`swiftc`, macOS only), and linuxocr (copied script, Linux only) — all into
-  `~/.cargo/bin`. On macOS it then installs `netbootd-bpf-helper` **setuid-root**
-  (the one-time sudo) so the rust netboot engine's BPF path works unprivileged.
-
-`make install` (repo root) is the one-step build-and-install: it bootstraps
-the CLI with `cargo install --path cli`, then runs `paniolo setup` (by its
-installed `~/.cargo/bin` path, immune to PATH shadows) for everything else —
-the CLI onto PATH, the helpers into `~/.local/libexec/paniolo/bin`.
-Re-run it after editing anything; it warns if another `paniolo` shadows the
-installed one (e.g. the retired Python CLI's uv-tools shim — remove with
-`uv tool uninstall paniolo`). Narrower target: `make rust` (build + install
-the Rust crates only via `paniolo setup --rust-only`, skipping
-OCR/setuid/zigplug); `make help` lists all.
-
-**Linux packages** (`.github/workflows/release.yml`): pushing a `v*` tag
-builds amd64 + arm64 `.deb`s and tarballs (all 9 Rust binaries + `linuxocr`
-+ the bundled skills; manifest in `packaging/nfpm.yaml`) and attaches them to
-a GitHub Release.
-Builds run in a `debian:bookworm` container so binaries work on Debian 12+
-and Raspberry Pi OS (glibc 2.36 baseline). The deb installs `paniolo` to
-`/usr/bin`, helpers to `/usr/libexec/paniolo/bin`, and skills to
-`/usr/share/paniolo/skills` (one explicit nfpm entry per skill — a glob would
-collide all three `SKILL.md` at one dst) — `find_binary` in
-`cli/src/daemons.rs` searches the libexec dir (and `../libexec/{bin,paniolo/bin}`
-relative to the resolved CLI binary, which covers Homebrew kegs and other
-prefix installs) after the per-user libexec, and `skills_dirs` in
-`cli/src/skills.rs` searches the share dir the same way, so a `make install`
-build always overrides an installed package. zigplug and
-group setup stay per-user via `paniolo setup`. `workflow_dispatch` builds
-artifacts without a Release for testing.
-
-After the Release publishes, a `bump-tap` job fires a `repository_dispatch`
-(`event_type: paniolo-release`, `client_payload.tag`) at the
-`curtisgalloway/homebrew-tap` repo, whose `bump-formula.yml` re-pins
-`Formula/paniolo.rb` (source-tarball URL + sha256) to the new tag and commits
-with its own `GITHUB_TOKEN`. The dispatch needs a cross-repo credential the
-default `GITHUB_TOKEN` lacks: a fine-grained PAT with **Contents: write on
-`curtisgalloway/homebrew-tap`**, stored as the `HOMEBREW_TAP_DISPATCH_TOKEN`
-repo secret. If the secret is missing the job warns and skips (releases never
-fail on it). The tap workflow also has a `workflow_dispatch` (optional `tag`
-input, default = latest release) for a manual re-pin without cutting a
-release.
-
 ## Runtime paths
 
 | Purpose | Path |
@@ -1009,15 +619,14 @@ base honors `$PANIOLO_RUNTIME_BASE` (default `/tmp`).
 - **No hardcoded network addresses, URLs, or hostnames.** All site-specific
   values go in config files under `~/.config/paniolo/` and are populated via
   setup commands. Error messages must be generic.
-- **No new dependencies without discussion.** Core dep: `typer` only; stdlib for
-  everything else (`urllib.request`, `tomllib`, `subprocess`). `pyserial` is an
-  optional extra (`[hid]`), lazy-imported, used only by `paniolo hid`. Dev: `pytest`.
-- **Python is formatted with `pyink` and linted with `pylint`, both at
-  line-length 88.** `pyproject.toml` pins `[tool.pyink] line-length = 88`; pylint
-  uses the Google style rcfile (`~/.config/pylintrc`, `max-line-length=88`). Keep
-  `uvx pyink src tests` and `uvx pylint src tests` clean. Single quotes nested in
-  double-quoted f-strings are required on the 3.11 floor, so `inconsistent-quotes`
-  is disabled per-file where that pattern appears (not worked around).
+- **No new dependencies without discussion.** Keep each crate's dependency set
+  lean and justify any new crate in review. (The `zigplug` Zigbee helper is the
+  one remaining Python component — its deps live in `zigplug/pyproject.toml`.)
+- **Rust is formatted with `rustfmt` and linted with `clippy`.** CI runs
+  `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` per crate
+  (`cli`, `serialcap`, `netbootd`, `hdmicap`) — keep both clean before pushing.
+  Run `make fmt` to format every crate. The `zigplug` Python helper is formatted
+  with `pyink` and linted with `pylint` at line-length 88.
 - **`paniolo setup` builds the native components from the source tree** when
   run from a clone — `make install` (which invokes the *installed* CLI)
   resolves the checkout by walking up from the cwd (`setup::find_repo_root`).
@@ -1050,14 +659,16 @@ helper CLI conventions, Rust/Python skeletons, verification ladder, PR
 checklist); `cambrionix/`, `zigplug/`, `usbhub/`, and `shellyplug/` (the
 simplest one — a stateless HTTP one-shot) are the exemplars.
 
-The steps below describe the legacy Python tree:
+For a genuine new subsystem (a channel with its own commands/daemon), in the
+Rust `cli/` crate:
 
-1. Create `src/paniolo/_<subsystem>.py`.
-2. Add state dataclass + path helpers to `_state.py` if the subsystem is a
-   daemon with a PID.
-3. Add a `<subsystem>_app = typer.Typer(...)` group in `_cli.py`.
-4. Add optional config fields to `TargetConfig` in `_config.py`.
-5. Regenerate the skill and update this file.
+1. Add a module `cli/src/<subsystem>.rs` for its logic.
+2. Add a clap subcommand group + its handlers in `cli/src/main.rs`.
+3. Add the channel's config fields to the data model (`cli/src/model.rs`) and
+   surgical lab-file editing (`cli/src/labfile.rs`) so they round-trip.
+4. If it's a daemon with a PID, add its state/discovery handling alongside the
+   others (`cli/src/state.rs`, `cli/src/daemons.rs`).
+5. Regenerate the skill (`paniolo skill`) and update this file and `docs/`.
 
 ## Linux support
 
@@ -1069,21 +680,20 @@ Paniolo runs on Linux as well as macOS. Platform differences:
   stdin-PNG → stdout-text interface via `PANIOLO_VISIONOCR`.
 - **Netboot uses `sudo` internally on Linux.** DHCP (port 67) and TFTP (port 69)
   require root on Linux; macOS 14+ allows them rootless. `paniolo netboot start`
-  auto-prepends `sudo env PYTHONUNBUFFERED=1 <python>` when spawning the two
-  server subprocesses on Linux. With passwordless sudoers this is transparent;
-  otherwise sudo prompts for a password. Interface config (`ip addr add`) also
-  uses sudo, same as macOS uses it for `ifconfig`.
-- **Interface management uses `ip` on Linux.** `_configure_interface()` runs
-  `ip addr add`/`ip link set up` (iproute2) instead of `networksetup`+`ifconfig`.
-  `_restore_interface()` flushes with `ip addr flush dev <iface>`.
-- **ARP pinning uses `ip neigh replace` on Linux.** `_dhcp._set_arp()` calls
+  auto-prepends `sudo` when spawning `netbootd` on Linux. With passwordless
+  sudoers this is transparent; otherwise sudo prompts for a password. Interface
+  config (`ip addr add`) also uses sudo, same as macOS uses it for `ifconfig`.
+- **Interface management uses `ip` on Linux.** `netif::configure_interface()`
+  runs `ip addr add`/`ip link set up` (iproute2) instead of
+  `networksetup`+`ifconfig`; `restore_interface()` flushes with
+  `ip addr flush dev <iface>`. (See `cli/src/netif.rs`.)
+- **ARP pinning uses `ip neigh replace` on Linux.** netbootd's ARP pin calls
   `arp -s` on macOS and `ip neigh replace ... nud permanent` on Linux.
-- **BPF raw-frame sender is macOS-only.** `BpfSender` in `_tftp.py` uses
-  `/dev/bpf*` ioctls that don't exist on Linux. On Linux `available` is always
-  `False` and the server falls back to normal `sendto()` with retry. The Python
-  server opens `/dev/bpf` in-process (needs root or `access_bpf`); the rust
-  `netbootd` engine instead receives the descriptor from the setuid
-  `netbootd-bpf-helper` and stays unprivileged (see the **netbootd** section).
+- **BPF raw-frame sender is macOS-only.** netbootd's BPF sender uses `/dev/bpf*`
+  ioctls that don't exist on Linux; on Linux it is unavailable and the server
+  falls back to normal `sendto()` with retry. On macOS netbootd receives the
+  `/dev/bpf` descriptor from the setuid `netbootd-bpf-helper` and stays
+  unprivileged (see the **netbootd** section).
 - **hdmicap build deps on Linux.** Building hdmicap requires system packages:
   `build-essential pkg-config libclang-dev clang` (for V4L2 bindgen via
   `v4l2-sys-mit`) plus `cmake nasm` (the `turbojpeg` crate builds a vendored
@@ -1103,10 +713,32 @@ Paniolo runs on Linux as well as macOS. Platform differences:
 
 ## Known limitations / gotchas
 
-- **Interface configuration requires root.** `_configure_interface()` needs
-  NOPASSWD sudo (`ifconfig`/`networksetup` on macOS, `ip` on Linux).
-- **SSH PATH.** Non-interactive SSH shells often lack `/opt/homebrew/bin`.
-  `_find_bin()` probes `_BREW_PATHS` on macOS and `/usr/sbin`+`/sbin` on Linux.
+- **Drive through paniolo, not around its devices.** The agent-facing rule
+  (`skills/paniolo/SKILL.md`): never reconfigure or open a paniolo-managed device
+  by hand — `ifconfig`/`ip`/`ethtool` on the netboot interface, `screen`/`tio` on
+  a serial port, `kill` on a daemon. A background daemon (netbootd/serialcap/
+  hdmicap/hid) holds the device and tracks state; touching it directly desyncs
+  that state (a stray interface address silently changes what `netif status`
+  reports; opening the serial port collides with the exclusive serialcap daemon).
+  Use `netif mode …`, `serial log`/`send`, `daemons stop`.
+- **`netif mode off`/`link` toggle the host IP, not the carrier; `netif
+  down-hard` drops the carrier.** `mode link` assigns just the host IP (no
+  daemon); `mode off` releases it. Neither admin-downs the interface, and `netif
+  status` reports `carrier` independently of `mode` — a NIC with **Wake-on-LAN**
+  enabled keeps the PHY energized when the interface is down, so `carrier` can
+  read `up` in `off` mode. `netif down-hard` is the hard down (for testing
+  link-drop *detection*): `mode off` + disable WoL (`ethtool -s <iface> wol d`,
+  Linux) + admin-down (`ip link set down` / `ifconfig down`). `mode link`/`netboot`
+  bring it back up; WoL stays off until re-enabled or the adapter is replugged.
+  (macOS WoL is a system-wide `pmset womp` pref, so `down-hard` relies on
+  admin-down there.) Heads-up: `del_host_ip` releases the macOS static IP via
+  `networksetup -setdhcp` (an `ifconfig` delete won't unset a `-setmanual` IP),
+  so `mode off` from `link` mode actually clears the address on macOS.
+- **Interface configuration requires root.** `netif::configure_interface()`
+  needs NOPASSWD sudo (`ifconfig`/`networksetup` on macOS, `ip` on Linux).
+- **SSH PATH.** Non-interactive SSH shells often lack `/opt/homebrew/bin`;
+  paniolo probes the Homebrew paths on macOS and `/usr/sbin`+`/sbin` on Linux
+  when resolving helper binaries.
 - **hdmicap device identity.** Capture devices have a stable, port-derived id
   (AVFoundation `uniqueID` on macOS, `/dev/v4l/by-path` symlink on Linux) shown
   by `hdmicap devices` / `paniolo video devices`. Prefer the id in lab files —

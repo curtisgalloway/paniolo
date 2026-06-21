@@ -13,6 +13,30 @@ dongle for video, a USB-serial adapter for the console, a smart plug for power).
 Almost every command operates on a named **target**. If exactly one target is
 configured, the name can be omitted.
 
+## Drive through paniolo — don't touch its devices directly
+
+Paniolo owns the hardware it's configured for, and a background **daemon** holds
+most of it open: netbootd (the netboot interface + DHCP/TFTP), serialcap (each
+serial port), hdmicap (the capture device), the hid injector. Those daemons
+track state, and the netif/netboot commands assume they're the only ones
+touching the link and ports. So **always go through paniolo commands; never
+reconfigure or open a paniolo-managed device by hand**:
+
+- **Don't** run `ifconfig` / `ip` / `networksetup` / `ethtool` on the netboot
+  interface — use `paniolo netif mode …` (and `paniolo netboot start/stop`). A
+  stray address or an admin-down behind paniolo's back desyncs what `netif
+  status` reports and can silently break DHCP/TFTP.
+- **Don't** open a serial port with `screen` / `tio` / `minicom` while a
+  `serial watch` daemon holds it (the port is exclusive) — read with `paniolo
+  serial log` and write with `paniolo serial send`.
+- **Don't** `kill` a daemon or its helper by PID — use `paniolo daemons stop`
+  (or the per-subsystem `stop`).
+
+If a paniolo command for what you want doesn't seem to exist, run `paniolo
+--help` or re-read this skill before reaching for the raw device — it almost
+certainly does (e.g. `netif mode link`/`off` to toggle the bare link, `daemons`
+to find and clear a stuck port).
+
 ## First-time setup
 
 ```
@@ -28,9 +52,10 @@ Only the `paniolo` CLI lands in `~/.cargo/bin` — make sure that's on `PATH`.
 The helpers (hdmicap, serialcap, netbootd, cambrionix, hidrig, zigplug, the
 OCR tool) live in the private libexec dir `~/.local/libexec/paniolo/bin`,
 off PATH; paniolo resolves them itself, and `paniolo helper [NAME] [ARGS…]`
-lists or runs one directly. If a `paniolo` from the retired Python CLI
-shadows the CLI (uv-tools shim in `~/.local/bin`), remove it with
-`uv tool uninstall paniolo`; `make install` warns when it detects a shadow.
+lists or runs one directly. If a different `paniolo` shadows the CLI on PATH
+(e.g. a Homebrew keg from the tap winning over `~/.cargo/bin`), put
+`~/.cargo/bin` first or remove the other copy; `make install` warns when it
+detects a shadow.
 
 ## Configure a target
 
@@ -69,10 +94,9 @@ paniolo netboot stop [target]
 ```
 
 `start` refuses an interface that carries the system default route (a primary
-NIC) — the netboot link must be a dedicated USB-Ethernet adapter. The default
-engine is the single-binary `netbootd` (Rust); `--engine python` selects the
-legacy DHCP+TFTP subprocess pair it was ported from. On macOS the rust engine's
-BPF send path uses the setuid `netbootd-bpf-helper` installed by `paniolo setup`.
+NIC) — the netboot link must be a dedicated USB-Ethernet adapter. Netboot is
+served by the single-binary `netbootd` (Rust). On macOS its BPF send path uses
+the setuid `netbootd-bpf-helper` installed by `paniolo setup`.
 
 Put boot files in the target's TFTP root (for a Raspberry Pi 5, the kernel goes
 in as `kernel_2712.img`). Needs passwordless `sudo` for `ifconfig` (it assigns
@@ -86,18 +110,42 @@ NBP (e.g. `grubaa64.efi`, `ipxe.efi`). **HTTP Boot is preferred** for UEFI — i
 runs over kernel TCP (robust under load) and skips the macOS BPF/ARP machinery
 the silent Pi bootloader needs. IPv4 + plain HTTP only (no IPv6/HTTPS yet).
 
-## Link mode — switch between netboot and ffx
+## Link mode — netboot · link · ffx · off
 
-The same USB-Ethernet link can't be in netboot mode and ffx-over-network mode at
-once (they want incompatible host addressing). Use `netif` to flip between them
-atomically instead of doing it by hand:
+`paniolo netif` owns the host side of the USB-Ethernet link and puts it in one of
+four mutually-exclusive modes. Use it to flip between them atomically instead of
+configuring the interface by hand:
 
 ```
 paniolo netif mode netboot [target]        # IPv4 + DHCP + TFTP (= netboot start)
+paniolo netif mode link [target]           # bare link UP: host IP only, no daemon
 paniolo netif mode ffx [target]            # stop netboot, add host fe80::1/64 for ffx
-paniolo netif mode off [target]            # tear down both
-paniolo netif status [target]              # which mode is active, addresses, peer
+paniolo netif mode off [target]            # soft DOWN: release host IP (+ ffx LL)
+paniolo netif down-hard [target]           # hard DOWN: also kill WoL + admin-down the iface
+paniolo netif status [target]              # mode, carrier, addresses, ffx peer
 ```
+
+**Testing the link up/down.** To check that the link itself comes up and drops —
+without serving anything — toggle `link` ↔ `off` and read `netif status`:
+
+```
+paniolo netif mode link [target]    # up:   host IP assigned, no DHCP/TFTP
+paniolo netif status [target]       #       mode=link, carrier up
+paniolo netif mode off [target]     # down: host IP released
+paniolo netif status [target]       #       mode=off
+```
+
+Caveat — **soft "down" (`mode off`) only releases the host IP; it does not force
+the carrier down.** `netif status` shows `carrier` separately from `mode` because
+a NIC with **Wake-on-LAN** enabled keeps the PHY energized even when the
+interface is down, so the peer's link LED stays lit and `carrier` can still read
+`up` in `off` mode. **When you need the target to actually *detect* link loss,
+use `paniolo netif down-hard`** — it does `mode off` and then disables WoL
+(`ethtool -s <iface> wol d` on Linux) and admin-downs the interface, so the peer
+sees carrier go away. Bring the link back with `netif mode link` (or `netboot`);
+WoL stays off until you re-enable it (`ethtool -s <iface> wol g`) or replug the
+adapter. (macOS WoL is a system-wide pref, so there `down-hard` relies on the
+admin-down; unplugging the cable is always the unambiguous drop.)
 
 - **Switching to ffx stops netboot first** — otherwise a power-cycle TFTP-boots a
   stale image instead of falling through to the SD card. This is the safe way to
@@ -492,10 +540,14 @@ instance. netbootd is excluded — cycle it via `paniolo netboot start/stop`.
 
 ## Quick reference — gotchas
 
+- **Drive through paniolo, not around it.** Don't reconfigure or open a
+  paniolo-managed device by hand (`ifconfig`/`ip`/`ethtool` on the netboot
+  interface, `screen`/`tio` on a serial port, `kill` on a daemon) — it desyncs
+  the daemon. Use `netif mode …`, `serial log`/`send`, `daemons stop`.
 - Serial port is exclusive: one of `connect` / `watch` / external `tio`/`screen`.
-- `~/.cargo/bin` (the CLI) must be on `PATH`; a stale Python `paniolo` in
-  `~/.local/bin` shadows it (`uv tool uninstall paniolo`). The helper
-  binaries are *not* on PATH — they live in `~/.local/libexec/paniolo/bin`
+- `~/.cargo/bin` (the CLI) must be on `PATH`, ahead of any other `paniolo`
+  (e.g. a Homebrew keg from the tap can shadow it). The helper binaries are
+  *not* on PATH — they live in `~/.local/libexec/paniolo/bin`
   (`paniolo helper <name> …` to run one by hand).
 - `paniolo console` auto-starts both daemons if they aren't running. Local
   `console` passes the serialcap daemon's OS-assigned port as `?serial=PORT`
@@ -503,6 +555,10 @@ instance. netbootd is excluded — cycle it via `paniolo netboot start/stop`.
 - Netboot requires passwordless `sudo` (`ip` on Linux, `ifconfig` on macOS).
 - netboot and ffx are mutually exclusive on the link — use `paniolo netif mode`
   to switch; entering ffx mode stops netboot so a power-cycle boots from SD.
+- To test the bare link: `paniolo netif mode link` (up) / `mode off` (soft down).
+  Soft "down" only releases the host IP — with Wake-on-LAN on, `carrier` can still
+  read `up` (the PHY stays powered). For a drop the target actually detects, use
+  `paniolo netif down-hard` (kills WoL + admin-downs the iface), or unplug.
 - Remote (lab) targets: if ssh fails with "Too many authentication failures",
   set the host's `identity` (agent key-spray); if the remote can't find paniolo,
   set its `paniolo_cmd` to an absolute path.
