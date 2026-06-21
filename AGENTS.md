@@ -70,6 +70,59 @@ follow-up. Run through this checklist before calling `gh pr create`:
    your own initiative, and never merge. When told to, open with `gh pr create`;
    the merge decision always belongs to the maintainer.
 
+## Cutting a release
+
+Releases are **tag-driven**: pushing an annotated `v*` tag to `origin` triggers
+`.github/workflows/release.yml`, which builds the Linux packages, publishes a
+GitHub Release, and bumps the Homebrew tap. There is no version to edit in
+source — the **tag is the single source of truth**. Every crate's
+`Cargo.toml` stays at `version = "0.1.0"`; the workflow derives the package
+version from the tag name (`${GITHUB_REF_NAME#v}`), so don't bump the manifests.
+
+Steps:
+
+1. **Pre-flight.** Be on `main`, clean, and in sync (`git fetch origin && git
+   status` → `main...origin/main`, nothing ahead/behind). Confirm CI is green on
+   the HEAD commit you're about to tag (`gh run list --branch main --limit 5`) —
+   the release builds that exact commit, so a red main means a broken release.
+
+2. **Pick the version.** Patch-bump from the latest tag
+   (`git tag --sort=-creatordate | head`); the project has stayed on `0.1.z`.
+
+3. **Create an annotated tag** whose subject mirrors the prior ones —
+   `vX.Y.Z: <lowercase one-line summary of the headline change>` — with an
+   optional body paragraph for detail. Tag as the releaser, matching the
+   email convention already in the history so GitHub doesn't reject the push
+   (`git log --format='%ae' | sort -u`; the project uses each author's
+   `<ID>+<user>@users.noreply.github.com` form):
+
+   ```bash
+   git -c user.email='<your-github-noreply-email>' -c user.name='<Your Name>' \
+       tag -a vX.Y.Z -m 'vX.Y.Z: <summary>' -m '<body paragraph>'
+   ```
+
+4. **Push the tag** (this is the outward-facing, hard-to-reverse step — gated on
+   the maintainer's explicit go-ahead, like push/merge):
+
+   ```bash
+   git push origin vX.Y.Z
+   ```
+
+   The push fans out to three jobs: `package` builds amd64 + arm64 `.deb`s and
+   tarballs inside a `debian:bookworm` container (glibc 2.36, so the packages run
+   on Debian 12+ and current Raspberry Pi OS) and smoke-tests the `.deb`;
+   `release` attaches them to a new GitHub Release with auto-generated notes; and
+   `bump-tap` fires a `repository_dispatch` at `curtisgalloway/homebrew-tap` so it
+   re-pins its formula to the new tag (needs the `HOMEBREW_TAP_DISPATCH_TOKEN`
+   secret — absent, it warns and skips rather than failing).
+
+5. **Watch it land.** `gh run list --workflow=release.yml --limit 1`, then
+   `gh release view vX.Y.Z` once green to confirm the artifacts and notes.
+
+A botched tag that hasn't shipped can be moved (`git tag -f` + `git push -f
+origin vX.Y.Z`), but once the Release and tap bump are public, roll forward with
+a new patch tag instead.
+
 ## Purpose
 
 Paniolo is a CLI tool that lets an AI agent fully control a target machine
