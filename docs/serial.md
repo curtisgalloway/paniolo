@@ -168,6 +168,54 @@ with the raw bytes as the request body (see HTTP API below).
 
 ---
 
+## Send/expect: scripted console exchanges
+
+`paniolo serial expect` runs one **send → wait-for-pattern** exchange through
+the running daemon: it sends text (optional), then waits for a regex to match
+the output that arrives afterwards, and reports the match and its capture
+groups. Capture keeps running throughout, so the device's response also lands
+in the log. It replaces the `serial send` + `serial log --since` polling loop
+for console automation: U-Boot autoboot interrupts, login prompts, AT
+commands, bootloader protocols (the [flash channel](flash.md) is built on it).
+
+```bash
+# Interrupt U-Boot autoboot and confirm the prompt appeared
+paniolo serial expect target-machine -i console --send "" --pattern "=> " --timeout-ms 3000
+
+# Probe a bootloader REPL: does echo answer?
+paniolo serial expect dabao --send "echo hi42" --pattern "hi42" --timeout-ms 2000
+
+# Pure wait (no send): watch for a login prompt
+paniolo serial expect target-machine --pattern "login: " --timeout-ms 60000
+
+# Capture groups, machine-readable
+paniolo serial expect dabao --send "version" --pattern "boot1 v([0-9.]+)" --json
+```
+
+Exit code 0 = matched, 1 = timeout (stderr shows the tail of whatever did
+arrive, for diagnosis). `--send` appends a carriage return unless
+`--no-newline`; `--pace-ms` paces the send like `serial send`.
+
+**Matching contract** (also the `POST /expect` endpoint contract):
+
+- Only bytes received **after the send completes** are considered — the
+  `reset_input_buffer` analog, so a stale response already in flight can't
+  match.
+- The regex runs over the **raw received bytes** as they accumulate in a
+  bounded (64 KiB) buffer: matches survive chunk boundaries, input is *not*
+  ANSI-stripped and *not* line-split. When a complete line matters, anchor the
+  pattern (`\r?\n`, or a trailing `\s`) so a partially-received line can't
+  match early.
+- If the daemon's fan-out drops bytes mid-wait (slow consumer), the exchange
+  ends as a timeout with `lagged` set — it never matches across a gap.
+- **One expect in flight per interface** (409 otherwise), and `serial dtr` /
+  `POST /button` are refused (409) while one is active — a DTR pulse drops and
+  reopens the port, which would kill the exchange mid-write. Plain `/input`
+  and dashboard keystrokes stay allowed during an expect — at your own risk
+  (concurrent input can confuse the pattern you're waiting for).
+
+---
+
 ## Integration with the video dashboard
 
 `paniolo console` opens the combined hdmicap dashboard in a browser, starting
@@ -244,10 +292,24 @@ configured interface. Responses carry a permissive CORS header.
 | GET | `/status` | One interface (`?interface=`) or all; `{name, device, baud, connected, power_on}` |
 | GET | `/interfaces` | All interfaces and their status |
 | GET | `/devices` | Serial devices on the host |
-| POST | `/button` | Pulse DTR for `?ms=N` (J2 power button); see [power.md](power.md) |
+| POST | `/button` | Pulse DTR for `?ms=N` (J2 power button); see [power.md](power.md). 409 while an expect is active |
 | POST | `/input` | Write the request body to the port; `?pace_ms=N` drips one byte per N ms |
+| POST | `/expect` | One send/expect exchange; JSON body `{send, pattern, timeout_ms, pace_ms}` |
+| POST | `/marker` | Inject a labelled marker line into stream + scrollback + capture; JSON body `{label}` |
 
 `POST /input` writes through the port the daemon already owns, so input coexists
 with live capture. A paced write (`pace_ms > 0`) blocks until the whole body is
 sent (~`len × pace_ms` ms). Returns 200 on success, 404 for an unknown interface,
 503 if the supervisor isn't running.
+
+`POST /expect` follows the matching contract above. Both outcomes are 200:
+`{"matched": true, "match": …, "captures": […], "elapsed_ms": N}` or
+`{"matched": false, "lagged": bool, "tail": …}` (`tail` = trailing output
+received during the wait). Errors: 400 bad regex, 404 unknown interface, 409
+an expect already in flight on that interface, 503 supervisor not running.
+`timeout_ms` is capped at 300 000. The daemon knows nothing about any device's
+command language — protocol clients (e.g. [flash](flash.md)) live in the CLI.
+
+`POST /marker` injects a timestamped, colored marker line (same shape as the
+connect/disconnect markers) so client-driven operations are legible in the
+capture log; control characters in the label are stripped.

@@ -210,6 +210,42 @@ fn check_channel(lab: &Lab, ch: &ResolvedChannel, rt: &ResolvedTarget) -> (Statu
                 rc => interpret(rc, serial.unwrap_or("device")),
             }
         }
+        ChannelKind::Flash => {
+            // Flash rides a serial channel; the serial probe covers the device,
+            // so the check here is that the ride resolves (method validity is
+            // enforced at lab load).
+            let named = field(ch, "interface");
+            let serials: Vec<&ResolvedChannel> = rt
+                .channels
+                .iter()
+                .filter(|c| c.kind == ChannelKind::Serial)
+                .collect();
+            let ride = match named {
+                Some(i) => serials.iter().find(|c| c.name == i).copied(),
+                None if serials.len() == 1 => Some(serials[0]),
+                None => None,
+            };
+            match ride {
+                Some(s) => (
+                    Status::Ok,
+                    format!(
+                        "{} via serial '{}'",
+                        field(ch, "method").unwrap_or("?"),
+                        s.name
+                    ),
+                ),
+                None => match named {
+                    Some(i) => (
+                        Status::Missing,
+                        format!("interface '{i}' has no matching serial"),
+                    ),
+                    None => (
+                        Status::Incomplete,
+                        "no interface set and target doesn't have exactly one serial".to_string(),
+                    ),
+                },
+            }
+        }
     }
 }
 

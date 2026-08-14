@@ -38,7 +38,9 @@ use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::debug;
 
-use crate::serial_io::{NamedSerial, SerialHandle, Serials};
+use crate::serial_io::{
+    ExpectError, ExpectOutcome, ExpectRequest, NamedSerial, SerialHandle, Serials,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -65,6 +67,33 @@ pub struct InputParam {
     pace_ms: u64,
 }
 
+/// Ceiling on a single expect's wait; protects the daemon from a client that
+/// asks for an unbounded exchange (the interface stays expect-busy throughout).
+const MAX_EXPECT_TIMEOUT_MS: u64 = 300_000;
+
+fn default_expect_timeout_ms() -> u64 {
+    5_000
+}
+
+#[derive(Deserialize)]
+pub struct ExpectBody {
+    /// Text to send before matching starts; null/absent = pure wait.
+    send: Option<String>,
+    /// Regex matched over raw received bytes (not ANSI-stripped, not
+    /// line-split); anchor with `\r?\n` / `\s` when a complete line matters.
+    pattern: String,
+    #[serde(default = "default_expect_timeout_ms")]
+    timeout_ms: u64,
+    /// Per-byte pacing for the send, as for /input.
+    #[serde(default)]
+    pace_ms: u64,
+}
+
+#[derive(Deserialize)]
+pub struct MarkerBody {
+    label: String,
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/stream", get(stream))
@@ -73,6 +102,8 @@ pub fn router(state: AppState) -> Router {
         .route("/devices", get(devices))
         .route("/button", post(button))
         .route("/input", post(input))
+        .route("/expect", post(expect))
+        .route("/marker", post(marker))
         .with_state(state)
 }
 
@@ -162,6 +193,18 @@ async fn button(State(s): State<AppState>, Query(q): Query<ButtonParam>) -> Resp
                 .into_response();
         }
     };
+    // A DTR press drops and reopens the port, which would kill an in-flight
+    // expect (or flash transfer) mid-write — refuse instead. dtr_press also
+    // checks (the flag can flip between here and there); this pre-check just
+    // picks the right status code for the common case.
+    if handle.expect_in_flight() {
+        return (
+            StatusCode::CONFLICT,
+            [CORS],
+            "an expect/transfer is active on this interface — retry when it finishes\n",
+        )
+            .into_response();
+    }
     match handle.dtr_press(q.ms).await {
         Ok(()) => ([CORS], format!("button pressed for {} ms\n", q.ms)).into_response(),
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, [CORS], format!("{e:#}\n")).into_response(),
@@ -197,6 +240,111 @@ async fn input(State(s): State<AppState>, Query(q): Query<InputParam>, body: Byt
         Ok(()) => ([CORS], format!("wrote {n} bytes\n")).into_response(),
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, [CORS], format!("{e:#}\n")).into_response(),
     }
+}
+
+/// One send/expect exchange (see docs/serial.md for the endpoint contract).
+///
+/// `POST /expect?[interface=NAME]`, JSON body:
+/// `{"send": "text"|null, "pattern": "regex", "timeout_ms": N, "pace_ms": N}`.
+///
+/// Sends `send` (if given) through the daemon's write path, then matches
+/// `pattern` against the bytes received *after* the send completes, up to
+/// `timeout_ms`. Both outcomes are 200 responses:
+///   match:   {"matched": true,  "match": …, "captures": […], "elapsed_ms": N}
+///   timeout: {"matched": false, "lagged": bool, "tail": …}
+/// Errors: 400 bad regex, 404 unknown interface, 409 an expect is already in
+/// flight on this interface, 503 supervisor not running.
+async fn expect(
+    State(s): State<AppState>,
+    Query(q): Query<IfaceParam>,
+    Json(body): Json<ExpectBody>,
+) -> Response {
+    let handle = match resolve(&s.serials, &q.interface) {
+        Some(h) => h.clone(),
+        None => {
+            let what = q.interface.as_deref().unwrap_or("(default)");
+            return (
+                StatusCode::NOT_FOUND,
+                [CORS],
+                format!("no interface '{what}'"),
+            )
+                .into_response();
+        }
+    };
+    let pattern = match regex::bytes::Regex::new(&body.pattern) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                [CORS],
+                format!("bad pattern: {e}\n"),
+            )
+                .into_response()
+        }
+    };
+    let req = ExpectRequest {
+        send: body.send.map(|t| Bytes::from(t.into_bytes())),
+        pace: std::time::Duration::from_millis(body.pace_ms),
+        pattern,
+        timeout: std::time::Duration::from_millis(body.timeout_ms.min(MAX_EXPECT_TIMEOUT_MS)),
+    };
+    match handle.expect(req).await {
+        Ok(ExpectOutcome::Match {
+            matched,
+            captures,
+            elapsed_ms,
+        }) => (
+            [CORS],
+            Json(serde_json::json!({
+                "matched": true,
+                "match": matched,
+                "captures": captures,
+                "elapsed_ms": elapsed_ms,
+            })),
+        )
+            .into_response(),
+        Ok(ExpectOutcome::Timeout { tail, lagged }) => (
+            [CORS],
+            Json(serde_json::json!({
+                "matched": false,
+                "lagged": lagged,
+                "tail": tail,
+            })),
+        )
+            .into_response(),
+        Err(ExpectError::Busy) => (
+            StatusCode::CONFLICT,
+            [CORS],
+            format!("{}\n", ExpectError::Busy),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, [CORS], format!("{e}\n")).into_response(),
+    }
+}
+
+/// Inject a labelled marker line into the stream/scrollback/capture log, so a
+/// client-driven operation (e.g. a flash transfer) is legible in the capture.
+///
+/// `POST /marker?[interface=NAME]`, JSON body `{"label": "text"}`.
+async fn marker(
+    State(s): State<AppState>,
+    Query(q): Query<IfaceParam>,
+    Json(body): Json<MarkerBody>,
+) -> Response {
+    let handle = match resolve(&s.serials, &q.interface) {
+        Some(h) => h.clone(),
+        None => {
+            let what = q.interface.as_deref().unwrap_or("(default)");
+            return (
+                StatusCode::NOT_FOUND,
+                [CORS],
+                format!("no interface '{what}'"),
+            )
+                .into_response();
+        }
+    };
+    handle.client_marker(&body.label);
+    ([CORS], "marker emitted\n").into_response()
 }
 
 async fn stream(

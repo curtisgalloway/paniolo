@@ -80,7 +80,7 @@ link (§7) is the only cross-subsystem coupling today.
 **All configuration lives in one CLI-managed lab file** — `~/.config/paniolo/lab.toml`, or
 `--lab` / `PANIOLO_LAB` to point elsewhere (e.g. a git-tracked file). It names the **hosts** and
 the **targets**, each target's hardware described as *channels* (`netboot`, `serial`, `power`,
-`video`, `hid`, `adb`) bound to the host they're physically attached to. No daemon is needed to read
+`video`, `hid`, `adb`, `flash`) bound to the host they're physically attached to. No daemon is needed to read
 it; if exactly one target is configured it is the default and may be omitted from every command.
 The schema (`cli/src/model.rs`):
 
@@ -115,6 +115,10 @@ cmd = "hidrig -d /dev/…"         # opaque helper prefix; `paniolo hid send` ap
 
 [targets.target-machine.adb]     # an Android DUT reached over adb
 serial = "33271JEGR02033"        # `adb -s <serial>`; omit for the sole device
+
+[targets.target-machine.flash]   # firmware flashing over a serial channel
+method = "bao1x-uf2"             # protocol client in the CLI (flash.md)
+interface = "console"            # which serial interface carries the bootloader REPL
 ```
 
 Every channel also takes an optional `host = "<name>"` to bind it to a remote control host
@@ -191,6 +195,26 @@ into the port. `paniolo serial log` reads the on-disk JSONL **directly** (no dae
 so it works whether or not the daemon is running. A separate, dependency-light **interactive**
 path (`paniolo serial connect`) execs `tio` for a foreground terminal — it holds the port
 exclusively and so conflicts with the daemon.
+
+The daemon also exposes a **generic send/expect primitive** (`POST /expect`:
+send bytes through the daemon-held port, wait for a regex in the bytes received
+afterwards — one in flight per interface, DTR refused meanwhile) and a marker
+injector (`POST /marker`), surfaced as `paniolo serial expect`. They exist so
+console *protocols* can be scripted through the daemon while capture keeps
+running; the daemon itself stays vendor-free — protocol clients live in the CLI.
+
+### Flash ([`flash.md`](flash.md))
+The `flash` channel reflashes a target through its serial console, built
+entirely on the send/expect primitive: the CLI-side protocol client
+(`cli/src/flash.rs`, method `bao1x-uf2` — UF2 blocks base64'd to the Baochip-1x
+boot1 REPL, per-block ack validation, retries, abort thresholds) drives
+`/expect` rounds against the daemon, so the transfer coexists with capture and
+its acks land in the serial log. The channel has **no host of its own** — it
+rides the serial interface it names, which structurally guarantees the transfer
+runs where that interface's daemon runs; `flash write` ships UF2 files to a
+remote serial host over the ssh.rs transport before re-exec, and `--cycle`
+composes with the power channel (run dev-machine-side when power lives on a
+different host).
 
 ### Power control ([`power.md`](power.md))
 Two mechanisms, both driven through serial/config: **DTR via FTDI** (the serial adapter's DTR

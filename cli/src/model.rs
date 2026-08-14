@@ -34,6 +34,8 @@ use serde::Deserialize;
 pub const LOCAL: &str = "local";
 pub const DEFAULT_HOST_IP: &str = "192.168.99.1";
 pub const VALID_SENSE_SIGNALS: [&str; 4] = ["cts", "dsr", "dcd", "ri"];
+/// Flash protocol clients the CLI implements (see cli/src/flash.rs).
+pub const VALID_FLASH_METHODS: [&str; 1] = ["bao1x-uf2"];
 
 /// The lab file is malformed or a mutation would make it invalid.
 #[derive(Debug, thiserror::Error)]
@@ -184,6 +186,18 @@ pub struct AdbChannel {
     pub host: Option<String>,
 }
 
+/// Firmware flashing over one of the target's serial channels. `method` names
+/// the protocol client in the CLI (see [`VALID_FLASH_METHODS`]); `interface`
+/// names which serial interface carries the bootloader REPL (optional when the
+/// target has exactly one). Deliberately no `host`: the transfer must run
+/// where that serial interface's capture daemon runs, so flash always resolves
+/// to its serial interface's host.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct FlashChannel {
+    pub method: String,
+    pub interface: Option<String>,
+}
+
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct Target {
     pub host: Option<String>,
@@ -199,11 +213,26 @@ pub struct Target {
     pub video: Option<VideoChannel>,
     pub hid: Option<HidChannel>,
     pub adb: Option<AdbChannel>,
+    pub flash: Option<FlashChannel>,
 }
 
 impl Target {
     pub fn default_host(&self) -> &str {
         self.host.as_deref().unwrap_or(LOCAL)
+    }
+
+    /// The serial channel the flash channel rides: the one it names, else the
+    /// target's sole serial interface. None when unresolvable (no flash
+    /// channel, named interface missing, or zero/multiple candidates).
+    pub fn flash_serial(&self) -> Option<&SerialChannel> {
+        let fl = self.flash.as_ref()?;
+        match &fl.interface {
+            Some(name) => self.serial.iter().find(|s| &s.name == name),
+            None => match self.serial.len() {
+                1 => self.serial.first(),
+                _ => None,
+            },
+        }
     }
 }
 
@@ -225,6 +254,7 @@ pub enum ChannelKind {
     Video,
     Hid,
     Adb,
+    Flash,
 }
 
 impl ChannelKind {
@@ -236,6 +266,7 @@ impl ChannelKind {
             ChannelKind::Video => "video",
             ChannelKind::Hid => "hid",
             ChannelKind::Adb => "adb",
+            ChannelKind::Flash => "flash",
         }
     }
 }
@@ -368,6 +399,23 @@ impl Lab {
                 fields: f,
             });
         }
+        if let Some(fl) = &t.flash {
+            let mut f = vec![("method", fl.method.clone())];
+            push_opt(&mut f, "interface", &fl.interface);
+            // No host of its own: flash resolves to its serial interface's
+            // host (falling back to the target default when unresolvable, so
+            // the command body can report the config problem).
+            let host = t
+                .flash_serial()
+                .map(|s| host_of(&s.host))
+                .unwrap_or_else(|| default_host.clone());
+            channels.push(ResolvedChannel {
+                kind: ChannelKind::Flash,
+                name: "flash".into(),
+                host,
+                fields: f,
+            });
+        }
         Some(ResolvedTarget {
             name: name.to_string(),
             default_host,
@@ -491,6 +539,23 @@ pub fn validate(lab: &Lab) -> Result<(), LabError> {
         if let Some(adb) = &t.adb {
             let h = adb.host.as_deref().unwrap_or(default_host);
             check_host_ref(h, &declared, &format!("target '{name}' adb"))?;
+        }
+        if let Some(fl) = &t.flash {
+            if !VALID_FLASH_METHODS.contains(&fl.method.as_str()) {
+                return lab_err(format!(
+                    "target '{name}' flash: unknown method '{}' (valid: {})",
+                    fl.method,
+                    VALID_FLASH_METHODS.join(", ")
+                ));
+            }
+            if let Some(iface) = &fl.interface {
+                if !t.serial.iter().any(|s| &s.name == iface) {
+                    return lab_err(format!(
+                        "target '{name}' flash: interface '{iface}' is not one of the \
+                         target's serial interfaces"
+                    ));
+                }
+            }
         }
         let mut seen: BTreeSet<&str> = BTreeSet::new();
         for s in &t.serial {
@@ -720,6 +785,74 @@ mod tests {
         );
         // The device id is plumbed via channel_host like any singleton kind.
         assert_eq!(channel_host(&rt, ChannelKind::Adb, None).unwrap(), "bench1");
+    }
+
+    #[test]
+    fn flash_resolves_to_its_serial_interfaces_host() {
+        let lab = parse(
+            r#"
+            [hosts.bench1]
+            ssh = "u@bench1"
+            [hosts.bench2]
+            ssh = "u@bench2"
+            [targets.dabao]
+            host = "bench1"
+            [[targets.dabao.serial]]
+            name = "console"
+            device = "/dev/cu.usbmodem1101"
+            baud = 1000000
+            host = "bench2"
+            [targets.dabao.flash]
+            method = "bao1x-uf2"
+            interface = "console"
+            "#,
+        )
+        .unwrap();
+        let rt = lab.resolved_target("dabao").unwrap();
+        let fl = rt
+            .channels
+            .iter()
+            .find(|c| c.kind == ChannelKind::Flash)
+            .expect("flash channel");
+        assert_eq!(
+            fl.host, "bench2",
+            "flash rides its serial interface's host, not the target default"
+        );
+        assert_eq!(
+            channel_host(&rt, ChannelKind::Flash, None).unwrap(),
+            "bench2"
+        );
+        // flash_serial resolves the named interface…
+        let t = &lab.targets["dabao"];
+        assert_eq!(t.flash_serial().unwrap().name, "console");
+    }
+
+    #[test]
+    fn flash_serial_falls_back_to_sole_interface() {
+        let lab = parse(
+            r#"
+            [targets.dabao]
+            [[targets.dabao.serial]]
+            name = "console"
+            device = "/dev/x"
+            [targets.dabao.flash]
+            method = "bao1x-uf2"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(lab.targets["dabao"].flash_serial().unwrap().name, "console");
+    }
+
+    #[test]
+    fn validate_rejects_unknown_flash_method_and_interface() {
+        let e = parse("[targets.t]\n[targets.t.flash]\nmethod = \"nope\"\n").unwrap_err();
+        assert!(e.0.contains("unknown method 'nope'"), "{}", e.0);
+        let e = parse(
+            "[targets.t]\n[[targets.t.serial]]\nname=\"c\"\ndevice=\"/d\"\n\
+             [targets.t.flash]\nmethod = \"bao1x-uf2\"\ninterface = \"ghost\"\n",
+        )
+        .unwrap_err();
+        assert!(e.0.contains("interface 'ghost' is not one of"), "{}", e.0);
     }
 
     #[test]

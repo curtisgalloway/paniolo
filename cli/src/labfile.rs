@@ -451,6 +451,23 @@ impl LabFile {
         self.remove_singleton(target, "adb")
     }
 
+    pub fn set_flash(
+        &mut self,
+        target: &str,
+        method: Option<&str>,
+        interface: Option<&str>,
+    ) -> Result<(), LabError> {
+        self.set_singleton(
+            target,
+            "flash",
+            &[("method", method), ("interface", interface)],
+        )
+    }
+
+    pub fn remove_flash(&mut self, target: &str) -> Result<(), LabError> {
+        self.remove_singleton(target, "flash")
+    }
+
     fn target_mut(&mut self, name: &str) -> Result<&mut Table, LabError> {
         self.doc
             .get_mut("targets")
@@ -688,6 +705,35 @@ mod tests {
         lf.save().unwrap();
         let lab = model::load(&path).unwrap();
         assert!(lab.targets["pixel"].adb.is_none());
+    }
+
+    #[test]
+    fn set_flash_round_trips_and_removes() {
+        let (_d, path) = tmp();
+        let mut lf = LabFile::create(&path);
+        lf.add_target("dabao", None, None).unwrap();
+        lf.add_serial(
+            "dabao",
+            "console",
+            "/dev/cu.usbmodem1101",
+            1_000_000,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        lf.set_flash("dabao", Some("bao1x-uf2"), Some("console"))
+            .unwrap();
+        lf.save().unwrap();
+        let lab = model::load(&path).unwrap();
+        let fl = lab.targets["dabao"].flash.as_ref().unwrap();
+        assert_eq!(fl.method, "bao1x-uf2");
+        assert_eq!(fl.interface.as_deref(), Some("console"));
+
+        lf.remove_flash("dabao").unwrap();
+        lf.save().unwrap();
+        let lab = model::load(&path).unwrap();
+        assert!(lab.targets["dabao"].flash.is_none());
     }
 
     #[test]

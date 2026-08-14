@@ -66,6 +66,20 @@
 | SER-E | `serial add/set/rm/devices/show`, multi-interface per target | M | ☑ | |
 | SER-F | DTR control: `serial dtr`, `serial reset` (soft-reset semantics) | M | ☑ | `cli/src/power.rs` |
 | SER-G | Power-sense read via modem-control input (`--power-sense cts\|dsr\|dcd\|ri`) | S | ☑ | `/status` → `power_on` |
+| SER-H | Generic **send/expect** primitive through the daemon (`POST /expect`, `paniolo serial expect`): matches only post-send bytes, bounded buffer, one in flight per interface, DTR refused while active | M | ☑ | `serialcap/src/serial_io.rs`; contract in [serial.md](serial.md) (2026-08) |
+| SER-I | Client marker injection (`POST /marker`) so CLI-driven operations are legible in the capture log | S | ☑ | used by flash transfers |
+
+### 3.1 Flash channel (serial-console firmware flashing)
+
+| ID | Requirement | Pri | Status | Notes |
+|---|---|---|---|---|
+| FLASH-1 | `flash` channel: per-target singleton **riding a serial interface** (no host of its own); `flash set/show/rm` | M | ☑ | `cli/src/model.rs`, `labfile.rs`; [flash.md](flash.md) |
+| FLASH-2 | `bao1x-uf2` protocol client: base64 UF2 blocks to the boot1 REPL via `/expect` rounds, ack **field validation**, 3 attempts/block, abort after 5 failed blocks, localecho off/on, `has-crc` variant probe | M | ☑ | `cli/src/flash.rs`; reference `bao1x-boot/uf2send.py`; any failed block = transfer failure |
+| FLASH-3 | `flash write --cycle` / `--boot` composite: power-channel entry, unique-nonce `echo` probe, `boot` (not `reset`) to start the OS | M | ☑ | bootwait one-time board prep documented, not automated |
+| FLASH-4 | Remote flash: UF2 files shipped to the serial host over SSH; cross-host `--cycle` runs the power step dev-machine-side | S | ☑ | `dispatch::ship_file`; flash ships with its serial interface in the lab slice |
+| FLASH-5 | `discover`/`configure` recognize the boot1 CDC console (USB `1d50:6196`) and propose the channel | S | ☑ | `cli/src/discover.rs` |
+| FLASH-6 | Hardware-in-the-loop validation on the dabao board (reset-vs-boot, shipped uf2 variant, cold-boot timing, transfer timing, paced localecho) | M | ☐ | checklist in [flash.md](flash.md#hardware-verification-status) |
+| FLASH-7 | `uf2-spim` (2-arg `uf2` + CRC-32 + `uf2_flush`) variant support | C | ⤵ | today: abort with a precise diagnosis (baosec-class boards) |
 
 ## 4. Power control
 
@@ -188,7 +202,7 @@ USB passthrough — verify USB observations on the hypervisor, not in the guest.
 | DEP-1 | netboot **stands down** under CI; no DHCP/TFTP contention | BOTH | M | ☐ | guard `netboot start` when CI attach active |
 | DEP-2 | netboot remains available for interactive/non-CI use | OWNER | M | ☑ | exists (NET-1..4); just not the CI path |
 | DEP-3 | (Full) paniolo-serves-images as a non-standard LAVA deploy method | LAVA | C | ⤵ | only if a board can't use LAVA TFTP |
-| BOOT-1 | `paniolo serial wait --match <regex> [--timeout]` boot-detect helper | OWNER | S | ⤵ | not required by either orchestrator; ergonomics |
+| BOOT-1 | `paniolo serial wait --match <regex> [--timeout]` boot-detect helper | OWNER | S | ☑ | subsumed by `paniolo serial expect --pattern … --timeout-ms …` (SER-H): pure-wait mode is exactly this |
 | JTAG-1 | `[jtag]`/`[debug]` config schema + `paniolo debug {halt\|resume\|reset\|gdb}` stubs | OWNER | C | ☐ | extension point only per D-4 |
 | JTAG-2 | OpenOCD backend: reset, flash-deploy, GDB `:3333` / Tcl `:6666` sockets | OWNER | C | ⤵ | deferred |
 

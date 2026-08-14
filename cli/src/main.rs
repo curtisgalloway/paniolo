@@ -24,6 +24,7 @@ mod daemons;
 mod discover;
 mod dispatch;
 mod doctor;
+mod flash;
 mod labfile;
 mod model;
 mod netboot;
@@ -116,6 +117,11 @@ enum Command {
     Adb {
         #[command(subcommand)]
         cmd: AdbCmd,
+    },
+    /// Flash firmware to a target over its serial console (hands-free UF2).
+    Flash {
+        #[command(subcommand)]
+        cmd: FlashCmd,
     },
     /// Open the combined video+serial dashboard, starting daemons if needed.
     Console {
@@ -386,6 +392,43 @@ enum SerialCmd {
         #[arg(long)]
         no_newline: bool,
     },
+    /// Send input and wait for a pattern in the response (one exchange
+    /// through the running daemon; capture keeps running).
+    ///
+    /// The pattern is a regex matched against the raw bytes received *after*
+    /// the send completes (not ANSI-stripped, not line-split — anchor with
+    /// \r?\n or \s when a complete line matters). Exits 0 on match, 1 on
+    /// timeout. Automates console interactions that otherwise need `serial
+    /// send` + `serial log --since` polling: U-Boot autoboot interrupts,
+    /// login prompts, AT commands, bootloader protocols.
+    Expect {
+        /// Target (optional when the lab has one); `-t` also accepted.
+        #[arg(value_name = "TARGET", conflicts_with = "target")]
+        target_pos: Option<String>,
+        #[arg(long, short)]
+        target: Option<String>,
+        /// Regex to wait for, e.g. 'Wrote (\d+) to (0x[0-9a-fA-F]+)\s'.
+        #[arg(long, short)]
+        pattern: String,
+        /// Text to send before matching starts (omit for a pure wait). A
+        /// carriage return is appended unless --no-newline.
+        #[arg(long, short)]
+        send: Option<String>,
+        /// Don't append a carriage return after --send text.
+        #[arg(long)]
+        no_newline: bool,
+        /// How long to wait for the pattern, in milliseconds.
+        #[arg(long, default_value_t = 5000)]
+        timeout_ms: u64,
+        /// Per-byte pacing in ms for the send (0 = full rate), as `serial send`.
+        #[arg(long, default_value_t = 0)]
+        pace_ms: u32,
+        #[arg(long, short)]
+        interface: Option<String>,
+        /// Print the exchange result as JSON (matched, captures, tail…).
+        #[arg(long)]
+        json: bool,
+    },
     /// Print captured serial output (reads serialcap's on-disk log).
     Log {
         /// Target (optional when the lab has one); `-t` also accepted.
@@ -439,6 +482,56 @@ enum SerialCmd {
         ms: u64,
         #[arg(long, short)]
         interface: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum FlashCmd {
+    /// Configure the target's flash channel (one per target).
+    ///
+    /// Flashing rides one of the target's serial channels: the transfer goes
+    /// through the running serialcap daemon, so capture keeps running and the
+    /// device's responses land in the serial log.
+    Set {
+        #[arg(long, short)]
+        target: String,
+        /// Flash protocol. Only `bao1x-uf2` today: UF2 blocks streamed to the
+        /// Baochip-1x boot1 bootloader REPL over the serial console.
+        #[arg(long, default_value = "bao1x-uf2")]
+        method: String,
+        /// Serial interface that carries the bootloader REPL (default: the
+        /// target's sole serial interface).
+        #[arg(long, short)]
+        interface: Option<String>,
+    },
+    /// Remove the target's flash channel.
+    Rm {
+        #[arg(long, short)]
+        target: String,
+    },
+    /// Show the target's flash channel config.
+    Show { target: Option<String> },
+    /// Flash UF2 image(s) to the target, in argument order.
+    ///
+    /// The bootloader REPL must be reachable on the flash serial interface —
+    /// pass --cycle to power-cycle into it (needs the target's power channel,
+    /// and the one-time `bootwait enable` board prep; see docs/flash.md).
+    /// Starts the serial daemon if it isn't running. Any block that fails all
+    /// its attempts fails the whole transfer.
+    Write {
+        /// Target then UF2 file(s) (`flash write dabao apps.uf2`), or just
+        /// file(s) when the target is given with -t or the lab has one.
+        #[arg(value_name = "TARGET|FILE.uf2", required = true)]
+        args: Vec<String>,
+        #[arg(long, short)]
+        target: Option<String>,
+        /// Power-cycle the target into the bootloader REPL first (via its
+        /// power channel), then wait for the REPL to answer.
+        #[arg(long)]
+        cycle: bool,
+        /// Boot the OS after the last file (sends the REPL's `boot` command).
+        #[arg(long)]
+        boot: bool,
     },
 }
 
@@ -733,6 +826,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Video { cmd } => video_cmd(lab_flag, cmd),
         Command::Hid { cmd } => hid_cmd(lab_flag, cmd),
         Command::Adb { cmd } => adb_cmd(lab_flag, cmd),
+        Command::Flash { cmd } => flash_cmd(lab_flag, cmd),
         Command::Console { target, interface } => {
             cmd_console(lab_flag, target.as_deref(), interface.as_deref())
         }
@@ -1145,6 +1239,23 @@ fn cmd_discover(json: bool) -> Result<()> {
             captures.join("\n\t")
         }
     );
+    let flashes: Vec<String> = inv["flash"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|d| {
+                    format!(
+                        "{}  ({} boot1 console — bao1x-uf2)",
+                        d["device"].as_str().unwrap_or(""),
+                        d["desc"].as_str().unwrap_or("Baochip-1x")
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !flashes.is_empty() {
+        println!("flash\t{}", flashes.join("\n\t"));
+    }
     let adbs: Vec<String> = inv["adb"]
         .as_array()
         .map(|a| {
@@ -1728,6 +1839,27 @@ fn serial_cmd(lab_flag: Option<&str>, cmd: SerialCmd) -> Result<()> {
                 !no_newline,
             )
         }
+        SerialCmd::Expect {
+            target_pos,
+            target,
+            pattern,
+            send,
+            no_newline,
+            timeout_ms,
+            pace_ms,
+            interface,
+            json,
+        } => cmd_serial_expect(
+            lab_flag,
+            target_pos.or(target).as_deref(),
+            interface.as_deref(),
+            &pattern,
+            send.as_deref(),
+            no_newline,
+            timeout_ms,
+            pace_ms,
+            json,
+        ),
         SerialCmd::Log {
             target_pos,
             target,
@@ -2489,6 +2621,71 @@ fn cmd_serial_send(
     serial::send_input(&url, &ch.name, &payload, pace_ms)?;
     println!("Sent.");
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_serial_expect(
+    lab_flag: Option<&str>,
+    target: Option<&str>,
+    interface: Option<&str>,
+    pattern: &str,
+    send: Option<&str>,
+    no_newline: bool,
+    timeout_ms: u64,
+    pace_ms: u32,
+    json: bool,
+) -> Result<()> {
+    let (target, serials) = serial_runtime(lab_flag, target, interface, dispatch::Mode::Reexec)?;
+    let ch = pick_serial(&serials, interface)?;
+    let url = serial::daemon_url(&target).ok_or_else(|| {
+        anyhow!("serialcap daemon not running — start it with `paniolo serial watch`")
+    })?;
+    let send_text = send.map(|s| {
+        if no_newline {
+            s.to_string()
+        } else {
+            format!("{s}\r")
+        }
+    });
+    let resp = serial::send_expect(
+        &url,
+        &ch.name,
+        send_text.as_deref(),
+        pattern,
+        timeout_ms,
+        pace_ms,
+    )?;
+    if json {
+        println!("{}", serde_json::to_string(&resp)?);
+    } else if resp.matched {
+        println!(
+            "Matched in {} ms: {:?}",
+            resp.elapsed_ms.unwrap_or(0),
+            resp.match_text.as_deref().unwrap_or("")
+        );
+        for (i, c) in resp.captures.iter().enumerate() {
+            match c {
+                Some(text) => println!("  ${}: {:?}", i + 1, text),
+                None => println!("  ${}: (no match)", i + 1),
+            }
+        }
+    } else {
+        if resp.lagged {
+            eprintln!("Output was dropped mid-wait (daemon fan-out lagged) — treated as timeout.");
+        }
+        eprintln!("No match within {timeout_ms} ms.");
+        let tail = resp.tail.as_deref().unwrap_or("");
+        if tail.is_empty() {
+            eprintln!("No output received during the wait.");
+        } else {
+            eprintln!("Tail of received output:\n{tail}");
+        }
+    }
+    if resp.matched {
+        Ok(())
+    } else {
+        std::process::exit(1);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3392,6 +3589,267 @@ fn cmd_adb_devices(lab_flag: Option<&str>, host: Option<&str>) -> Result<()> {
     let mut argv = vec![adb::DEFAULT_ADB.to_string()];
     argv.extend(rest);
     std::process::exit(ssh::run_passthrough(&resolved, &argv, &[])?);
+}
+
+// ── flash ───────────────────────────────────────────────────────────────────
+
+fn flash_cmd(lab_flag: Option<&str>, cmd: FlashCmd) -> Result<()> {
+    match cmd {
+        FlashCmd::Set {
+            target,
+            method,
+            interface,
+        } => {
+            edit_lab(lab_flag, |lf| {
+                lf.set_flash(&target, Some(&method), interface.as_deref())
+            })?;
+            println!("Flash channel set on '{target}': method {method}.");
+            Ok(())
+        }
+        FlashCmd::Rm { target } => {
+            edit_lab(lab_flag, |lf| lf.remove_flash(&target))?;
+            println!("Flash channel removed from '{target}'.");
+            Ok(())
+        }
+        FlashCmd::Show { target } => cmd_flash_show(lab_flag, target.as_deref()),
+        FlashCmd::Write {
+            args,
+            target,
+            cycle,
+            boot,
+        } => cmd_flash_write(lab_flag, target.as_deref(), args, cycle, boot),
+    }
+}
+
+fn cmd_flash_show(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    let target = resolve_single_target(&lab, target)?;
+    let t = lab
+        .targets
+        .get(&target)
+        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+    let Some(fc) = &t.flash else {
+        println!("No flash channel configured. (paniolo flash set -t {target} --method bao1x-uf2)");
+        return Ok(());
+    };
+    println!("method\t{}", fc.method);
+    match t.flash_serial() {
+        Some(s) => {
+            let host = s.host.as_deref().unwrap_or(t.default_host());
+            println!(
+                "interface\t{} ({} @ {}, host {host})",
+                s.name, s.device, s.baud
+            );
+        }
+        None => match &fc.interface {
+            Some(i) => println!("interface\t{i} (NOT one of the target's serial interfaces!)"),
+            None => println!(
+                "interface\t(unset — target needs exactly one serial interface, \
+                 or set flash.interface)"
+            ),
+        },
+    }
+    Ok(())
+}
+
+/// The serialcap daemon URL for `target`, starting (or restarting a stale)
+/// daemon if needed — `flash write` must not depend on a separate `serial
+/// watch` step, and a pre-/expect binary would 404 the transfer.
+fn ensure_serial_daemon(lab: &Lab, target: &str) -> Result<String> {
+    if let Some(url) = serial::daemon_url(target) {
+        if daemons::binary_is_stale(serial::DAEMON, Some(target)) == Some(true) {
+            eprintln!("Serial daemon for '{target}' was built from an older binary; restarting…");
+            let _ = serial::stop_daemon(target);
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        } else {
+            return Ok(url);
+        }
+    }
+    let serials = local_serials(lab, target)?;
+    if serials.is_empty() {
+        bail!("no serial interfaces configured for '{target}' (paniolo serial add ...)");
+    }
+    eprintln!("Starting serial daemon for '{target}'…");
+    serial::start_daemon(&serials, 0, target)?;
+    daemons::wait_for_daemon(
+        serial::DAEMON,
+        Some(target),
+        std::time::Duration::from_secs(5),
+    )
+    .ok_or_else(|| {
+        daemons::start_failure(
+            serial::DAEMON,
+            Some(target),
+            std::time::Duration::from_secs(5),
+        )
+    })
+}
+
+/// Power-cycle `target` wherever its power channel lives: local hooks when
+/// it's this host, a dispatched `power-cycle` / `power off`+`on` otherwise.
+/// Prefers cycle_cmd, falling back to off_cmd → on_cmd.
+fn power_cycle_anywhere(lab: &Lab, target: &str) -> Result<()> {
+    let t = lab
+        .targets
+        .get(target)
+        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+    let p = t.power.clone().ok_or_else(|| {
+        anyhow!("--cycle needs a power channel on '{target}' (paniolo power set -t {target} ...)")
+    })?;
+    let rt = lab.resolved_target(target).unwrap();
+    let power_host = model::channel_host(&rt, model::ChannelKind::Power, None)?;
+    let host = lab.host(&power_host);
+    let has_cycle = p.cycle_cmd.is_some();
+    let has_off_on = p.off_cmd.is_some() && p.on_cmd.is_some();
+    if !has_cycle && !has_off_on {
+        bail!(
+            "--cycle needs cycle_cmd (or off_cmd + on_cmd) on '{target}'s power channel \
+             (paniolo power set -t {target} --cycle-cmd ...)"
+        );
+    }
+    if host.is_local(&power_host) {
+        if has_cycle {
+            run_power_hook(&p.cycle_cmd.unwrap(), "Power cycling", target)?;
+        } else {
+            run_power_hook(&p.off_cmd.unwrap(), "Powering off", target)?;
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            run_power_hook(&p.on_cmd.unwrap(), "Powering on", target)?;
+        }
+        return Ok(());
+    }
+    let subs: Vec<Vec<&str>> = if has_cycle {
+        vec![vec!["power-cycle", target]]
+    } else {
+        vec![vec!["power", "off", target], vec!["power", "on", target]]
+    };
+    eprintln!("Power cycling '{target}' via {power_host}…");
+    for sub in subs {
+        let out = dispatch::run_subcommand(lab, target, &power_host, &sub)?;
+        if out.status != 0 {
+            let msg = if out.stderr.trim().is_empty() {
+                out.stdout.trim().to_string()
+            } else {
+                out.stderr.trim().to_string()
+            };
+            bail!("'{}' failed on {power_host}: {msg}", sub.join(" "));
+        }
+    }
+    Ok(())
+}
+
+/// How long `flash write` waits for the boot1 REPL to answer. Cold boot after
+/// --cycle covers USB CDC re-enumeration; without --cycle the REPL is expected
+/// to already be there, so the wait is just slack.
+const REPL_WAIT_AFTER_CYCLE: std::time::Duration = std::time::Duration::from_secs(30);
+const REPL_WAIT_NO_CYCLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn cmd_flash_write(
+    lab_flag: Option<&str>,
+    target_flag: Option<&str>,
+    positionals: Vec<String>,
+    cycle: bool,
+    boot: bool,
+) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    // First positional is the target when it names one in the lab (and -t
+    // wasn't given); everything else is UF2 files, in flash order.
+    let (target, file_args) = match target_flag {
+        Some(t) => (t.to_string(), positionals),
+        None => match positionals.split_first() {
+            Some((first, rest)) if lab.targets.contains_key(first) => {
+                (first.clone(), rest.to_vec())
+            }
+            _ => (resolve_single_target(&lab, None)?, positionals),
+        },
+    };
+    if file_args.is_empty() {
+        bail!("no UF2 files given (paniolo flash write {target} <file.uf2>…)");
+    }
+    let t = lab
+        .targets
+        .get(&target)
+        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+    if t.flash.is_none() {
+        bail!(
+            "target '{target}' has no flash channel \
+             (paniolo flash set -t {target} --method bao1x-uf2)"
+        );
+    }
+    let sch = t
+        .flash_serial()
+        .ok_or_else(|| match &t.flash.as_ref().unwrap().interface {
+            Some(i) => anyhow!("flash interface '{i}' is not one of '{target}'s serial interfaces"),
+            None => anyhow!(
+                "target '{target}' needs exactly one serial interface, \
+                 or name one with `paniolo flash set -t {target} --interface <name>`"
+            ),
+        })?;
+    let iface = sch.name.clone();
+
+    // Validate every image before any power or REPL action.
+    let files = flash::load_uf2_files(&file_args)?;
+
+    let rt = lab.resolved_target(&target).unwrap();
+    let serial_host = model::channel_host(&rt, model::ChannelKind::Serial, Some(&iface))?;
+    let host = lab.host(&serial_host);
+
+    if !host.is_local(&serial_host) {
+        // The slice shipped to the serial host carries only that host's
+        // channels — run the power step from here unless power is co-located
+        // (then the remote leg cycles+probes with no gap).
+        let mut cycle_remote = false;
+        if cycle {
+            let power_host = model::channel_host(&rt, model::ChannelKind::Power, None)?;
+            if power_host == serial_host {
+                cycle_remote = true;
+            } else {
+                power_cycle_anywhere(&lab, &target)?;
+            }
+        }
+        eprintln!("Shipping {} file(s) to {serial_host}…", file_args.len());
+        let mut remote_paths = Vec::new();
+        for p in &file_args {
+            let bytes = std::fs::read(p)?;
+            let rp = dispatch::ship_file(&host, &bytes, p)?;
+            eprintln!("  {p} → {serial_host}:{rp} ({} KiB)", bytes.len() / 1024);
+            remote_paths.push(rp);
+        }
+        let mut argv: Vec<String> = vec!["flash".into(), "write".into(), target.clone()];
+        argv.extend(remote_paths.iter().cloned());
+        if cycle_remote {
+            argv.push("--cycle".into());
+        }
+        if boot {
+            argv.push("--boot".into());
+        }
+        let code = dispatch::dispatch(&lab, &target, &serial_host, dispatch::Mode::Reexec, &argv)?;
+        let mut rm = vec!["rm".to_string(), "-f".to_string()];
+        rm.extend(remote_paths);
+        let _ = ssh::run(&host, &rm, None, &[]);
+        std::process::exit(code);
+    }
+
+    if cycle {
+        power_cycle_anywhere(&lab, &target)?;
+    }
+    let url = ensure_serial_daemon(&lab, &target)?;
+    let wait = if cycle {
+        REPL_WAIT_AFTER_CYCLE
+    } else {
+        REPL_WAIT_NO_CYCLE
+    };
+    eprintln!("Waiting for the boot1 REPL on '{iface}'…");
+    flash::probe_repl(&url, &iface, wait)?;
+    flash::flash_files(&url, &iface, &files)?;
+    if boot {
+        flash::send_boot(&url, &iface)?;
+        println!("Boot command sent.");
+    }
+    println!(
+        "Flash complete: {} file(s) written to '{target}'.",
+        files.len()
+    );
+    Ok(())
 }
 
 // ── rendering helpers ───────────────────────────────────────────────────────

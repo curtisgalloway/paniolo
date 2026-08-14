@@ -25,6 +25,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as stdmpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -42,6 +43,12 @@ const RING_BYTES: usize = 64 * 1024;
 const BROADCAST_CAP: usize = 1024;
 const WRITE_CAP: usize = 256;
 const REOPEN_DELAY: Duration = Duration::from_millis(750);
+/// Cap on the /expect match buffer. When exceeded, the oldest bytes are
+/// dropped (a match spanning the drop boundary is lost — acceptable: patterns
+/// are expected to match well within this window).
+const EXPECT_BUF_MAX: usize = 64 * 1024;
+/// How much trailing output a timed-out expect returns for diagnosis.
+const EXPECT_TAIL_BYTES: usize = 512;
 
 #[derive(Clone)]
 pub struct Status {
@@ -133,6 +140,63 @@ pub struct SerialHandle {
     /// Button-press requests: caller sends (duration_ms, responder); the
     /// supervisor asserts DTR for that many milliseconds then replies.
     dtr_tx: mpsc::Sender<(u64, oneshot::Sender<()>)>,
+    /// Raw byte chunks tee'd to the capture thread; held here so client-driven
+    /// markers ([`SerialHandle::client_marker`]) land in the on-disk log too.
+    line_tx: stdmpsc::Sender<Bytes>,
+    /// True while a send/expect exchange is running on this interface. One
+    /// expect in flight per interface; DTR presses are refused while set (a
+    /// press drops and reopens the port, killing the exchange mid-flight).
+    expect_active: Arc<AtomicBool>,
+}
+
+/// One send/expect exchange: optionally send bytes, then wait for `pattern`
+/// in the output that arrives afterwards.
+pub struct ExpectRequest {
+    /// Bytes to write before matching starts; None = pure wait.
+    pub send: Option<Bytes>,
+    /// Per-byte pacing for the send (see [`SerialHandle::write_paced`]).
+    pub pace: Duration,
+    /// Pattern matched over raw received bytes (not ANSI-stripped, not
+    /// line-split). Anchor with `\r?\n` / `\s` when a complete line matters.
+    pub pattern: regex::bytes::Regex,
+    pub timeout: Duration,
+}
+
+/// How an expect ended.
+pub enum ExpectOutcome {
+    Match {
+        /// The whole matched text (capture group 0).
+        matched: String,
+        /// Capture groups 1.., lossy UTF-8; None for groups that didn't
+        /// participate in the match.
+        captures: Vec<Option<String>>,
+        elapsed_ms: u64,
+    },
+    /// No match within the timeout. `lagged` = the broadcast receiver fell
+    /// behind and bytes were lost, so the match may have been missed (treated
+    /// as a timeout per the endpoint contract, never a panic).
+    Timeout {
+        /// Trailing output received during the wait, for diagnosis.
+        tail: String,
+        lagged: bool,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ExpectError {
+    #[error("an expect is already in flight on this interface")]
+    Busy,
+    #[error("supervisor not running")]
+    SupervisorDead,
+}
+
+/// Clears the expect-active flag when the exchange ends — including when the
+/// HTTP client disconnects and axum drops the future mid-await.
+struct ExpectGuard(Arc<AtomicBool>);
+impl Drop for ExpectGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 impl SerialHandle {
@@ -157,7 +221,14 @@ impl SerialHandle {
     /// - long press (≥3 s): PMIC hard power-off
     ///
     /// Blocks until the press completes. Concurrent calls queue and execute serially.
+    /// Refused while an expect is in flight — the press drops and reopens the
+    /// port, which would kill the exchange (or a flash transfer) mid-write.
     pub async fn dtr_press(&self, duration_ms: u64) -> anyhow::Result<()> {
+        if self.expect_in_flight() {
+            anyhow::bail!(
+                "an expect/transfer is active on this interface — retry when it finishes"
+            );
+        }
         let (resp_tx, resp_rx) = oneshot::channel();
         self.dtr_tx
             .send((duration_ms, resp_tx))
@@ -194,6 +265,102 @@ impl SerialHandle {
         }
         Ok(())
     }
+
+    /// True while a send/expect exchange is running on this interface.
+    pub fn expect_in_flight(&self) -> bool {
+        self.expect_active.load(Ordering::SeqCst)
+    }
+
+    /// One send/expect exchange through the daemon-held port, coexisting with
+    /// capture (the matcher taps the same broadcast fan-out the WS clients use).
+    ///
+    /// Contract (see docs/serial.md):
+    /// - Only bytes received *after* the send completes are considered — the
+    ///   receiver subscribes once the write has been handed off, the
+    ///   `reset_input_buffer` analog, so stale output in flight can't match.
+    /// - Matching is continuous over an assembled, bounded buffer of raw bytes
+    ///   (chunk boundaries can't hide a match; input is NOT ANSI-stripped and
+    ///   NOT line-split — anchor patterns that need a complete line).
+    /// - A broadcast `Lagged` error means bytes were lost; the exchange ends as
+    ///   a timeout with `lagged` set rather than matching over a gap.
+    /// - One expect in flight per interface ([`ExpectError::Busy`] otherwise).
+    pub async fn expect(&self, req: ExpectRequest) -> Result<ExpectOutcome, ExpectError> {
+        if self
+            .expect_active
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(ExpectError::Busy);
+        }
+        let _guard = ExpectGuard(self.expect_active.clone());
+
+        if let Some(data) = req.send {
+            self.write_paced(data, req.pace)
+                .await
+                .map_err(|_| ExpectError::SupervisorDead)?;
+        }
+        // Subscribe only now: broadcast receivers see nothing sent before the
+        // subscription, which is exactly the only-after-send contract.
+        let mut rx = self.to_clients.subscribe();
+
+        let started = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + req.timeout;
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            let chunk = match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Err(_) => {
+                    return Ok(ExpectOutcome::Timeout {
+                        tail: expect_tail(&buf),
+                        lagged: false,
+                    })
+                }
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                    return Ok(ExpectOutcome::Timeout {
+                        tail: expect_tail(&buf),
+                        lagged: true,
+                    })
+                }
+                Ok(Err(broadcast::error::RecvError::Closed)) => {
+                    return Err(ExpectError::SupervisorDead)
+                }
+                Ok(Ok(chunk)) => chunk,
+            };
+            buf.extend_from_slice(&chunk);
+            let overflow = buf.len().saturating_sub(EXPECT_BUF_MAX);
+            if overflow > 0 {
+                buf.drain(0..overflow);
+            }
+            if let Some(caps) = req.pattern.captures(&buf) {
+                let text =
+                    |m: regex::bytes::Match| String::from_utf8_lossy(m.as_bytes()).into_owned();
+                return Ok(ExpectOutcome::Match {
+                    matched: caps.get(0).map(text).unwrap_or_default(),
+                    captures: (1..caps.len()).map(|i| caps.get(i).map(text)).collect(),
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                });
+            }
+        }
+    }
+
+    /// Inject a client-supplied marker line into the stream, scrollback, and
+    /// capture log (same shape as the connect/disconnect markers), so external
+    /// operations — e.g. a flash transfer — are legible in the log. The daemon
+    /// stays vendor-free: the label is opaque text.
+    pub fn client_marker(&self, label: &str) {
+        // One line, no control bytes: the marker must not corrupt the log.
+        let clean: String = label
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(120)
+            .collect();
+        emit_marker(&self.ring, &self.to_clients, &self.line_tx, &clean, 33); // yellow
+    }
+}
+
+/// Lossy text of the last [`EXPECT_TAIL_BYTES`] of the match buffer.
+fn expect_tail(buf: &[u8]) -> String {
+    let start = buf.len().saturating_sub(EXPECT_TAIL_BYTES);
+    String::from_utf8_lossy(&buf[start..]).into_owned()
 }
 
 /// Spawn the supervisor for one interface on the current tokio runtime and return
@@ -224,7 +391,7 @@ pub fn spawn_interface(
         dtr_rx,
         ring.clone(),
         status.clone(),
-        line_tx,
+        line_tx.clone(),
     ));
 
     SerialHandle {
@@ -233,6 +400,8 @@ pub fn spawn_interface(
         ring,
         status,
         dtr_tx,
+        line_tx,
+        expect_active: Arc::new(AtomicBool::new(false)),
     }
 }
 
@@ -554,6 +723,7 @@ mod tests {
         let (to_clients, _) = broadcast::channel(16);
         let (write_tx, write_rx) = mpsc::channel(WRITE_CAP);
         let (dtr_tx, _dtr_rx) = mpsc::channel(1);
+        let (line_tx, _line_rx) = stdmpsc::channel();
         let status = Arc::new(Mutex::new(Status {
             device: "test".into(),
             baud: 115_200,
@@ -566,6 +736,8 @@ mod tests {
             ring: ring(),
             status,
             dtr_tx,
+            line_tx,
+            expect_active: Arc::new(AtomicBool::new(false)),
         };
         // _dtr_rx is held by the caller's scope only long enough to build the
         // handle; write_paced never touches the DTR path.
@@ -610,5 +782,131 @@ mod tests {
             .await
             .unwrap();
         assert!(rx.try_recv().is_err());
+    }
+
+    // ── expect: the generic send/expect primitive ───────────────────────────
+
+    fn expect_req(send: Option<&'static [u8]>, pattern: &str, timeout_ms: u64) -> ExpectRequest {
+        ExpectRequest {
+            send: send.map(Bytes::from_static),
+            pace: Duration::ZERO,
+            pattern: regex::bytes::Regex::new(pattern).unwrap(),
+            timeout: Duration::from_millis(timeout_ms),
+        }
+    }
+
+    /// Feed chunks to the fan-out once a subscriber exists (the expect call
+    /// subscribes after its send completes, so a fixed sleep would race).
+    fn feed_chunks(h: &SerialHandle, chunks: &'static [&'static [u8]]) {
+        let tx = h.to_clients.clone();
+        tokio::spawn(async move {
+            while tx.receiver_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            for c in chunks {
+                let _ = tx.send(Bytes::from_static(c));
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn expect_matches_across_chunk_boundaries_with_captures() {
+        let (h, _rx) = test_handle();
+        feed_chunks(&h, &[b"noise\r\nWrote 476 to 0x6", b"0100000\r\n"]);
+        let out = h
+            .expect(expect_req(
+                Some(b"uf2 AAAA\r"),
+                r"Wrote (\d+) to (0x[0-9a-fA-F]+)\s",
+                2_000,
+            ))
+            .await
+            .unwrap();
+        match out {
+            ExpectOutcome::Match {
+                matched, captures, ..
+            } => {
+                assert!(matched.starts_with("Wrote 476 to 0x60100000"));
+                assert_eq!(captures[0].as_deref(), Some("476"));
+                assert_eq!(captures[1].as_deref(), Some("0x60100000"));
+            }
+            ExpectOutcome::Timeout { tail, .. } => panic!("timed out, tail: {tail:?}"),
+        }
+        assert!(!h.expect_in_flight(), "flag cleared after the exchange");
+    }
+
+    #[tokio::test]
+    async fn expect_timeout_returns_received_tail() {
+        let (h, _rx) = test_handle();
+        feed_chunks(&h, &[b"Corrupt base64\r\n"]);
+        let out = h
+            .expect(expect_req(Some(b"uf2 !!\r"), r"Wrote \d+", 50))
+            .await
+            .unwrap();
+        match out {
+            ExpectOutcome::Timeout { tail, lagged } => {
+                assert!(tail.contains("Corrupt base64"), "tail: {tail:?}");
+                assert!(!lagged);
+            }
+            ExpectOutcome::Match { matched, .. } => panic!("unexpected match: {matched:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn expect_rejects_concurrent_exchange_and_dtr() {
+        let (h, _rx) = test_handle();
+        let h2 = h.clone();
+        let first =
+            tokio::spawn(async move { h2.expect(expect_req(None, r"never-matches", 300)).await });
+        while !h.expect_in_flight() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(matches!(
+            h.expect(expect_req(None, r"x", 50)).await,
+            Err(ExpectError::Busy)
+        ));
+        let dtr_err = h.dtr_press(10).await.unwrap_err();
+        assert!(dtr_err.to_string().contains("active"), "{dtr_err}");
+        assert!(matches!(
+            first.await.unwrap().unwrap(),
+            ExpectOutcome::Timeout { .. }
+        ));
+        assert!(!h.expect_in_flight());
+    }
+
+    #[tokio::test]
+    async fn expect_bounded_buffer_keeps_matching_on_newest_bytes() {
+        let (h, _rx) = test_handle();
+        let tx = h.to_clients.clone();
+        let h2 = h.clone();
+        let task =
+            tokio::spawn(async move { h2.expect(expect_req(None, r"NEEDLE-(\d+)", 2_000)).await });
+        while tx.receiver_count() == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // Overflow the bounded buffer, then send the needle: the drain of old
+        // bytes must not break matching of what follows.
+        for _ in 0..3 {
+            let _ = tx.send(Bytes::from(vec![b'x'; EXPECT_BUF_MAX / 2]));
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let _ = tx.send(Bytes::from_static(b"NEEDLE-7\r\n"));
+        match task.await.unwrap().unwrap() {
+            ExpectOutcome::Match { captures, .. } => {
+                assert_eq!(captures[0].as_deref(), Some("7"));
+            }
+            ExpectOutcome::Timeout { .. } => panic!("needle not found after overflow"),
+        }
+    }
+
+    #[tokio::test]
+    async fn client_marker_lands_in_ring_control_stripped() {
+        let (h, _rx) = test_handle();
+        h.client_marker("flash write apps.uf2\x1b[31m start");
+        let snap = String::from_utf8_lossy(&snapshot(&h.ring)).into_owned();
+        assert!(
+            snap.contains("flash write apps.uf2[31m start"),
+            "control bytes stripped, text kept: {snap:?}"
+        );
     }
 }

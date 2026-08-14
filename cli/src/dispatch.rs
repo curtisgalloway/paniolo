@@ -102,6 +102,13 @@ pub fn build_slice(lab: &Lab, target: &str, host: &str) -> Result<String, LabErr
             lf.set_adb(target, a.serial.as_deref(), a.adb.as_deref(), None)?;
         }
     }
+    if let Some(fl) = &t.flash {
+        // Flash has no host of its own — it ships with the serial interface
+        // it rides, so the remote resolves both as local together.
+        if t.flash_serial().map(|s| on(&s.host)).unwrap_or(false) {
+            lf.set_flash(target, Some(&fl.method), fl.interface.as_deref())?;
+        }
+    }
     Ok(lf.doc.to_string())
 }
 
@@ -145,6 +152,32 @@ pub fn ship_slice(host: &crate::model::Host, slice_toml: &str) -> std::io::Resul
     if out.status != 0 || path.is_empty() {
         return Err(std::io::Error::other(format!(
             "failed to ship lab slice to {}: {}",
+            host.ssh,
+            out.stderr.trim()
+        )));
+    }
+    Ok(path)
+}
+
+const SHIP_FILE_SCRIPT: &str =
+    r#"f=$(mktemp "${TMPDIR:-/tmp}/paniolo-ship.XXXXXX") && base64 -d > "$f" && printf %s "$f""#;
+
+/// Ship an opaque binary payload (e.g. a UF2 image for `flash write`) to a
+/// temp file on `host` over SSH and return its remote path. `ssh::run`'s stdin
+/// is text, so the payload travels base64-encoded and is decoded remotely.
+/// The caller removes the file when done (as with [`ship_slice`]).
+pub fn ship_file(host: &crate::model::Host, bytes: &[u8], what: &str) -> std::io::Result<String> {
+    let encoded = crate::flash::base64_encode(bytes);
+    let argv = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        SHIP_FILE_SCRIPT.to_string(),
+    ];
+    let out = ssh::run(host, &argv, Some(&encoded), &[])?;
+    let path = out.stdout.trim().to_string();
+    if out.status != 0 || path.is_empty() {
+        return Err(std::io::Error::other(format!(
+            "failed to ship {what} to {}: {}",
             host.ssh,
             out.stderr.trim()
         )));
@@ -292,6 +325,34 @@ mod tests {
         // Host fields are stripped so the remote resolves them as local.
         assert!(t.host.is_none());
         assert!(t.serial[0].host.is_none());
+    }
+
+    #[test]
+    fn slice_ships_flash_with_its_serial_interface() {
+        let lab = model::parse(
+            r#"
+            [hosts.bench1]
+            ssh = "u@bench1"
+            [hosts.bench2]
+            ssh = "u@bench2"
+            [targets.dabao]
+            host = "bench1"
+            [[targets.dabao.serial]]
+            name = "console"
+            device = "/dev/cu.usbmodem1101"
+            [targets.dabao.flash]
+            method = "bao1x-uf2"
+            interface = "console"
+            "#,
+        )
+        .unwrap();
+        // The serial interface lives on bench1 (target default): flash ships
+        // with it there, and not to a host that lacks the interface.
+        let s1 = model::parse(&build_slice(&lab, "dabao", "bench1").unwrap()).unwrap();
+        assert!(s1.targets["dabao"].flash.is_some());
+        assert_eq!(s1.targets["dabao"].serial.len(), 1);
+        let s2 = model::parse(&build_slice(&lab, "dabao", "bench2").unwrap()).unwrap();
+        assert!(s2.targets["dabao"].flash.is_none());
     }
 
     #[test]

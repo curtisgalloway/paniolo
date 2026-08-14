@@ -86,6 +86,7 @@ nav:
       - HID injection: hid.md
       - HID serial protocol: hid-serial-protocol.md
       - adb (Android targets): adb.md
+      - Flash: flash.md
   - Distributed control: distributed-control.md
   - Hardware-CI integration:
       - Gap analysis: ci-integration/gap-analysis.md

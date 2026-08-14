@@ -112,6 +112,77 @@ pub fn send_input(base_url: &str, interface: &str, data: &[u8], pace_ms: u32) ->
         .map_err(|e| anyhow!("serialcap /input failed: {e}"))
 }
 
+// ── send/expect ─────────────────────────────────────────────────────────────
+
+/// Outcome of one `/expect` exchange, as returned by the daemon.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ExpectResponse {
+    pub matched: bool,
+    /// The whole matched text (present when `matched`).
+    #[serde(rename = "match", skip_serializing_if = "Option::is_none")]
+    pub match_text: Option<String>,
+    /// Capture groups 1.. (None = group didn't participate).
+    #[serde(default)]
+    pub captures: Vec<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+    /// The daemon's fan-out dropped bytes during the wait, so the match may
+    /// have been missed (reported as a timeout).
+    #[serde(default)]
+    pub lagged: bool,
+    /// Trailing output received during a timed-out wait, for diagnosis.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tail: Option<String>,
+}
+
+/// POST one send/expect exchange to the daemon: send `send` (if any) through
+/// the daemon-held port, then wait up to `timeout_ms` for `pattern` to match
+/// the output that arrives afterwards. Capture keeps running throughout.
+pub fn send_expect(
+    base_url: &str,
+    interface: &str,
+    send: Option<&str>,
+    pattern: &str,
+    timeout_ms: u64,
+    pace_ms: u32,
+) -> Result<ExpectResponse> {
+    let url = format!("{base_url}/expect?interface={interface}");
+    let send_len = send.map(str::len).unwrap_or(0) as u64;
+    // The daemon holds the request for send + wait; give the HTTP layer slack.
+    let http_timeout = timeout_ms + send_len * pace_ms as u64 + 10_000;
+    let body = serde_json::json!({
+        "send": send,
+        "pattern": pattern,
+        "timeout_ms": timeout_ms,
+        "pace_ms": pace_ms,
+    });
+    let resp = ureq::post(&url)
+        .timeout(Duration::from_millis(http_timeout))
+        .send_json(body)
+        .map_err(|e| match e {
+            ureq::Error::Status(409, _) => anyhow!(
+                "another expect/transfer is already running on '{interface}' — retry when it finishes"
+            ),
+            ureq::Error::Status(code, resp) => {
+                let msg = resp.into_string().unwrap_or_default();
+                anyhow!("serialcap /expect failed ({code}): {}", msg.trim())
+            }
+            other => anyhow!("serialcap /expect failed: {other}"),
+        })?;
+    resp.into_json::<ExpectResponse>()
+        .map_err(|e| anyhow!("serialcap /expect returned malformed JSON: {e}"))
+}
+
+/// Inject a labelled marker line into the capture stream (`POST /marker`), so
+/// client-driven operations (e.g. a flash transfer) are legible in the log.
+/// Best-effort: marker failures never fail the operation being marked.
+pub fn send_marker(base_url: &str, interface: &str, label: &str) {
+    let url = format!("{base_url}/marker?interface={interface}");
+    let _ = ureq::post(&url)
+        .timeout(Duration::from_secs(5))
+        .send_json(serde_json::json!({ "label": label }));
+}
+
 // ── interactive console ─────────────────────────────────────────────────────
 
 /// Replace this process with `tio` on the given device (never returns on

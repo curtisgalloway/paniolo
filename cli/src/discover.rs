@@ -28,8 +28,8 @@ const BUILTIN_CAPTURE: [&str; 5] = ["FaceTime", "Capture screen", "iSight", "iPh
 
 /// This host's lab-relevant hardware, in the same JSON shape the Python CLI
 /// emits (so mixed-version labs interoperate during the migration; the video
-/// entries' `id` field and the `adb` array are Rust-side additions, ignored by
-/// older consumers).
+/// entries' `id` field and the `adb`/`flash` arrays are Rust-side additions,
+/// ignored by older consumers).
 pub fn local_inventory() -> Value {
     let ethernet: Vec<Value> = netif::list_usb_ethernet_interfaces()
         .iter()
@@ -44,7 +44,51 @@ pub fn local_inventory() -> Value {
         "serial": serial,
         "video": list_capture_devices(),
         "adb": list_adb_devices(),
+        "flash": list_bao1x_devices(),
     })
+}
+
+/// The Baochip-1x boot1 bootloader's USB CDC identity (`bao1x-boot/boot1/src/
+/// platform/bao1x/usb/mod.rs` in betrusted-io/xous-core): flash-channel
+/// candidates for the `bao1x-uf2` method. boot1's console runs at 1 Mbaud.
+const BAO1X_VID: u16 = 0x1d50;
+const BAO1X_PID: u16 = 0x6196;
+pub const BAO1X_BAUD: i64 = 1_000_000;
+
+/// Serial CDC devices that are a Baochip-1x boot1 console, as
+/// `[{device, desc}, ...]`. On macOS both `/dev/tty.*` and `/dev/cu.*` names
+/// enumerate for one port; the callout (`cu.`) sibling is preferred.
+fn list_bao1x_devices() -> Vec<Value> {
+    let ports = serialport::available_ports().unwrap_or_default();
+    let mut found: Vec<(String, String)> = Vec::new();
+    for p in ports {
+        let serialport::SerialPortType::UsbPort(info) = &p.port_type else {
+            continue;
+        };
+        if info.vid != BAO1X_VID || info.pid != BAO1X_PID {
+            continue;
+        }
+        let product = info.product.as_deref().unwrap_or("Baochip-1x");
+        found.push((p.port_name.clone(), product.to_string()));
+    }
+    prefer_callout(&mut found);
+    found
+        .into_iter()
+        .map(|(device, desc)| json!({"device": device, "desc": desc}))
+        .collect()
+}
+
+/// Drop `/dev/tty.X` when `/dev/cu.X` is also present (macOS lists both names
+/// for one port; the callout device is the one to open).
+fn prefer_callout(devs: &mut Vec<(String, String)>) {
+    let cu_suffixes: Vec<String> = devs
+        .iter()
+        .filter_map(|(d, _)| d.strip_prefix("/dev/cu.").map(String::from))
+        .collect();
+    devs.retain(|(d, _)| match d.strip_prefix("/dev/tty.") {
+        Some(suffix) => !cu_suffixes.iter().any(|s| s == suffix),
+        None => true,
+    });
 }
 
 /// Capture devices from `hdmicap devices --json`:
@@ -244,6 +288,38 @@ pub fn propose_target_block(name: &str, host: &str, inv: &Value) -> String {
     }
     out.push(String::new());
 
+    // flash: a discovered Baochip-1x boot1 console proposes the bao1x-uf2
+    // channel (riding a serial interface at boot1's 1 Mbaud).
+    let flashes: Vec<(&str, &str)> = inv
+        .get("flash")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|d| Some((str_at(d, "device")?, str_at(d, "desc").unwrap_or(""))))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let [(dev, desc)] = flashes.as_slice() {
+        out.push(format!(
+            "# {desc} boot1 console at {dev} — pair the flash channel with a"
+        ));
+        out.push(format!(
+            "# [[serial]] interface on that device at baud {BAO1X_BAUD}:"
+        ));
+        out.push(format!("[targets.{name}.flash]"));
+        out.push("method = \"bao1x-uf2\"".to_string());
+        out.push("interface = \"console\"".to_string());
+        out.push(String::new());
+    } else if !flashes.is_empty() {
+        out.push(format!(
+            "# [targets.{name}.flash]  # multiple Baochip-1x consoles — pick one serial:"
+        ));
+        for (dev, desc) in &flashes {
+            out.push(format!("# {dev}  # {desc}"));
+        }
+        out.push(String::new());
+    }
+
     out.push(format!("# [targets.{name}.power]"));
     out.push("# cycle_cmd = \"/path/to/power-cycle.sh\"  # not discoverable".to_string());
 
@@ -368,6 +444,44 @@ mod tests {
         assert!(block.contains("multiple adb devices"), "{block}");
         assert!(block.contains("# serial = \"AAA\"  # Pixel 6a"), "{block}");
         assert!(block.contains("# serial = \"BBB\""), "{block}");
+    }
+
+    #[test]
+    fn propose_includes_flash_for_discovered_bao1x_console() {
+        let inv = json!({
+            "ethernet": [], "serial": ["/dev/cu.usbmodem1101"], "video": [],
+            "flash": [{"device": "/dev/cu.usbmodem1101", "desc": "Baochip-1x"}],
+        });
+        let block = propose_target_block("dabao", "local", &inv);
+        assert!(block.contains("[targets.dabao.flash]"), "{block}");
+        assert!(block.contains("method = \"bao1x-uf2\""), "{block}");
+        assert!(
+            block.contains("baud 1000000"),
+            "proposal names boot1's baud: {block}"
+        );
+        // No flash block proposed when nothing was discovered.
+        let none = propose_target_block("t", "local", &json!({"serial": []}));
+        assert!(!none.contains(".flash]"), "{none}");
+    }
+
+    #[test]
+    fn prefer_callout_drops_tty_siblings_only() {
+        let mut devs = vec![
+            ("/dev/tty.usbmodem1101".to_string(), "a".to_string()),
+            ("/dev/cu.usbmodem1101".to_string(), "a".to_string()),
+            ("/dev/tty.usbmodem2202".to_string(), "b".to_string()),
+            ("/dev/ttyACM0".to_string(), "c".to_string()),
+        ];
+        prefer_callout(&mut devs);
+        let names: Vec<&str> = devs.iter().map(|(d, _)| d.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "/dev/cu.usbmodem1101",
+                "/dev/tty.usbmodem2202",
+                "/dev/ttyACM0"
+            ]
+        );
     }
 
     #[test]

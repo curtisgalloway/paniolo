@@ -1,6 +1,6 @@
 ---
 name: paniolo
-description: Control a physical target machine (SBC, e.g. a Raspberry Pi) with the paniolo CLI during low-level bring-up — netboot it over a direct USB-Ethernet link, watch and OCR its HDMI screen, drive its serial console, power-cycle it, switch the link between netboot and ffx, and drive targets on remote control hosts transparently via a single git-tracked lab file over SSH. Use when you need to boot, observe, type into, screenshot, read the screen of, power, or remotely control a target/board through paniolo — including across multiple control hosts.
+description: Control a physical target machine (SBC, e.g. a Raspberry Pi) with the paniolo CLI during low-level bring-up — netboot it over a direct USB-Ethernet link, watch and OCR its HDMI screen, drive its serial console, script console exchanges (send/expect), flash firmware over the console (UF2 → Baochip-1x boot1), power-cycle it, switch the link between netboot and ffx, and drive targets on remote control hosts transparently via a single git-tracked lab file over SSH. Use when you need to boot, observe, type into, screenshot, read the screen of, power, flash, or remotely control a target/board through paniolo — including across multiple control hosts.
 ---
 
 # Paniolo — controlling a target machine
@@ -70,6 +70,8 @@ paniolo power set -t <name> [--cycle-cmd C] [--on-cmd C] [--off-cmd C] [--state-
 paniolo video set -t <name> --device "<capture id or name>"
 paniolo hid set -t <name> --cmd "hidrig -d <uart>"   # USB HID injection helper
 paniolo adb set -t <name> [--serial <adb-id>]        # an Android DUT over adb
+paniolo flash set -t <name> --method bao1x-uf2 [--interface console]  # firmware
+                                                     #   flashing over a serial channel
 ```
 
 - `paniolo netboot devices` lists candidate USB-Ethernet interfaces (the
@@ -77,7 +79,8 @@ paniolo adb set -t <name> [--serial <adb-id>]        # an Android DUT over adb
   `paniolo configure <name> -H <host>` proposes a whole block to paste in.
 - Inspect: `paniolo config show` (whole lab) / `paniolo target show <name>`.
 - Remove: `paniolo target rm <name>`, or per channel (`netboot rm`,
-  `serial rm <iface> -t <name>`, `power rm`, `video rm`, `hid rm`, `adb rm`).
+  `serial rm <iface> -t <name>`, `power rm`, `video rm`, `hid rm`, `adb rm`,
+  `flash rm`).
 - `paniolo doctor` probes every configured channel against reality (devices
   exist, over SSH for remote hosts).
 
@@ -216,6 +219,8 @@ paniolo serial watch [target]                  # run the daemon for ALL interfac
                                                #   they appear in the dashboard pane
 paniolo serial send [target] "text"            # send one line of input through
                                                #   the running daemon (see below)
+paniolo serial expect [target] --pattern RE [--send "text"] [--timeout-ms N]
+                                               # one send→wait-for-regex exchange
 paniolo serial log [target] [-i name] [options] # print captured output (timestamped)
 paniolo serial show [target]                   # list interfaces + daemon status
 paniolo serial stop [target]                   # release the ports (on the target's host)
@@ -276,6 +281,52 @@ paniolo serial send --pace-ms 8 "long command"       # per-byte pacing for slow
 
 Note the input only reaches the target if its console actually reads the UART
 (a kernel with a broken serial driver logs output but ignores input).
+
+### Send + wait for a response (`serial expect`)
+
+For console automation — U-Boot autoboot interrupts, login prompts, AT
+commands, "did the shell answer?" — use one `serial expect` exchange instead of
+a `serial send` + `serial log --since` polling loop:
+
+```
+paniolo serial expect <target> --send "echo ok41" --pattern "ok41"   # probe
+paniolo serial expect <target> --pattern "login: " --timeout-ms 60000  # pure wait
+paniolo serial expect <target> --send "version" --pattern "v([0-9.]+)" --json
+```
+
+Exit 0 = matched (captures printed), 1 = timeout (stderr shows the tail of what
+did arrive). Only bytes received *after* the send count, and the regex runs
+over raw bytes (not ANSI-stripped, not line-split) — anchor with `\s`/`\r?\n`
+when a complete line matters. One expect at a time per interface, and `serial
+dtr` is refused while one runs (a DTR pulse would drop the port mid-exchange).
+
+## Flash — reflash firmware over the serial console
+
+A target with a `flash` channel can be reflashed hands-free through its
+console — no buttons, no mass-storage copy. The only method today is
+`bao1x-uf2` (Baochip-1x / dabao boards: UF2 blocks streamed to the boot1
+bootloader REPL). The transfer runs through the serial daemon, so capture
+keeps running and the per-block acks land in `serial log`.
+
+```
+paniolo flash set -t dabao --method bao1x-uf2 --interface console
+paniolo flash write dabao apps.uf2 --cycle --boot   # the dev loop:
+                                    # power-cycle into the REPL, stream, boot OS
+paniolo flash write dabao loader.uf2 xous.uf2 apps.uf2 --cycle --boot
+paniolo flash show [dabao]
+```
+
+- `--cycle` enters the bootloader via the power channel; it relies on the
+  **one-time board prep** `bootwait enable` (done by hand on the boot1 console
+  — see `docs/flash.md`). Without it the board boots its OS and the REPL probe
+  times out.
+- `--boot` starts the OS afterwards (boot1's `boot` command — a plain `reset`
+  would land back in the REPL).
+- Works against a remote serial host: the UF2 files are shipped over SSH
+  automatically.
+- **Flashing goes through the daemon — never run xous-core's uf2send.py
+  against a port a `serial watch` daemon holds** (the port is exclusive). To
+  cross-check a failure with uf2send.py, `paniolo serial stop <target>` first.
 
 ## adb (Android targets)
 
@@ -545,6 +596,10 @@ instance. netbootd is excluded — cycle it via `paniolo netboot start/stop`.
   interface, `screen`/`tio` on a serial port, `kill` on a daemon) — it desyncs
   the daemon. Use `netif mode …`, `serial log`/`send`, `daemons stop`.
 - Serial port is exclusive: one of `connect` / `watch` / external `tio`/`screen`.
+- Flashing goes through the daemon (`paniolo flash write`) — don't run
+  uf2send.py or any external flasher against a watched port; `serial stop`
+  first if you must. During a transfer/expect, `serial dtr` and the dashboard
+  power button return 409 by design.
 - `~/.cargo/bin` (the CLI) must be on `PATH`, ahead of any other `paniolo`
   (e.g. a Homebrew keg from the tap can shadow it). The helper binaries are
   *not* on PATH — they live in `~/.local/libexec/paniolo/bin`

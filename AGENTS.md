@@ -179,8 +179,10 @@ Python tree below:
 
 - **Config is one CLI-managed lab file** (`~/.config/paniolo/lab.toml`, or
   `--lab`/`PANIOLO_LAB`): hosts + targets, each target's hardware as *channels*
-  (`netboot`, `serial[]`, `power`, `video`, `hid`, `adb`) with per-channel host
-  binding.
+  (`netboot`, `serial[]`, `power`, `video`, `hid`, `adb`, `flash`) with
+  per-channel host binding (`flash` is the exception: it has no host field —
+  it rides the serial interface it names and resolves to that interface's
+  host, since the transfer must run where the serialcap daemon runs).
   Edited surgically via `toml_edit` (hand-comments survive); validated on load
   and before every save. The legacy `~/.config/paniolo/targets/*.toml` files are
   not used by the Rust CLI.
@@ -238,7 +240,12 @@ cli/src/
   ssh.rs        SSH transport: ControlMaster run/passthrough/interactive, forward (tunnels)
   daemons.rs    shared daemon contract: find_binary (libexec → PATH →
                 legacy ~/.cargo/bin), hook_path, daemon.json discovery, wait
-  serial.rs     serialcap orchestration + tio exec + /input + device listing
+  serial.rs     serialcap orchestration + tio exec + /input + /expect + /marker
+                clients + device listing
+  flash.rs      bao1x-uf2 flash protocol client (UF2 parse/validate, base64,
+                block loop with ack field-validation/retries via /expect
+                rounds) — vendor knowledge in a CLI module, like adb.rs; the
+                daemon stays vendor-free
   video.rs      hdmicap orchestration (daemon start/stop, client passthrough)
   adb.rs        adb transport (argv build, shell exec, run/input passthrough,
                 exec-out screencap → PNG) — a generic transport in core, no helper
@@ -361,7 +368,11 @@ serialcap/       Rust crate: serial console daemon (parallels hdmicap)
     serial_io.rs one supervisor per interface: tokio-serial port owner; reconnect
                  loop; broadcast fan-out to WS clients; mpsc client->port; 64KB
                  scrollback ring; tees every chunk to that interface's capture
-                 thread (off the live fan-out path). `Serials` holds the named set
+                 thread (off the live fan-out path). `Serials` holds the named set.
+                 Also the generic send/expect primitive (`SerialHandle::expect`:
+                 subscribe-after-send, bounded regex buffer, one in flight per
+                 interface, DTR refused while active — vendor-free; protocol
+                 clients live in cli/src/flash.rs etc.) and client_marker
     capture.rs   line assembler: splits bytes into timestamped, sequence-numbered
                  lines; appends them to a rotating on-disk JSONL log under
                  capture/<name>/ (survives restarts; resumes the seq counter);
@@ -369,10 +380,13 @@ serialcap/       Rust crate: serial console daemon (parallels hdmicap)
                  the `log` reader (interface select; tail / range / since,
                  ANSI-stripped by default) + UTC formatting
     server.rs    axum: GET /stream (bidirectional WebSocket), /status, /interfaces,
-                 /devices; POST /button (DTR pulse), /input (write bytes to port,
-                 ?pace_ms=N drips one byte per N ms for a slow polled console).
-                 Per-interface endpoints take ?interface=NAME, defaulting to the
-                 first configured interface
+                 /devices; POST /button (DTR pulse; 409 while an expect is
+                 active), /input (write bytes to port, ?pace_ms=N drips one byte
+                 per N ms for a slow polled console), /expect (one send/expect
+                 exchange, JSON body {send, pattern, timeout_ms, pace_ms};
+                 contract in docs/serial.md), /marker (inject a labelled capture
+                 marker). Per-interface endpoints take ?interface=NAME,
+                 defaulting to the first configured interface
     daemon.rs    advisory lock, discovery file, tokio runtime, graceful shutdown;
                  spawns one supervisor per interface
 
