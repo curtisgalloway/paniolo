@@ -246,9 +246,11 @@ cli/src/
                 one SKILL.md (or --path), install_bundled() for setup.rs
 ```
 
-Deferred (tracked in docs/config-redesign.md): the
-Openterface CH9329 HID backend (clean-room spec at docs/ch9329-spec.md — a shim
-speaking the HID serial protocol would plug into the existing `hid` channel).
+The Openterface CH9329 HID backend (once deferred in
+docs/config-redesign.md) is **implemented and hardware-verified**: the `ch9329/`
+crate is a helper that speaks the HID serial protocol surface into the existing
+`hid` channel, with no device-specific code in `cli/`. Clean-room protocol
+reference: docs/ch9329-spec.md.
 
 **Helper state/runtime-dir API** (daemons.rs `helper_env`): paniolo exports
 `PANIOLO_STATE_DIR` (`~/.config/paniolo/helpers/<name>/`, durable) and
@@ -419,6 +421,43 @@ hidrig/          USB HID injector: host CLI + daemon (Rust) + dual-board KB2040 
   README.md        topology, wiring, frame protocol, CLI usage. The command
                    vocabulary spec is docs/hid-serial-protocol.md; the dual-board
                    design + frame format is docs/hid-dual-board-design.md
+
+ch9329/          Rust crate: the *other* hid helper — a WCH CH9329 UART->USB-HID
+                 bridge client, hardware-verified against an Openterface
+                 Mini-KVM (the Sipeed NanoKVM-USB speaks the same frame
+                 protocol at 57600 but is not bench-verified here). Same
+                 CLI surface as hidrig, so it drops into a `hid` channel
+                 identically (`paniolo hid set --cmd "ch9329 -d <uart>"`); the
+                 chip *is* the HID device, so it speaks the binary frame
+                 protocol (HEAD 57 AB / ADDR / CMD / LEN / DATA / SUM) rather
+                 than relaying the line protocol. Clean-room spec:
+                 docs/ch9329-spec.md
+  src/proto.rs     the HID serial protocol grammar executed against a Session
+                   instead of forwarded to a microcontroller; `execute_line` is
+                   the one backend for CLI subcommands and `run` files, so the
+                   accepted command set matches hidrig exactly (sequence parser
+                   + moveabs clamp ported from hidrig/src/proto.rs)
+  src/session.rs   the link itself: framing/checksum, GET_INFO, held-key/pointer
+                   state, and `open()`'s baud probe (BAUD_CANDIDATES = 115200
+                   then 9600; force with -b — e.g. -b 57600, the NanoKVM-USB
+                   default). Holds two verified CH9329-on-Linux workarounds —
+                   clicks go through the *relative* report (libinput coalesces a
+                   button transition in an absolute report at an unchanged
+                   coordinate), and `moveabs` nudges one unit before the exact
+                   target (an absolute report equal to the previous one is
+                   coalesced away)
+  src/uart.rs      the UART owner (daemon path): one dedicated thread holding a
+                   long-lived Session, serializing CLI- and WebSocket-injected
+                   commands onto the one wire, one in flight — which is also
+                   what makes held state survive across separate invocations
+  src/keys.rs      key-name -> USB HID usage mapping (adafruit_hid Keycode names,
+                   US layout), shared with the hidrig vocabulary
+  src/server.rs    axum: GET /hid (WebSocket), POST /send, /status, /version
+  src/daemon.rs    `serve`/`stop`: owns the UART, publishes the same
+                   /tmp/paniolo-<uid>/hid/ discovery file paniolo's console reads
+  README.md        wiring, extras beyond hidrig's surface (`info` reports target
+                   USB enumeration + lock LEDs; `baud` persists a rate to flash),
+                   and the hardware-verified status notes
 ```
 
 ### hid daemon + KVM (`hidrig serve`)
