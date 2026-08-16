@@ -23,7 +23,7 @@ and power-cycle it without a person at the bench each iteration. See the root
 | [Power](power.md) | `paniolo power on/off`, `power-cycle`, `power-state`, `serial dtr/reset` | DTR power-button wiring (J2; opt-in per serial interface) and generic shell-command hooks; `cambrionix` hub, `usbhub` per-port USB hub power, `zigplug` Zigbee smart-plug, and `shellyplug` Shelly Gen2+ plug/relay (local HTTP RPC) helpers. |
 | [Video](video.md) | `paniolo video` | `hdmicap` warm-stream HDMI capture + on-device OCR. |
 | [Dashboard](dashboard.md) | `paniolo console` | Combined video + serial web UI. |
-| [HID injection](hid.md) | `paniolo hid` | USB keyboard/mouse injection via a generic helper hook; `hidrig` KB2040 injector; KVM input from the web console. |
+| [HID injection](hid.md) | `paniolo hid` | USB keyboard/mouse injection via a generic helper hook; `hidrig` KB2040 injector and `ch9329` CH9329 bridge (Openterface Mini-KVM); KVM input from the web console. |
 | [HID serial protocol](hid-serial-protocol.md) | — | Normative command vocabulary (v1) — the external interface `hidrig` composes from; the dual-board device wire is in [hid-dual-board-design.md](hid-dual-board-design.md). |
 | [adb (Android targets)](adb.md) | `paniolo adb` | Drive an Android DUT over adb — console (`adb shell`/`run`), screen (`screencap`), and input (`adb input`); one transport, no capture/HID/serial rig. |
 
@@ -42,7 +42,7 @@ part of the end-user documentation site.
 | Doc | What it covers |
 |---|---|
 | [Config redesign: a CLI-managed lab](https://github.com/curtisgalloway/paniolo/blob/main/docs/config-redesign.md) | The lab data model (hosts/targets/per-channel hosts), the CRUD command surface, per-channel dispatch design, and the Python→Rust pivot + staged plan. The CLI + orchestration is rewritten Python→Rust (the `cli/` crate); the lab file is the single, CLI-managed source of truth. |
-| [CH9329 driver spec (clean-room)](https://github.com/curtisgalloway/paniolo/blob/main/docs/ch9329-spec.md) | **Deferred** (Openterface HID backend, to revisit): WCH CH9329 serial protocol — frame format, GET_INFO, keyboard report, parameter-config/baud, reset, ACK codes. A CH9329 shim speaking the [HID serial protocol](hid-serial-protocol.md) would plug into the same `hid` channel. |
+| [CH9329 driver spec (clean-room)](https://github.com/curtisgalloway/paniolo/blob/main/docs/ch9329-spec.md) | **Implemented** (the [`ch9329`](https://github.com/curtisgalloway/paniolo/blob/main/ch9329/README.md) helper crate): WCH CH9329 serial protocol — frame format, GET_INFO, keyboard report, parameter-config/baud, reset, ACK codes. The helper speaks the [HID serial protocol](hid-serial-protocol.md) surface and plugs into the same `hid` channel; the spec remains the clean-room reference it was built from. |
 | [Distributed-control implementation plan](https://github.com/curtisgalloway/paniolo/blob/main/docs/distributed-control-plan.md) | The original (Python-era) phased build sequence for [distributed control](distributed-control.md) — Phases 0–5 shipped; superseded by the Rust control plane for mechanism details. |
 
 ## Hardware-CI integration (in design)

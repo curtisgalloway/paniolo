@@ -23,8 +23,10 @@ crate): config model + CRUD + doctor (R1), per-channel dispatch + SSH transport
 (serial round-trip, live HDMI capture, netbootd serving DHCP+TFTP, netif mode
 transitions; a real TFTP boot — Fuchsia shim + ZBI on the Pi 5 — verified
 2026-06-04). Remaining: live remote-host dispatch test (needs a second control
-host), docs/cutover, and the deferred Openterface HID. (OCR landed 2026-06-05:
-`paniolo video read` wraps the hdmicap daemon's `GET /ocr`.)
+host) and docs/cutover. (The Openterface CH9329 HID backend, formerly listed
+here as deferred, shipped as the `ch9329` helper crate — see
+docs/ch9329-spec.md. OCR landed 2026-06-05: `paniolo video read` wraps the
+hdmicap daemon's `GET /ocr`.)
 
 Helper state/runtime-dir API (landed 2026-06-05): paniolo exports
 `PANIOLO_STATE_DIR` (`~/.config/paniolo/helpers/<name>/`) and

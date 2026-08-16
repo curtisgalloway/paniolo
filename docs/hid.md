@@ -37,8 +37,12 @@ the line protocol never travels on a wire. See
 [`hid-dual-board-design.md`](hid-dual-board-design.md) for the design and the
 frame format, and [`../hidrig/README.md`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md) for wiring and bring-up.
 Because the interface above `hidrig` is just the helper's CLI, any other
-injector (another microcontroller, a CH9329 shim) drops in through the same
-generic `hid` channel without touching paniolo.
+injector drops in through the same generic `hid` channel without touching
+paniolo. One such injector ships in-tree: the
+[`ch9329`](https://github.com/curtisgalloway/paniolo/blob/main/ch9329/README.md)
+helper drives a WCH CH9329 UART→USB-HID bridge (the keyboard/mouse half of an
+Openterface Mini-KVM) with the same CLI surface, so
+`paniolo hid set -t <target> --cmd "ch9329 -d <uart>"` is the only difference.
 
 
 ---
