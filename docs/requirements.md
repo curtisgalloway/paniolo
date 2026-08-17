@@ -95,6 +95,24 @@
 | HID-6 | KVM in `paniolo console`: stream web keyboard + absolute mouse, intermixed with CLI injection | S | ☑ | hardware-verified on pi5 Linux desktop |
 | HID-7 | KVM latency: HID frames fire-and-forget over USB-CDC (no per-frame round-trip), coalesce mouse moves (per-frame); floor is the target's USB `bInterval` (~8 ms) | S | ☑ | macOS `IOSSDATALAT` floored for control-frame replies |
 
+### 6.1 Openterface deep control (OTF)
+
+Findings from the Openterface Mini-KVM's open hardware design (v1.9
+schematic/BOM/datasheet): the switchable USB-A port and the CH340's modem
+lines make a stock unit a small programmable USB fixture. Details + bench
+test checklist: [`openterface-deep-control.md`](https://github.com/curtisgalloway/paniolo/blob/main/docs/openterface-deep-control.md).
+**OTF-1 gates the rest — findings are schematic-derived, nothing verified on
+hardware yet.**
+
+| ID | Requirement | Pri | Status | Notes |
+|---|---|---|---|---|
+| OTF-1 | Bench-verify the control paths on our unit: PCB rev; MS2109 GPIO write for the A-port mux; DTR→`SW_GND` replug polarity + hold time; RTS→CH9329 reset; `DATAFLIP` semantics; serial-open DTR-pulse side effects; EEPROM backup dump | M | ☐ | test checklist in the findings doc; do before any code |
+| OTF-2 | RTS hardware reset of the CH9329 (`HIDRESET` line) as a recovery verb in the shipped `ch9329` backend; guard against serial-open modem-line pulses disturbing the A-port (see OTF-1) | S | ☐ | ch9329 backend itself shipped (#74); this adds the watchdog action |
+| OTF-3 | `usb attach-host` / `usb attach-target`: software flip of the A-port mux (MS2109 GPIO) — hands-free physical media (image stick host-side, boot it target-side, BIOS-visible) | S | ☐ | after OTF-1 |
+| OTF-4 | `usb replug [--hold-ms]`: soft surprise-unplug/replug of the A-port device via CH340 DTR ground-float — scripted hot-plug exerciser for USB driver testing | S | ☐ | after OTF-1 |
+| OTF-5 | EEPROM serial-stamping utility (AT24C16 via MS2109) → unique USB serials → stable by-id paths on multi-unit benches | C | ☐ | CH340 stays serial-less; by-path for that |
+| OTF-6 | Extension-pins target-side gadget slot (spare downstream port of each hub on pads): MCU mass-storage gadget (true virtual media) or analyzer tap | C | ⤵ | solder mod; revisit after OTF-3/4 prove out |
+
 ## 7. Dashboard
 
 | ID | Requirement | Pri | Status | Notes |
