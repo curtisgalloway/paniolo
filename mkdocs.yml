@@ -59,6 +59,7 @@ exclude_docs: |
   ch9329-spec.md
   distributed-control-plan.md
   uefi-http-boot-design.md
+  openterface-deep-control.md
 
 markdown_extensions:
   - admonition
