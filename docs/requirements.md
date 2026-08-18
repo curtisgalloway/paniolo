@@ -101,16 +101,18 @@ Findings from the Openterface Mini-KVM's open hardware design (v1.9
 schematic/BOM/datasheet): the switchable USB-A port and the CH340's modem
 lines make a stock unit a small programmable USB fixture. Details + bench
 test checklist: [`openterface-deep-control.md`](https://github.com/curtisgalloway/paniolo/blob/main/docs/openterface-deep-control.md).
-**OTF-1 gates the rest — findings are schematic-derived, nothing verified on
-hardware yet.**
+**OTF-1 partially verified 2026-08-18**: DTR/`SW_GND` characterized, EEPROM
+dumped, switch semantics resolved from vendor docs; RTS and `DATAFLIP` still
+untested, and the MS2109 GPIO path is blocked. Note the lab host is a VM with
+USB passthrough — verify USB observations on the hypervisor, not in the guest.
 
 | ID | Requirement | Pri | Status | Notes |
 |---|---|---|---|---|
-| OTF-1 | Bench-verify the control paths on our unit: PCB rev; MS2109 GPIO write for the A-port mux; DTR→`SW_GND` replug polarity + hold time; RTS→CH9329 reset; `DATAFLIP` semantics; serial-open DTR-pulse side effects; EEPROM backup dump | M | ☐ | test checklist in the findings doc; do before any code |
-| OTF-2 | RTS hardware reset of the CH9329 (`HIDRESET` line) as a recovery verb in the shipped `ch9329` backend; guard against serial-open modem-line pulses disturbing the A-port (see OTF-1) | S | ☐ | ch9329 backend itself shipped (#74); this adds the watchdog action |
-| OTF-3 | `usb attach-host` / `usb attach-target`: software flip of the A-port mux (MS2109 GPIO) — hands-free physical media (image stick host-side, boot it target-side, BIOS-visible) | S | ☐ | after OTF-1 |
-| OTF-4 | `usb replug [--hold-ms]`: soft surprise-unplug/replug of the A-port device via CH340 DTR ground-float — scripted hot-plug exerciser for USB driver testing | S | ☐ | after OTF-1 |
-| OTF-5 | EEPROM serial-stamping utility (AT24C16 via MS2109) → unique USB serials → stable by-id paths on multi-unit benches | C | ☐ | CH340 stays serial-less; by-path for that |
+| OTF-1 | Bench-verify the control paths on our unit: PCB rev; MS2109 GPIO write for the A-port mux; DTR→`SW_GND` replug polarity + hold time; RTS→CH9329 reset; `DATAFLIP` semantics; serial-open DTR-pulse side effects; EEPROM backup dump | M | ☐ | **done**: v1.9; DTR polarity (asserted = disconnected); serial-open *does* replug the A-port; EEPROM dumped (`sha256 9b46336d…`); switch is software-monitored, not a control. **open**: RTS, `DATAFLIP`, GPIO write |
+| OTF-2 | RTS hardware reset of the CH9329 (`HIDRESET` line) as a recovery verb in the shipped `ch9329` backend; guard against serial-open modem-line pulses disturbing the A-port (see OTF-1) | S | ☐ | backend shipped earlier (#74 corrected its status); this adds the watchdog action. RTS still unverified; the reset must route through the existing session — opening the tty asserts DTR+RTS |
+| OTF-3 | `usb attach-host` / `usb attach-target`: software flip of the A-port mux (MS2109 GPIO) — hands-free physical media (image stick host-side, boot it target-side, BIOS-visible) | S | ☐ | **blocked**: ms-tools cannot patch this firmware (`Could not patch code`; handshake at `0xCBD4` never fires). Needs a USB capture of the vendor app's software switch, or vendor register docs |
+| OTF-4 | `usb replug [--hold-ms]`: soft surprise-unplug/replug of the A-port device via CH340 DTR ground-float — scripted hot-plug exerciser for USB driver testing | S | ☐ | mechanism confirmed on hardware, but **not production-ready**: replugs return at full-speed nondeterministically, each pulse causes a re-enumeration burst, and ~9 cycles destabilized the shared hub and wedged the CH340 (recovered by physical replug) |
+| OTF-5 | EEPROM serial-stamping utility (AT24C16 via MS2109) → unique USB serials → stable by-id paths on multi-unit benches | C | ☐ | **premise corrected**: the `????????` serial is a RAM-resident string descriptor at XDATA `0xC676`, not an EEPROM field — needs a firmware patch, so blocked with OTF-3. CH340 stays serial-less; by-path for that |
 | OTF-6 | Extension-pins target-side gadget slot (spare downstream port of each hub on pads): MCU mass-storage gadget (true virtual media) or analyzer tap | C | ⤵ | solder mod; revisit after OTF-3/4 prove out |
 
 ## 7. Dashboard
