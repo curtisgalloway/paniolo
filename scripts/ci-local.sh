@@ -38,9 +38,20 @@ DST="${PANIOLO_CI_DIR:-$HOME/.cache/paniolo-ci-src}"
 export DEBIAN_FRONTEND=noninteractive
 
 echo "### [setup] system deps"
-sudo apt-get update -qq
-sudo apt-get install -y -qq pkg-config libudev-dev build-essential \
-  libclang-dev clang cmake nasm libturbojpeg0-dev curl ca-certificates rsync >/dev/null
+# Wait for the dpkg lock rather than failing on it: a freshly booted VM usually
+# has unattended-upgrades holding it for the first few minutes. And abort if the
+# install still fails -- without these libraries every serialport crate (cli,
+# serialcap, cambrionix, ch9329, hidrig) and hdmicap fail to build, which reads
+# as six code failures instead of one missing dependency.
+APT="-o DPkg::Lock::Timeout=300"
+if ! sudo apt-get $APT update -qq \
+  || ! sudo apt-get $APT install -y -qq pkg-config libudev-dev build-essential \
+       libclang-dev clang cmake nasm libturbojpeg0-dev curl ca-certificates rsync >/dev/null
+then
+  echo "FATAL: could not install the system build dependencies; aborting." >&2
+  echo "       Re-run once apt is free, or install them by hand." >&2
+  exit 2
+fi
 
 if ! command -v cargo >/dev/null 2>&1; then
   echo "### [setup] rustup (stable, minimal + clippy + rustfmt)"
