@@ -47,8 +47,9 @@ const HELPER_CRATES: [&str; 8] = [
 ];
 
 fn is_repo_root(d: &Path) -> bool {
-    d.join("pyproject.toml").is_file()
+    d.join("Makefile").is_file()
         && d.join("ocr").is_dir()
+        && d.join("cli/Cargo.toml").is_file()
         && d.join("hdmicap/Cargo.toml").is_file()
 }
 
@@ -423,4 +424,38 @@ pub fn run(repo: &Path, rust_only: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The markers `is_repo_root` keys off must match the *real* tree.
+    ///
+    /// A tmpdir-fixture test would be useless here: it would create whatever
+    /// files the predicate currently names and keep passing forever after one
+    /// of them was deleted from the repo. That is exactly how the
+    /// `pyproject.toml` marker outlived the legacy Python CLI removal and
+    /// silently broke `paniolo setup --rust-only` (and, quietly, the
+    /// repo-checkout branch of the skill and usbhub-profile search paths).
+    /// Assert against the actual checkout so marker drift fails the build.
+    #[test]
+    fn repo_root_detects_the_real_checkout() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the cli crate always has a parent directory");
+        assert!(
+            is_repo_root(repo),
+            "is_repo_root() no longer recognizes the checkout at {}: a marker \
+             it checks for was renamed or removed",
+            repo.display()
+        );
+    }
+
+    #[test]
+    fn repo_root_rejects_a_non_repo_directory() {
+        assert!(!is_repo_root(Path::new("/")));
+        let cli = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(!is_repo_root(cli), "the cli crate dir is not the repo root");
+    }
 }
