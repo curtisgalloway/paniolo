@@ -12,9 +12,10 @@ You may obtain a copy of the License at
 
 *Status: **bench-verified 2026-08-18** as far as this bench allows. DTR→`SW_GND`
 and RTS→`HIDRESET` are both characterized; `DATAFLIP` is not observable from the
-host; the EEPROM is dumped. Everything still open is blocked on the MS2109
-firmware-patch wall (finding 7), a non-virtualized host, or the vendor app.
-Tracker: requirements §6.1 (OTF-1…6).*
+host; the EEPROM is dumped; the slide-switch position is readable without a
+firmware patch at XDATA `0xDF00` (finding 9). Driving the mux is still blocked
+on the MS2109 firmware-patch wall (finding 7), with two untried leads in
+finding 8. Tracker: requirements §6.1 (OTF-1…6).*
 
 The Openterface Mini-KVM's hardware is open source
 ([TechxArtisanStudio/Openterface_Mini-KVM_Hardware](https://github.com/TechxArtisanStudio/Openterface_Mini-KVM_Hardware),
@@ -210,6 +211,60 @@ switched over).
    application's USB traffic while toggling its software switch and derive the
    command from observed bytes.
 
+   **ms-tools runs on macOS** — the `hidraw`/`--raw-path` requirement is a
+   *pure-Go-mode* limitation, not a platform one. Build it without
+   `-tags puregohid` against Homebrew hidapi
+   (`CGO_CFLAGS=-I/opt/homebrew/include CGO_LDFLAGS='-L/opt/homebrew/lib -lhidapi'`)
+   and `list-dev` works, finding the unit on interface 4, usage page `0xff00`.
+   That matters because it allows every ms-tools result here to be re-taken
+   off a directly-attached host, without the passthrough caveat above.
+
+   **Reads are size-sensitive and flaky.** Measured over hidapi on macOS:
+   256-byte reads 5/6, 1 KB 2/6, 4 KB 0/6, and a whole-region read almost
+   always fails. `read <region> <addr>` with the length *omitted* sometimes
+   succeeds where an explicit full length errors. Dump in 256-byte chunks with
+   retries — that yields a clean 64 KB XDATA image with zero failed chunks.
+
+8. **GPIO on these chips is 8051 SFR P2/P3 — and ms-tools has a no-patch path
+   for it, gated to the wrong chip.** From the ms-tools source (MIT, so
+   readable, unlike the vendor host apps): `gpioUpdateSFR` reads and writes
+   **P2 at SFR `0xA0`** (pin state) and **P3 at SFR `0xB0`** (direction), and
+   `GPIOUpdate` uses that direct-SFR path *instead of* the 8051 patch whenever
+   an `SFR` memory region exists. The ROM commands are `0xc5`/`0xc6` for SFR
+   read/write (8-bit address) and `0xb5`/`0xb6` for XDATA (16-bit), carried in
+   9-byte HID feature reports laid out `[reportID=0, cmd, addr…]`.
+
+   The catch: `MemoryRegionList` only offers `SFR` when `deviceType == 2130`.
+   Ours is 2109, so ms-tools never takes that path for us. **This is a gap in
+   ms-tools' support matrix, not proof the MS2109 ROM lacks command `0xc5`** —
+   which makes a read-only `0xc5` probe (via `raw-cmd`, validating the frame
+   layout against a known value first) the cheapest remaining shot at OTF-3.
+   Untested so far.
+
+9. **The slide-switch position is readable from XDATA at `0xDF00`, with no
+   firmware patch.** Bit 0 mirrors the switch: `0x00` inward/H, `0x01`
+   outward/T. Found by differencing full 64 KB XDATA dumps across switch
+   positions and confirmed live across four consecutive flips.
+
+   Method, because the noise floor is what makes it interpretable: XDATA is
+   live RAM, so two dumps in the *same* position already differ. Taking two
+   dumps per position established that floor at **41 of 65,536 bytes (0.06%)**,
+   almost all in a `0x0040`–`0x0070` cluster that looks like video/audio
+   counters. Of the whole address space only three bytes were stable within
+   each position yet differed across positions — `0x0042` and `0x0066`, both
+   inside that noisy cluster and treated as coincidence, and `0xDF00`, an
+   isolated clean single-bit change. Polling `0xDF00` while the switch was
+   flipped H→T→H→T→H tracked every transition.
+
+   This is the **sense** path, not the control path: it is most likely a
+   firmware-maintained copy of the polled switch position rather than the mux
+   register itself, and it does not by itself enable OTF-3. Its value is that
+   it is the first read-only foothold in the `USB_SWITCH` block and anchors a
+   byte of known meaning near whatever drives `Sel` — a far better starting
+   point than a blind search. It also confirms finding 1 from the chip's side:
+   the firmware *does* sense the switch even when no host application is
+   running to act on it.
+
 ## Testing TODO (OTF-1)
 
 Done 2026-08-18:
@@ -226,20 +281,36 @@ Done 2026-08-18:
       ~700 ms to boot; A-port undisturbed. See finding 3.
 - [x] Map `DATAFLIP`: **not observable** on any CH340 modem input across
       1,956 samples spanning a reset. See finding 3.
+- [x] Read the switch position without patching the firmware — **XDATA
+      `0xDF00` bit 0**, confirmed across four flips. See finding 9.
+- [x] Re-run the ms-tools reads on a non-virtualized host — done on macOS via
+      the hidapi build; see finding 7. (The DTR/hot-plug half of that TODO is
+      still outstanding, below.)
 
 Blocked, not merely pending — each needs something this bench cannot supply:
 
 - [ ] Find the MS2109 GPIO write that drives the mux `Sel` — blocked on
       finding 7; needs a USB capture of the vendor app, or vendor register
       documentation. `i2c-scan` is blocked by the same wall, so the config
-      I2C bus cannot be enumerated either.
+      I2C bus cannot be enumerated either. **Two untried leads before falling
+      back to a USB capture:** a read-only ROM `0xc5` SFR probe (finding 8),
+      and disassembling our own EEPROM image — the 8051 code from `0x30` is
+      already dumped and is our own hardware's contents, so it involves no
+      vendor source. Searching it for the write that sets the `0xDF00`
+      neighbourhood is the natural next step.
 - [ ] Measure mux-flip behavior once a flip is possible: does the previously
       attached side see a clean disconnect? Settle time?
 - [ ] Video-disturbance check during mux flips — **not yet meaningful**: the
       current target outputs a black HDMI signal, so before/after frame
       comparison proves nothing. Needs real content on screen.
-- [ ] Re-run hot-plug characterization with the unit attached to a
-      non-virtualized host, to remove the passthrough layer entirely.
+- [ ] Re-run the DTR hot-plug characterization with the unit attached to a
+      non-virtualized host, to remove the passthrough layer entirely. (The
+      ms-tools reads have now been re-taken this way; the DTR work has not.)
+      Related: the `ch9329` baud-autodetect failure of issue #81 likewise did
+      **not** reproduce off the VM — 10/10 against the same factory-baud chip
+      on a directly-attached host — which is independent evidence that the
+      passthrough layer, not the hardware, is responsible for at least some
+      of what this bench has measured.
 - [ ] Root-cause the failed-enumeration storm in finding 2 before OTF-4 ships.
 
 ## Integration sketch
