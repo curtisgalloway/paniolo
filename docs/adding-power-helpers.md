@@ -106,6 +106,8 @@ including lazy migration from a pre-API path).
 3. Add the crate name to `CRATES` in [`Makefile`](https://github.com/curtisgalloway/paniolo/blob/main/Makefile) **and** to
    `HELPER_CRATES` in `cli/src/setup.rs` so `make install` / `paniolo setup`
    build and install it into the libexec dir (`cargo install --root`).
+4. Give it a CI job (`.github/workflows/ci.yml`) and a `crate_job` line in
+   `scripts/ci-local.sh`; `scripts/ci-coverage-check.sh` enforces both.
 
 **Python helper (the `zigplug` pattern):**
 
@@ -174,6 +176,11 @@ A helper PR touches more than the helper directory:
 - [ ] `README.md` — both helper lists (the power row in the subsystem table
       and the `make install` paragraph) + the manual install command block
 - [ ] `Makefile` — `CRATES` (Rust) or the header comment (other)
+- [ ] `.github/workflows/ci.yml` — a job for the new crate
+      (`working-directory: <crate>`; copy an existing crate job) **and** a
+      matching `crate_job` line in `scripts/ci-local.sh`. The `coverage` job
+      fails the build until both exist — every crate has a CI job, no
+      exceptions.
 - [ ] `docs/README.md` — the Power row in the subsystem guide table
 - [ ] Apache 2.0 headers on all new source files
 

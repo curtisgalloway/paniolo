@@ -22,6 +22,9 @@
 #   # Or directly on a Linux box / dev container:
 #   bash scripts/ci-local.sh
 #
+# It mirrors every Linux crate job in ci.yml; scripts/ci-coverage-check.sh
+# enforces that the two stay in sync.
+#
 # It installs the toolchain if missing (rustup + uv + apt build deps) and copies
 # the working tree to a VM-local dir before building, so nothing is written to a
 # shared host mount (a virtiofs/9p mount rejects setuptools' editable egg-info
@@ -82,15 +85,21 @@ crate_job () {
   echo "----- $name exit ${RES[$name]} -----"
 }
 
-crate_job "cli"       "cli"       "cargo test"
-crate_job "serialcap" "serialcap" "cargo test"
-crate_job "netbootd"  "netbootd"  "cargo test"
-crate_job "hdmicap"   "hdmicap"   "cargo build"
+crate_job "cli"        "cli"        "cargo test"
+crate_job "serialcap"  "serialcap"  "cargo test"
+crate_job "netbootd"   "netbootd"   "cargo test"
+crate_job "hdmicap"    "hdmicap"    "cargo build"
+crate_job "cambrionix" "cambrionix" "cargo test"
+crate_job "ch9329"     "ch9329"     "cargo test"
+crate_job "hidrig"     "hidrig"     "cargo test"
+crate_job "usbhub"     "usbhub"     "cargo test"
+crate_job "shellyplug" "shellyplug" "cargo test"
 
 echo
 echo "########## LOCAL CI SUMMARY ##########"
 fail=0
-for k in "cli" "serialcap" "netbootd" "hdmicap"; do
+for k in "cli" "serialcap" "netbootd" "hdmicap" "cambrionix" "ch9329" \
+         "hidrig" "usbhub" "shellyplug"; do
   c="${RES[$k]:-NA}"
   if [ "$c" = "0" ]; then printf 'PASS       %s\n' "$k"; else printf 'FAIL(%s)  %s\n' "$c" "$k"; fail=1; fi
 done
