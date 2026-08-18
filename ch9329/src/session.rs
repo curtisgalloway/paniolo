@@ -62,6 +62,26 @@ const LOGICAL_MAX: i64 = 32_767;
 /// (see `docs/ch9329-spec.md` §2).
 const BAUD_CANDIDATES: [u32; 3] = [115_200, 57_600, 9_600];
 
+/// Quiet period between baud probes — defensive, and host-dependent.
+///
+/// On some hosts a reopen immediately after a failed probe times out, and only
+/// an idle gap lets the next rate answer. Reported (issue #81) on Linux with
+/// the CH340 passed through to a VM: an Openterface at the factory 9600 rate
+/// (the third candidate, so behind two failed probes) autodetected 1/6, while
+/// `-b 9600` answered 6/6 and the same probes as separate processes with a
+/// 0.3 s gap answered 4/4.
+///
+/// This is NOT a property of the CH9329 itself. The same Openterface, same
+/// 9600 chip, attached directly to a macOS host autodetects 10/10 *without*
+/// any settle — so the delay is compensating for the host's USB-serial path
+/// (USB passthrough is the leading suspect), not for the chip.
+///
+/// Kept because the cost is small and paid once: autodetect runs when the
+/// session opens, and one-shots route through a persistent daemon, so this is
+/// at most 300 ms per failed candidate once per daemon start — not per
+/// command. Measured on macOS against a 9600 chip: 1.14 s → 1.75 s to open.
+const PROBE_SETTLE: Duration = Duration::from_millis(300);
+
 /// How long a key is held before release on a `tap`/`combo`.
 const HOLD: Duration = Duration::from_millis(30);
 /// How long a mouse button is held during a `click`. Much longer than a
@@ -116,7 +136,8 @@ impl Session {
             None => BAUD_CANDIDATES.to_vec(),
         };
         let mut last_err: Option<anyhow::Error> = None;
-        for &rate in &candidates {
+        let last_index = candidates.len() - 1;
+        for (i, &rate) in candidates.iter().enumerate() {
             let port = serialport::new(device, rate)
                 .data_bits(serialport::DataBits::Eight)
                 .parity(serialport::Parity::None)
@@ -138,7 +159,17 @@ impl Session {
             };
             match s.get_info() {
                 Ok(_) => return Ok(s),
-                Err(e) => last_err = Some(e),
+                Err(e) => {
+                    last_err = Some(e);
+                    // Close the port before the settle window so the chip sees
+                    // an idle line rather than a held-open handle. Skipped
+                    // after the final candidate: nothing follows it, so the
+                    // wait would only delay the error.
+                    drop(s);
+                    if i != last_index {
+                        sleep(PROBE_SETTLE);
+                    }
+                }
             }
         }
         Err(anyhow!(
