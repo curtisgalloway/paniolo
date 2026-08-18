@@ -10,9 +10,11 @@ You may obtain a copy of the License at
 
 # Openterface Mini-KVM deep control — findings & testing TODO
 
-*Status: **partially bench-verified 2026-08-18.** DTR→`SW_GND` characterized on
-hardware; EEPROM dumped; the MS2109 GPIO path is blocked. RTS→CH9329 and
-`DATAFLIP` remain untested. Tracker: requirements §6.1 (OTF-1…6).*
+*Status: **bench-verified 2026-08-18** as far as this bench allows. DTR→`SW_GND`
+and RTS→`HIDRESET` are both characterized; `DATAFLIP` is not observable from the
+host; the EEPROM is dumped. Everything still open is blocked on the MS2109
+firmware-patch wall (finding 7), a non-virtualized host, or the vendor app.
+Tracker: requirements §6.1 (OTF-1…6).*
 
 The Openterface Mini-KVM's hardware is open source
 ([TechxArtisanStudio/Openterface_Mini-KVM_Hardware](https://github.com/TechxArtisanStudio/Openterface_Mini-KVM_Hardware),
@@ -125,15 +127,36 @@ switched over).
      brownout storm — but the practical point stands: **this primitive can
      take down the control channel paniolo needs for HID.**
 
-3. **CH340 `RTS#` → net `HIDRESET` → CH9329 reset/config pin** (p3). A
-   wedged HID chip should be recoverable in software — the natural watchdog
-   action for a CH9329-based `hid` backend. **Still untested**: RTS sat
-   asserted throughout the 2026-08-18 session and was never toggled. Note the
-   kernel asserts RTS at open, and the shipped backend works, so asserted-RTS
-   is evidently not a *held* reset; whether a transition triggers one is
-   unknown. (A third line, `DATAFLIP`, runs to the CH9329 `DEF`/`UP` pins —
-   also untested. All four CH340 input lines read `0` in every sample taken,
-   so if `DATAFLIP` is a status input on the CH340 side it never moved.)
+3. **CH340 `RTS#` → net `HIDRESET` → CH9329 reset/config pin** (p3).
+   **Confirmed on hardware.** An RTS-low pulse resets the chip; recovery is
+   strikingly deterministic:
+
+   | RTS-low hold | Result | Recovery |
+   |---|---|---|
+   | 20 ms | no reset | — |
+   | 50 ms | reset | ~747 ms |
+   | 100 ms ×3 | reset | ~696–698 ms |
+
+   So the **reset threshold sits between 20 and 50 ms**, and the chip needs
+   **~700 ms to boot** before it answers again. The A-port device stayed
+   attached across every pulse, satisfying OTF-2's requirement that the reset
+   not disturb it. This makes the watchdog action actionable: pulse RTS low
+   for ≥ 50 ms, then allow ≥ 800 ms before the first command.
+
+   Note this unit's CH9329 runs at **9600 baud**, the factory rate, not the
+   115200 Openterface default — relevant because the helper's autodetect is
+   unreliable against a factory-baud part
+   ([#81](https://github.com/curtisgalloway/paniolo/issues/81)).
+
+   **`DATAFLIP` is not observable from the host.** The schematic reading has a
+   third line running to the CH9329 `DEF`/`UP` pins, but sampling all four
+   CH340 modem inputs at ~200 Hz across a baseline window *and* a full reset
+   cycle (1,956 samples) recorded **zero transitions** — CTS, DSR, CD and RI
+   all sat at `0` throughout, including during the reset and boot, the one
+   event guaranteed to change the chip's state. Whether it is a static strap,
+   driven by the MS2109, or a misreading of the schematic cannot be settled
+   from the host side. Practical consequence: OTF-2 gets **no status input
+   back** from the CH9329, and `DEF`/`UP` cannot be reached via the CH340.
 
 4. **USB descriptors in a writable AT24C16 EEPROM** hanging off the MS2109's
    config I2C (p2, with a WP line). **Confirmed**: ms-tools reports an
@@ -172,15 +195,18 @@ switched over).
    `USERCONFIG 48 @ RAM.CBD0`, `USERRAM 8192 @ RAM.C000`, and region reads
    work with `--no-patch`.
 
-   **But GPIO access requires uploading code into the running 8051, and that
-   fails on this unit.** `gpio-get` under `--no-patch` returns "not supported
-   in this mode"; with patching enabled it reports `Could not patch code`.
+   **But every *active* capability requires uploading code into the running
+   8051, and that upload fails on this unit.** This is one wall, not several:
+   `gpio-get` and `i2c-scan` both refuse under `--no-patch` with "not
+   supported in this mode", and with patching enabled the run reports
+   `Could not patch code`. `uart-tx` and `dump-rom` depend on the same
+   mechanism. Region reads are the only thing that works.
    Verbose logging shows the chip detected, a 14-byte patch allocated, and the
    writes genuinely landing (`ROMOut`/`ROMIn` readbacks match) — but the
    handshake byte at `0xCBD4` never changes from `0b`, so the injected code
    never executes. Expected, given the EEPROM carries vendor 8051 code rather
-   than a stock dongle image. **OTF-3 has no path through ms-tools as it
-   stands.** The remaining clean-room option is to capture the vendor
+   than a stock dongle image. **OTF-3 and OTF-5 have no path through ms-tools as
+   it stands.** The remaining clean-room option is to capture the vendor
    application's USB traffic while toggling its software switch and derive the
    command from observed bytes.
 
@@ -196,17 +222,17 @@ Done 2026-08-18:
       A-port device, closing restores it.
 - [x] Dump the AT24C16 before any write; archive per-unit backups.
 - [x] Does the switch override, or gate, the GPIO? **Neither** — see finding 1.
+- [x] `TIOCMSET` RTS: **resets the CH9329**. Threshold between 20 and 50 ms;
+      ~700 ms to boot; A-port undisturbed. See finding 3.
+- [x] Map `DATAFLIP`: **not observable** on any CH340 modem input across
+      1,956 samples spanning a reset. See finding 3.
 
-Still open:
+Blocked, not merely pending — each needs something this bench cannot supply:
 
-- [ ] `TIOCMSET` RTS: confirm it resets the CH9329 (chip re-announces on
-      serial; keyboard re-enumerates target-side) and that it does NOT
-      disturb the A-port or video.
-- [ ] Map `DATAFLIP` (DSR/CTS side): status input from the CH9329, or a
-      default-restore strap? Document.
 - [ ] Find the MS2109 GPIO write that drives the mux `Sel` — blocked on
       finding 7; needs a USB capture of the vendor app, or vendor register
-      documentation.
+      documentation. `i2c-scan` is blocked by the same wall, so the config
+      I2C bus cannot be enumerated either.
 - [ ] Measure mux-flip behavior once a flip is possible: does the previously
       attached side see a clean disconnect? Settle time?
 - [ ] Video-disturbance check during mux flips — **not yet meaningful**: the
@@ -220,8 +246,13 @@ Still open:
 
 - The CH9329 `hid` backend (the `ch9329/` helper crate,
   [clean-room spec](ch9329-spec.md)) has shipped; add RTS hardware reset as
-  its recovery verb (OTF-2) — after confirming the reset actually works, and
-  routing it through the existing session rather than a second `open()`.
+  its recovery verb (OTF-2). The reset is now characterized — pulse RTS low
+  for ≥ 50 ms, then wait ≥ 800 ms for the ~700 ms boot before the first
+  command — so this is implementable. Route it through the existing session
+  rather than a second `open()`, since opening asserts DTR and RTS. A watchdog
+  that reconnects should force the baud rather than rely on autodetect —
+  see [#81](https://github.com/curtisgalloway/paniolo/issues/81), filed from
+  this bench's factory-baud chip.
 - `usb attach-host` / `usb attach-target` (OTF-3) is **blocked** on a way to
   drive the MS2109 GPIO.
 - `usb replug [--hold-ms]` (OTF-4) works mechanically but is **not
