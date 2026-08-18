@@ -303,15 +303,49 @@ Blocked, not merely pending — each needs something this bench cannot supply:
 - [ ] Video-disturbance check during mux flips — **not yet meaningful**: the
       current target outputs a black HDMI signal, so before/after frame
       comparison proves nothing. Needs real content on screen.
-- [ ] Re-run the DTR hot-plug characterization with the unit attached to a
-      non-virtualized host, to remove the passthrough layer entirely. (The
-      ms-tools reads have now been re-taken this way; the DTR work has not.)
+- [x] Re-run the DTR hot-plug characterization with the unit attached to a
+      non-virtualized host — **done, and it overturns two of finding 2's
+      sub-claims. See finding 10.**
       Related: the `ch9329` baud-autodetect failure of issue #81 likewise did
       **not** reproduce off the VM — 10/10 against the same factory-baud chip
       on a directly-attached host — which is independent evidence that the
       passthrough layer, not the hardware, is responsible for at least some
       of what this bench has measured.
-- [ ] Root-cause the failed-enumeration storm in finding 2 before OTF-4 ships.
+- [ ] Root-cause the failed-enumeration storm in finding 2 before OTF-4 ships —
+      **but it did not occur at all off the VM** (finding 10), so start by
+      confirming it is reproducible on bare-metal Linux before hunting a
+      hardware cause.
+
+10. **Off the VM, the DTR replug is clean: no speed degradation, no
+    instability.** Re-ran finding 2's characterization with the unit attached
+    directly to a macOS host (`/dev/cu.usbserial-*`, DTR driven via `TIOCMSET`
+    through pyserial), against a Kingston DT microDuo 3C in the A-port that
+    enumerates at high speed.
+
+    | claim (finding 2, on the VM) | bare metal |
+    |---|---|
+    | asserted DTR disconnects the A-port device | **confirmed** — ABSENT on 6/6 probes taken *during* assertion, present again on release |
+    | replugs usually come back at full-speed 12 Mbps, "nondeterministic" | **did not reproduce** — 28/28 cycles returned at high-speed 480 Mbps, zero degraded |
+    | ~9 cycles destabilize the hub and wedge the sibling CH340 | **did not reproduce** — 28 cycles with the CH340 and MS2109 checked every cycle, both healthy throughout; `ch9329 info` answered normally afterwards |
+
+    Taken with the same pattern in issue #81 (that autodetect failure also did
+    not reproduce off the VM), the reasonable reading is that **the degraded
+    link speeds and the enumeration storm are artifacts of per-device USB
+    passthrough, not properties of this hardware.** The practical consequence
+    is large: OTF-4 (`usb replug`) was held back as "not production-ready"
+    mainly because of those two behaviours, and neither survives off the VM.
+
+    Two honest limits on this. It is macOS, not bare-metal Linux — the cleanest
+    remaining experiment is the same unit on a Linux host with no
+    virtualization, which separates "not Linux" from "not passthrough". And one
+    sub-claim of finding 2 needs re-examination rather than confirmation:
+    **merely opening the control tty did not unplug the A-port device here.**
+    Opening `/dev/cu.*` left it present and enumerated; only an explicit
+    deasserted→asserted DTR transition disconnected it. That may be the BSD
+    call-out (`cu`) versus dial-in (`tty`) distinction rather than a platform
+    difference, and it matters because the "route replug through the existing
+    session, never a second `open()`" constraint for OTF-2/3/4 rests on it.
+    Do not relax that constraint on the strength of one macOS observation.
 
 ## Integration sketch
 
