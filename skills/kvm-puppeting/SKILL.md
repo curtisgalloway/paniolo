@@ -51,10 +51,13 @@ working `video` and `hid` channels.
 
 ## Hardware is irrelevant to the method
 
-Two injectors are common and both speak the same `paniolo hid` commands:
+Three injectors are common and all speak the same `paniolo hid` commands:
 
 - an **Openterface Mini-KVM** (one box: an MS2109 HDMI capture + a CH9329 HID
-  bridge, driven by the `ch9329` helper), or
+  bridge, driven by the `ch9329` helper),
+- a **Sipeed NanoKVM-USB** (one box: an MS2130 HDMI capture + a CH9329 behind a
+  CH340 UART bridge, also driven by the `ch9329` helper — same protocol, but the
+  link runs at **57600** baud, not the Openterface's 115200), or
 - a **capture dongle + a KB2040** injector (the `hidrig` helper).
 
 The doctrine below is identical for either. A couple of CH9329-only conveniences

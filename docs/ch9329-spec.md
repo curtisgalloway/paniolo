@@ -51,6 +51,11 @@ Power-on default **9600**; supported 1200…**115200**; framing **8N1**.
 115200 requires 5 V supply (not guaranteed at 3.3 V). A factory/unconfigured chip
 is at 9600 — do not assume 115200; detect it.
 
+Vendor-configured rates observed on real hardware: Openterface Mini-KVM **115200**,
+Sipeed NanoKVM-USB **57600** (hardcoded as `SERIAL_BAUD_RATE` in the vendor's
+`browser/src/libs/device/serial-port.ts`). `ch9329` auto-detects 115200, 57600,
+then 9600.
+
 ## 3. GET_INFO — `0x01` → `0x81`, 8-byte response
 
 Request `57 AB 00 01 00 03`. Response payload: `[0]` chip version (`0x30+minor`);
@@ -102,7 +107,7 @@ default. ASCII/transparent modes type raw bytes instead of parsing frames.
 
 ## Init + baud-upgrade sequence
 
-1. Open at current baud (try 9600, then 115200) and `GET_INFO`; a `0x81` reply
+1. Open at current baud (try 9600, 57600, then 115200) and `GET_INFO`; a `0x81` reply
    confirms the baud and reports USB-enumeration + version.
 2. If not already 115200: `GET_PARA_CFG`, set baud 3..6=`00 01 C2 00`, mode/serial=0,
    `SET_PARA_CFG` (expect `0x89`/`0x00`), `CMD_RESET` (expect `0x8F`/`0x00`).

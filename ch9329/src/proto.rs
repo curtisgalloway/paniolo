@@ -115,7 +115,8 @@ pub fn execute_line(s: &mut Session, line: &str) -> Result<String> {
             s.set_baud(rate)?;
             return Ok(format!(
                 "link persisted to {rate} baud (CH9329 flash; auto-detect probes \
-                 115200 then 9600 — for other rates reconnect with -b {rate})"
+                 115200, 57600, then 9600 — for other rates reconnect with -b \
+                 {rate})"
             ));
         }
         other => bail!("unknown command: {other}"),

@@ -177,7 +177,7 @@ mod tests {
         assert!(is_transport_error("serial write failed: x"));
         assert!(is_transport_error("timed out waiting for CH9329 reply"));
         assert!(is_transport_error(
-            "CH9329 did not respond on /dev/x at 115200/9600 baud"
+            "CH9329 did not respond on /dev/x at 115200/57600/9600 baud"
         ));
         assert!(!is_transport_error(
             "CH9329 rejected cmd 0x02: bad parameter (0xe5)"
