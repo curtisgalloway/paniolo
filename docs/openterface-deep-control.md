@@ -235,11 +235,27 @@ switched over).
    9-byte HID feature reports laid out `[reportID=0, cmd, addr…]`.
 
    The catch: `MemoryRegionList` only offers `SFR` when `deviceType == 2130`.
-   Ours is 2109, so ms-tools never takes that path for us. **This is a gap in
-   ms-tools' support matrix, not proof the MS2109 ROM lacks command `0xc5`** —
-   which makes a read-only `0xc5` probe (via `raw-cmd`, validating the frame
-   layout against a known value first) the cheapest remaining shot at OTF-3.
-   Untested so far.
+   Ours is 2109, so ms-tools never takes that path for us.
+
+   **Probed, and the MS2109 ROM does not implement `0xc5`.** Frame layout was
+   validated first against known values via the working XDATA command — `raw-cmd
+   b50001` → `b5 00 01 **13**`, `b5000b` → `21`, `b5000c` → `09`, all matching
+   the dumps, confirming the reply byte sits at index 3 for a 16-bit read (index
+   2 for an 8-bit one). Command `0xc5` then returned the address echo followed by
+   **`00` at every SFR tried** — `0x80` P0, `0x81` SP, `0x90` P1, `0xA0` P2,
+   `0xB0` P3, `0xD0` PSW, `0xE0` ACC, `0xF0` B.
+
+   That is an unimplemented command, not a chip whose registers are all zero:
+   `SP` and `ACC` cannot both read `0x00` on a running 8051 (`SP` is never zero
+   in normal operation), and the same transport returned varied, correct data
+   for `0xb5` moments earlier. So ms-tools' `deviceType == 2130` gate reflects
+   the hardware rather than an oversight, and **the no-patch SFR route is
+   genuinely closed on this chip.**
+
+   No further opcodes were swept looking for an equivalent: an unknown command
+   id could be a write or a reset, and the EEPROM has no external recovery path
+   confirmed yet. Remaining leads for OTF-3 are disassembling our own dumped
+   EEPROM image, and the USB capture of the vendor app.
 
 9. **The slide-switch position is readable from XDATA at `0xDF00`, with no
    firmware patch.** Bit 0 mirrors the switch: `0x00` inward/H, `0x01`
