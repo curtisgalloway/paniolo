@@ -103,6 +103,7 @@ rust: check-deps
 	$(PANIOLO) setup --rust-only
 
 test:
+	@bash scripts/ci-coverage-check.sh
 	@for crate in $(CRATES); do \
 		echo "==> cargo test ($$crate)"; \
 		( cd $$crate && cargo test ) || exit 1; \

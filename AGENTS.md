@@ -58,13 +58,28 @@ follow-up. Run through this checklist before calling `gh pr create`:
 
 4. **Validate before pushing.** Build and run the tests for the crates you
    touched. To catch the Linux-only CI failures without a round-trip, run
-   `scripts/ci-local.sh` — it mirrors the GitHub Linux CI jobs (`cli`,
-   `serialcap`, `netbootd`, `hdmicap`) in a Linux environment, e.g. a
-   Lima VM: `limactl shell <instance> -- bash -l scripts/ci-local.sh`. (The
-   macOS-only job — hdmicap AVFoundation + visionocr — runs on the host.) Note
-   `cli` is the primary control-plane crate; don't let its tests rot.
+   `scripts/ci-local.sh` — it mirrors every GitHub Linux CI job (`cli`,
+   `serialcap`, `netbootd`, `hdmicap`, `cambrionix`, `ch9329`, `hidrig`,
+   `usbhub`, `shellyplug`) in a Linux environment, e.g. a Lima VM:
+   `limactl shell <instance> -- bash -l scripts/ci-local.sh`. (The macOS-only
+   job — hdmicap AVFoundation + visionocr — runs on the host.) Note `cli` is
+   the primary control-plane crate; don't let its tests rot.
 
-5. **Push, open the PR, and merge only when asked.** Get the branch ready by
+5. **Every crate has a CI job — no exceptions.** A crate is not finished until
+   `.github/workflows/ci.yml` has a job for it (`working-directory: <crate>`,
+   then fmt + clippy `-D warnings` + test, copied from an existing crate job)
+   *and* `scripts/ci-local.sh` has a matching `crate_job` line. This is
+   enforced mechanically, not by memory: the `coverage` job runs
+   `scripts/ci-coverage-check.sh`, which fails the build when a crate has
+   neither. If a crate genuinely cannot run in CI, add it to `EXEMPT` in that
+   script **with the reason written down** — never weaken or delete the check.
+
+   The rule exists because five crates (`cambrionix`, `ch9329`, `hidrig`,
+   `usbhub`, `shellyplug`) went months with no CI at all: jobs were added
+   per-crate as each one happened to matter, and nothing noticed the ones that
+   were skipped.
+
+6. **Push, open the PR, and merge only when asked.** Get the branch ready by
    committing locally, but treat `git push`, `gh pr create`, and merging as
    gated on the maintainer's explicit instruction — don't push or open a PR on
    your own initiative, and never merge. When told to, open with `gh pr create`;
@@ -761,6 +776,10 @@ Rust `cli/` crate:
 4. If it's a daemon with a PID, add its state/discovery handling alongside the
    others (`cli/src/state.rs`, `cli/src/daemons.rs`).
 5. Regenerate the skill (`paniolo skill`) and update this file and `docs/`.
+
+A new **crate** (helper or otherwise) additionally needs a CI job and a
+`scripts/ci-local.sh` line — see the CI-coverage rule in "Before opening a PR".
+`scripts/ci-coverage-check.sh` fails the build until both exist.
 
 ## Linux support
 

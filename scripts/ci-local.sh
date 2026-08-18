@@ -22,6 +22,9 @@
 #   # Or directly on a Linux box / dev container:
 #   bash scripts/ci-local.sh
 #
+# It mirrors every Linux crate job in ci.yml; scripts/ci-coverage-check.sh
+# enforces that the two stay in sync.
+#
 # It installs the toolchain if missing (rustup + uv + apt build deps) and copies
 # the working tree to a VM-local dir before building, so nothing is written to a
 # shared host mount (a virtiofs/9p mount rejects setuptools' editable egg-info
@@ -35,9 +38,20 @@ DST="${PANIOLO_CI_DIR:-$HOME/.cache/paniolo-ci-src}"
 export DEBIAN_FRONTEND=noninteractive
 
 echo "### [setup] system deps"
-sudo apt-get update -qq
-sudo apt-get install -y -qq pkg-config libudev-dev build-essential \
-  libclang-dev clang cmake nasm libturbojpeg0-dev curl ca-certificates rsync >/dev/null
+# Wait for the dpkg lock rather than failing on it: a freshly booted VM usually
+# has unattended-upgrades holding it for the first few minutes. And abort if the
+# install still fails -- without these libraries every serialport crate (cli,
+# serialcap, cambrionix, ch9329, hidrig) and hdmicap fail to build, which reads
+# as six code failures instead of one missing dependency.
+APT="-o DPkg::Lock::Timeout=300"
+if ! sudo apt-get $APT update -qq \
+  || ! sudo apt-get $APT install -y -qq pkg-config libudev-dev build-essential \
+       libclang-dev clang cmake nasm libturbojpeg0-dev curl ca-certificates rsync >/dev/null
+then
+  echo "FATAL: could not install the system build dependencies; aborting." >&2
+  echo "       Re-run once apt is free, or install them by hand." >&2
+  exit 2
+fi
 
 if ! command -v cargo >/dev/null 2>&1; then
   echo "### [setup] rustup (stable, minimal + clippy + rustfmt)"
@@ -82,15 +96,21 @@ crate_job () {
   echo "----- $name exit ${RES[$name]} -----"
 }
 
-crate_job "cli"       "cli"       "cargo test"
-crate_job "serialcap" "serialcap" "cargo test"
-crate_job "netbootd"  "netbootd"  "cargo test"
-crate_job "hdmicap"   "hdmicap"   "cargo build"
+crate_job "cli"        "cli"        "cargo test"
+crate_job "serialcap"  "serialcap"  "cargo test"
+crate_job "netbootd"   "netbootd"   "cargo test"
+crate_job "hdmicap"    "hdmicap"    "cargo build"
+crate_job "cambrionix" "cambrionix" "cargo test"
+crate_job "ch9329"     "ch9329"     "cargo test"
+crate_job "hidrig"     "hidrig"     "cargo test"
+crate_job "usbhub"     "usbhub"     "cargo test"
+crate_job "shellyplug" "shellyplug" "cargo test"
 
 echo
 echo "########## LOCAL CI SUMMARY ##########"
 fail=0
-for k in "cli" "serialcap" "netbootd" "hdmicap"; do
+for k in "cli" "serialcap" "netbootd" "hdmicap" "cambrionix" "ch9329" \
+         "hidrig" "usbhub" "shellyplug"; do
   c="${RES[$k]:-NA}"
   if [ "$c" = "0" ]; then printf 'PASS       %s\n' "$k"; else printf 'FAIL(%s)  %s\n' "$c" "$k"; fail=1; fi
 done
