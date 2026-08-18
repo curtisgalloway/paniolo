@@ -47,8 +47,9 @@ const HELPER_CRATES: [&str; 8] = [
 ];
 
 fn is_repo_root(d: &Path) -> bool {
-    d.join("pyproject.toml").is_file()
+    d.join("Makefile").is_file()
         && d.join("ocr").is_dir()
+        && d.join("cli/Cargo.toml").is_file()
         && d.join("hdmicap/Cargo.toml").is_file()
 }
 
