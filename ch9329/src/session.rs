@@ -58,8 +58,9 @@ const ABS_FULL: i64 = 4096;
 const LOGICAL_MAX: i64 = 32_767;
 
 /// Baud rates tried, in order, when none is forced. Openterface units default
-/// to 115200; a factory CH9329 is at 9600 (see `docs/ch9329-spec.md` §2).
-const BAUD_CANDIDATES: [u32; 2] = [115_200, 9_600];
+/// to 115200; a Sipeed NanoKVM-USB ships at 57600; a factory CH9329 is at 9600
+/// (see `docs/ch9329-spec.md` §2).
+const BAUD_CANDIDATES: [u32; 3] = [115_200, 57_600, 9_600];
 
 /// How long a key is held before release on a `tap`/`combo`.
 const HOLD: Duration = Duration::from_millis(30);
@@ -115,7 +116,7 @@ impl Session {
             None => BAUD_CANDIDATES.to_vec(),
         };
         let mut last_err: Option<anyhow::Error> = None;
-        for rate in candidates {
+        for &rate in &candidates {
             let port = serialport::new(device, rate)
                 .data_bits(serialport::DataBits::Eight)
                 .parity(serialport::Parity::None)
@@ -142,7 +143,7 @@ impl Session {
         }
         Err(anyhow!(
             "CH9329 did not respond on {device} at {} baud: {}",
-            BAUD_CANDIDATES
+            candidates
                 .iter()
                 .map(|b| b.to_string())
                 .collect::<Vec<_>>()

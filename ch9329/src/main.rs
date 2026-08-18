@@ -56,7 +56,7 @@ struct Cli {
     #[arg(short = 'd', long = "device", value_name = "DEVICE", global = true)]
     device: Option<String>,
 
-    /// Force the serial baud rate (default: autodetect 115200 then 9600).
+    /// Force the serial baud rate (default: autodetect 115200, 57600, then 9600).
     #[arg(short = 'b', long = "baud", global = true)]
     baud: Option<u32>,
 
@@ -147,7 +147,8 @@ enum Cmd {
     Stop,
     /// Persistently set the CH9329's serial baud (SET_PARA_CFG flash + reset),
     /// then reconnect at the new rate. The datasheet range is 1200..=115200
-    /// (Openterface default 115200; factory chips 9600). Unlike the protocol's
+    /// (Openterface default 115200; NanoKVM-USB 57600; factory chips 9600).
+    /// Unlike the protocol's
     /// transient `baud`, this is stored in flash and survives a power-cycle.
     Baud { rate: u32 },
 }
