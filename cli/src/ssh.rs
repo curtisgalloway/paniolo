@@ -173,6 +173,25 @@ pub fn run_passthrough(
     Ok(status.code().unwrap_or(-1))
 }
 
+/// Run `argv` on `host` with stdout redirected into `sink` (stderr and stdin
+/// pass through). For remote commands that stream a binary payload on stdout
+/// (e.g. `video shot --out -`), where capturing into a lossy String would
+/// corrupt it.
+pub fn run_stdout_to(
+    host: &Host,
+    argv: &[String],
+    env: &[(String, String)],
+    sink: std::fs::File,
+) -> std::io::Result<i32> {
+    let status = Command::new("ssh")
+        .args(&base_args(host, false, true)[1..])
+        .arg(&host.ssh)
+        .arg(remote_command(argv, env))
+        .stdout(Stdio::from(sink))
+        .status()?;
+    Ok(status.code().unwrap_or(-1))
+}
+
 /// Run `argv` on `host` over an `ssh -t` PTY (for interactive tools like tio).
 pub fn run_interactive(
     host: &Host,

@@ -49,12 +49,27 @@ pub fn ocr(target: &str, stable: bool, timeout_ms: u64) -> Result<String> {
             .call()
             .map_err(|e| anyhow!("waiting for a stable frame failed: {e}"))?;
     }
-    ureq::get(&format!("{url}/ocr"))
+    match ureq::get(&format!("{url}/ocr"))
         .timeout(std::time::Duration::from_secs(30))
         .call()
-        .map_err(|e| anyhow!("OCR failed: {e}"))?
-        .into_string()
-        .map_err(|e| anyhow!("reading the OCR response failed: {e}"))
+    {
+        Ok(resp) => resp
+            .into_string()
+            .map_err(|e| anyhow!("reading the OCR response failed: {e}")),
+        // Surface the daemon's own explanation ("no video signal", "no capture
+        // device") instead of a bare status code — an agent must be able to
+        // tell "display is off" apart from "screen is blank".
+        Err(ureq::Error::Status(code, resp)) => {
+            let msg = resp.into_string().unwrap_or_default();
+            let msg = msg.trim();
+            if msg.is_empty() {
+                Err(anyhow!("OCR failed: daemon returned status {code}"))
+            } else {
+                Err(anyhow!("OCR failed: {msg}"))
+            }
+        }
+        Err(e) => Err(anyhow!("OCR failed: {e}")),
+    }
 }
 
 /// Start the `target`'s hdmicap daemon for `device`, detached; caller polls

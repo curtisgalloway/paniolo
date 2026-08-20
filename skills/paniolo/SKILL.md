@@ -193,10 +193,18 @@ paniolo video stop [target]           # stop the daemon (on the target's host)
 - `--stable` waits for a steady frame before capturing (useful right after a mode
   switch or reboot). `video shot` prints `signal=… hash=…` on stderr — feed that
   hash to `--changed-since` to wait efficiently for the screen to change.
+- `shot --out <path>` always writes on the **invoking machine**, even when the
+  video channel lives on a remote control host (the PNG streams back over SSH;
+  no copy step). `video devices` hides SoC-internal video nodes (Pi pipeline
+  stages, codecs) — pass `--all` through `paniolo helper hdmicap devices --all`
+  if you truly need them.
 - **OCR** (`video read`, which wraps the daemon's `GET /ocr`; also the
   dashboard button) is on-device (Apple Vision on macOS, Tesseract on Linux).
   It reads large boot-screen / BIOS text well; very small console fonts can
-  produce a few character confusions (e.g. `1`/`l`, `2`/`Z`).
+  produce a few character confusions (e.g. `1`/`l`, `2`/`Z`). With **no video
+  signal** (target display off/unplugged) `read` errors with `no video signal`
+  rather than returning empty text — wake the display (a `hid` keypress) and
+  retry.
 
 ## Serial console
 

@@ -25,6 +25,12 @@ paniolo video devices
 paniolo video set -t target-machine --device "0x8300000534d2109"
 ```
 
+On Linux, `video devices` hides SoC-internal video nodes (e.g. a Raspberry
+Pi's `pispbe-*` pipeline stages and HEVC decoder, which otherwise flood the
+list) — only external capture devices are shown. `paniolo helper hdmicap
+devices --all` lists everything, and an explicitly configured internal device
+still resolves.
+
 The `--device` value may be:
 
 - a **stable id** (preferred): the AVFoundation `uniqueID` on macOS, the
@@ -78,6 +84,11 @@ paniolo video preview [target-machine]           # print the live-dashboard URL 
 `signal=… hash=…` to stderr; feed that hash to a later `--changed-since` to
 wait for the screen to change.
 
+`-o <path>` always means the **invoking machine's** filesystem, including when
+the target's video channel lives on a remote control host: the remote shot
+streams over SSH and the PNG is written locally (a failed capture removes the
+stub file). No copy-back step needed.
+
 ---
 
 ## OCR
@@ -89,7 +100,10 @@ paniolo video read --stable [--timeout <ms>]   # wait for a steady frame first
 
 `read` wraps the running daemon's `GET /ocr` endpoint (also reachable directly
 — `curl -s "$(paniolo video preview)/ocr"` — and via the OCR button on the
-[web dashboard](dashboard.md)). On macOS this uses Apple Vision's
+[web dashboard](dashboard.md)). When the capture has **no video signal** (the
+target's display is off or unplugged) `read` errors with `no video signal`
+instead of returning empty text, so "display is off" and "screen is blank"
+stay distinguishable. On macOS this uses Apple Vision's
 `VNRecognizeTextRequest` — on-device, no network, no model download required.
 
 `paniolo setup` compiles `ocr/visionocr.swift` with `swiftc` into the private

@@ -120,6 +120,11 @@ pub fn list_usb_ethernet_interfaces() -> Vec<EthInterface> {
             if !is_ether {
                 continue;
             }
+            // Wi-Fi also reports ARPHRD_ETHER, but a wireless NIC can never be
+            // the point-to-point netboot link; the `wireless` sysfs dir marks it.
+            if e.path().join("wireless").exists() {
+                continue;
+            }
             let active = is_interface_active(&name);
             out.push(EthInterface {
                 port: name.clone(),
