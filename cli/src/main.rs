@@ -2731,8 +2731,13 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
                         sub.push("--changed-since".to_string());
                         sub.push(h.clone());
                     }
-                    let code =
-                        dispatch::dispatch_stdout_to_file(&lab, &target_name, &host_name, &sub, &out)?;
+                    let code = dispatch::dispatch_stdout_to_file(
+                        &lab,
+                        &target_name,
+                        &host_name,
+                        &sub,
+                        &out,
+                    )?;
                     if code == 0 {
                         eprintln!("saved to {out}");
                     }

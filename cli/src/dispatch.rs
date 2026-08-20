@@ -226,8 +226,8 @@ pub fn dispatch_stdout_to_file(
     let mut argv = vec![host.paniolo(), "--lab".to_string(), remote_path.clone()];
     argv.extend(sub_argv.iter().cloned());
 
-    let sink = std::fs::File::create(out_path)
-        .map_err(|e| anyhow::anyhow!("creating {out_path}: {e}"))?;
+    let sink =
+        std::fs::File::create(out_path).map_err(|e| anyhow::anyhow!("creating {out_path}: {e}"))?;
     let code = ssh::run_stdout_to(&host, &argv, &[], sink)?;
 
     let _ = ssh::run(

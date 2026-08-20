@@ -227,4 +227,3 @@ fn cmd_stop() -> Result<()> {
     println!("daemon (pid {}) stopping", d.pid);
     Ok(())
 }
-
