@@ -6,9 +6,12 @@
 > complements [pi4-control-host.md](pi4-control-host.md) (per-bench hardware,
 > wiring, and UART/gadget configuration), and builds on the distributed-control
 > principle that control hosts are disposable. The first `pi-sd` seed was
-> hand-built 2026-08-20 (host `waldo`, a Pi 5, on Pi OS Trixie Lite arm64) —
-> injection verified, first-boot validation pending. The generator and
-> templates land under `packaging/` when built.
+> hand-built 2026-08-20 (host `waldo`, a Pi 5 8 GB, on Pi OS Trixie Lite
+> arm64) and **hardware-validated**: cloud-init done, key-only SSH up, groups
+> and packages applied, the release `.deb` installed. See
+> [pi-sd findings](#pi-sd-hardware-findings-waldo-2026-08-20) for what the
+> first pass corrected. The generator and templates land under `packaging/`
+> when built.
 
 ## The problem
 
@@ -131,6 +134,35 @@ Notes:
   normal lab-file flow. Wi-Fi-as-uplink on the Pi is supported by
   `network-config`, with the caveat that the PSK sits in plaintext on the
   boot partition.
+
+## pi-sd hardware findings (waldo, 2026-08-20)
+
+The first real seed run surfaced four facts the templates must encode:
+
+- **sshd is disabled by default on Pi OS, and the announced `enable_ssh: true`
+  did NOT enable it** on the 2026-06-18 Trixie Lite arm64 image (the key is a
+  Pi OS downstream extension, absent from upstream `cc_raspberry_pi`; on this
+  image it was a silent no-op). What works: the classic **empty `ssh` flag
+  file** on `bootfs` — `sshswitch.service` survives in Trixie, enabled sshd,
+  and consumed the file — plus a `bootcmd` fallback. Ship both; keep
+  `openssh-server` in `packages` as insurance.
+- **Never `systemctl enable --now ssh` in `bootcmd`.** `bootcmd` runs in
+  cloud-init's pre-network local stage; `--now` waits for ssh.service, which
+  waits for the network, which waits for cloud-init-local → the boot
+  deadlocks (observed: hang at "Local Stage (pre-network)", recovered only by
+  power-cut). `systemctl enable ssh` (symlink only) is safe and sufficient.
+- **Re-seeding an already-booted card**: edit `user-data` on `bootfs` *and*
+  bump `instance_id` in `meta-data` — cloud-init caches per-instance state on
+  the rootfs, so an unchanged id means user/packages/runcmd never re-run.
+- **`extended_status: degraded done` is normal** on this image: cloud-init
+  warns it can't find `cc_netplan_nm_patch` (Pi OS packaging wart). All
+  stages complete, `errors: []` — don't let a health check treat it as
+  failure; check `errors`/`recoverable_errors`, not the word "degraded".
+
+Bench note, not a seed concern: a board reused from netboot bring-up may have
+EEPROM `BOOT_ORDER` set network-first (waldo's was `0xf12` from its Fuchsia
+DUT days, costing ~40 s per boot); set it SD-first (e.g. `0xf21`) when the
+board becomes a control host.
 
 ## Host sizing
 
