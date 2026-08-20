@@ -10,6 +10,12 @@ exercise (the agent says what it would run) or a *config-only* exercise (the
 agent really runs paniolo against a throwaway lab file). Both run on any machine
 with the `paniolo` CLI installed; neither touches a bench target.
 
+> **Complementary suite.** This doc measures *discovery + usage of paniolo
+> itself*. For the **hardware-in-the-loop, head-to-head** question — does paniolo
+> produce better serial-task *outcomes* than the alternatives an agent would
+> otherwise use (improvising, or `fx serial`), across Claude Code and
+> Antigravity — see [`serial-agent-benchmark.md`](serial-agent-benchmark.md).
+
 ---
 
 ## 1. What is actually under test
