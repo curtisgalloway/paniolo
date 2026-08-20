@@ -681,7 +681,7 @@ and reads back `CIM_AssociatedPowerManagementService.PowerState`.
 **The password never appears in the lab file, a flag, or any repository.**
 The helper reads it from the **`AMT_PASSWORD` environment variable** only;
 the lab file carries just the address and username. Inject it at call time —
-with the 1Password CLI:
+for example with the 1Password CLI:
 
 ```bash
 # .env:  AMT_PASSWORD=op://<vault>/<item>/password
@@ -692,6 +692,45 @@ Single quotes matter: the parent shell must not expand `$AMT_PASSWORD`
 before `op run` sets it (see the Generic power hooks section for the same
 gotcha with `HA_TOKEN`). Without the variable, every subcommand fails with a
 message saying exactly this.
+
+### Setting up the credential source
+
+`AMT_PASSWORD` is deliberately the whole interface: the helper neither knows
+nor cares where the secret is kept. **Any secret manager works** — 1Password,
+HashiCorp Vault, `pass`, systemd credentials, a cloud secrets service — as
+long as the variable is present in the environment of the `paniolo`
+invocation whose hook needs it. To make that repeatable rather than
+hand-typed, set up one of these **next to whatever invokes paniolo**:
+
+- **A reference file + run wrapper**, when the secret manager has an
+  `op run`-style launcher that resolves references into env vars at call
+  time. The reference (`op://<vault>/<item>/password` above) is a pointer,
+  not a secret — it is safe to commit to the private repo that holds your
+  automation; the value itself never lands in a file.
+- **A small fetch-and-exec wrapper** for managers without such a launcher
+  (a 1Password Connect fetcher, `vault kv get`, `pass show`, …):
+
+  ```sh
+  #!/bin/sh
+  # with-amt-password — run a command with AMT_PASSWORD in its environment
+  AMT_PASSWORD="$(fetch-secret amt/password)" || exit 1
+  export AMT_PASSWORD
+  exec "$@"
+  ```
+
+  Commit the wrapper alongside your automation (it names *where* the secret
+  lives, never the secret) and invoke hooks through it:
+  `with-amt-password paniolo power-cycle <target>`.
+- **An interactive export** for one-off manual use:
+  `read -rs AMT_PASSWORD && export AMT_PASSWORD` keeps the value out of the
+  command line and shell history.
+
+**Placement rule:** the variable must exist where the *hook runs* — the host
+that owns the target's power channel. Locally that is simply the environment
+of your `paniolo` command. For a target driven through a remote lab host,
+plain SSH does not carry your local environment across, so install the
+wrapper/reference file on the control host itself (or use the sshd
+`AcceptEnv` forwarding pattern shown under Generic power hooks).
 
 ### Commands
 

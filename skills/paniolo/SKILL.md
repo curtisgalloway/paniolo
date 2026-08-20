@@ -377,8 +377,13 @@ paniolo power set -t optiplex \
 `AMT_PASSWORD` environment variable, so `paniolo power …` / `power-cycle` /
 `power-state` against an AMT-backed target must run with it set, e.g.
 `op run --env-file .env -- bash -c 'paniolo power-cycle optiplex'` (single
-quotes — the parent shell must not expand it). Without it the hook fails with
-a message saying exactly this. See `docs/power.md` for details and gotchas.
+quotes — the parent shell must not expand it). 1Password is only one option:
+any secret manager works, usually via a committed reference file or a small
+fetch-and-exec wrapper next to the automation that invokes paniolo — look
+for one there before composing the fetch by hand. Without the variable the
+hook fails with a message saying exactly this. See "Setting up the
+credential source" in `docs/power.md` for the patterns and the placement
+rule (the variable must exist on the host that owns the power channel).
 
 ## HID injection — type and click into the target
 
