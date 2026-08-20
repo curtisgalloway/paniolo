@@ -33,11 +33,12 @@ Paniolo runs each hook with `sh -c <cmd>` (`cli/src/main.rs`,
 Environment the helper must tolerate:
 
 - **`sh -c`, no shell profile.** The command string is evaluated by `sh` with
-  the paniolo process's PATH **plus the private libexec dir
-  (`~/.local/libexec/paniolo/bin`) prepended** — so helpers installed by
-  `paniolo setup` resolve by bare name without living on the user's PATH.
+  the paniolo process's PATH **plus the helper dirs prepended** — the private
+  libexec dir (`~/.local/libexec/paniolo/bin`), then the system package dir
+  (`/usr/libexec/paniolo/bin`) — so helpers installed by `paniolo setup` *or*
+  by the .deb resolve by bare name without living on the user's PATH.
   Absolute paths also work. `paniolo doctor` probes both forms: `test -e` for
-  absolute paths, `command -v` under the same libexec-then-PATH resolution
+  absolute paths, `command -v` under the same helper-dirs-then-PATH resolution
   for bare names.
 - **Runs on the channel's control host.** Power commands re-exec over SSH on
   the host that owns the power channel (`paniolo power set --host <labhost>`).

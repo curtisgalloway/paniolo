@@ -98,7 +98,8 @@ tftp_root = "/path/to/pxe"       # required to start netboot
 
 [[targets.target-machine.serial]] # repeatable — a target may have several named consoles
 name = "console"
-device = "/dev/serial/by-path/…" # stable by-path symlink preferred (Linux)
+device = "/dev/serial/by-id/…"   # stable symlink preferred (Linux): by-id names the
+                                 #   adapter; by-path when it has no serial number
 baud = 115200
 power_sense_signal = "cts"       # optional; cts|dsr|dcd|ri — modem-control input wired to the rail
 
@@ -281,7 +282,7 @@ Core power/serial/netboot works on both; the platform-specific spots are contain
 | TFTP egress workaround | BPF raw frames (`/dev/bpf*`) for Sequoia routing | normal `sendto()` |
 | BPF descriptor access (rust engine) | setuid `netbootd-bpf-helper` passes the fd (daemon stays unprivileged) | n/a (kernel send path) |
 | OCR backend | Apple Vision (`visionocr`, `swiftc`) | Tesseract (`linuxocr`, `tesseract-ocr` pkg) |
-| Serial device discovery | `/dev/tty.usb*` | `/dev/serial/by-path/*` → `/dev/ttyUSB*`/`ACM*` |
+| Serial device discovery | `/dev/tty.usb*` | `/dev/serial/{by-id,by-path}/*` grouped per port, by-id preferred → `/dev/ttyUSB*`/`ACM*` |
 | `paniolo setup` extras | compiles `visionocr` (`swiftc`) + installs setuid `netbootd-bpf-helper` (one sudo) | `linuxocr` (needs `tesseract-ocr` pkg) |
 
 For headless CI the relevant takeaway (see `ci-integration/`): the core path is clean on Linux,
