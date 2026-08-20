@@ -130,8 +130,10 @@ pub fn exec_tio(device: &str, baud: i64) -> Result<()> {
 
 // ── device listing ──────────────────────────────────────────────────────────
 
-/// Available serial device paths on this platform. On Linux, prefers the
-/// stable /dev/serial/by-path symlinks.
+/// Available serial device paths on this platform. On Linux, one entry per
+/// physical port, named by its stable /dev/serial symlink — by-id preferred
+/// (names the adapter; what lab files typically use), by-path as the fallback
+/// (port-derived; the only stable name for adapters without a serial number).
 pub fn list_devices() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if cfg!(target_os = "macos") {
@@ -144,11 +146,24 @@ pub fn list_devices() -> Vec<String> {
             }
         }
     } else {
-        if let Ok(rd) = std::fs::read_dir("/dev/serial/by-path") {
-            for e in rd.flatten() {
-                out.push(e.path().display().to_string());
+        // Group the /dev/serial symlinks by the tty they resolve to, so each
+        // physical port lists once even though udev usually gives it several
+        // aliases (a by-id name, plus by-path `usb`/`usbv2` twins).
+        let mut by_tty: std::collections::BTreeMap<std::path::PathBuf, Vec<String>> =
+            Default::default();
+        for dir in ["/dev/serial/by-id", "/dev/serial/by-path"] {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let path = e.path();
+                    let tty = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                    by_tty
+                        .entry(tty)
+                        .or_default()
+                        .push(path.display().to_string());
+                }
             }
         }
+        out.extend(by_tty.values().filter_map(|a| preferred_alias(a).cloned()));
         if out.is_empty() {
             if let Ok(rd) = std::fs::read_dir("/dev") {
                 for e in rd.flatten() {
@@ -162,6 +177,16 @@ pub fn list_devices() -> Vec<String> {
     }
     out.sort();
     out
+}
+
+/// The display name for one physical port's symlink aliases: the by-id name
+/// when the adapter has one, else the first (sorted) alias — which keeps the
+/// plain `usb` by-path variant ahead of its `usbv2` twin.
+fn preferred_alias(aliases: &[String]) -> Option<&String> {
+    aliases
+        .iter()
+        .find(|a| a.contains("/by-id/"))
+        .or_else(|| aliases.iter().min())
 }
 
 #[cfg(test)]
@@ -193,5 +218,33 @@ mod tests {
             interface_arg(&ch("console", Some("cts"))),
             "console=/dev/ttyUSB0@115200:cts"
         );
+    }
+
+    #[test]
+    fn preferred_alias_picks_by_id_over_by_path() {
+        let aliases = vec![
+            "/dev/serial/by-path/platform-xhci-hcd.1-usb-0:1.2:1.0-port0".to_string(),
+            "/dev/serial/by-id/usb-1a86_USB2.0-Serial-if00-port0".to_string(),
+            "/dev/serial/by-path/platform-xhci-hcd.1-usbv2-0:1.2:1.0-port0".to_string(),
+        ];
+        assert_eq!(
+            preferred_alias(&aliases).unwrap(),
+            "/dev/serial/by-id/usb-1a86_USB2.0-Serial-if00-port0"
+        );
+    }
+
+    #[test]
+    fn preferred_alias_falls_back_to_first_sorted_by_path() {
+        // No by-id (adapter without a serial number): the plain `usb` by-path
+        // variant sorts ahead of its `usbv2` twin and wins deterministically.
+        let aliases = vec![
+            "/dev/serial/by-path/platform-xhci-hcd.1-usbv2-0:1.2:1.0-port0".to_string(),
+            "/dev/serial/by-path/platform-xhci-hcd.1-usb-0:1.2:1.0-port0".to_string(),
+        ];
+        assert_eq!(
+            preferred_alias(&aliases).unwrap(),
+            "/dev/serial/by-path/platform-xhci-hcd.1-usb-0:1.2:1.0-port0"
+        );
+        assert_eq!(preferred_alias(&[]), None);
     }
 }

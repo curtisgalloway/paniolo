@@ -83,26 +83,32 @@ fn field<'a>(ch: &'a ResolvedChannel, key: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
-/// Shell fragment giving hook commands the same resolution paniolo uses
-/// locally: the libexec dir first, then PATH. The literal path must match
-/// `daemons::libexec_dir()`; it is expanded by the probed host's own shell so
-/// that host's $HOME applies.
-const HOOK_PATH_PREFIX: &str = "PATH=\"$HOME/.local/libexec/paniolo/bin:$PATH\"";
+/// Shell statement giving hook commands the same resolution the hooks get at
+/// runtime (`daemons::hook_path()`): the per-user libexec dir, then the system
+/// package dir, then PATH. The literal paths must match
+/// `daemons::libexec_dir()` / `daemons::system_libexec_dir()`; `$HOME` is
+/// expanded by the probed host's own shell so that host's home applies. A
+/// standalone assignment (not a `VAR=… cmd` prefix) so the `command -v`
+/// lookup that follows honors it in every /bin/sh, dash included. Exe-relative
+/// helper dirs (a Homebrew keg) can't be derived for a remote host, so a
+/// keg-only install on a *remote* control host may still probe MISSING.
+const HOOK_PATH_PREFIX: &str =
+    "PATH=\"$HOME/.local/libexec/paniolo/bin:/usr/libexec/paniolo/bin:$PATH\";";
 
 /// Probe script for a video channel. The device is usually a capture-device
 /// NAME (e.g. "USB Video" on macOS), not a path, so `test -e` alone is wrong:
 /// ask `hdmicap devices` on the channel host whether it enumerates. Path-style
-/// devices (`/dev/video0`) still short-circuit via `test -e`. Exit 3 = hdmicap
-/// itself is missing (libexec, PATH, or legacy ~/.cargo/bin), a distinct
-/// failure from a missing device.
+/// devices (`/dev/video0`) still short-circuit via `test -e`. hdmicap resolves
+/// like `daemons::find_binary()`: the helper dirs (via [`HOOK_PATH_PREFIX`]),
+/// then PATH, then the legacy ~/.cargo/bin. Exit 3 = hdmicap itself is
+/// missing, a distinct failure from a missing device.
 fn video_probe_script(device: &str) -> String {
     let q = ssh::shell_quote(device);
     format!(
         "test -e {q} && exit 0; \
-         bin=\"$HOME/.local/libexec/paniolo/bin/hdmicap\"; \
-         test -x \"$bin\" || bin=$(command -v hdmicap) || bin=\"$HOME/.cargo/bin/hdmicap\"; \
-         test -x \"$bin\" || exit 3; \
-         \"$bin\" devices 2>/dev/null | grep -F -q -- {q}"
+         {HOOK_PATH_PREFIX} PATH=\"$PATH:$HOME/.cargo/bin\"; \
+         command -v hdmicap >/dev/null || exit 3; \
+         hdmicap devices 2>/dev/null | grep -F -q -- {q}"
     )
 }
 
@@ -262,4 +268,30 @@ pub fn run(lab: &Lab, target: Option<&str>, host_filter: Option<&str>) -> i32 {
         println!("All configured channels present.");
     }
     problems
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hook_path_prefix_covers_user_and_system_libexec() {
+        // The probe must search everywhere the hooks themselves resolve
+        // helpers (daemons::helper_dirs()): a .deb install's helpers live only
+        // in /usr/libexec/paniolo/bin, off PATH.
+        assert!(HOOK_PATH_PREFIX.contains("$HOME/.local/libexec/paniolo/bin"));
+        assert!(HOOK_PATH_PREFIX.contains("/usr/libexec/paniolo/bin"));
+        // A standalone statement, so a following `command -v` honors it in
+        // dash as well as bash.
+        assert!(HOOK_PATH_PREFIX.ends_with(';'));
+    }
+
+    #[test]
+    fn video_probe_searches_helper_dirs_then_path_then_cargo() {
+        let s = video_probe_script("/dev/video0");
+        assert!(s.contains("/usr/libexec/paniolo/bin"), "{s}");
+        assert!(s.contains("$HOME/.cargo/bin"), "{s}");
+        assert!(s.contains("command -v hdmicap"), "{s}");
+        assert!(s.starts_with("test -e /dev/video0 && exit 0"), "{s}");
+    }
 }

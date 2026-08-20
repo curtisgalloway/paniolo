@@ -147,8 +147,11 @@ sense signal to be wired and the serialcap daemon to be running).
 
 ### `paniolo doctor` hook probing
 
-`paniolo doctor` probes every hook whose value is an absolute path with
-`test -e` (over SSH for remote hosts) and reports which hooks are configured
+`paniolo doctor` probes every hook (over SSH for remote hosts): an absolute
+path with `test -e`, a bare name with `command -v` under the same resolution
+the hooks get at runtime — the per-user libexec dir
+(`~/.local/libexec/paniolo/bin`), then the system package dir
+(`/usr/libexec/paniolo/bin`), then PATH. It reports which hooks are configured
 by name, e.g. `cycle_cmd,on_cmd,off_cmd,state_cmd`.
 
 ### Example: Home Assistant script (cycle_cmd)
