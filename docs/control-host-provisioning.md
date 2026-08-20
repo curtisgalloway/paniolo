@@ -1,11 +1,13 @@
 # Provisioning a Linux control host
 
-> **Status: design, not implemented.** This doc specifies the unattended-install
-> recipe ("seed") for standing up a new Linux control host — an x86 mini-PC or a
-> Raspberry Pi — from blank hardware to agent-reachable. It complements
-> [pi4-control-host.md](pi4-control-host.md) (per-bench hardware, wiring, and
-> UART/gadget configuration), and builds on the distributed-control principle
-> that control hosts are disposable. Nothing here exists yet; the generator and
+> **Status: design; generator not built.** This doc specifies the
+> unattended-install recipe ("seed") for standing up a new Linux control host —
+> an x86 mini-PC or a Raspberry Pi — from blank hardware to agent-reachable. It
+> complements [pi4-control-host.md](pi4-control-host.md) (per-bench hardware,
+> wiring, and UART/gadget configuration), and builds on the distributed-control
+> principle that control hosts are disposable. The first `pi-sd` seed was
+> hand-built 2026-08-20 (host `waldo`, a Pi 5, on Pi OS Trixie Lite arm64) —
+> injection verified, first-boot validation pending. The generator and
 > templates land under `packaging/` when built.
 
 ## The problem
@@ -51,17 +53,24 @@ install would fork the source of truth away from the lab file.
 
 ## Design: one cloud-init core, two wrappers
 
-Ubuntu Server's unattended-install mechanisms converge on **cloud-init**, so
-one shared `user-data` core serves both platforms with a thin delivery wrapper
-each:
+Both platforms' unattended-install mechanisms converge on **cloud-init** —
+Ubuntu's autoinstall embeds it, and Raspberry Pi OS ships it natively since
+Trixie — so one shared `user-data` core serves both with a thin delivery
+wrapper each:
 
 | Platform | Base OS | Mechanism | Delivery |
 |---|---|---|---|
 | x86 box (NUC-class or any UEFI PC) | Ubuntu Server 24.04 LTS amd64 | subiquity **autoinstall** (embeds the cloud-init core) | Generator emits a bootable USB installer; installs to internal disk unattended |
-| Raspberry Pi 4 / 5 | Ubuntu Server 24.04 LTS arm64 **preinstalled image** | cloud-init **NoCloud** | Flash the stock image; generator writes `user-data` / `network-config` (and optional `config.txt` fragment) onto the FAT `system-boot` partition |
+| Raspberry Pi 4 / 5 | Raspberry Pi OS **Lite arm64** (Trixie, ≥ 2025-11-24) | cloud-init **NoCloud** — native in Pi OS Trixie | Flash the stock image; generator overwrites `user-data` / `network-config` on the FAT `bootfs` partition |
 
 The Pi path is the lighter of the two — no installer even runs; the image is
-the disk and cloud-init applies the seed on first boot.
+the disk and cloud-init applies the seed on first boot. Pi OS Trixie ships the
+three NoCloud files (`user-data`, `meta-data`, `network-config`) on `bootfs`
+out of the box, hand-editable without Raspberry Pi Imager — **verified on the
+2026-06-18 Lite arm64 image**. (Ubuntu Server's arm64 preinstalled image works
+the same way via its `system-boot` partition, and remains the fallback if
+distro unification with the x86 flavor ever matters more than Pi-native
+firmware/kernel integration.)
 
 ### The shared cloud-init core
 
@@ -104,12 +113,15 @@ Notes:
 - **x86 wrapper:** the autoinstall YAML adds `identity`/`storage` (whole-disk,
   direct layout) around the shared core, plus a late-command for the `.deb` if
   installing inside the target chroot is preferred over first-boot `runcmd`.
-- **Pi wrapper:** optionally appends the control-host fragment to
-  `/boot/firmware/config.txt` — `enable_uart=1` + `dtoverlay=disable-bt` for
-  the PL011 GPIO console, `dtoverlay=dwc2,dr_mode=peripheral` for the future
-  HID gadget — and disables the serial getty. These are only wanted when the
-  bench uses the GPIO UART / gadget port, so they are generator flags, not
-  defaults. Wiring, voltage-level, and topology guidance stays in
+- **Pi wrapper:** hardware-interface enablement — the PL011 GPIO console
+  (`enable_uart=1` + `dtoverlay=disable-bt`, getty disabled), the future HID
+  gadget (`dtoverlay=dwc2,dr_mode=peripheral`) — is only wanted when the bench
+  uses those ports, so these are generator flags, not defaults. Pi OS Trixie's
+  cloud-init ships a Pi-specific `cc_raspberry_pi` module that can activate
+  serial/I2C/SPI/1-Wire and USB gadget mode declaratively from `user-data`;
+  prefer it over hand-appended `config.txt` fragments where it covers the
+  need (verify its serial semantics against the getty/console requirements
+  before relying on it). Wiring, voltage-level, and topology guidance stays in
   [pi4-control-host.md](pi4-control-host.md).
 - **Networking:** netboot's refusal to serve on the primary NIC means a
   control host needs **two** interfaces (uplink + DUT link). The seed can
@@ -177,12 +189,21 @@ scriptable around Raspberry Pi Imager or `dd`.
   buys bit-reproducibility (which stateless hosts don't need — first boot
   starts with `apt upgrade` anyway) at the cost of owning kernel/security
   updates and multi-GB build artifacts.
-- **Raspberry Pi OS + Imager `custom.toml` / `firstrun.sh`**: rejected —
-  Imager customization covers user/Wi-Fi/SSH but not arbitrary packages or
-  first-boot commands without patching `firstrun.sh` by hand. Ubuntu on both
-  platforms means one template, one mental model, one `.deb` pipeline. The
+- **Raspberry Pi OS via Imager `custom.toml` / `firstrun.sh`**: the *legacy*
+  Pi OS provisioning path — user/Wi-Fi/SSH only, arbitrary packages and
+  first-boot commands require hand-patching `firstrun.sh` — was rejected, and
+  an earlier draft of this doc rejected Pi OS wholesale on those grounds.
+  That rationale is obsolete: since Pi OS Trixie (2025-11-24), cloud-init is
+  the native first-boot mechanism, which is why Pi OS is now the *chosen*
+  base for the `pi-sd` flavor above (and it was the operator-proven path
+  before this doc existed). The lesson stands recorded: the rejection was
+  written from stale knowledge of a moving target.
+- **Ubuntu Server preinstalled arm64 on the Pi**: the earlier draft's pick,
+  for distro unification with the x86 flavor. Demoted to fallback — Pi OS's
+  native firmware/kernel integration and `cc_raspberry_pi` outweigh
+  unification, and the shared cloud-init core is distro-agnostic anyway. The
   `config.txt` mechanics from [pi4-control-host.md](pi4-control-host.md)
-  transfer unchanged (`/boot/firmware/` layout is the same).
+  apply to both (`/boot/firmware/` layout is the same).
 - **PXE-boot the installer via `netbootd`**: not the plan (bootstrap
   chicken-and-egg — it needs an existing control host), but the UEFI PXE path
   is hardware-verified, so a "paniolo installs its own next control host"
