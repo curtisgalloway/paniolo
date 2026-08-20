@@ -29,11 +29,11 @@ use std::net::Ipv4Addr;
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 pub fn inet_checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
-    let mut chunks = data.chunks_exact(2);
-    for c in &mut chunks {
-        sum += u16::from_be_bytes([c[0], c[1]]) as u32;
+    let (words, rest) = data.as_chunks::<2>();
+    for c in words {
+        sum += u16::from_be_bytes(*c) as u32;
     }
-    if let [b] = chunks.remainder() {
+    if let [b] = rest {
         sum += (*b as u32) << 8;
     }
     while (sum >> 16) != 0 {
