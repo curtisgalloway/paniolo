@@ -241,6 +241,27 @@ jobs:
       - name: Test
         run: cargo test
 
+  amt:
+    name: amt (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: amt
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: amt
+      - name: Format check
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+
   macos:
     # Exercises the macOS-only stack the Linux jobs can't: hdmicap's AVFoundation
     # capture path and the Apple Vision OCR helper. fmt/clippy run on both Linux

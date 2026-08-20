@@ -640,3 +640,107 @@ After this, `paniolo power on/off`, `paniolo power-cycle`, and
 - **`state` is cheap and honest.** It reads `Switch.GetStatus` live every call
   (no caching) and fails loudly if the device is unreachable, rather than
   reporting a stale guess — it is the hook agents poll.
+
+---
+
+## Intel AMT power control (amt)
+
+The `amt` standalone helper switches **Intel AMT (vPro) machines** over
+**WS-Management** (SOAP over HTTP on port 16992) — no smart plug at all: the
+power switch is the machine's own Management Engine, reached over the regular
+network. Pure Rust via [ureq](https://crates.io/crates/ureq); one-shot and
+stateless like `shellyplug`.
+
+Two properties make AMT the preferred backend where the hardware has it:
+
+- **True power-state readback.** The ME runs on standby power and answers
+  with the host on, off, sleeping, or bare-metal with no OS installed —
+  `state` is a genuine sensor, not an outlet-side guess. (An HA/smart-plug
+  cycle hook can't report state at all.)
+- **Per-target control with zero extra hardware** — no outlet, no relay, no
+  wiring; just the onboard NIC.
+
+Mechanically it acts on `CIM_PowerManagementService.RequestPowerStateChange`
+and reads back `CIM_AssociatedPowerManagementService.PowerState`.
+
+### Requirements
+
+- AMT provisioned and enabled in MEBx (Ctrl-P at boot), with network access
+  to port 16992 on the AMT NIC. Works with the machine in any state — even
+  with no OS on disk.
+- **Digest-only auth is handled natively.** AMT 11+ advertises HTTP Digest
+  as the *only* supported auth and rejects plaintext (this is why Debian's
+  `amtterm` cannot talk to modern AMT). The helper implements the RFC 2617
+  digest handshake itself.
+- **TLS-provisioned AMT is not supported.** A machine provisioned for TLS
+  serves WS-Man only on port 16993; the helper speaks the plain port and
+  reports this clearly rather than guessing.
+
+### Credentials
+
+**The password never appears in the lab file, a flag, or any repository.**
+The helper reads it from the **`AMT_PASSWORD` environment variable** only;
+the lab file carries just the address and username. Inject it at call time —
+with the 1Password CLI:
+
+```bash
+# .env:  AMT_PASSWORD=op://<vault>/<item>/password
+op run --env-file .env -- bash -c 'paniolo power-state <target>'
+```
+
+Single quotes matter: the parent shell must not expand `$AMT_PASSWORD`
+before `op run` sets it (see the Generic power hooks section for the same
+gotcha with `HA_TOKEN`). Without the variable, every subcommand fails with a
+message saying exactly this.
+
+### Commands
+
+```bash
+amt -d <host> status                 # firmware identity + power state detail
+amt -d <host> state                  # print exactly "on" or "off" (state_cmd contract)
+amt -d <host> on                     # power on, confirm by read-back
+amt -d <host> off                    # power off (hard), confirm by read-back
+amt -d <host> cycle [--delay-ms 3000]  # off → delay → on → confirm
+```
+
+- `-d <host>` is an IP or hostname, optionally with a port (default 16992);
+  `-u <user>` sets the Digest username (default `admin`).
+- `state` prints `on` only when the host is running (PowerState 2); sleep,
+  hibernate, and soft-off all print `off`.
+- `off` is the CIM "Off - Soft" **unconditional power-off** — equivalent to
+  holding the power button, not a graceful OS shutdown.
+- `cycle` is built as off → delay → on rather than the fixed CIM power-cycle
+  state, so the off-hold matches the other helpers' `--delay-ms` semantics;
+  it produces a genuine cold boot (POST) and confirms by read-back.
+
+### Wiring into paniolo power hooks
+
+```bash
+paniolo power set -t target-machine \
+    --cycle-cmd "amt cycle -d 10.0.0.5 -u admin --delay-ms 5000" \
+    --on-cmd    "amt on -d 10.0.0.5 -u admin" \
+    --off-cmd   "amt off -d 10.0.0.5 -u admin" \
+    --state-cmd "amt state -d 10.0.0.5 -u admin"
+```
+
+Remember the hooks run in paniolo's environment: `paniolo power …` /
+`power-cycle` / `power-state` must themselves be invoked with `AMT_PASSWORD`
+set (the `op run … bash -c '…'` pattern above).
+
+### Gotchas
+
+- **The AMT NIC drops link around power transitions.** For a few seconds as
+  the host powers on or off, the shared NIC's PHY renegotiates and WS-Man
+  requests fail with "no route to host" (observed on a Dell OptiPlex 7060:
+  the power-on succeeded but the immediate read-back could not connect). The
+  helper absorbs this: power requests and read-back polling retry transient
+  transport errors for up to 20 s. If a machine stays unreachable longer
+  than that, treat it as real.
+- **`state` reflects the host, not the outlet.** Sleep (S3) and hibernate
+  report `off` — the OS isn't running — even though the PSU has power. `on`
+  from any of those states boots/wakes the machine.
+- **BIOS "AC Recovery" is irrelevant here** (unlike outlet-based helpers):
+  AMT's power-on is an explicit command to the ME, not a power restore, so
+  it works regardless of the AC-recovery BIOS setting.
+- **`status` is the debugging view**: it prints the AMT firmware identity
+  (from the HTTP `Server:` header) and the raw CIM PowerState name/number.

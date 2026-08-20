@@ -35,7 +35,7 @@ use anyhow::{anyhow, bail, Result};
 
 /// The helper crates `setup` builds and installs into libexec, in order. The
 /// `cli` crate (the `paniolo` binary itself) installs separately onto PATH.
-const HELPER_CRATES: [&str; 8] = [
+const HELPER_CRATES: [&str; 9] = [
     "hdmicap",
     "serialcap",
     "netbootd",
@@ -44,6 +44,7 @@ const HELPER_CRATES: [&str; 8] = [
     "ch9329",
     "usbhub",
     "shellyplug",
+    "amt",
 ];
 
 fn is_repo_root(d: &Path) -> bool {

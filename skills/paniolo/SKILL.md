@@ -359,6 +359,27 @@ paniolo power set -t pi5 \
 
 See `docs/power.md` for the full `cambrionix` command surface.
 
+### Intel AMT / vPro (example)
+
+The `amt` helper switches vPro machines over the network via their Management
+Engine — no plug hardware — and gives **true power-state readback** (the ME
+answers with the host on, off, or bare-metal):
+
+```
+paniolo power set -t optiplex \
+    --cycle-cmd "amt cycle -d 10.0.0.5 -u admin --delay-ms 5000" \
+    --on-cmd    "amt on -d 10.0.0.5 -u admin" \
+    --off-cmd   "amt off -d 10.0.0.5 -u admin" \
+    --state-cmd "amt state -d 10.0.0.5 -u admin"
+```
+
+**The AMT password is not in the lab file** — the helper takes it from the
+`AMT_PASSWORD` environment variable, so `paniolo power …` / `power-cycle` /
+`power-state` against an AMT-backed target must run with it set, e.g.
+`op run --env-file .env -- bash -c 'paniolo power-cycle optiplex'` (single
+quotes — the parent shell must not expand it). Without it the hook fails with
+a message saying exactly this. See `docs/power.md` for details and gotchas.
+
 ## HID injection — type and click into the target
 
 The default injector is the dual-board KB2040 "dumb pipe": the host-side
@@ -563,6 +584,9 @@ instance. netbootd is excluded — cycle it via `paniolo netboot start/stop`.
   set the host's `identity` (agent key-spray); if the remote can't find paniolo,
   set its `paniolo_cmd` to an absolute path.
 - OCR is strongest on large text; tiny console fonts may misread some characters.
+- AMT-backed power hooks need `AMT_PASSWORD` in the environment of the
+  `paniolo power …` invocation (see the Intel AMT power example) — a clean
+  "AMT_PASSWORD is not set" failure means inject the secret, not a bug.
 
 ---
 
