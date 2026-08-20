@@ -60,6 +60,7 @@ exclude_docs: |
   distributed-control-plan.md
   uefi-http-boot-design.md
   openterface-deep-control.md
+  control-host-provisioning.md
 
 markdown_extensions:
   - admonition
