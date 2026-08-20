@@ -207,6 +207,41 @@ pub fn run_subcommand(
     Ok(out?)
 }
 
+/// Like [`dispatch`], but the remote command's stdout streams into the local
+/// file at `out_path` instead of the terminal — for remote commands producing
+/// a binary payload (`video shot`), where `--out <path>` must mean the
+/// invoking machine's filesystem, not the control host's. The file is removed
+/// on a non-zero exit so a failed capture doesn't leave a stub behind.
+pub fn dispatch_stdout_to_file(
+    lab: &Lab,
+    target: &str,
+    host_name: &str,
+    sub_argv: &[String],
+    out_path: &str,
+) -> anyhow::Result<i32> {
+    let host = lab.host(host_name);
+    let slice = build_slice(lab, target, host_name)?;
+    let remote_path = ship_slice(&host, &slice)?;
+
+    let mut argv = vec![host.paniolo(), "--lab".to_string(), remote_path.clone()];
+    argv.extend(sub_argv.iter().cloned());
+
+    let sink =
+        std::fs::File::create(out_path).map_err(|e| anyhow::anyhow!("creating {out_path}: {e}"))?;
+    let code = ssh::run_stdout_to(&host, &argv, &[], sink)?;
+
+    let _ = ssh::run(
+        &host,
+        &["rm".to_string(), "-f".to_string(), remote_path],
+        None,
+        &[],
+    );
+    if code != 0 {
+        let _ = std::fs::remove_file(out_path);
+    }
+    Ok(code)
+}
+
 /// Read the TCP port from a daemon's discovery file on `host`, or None.
 /// The path is resolved by a remote shell so the host's own uid applies;
 /// must match `runtime_base()` in daemons.rs (and the daemon crates).

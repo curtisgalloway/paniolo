@@ -339,6 +339,11 @@ async fn ocr(State(s): State<AppState>) -> Response {
     if f.signal == Signal::NoDevice || f.width == 0 {
         return (StatusCode::SERVICE_UNAVAILABLE, "no capture device").into_response();
     }
+    // A dark/off display OCRs to empty text, which a caller can't tell apart
+    // from a genuinely blank screen — report the missing signal instead.
+    if f.signal == Signal::NoSignal {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no video signal").into_response();
+    }
     let png = match encode_png(&f) {
         Some(p) => p,
         None => return (StatusCode::INTERNAL_SERVER_ERROR, "png encode failed").into_response(),

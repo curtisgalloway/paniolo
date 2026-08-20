@@ -140,6 +140,47 @@ pub fn enumerate() -> Result<Vec<DeviceInfo>> {
         .collect())
 }
 
+/// True when a node's V4L2 *device* capabilities mark it as a real capture
+/// device: `VIDEO_CAPTURE` set, and neither `VIDEO_OUTPUT` nor `VIDEO_M2M`
+/// (SoC pipeline stages and codecs — the Pi's `pispbe-*` nodes, HEVC
+/// decoders — are M2M; UVC metadata nodes lack `VIDEO_CAPTURE` entirely).
+#[cfg(target_os = "linux")]
+fn is_capture_caps(flags: v4l::capability::Flags) -> bool {
+    use v4l::capability::Flags as F;
+    flags.contains(F::VIDEO_CAPTURE)
+        && !flags.intersects(F::VIDEO_OUTPUT | F::VIDEO_M2M | F::VIDEO_M2M_MPLANE)
+}
+
+/// [`enumerate`], filtered to nodes that can actually capture (see
+/// [`is_capture_caps`]). Nodes nokhwa reports without a numeric index can't
+/// be opened as devices at all and are dropped too. A node whose caps can't
+/// be read is kept — only a confidently-internal node is hidden. This is the
+/// *listing* filter (`devices` without `--all`); `resolve` keeps matching the
+/// unfiltered list so an explicitly configured device always resolves.
+#[cfg(target_os = "linux")]
+pub fn enumerate_capture() -> Result<Vec<DeviceInfo>> {
+    let mut devices = enumerate()?;
+    devices.retain(|d| {
+        if d.index == u32::MAX {
+            return false;
+        }
+        match v4l::Device::new(d.index as usize) {
+            Ok(dev) => dev
+                .query_caps()
+                // The v4l crate populates `capabilities` from device_caps.
+                .map(|c| is_capture_caps(c.capabilities))
+                .unwrap_or(true),
+            Err(_) => true,
+        }
+    });
+    Ok(devices)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn enumerate_capture() -> Result<Vec<DeviceInfo>> {
+    enumerate()
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn enumerate() -> Result<Vec<DeviceInfo>> {
     use std::ffi::{c_char, c_void, CStr};
@@ -603,5 +644,24 @@ mod tests {
         // Empty string parses to Auto via parse(); construct Name directly to
         // prove the id-equality guard, then expect substring match (matches).
         assert_eq!(resolve_in(&devices, &spec).unwrap(), 0);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod caps_tests {
+    use super::is_capture_caps;
+    use v4l::capability::Flags as F;
+
+    #[test]
+    fn capture_caps_filter() {
+        // UVC video node: capture + streaming.
+        assert!(is_capture_caps(F::VIDEO_CAPTURE | F::STREAMING));
+        // UVC metadata node: no VIDEO_CAPTURE.
+        assert!(!is_capture_caps(F::META_CAPTURE | F::STREAMING));
+        // M2M pipeline stage / codec (Pi pispbe, HEVC decoder).
+        assert!(!is_capture_caps(F::VIDEO_M2M | F::STREAMING));
+        assert!(!is_capture_caps(
+            F::VIDEO_CAPTURE | F::VIDEO_OUTPUT | F::STREAMING
+        ));
     }
 }

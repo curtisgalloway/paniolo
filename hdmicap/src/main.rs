@@ -59,6 +59,10 @@ enum Cmd {
         /// Emit machine-readable JSON instead of the human table.
         #[arg(long)]
         json: bool,
+        /// Include internal platform video nodes (SoC pipeline stages, codecs)
+        /// normally hidden from the listing.
+        #[arg(long)]
+        all: bool,
     },
     /// Fetch one screenshot from the running daemon.
     Shot {
@@ -97,7 +101,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Daemon { device, port } => daemon::run(DeviceSpec::parse(&device), port),
-        Cmd::Devices { json } => cmd_devices(json),
+        Cmd::Devices { json, all } => cmd_devices(json, all),
         Cmd::Shot {
             stable,
             changed_since,
@@ -115,8 +119,15 @@ fn base_url() -> Result<String> {
     Ok(format!("http://127.0.0.1:{}", d.port))
 }
 
-fn cmd_devices(json: bool) -> Result<()> {
-    let devices = capture::enumerate()?;
+fn cmd_devices(json: bool, all: bool) -> Result<()> {
+    // The default listing hides nodes that can't capture (Linux: SoC pipeline
+    // stages, codecs, UVC metadata nodes — filtered by V4L2 device caps in
+    // capture::enumerate_capture); --all shows the raw enumeration.
+    let devices = if all {
+        capture::enumerate()?
+    } else {
+        capture::enumerate_capture()?
+    };
     if json {
         let list: Vec<serde_json::Value> = devices
             .iter()

@@ -2703,6 +2703,47 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
             timeout,
             out,
         } => {
+            // Remote channel + a real --out path: `--out` must mean the
+            // invoking machine's filesystem, so run the remote shot with
+            // `--out -` and stream the PNG into the local file instead of
+            // re-execing verbatim (which would write on the control host).
+            if out != "-" {
+                let lab = load_for_read(lab_flag)?;
+                let target_name = resolve_single_target(&lab, target.as_deref())?;
+                let rt = lab
+                    .resolved_target(&target_name)
+                    .ok_or_else(|| anyhow!("target '{target_name}' not found in lab"))?;
+                let host_name = model::channel_host(&rt, model::ChannelKind::Video, None)?;
+                if !lab.host(&host_name).is_local(&host_name) {
+                    let mut sub = vec![
+                        "video".to_string(),
+                        "shot".to_string(),
+                        target_name.clone(),
+                        "--timeout".to_string(),
+                        timeout.to_string(),
+                        "--out".to_string(),
+                        "-".to_string(),
+                    ];
+                    if stable {
+                        sub.push("--stable".to_string());
+                    }
+                    if let Some(h) = &changed_since {
+                        sub.push("--changed-since".to_string());
+                        sub.push(h.clone());
+                    }
+                    let code = dispatch::dispatch_stdout_to_file(
+                        &lab,
+                        &target_name,
+                        &host_name,
+                        &sub,
+                        &out,
+                    )?;
+                    if code == 0 {
+                        eprintln!("saved to {out}");
+                    }
+                    std::process::exit(code);
+                }
+            }
             let (target, _v) = video_runtime(lab_flag, target.as_deref())?;
             let mut args = vec![
                 "shot".to_string(),
