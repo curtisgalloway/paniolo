@@ -84,6 +84,13 @@ const PROBE_SETTLE: Duration = Duration::from_millis(300);
 
 /// How long a key is held before release on a `tap`/`combo`.
 const HOLD: Duration = Duration::from_millis(30);
+/// Hold used instead of [`HOLD`] when a tap/combo involves a lock key
+/// (Caps/Num/Scroll Lock). macOS debounces Caps Lock — a tap shorter than its
+/// threshold is discarded by the host before it changes state, and the chip
+/// still ACKs, so the drop is silent. Measured against a macOS 15 target over
+/// an Openterface: 30 ms dropped, 60 ms registered; 200 ms toggled 10/10 and
+/// keeps margin for slower hosts.
+const LOCK_HOLD: Duration = Duration::from_millis(200);
 /// How long a mouse button is held during a `click`. Much longer than a
 /// keypress: the target's input layer must sample the button-down and
 /// button-up as distinct events across the serial→USB→OS chain, and 12 ms was
@@ -96,6 +103,16 @@ const CLICK_HOLD: Duration = Duration::from_millis(80);
 const CLICK_SETTLE: Duration = Duration::from_millis(60);
 /// Per-character hold/pacing for `type`.
 const TYPE_GAP: Duration = Duration::from_millis(15);
+
+/// Hold duration for a tap/chord: [`LOCK_HOLD`] if any key is a lock key,
+/// [`HOLD`] otherwise.
+fn hold_for(keys: &[Key]) -> Duration {
+    if keys.iter().any(|k| k.is_lock()) {
+        LOCK_HOLD
+    } else {
+        HOLD
+    }
+}
 
 fn button_mask(name: &str) -> Result<u8> {
     match name.to_ascii_lowercase().as_str() {
@@ -349,7 +366,7 @@ impl Session {
     pub fn tap(&mut self, key: Key) -> Result<()> {
         self.apply_down(key);
         self.push_keyboard()?;
-        sleep(HOLD);
+        sleep(hold_for(&[key]));
         self.apply_up(key);
         self.push_keyboard()
     }
@@ -360,7 +377,7 @@ impl Session {
             self.apply_down(k);
         }
         self.push_keyboard()?;
-        sleep(HOLD);
+        sleep(hold_for(chord));
         for &k in chord {
             self.apply_up(k);
         }

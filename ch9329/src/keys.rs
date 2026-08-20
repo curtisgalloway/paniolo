@@ -49,6 +49,15 @@ pub enum Key {
     Usage(u8),
 }
 
+impl Key {
+    /// Whether this is a lock key (Caps/Scroll/Num Lock). Hosts treat these
+    /// specially — macOS debounces Caps Lock — so taps of them need a longer
+    /// hold than ordinary keys.
+    pub fn is_lock(self) -> bool {
+        matches!(self, Key::Usage(0x39) | Key::Usage(0x47) | Key::Usage(0x53))
+    }
+}
+
 /// Resolve an `adafruit_hid` Keycode name (case-insensitive) to a [`Key`].
 ///
 /// Accepts the full set the protocol requires plus common aliases. An unknown
@@ -230,6 +239,15 @@ mod tests {
         assert_eq!(name_to_key("FORWARD_SLASH").unwrap(), Key::Usage(0x38));
         assert_eq!(name_to_key("F12").unwrap(), Key::Usage(0x45));
         assert!(name_to_key("NOPE").is_err());
+    }
+
+    #[test]
+    fn lock_keys() {
+        assert!(name_to_key("CAPS_LOCK").unwrap().is_lock());
+        assert!(name_to_key("SCROLL_LOCK").unwrap().is_lock());
+        assert!(name_to_key("NUM_LOCK").unwrap().is_lock());
+        assert!(!name_to_key("A").unwrap().is_lock());
+        assert!(!name_to_key("LEFT_SHIFT").unwrap().is_lock());
     }
 
     #[test]
