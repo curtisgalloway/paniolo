@@ -31,6 +31,18 @@ reconfigure or open a paniolo-managed device by hand**:
   serial log` and write with `paniolo serial send`.
 - **Don't** `kill` a daemon or its helper by PID — use `paniolo daemons stop`
   (or the per-subsystem `stop`).
+- **Don't** rewrite the lab config to "fix" a mismatch you didn't create —
+  neither by editing the lab file nor via `… set`/`… rm` config commands. The
+  lab file is the user's reviewed source of truth, and `paniolo doctor` is a
+  hint, not ground truth: when doctor flags a channel, **try the channel
+  first** (`hid send … ping`, `serial log`, `video shot`). If it works, the
+  config is right — report the doctor discrepancy to the user instead of
+  "repairing" it.
+- **Don't** reach around a remote control host. A remote target is driven by
+  the same paniolo commands from where you are (the lab file routes them over
+  SSH) — don't ssh over to run helper binaries against its devices, curl a
+  daemon's local port, or read `/dev/video*`/serial devices directly; the
+  daemons there hold the same exclusive locks.
 
 If a paniolo command for what you want doesn't seem to exist, run `paniolo
 --help` or re-read this skill before reaching for the raw device — it almost
@@ -578,6 +590,8 @@ instance. netbootd is excluded — cycle it via `paniolo netboot start/stop`.
   paniolo-managed device by hand (`ifconfig`/`ip`/`ethtool` on the netboot
   interface, `screen`/`tio` on a serial port, `kill` on a daemon) — it desyncs
   the daemon. Use `netif mode …`, `serial log`/`send`, `daemons stop`.
+- `doctor` flags a channel that still works? Believe the working channel and
+  report the discrepancy — never rewrite the lab config to silence `doctor`.
 - Serial port is exclusive: one of `connect` / `watch` / external `tio`/`screen`.
 - `~/.cargo/bin` (the CLI) must be on `PATH`, ahead of any other `paniolo`
   (e.g. a Homebrew keg from the tap can shadow it). The helper binaries are
