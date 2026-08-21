@@ -35,7 +35,7 @@ permissions:
 
 env:
   NFPM_VERSION: 2.46.3
-  HELPERS: hdmicap serialcap netbootd cambrionix hidrig ch9329 usbhub shellyplug
+  HELPERS: hdmicap serialcap netbootd cambrionix hidrig ch9329 usbhub shellyplug amt
 
 jobs:
   package:
@@ -82,6 +82,7 @@ jobs:
             ch9329
             usbhub
             shellyplug
+            amt
 
       - name: Build release binaries
         env:
@@ -148,7 +149,9 @@ jobs:
         run: |
           apt-get install -y ./dist/paniolo_*.deb
           test -x /usr/bin/paniolo
-          test -x /usr/libexec/paniolo/bin/hdmicap
+          for helper in $HELPERS; do
+            test -x "/usr/libexec/paniolo/bin/$helper"
+          done
           test -x /usr/libexec/paniolo/bin/linuxocr
           test -f /usr/share/paniolo/skills/paniolo/SKILL.md
           /usr/bin/paniolo --help
