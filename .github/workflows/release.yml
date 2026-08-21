@@ -14,7 +14,8 @@
 
 # Build Linux packages (.deb + tarball) for amd64 and arm64 and attach them
 # to a GitHub Release when a v* tag is pushed, then fire a repository_dispatch
-# at the Homebrew tap so it re-pins its formula to the new tag.
+# at the Homebrew tap so it re-pins its formula to the new tag, and re-run the
+# docs workflow so the Pages apt repository picks up the new .debs.
 # workflow_dispatch builds the packages as artifacts only (no Release, no tap
 # bump), for testing the pipeline.
 #
@@ -208,3 +209,21 @@ jobs:
             https://api.github.com/repos/curtisgalloway/homebrew-tap/dispatches \
             -d "{\"event_type\":\"paniolo-release\",\"client_payload\":{\"tag\":\"${TAG}\"}}"
           echo "Dispatched paniolo-release (${TAG}) to homebrew-tap."
+
+  refresh-apt-repo:
+    name: refresh Pages apt repo
+    if: github.ref_type == 'tag'
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      # The Pages site (docs + /apt/) is assembled by docs.yml, and a Pages
+      # deploy replaces the whole site — so after the new .debs are attached
+      # to the Release, re-run that workflow to fold them into the apt pool.
+      # (A push made with the default GITHUB_TOKEN can't trigger docs.yml on
+      # its own; the explicit dispatch is required.)
+      - name: Dispatch docs workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run docs.yml --repo "$GITHUB_REPOSITORY" --ref main
