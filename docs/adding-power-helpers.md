@@ -177,11 +177,20 @@ A helper PR touches more than the helper directory:
 - [ ] `README.md` — both helper lists (the power row in the subsystem table
       and the `make install` paragraph) + the manual install command block
 - [ ] `Makefile` — `CRATES` (Rust) or the header comment (other)
+- [ ] `cli/src/setup.rs` — `HELPER_CRATES`, so `paniolo setup` installs the
+      helper from a source clone
+- [ ] `.github/workflows/release.yml` — the `HELPERS` env list **and** the
+      rust-cache `workspaces` block, so the released `.deb`/tarball actually
+      ship the binary. This is easy to forget because nothing else fails
+      without it: v0.1.13 shipped without the `amt` helper this way.
+- [ ] `packaging/nfpm.yaml` — the helper list in the package description
 - [ ] `.github/workflows/ci.yml` — a job for the new crate
       (`working-directory: <crate>`; copy an existing crate job) **and** a
       matching `crate_job` line in `scripts/ci-local.sh`. The `coverage` job
       fails the build until both exist — every crate has a CI job, no
-      exceptions.
+      exceptions. The same job also fails if the `Makefile`, release
+      `HELPERS`, or `HELPER_CRATES` lists above omit the crate
+      (`scripts/ci-coverage-check.sh`).
 - [ ] `docs/README.md` — the Power row in the subsystem guide table
 - [ ] Apache 2.0 headers on all new source files
 

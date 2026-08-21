@@ -798,6 +798,22 @@ A new **crate** (helper or otherwise) additionally needs a CI job and a
 `scripts/ci-local.sh` line — see the CI-coverage rule in "Before opening a PR".
 `scripts/ci-coverage-check.sh` fails the build until both exist.
 
+A new **helper binary** must also be registered everywhere the helper set is
+named, or it builds green in CI and then silently never reaches users:
+
+- `Makefile` — `CRATES`
+- `cli/src/setup.rs` — `HELPER_CRATES` (what `paniolo setup` installs from a
+  source clone)
+- `.github/workflows/release.yml` — the `HELPERS` env list **and** the
+  rust-cache `workspaces` block (what the released `.deb`/tarball ship;
+  v0.1.13 shipped without the `amt` helper because this list was missed)
+- `packaging/nfpm.yaml` — the helper list in the package description
+
+`scripts/ci-coverage-check.sh` (run by the `coverage` CI job) fails the build
+when the `Makefile`, release `HELPERS`, or `HELPER_CRATES` lists omit a crate,
+so the mechanical ones can't drift again; the release smoke test also verifies
+every `HELPERS` binary landed in the installed `.deb`.
+
 ## Linux support
 
 Paniolo runs on Linux as well as macOS. Platform differences:
