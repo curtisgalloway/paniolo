@@ -1,0 +1,106 @@
+#!/bin/bash
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Assemble the signed apt repository that docs.yml publishes to GitHub Pages
+# under /apt/. Stateless by design: point it at a directory of .debs (the
+# workflow downloads them from recent GitHub Releases) and it emits a complete
+# pooled repo — pool/, per-arch Packages indexes, a GPG-signed
+# Release/InRelease, and the public key as paniolo.asc — into the output dir.
+# Nothing is kept between runs, so the live repo always mirrors the releases.
+#
+# The signing key must already be imported into the calling GNUPGHOME and must
+# have no passphrase (CI runs non-interactively).
+#
+# Usage: build-apt-repo.sh <debs-dir> <out-dir> <signing-key-fingerprint>
+
+set -euo pipefail
+
+DEBS_DIR="$1"
+OUT="$2"
+KEY="$3"
+
+SUITE=stable
+COMPONENT=main
+ARCHES="amd64 arm64"
+BASE_URL="https://curtisgalloway.github.io/paniolo/apt"
+
+command -v dpkg-scanpackages >/dev/null 2>&1 || {
+  echo "error: dpkg-scanpackages not found (apt-get install dpkg-dev)" >&2
+  exit 1
+}
+command -v apt-ftparchive >/dev/null 2>&1 || {
+  echo "error: apt-ftparchive not found (apt-get install apt-utils)" >&2
+  exit 1
+}
+ls "$DEBS_DIR"/*.deb >/dev/null 2>&1 || {
+  echo "error: no .deb files in $DEBS_DIR" >&2
+  exit 1
+}
+
+POOL="pool/$COMPONENT/p/paniolo"
+mkdir -p "$OUT/$POOL"
+cp "$DEBS_DIR"/*.deb "$OUT/$POOL/"
+
+cd "$OUT"
+
+# --multiversion keeps every release in the index (the pool holds the last few
+# releases so clients can pin or roll back); without it dpkg-scanpackages
+# silently drops all but the newest.
+for arch in $ARCHES; do
+  bindir="dists/$SUITE/$COMPONENT/binary-$arch"
+  mkdir -p "$bindir"
+  dpkg-scanpackages --multiversion --arch "$arch" pool > "$bindir/Packages"
+  gzip -9 -c "$bindir/Packages" > "$bindir/Packages.gz"
+done
+
+apt-ftparchive \
+  -o "APT::FTPArchive::Release::Origin=paniolo" \
+  -o "APT::FTPArchive::Release::Label=paniolo" \
+  -o "APT::FTPArchive::Release::Suite=$SUITE" \
+  -o "APT::FTPArchive::Release::Codename=$SUITE" \
+  -o "APT::FTPArchive::Release::Architectures=$ARCHES" \
+  -o "APT::FTPArchive::Release::Components=$COMPONENT" \
+  release "dists/$SUITE" > "dists/$SUITE/Release"
+
+gpg --batch --yes --local-user "$KEY" --armor --detach-sign \
+  --output "dists/$SUITE/Release.gpg" "dists/$SUITE/Release"
+gpg --batch --yes --local-user "$KEY" --clearsign \
+  --output "dists/$SUITE/InRelease" "dists/$SUITE/Release"
+gpg --batch --armor --export "$KEY" > paniolo.asc
+
+cat > index.html <<EOF
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>paniolo apt repository</title></head>
+<body><h1>paniolo apt repository</h1>
+<p>Signed apt repository for <a href="https://github.com/curtisgalloway/paniolo">paniolo</a>
+(amd64/arm64, Debian 12+ and Raspberry Pi OS). To use it:</p>
+<pre>
+sudo install -d /etc/apt/keyrings
+sudo curl -fsSL -o /etc/apt/keyrings/paniolo.asc $BASE_URL/paniolo.asc
+sudo tee /etc/apt/sources.list.d/paniolo.sources &gt;/dev/null &lt;&lt;'SRC'
+Types: deb
+URIs: $BASE_URL
+Suites: $SUITE
+Components: $COMPONENT
+Signed-By: /etc/apt/keyrings/paniolo.asc
+SRC
+sudo apt update &amp;&amp; sudo apt install paniolo
+</pre>
+<p>Signing key fingerprint: <code>93087CD8AF0D6D0717E8F8518D26C3AFB0A4FCBA</code></p>
+</body></html>
+EOF
+
+echo "apt repo assembled in $OUT:"
+find . -type f | sort

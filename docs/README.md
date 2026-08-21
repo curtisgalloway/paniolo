@@ -3,7 +3,8 @@
 Paniolo is an **agent-controlled target-machine wrangler** for low-level software development —
 it gives an AI agent (or you) the controls to netboot a target, watch its output, send it input,
 and power-cycle it without a person at the bench each iteration. See the root
-[`README.md`](https://github.com/curtisgalloway/paniolo/blob/main/README.md) for install and the quick remote-control pattern.
+[`README.md`](https://github.com/curtisgalloway/paniolo/blob/main/README.md) for install and the quick remote-control pattern —
+on Debian/Raspberry Pi OS the quickest route is the [apt repository](https://curtisgalloway.github.io/paniolo/apt/) served from this site.
 
 ## Start here
 

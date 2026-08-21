@@ -49,12 +49,28 @@ Fuchsia/botanist) design and the project requirements tracker are under
 
 ## Installation
 
-On Linux, prebuilt packages (amd64/arm64 `.deb` and tarball, Debian 12+ /
-Raspberry Pi OS) are attached to each
-[GitHub Release](https://github.com/curtisgalloway/paniolo/releases) —
-`sudo apt install ./paniolo_<version>_<arch>.deb`, then run `paniolo setup`
-once for group membership and the optional zigplug helper. Or build from
-source:
+On Linux (Debian 12+ / Raspberry Pi OS, amd64/arm64), the easiest install is
+the signed apt repository served from the docs site — new releases then
+arrive with a normal `apt upgrade`:
+
+```bash
+sudo install -d /etc/apt/keyrings
+sudo curl -fsSL -o /etc/apt/keyrings/paniolo.asc https://curtisgalloway.github.io/paniolo/apt/paniolo.asc
+sudo tee /etc/apt/sources.list.d/paniolo.sources >/dev/null <<'EOF'
+Types: deb
+URIs: https://curtisgalloway.github.io/paniolo/apt
+Suites: stable
+Components: main
+Signed-By: /etc/apt/keyrings/paniolo.asc
+EOF
+sudo apt update && sudo apt install paniolo
+```
+
+The same prebuilt packages (`.deb` and tarball) are attached to each
+[GitHub Release](https://github.com/curtisgalloway/paniolo/releases) for
+direct install — `sudo apt install ./paniolo_<version>_<arch>.deb`. Either
+way, run `paniolo setup` once after installing for group membership and the
+optional zigplug helper. Or build from source:
 
 ```bash
 git clone https://github.com/curtisgalloway/paniolo ~/src/paniolo

@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Build the MkDocs site from docs/ and deploy it to GitHub Pages.
+# Build the MkDocs site from docs/ and deploy it to GitHub Pages, with the
+# signed apt repository folded in under /apt/ (assembled by
+# packaging/scripts/build-apt-repo.sh from the .debs of recent GitHub
+# Releases). release.yml dispatches this workflow after each release so the
+# new packages land in the pool.
 # Requires repo Settings -> Pages -> Source set to "GitHub Actions".
 
 name: docs
@@ -23,6 +27,7 @@ on:
     paths:
       - "docs/**"
       - "mkdocs.yml"
+      - "packaging/scripts/build-apt-repo.sh"
       - ".github/workflows/docs.yml"
   workflow_dispatch:
 
@@ -43,6 +48,46 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - name: Build site
         run: uvx --with mkdocs-material mkdocs build --strict --site-dir _site
+
+      # Fold the signed apt repo into the site under /apt/. Stateless: the
+      # pool is rebuilt from the .debs of the newest $APT_POOL_RELEASES
+      # GitHub releases on every deploy, so the live repo always mirrors the
+      # releases (deleting a release drops it; older versions age out, which
+      # also keeps the site far below the Pages 1 GB cap).
+      # A Pages deploy replaces the entire site, so on the canonical repo a
+      # missing signing key fails the build rather than silently publishing a
+      # site without /apt/ (that would 404 every apt client on the next
+      # `apt update`). Forks without the secret skip the step instead.
+      - name: Assemble apt repository
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          APT_POOL_RELEASES: "5"
+        run: |
+          if [ -z "$APT_SIGNING_KEY" ]; then
+            if [ "$GITHUB_REPOSITORY" = "curtisgalloway/paniolo" ]; then
+              echo "::error::APT_SIGNING_KEY secret is not set — refusing to deploy a site without /apt/."
+              exit 1
+            fi
+            echo "::warning::APT_SIGNING_KEY not set (fork?) — skipping apt repo assembly."
+            exit 0
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq dpkg-dev apt-utils
+          mkdir -p /tmp/apt-debs
+          gh release list --repo "$GITHUB_REPOSITORY" \
+            --exclude-drafts --exclude-pre-releases \
+            --limit "$APT_POOL_RELEASES" --json tagName --jq '.[].tagName' \
+          | while read -r tag; do
+              gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+                --pattern '*.deb' --dir /tmp/apt-debs \
+                || echo "::warning::no .deb assets on $tag — skipped"
+            done
+          printf '%s' "$APT_SIGNING_KEY" | gpg --batch --import
+          fpr=$(gpg --batch --list-secret-keys --with-colons \
+                | awk -F: '/^fpr:/ {print $10; exit}')
+          packaging/scripts/build-apt-repo.sh /tmp/apt-debs _site/apt "$fpr"
+
       - uses: actions/upload-pages-artifact@v3
 
   deploy:
