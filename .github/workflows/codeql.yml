@@ -1,0 +1,94 @@
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# CodeQL code scanning. This replaces GitHub's "default setup", which must be
+# disabled in Settings -> Code security -> Code scanning before this workflow's
+# results will be accepted (the two configurations cannot both be active).
+#
+# Why this repo owns the workflow:
+#
+#   1. The language list is explicit. Swift is detected here
+#      (ocr/visionocr.swift) but is deliberately not analyzed: it is a single
+#      macOS-only wrapper over Apple's Vision framework, with no Package.swift
+#      or Xcode project for the Swift extractor to build, and it would need a
+#      macOS runner. Naming languages here records that decision instead of
+#      letting it resurface as a "detected but unconfigured" prompt.
+#
+#   2. There is somewhere to put extractor options. Default setup exposes only
+#      languages, query suite, threat model and runner type.
+#
+# Known upstream, not ours: the Rust extractor reports ~68 of 69 files as
+# "extracted with errors" because macro expansion fails for format!, vec!,
+# assert_eq!, anyhow! and even the built-in cfg!. That is github/codeql#19982
+# (open), reproducible on unrelated repositories. Installing rust-src below
+# does NOT fix it -- measured at 1577 macro expansion failures both with and
+# without the component -- it is kept only because it is the right baseline if
+# upstream lands a fix. Check that issue before re-diagnosing this locally.
+
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, matching the cadence default setup used.
+    - cron: "24 5 * * 1"
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: actions
+            build-mode: none
+          - language: c-cpp
+            build-mode: none
+          - language: python
+            build-mode: none
+          - language: rust
+            build-mode: none
+    steps:
+      - uses: actions/checkout@v6
+
+      # See note 1 in the header: without rust-src the extractor cannot expand
+      # std macros and nearly every file is logged as extracted with errors.
+      - name: Install Rust toolchain with std source
+        if: matrix.language == 'rust'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rust-src
+
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
