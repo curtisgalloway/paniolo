@@ -79,7 +79,24 @@ follow-up. Run through this checklist before calling `gh pr create`:
    per-crate as each one happened to matter, and nothing noticed the ones that
    were skipped.
 
-6. **Push, open the PR, and merge only when asked.** Get the branch ready by
+6. **Code scanning is advanced setup, not default setup.** CodeQL runs from
+   `.github/workflows/codeql.yml`, which this repo owns; GitHub's "default
+   setup" must stay disabled, because the two configurations cannot both be
+   active. The workflow exists so the language list is explicit — it
+   deliberately omits Swift, since `ocr/visionocr.swift` is a macOS-only
+   Vision wrapper with no Swift package for the extractor to build — and so
+   there is somewhere to put extractor options, which default setup does not
+   expose. Don't move it back to default setup to silence a prompt.
+
+   The Rust extractor reports ~68 of 69 files as "extracted with errors":
+   `format!`, `vec!`, `assert_eq!`, `anyhow!` and even the built-in `cfg!`
+   all fail to expand. That is upstream github/codeql#19982, reproducible on
+   unrelated repositories — not a fault in this repo's configuration, and
+   installing `rust-src` does not change it (1577 macro failures with and
+   without, identical). Until it is fixed upstream, treat Rust dataflow
+   results as low-signal instead of re-diagnosing the CI config.
+
+7. **Push, open the PR, and merge only when asked.** Get the branch ready by
    committing locally, but treat `git push`, `gh pr create`, and merging as
    gated on the maintainer's explicit instruction — don't push or open a PR on
    your own initiative, and never merge. When told to, open with `gh pr create`;
