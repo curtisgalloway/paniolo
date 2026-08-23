@@ -56,6 +56,13 @@ pub struct ButtonParam {
     ms: u64,
 }
 
+/// Ceiling on a single button press. A DTR press takes the port out of the
+/// supervisor's select loop for its whole duration — no reads, no writes — so
+/// an unbounded `ms` is a way to disable the interface until the daemon
+/// restarts. Real presses are milliseconds to a few seconds (<=500 ms is a
+/// power-button event, >=3 s a hard PMIC cut), so a minute is generous.
+const MAX_BUTTON_MS: u64 = 60_000;
+
 #[derive(Deserialize)]
 pub struct InputParam {
     interface: Option<String>,
@@ -162,6 +169,18 @@ async fn button(State(s): State<AppState>, Query(q): Query<ButtonParam>) -> Resp
                 .into_response();
         }
     };
+    if q.ms > MAX_BUTTON_MS {
+        return (
+            StatusCode::BAD_REQUEST,
+            [CORS],
+            format!(
+                "ms={} exceeds the {MAX_BUTTON_MS} ms ceiling — the port is out of the \
+                 read/write loop for the whole press\n",
+                q.ms
+            ),
+        )
+            .into_response();
+    }
     match handle.dtr_press(q.ms).await {
         Ok(()) => ([CORS], format!("button pressed for {} ms\n", q.ms)).into_response(),
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, [CORS], format!("{e:#}\n")).into_response(),
