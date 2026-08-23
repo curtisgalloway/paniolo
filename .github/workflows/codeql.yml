@@ -28,13 +28,19 @@
 #   2. There is somewhere to put extractor options. Default setup exposes only
 #      languages, query suite, threat model and runner type.
 #
-# Known upstream, not ours: the Rust extractor reports ~68 of 69 files as
-# "extracted with errors" because macro expansion fails for format!, vec!,
-# assert_eq!, anyhow! and even the built-in cfg!. That is github/codeql#19982
-# (open), reproducible on unrelated repositories. Installing the rust-src
-# component was tried and does NOT help -- 1577 macro expansion failures both
-# with and without it, identical -- so this workflow deliberately does not
-# install it. Check that issue before re-diagnosing this locally.
+# Known upstream, worked around below: the Rust extractor's macro expansion
+# fails for format!, vec!, assert_eq! and friends -- github/codeql#19982, still
+# open. The cause is the std version rather than anything in this repo. CodeQL
+# 2.26.x cannot parse std newer than 1.94, the runners ship 1.97+, and the
+# extractor never resolves a sysroot on its own (the config dump reads
+# "sysroot: None, sysroot_src: None"). Left alone that reported 68 of 69 files
+# as "extracted with errors", which made the Rust queries near-useless.
+#
+# The fix is the sysroot step below. Two things learned the expensive way:
+# installing rust-src for the *ambient* toolchain does nothing (measured here
+# at 1577 macro failures with and without it, identical), and _SYSROOT_SRC on
+# its own is not enough -- rust-analyzer then keeps the discovered 1.97 binary
+# sysroot. Drop the pin once #19982 closes and newer std parses cleanly.
 
 name: CodeQL
 
@@ -75,6 +81,19 @@ jobs:
             build-mode: none
     steps:
       - uses: actions/checkout@v6
+
+      # See the header note. Both variables are required. The path is computed
+      # rather than hardcoded, and the directory is asserted, so a rustup layout
+      # change or a missing rust-src fails loudly here instead of silently
+      # reverting to the broken ambient sysroot.
+      - name: Pin a 1.94 sysroot for the CodeQL Rust extractor
+        if: matrix.language == 'rust'
+        run: |
+          rustup toolchain install 1.94 --component rust-src --profile minimal --no-self-update
+          sysroot="$(rustup run 1.94 rustc --print sysroot)"
+          test -d "$sysroot/lib/rustlib/src/rust/library"
+          echo "CODEQL_EXTRACTOR_RUST_OPTION_SYSROOT=$sysroot" >> "$GITHUB_ENV"
+          echo "CODEQL_EXTRACTOR_RUST_OPTION_SYSROOT_SRC=$sysroot/lib/rustlib/src/rust/library" >> "$GITHUB_ENV"
 
       - uses: github/codeql-action/init@v3
         with:

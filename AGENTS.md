@@ -88,14 +88,16 @@ follow-up. Run through this checklist before calling `gh pr create`:
    there is somewhere to put extractor options, which default setup does not
    expose. Don't move it back to default setup to silence a prompt.
 
-   The Rust extractor reports ~68 of 69 files as "extracted with errors":
-   `format!`, `vec!`, `assert_eq!`, `anyhow!` and even the built-in `cfg!`
-   all fail to expand. That is upstream github/codeql#19982, reproducible on
-   unrelated repositories — not a fault in this repo's configuration. Adding
-   the `rust-src` component was tried and made no difference (1577 macro
-   failures with and without it, identical), so the workflow does not install
-   it; don't re-add it. Until this is fixed upstream, treat Rust dataflow
-   results as low-signal instead of re-diagnosing the CI config.
+   The workflow pins a **Rust 1.94 sysroot** for the extractor via
+   `CODEQL_EXTRACTOR_RUST_OPTION_SYSROOT` and `..._SYSROOT_SRC`. Don't remove
+   that step: CodeQL 2.26.x cannot parse std newer than 1.94 and the runners
+   ship 1.97+, so without it macro expansion fails for `format!`, `vec!`,
+   `assert_eq!` and friends, and ~68 of 69 files come back "extracted with
+   errors" (upstream github/codeql#19982). Two dead ends already ruled out:
+   installing `rust-src` for the ambient toolchain does nothing (1577 macro
+   failures with and without it, identical), and setting only `_SYSROOT_SRC`
+   leaves the ambient binary sysroot in place. Revisit the pin when #19982
+   closes.
 
 7. **Push, open the PR, and merge only when asked.** Get the branch ready by
    committing locally, but treat `git push`, `gh pr create`, and merging as
