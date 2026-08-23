@@ -154,6 +154,25 @@ fn parse_request(data: &[u8]) -> Option<Request> {
 }
 
 fn encode_option(buf: &mut Vec<u8>, tag: u8, value: &[u8]) {
+    // A DHCP option length is one byte. Pushing `value.len() as u8` for a
+    // longer value wraps mod 256 while the whole value still gets appended, so
+    // every following TLV — including OPT_END — is parsed at the wrong
+    // offset and the client sees a garbled options block. Option 67 is the
+    // reachable case: it carries the operator's boot_file, or the generated
+    // `http://host:port/file` URL on the HTTP Boot path. Truncate so the
+    // stream stays well-formed, and say so loudly — a bootfile that does not
+    // fit is an operator error, and a clear warning plus a short filename
+    // beats a silently corrupt offer.
+    let value = match value.len() > u8::MAX as usize {
+        true => {
+            warn!(
+                "DHCP option {tag}: {} bytes exceeds the 255-byte option limit, truncating",
+                value.len()
+            );
+            &value[..u8::MAX as usize]
+        }
+        false => value,
+    };
     buf.push(tag);
     buf.push(value.len() as u8);
     buf.extend_from_slice(value);
@@ -637,6 +656,23 @@ mod tests {
         let mut buf = Vec::new();
         encode_option(&mut buf, OPT_LEASE, &[0, 0, 0x0e, 0x10]);
         assert_eq!(buf, vec![OPT_LEASE, 4, 0, 0, 0x0e, 0x10]);
+    }
+
+    /// A value past the one-byte length field must not wrap it: the length
+    /// byte and the appended bytes have to agree, or every later TLV (OPT_END
+    /// included) is read at the wrong offset and the offer is garbage.
+    #[test]
+    fn encode_option_truncates_oversized_value_keeping_tlv_consistent() {
+        let mut buf = Vec::new();
+        let long = vec![b'x'; 300];
+        encode_option(&mut buf, OPT_BOOTFILE, &long);
+        assert_eq!(buf[0], OPT_BOOTFILE);
+        assert_eq!(buf[1], 255, "length byte saturates instead of wrapping to 44");
+        assert_eq!(
+            buf.len(),
+            2 + 255,
+            "appended exactly as many bytes as the length byte claims"
+        );
     }
 
     // ── UEFI HTTP Boot path ──────────────────────────────────────────────────
