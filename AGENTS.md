@@ -91,9 +91,10 @@ follow-up. Run through this checklist before calling `gh pr create`:
    The Rust extractor reports ~68 of 69 files as "extracted with errors":
    `format!`, `vec!`, `assert_eq!`, `anyhow!` and even the built-in `cfg!`
    all fail to expand. That is upstream github/codeql#19982, reproducible on
-   unrelated repositories — not a fault in this repo's configuration, and
-   installing `rust-src` does not change it (1577 macro failures with and
-   without, identical). Until it is fixed upstream, treat Rust dataflow
+   unrelated repositories — not a fault in this repo's configuration. Adding
+   the `rust-src` component was tried and made no difference (1577 macro
+   failures with and without it, identical), so the workflow does not install
+   it; don't re-add it. Until this is fixed upstream, treat Rust dataflow
    results as low-signal instead of re-diagnosing the CI config.
 
 7. **Push, open the PR, and merge only when asked.** Get the branch ready by
