@@ -156,16 +156,35 @@ fn nonce() -> String {
 /// USB CDC is up and only reach the hardware UART).
 pub fn probe_repl(url: &str, iface: &str, wait: Duration) -> Result<()> {
     let start = Instant::now();
+    // A probe that fails at the transport (daemon down, 409, HTTP error) is
+    // tolerated while the window lasts — the port re-enumerates after a power
+    // cycle, so a failure or two is expected — but the last one is kept. If
+    // the window expires with the transport still broken, that is the
+    // diagnosis; blaming the board's bootwait setting sends the user to fix
+    // hardware for a daemon that was never running.
     loop {
         let n = nonce();
-        if let Ok(resp) =
-            serial::send_expect(url, iface, Some(&format!("echo {n}\r")), &n, 1_000, 0)
-        {
-            if resp.matched {
-                return Ok(());
-            }
-        }
+        // Scoped to the iteration on purpose: a probe the daemon answered
+        // clears the record, so an earlier transient failure can never outlive
+        // it as a stale diagnosis.
+        let transport_err =
+            match serial::send_expect(url, iface, Some(&format!("echo {n}\r")), &n, 1_000, 0) {
+                Ok(resp) => {
+                    if resp.matched {
+                        return Ok(());
+                    }
+                    None
+                }
+                Err(e) => Some(e),
+            };
         if start.elapsed() >= wait {
+            if let Some(e) = transport_err {
+                return Err(e.context(format!(
+                    "couldn't reach the serialcap daemon for '{iface}' while waiting {} s \
+                     for the boot1 REPL — this is a transport failure, not the board",
+                    wait.as_secs()
+                )));
+            }
             bail!(
                 "boot1 REPL did not answer within {} s — if the board booted its OS \
                  instead of stopping at the bootloader, enable boot-to-REPL once with \
@@ -465,6 +484,21 @@ mod tests {
         let img = uf2_block(0x6000_0000, 500); // > 476-byte payload field
         let e = parse_uf2("t.uf2", &img).unwrap_err();
         assert!(e.to_string().contains("implausible payload"), "{e}");
+    }
+
+    // ── probe_repl diagnosis ───────────────────────────────────────
+
+    /// A dead daemon must be reported as a dead daemon. Port 1 on loopback
+    /// refuses instantly, so every probe fails at the transport; with a zero
+    /// wait the window expires on the first one. Before the fix this returned
+    /// the `bootwait enable` advice and sent the user at the board.
+    #[test]
+    fn probe_repl_reports_transport_failure_not_bootwait() {
+        let e = probe_repl("http://127.0.0.1:1", "dabao-console", Duration::from_millis(0))
+            .unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains("transport failure"), "{msg}");
+        assert!(!msg.contains("bootwait"), "{msg}");
     }
 
     // ── ack validation (the late-ack self-correction) ───────────────────────
