@@ -17,6 +17,14 @@ firmware patch at XDATA `0xDF00` (finding 9). Driving the mux is still blocked
 on the MS2109 firmware-patch wall (finding 7), with two untried leads in
 finding 8. Tracker: requirements §6.1 (OTF-1…6).*
 
+> **This doc is about the Mini-KVM.** For its successor see
+> [Openterface KVM-Go](openterface-kvm-go.md), which uses a different chipset
+> (MS2130S + CH32V208 instead of MS2109 + CH340C/CH9329). Findings 2 and 3
+> **do not carry over**: there is no CH340 on that board, so the
+> `DTR`→`SW_GND` and `RTS`→`HIDRESET` modem-line behaviours don't exist there.
+> The USB mux `Sel` also moved off the MS2109 GPIO onto the MCU, which makes
+> the **OTF-3 equivalent reachable** on that device.
+
 The Openterface Mini-KVM's hardware is open source
 ([TechxArtisanStudio/Openterface_Mini-KVM_Hardware](https://github.com/TechxArtisanStudio/Openterface_Mini-KVM_Hardware),
 CERN-OHL-S v2). Reading the v1.9 schematic, BOM, and datasheet shows the
