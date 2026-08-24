@@ -667,7 +667,10 @@ mod tests {
         let long = vec![b'x'; 300];
         encode_option(&mut buf, OPT_BOOTFILE, &long);
         assert_eq!(buf[0], OPT_BOOTFILE);
-        assert_eq!(buf[1], 255, "length byte saturates instead of wrapping to 44");
+        assert_eq!(
+            buf[1], 255,
+            "length byte saturates instead of wrapping to 44"
+        );
         assert_eq!(
             buf.len(),
             2 + 255,
