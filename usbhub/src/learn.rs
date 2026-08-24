@@ -307,6 +307,24 @@ impl Session {
         self.expect_stage(Stage::Captured, "run the capture steps first")?;
         let entry = self.ports.entry(physical).or_default();
         let mut msg = format!("Physical port {physical}:\n");
+        // A verdict belongs to the location it was earned at. If re-recording
+        // moves this port somewhere else, the old verdict does not follow it --
+        // keeping it would publish `controllable` for a chip port no human
+        // ever watched, which is exactly the inference this module refuses to
+        // make. Detected before the writes below, while the old value is intact.
+        let moved = findings.iter().any(|f| {
+            let current = match f.side {
+                Side::Usb3 => entry.usb3.as_ref(),
+                Side::Usb2 => entry.usb2.as_ref(),
+            };
+            matches!(current, Some(prev) if *prev != f.at)
+        });
+        let dropped = moved && entry.result.is_some();
+        if dropped {
+            entry.result = None;
+            entry.reason = None;
+        }
+
         for f in findings {
             msg.push_str(&format!(
                 "  [{}] chip path {:?}, chip port {}\n",
@@ -322,6 +340,12 @@ impl Session {
                     entry.usb2_probe = Some(f.probe.clone());
                 }
             }
+        }
+        if dropped {
+            msg.push_str(
+                "  NOTE: this port now maps to a different chip port, so its \
+                 earlier verdict was discarded — verify it again.\n",
+            );
         }
         msg.push_str(&format!(
             "Next: `usbhub learn verify {physical}` (leave the probe plugged \
@@ -387,6 +411,15 @@ impl Session {
         // whether the probe device actually dropped off.
         let before = hw.live_keys().unwrap_or_default();
 
+        // Set BEFORE cutting power, not after the loop. With two sides, a
+        // failure on the second `set_power` used to return with pending_verify
+        // still None while the first side was already dark -- no session record,
+        // so neither abort_restore nor record_verify would ever restore it.
+        // Claiming a pending verify that then fails to happen is the safe
+        // direction: the operator is told to report a verdict for a port that
+        // is still powered, which is recoverable and visible.
+        self.pending_verify = Some(physical);
+
         let mut msg = format!("Powering OFF physical port {physical}:\n");
         for (side, chip, port) in &sides {
             hw.set_power(*side, chip, *port, false)
@@ -401,7 +434,6 @@ impl Session {
                 }
             ));
         }
-        self.pending_verify = Some(physical);
 
         // Give the device a moment to fall off the bus, then re-enumerate and
         // see whether the probe is still there.
@@ -752,7 +784,9 @@ pub fn save_session(state_dir: &Path, session: &Session) -> Result<()> {
         .with_context(|| format!("creating {}", state_dir.display()))?;
     let path = session_path(state_dir);
     let text = serde_json::to_string_pretty(session)?;
-    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    // Atomic: a truncated learn.json loses the record of which port is still
+    // powered off, and nothing else knows to restore it.
+    crate::profile::write_atomic(&path, &text)?;
     Ok(())
 }
 
@@ -830,6 +864,9 @@ mod tests {
         state: HashMap<(Side, Vec<u8>, u8), bool>,
         calls: Vec<String>,
         fail_restore: bool,
+        /// Inject a failure when cutting power on this side, to model a
+        /// two-sided power-off that dies partway through.
+        fail_off_side: Option<Side>,
         probe_at: HashMap<(Side, Vec<u8>, u8), DevKey>,
         lying: HashSet<(Side, Vec<u8>, u8)>,
     }
@@ -864,6 +901,9 @@ mod tests {
         fn set_power(&mut self, side: Side, chip: &DevRecord, port: u8, on: bool) -> Result<()> {
             if on && self.fail_restore {
                 bail!("injected restore failure");
+            }
+            if !on && self.fail_off_side == Some(side) {
+                bail!("injected power-off failure on {side}");
             }
             self.calls.push(format!(
                 "{side} {} p{port} {}",
@@ -1007,6 +1047,75 @@ mod tests {
         assert_eq!(s.pending_liveness, None);
         assert_eq!(s.ports[&7].result, Some(VerifyResult::Dead));
         assert_eq!(hw.calls.len(), 4, "two offs then two ons");
+    }
+
+    /// A two-sided power-off that fails partway used to return with
+    /// pending_verify still None while the first side was already dark, so
+    /// nothing ever restored it. The session must record the pending verify
+    /// even when the call errors.
+    #[test]
+    fn begin_verify_records_pending_when_power_off_fails_partway() {
+        let mut s = mapped_session();
+        let mut hw = hw_port7(false);
+        hw.fail_off_side = Some(Side::Usb2);
+
+        let err = s.begin_verify(7, &mut hw, Duration::ZERO).unwrap_err();
+        assert!(err.to_string().contains("powering off"), "{err}");
+
+        // usb3 really was cut, so the session has to know a port is dark.
+        assert_eq!(hw.calls, vec!["usb3 1.4 p1 off"]);
+        assert_eq!(
+            s.pending_verify,
+            Some(7),
+            "a port left powered off must leave a record to restore it"
+        );
+
+        // And the recorded pending verify is actionable: restoring works.
+        hw.fail_off_side = None;
+        s.abort_restore(&mut hw).unwrap();
+        assert_eq!(s.pending_verify, None);
+        assert!(
+            hw.calls.iter().any(|c| c == "usb3 1.4 p1 on"),
+            "restore should power the dark port back on: {:?}",
+            hw.calls
+        );
+    }
+
+    /// A verdict belongs to the chip port it was earned at. Re-recording a
+    /// port at a different location must drop it rather than let it be
+    /// published as a `controllable` assertion nobody made for that location.
+    #[test]
+    fn record_port_drops_verdict_when_the_mapping_moves() {
+        let mut s = mapped_session();
+        let mut hw = hw_port7(false);
+        s.begin_verify(7, &mut hw, Duration::ZERO).unwrap();
+        s.record_verify(7, VerifyResult::Dead, None, &mut hw).unwrap();
+        assert_eq!(s.ports[&7].result, Some(VerifyResult::Dead));
+
+        // Same port, now found at chip port 2 instead of 1.
+        let msg = s
+            .record_port(7, &[finding(Side::Usb3, "4", 2, probe_u3())])
+            .unwrap();
+        assert_eq!(
+            s.ports[&7].result, None,
+            "verdict earned at port 1 must not survive a move to port 2"
+        );
+        assert_eq!(s.ports[&7].reason, None);
+        assert!(msg.contains("verify it again"), "{msg}");
+    }
+
+    /// Re-recording the *same* location is a no-op for the verdict — a re-walk
+    /// that confirms the existing mapping must not throw away a real result.
+    #[test]
+    fn record_port_keeps_verdict_when_the_mapping_is_unchanged() {
+        let mut s = mapped_session();
+        let mut hw = hw_port7(false);
+        s.begin_verify(7, &mut hw, Duration::ZERO).unwrap();
+        s.record_verify(7, VerifyResult::Dead, None, &mut hw).unwrap();
+
+        s.record_port(7, &[finding(Side::Usb3, "4", 1, probe_u3())])
+            .unwrap();
+        assert_eq!(s.ports[&7].result, Some(VerifyResult::Dead));
     }
 
     #[test]
