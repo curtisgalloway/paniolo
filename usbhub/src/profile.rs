@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -298,8 +299,52 @@ pub fn save_profile(dir: &Path, profile: &Profile) -> Result<PathBuf> {
         .with_context(|| format!("creating profile dir {}", dir.display()))?;
     let path = dir.join(format!("{}.toml", profile.model.name));
     let text = to_toml(profile)?;
-    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    write_atomic(&path, &text)?;
     Ok(path)
+}
+
+/// Replace `path`'s contents atomically: write a sibling temp file, then
+/// rename over the target.
+///
+/// `std::fs::write` truncates in place, so a crash between the truncate and
+/// the last byte leaves a half-written file where a good one used to be. Both
+/// files this crate persists are ones you cannot cheaply regenerate — a
+/// hand-verified profile costs a bench session with a human power-cycling
+/// ports, and a learn session carries the record of which port is currently
+/// powered off. Losing either to a partial write is far worse than losing the
+/// step that was in flight. A rename within a directory is atomic, so a reader
+/// sees the old contents or the new ones, never a splice of both.
+pub fn write_atomic(path: &Path, text: &str) -> Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("profile");
+    // Same directory, or the rename would cross a filesystem and stop being
+    // atomic. Pid-suffixed so two processes cannot collide on the temp name.
+    let tmp = dir.join(format!(".{}.{}.tmp", stem, std::process::id()));
+
+    let write = |tmp: &Path| -> Result<()> {
+        let mut f =
+            std::fs::File::create(tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        f.write_all(text.as_bytes())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        // Without the sync the rename can land while the contents have not,
+        // which reintroduces exactly the truncated file this avoids.
+        f.sync_all()
+            .with_context(|| format!("syncing {}", tmp.display()))
+    };
+
+    if let Err(e) = write(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow::Error::from(e))
+            .with_context(|| format!("replacing {}", path.display()));
+    }
+    Ok(())
 }
 
 pub fn to_toml(profile: &Profile) -> Result<String> {
@@ -512,6 +557,43 @@ fn collect_chips(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Replacing an existing file must leave the new contents and no debris.
+    /// The failure this guards is a truncate-in-place that dies mid-write and
+    /// leaves neither the old file nor a complete new one.
+    #[test]
+    fn write_atomic_replaces_and_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "usbhub-atomic-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("thing.toml");
+
+        write_atomic(&path, "first").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+
+        write_atomic(&path, "second").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "second",
+            "replacement is visible in full"
+        );
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     fn rec(bus: &str, chain: &[u8], vid: u16, pid: u16, class: u8, speed: &str) -> DevRecord {
         DevRecord {
