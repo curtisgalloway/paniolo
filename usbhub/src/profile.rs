@@ -325,8 +325,8 @@ pub fn write_atomic(path: &Path, text: &str) -> Result<()> {
     let tmp = dir.join(format!(".{}.{}.tmp", stem, std::process::id()));
 
     let write = |tmp: &Path| -> Result<()> {
-        let mut f = std::fs::File::create(tmp)
-            .with_context(|| format!("creating {}", tmp.display()))?;
+        let mut f =
+            std::fs::File::create(tmp).with_context(|| format!("creating {}", tmp.display()))?;
         f.write_all(text.as_bytes())
             .with_context(|| format!("writing {}", tmp.display()))?;
         // Without the sync the rename can land while the contents have not,
@@ -587,7 +587,10 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.ends_with(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

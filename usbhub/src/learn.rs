@@ -1089,7 +1089,8 @@ mod tests {
         let mut s = mapped_session();
         let mut hw = hw_port7(false);
         s.begin_verify(7, &mut hw, Duration::ZERO).unwrap();
-        s.record_verify(7, VerifyResult::Dead, None, &mut hw).unwrap();
+        s.record_verify(7, VerifyResult::Dead, None, &mut hw)
+            .unwrap();
         assert_eq!(s.ports[&7].result, Some(VerifyResult::Dead));
 
         // Same port, now found at chip port 2 instead of 1.
@@ -1111,7 +1112,8 @@ mod tests {
         let mut s = mapped_session();
         let mut hw = hw_port7(false);
         s.begin_verify(7, &mut hw, Duration::ZERO).unwrap();
-        s.record_verify(7, VerifyResult::Dead, None, &mut hw).unwrap();
+        s.record_verify(7, VerifyResult::Dead, None, &mut hw)
+            .unwrap();
 
         s.record_port(7, &[finding(Side::Usb3, "4", 1, probe_u3())])
             .unwrap();
