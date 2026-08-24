@@ -56,14 +56,32 @@ follow-up. Run through this checklist before calling `gh pr create`:
    skill) and a copy line is unnecessary for `setup.rs`/the tarball (both
    enumerate `skills/` automatically).
 
-4. **Validate before pushing.** Build and run the tests for the crates you
-   touched. To catch the Linux-only CI failures without a round-trip, run
+4. **Validate before pushing.** For every crate you touched, run all three
+   gates from that crate's directory. CI runs them per crate and fails the
+   job on any one of them:
+
+   ```bash
+   cargo fmt --check
+   cargo clippy --all-targets -- -D warnings
+   cargo test
+   ```
+
+   `cargo fmt --check` is the one that is easy to skip and cheap to fail on.
+   Passing tests and clean clippy say nothing about it, and a formatting diff
+   fails the crate's job exactly as hard as a broken test. Run `cargo fmt`
+   (no `--check`) to fix it, and note the check covers the whole crate, not
+   just your diff.
+
+   To catch the Linux-only failures without a round-trip, run
    `scripts/ci-local.sh` — it mirrors every GitHub Linux CI job (`cli`,
    `serialcap`, `netbootd`, `hdmicap`, `cambrionix`, `ch9329`, `hidrig`,
    `usbhub`, `shellyplug`) in a Linux environment, e.g. a Lima VM:
-   `limactl shell <instance> -- bash -l scripts/ci-local.sh`. (The macOS-only
-   job — hdmicap AVFoundation + visionocr — runs on the host.) Note `cli` is
-   the primary control-plane crate; don't let its tests rot.
+   `limactl shell <instance> -- bash -l scripts/ci-local.sh`. It needs a Linux
+   box or VM — it apt-installs and copies the tree — so treat it as the fuller
+   check rather than the quick one; the three commands above are the minimum
+   for a pure-Rust change and run fine on the host. (The macOS-only job —
+   hdmicap AVFoundation + visionocr — runs on the host.) Note `cli` is the
+   primary control-plane crate; don't let its tests rot.
 
 5. **Every crate has a CI job — no exceptions.** A crate is not finished until
    `.github/workflows/ci.yml` has a job for it (`working-directory: <crate>`,
