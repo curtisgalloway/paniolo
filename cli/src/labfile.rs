@@ -218,6 +218,25 @@ impl LabFile {
         Ok(())
     }
 
+    /// Rename a target, carrying every channel table (and any hand-written
+    /// comments inside them) to the new name.
+    pub fn rename_target(&mut self, old: &str, new: &str) -> Result<(), LabError> {
+        let targets = self
+            .doc
+            .get_mut("targets")
+            .and_then(|i| i.as_table_mut())
+            .ok_or_else(|| LabError(format!("no target '{old}'")))?;
+        if !targets.contains_key(old) {
+            return lab_err(format!("no target '{old}'"));
+        }
+        if targets.contains_key(new) {
+            return lab_err(format!("target '{new}' already exists"));
+        }
+        let item = targets.remove(old).expect("presence checked above");
+        targets.insert(new, item);
+        Ok(())
+    }
+
     // ── serial channels (collection) ─────────────────────────────────────────
 
     // Mirrors the `[[serial]]` field set one-for-one; a params struct would just
@@ -575,6 +594,47 @@ mod tests {
         assert!(text.contains("# hand-written"), "{text}");
         assert!(text.contains("# noisy"), "{text}");
         assert!(text.contains("identity"), "{text}");
+    }
+
+    #[test]
+    fn rename_target_carries_channels_comments_and_position() {
+        let (_d, path) = tmp();
+        std::fs::write(
+            &path,
+            "[targets.old]\nhost = \"b1\"  # pinned\n\n# capture dongle\n[targets.old.video]\ndevice = \"/dev/v0\"\n\n[[targets.old.serial]]\nname = \"console\"\ndevice = \"/dev/a\"\nbaud = 115200\n\n[hosts.b1]\nssh = \"u@b1\"\n",
+        )
+        .unwrap();
+        let mut lf = LabFile::load(&path).unwrap();
+        lf.rename_target("old", "new").unwrap();
+        lf.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[targets.new]"), "{text}");
+        assert!(text.contains("[targets.new.video]"), "{text}");
+        assert!(text.contains("[[targets.new.serial]]"), "{text}");
+        assert!(!text.contains("targets.old"), "{text}");
+        assert!(text.contains("# capture dongle"), "{text}");
+        assert!(text.contains("# pinned"), "{text}");
+        assert!(
+            text.find("[targets.new]").unwrap() < text.find("[hosts.b1]").unwrap(),
+            "renamed target should keep its place in the document:\n{text}"
+        );
+        let lab = model::load(&path).unwrap();
+        let t = &lab.targets["new"];
+        assert_eq!(t.host.as_deref(), Some("b1"));
+        assert_eq!(t.serial.len(), 1);
+        assert!(t.video.is_some());
+    }
+
+    #[test]
+    fn rename_target_refuses_missing_and_collision() {
+        let (_d, path) = tmp();
+        let mut lf = LabFile::create(&path);
+        lf.add_target("a", None, None).unwrap();
+        lf.add_target("b", None, None).unwrap();
+        let e = lf.rename_target("a", "b").unwrap_err();
+        assert!(e.0.contains("already exists"), "{}", e.0);
+        let e = lf.rename_target("ghost", "c").unwrap_err();
+        assert!(e.0.contains("no target 'ghost'"), "{}", e.0);
     }
 
     #[test]
