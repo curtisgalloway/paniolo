@@ -90,6 +90,9 @@ paniolo adb set -t <name> [--serial <adb-id>]        # an Android DUT over adb
 - Inspect: `paniolo config show` (whole lab) / `paniolo target show <name>`.
 - Remove: `paniolo target rm <name>`, or per channel (`netboot rm`,
   `serial rm <iface> -t <name>`, `power rm`, `video rm`, `hid rm`, `adb rm`).
+- Rename: `paniolo target rename <old> <new>` carries all channels (and your
+  lab-file comments) to the new name. Config-only — running daemons keep the
+  old name, so `stop` and re-`watch`/`serve` them under the new one.
 - `paniolo doctor` probes every configured channel against reality (devices
   exist, over SSH for remote hosts).
 

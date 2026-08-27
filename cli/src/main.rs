@@ -300,6 +300,8 @@ enum TargetCmd {
         #[arg(long, alias = "note")]
         description: Option<String>,
     },
+    /// Rename a target, carrying all its channels.
+    Rename { old: String, new: String },
     /// Remove a target and all its channels.
     Rm { name: String },
 }
@@ -1569,6 +1571,15 @@ fn target_cmd(lab_flag: Option<&str>, cmd: TargetCmd) -> Result<()> {
                 lf.update_target(&name, host.as_deref(), description.as_deref())
             })?;
             println!("Target '{name}' updated.");
+            Ok(())
+        }
+        TargetCmd::Rename { old, new } => {
+            edit_lab(lab_flag, |lf| lf.rename_target(&old, &new))?;
+            println!("Target '{old}' renamed to '{new}'.");
+            println!(
+                "Running daemons keep the old name — if `serial watch`, `video watch`, \
+                 or `hid serve` were up for '{old}', stop and restart them as '{new}'."
+            );
             Ok(())
         }
         TargetCmd::Rm { name } => {
