@@ -670,6 +670,7 @@ dependencies = [
  "turbojpeg",
  "ureq",
  "v4l",
+ "windows",
  "windows-sys 0.59.0",
 ]
 

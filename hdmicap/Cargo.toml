@@ -66,6 +66,15 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
 ] }
+# Media Foundation, for src/capture_mf.rs — the Windows capture backend. This
+# is Microsoft's own binding crate, the counterpart of talking to AVFoundation
+# directly on macOS and the `v4l` crate on Linux; no third-party camera
+# abstraction sits in between.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+] }
 
 [profile.release]
 opt-level = 3

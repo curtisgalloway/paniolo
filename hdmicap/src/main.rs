@@ -31,10 +31,8 @@ mod frame;
 // the design, not dead weight.
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 mod pixel;
-// Not every helper needs every primitive in here (hdmicap and serialcap have
-// no pid-liveness probe of their own), and the file is kept byte-identical
-// across the crates that copy it, so unused items are expected rather than a
-// smell.
+// The file is kept byte-identical across the crates that copy it, so a crate
+// may not use every primitive in it.
 #[allow(dead_code)]
 mod platform;
 mod server;
