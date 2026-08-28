@@ -51,6 +51,20 @@ pub fn system_libexec_dir() -> PathBuf {
     PathBuf::from("/usr/libexec/paniolo/bin")
 }
 
+/// Candidate file names for a helper in a directory.
+///
+/// Windows requires the `.exe` suffix to execute a file and the packaged
+/// helpers carry it, but every caller names helpers bare (`"hdmicap"`), so the
+/// suffixed name is tried first and the bare one kept as a fallback for a
+/// cross-built or extension-less binary. On Unix there is only ever one name.
+fn binary_names(name: &str) -> Vec<String> {
+    if cfg!(windows) && !name.ends_with(".exe") {
+        vec![format!("{name}.exe"), name.to_string()]
+    } else {
+        vec![name.to_string()]
+    }
+}
+
 /// Helper dirs relative to the running CLI binary, after resolving symlinks
 /// (Homebrew links `<prefix>/bin/paniolo` into the versioned keg):
 /// `../libexec/bin` (Homebrew keg layout) and `../libexec/paniolo/bin`
@@ -66,10 +80,19 @@ fn exe_relative_dirs() -> Vec<PathBuf> {
     let Some(prefix) = exe.parent().and_then(|d| d.parent()) else {
         return Vec::new();
     };
-    vec![
+    let mut dirs = vec![
         prefix.join("libexec/bin"),
         prefix.join("libexec/paniolo/bin"),
-    ]
+    ];
+    // The portable Windows layout is `paniolo\paniolo.exe` with the helpers in
+    // `paniolo\libexec` beside it — the exe's own directory is the install
+    // prefix there, since Windows has no bin/libexec split to hang them off.
+    if cfg!(windows) {
+        if let Some(exe_dir) = exe.parent() {
+            dirs.push(exe_dir.join("libexec"));
+        }
+    }
+    dirs
 }
 
 /// The paniolo helper directories, in resolution order: the per-user libexec
@@ -95,22 +118,30 @@ pub fn helper_dirs() -> Vec<PathBuf> {
 /// transitional fallback). Never the in-repo build tree, so a running daemon
 /// can't point at an ephemeral build artifact.
 pub fn find_binary(name: &str) -> Option<PathBuf> {
+    let names = binary_names(name);
     for dir in helper_dirs() {
-        let p = dir.join(name);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let p = dir.join(name);
+        for n in &names {
+            let p = dir.join(n);
             if p.is_file() {
                 return Some(p);
             }
         }
     }
-    let cargo = dirs::home_dir()?.join(".cargo/bin").join(name);
-    cargo.is_file().then_some(cargo)
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            for n in &names {
+                let p = dir.join(n);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    let cargo_bin = dirs::home_dir()?.join(".cargo/bin");
+    names
+        .iter()
+        .map(|n| cargo_bin.join(n))
+        .find(|p| p.is_file())
 }
 
 /// PATH value with the libexec dir prepended, for `sh -c` hook commands

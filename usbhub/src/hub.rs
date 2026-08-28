@@ -67,10 +67,10 @@ impl ControlHandle {
 
     #[cfg(windows)]
     pub fn open(device: nusb::Device) -> Result<Self> {
-        let inner = device.claim_interface(0).context(
+        let inner = device.claim_interface(0).wait().context(
             "claiming interface 0 for hub-class control transfers (Windows routes \
-                 control transfers through a claimed interface; a hub bound to usbhub.sys \
-                 will refuse this)",
+             control transfers through a claimed interface; a hub bound to usbhub.sys \
+             will refuse this)",
         )?;
         Ok(ControlHandle { inner })
     }

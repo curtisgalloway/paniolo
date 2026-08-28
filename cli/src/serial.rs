@@ -134,7 +134,28 @@ pub fn exec_tio(device: &str, baud: i64) -> Result<()> {
 /// physical port, named by its stable /dev/serial symlink — by-id preferred
 /// (names the adapter; what lab files typically use), by-path as the fallback
 /// (port-derived; the only stable name for adapters without a serial number).
+/// On Windows the OS assigns `COM<n>` names and there is no stable by-path
+/// analogue, so the enumeration comes from the `serialport` crate as-is.
 pub fn list_devices() -> Vec<String> {
+    let mut out = enumerate_devices();
+    out.sort();
+    out
+}
+
+/// Windows enumeration: whatever the OS reports as a serial port.
+///
+/// COM numbers are assigned by the OS and can move when an adapter is
+/// re-enumerated, so a lab file pinned to `COM7` is not as stable as a Linux
+/// by-id path. There is no better handle to offer.
+#[cfg(windows)]
+fn enumerate_devices() -> Vec<String> {
+    serialport::available_ports()
+        .map(|ports| ports.into_iter().map(|p| p.port_name).collect())
+        .unwrap_or_default()
+}
+
+#[cfg(not(windows))]
+fn enumerate_devices() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if cfg!(target_os = "macos") {
         if let Ok(rd) = std::fs::read_dir("/dev") {
@@ -175,13 +196,13 @@ pub fn list_devices() -> Vec<String> {
             }
         }
     }
-    out.sort();
     out
 }
 
 /// The display name for one physical port's symlink aliases: the by-id name
 /// when the adapter has one, else the first (sorted) alias — which keeps the
 /// plain `usb` by-path variant ahead of its `usbv2` twin.
+#[cfg(not(windows))]
 fn preferred_alias(aliases: &[String]) -> Option<&String> {
     aliases
         .iter()
@@ -220,6 +241,9 @@ mod tests {
         );
     }
 
+    // `preferred_alias` serves the /dev/serial enumeration, which does not
+    // exist on Windows.
+    #[cfg(not(windows))]
     #[test]
     fn preferred_alias_picks_by_id_over_by_path() {
         let aliases = vec![
@@ -233,6 +257,9 @@ mod tests {
         );
     }
 
+    // `preferred_alias` serves the /dev/serial enumeration, which does not
+    // exist on Windows.
+    #[cfg(not(windows))]
     #[test]
     fn preferred_alias_falls_back_to_first_sorted_by_path() {
         // No by-id (adapter without a serial number): the plain `usb` by-path

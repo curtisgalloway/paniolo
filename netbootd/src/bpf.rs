@@ -36,16 +36,22 @@
 //! [`BpfSender::from_handoff`] — elsewhere [`BpfSender::unavailable`] is used and
 //! TFTP falls back to ordinary `send_to`, matching the Python behavior.
 
+#[cfg(unix)]
 use std::net::Ipv4Addr;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
 
+#[cfg(unix)]
 use netbootd::frame::build_udp_frame;
+#[cfg(unix)]
 use tracing::warn;
 
 /// Sends UDP datagrams as raw Ethernet frames, bypassing the kernel ARP table.
 /// The descriptor is a `/dev/bpf` fd received from the privileged helper.
 pub struct BpfSender {
+    /// Source MAC for the frames we build. Only the raw-frame path reads it,
+    /// so off Unix it exists purely to keep `unavailable()` uniform.
+    #[cfg_attr(not(unix), allow(dead_code))]
     src_mac: Option<[u8; 6]>,
     /// The `/dev/bpf` descriptor. Windows has no such device and no file
     /// descriptors to hold, so the field simply does not exist there and the

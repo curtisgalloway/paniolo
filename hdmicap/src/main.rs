@@ -26,6 +26,10 @@ mod capture;
 mod capture_thread;
 mod daemon;
 mod frame;
+// Pixel formats and conversions exist to serve a capture backend. On a
+// platform with none compiled in (Windows), nothing constructs them — that is
+// the design, not dead weight.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 mod pixel;
 // Not every helper needs every primitive in here (hdmicap and serialcap have
 // no pid-liveness probe of their own), and the file is kept byte-identical

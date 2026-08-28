@@ -854,66 +854,118 @@ every `HELPERS` binary landed in the installed `.deb`.
 
 ## Platform support
 
-Paniolo targets three host platforms. Support status:
+Paniolo runs on three host platforms:
 
 | Platform | Status | CI | Release artifacts |
 | --- | --- | --- | --- |
-| macOS (Apple Silicon) | Supported | `macos-latest` job in `ci.yml` | Homebrew tap (arm64 bottle) |
-| Linux (Debian/Ubuntu) | Supported | all `ubuntu-latest` jobs in `ci.yml` | `.deb` + tarball from `release.yml` |
-| Windows (x86_64-msvc) | **Partial** — 3 of 10 crates build | none yet (bench host `brik`) | none |
+| macOS (Apple Silicon) | Supported | `macos` job in `ci.yml` | Homebrew tap (arm64 bottle) |
+| Linux (Debian/Ubuntu) | Supported | the `ubuntu-latest` jobs in `ci.yml` | `.deb` + tarball from `release.yml` |
+| Windows (x86_64-msvc) | Builds and unit-tests; **no hardware path verified** | `windows` job in `ci.yml` | portable zip + winget |
 
-**Windows status (measured 2026-08-28 on `brik`, a Windows 11 26200 / AMD64
-box reachable over SSH; `x86_64-pc-windows-msvc`, rustc 1.97.1, VS Build Tools
-2022).** The MSVC linker is found automatically, so `cargo build` works without
-a Developer Prompt. Per-crate result of `cargo build --all-targets` at `fe8efc5`:
+All ten crates build, lint clean under `clippy -D warnings`, and pass their
+unit tests on all three. The `windows` CI job runs the same fmt/clippy/test
+triple as the Linux jobs, because a Unix-only CI cannot tell you whether the
+Windows `#[cfg]` arm still compiles.
 
-| Crate | Windows | Blocker |
-| --- | --- | --- |
-| `cambrionix` | builds, 8 tests pass | — |
-| `shellyplug` | builds, 1 test passes | — |
-| `amt` | builds, 8 tests pass | — |
-| `cli` | fails | `std::os::unix`, `libc::{getuid,kill,SIGKILL}`, `CommandExt::exec` |
-| `hdmicap` | fails | `nix::{sys,unistd}`, `DirBuilderExt`/`MetadataExt`, `libc::getuid` |
-| `serialcap` | fails | same set as `hdmicap` (`nix`, `DirBuilderExt`, `getuid`) |
-| `netbootd` | fails | `std::os::fd`, `libc::{iovec,msghdr,CMSG_*,SOL_SOCKET}` |
-| `hidrig` | fails | `std::os::unix`, `libc::{getuid,kill,posix_openpt}` |
-| `ch9329` | fails | `std::os::unix::fs`, `libc::{getuid,kill}` |
-| `usbhub` | fails | `nusb::Device::{control_in,control_out}` — not the POSIX set |
+**What is not verified on Windows.** Everything below is compile-and-unit-test
+only — no Windows build has driven real hardware:
 
-The three that pass are the pure-network / pure-serial helpers: they touch no
-daemon machinery. Every failure is one of four groups, and they are shared, so
-fixing them is mostly one job done once rather than seven:
+- **hdmicap has no capture backend.** V4L2 and AVFoundation have no Windows
+  equivalent compiled in; a Media Foundation backend would have to be written.
+  Every capture entry point returns an explicit "no capture backend on this
+  platform" error rather than an empty device list, because an empty list reads
+  as "nothing plugged in" and sends you hunting a hardware fault.
+- **usbhub cannot claim a hub.** Windows routes control transfers through a
+  claimed interface, and USB hubs are owned by Microsoft's `usbhub.sys`, which
+  does not permit claiming. `hub::ControlHandle::open` is structurally correct
+  and expected to fail against a real hub; per-port power on Windows needs a
+  hub-driver route (`IOCTL_USB_HUB_CYCLE_PORT` or similar).
+- **hidrig has no console bridge.** The PTY the `serial` channel points its
+  `device =` at has no Windows analogue — ConPTY is not a substitute, since it
+  exposes no filesystem node another process can open. HID and control are
+  unaffected.
+- **netbootd falls back to `send_to`.** The `/dev/bpf` raw-frame sender and the
+  `SCM_RIGHTS` fd handoff are Unix-only, exactly as on Linux. Whether DHCP/TFTP
+  netboot actually works against a real target on Windows is untested.
+- **OCR is absent.** Neither Apple Vision nor Tesseract is wired up.
 
-1. **Daemon runtime dir + liveness** (`cli`, `hdmicap`, `serialcap`, `hidrig`,
-   `ch9329`) — `libc::getuid` for the `/tmp/paniolo-<uid>` path,
-   `libc::kill(pid, 0)` for the is-it-alive probe, and `DirBuilderExt::mode` /
-   `MetadataExt::uid` for the 0700 ownership check. This is the single biggest
-   win: one portable abstraction over "runtime dir" and "is this pid alive"
-   unblocks five crates.
-2. **Process control** — `CommandExt::exec` (`cli`), `process_group`, and
-   `SIGTERM`/`SIGKILL` signalling. Windows has no `exec`; a spawn-and-wait or
-   job-object equivalent is needed.
-3. **Raw sockets and fd passing** (`netbootd`) — `SCM_RIGHTS`, `msghdr`,
-   `IP_BOUND_IF`, `/dev/bpf*`. The hardest group, and the one with no direct
-   Windows analogue.
-4. **PTY** (`hidrig`) — `posix_openpt`/`ptsname`/`unlockpt`, used by the
-   fake-REPL test harness, not the production path.
+### Writing portable code here
 
-`usbhub` is the outlier and the cheapest real fix: it is blocked only because
-`nusb` exposes `control_in`/`control_out` on `Device` on Unix but requires an
-`Interface` handle on Windows. No POSIX dependency is involved.
+The POSIX primitives paniolo depends on live behind `cli/src/platform.rs`, with
+one implementation per platform and a single documented contract each:
+`current_uid`, `runtime_root`, `ensure_private_dir`, `make_executable`,
+`pid_alive`, `signal_pid` / `try_signal_pid` / `terminate_pid`, `is_superuser`,
+`detach`, `exec_replace`. **Reach for those rather than `libc` or
+`std::os::unix` at a call site** — that is the rule the port established, and
+the reason it is one small module instead of `#[cfg]` scattered through twenty
+files.
 
-Not yet assessed on Windows, because nothing that needs them builds: the OCR
-backends, capture (no Media Foundation equivalent to AVFoundation/V4L2),
-interface management, and the `paniolo setup` install flow. Do not assume a
-crate that compiles also *works* — `cambrionix`, `shellyplug` and `amt` have
-only been unit-tested there, never run against hardware.
+A trimmed copy of the module is duplicated into hdmicap, serialcap, ch9329 and
+hidrig. That is deliberate and matches how `daemon.rs` is already duplicated:
+these are standalone cargo projects with no crate between them. **Keep the five
+copies in sync.**
 
-**Working on Windows:** `brik.h.curtisg.xyz` (10.66.30.58) is the Windows bench
-host; SSH lands in PowerShell 7 with the repo cloned at
-`C:\Users\curti\src\paniolo`. Note `$HOME` there is `C:\Users\curti`, not
-`curtisg`. There is no workspace `Cargo.toml` — each crate is a separate cargo
-project, so build them individually.
+Two semantic differences are worth knowing before you rely on them:
+
+- **Windows has no signals.** Both `Signal::Term` and `Signal::Kill` land on
+  `TerminateProcess`, so a Windows daemon never runs its graceful-shutdown path
+  (discovery-file removal, the 300 ms grace) and may leave a stale discovery
+  file for the next `pid_alive` probe to reap.
+- **Windows has no uid.** The runtime namespace uses an FNV hash of `%USERNAME%`
+  — stable per user, meaningless on its own, and never used for an
+  authorization decision. The 0700-plus-ownership check on the runtime dir
+  becomes "exists and is a directory", because the path sits inside the user's
+  own profile whose inherited ACL already excludes other non-admin users.
+
+### Windows packaging
+
+The Windows artifact is a **portable zip**, not an MSI — paniolo is a CLI plus
+nine helpers, so the Windows analogue of the Homebrew tap and the `.deb` is a
+tarball of binaries, not an installer. (Contrast `~/src/oh-brother`, which needs
+WiX + a Burn bundle because it is a GUI app bootstrapping a WebView2 runtime.)
+
+The layout is flat, because Windows has no bin/libexec split to hang helpers
+off — the exe's own directory *is* the install prefix:
+
+```
+paniolo\
+  paniolo.exe          <- the only thing that goes on PATH
+  libexec\
+    hdmicap.exe  serialcap.exe  netbootd.exe  hidrig.exe  …
+```
+
+`daemons::exe_relative_dirs` adds `<exe dir>\libexec` on Windows, and
+`daemons::find_binary` tries `<name>.exe` before the bare name. `paniolo setup`
+on Windows does nothing but verify that layout: there is no setuid bit, no
+`dialout` group, and no OCR helper to build.
+
+Signing reuses oh-brother's Azure Artifact Signing setup — same account, same
+OIDC identity, same action. Three differences from that pipeline: the **exes are
+signed before zipping** (a zip carries no Authenticode signature, and SmartScreen
+judges the exe), it is **ten files rather than three** (one glob, no Burn engine
+detach/reattach — that dance is MSI-bundle-specific), and the RFC3161 timestamp
+is asserted in a verify step for the same reason as there: Artifact Signing
+certificates live 72 hours, so an untimestamped signature passes on release day
+and dies in the field three days later.
+
+`release.yml` gains `package-windows` (build → sign → verify → zip) and a
+`winget` job. Both no-op until their credentials exist: signing skips while
+`vars.AZURE_SIGNING_ACCOUNT` is unset, winget while `secrets.WINGET_TOKEN` is.
+**The first winget version must be submitted by hand** (`wingetcreate` or
+`komac`) — the action only updates a package that already exists.
+
+### Developing against Windows
+
+`brik.h.curtisg.xyz` (10.66.30.58) is the Windows bench host: SSH lands in
+PowerShell 7, `$HOME` is `C:\Users\curti` (not `curtisg`), and the repo is
+cloned at `C:\Users\curti\src\paniolo`. `scripts/sync-brik.sh <crate>…`
+pushes sources there (it excludes `target/`, which is gigabytes and stalls the
+transfer). The MSVC linker resolves without a Developer Prompt.
+
+A local `cargo check --target x86_64-pc-windows-msvc` catches most `#[cfg]`
+mistakes without leaving macOS, but **only for crates with no C dependency** —
+anything pulling `ring` (i.e. anything with TLS) fails at its build script for
+want of Windows headers. Those need the real host.
 
 Per-subsystem behavior:
 
@@ -930,8 +982,8 @@ Per-subsystem behavior:
   - *Linux:* both ports require root, so `paniolo netboot start` auto-prepends
     `sudo` when spawning `netbootd`, and `ip addr add` uses sudo too. With
     passwordless sudoers this is transparent; otherwise sudo prompts.
-  - *Windows:* no equivalent implemented (privileged-port and elevation model
-    both differ).
+  - *Windows:* neither port is privileged — Windows has no low-port
+    restriction — so `netbootd` is spawned directly with no `sudo` prefix.
 - **Interface management** (`cli/src/netif.rs`, `netif::configure_interface()` /
   `restore_interface()`).
   - *macOS:* `networksetup` + `ifconfig`.
@@ -965,10 +1017,10 @@ Per-subsystem behavior:
     (colons in a by-path name are not confused with the optional `:SENSE`
     suffix because only the known signal names `cts`, `dsr`, `dcd`, `ri` are
     treated as the sense suffix).
-  - *Windows:* not implemented (`COMn` naming has no stable by-path analogue
-    here).
-  - *Windows:* not implemented (`COMn` naming has no stable by-path analogue
-    here).
+  - *Windows:* `serialport::available_ports()` returns the OS's `COM<n>`
+    names. There is no by-path analogue, so a lab file pinned to `COM7` is
+    less stable than a Linux by-id path — the number can move when an adapter
+    is re-enumerated.
 - **hdmicap capture + build deps.**
   - *macOS:* our own AVFoundation layer (`hdmicap/src/capture_avf.m`); no extra
     system packages beyond the Xcode toolchain.

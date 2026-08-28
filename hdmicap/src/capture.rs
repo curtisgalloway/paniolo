@@ -44,7 +44,11 @@ pub struct DeviceInfo {
 }
 
 /// How the user asked us to pick a device.
+///
+/// The payloads are read only when a capture backend resolves them, so a
+/// platform with no backend compiled in never touches them.
 #[derive(Clone, Debug)]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 pub enum DeviceSpec {
     Auto,
     Index(u32),
@@ -69,6 +73,9 @@ impl DeviceSpec {
     }
 }
 
+// Only a real capture backend resolves a device, so on a backend-less platform
+// these are unreferenced by design rather than dead.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 const BUILTIN_HINTS: &[&str] = &["facetime", "built-in", "integrated", "isight"];
 
 /// One captured frame in its native form. `jpeg` carries raw MJPEG bytes when
@@ -243,6 +250,7 @@ pub fn resolve(spec: &DeviceSpec) -> Result<u32> {
 /// otherwise case-insensitive name substring, which must match exactly one
 /// device — a first-match-wins guess is how two identical dongles end up
 /// silently swapped.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 fn resolve_in(devices: &[DeviceInfo], spec: &DeviceSpec) -> Result<u32> {
     if devices.is_empty() {
         return Err(anyhow!("no capture devices found"));
