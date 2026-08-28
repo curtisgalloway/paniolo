@@ -39,10 +39,11 @@ caught on serial.
 | [Video](docs/video.md) | `paniolo video` | HDMI capture via warm-stream daemon; on-device OCR |
 | [Serial](docs/serial.md) | `paniolo serial` | Serial console — interactive (tio) or daemon-backed with timestamped rolling log |
 | [Power control](docs/power.md) | `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`, `paniolo serial dtr/reset` | DTR-based hardware power button (J2 header; opt-in per serial interface) and generic shell-command hooks (on/off/cycle/state); helpers: `cambrionix` (Cambrionix hub ports), `zigplug` (Zigbee smart plugs), `shellyplug` (Shelly Gen2+ plugs/relays over local HTTP RPC), `amt` (Intel AMT/vPro over WS-Man, with true power-state readback) |
-| [HID injection](docs/hid.md) | `paniolo hid` | USB keyboard/mouse injection via a generic helper hook (`hidrig` KB2040 injector); KVM input from the web console |
+| [HID injection](docs/hid.md) | `paniolo hid` | USB keyboard/mouse injection via a generic helper hook (`hidrig` KB2040 injector, or `ch9329` for Openterface Mini-KVM / KVM-Go and Sipeed NanoKVM-USB); KVM input from the web console |
 | [adb (Android targets)](docs/adb.md) | `paniolo adb` | Drive an Android DUT over adb — console (`shell`/`run`), screen (`screencap`), and input — one USB cable, no capture/HID/serial rig |
 | [Dashboard](docs/dashboard.md) | `paniolo console` | Combined video + serial web UI; auto-starts daemons; `-i <name>` preselects a serial interface |
 | Agent skills | `paniolo skill` | List the bundled agent guides (driving a target, GUI puppeting, USB-hub power), or print one's `SKILL.md` for an agent to read |
+| Lab config & diagnostics | `paniolo target`/`host`/`config`, `paniolo discover`, `paniolo configure`, `paniolo doctor`, `paniolo daemons` | CLI-managed lab file (targets, hosts, channels), hardware discovery with a proposed config block, config-vs-reality probing, and a one-view daemon inventory with stop/restart |
 
 ---
 
@@ -102,7 +103,7 @@ make install           # paniolo CLI + daemons + OCR helper, in one step
 `make install` bootstraps the CLI with `cargo install --path cli`, then runs
 `paniolo setup`, which compiles and installs all of paniolo's binaries. Only
 the `paniolo` CLI lands on PATH (`~/.cargo/bin`); the daemons and helpers
-(`hdmicap`, `serialcap`, `netbootd`, `cambrionix`, `hidrig`,
+(`hdmicap`, `serialcap`, `netbootd`, `cambrionix`, `hidrig`, `ch9329`,
 `shellyplug`, `amt`) and the OCR
 helper (`visionocr` on macOS via `swiftc`, `linuxocr` on Linux) install into
 the private libexec dir `~/.local/libexec/paniolo/bin`, where paniolo finds
@@ -138,14 +139,17 @@ cargo install --path ~/src/paniolo/serialcap --root ~/.local/libexec/paniolo  # 
 cargo install --path ~/src/paniolo/netbootd  --root ~/.local/libexec/paniolo  # if netbootd changed (re-run `paniolo setup` to re-setuid the helper on macOS)
 cargo install --path ~/src/paniolo/cambrionix --root ~/.local/libexec/paniolo # if cambrionix changed
 cargo install --path ~/src/paniolo/hidrig    --root ~/.local/libexec/paniolo  # if hidrig changed
+cargo install --path ~/src/paniolo/ch9329    --root ~/.local/libexec/paniolo  # if ch9329 changed
 cargo install --path ~/src/paniolo/shellyplug --root ~/.local/libexec/paniolo # if shellyplug changed
 cargo install --path ~/src/paniolo/amt       --root ~/.local/libexec/paniolo  # if amt changed
 UV_TOOL_BIN_DIR=~/.local/libexec/paniolo/bin uv tool install --force ~/src/paniolo/zigplug # if zigplug changed
 ```
 
 USB HID injection (`paniolo hid`) shells out to a helper speaking the
-[HID serial protocol](docs/hid-serial-protocol.md) — by default `hidrig`,
-the client for the KB2040 injector (see [docs/hid.md](docs/hid.md)).
+[HID serial protocol](docs/hid-serial-protocol.md) — `hidrig`, the client
+for the KB2040 injector, or `ch9329` for CH9329-based KVM devices
+(Openterface Mini-KVM / KVM-Go, Sipeed NanoKVM-USB); see
+[docs/hid.md](docs/hid.md).
 
 ---
 

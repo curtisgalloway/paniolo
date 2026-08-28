@@ -269,8 +269,9 @@ reports leak into your live session.
 > `hid_capture_usb` when you need true exclusivity.
 
 `host/hid_bench.py` measures latency/throughput and `host/leak_check.py`
-asserts no cursor leak — both via `uv run --with pyserial …`. See
-`host/README.md`.
+asserts no cursor leak — both via `uv run --with pyserial …`. Note both still
+speak the **retired single-board firmware's** line protocol (they don't drive
+the dual-board rig's binary-frame CDC link). See `host/README.md`.
 
 ### macOS serial latency
 

@@ -84,7 +84,7 @@ Plus a **future cross-cutting primitive** the owner wants: **JTAG** (see §6).
 **paniolo today.**
 - `power-cycle`, `power on`, `power off` run arbitrary hook commands from the target's
   `[power]` block (`cycle_cmd`/`on_cmd`/`off_cmd` — `cli/src/main.rs`, `model.rs`); helpers
-  (`cambrionix`, `zigplug`) ship for USB-hub and Zigbee-plug switching. ≈ `hard_reset` + the
+  (`cambrionix`, `zigplug`, `shellyplug`, `amt`) ship for USB-hub, smart-plug, and Intel AMT switching. ≈ `hard_reset` + the
   discrete verbs.
 - DTR "power button" pulses on a J2 header: `serial dtr`/`serial reset`, ≤500 ms = soft reset,
   ≥3 s = hard power-off — `cli/src/power.rs`.

@@ -45,7 +45,7 @@ Openterface Mini-KVM) with the same CLI surface, so
 `paniolo hid set -t <target> --cmd "ch9329 -d <uart>"` is the only difference.
 The same helper also drives the **Openterface KVM-Go**, whose CH32V208 MCU
 emulates the CH9329 protocol rather than being the chip — see the
-[KVM-Go notes](openterface-kvm-go.md).
+[KVM-Go notes](https://github.com/curtisgalloway/paniolo/blob/main/docs/openterface-kvm-go.md).
 
 
 ---

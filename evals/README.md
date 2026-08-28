@@ -79,6 +79,8 @@ evals/
   graders/
     t1_config.py         scripted grader: lab.toml assertions + T1-safe allowlist
     judge.py             builds the LLM-judge prompt (and can call a judge)
+    drift.py             the --check drift guard: scenario expectations vs the
+                         live CLI surface
   results/               written per run (gitignored)
 ```
 

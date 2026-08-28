@@ -156,7 +156,7 @@ for the video path.
 Incidental CDC observations from the same capture: the app sets
 `SET_LINE_CODING` to 9600 8N1, later to 115200 8N1, and asserts DTR+RTS
 (`SET_CONTROL_LINE_STATE wValue=0x0003`). Consistent with `ch9329`'s existing
-115200-then-9600 autodetect; nothing to change.
+115200/57600/9600 autodetect; nothing to change.
 
 ## Operational notes
 

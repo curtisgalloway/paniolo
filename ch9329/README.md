@@ -18,7 +18,13 @@ limitations under the License.
 
 `ch9329` is a paniolo `hid` helper for the **WCH CH9329** UART→USB-HID bridge —
 the keyboard/mouse half of an **[Openterface Mini-KVM](https://openterface.com/)**
-(reached through its CH340 USB-serial adapter). It is a sibling of
+(reached through its CH340 USB-serial adapter). The same helper drives,
+unmodified, the **Openterface KVM-Go** (a CH32V208 emulating the CH9329
+protocol over its own USB-CDC port; it reports `chip_version=0x01` instead of
+a real chip's `0x38` — see
+[`docs/openterface-kvm-go.md`](../docs/openterface-kvm-go.md)) and should
+drive the **Sipeed NanoKVM-USB** (same protocol, linked at 57600 baud; not
+bench-verified here). It is a sibling of
 [`hidrig`](../hidrig/README.md) (the KB2040 injector client): it exposes the
 **same CLI surface**, so it drops straight into a paniolo `hid` channel and
 `paniolo hid send` drives it identically.
@@ -67,13 +73,14 @@ Extras beyond hidrig's surface:
   can't report target enumeration, the CH9329 can.
 - `ch9329 -d <dev> baud <rate>` — **persistently** set the chip's serial baud
   (`SET_PARA_CFG` → flash → `RESET` to activate), then reconnect at the new
-  rate. Datasheet range 1200..=115200 (Openterface default 115200; factory
-  chips 9600). Use it to bring a factory-9600 chip up to 115200, for example.
+  rate. Datasheet range 1200..=115200 (Openterface default 115200;
+  NanoKVM-USB 57600; factory chips 9600). Use it to bring a factory-9600 chip
+  up to 115200, for example.
   Note the `RESET` makes the chip re-enumerate its USB HID, so the target
   briefly sees the keyboard/mouse disconnect and reconnect.
 - `-b/--baud <rate>` — force the link rate for *this* connection without
-  changing the chip (default: autodetect 115200 then 9600). Needed to reconnect
-  after `baud` set a rate other than 115200/9600.
+  changing the chip (default: autodetect 115200, 57600, then 9600). Needed to
+  reconnect after `baud` set a rate outside that autodetect list.
 
 `version` reports `1 ch9329/0.1.0 moveabs` — it advertises the **`moveabs`**
 capability (the CH9329 has a true absolute pointer, so click-where-you-point
@@ -89,6 +96,14 @@ behavior.
   a Pi 5): typing (US layout), special keys (`ENTER`/`ESCAPE`/`CAPS_LOCK` —
   confirmed via the lock-LED round trip in `GET_INFO`), absolute pointer
   positioning, clicking, and right-click all drive the desktop correctly.
+  The **Openterface KVM-Go** is bench-verified end-to-end too
+  (`chip_version=0x01`, 115200 — see
+  [`docs/openterface-kvm-go.md`](../docs/openterface-kvm-go.md)); the
+  NanoKVM-USB speaks the same protocol but is not bench-verified here.
+  A tap or chord involving a **lock key** (`CAPS_LOCK` etc.) is held for
+  200 ms before release — macOS debounces short lock-key presses (against a
+  macOS 15 target at the bench: 30 ms never registered, 60 ms did, 200 ms
+  toggled 10/10).
 - **Two CH9329-on-Linux quirks are worked around in `session.rs`** (both would
   have bitten a naive port — marion's mouse code, never hardware-tested, has
   neither):
@@ -104,7 +119,7 @@ behavior.
 - **The KVM daemon (`serve`/`stop`) is implemented and hardware-verified.**
   `ch9329 serve` owns the UART and re-exposes the protocol over a localhost
   WebSocket (`GET /hid`) plus a `POST /send` one-shot endpoint, publishing the
-  `/tmp/paniolo-<uid>/hid/daemon.json` discovery file paniolo's `console` reads
+  `/tmp/paniolo-<uid>/hid/<target>/daemon.json` discovery file paniolo's `console` reads
   — so the web-console "Capture input" KVM works with the Openterface. While a
   daemon runs, one-shot `paniolo hid send` invocations route through it
   automatically, so the CLI and the browser never contend for the UART and

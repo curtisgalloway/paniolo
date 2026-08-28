@@ -70,9 +70,15 @@ follow-up. Run through this checklist before calling `gh pr create`:
    - `docs/<subsystem>.md` — commands, config fields, workflows
    - `docs/architecture.md` — whole-system design, data flows, runtime paths (if structure changed)
    - `docs/README.md` — the docs index (if a doc was added/removed)
+   - `mkdocs.yml` — a new `docs/*.md` needs a `nav:` entry (end-user doc) or an
+     `exclude_docs:` entry (repo-only design record); the docs build runs
+     `mkdocs build --strict`
    - `docs/requirements.md` — the requirements tracker status (if scope/progress changed)
    - `README.md` — capabilities table, installation steps
    - `AGENTS.md` — module layout, command descriptions, architecture notes
+   - `evals/scenarios/*.toml` — the agent-eval scenarios assert CLI behavior;
+     `python3.12 evals/run.py --check` (Python ≥ 3.11) flags expectations the
+     surface change broke
    Include doc updates in the same PR, not a follow-up.
 
    Also check the diff for private infrastructure — real hostnames, private
@@ -123,7 +129,7 @@ follow-up. Run through this checklist before calling `gh pr create`:
    To catch the Linux-only failures without a round-trip, run
    `scripts/ci-local.sh` — it mirrors every GitHub Linux CI job (`cli`,
    `serialcap`, `netbootd`, `hdmicap`, `cambrionix`, `ch9329`, `hidrig`,
-   `shellyplug`) in a Linux environment, e.g. a Lima VM:
+   `shellyplug`, `amt`) in a Linux environment, e.g. a Lima VM:
    `limactl shell <instance> -- bash -l scripts/ci-local.sh`. It needs a Linux
    box or VM — it apt-installs and copies the tree — so treat it as the fuller
    check rather than the quick one; the three commands above are the minimum
@@ -175,7 +181,8 @@ follow-up. Run through this checklist before calling `gh pr create`:
 
 Releases are **tag-driven**: pushing an annotated `v*` tag to `origin` triggers
 `.github/workflows/release.yml`, which builds the Linux packages, publishes a
-GitHub Release, and bumps the Homebrew tap. There is no version to edit in
+GitHub Release, bumps the Homebrew tap, and refreshes the signed apt
+repository served from the GitHub Pages docs site. There is no version to edit in
 source — the **tag is the single source of truth**. Every crate's
 `Cargo.toml` stays at `version = "0.1.0"`; the workflow derives the package
 version from the tag name (`${GITHUB_REF_NAME#v}`), so don't bump the manifests.
@@ -209,16 +216,26 @@ Steps:
    git push origin vX.Y.Z
    ```
 
-   The push fans out to three jobs: `package` builds amd64 + arm64 `.deb`s and
+   The push fans out to four jobs: `package` builds amd64 + arm64 `.deb`s and
    tarballs inside a `debian:bookworm` container (glibc 2.36, so the packages run
    on Debian 12+ and current Raspberry Pi OS) and smoke-tests the `.deb`;
-   `release` attaches them to a new GitHub Release with auto-generated notes; and
+   `release` attaches them to a new GitHub Release with auto-generated notes;
    `bump-tap` fires a `repository_dispatch` at `curtisgalloway/homebrew-tap` so it
    re-pins its formula to the new tag (needs the `HOMEBREW_TAP_DISPATCH_TOKEN`
-   secret — absent, it warns and skips rather than failing).
+   secret — absent, it warns and skips rather than failing); and
+   `refresh-apt-repo` re-dispatches `.github/workflows/docs.yml` after the
+   Release is published, so the Pages site's `/apt/` pool picks up the new
+   `.deb`s. The docs workflow rebuilds the apt pool statelessly from the
+   newest `APT_POOL_RELEASES` (currently 5) GitHub Releases and signs it with
+   the `APT_SIGNING_KEY` secret (`packaging/scripts/build-apt-repo.sh`); on
+   the canonical repo a missing key **fails** the docs build rather than
+   deploying a site without `/apt/`, since a Pages deploy replaces the whole
+   site.
 
 5. **Watch it land.** `gh run list --workflow=release.yml --limit 1`, then
    `gh release view vX.Y.Z` once green to confirm the artifacts and notes.
+   Also confirm the dispatched `docs.yml` run went green — a failed apt-pool
+   refresh means apt clients keep seeing the previous version.
 
 A botched tag that hasn't shipped can be moved (`git tag -f` + `git push -f
 origin vX.Y.Z`), but once the Release and tap bump are public, roll forward with
@@ -296,7 +313,10 @@ Python tree below:
   `serial send` and `serial log` accept `-t` as well (`serial send` reads two
   positionals as `<target> <text>`, one as just the text); `hid send`, `adb
   run`, and `adb input` take `-t` only, because their positional tail is the
-  helper's / `adb`'s args.
+  helper's / `adb`'s args. One config-command exception: `target rename OLD
+  NEW` takes two bare positionals and no `-t` (it renames the target itself,
+  carrying all channels and lab-file comments; config-only — running daemons
+  keep their runtime dirs under the old name, so `stop` and re-`watch` them).
 - **`paniolo daemons`** is the unified daemon inventory: every discovery-file
   daemon under `/tmp/paniolo-<uid>/` (the per-target capture daemons listed as
   `serialcap[<target>]`, `hdmicap[<target>]`, `hid[<target>]`; plus host-singleton
@@ -531,8 +551,11 @@ hidrig/          USB HID injector: host CLI + daemon (Rust) + dual-board KB2040 
 
 ch9329/          Rust crate: the *other* hid helper — a WCH CH9329 UART->USB-HID
                  bridge client, hardware-verified against an Openterface
-                 Mini-KVM (the Sipeed NanoKVM-USB speaks the same frame
-                 protocol at 57600 but is not bench-verified here). Same
+                 Mini-KVM and an Openterface KVM-Go (a CH32V208 emulating the
+                 CH9329 protocol; reports chip_version=0x01, not a real chip's
+                 0x38 — see docs/openterface-kvm-go.md). The Sipeed
+                 NanoKVM-USB speaks the same frame protocol at 57600 but is
+                 not bench-verified here. Same
                  CLI surface as hidrig, so it drops into a `hid` channel
                  identically (`paniolo hid set --cmd "ch9329 -d <uart>"`); the
                  chip *is* the HID device, so it speaks the binary frame
@@ -545,9 +568,9 @@ ch9329/          Rust crate: the *other* hid helper — a WCH CH9329 UART->USB-H
                    accepted command set matches hidrig exactly (sequence parser
                    + moveabs clamp ported from hidrig/src/proto.rs)
   src/session.rs   the link itself: framing/checksum, GET_INFO, held-key/pointer
-                   state, and `open()`'s baud probe (BAUD_CANDIDATES = 115200
-                   then 9600; force with -b — e.g. -b 57600, the NanoKVM-USB
-                   default). Holds two verified CH9329-on-Linux workarounds —
+                   state, and `open()`'s baud probe (BAUD_CANDIDATES = 115200,
+                   57600 — the NanoKVM-USB default — then 9600; force one with
+                   -b). Holds two verified CH9329-on-Linux workarounds —
                    clicks go through the *relative* report (libinput coalesces a
                    button transition in an absolute report at an unchanged
                    coordinate), and `moveabs` nudges one unit before the exact
@@ -743,15 +766,22 @@ reference firmware. The retired single-board "smart" firmware
 future dumb single-board on the same composition.
 
 
-### USB identity (`firmware/boot.py`)
+### USB identity (`firmware/dual/target/boot.py`)
 
-In normal operation the target must see a plain keyboard + mouse, so boot.py
-disables the CIRCUITPY drive, the CDC REPL, and MIDI. Jumpering **D2 to GND**
-at reset re-enables them for firmware updates (plug into a dev machine, not
-the target). boot.py only re-runs on hard reset. The status NeoPixel is driven
-via the core `neopixel_write` module (no /lib dependency): blinking red =
-waiting for target enumeration, green blip = serving, solid red = last
-command failed.
+In normal (HID-only) operation the DUT must see a plain keyboard + mouse, so
+the target board's boot.py disables the CIRCUITPY drive, the CDC REPL, and
+MIDI. The mode lives in NVM byte 0 — `0` = HID-only, anything else (including
+erased `0xFF`, so a fresh board boots editable) = dev mode with CIRCUITPY +
+REPL + HID. **Tap the BOOT button (GP11)** while running and code.py flips the
+flag and resets, toggling dev ↔ HID-only with no jumper; grounding **D2** at
+reset forces dev mode regardless of the flag, as a hardware fallback for a
+wedged code.py. Do firmware edits on a dev machine, not the DUT. boot.py only
+re-runs on hard reset. The status NeoPixel (core `neopixel_write`, no /lib
+dependency): blue = up, waiting for the controller over I2C; green blip = a
+frame arrived; red blip = `send_report` failed (DUT not enumerated yet). The
+retired single-board `firmware/boot.py` used the D2 jumper alone and a
+different colour code (blinking red = waiting for enumeration, solid red =
+last command failed).
 
 ### paniolo integration
 
@@ -794,8 +824,8 @@ whose trailing args allow hyphen values — keep `-t` before them).
 
 | Purpose | Path |
 |---|---|
-| Target configs | `~/.config/paniolo/targets/<name>.toml` |
-| Video config | `~/.config/paniolo/video.toml` |
+| Lab file (all config) | `~/.config/paniolo/lab.toml` (or `--lab`/`PANIOLO_LAB`) |
+| Helper durable state | `~/.config/paniolo/helpers/<name>/` (`PANIOLO_STATE_DIR`) |
 | Netboot daemon state | `~/.local/share/paniolo/<name>/netboot.json` |
 | Combined netboot log | `~/.local/share/paniolo/<name>/netboot.log` |
 | hdmicap discovery file | `/tmp/paniolo-<uid>/hdmicap/<target>/daemon.json` (`{pid, port}`) |
@@ -825,9 +855,10 @@ base honors `$PANIOLO_RUNTIME_BASE` (default `/tmp`).
   one remaining Python component — its deps live in `zigplug/pyproject.toml`.)
 - **Rust is formatted with `rustfmt` and linted with `clippy`.** CI runs
   `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` per crate
-  (`cli`, `serialcap`, `netbootd`, `hdmicap`) — keep both clean before pushing.
+  (every crate in the Makefile `CRATES` list has its own job) — keep both
+  clean before pushing.
   Run `make fmt` to format every crate. The `zigplug` Python helper is formatted
-  with `pyink` and linted with `pylint` at line-length 88.
+  with `pyink` at line-length 88 (`zigplug/pyproject.toml`).
 - **`paniolo setup` builds the native components from the source tree** when
   run from a clone — `make install` (which invokes the *installed* CLI)
   resolves the checkout by walking up from the cwd (`setup::find_repo_root`).
@@ -840,7 +871,7 @@ base honors `$PANIOLO_RUNTIME_BASE` (default `/tmp`).
 ## Remote control pattern
 
 ```bash
-ssh control-mac "paniolo target set target-machine --interface en3 --tftp-root ~/pxe"
+ssh control-mac "paniolo netboot set -t target-machine --interface en3 --tftp-root ~/pxe"
 ssh control-mac "paniolo power set -t target-machine \
   --cycle-cmd /Users/you/.config/paniolo/scripts/power-cycle-target-machine.sh"
 ssh control-mac "paniolo netboot start target-machine"
@@ -869,7 +900,9 @@ Rust `cli/` crate:
    surgical lab-file editing (`cli/src/labfile.rs`) so they round-trip.
 4. If it's a daemon with a PID, add its state/discovery handling alongside the
    others (`cli/src/state.rs`, `cli/src/daemons.rs`).
-5. Regenerate the skill (`paniolo skill`) and update this file and `docs/`.
+5. Hand-update the usage skill (`skills/paniolo/SKILL.md`) and update this
+   file and `docs/` (`paniolo skill` only lists/prints the bundled skills —
+   it generates nothing).
 
 A new **crate** (helper or otherwise) additionally needs a CI job and a
 `scripts/ci-local.sh` line — see the CI-coverage rule in "Before opening a PR".

@@ -61,6 +61,8 @@ exclude_docs: |
   uefi-http-boot-design.md
   openterface-deep-control.md
   openterface-kvm-go.md
+  console-front-door.md
+  pi4-control-host.md
 
 markdown_extensions:
   - admonition
@@ -87,6 +89,7 @@ nav:
       - Dashboard: dashboard.md
       - HID injection: hid.md
       - HID serial protocol: hid-serial-protocol.md
+      - HID dual-board design: hid-dual-board-design.md
       - adb (Android targets): adb.md
   - Distributed control: distributed-control.md
   - Hardware-CI integration:
@@ -96,3 +99,5 @@ nav:
       - Redfish provider: ci-integration/redfish-provider.md
   - Contributing:
       - Adding power helpers: adding-power-helpers.md
+      - Agent evals: agent-evals.md
+      - Serial agent benchmark: serial-agent-benchmark.md

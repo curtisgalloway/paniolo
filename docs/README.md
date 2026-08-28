@@ -19,13 +19,13 @@ on Debian/Raspberry Pi OS the quickest route is the [apt repository](https://cur
 
 | Guide | Commands | Summary |
 |---|---|---|
-| [Netboot](netboot.md) | `paniolo netboot` | DHCP + TFTP over a direct USB-Ethernet link (single-binary Rust `netbootd`). |
-| [Link mode](netif.md) | `paniolo netif` | Atomically switch the link between netboot and ffx-over-IPv6 modes (stops netboot, sets up the host `fe80::1`). |
+| [Netboot](netboot.md) | `paniolo netboot` | DHCP + TFTP + HTTP over a direct USB-Ethernet link (single-binary Rust `netbootd`), incl. UEFI PXE / HTTP Boot. |
+| [Link mode](netif.md) | `paniolo netif` | Atomically switch the link between `netboot`, bare-`link`, `ffx`-over-IPv6, and `off` modes (entering ffx stops netboot and sets up the host `fe80::1`); `down-hard` forces a real carrier drop. |
 | [Serial](serial.md) | `paniolo serial` | `serialcap` daemon (timestamped JSONL log + WebSocket terminal) and interactive `tio`. |
 | [Power](power.md) | `paniolo power on/off`, `power-cycle`, `power-state`, `serial dtr/reset` | DTR power-button wiring (J2; opt-in per serial interface) and generic shell-command hooks; `cambrionix` hub, `zigplug` Zigbee smart-plug, `shellyplug` Shelly Gen2+ plug/relay (local HTTP RPC), and `amt` Intel AMT/vPro (WS-Man, with true power-state readback) helpers. |
 | [Video](video.md) | `paniolo video` | `hdmicap` warm-stream HDMI capture + on-device OCR. |
 | [Dashboard](dashboard.md) | `paniolo console` | Combined video + serial web UI. |
-| [HID injection](hid.md) | `paniolo hid` | USB keyboard/mouse injection via a generic helper hook; `hidrig` KB2040 injector and `ch9329` CH9329 bridge (Openterface Mini-KVM); KVM input from the web console. |
+| [HID injection](hid.md) | `paniolo hid` | USB keyboard/mouse injection via a generic helper hook; `hidrig` KB2040 injector and `ch9329` CH9329 bridge (Openterface Mini-KVM / KVM-Go, Sipeed NanoKVM-USB); KVM input from the web console. |
 | [HID serial protocol](hid-serial-protocol.md) | — | Normative command vocabulary (v1) — the external interface `hidrig` composes from; the dual-board device wire is in [hid-dual-board-design.md](hid-dual-board-design.md). |
 | [adb (Android targets)](adb.md) | `paniolo adb` | Drive an Android DUT over adb — console (`adb shell`/`run`), screen (`screencap`), and input (`adb input`); one transport, no capture/HID/serial rig. |
 
@@ -47,6 +47,10 @@ part of the end-user documentation site.
 | [CH9329 driver spec (clean-room)](https://github.com/curtisgalloway/paniolo/blob/main/docs/ch9329-spec.md) | **Implemented** (the [`ch9329`](https://github.com/curtisgalloway/paniolo/blob/main/ch9329/README.md) helper crate): WCH CH9329 serial protocol — frame format, GET_INFO, keyboard report, parameter-config/baud, reset, ACK codes. The helper speaks the [HID serial protocol](hid-serial-protocol.md) surface and plugs into the same `hid` channel; the spec remains the clean-room reference it was built from. |
 | [Openterface deep control — findings & testing TODO](https://github.com/curtisgalloway/paniolo/blob/main/docs/openterface-deep-control.md) | **Partially verified (tracker §6.1 OTF-1)**: DTR-driven unplug/replug of the A-port device is confirmed on hardware (asserted DTR = disconnected; opening the control tty replugs it) but is not production-ready — degraded link speed and hub-level instability. The USB-A switch turns out to be *software-monitored*, not switch-driven, and the MS2109 GPIO mux is blocked because ms-tools cannot patch this firmware. EEPROM dumped; the `????????` serial is a RAM descriptor, not an EEPROM field. RTS→CH9329 reset still untested. |
 | [Distributed-control implementation plan](https://github.com/curtisgalloway/paniolo/blob/main/docs/distributed-control-plan.md) | The original (Python-era) phased build sequence for [distributed control](distributed-control.md) — Phases 0–5 shipped; superseded by the Rust control plane for mechanism details. |
+| [UEFI HTTP Boot design](https://github.com/curtisgalloway/paniolo/blob/main/docs/uefi-http-boot-design.md) | The design netbootd's UEFI PXE / HTTP Boot support was built from (vendor-class dispatch, HTTP serving); the shipped behavior is documented in [netboot.md](netboot.md). |
+| [Openterface KVM-Go — architecture and paniolo support](https://github.com/curtisgalloway/paniolo/blob/main/docs/openterface-kvm-go.md) | **Bench-verified 2026-08-24**: the keychain-sized Mini-KVM successor (MS2130S capture + CH32V208 emulating the CH9329 protocol) — both paniolo channels work unmodified; hardware findings and deep-control notes. |
+| [Console front door](https://github.com/curtisgalloway/paniolo/blob/main/docs/console-front-door.md) | **Design only — parked**: one stable port with server-side fan-out for the remote dashboard, superseding `?serialws=` stitching. |
+| [Pi 4 control host](https://github.com/curtisgalloway/paniolo/blob/main/docs/pi4-control-host.md) | Bring-up plan for a self-contained Pi 4 control host; everything works on Linux/ARM64 today except the net-new USB-HID-gadget backend (design sketch, not implemented). |
 
 ## Hardware-CI integration (in design)
 

@@ -178,7 +178,9 @@ write   paniolo init
 ```
 
 *Since this design, the surface also grew `paniolo hid set/rm` (the `hid`
-channel), `power set --on-cmd/--off-cmd/--state-cmd`, the runtime verbs
+channel), `paniolo adb set/rm` (the `adb` channel for Android DUTs, with its
+runtime verbs `adb shell/run/screencap/input/show/devices`),
+`power set --on-cmd/--off-cmd/--state-cmd`, the runtime verbs
 that consume them (`power on/off`, `power-state`, `hid send/serve/stop`),
 and `target rename OLD NEW` (a comment-preserving key move; daemons keyed to
 the old name must be restarted).*

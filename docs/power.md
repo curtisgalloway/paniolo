@@ -129,6 +129,11 @@ paniolo power set -t <target> \
 
 Each hook is run via `sh -c <cmd>`. Exit code determines success or failure.
 Hooks can be any shell command, script path, or standalone helper binary.
+Besides the dedicated helpers documented below (`cambrionix`, `zigplug`,
+`shellyplug`, `amt`), the dual-board `hidrig` control board can
+switch a DUT power relay (`hidrig power off|on|cycle`) behind these same
+hooks — one USB device for HID, console, and power (see
+[`hidrig/README.md`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md)).
 
 ### Commands backed by hooks
 

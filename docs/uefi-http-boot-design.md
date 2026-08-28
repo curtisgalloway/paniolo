@@ -16,7 +16,11 @@ limitations under the License.
 
 # UEFI HTTP Boot (IPv4) for netbootd — design
 
-> **Status:** proposed, not yet built. **Date:** 2026-06-13.
+> **Status:** implemented (PRs #57, #58) — PXE/IPv4 is hardware-verified on
+> the Nova; HTTP Boot is served, but that board's EDK2 build only accepts
+> `https://` URLs, so PXE is the working path there. Shipped behavior is
+> documented in [netboot.md](netboot.md); this is the design record.
+> **Design date:** 2026-06-13.
 > Target hardware: **Indiedroid Nova** (Rockchip RK3588S) running Tianocore
 > **EDK2** firmware, which offers PXE and UEFI HTTP Boot over IPv4 and IPv6.
 > This doc designs **HTTP Boot over IPv4 only**. PXE/IPv4 is a near-sibling
