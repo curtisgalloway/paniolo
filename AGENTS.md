@@ -917,6 +917,41 @@ Two semantic differences are worth knowing before you rely on them:
   becomes "exists and is a directory", because the path sits inside the user's
   own profile whose inherited ACL already excludes other non-admin users.
 
+### Testing the platform split
+
+A `#[cfg]` that compiles is not a `#[cfg]` that works, and the tests have to
+know the difference. `paniolo doctor` shipped in the first cut of the Windows
+port depending on `sh -c` — a binary Windows does not have — and CI was green,
+because the doctor tests asserted on the **text** of the generated shell script
+rather than running it. A string-shape test passes identically on every
+platform; it can only tell you what a command *would* say, never whether it can
+launch.
+
+So: **anything that spawns a process, touches the filesystem, or resolves a
+name gets a test that executes it.** The ones that matter live in
+`cli/src/platform.rs` (`pid_alive` against a real child, `shell_command`
+running a command and reading its exit code back, `ensure_private_dir`
+creating then revalidating), `cli/src/doctor.rs` (every `Probe` variant run
+natively via `run_local`), and `cli/src/daemons.rs` (`find_binary` resolving a
+bare name to a real file through `$PATH`).
+
+Two bugs were found by writing exactly those tests, one of them serious:
+
+- **Non-positive pids were unguarded on Unix.** `kill()` reads 0 as "every
+  process in my group" and -1 as "every process I may signal", so a zero or
+  corrupt pid in a discovery file made `pid_alive` answer *running* and would
+  have made `signal_pid(.., Kill)` take down paniolo and the shell that
+  launched it. `is_real_pid` now guards every entry point, in all five copies
+  of the module, with a test in each so the guard cannot quietly go missing.
+- **Opaque lab-file commands ran through `sh -c`.** Power hooks and the hid
+  `cmd` are user-written strings that need a shell; `platform::shell_command`
+  now supplies `sh` on Unix and `cmd.exe` on Windows.
+
+`doctor` no longer needs a shell locally at all. Probes are a `Probe` enum with
+two views — `run_local()` executes natively, `to_posix()` renders the POSIX
+script still used for the SSH hop to a Unix control host — so the local path
+and the remote path cannot drift apart silently.
+
 ### Windows packaging
 
 The Windows artifact is a **portable zip**, not an MSI — paniolo is a CLI plus

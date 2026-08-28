@@ -2195,9 +2195,7 @@ fn hook_envs(cmd: &str) -> Vec<(&'static str, std::path::PathBuf)> {
 /// `label` is a human-readable description shown in the progress message.
 fn run_power_hook(cmd: &str, label: &str, target: &str) -> Result<()> {
     eprintln!("{label} '{target}' via {cmd}");
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
+    let status = platform::shell_command(cmd)
         .env("PATH", daemons::hook_path())
         .envs(hook_envs(cmd))
         .status()?;
@@ -2300,9 +2298,7 @@ fn cmd_power_state(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
 
     // Prefer state_cmd when configured; fall back to serial sense.
     if let Some(cmd) = p.state_cmd {
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&cmd)
+        let out = platform::shell_command(&cmd)
             .env("PATH", daemons::hook_path())
             .envs(hook_envs(&cmd))
             .output()?;
@@ -3171,6 +3167,21 @@ const HID_DAEMON: &str = "hid";
 /// `cmd` is run as `<cmd> serve --port 0` via `sh -c`; the contract is that it
 /// daemonizes and publishes `<runtime-base>/hid/<target>/daemon.json` (its
 /// per-target `PANIOLO_RUNTIME_DIR`).
+/// Prefix a daemon command with `exec` where the shell supports it.
+///
+/// On Unix `exec` makes the daemon replace the shell, so the pid paniolo
+/// records is the daemon's own. `cmd.exe` has no `exec`, so on Windows the
+/// shell stays as a parent and the recorded pid is the shell's — which still
+/// answers `platform::pid_alive` correctly, because that shell lives exactly
+/// as long as the daemon it is waiting on.
+fn exec_prefixed(cmd: &str) -> String {
+    if cfg!(unix) {
+        format!("exec {cmd}")
+    } else {
+        cmd.to_string()
+    }
+}
+
 fn ensure_hid_daemon_local(lab: &Lab, target: &str) -> Result<Option<u16>> {
     let t = lab
         .targets
@@ -3194,10 +3205,8 @@ fn ensure_hid_daemon_local(lab: &Lab, target: &str) -> Result<Option<u16>> {
     let log = std::fs::File::create(
         daemons::ensure_runtime_dir(HID_DAEMON, Some(target))?.join("daemon.log"),
     )?;
-    let mut command = std::process::Command::new("sh");
+    let mut command = platform::shell_command(&exec_prefixed(&format!("{cmd} serve --port 0")));
     command
-        .arg("-c")
-        .arg(format!("exec {cmd} serve --port 0"))
         .env("PATH", daemons::hook_path())
         // The hid daemon's discovery dir is the channel name ("hid"), not
         // the helper binary's name — pass it explicitly, namespaced by target.
@@ -3260,9 +3269,7 @@ fn cmd_hid_stop(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
         .ok_or_else(|| anyhow!("target '{target}' has no hid channel"))?;
     // The helper owns its own stop (e.g. `hidrig stop`); strip any trailing
     // device args isn't needed — `<cmd> stop` ignores extra args it doesn't use.
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("{cmd} stop"))
+    let status = platform::shell_command(&format!("{cmd} stop"))
         .env("PATH", daemons::hook_path())
         .envs(daemons::helper_env(HID_DAEMON, Some(&target)))
         .status()?;
@@ -3306,9 +3313,7 @@ fn cmd_hid_send(lab_flag: Option<&str>, target: Option<&str>, args: &[String]) -
     })?;
     let quoted: Vec<String> = args.iter().map(|a| ssh::shell_quote(a)).collect();
     let full = format!("{cmd} {}", quoted.join(" "));
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&full)
+    let status = platform::shell_command(&full)
         .env("PATH", daemons::hook_path())
         .envs(daemons::helper_env(HID_DAEMON, Some(&target)))
         .status()?;

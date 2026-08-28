@@ -639,6 +639,65 @@ mod tests {
         std::fs::remove_file(&other).ok();
     }
 
+    /// Helper lookup has to try `<name>.exe` on Windows: every caller names
+    /// helpers bare (`"hdmicap"`), and the packaged binaries carry the suffix,
+    /// so without this no helper resolves at all on a Windows install.
+    #[test]
+    fn binary_names_adds_the_windows_suffix() {
+        let names = binary_names("hdmicap");
+        if cfg!(windows) {
+            assert_eq!(names, vec!["hdmicap.exe", "hdmicap"]);
+        } else {
+            assert_eq!(names, vec!["hdmicap"]);
+        }
+        // An explicit .exe is never doubled up.
+        assert_eq!(binary_names("hdmicap.exe"), vec!["hdmicap.exe"]);
+    }
+
+    /// The lookup is exercised through $PATH, which `find_binary` searches on
+    /// every platform — so this runs the real resolution code rather than
+    /// asserting on the shape of a name.
+    #[test]
+    fn find_binary_resolves_a_helper_through_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = if cfg!(windows) {
+            "paniolo-fake-helper.exe"
+        } else {
+            "paniolo-fake-helper"
+        };
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+
+        let prev = std::env::var_os("PATH");
+        let mut paths = vec![dir.path().to_path_buf()];
+        if let Some(p) = &prev {
+            paths.extend(std::env::split_paths(p));
+        }
+        // Safe: single-threaded test process; PATH is restored below.
+        unsafe { std::env::set_var("PATH", std::env::join_paths(paths).unwrap()) };
+
+        // Named bare, as every caller names helpers.
+        let found = find_binary("paniolo-fake-helper");
+
+        match prev {
+            Some(p) => unsafe { std::env::set_var("PATH", p) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+
+        assert_eq!(
+            found.as_deref(),
+            Some(path.as_path()),
+            "a bare helper name must resolve to the real file"
+        );
+    }
+
     #[test]
     fn runtime_root_honors_env_default_tmp() {
         // With no override, the root is the platform default: the hardcoded

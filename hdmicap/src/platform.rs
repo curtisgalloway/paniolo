@@ -110,6 +110,18 @@ pub fn ensure_private_dir(base: &Path) -> Result<()> {
     }
 }
 
+/// A pid that could not name a real process.
+///
+/// This guard is not defensive padding. On Unix `kill()` reads non-positive
+/// pids as *broadcasts*: 0 means "every process in my group", -1 means "every
+/// process I am allowed to signal", and any other negative is a process group.
+/// So a zero or corrupt pid in a discovery file would make `pid_alive` answer
+/// "yes, running" and `signal_pid(.., Kill)` take down paniolo itself and the
+/// shell that launched it. Only positive pids are ever real daemons.
+fn is_real_pid(pid: i32) -> bool {
+    pid > 0
+}
+
 /// True if a process with this pid exists.
 ///
 /// Unix uses the signal-0 probe, treating `EPERM` as alive. Windows opens the
@@ -118,6 +130,9 @@ pub fn ensure_private_dir(base: &Path) -> Result<()> {
 /// ours.
 #[cfg(unix)]
 pub fn pid_alive(pid: i32) -> bool {
+    if !is_real_pid(pid) {
+        return false;
+    }
     // Safe: kill(pid, 0) only probes for existence.
     let rc = unsafe { libc::kill(pid, 0) };
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
@@ -131,7 +146,7 @@ pub fn pid_alive(pid: i32) -> bool {
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
-    if pid <= 0 {
+    if !is_real_pid(pid) {
         return false;
     }
     // Safe: OpenProcess validates the pid and returns null on failure.
@@ -154,6 +169,9 @@ pub fn pid_alive(pid: i32) -> bool {
 /// discovery file may be left for the next [`pid_alive`] probe to reap.
 #[cfg(unix)]
 pub fn terminate_pid(pid: i32) -> Result<()> {
+    if !is_real_pid(pid) {
+        return Err(anyhow!("invalid pid {pid}"));
+    }
     // Safe: kill() on an arbitrary pid is defined; we only read the result.
     if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
         return Err(std::io::Error::last_os_error().into());
@@ -165,7 +183,7 @@ pub fn terminate_pid(pid: i32) -> Result<()> {
 pub fn terminate_pid(pid: i32) -> Result<()> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
-    if pid <= 0 {
+    if !is_real_pid(pid) {
         return Err(anyhow!("invalid pid {pid}"));
     }
     // Safe: a null handle is checked before use.
@@ -181,4 +199,36 @@ pub fn terminate_pid(pid: i32) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guards the broadcast-pid hazard: on Unix `kill()` reads 0 as "my whole
+    /// process group" and -1 as "everything I may signal", so a corrupt pid in
+    /// a discovery file must never reach it. Kept in every copy of this module
+    /// so the guard cannot be dropped from one of them unnoticed.
+    #[test]
+    fn non_positive_pids_are_never_real() {
+        assert!(!pid_alive(0));
+        assert!(!pid_alive(-1));
+        assert!(terminate_pid(0).is_err());
+        assert!(terminate_pid(-1).is_err());
+    }
+
+    #[test]
+    fn runtime_root_is_absolute() {
+        assert!(runtime_root().is_absolute());
+    }
+
+    #[test]
+    fn ensure_private_dir_creates_then_revalidates() {
+        let tmp = std::env::temp_dir().join(format!("paniolo-hp-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        ensure_private_dir(&tmp).expect("first call creates");
+        assert!(tmp.is_dir());
+        ensure_private_dir(&tmp).expect("second call revalidates");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

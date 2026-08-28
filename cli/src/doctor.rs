@@ -46,20 +46,156 @@ impl Status {
     }
 }
 
-/// Run a POSIX-sh probe on a host (locally or over SSH); None == unreachable.
-fn probe(lab: &Lab, host_name: &str, script: &str) -> Option<i32> {
-    let host = lab.host(host_name);
-    if host.is_local(host_name) {
-        return Command::new("sh")
-            .arg("-c")
-            .arg(script)
+/// One health check, expressed structurally rather than as shell text.
+///
+/// Locally a probe runs natively, so `paniolo doctor` needs no shell at all.
+/// It used to build a POSIX script and run it through `sh -c`, which does not
+/// exist on Windows — and nothing caught that, because the tests asserted on
+/// the *text* of the generated script instead of running it. Anything that
+/// only inspects a command string is blind to whether the command can run.
+///
+/// Remotely a probe still renders to POSIX sh via [`Probe::to_posix`], because
+/// the far side of the SSH hop is a Unix control host. Keeping both views of
+/// each probe in one type is what stops them drifting apart.
+enum Probe {
+    /// The path exists.
+    Exists(String),
+    /// The program resolves the way a hook would: libexec dirs, then PATH.
+    OnHookPath(String),
+    /// A capture device: either a path that exists, or a name `hdmicap
+    /// devices` lists. Exit 3 means hdmicap itself is missing — a different
+    /// failure from a missing device.
+    Video(String),
+    /// The network interface is present on this host.
+    NetInterface(String),
+    /// adb reaches the device: the binary resolves (else exit 3), then
+    /// `get-state` succeeds.
+    Adb { bin: String, serial: Option<String> },
+}
+
+impl Probe {
+    /// Render as a POSIX-sh script, for probing a remote Unix control host.
+    fn to_posix(&self) -> String {
+        match self {
+            Probe::Exists(p) => format!("test -e {}", ssh::shell_quote(p)),
+            Probe::OnHookPath(prog) => format!(
+                "{HOOK_PATH_PREFIX} command -v {} >/dev/null",
+                ssh::shell_quote(prog)
+            ),
+            Probe::Video(dev) => video_probe_script(dev),
+            Probe::NetInterface(iface) => {
+                let q = ssh::shell_quote(iface);
+                format!("test -e /sys/class/net/{q} || ifconfig {q} >/dev/null 2>&1")
+            }
+            Probe::Adb { bin, serial } => {
+                let q_bin = ssh::shell_quote(bin);
+                let find = if bin.starts_with('/') {
+                    format!("test -x {q_bin}")
+                } else {
+                    format!("command -v {q_bin} >/dev/null")
+                };
+                let sel = match serial {
+                    Some(s) => format!("-s {} ", ssh::shell_quote(s)),
+                    None => String::new(),
+                };
+                format!("{find} || exit 3; {q_bin} {sel}get-state >/dev/null 2>&1")
+            }
+        }
+    }
+
+    /// Run the probe on this host, natively. Exit codes match [`to_posix`], so
+    /// a local and a remote answer mean the same thing.
+    fn run_local(&self) -> Option<i32> {
+        let ok = |b: bool| Some(if b { 0 } else { 1 });
+        match self {
+            Probe::Exists(p) => ok(std::path::Path::new(p).exists()),
+            Probe::OnHookPath(prog) => ok(crate::daemons::find_binary(prog).is_some()),
+            Probe::Video(dev) => {
+                if std::path::Path::new(dev).exists() {
+                    return Some(0);
+                }
+                let Some(hdmicap) = crate::daemons::find_binary("hdmicap") else {
+                    return Some(3);
+                };
+                let out = Command::new(hdmicap).arg("devices").output().ok()?;
+                ok(String::from_utf8_lossy(&out.stdout).contains(dev.as_str()))
+            }
+            Probe::NetInterface(iface) => local_interface_exists(iface),
+            Probe::Adb { bin, serial } => {
+                let found = if bin.starts_with('/') {
+                    is_executable(std::path::Path::new(bin)).then(|| bin.into())
+                } else {
+                    crate::daemons::find_binary(bin)
+                };
+                let Some(adb) = found else {
+                    return Some(3);
+                };
+                let mut cmd = Command::new(adb);
+                if let Some(s) = serial {
+                    cmd.arg("-s").arg(s);
+                }
+                let status = cmd
+                    .arg("get-state")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .ok()?;
+                ok(status.success())
+            }
+        }
+    }
+}
+
+/// Is this a file we could execute? On Unix that is an execute bit; Windows
+/// has no such bit, so existing and being a file is the whole test.
+fn is_executable(p: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p)
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        p.is_file()
+    }
+}
+
+/// Is `iface` present on this host?
+///
+/// Linux exposes every interface under sysfs. macOS has no such tree, so ask
+/// `ifconfig`. Windows has neither, and `netif` has no Windows implementation
+/// to configure one with — so the honest answer there is "cannot tell", which
+/// [`interpret`] renders as unreachable rather than a confident "missing".
+fn local_interface_exists(iface: &str) -> Option<i32> {
+    if cfg!(target_os = "linux") {
+        return Some(i32::from(
+            !std::path::Path::new(&format!("/sys/class/net/{iface}")).exists(),
+        ));
+    }
+    if cfg!(target_os = "macos") {
+        return Command::new("ifconfig")
+            .arg(iface)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .ok()
             .map(|s| s.code().unwrap_or(-1));
     }
+    None
+}
+
+/// Run a probe on a host: natively when it is this machine, over SSH as a
+/// POSIX script otherwise. None == unreachable.
+fn probe(lab: &Lab, host_name: &str, p: &Probe) -> Option<i32> {
+    let host = lab.host(host_name);
+    if host.is_local(host_name) {
+        return p.run_local();
+    }
     match ssh::run(
         &host,
-        &["sh".to_string(), "-c".to_string(), script.to_string()],
+        &["sh".to_string(), "-c".to_string(), p.to_posix()],
         None,
         &[],
     ) {
@@ -112,29 +248,36 @@ fn video_probe_script(device: &str) -> String {
     )
 }
 
+/// How a hook program (a power hook, or the hid `cmd`) is probed: an absolute
+/// path just has to exist; a bare name has to resolve the way the hook itself
+/// will resolve it — libexec dirs, then PATH.
+fn hook_probe(prog: &str) -> Probe {
+    if prog.starts_with('/') {
+        Probe::Exists(prog.to_string())
+    } else {
+        Probe::OnHookPath(prog.to_string())
+    }
+}
+
 fn check_channel(lab: &Lab, ch: &ResolvedChannel, rt: &ResolvedTarget) -> (Status, String) {
     match ch.kind {
         ChannelKind::Serial => match field(ch, "device") {
             None => (Status::Incomplete, "no device set".to_string()),
-            Some(dev) => interpret(
-                probe(lab, &ch.host, &format!("test -e {}", ssh::shell_quote(dev))),
-                dev,
-            ),
+            Some(dev) => interpret(probe(lab, &ch.host, &Probe::Exists(dev.to_string())), dev),
         },
         ChannelKind::Video => match field(ch, "device") {
             None => (Status::Incomplete, "no device set".to_string()),
-            Some(dev) => match probe(lab, &ch.host, &video_probe_script(dev)) {
+            Some(dev) => match probe(lab, &ch.host, &Probe::Video(dev.to_string())) {
                 Some(3) => (Status::Missing, format!("{dev} (hdmicap not installed)")),
                 rc => interpret(rc, dev),
             },
         },
         ChannelKind::Netboot => match field(ch, "interface") {
             None => (Status::Incomplete, "no interface set".to_string()),
-            Some(iface) => {
-                let q = ssh::shell_quote(iface);
-                let script = format!("test -e /sys/class/net/{q} || ifconfig {q} >/dev/null 2>&1");
-                interpret(probe(lab, &ch.host, &script), iface)
-            }
+            Some(iface) => interpret(
+                probe(lab, &ch.host, &Probe::NetInterface(iface.to_string())),
+                iface,
+            ),
         },
         ChannelKind::Power => {
             if let Some(si) = field(ch, "serial_interface") {
@@ -158,15 +301,7 @@ fn check_channel(lab: &Lab, ch: &ResolvedChannel, rt: &ResolvedTarget) -> (Statu
                 if let Some(cmd) = field(ch, key) {
                     configured.push(key);
                     let prog = cmd.split_whitespace().next().unwrap_or("");
-                    let script = if prog.starts_with('/') {
-                        format!("test -e {}", ssh::shell_quote(prog))
-                    } else {
-                        format!(
-                            "{HOOK_PATH_PREFIX} command -v {} >/dev/null",
-                            ssh::shell_quote(prog)
-                        )
-                    };
-                    let rc = probe(lab, &ch.host, &script);
+                    let rc = probe(lab, &ch.host, &hook_probe(prog));
                     if rc != Some(0) {
                         return interpret(rc, prog);
                     }
@@ -184,15 +319,7 @@ fn check_channel(lab: &Lab, ch: &ResolvedChannel, rt: &ResolvedTarget) -> (Statu
             // existence; bare names are probed under libexec-then-PATH.
             Some(cmd) => {
                 let prog = cmd.split_whitespace().next().unwrap_or("");
-                let script = if prog.starts_with('/') {
-                    format!("test -e {}", ssh::shell_quote(prog))
-                } else {
-                    format!(
-                        "{HOOK_PATH_PREFIX} command -v {} >/dev/null",
-                        ssh::shell_quote(prog)
-                    )
-                };
-                interpret(probe(lab, &ch.host, &script), prog)
+                interpret(probe(lab, &ch.host, &hook_probe(prog)), prog)
             }
         },
         ChannelKind::Adb => {
@@ -200,18 +327,11 @@ fn check_channel(lab: &Lab, ch: &ResolvedChannel, rt: &ResolvedTarget) -> (Statu
             // distinguishes "adb not installed" from "device not reachable".
             let adb_bin = field(ch, "adb").unwrap_or("adb");
             let serial = field(ch, "serial");
-            let q_bin = ssh::shell_quote(adb_bin);
-            let find = if adb_bin.starts_with('/') {
-                format!("test -x {q_bin}")
-            } else {
-                format!("command -v {q_bin} >/dev/null")
+            let p = Probe::Adb {
+                bin: adb_bin.to_string(),
+                serial: serial.map(str::to_string),
             };
-            let sel = match serial {
-                Some(s) => format!("-s {} ", ssh::shell_quote(s)),
-                None => String::new(),
-            };
-            let script = format!("{find} || exit 3; {q_bin} {sel}get-state >/dev/null 2>&1");
-            match probe(lab, &ch.host, &script) {
+            match probe(lab, &ch.host, &p) {
                 Some(3) => (Status::Missing, format!("{adb_bin} (adb not installed)")),
                 rc => interpret(rc, serial.unwrap_or("device")),
             }
@@ -284,6 +404,96 @@ mod tests {
         // A standalone statement, so a following `command -v` honors it in
         // dash as well as bash.
         assert!(HOOK_PATH_PREFIX.ends_with(';'));
+    }
+
+    // ── behavioural tests ───────────────────────────────────────────────
+    //
+    // These RUN the probes. The string-shape tests below cover the POSIX
+    // rendering used over SSH, but they pass identically on every platform —
+    // which is exactly how `paniolo doctor` shipped depending on `sh -c`, a
+    // binary that does not exist on Windows. A probe that cannot execute has
+    // to fail a test somewhere, so it fails here.
+
+    #[test]
+    fn exists_probe_runs_natively() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("device");
+        std::fs::write(&present, b"").unwrap();
+
+        assert_eq!(
+            Probe::Exists(present.to_string_lossy().into_owned()).run_local(),
+            Some(0),
+            "a file that exists must probe ok"
+        );
+        assert_eq!(
+            Probe::Exists(
+                dir.path()
+                    .join("no-such-device")
+                    .to_string_lossy()
+                    .into_owned()
+            )
+            .run_local(),
+            Some(1),
+            "a missing file must probe missing, not error"
+        );
+    }
+
+    #[test]
+    fn hook_path_probe_runs_natively() {
+        // A name nothing could resolve. The point is that the lookup runs to
+        // completion and reports missing, rather than failing to launch.
+        assert_eq!(
+            Probe::OnHookPath("paniolo-no-such-helper-xyzzy".to_string()).run_local(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn hook_probe_picks_path_vs_name_lookup() {
+        assert!(matches!(hook_probe("/opt/bin/zigplug"), Probe::Exists(_)));
+        assert!(matches!(hook_probe("zigplug"), Probe::OnHookPath(_)));
+    }
+
+    #[test]
+    fn adb_probe_reports_missing_binary_distinctly() {
+        // Exit 3 is what separates "adb is not installed" from "the device is
+        // not reachable"; callers branch on it.
+        let p = Probe::Adb {
+            bin: "paniolo-no-such-adb-xyzzy".to_string(),
+            serial: None,
+        };
+        assert_eq!(p.run_local(), Some(3));
+    }
+
+    #[test]
+    fn video_probe_reports_missing_hdmicap_distinctly() {
+        // A device path that cannot exist, so the probe falls through to the
+        // hdmicap lookup. If hdmicap IS installed on this machine the fallback
+        // runs it instead, which is also a valid answer — assert on the pair.
+        let p = Probe::Video("/paniolo-no-such-capture-device-xyzzy".to_string());
+        let rc = p.run_local();
+        if crate::daemons::find_binary("hdmicap").is_some() {
+            assert_eq!(rc, Some(1), "hdmicap present: device simply not listed");
+        } else {
+            assert_eq!(rc, Some(3), "hdmicap absent: exit 3, not a device failure");
+        }
+    }
+
+    #[test]
+    fn every_probe_renders_posix_for_the_remote_hop() {
+        // The SSH path still ships shell text, so each variant must render.
+        for p in [
+            Probe::Exists("/dev/ttyUSB0".to_string()),
+            Probe::OnHookPath("zigplug".to_string()),
+            Probe::Video("/dev/video0".to_string()),
+            Probe::NetInterface("eth0".to_string()),
+            Probe::Adb {
+                bin: "adb".to_string(),
+                serial: Some("XYZ".to_string()),
+            },
+        ] {
+            assert!(!p.to_posix().is_empty());
+        }
     }
 
     #[test]

@@ -151,6 +151,18 @@ pub fn make_executable(_path: &Path) -> std::io::Result<()> {
 
 // ── process lifecycle ───────────────────────────────────────────────────────
 
+/// A pid that could not name a real process.
+///
+/// This guard is not defensive padding. On Unix `kill()` reads non-positive
+/// pids as *broadcasts*: 0 means "every process in my group", -1 means "every
+/// process I am allowed to signal", and any other negative is a process group.
+/// So a zero or corrupt pid in a discovery file would make `pid_alive` answer
+/// "yes, running" and `signal_pid(.., Kill)` take down paniolo itself and the
+/// shell that launched it. Only positive pids are ever real daemons.
+fn is_real_pid(pid: i32) -> bool {
+    pid > 0
+}
+
 /// True if a process with this pid exists.
 ///
 /// Unix uses the signal-0 probe, treating `EPERM` as alive (the process exists
@@ -160,6 +172,9 @@ pub fn make_executable(_path: &Path) -> std::io::Result<()> {
 /// `ERROR_ACCESS_DENIED` likewise means the pid is live but not ours.
 #[cfg(unix)]
 pub fn pid_alive(pid: i32) -> bool {
+    if !is_real_pid(pid) {
+        return false;
+    }
     // Safe: kill(pid, 0) only probes for existence.
     let rc = unsafe { libc::kill(pid, 0) };
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
@@ -171,7 +186,7 @@ pub fn pid_alive(pid: i32) -> bool {
         CloseHandle, GetLastError, ERROR_ACCESS_DENIED, STILL_ACTIVE,
     };
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-    if pid <= 0 {
+    if !is_real_pid(pid) {
         return false;
     }
     // Safe: OpenProcess validates the pid itself and returns null on failure.
@@ -207,6 +222,9 @@ pub fn is_superuser() -> bool {
 /// caller can escalate (e.g. re-send under `sudo`) when it was not.
 #[cfg(unix)]
 pub fn try_signal_pid(pid: i32, signal: Signal) -> bool {
+    if !is_real_pid(pid) {
+        return false;
+    }
     let sig = match signal {
         Signal::Term => libc::SIGTERM,
         Signal::Kill => libc::SIGKILL,
@@ -219,7 +237,7 @@ pub fn try_signal_pid(pid: i32, signal: Signal) -> bool {
 pub fn try_signal_pid(pid: i32, _signal: Signal) -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
-    if pid <= 0 {
+    if !is_real_pid(pid) {
         return false;
     }
     // Safe: a null handle is checked before use.
@@ -238,6 +256,9 @@ pub fn try_signal_pid(pid: i32, _signal: Signal) -> bool {
 /// is silently ignored on both platforms.
 #[cfg(unix)]
 pub fn signal_pid(pid: i32, signal: Signal) {
+    if !is_real_pid(pid) {
+        return;
+    }
     let sig = match signal {
         Signal::Term => libc::SIGTERM,
         Signal::Kill => libc::SIGKILL,
@@ -252,7 +273,7 @@ pub fn signal_pid(pid: i32, signal: Signal) {
 pub fn signal_pid(pid: i32, _signal: Signal) {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
-    if pid <= 0 {
+    if !is_real_pid(pid) {
         return;
     }
     // Safe: a null handle is checked; TerminateProcess on a live handle is
@@ -265,6 +286,38 @@ pub fn signal_pid(pid: i32, _signal: Signal) {
         TerminateProcess(h, 1);
         CloseHandle(h);
     }
+}
+
+/// A shell invocation for an opaque command string from the lab file.
+///
+/// Power hooks (`on_cmd`, `off_cmd`, …) and the hid `cmd` are written by the
+/// user, may contain pipelines or redirection, and so have to go through a
+/// shell rather than being split into an argv. That shell is `sh` on Unix and
+/// `cmd.exe` on Windows.
+///
+/// A lab file's command strings are already platform-specific — one naming
+/// `/dev/cu.usbmodem…` is macOS-only however it is run — so this does not make
+/// a Unix lab file portable. It makes a *Windows* lab file (`COM4`,
+/// `ch9329.exe`) runnable at all, which it was not: `Command::new("sh")`
+/// compiles everywhere and fails to launch on Windows, which is how this
+/// shipped broken.
+#[cfg(unix)]
+pub fn shell_command(script: &str) -> Command {
+    let mut c = Command::new("sh");
+    c.arg("-c").arg(script);
+    c
+}
+
+#[cfg(windows)]
+pub fn shell_command(script: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+    let mut c = Command::new("cmd");
+    c.arg("/C");
+    // cmd.exe does not follow the argument-quoting rules std applies, so the
+    // script is handed over verbatim; std's escaping would mangle any quoting
+    // the user wrote.
+    c.raw_arg(script);
+    c
 }
 
 /// Detach `cmd` so the spawned daemon outlives this CLI process.
@@ -304,5 +357,120 @@ pub fn exec_replace(cmd: &mut Command) -> std::io::Error {
     match cmd.status() {
         Ok(status) => std::process::exit(status.code().unwrap_or(1)),
         Err(e) => e,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A child process that will sit still until we kill it.
+    ///
+    /// `sleep`/`timeout` are the one command with a long-running form on both
+    /// platforms; the point is only to have a live pid to probe.
+    fn spawn_sleeper() -> std::process::Child {
+        if cfg!(windows) {
+            // `timeout` needs a console; ping to loopback is the portable idle.
+            let mut c = Command::new("cmd");
+            c.args(["/C", "ping -n 30 127.0.0.1 > NUL"]);
+            c
+        } else {
+            let mut c = Command::new("sleep");
+            c.arg("30");
+            c
+        }
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn sleeper")
+    }
+
+    /// The daemon machinery lives or dies on these two: every `discover()`
+    /// asks whether a recorded pid is alive, and every `stop` terminates one.
+    /// Both are hand-written per platform — on Windows they are raw Win32
+    /// calls — so they get an actual process rather than a mocked one.
+    #[test]
+    fn pid_alive_tracks_a_real_process() {
+        let mut child = spawn_sleeper();
+        let pid = child.id() as i32;
+        assert!(pid_alive(pid), "a just-spawned child must read as alive");
+
+        assert!(
+            try_signal_pid(pid, Signal::Kill),
+            "terminating our own child must succeed"
+        );
+        let _ = child.wait();
+
+        // Windows can take a moment to tear the process down, and a reaped
+        // Unix pid is gone immediately; poll briefly rather than race.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pid_alive(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(!pid_alive(pid), "a terminated child must read as dead");
+    }
+
+    #[test]
+    fn pid_alive_rejects_impossible_pids() {
+        assert!(!pid_alive(0));
+        assert!(!pid_alive(-1));
+    }
+
+    #[test]
+    fn signal_pid_on_a_dead_pid_is_survivable() {
+        // Best-effort by contract: reaping an already-dead daemon must not
+        // panic or hang, on either platform.
+        let mut child = spawn_sleeper();
+        let pid = child.id() as i32;
+        let _ = try_signal_pid(pid, Signal::Kill);
+        let _ = child.wait();
+        signal_pid(pid, Signal::Term);
+        signal_pid(pid, Signal::Kill);
+    }
+
+    /// `Command::new("sh")` compiles on Windows and fails to launch, which is
+    /// how `doctor` and the power hooks shipped broken. Run a real command
+    /// through the shell wrapper and read its exit code back.
+    #[test]
+    fn shell_command_actually_runs_a_command() {
+        let status = shell_command("exit 7").status().expect("shell must launch");
+        assert_eq!(status.code(), Some(7));
+
+        let ok = shell_command("exit 0").status().expect("shell must launch");
+        assert!(ok.success());
+    }
+
+    #[test]
+    fn runtime_root_is_absolute_and_usable() {
+        // The daemon runtime dir hangs off this; a relative or empty root
+        // would put daemon state somewhere unpredictable.
+        let root = default_runtime_root();
+        assert!(root.is_absolute(), "{root:?} must be absolute");
+    }
+
+    #[test]
+    fn ensure_private_dir_creates_then_revalidates() {
+        let tmp = std::env::temp_dir().join(format!("paniolo-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        ensure_private_dir(&tmp).expect("first call creates");
+        assert!(tmp.is_dir());
+        // Second call takes the already-exists path, including the Unix
+        // ownership check — the branch a running daemon hits every time.
+        ensure_private_dir(&tmp).expect("second call revalidates");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn ensure_private_dir_rejects_a_non_directory() {
+        let tmp = std::env::temp_dir().join(format!("paniolo-test-file-{}", std::process::id()));
+        std::fs::write(&tmp, b"not a directory").unwrap();
+        assert!(
+            ensure_private_dir(&tmp).is_err(),
+            "a squatted path must be refused, not silently used"
+        );
+        let _ = std::fs::remove_file(&tmp);
     }
 }
