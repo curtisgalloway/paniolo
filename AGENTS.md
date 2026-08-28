@@ -860,34 +860,49 @@ Paniolo runs on three host platforms:
 | --- | --- | --- | --- |
 | macOS (Apple Silicon) | Supported | `macos` job in `ci.yml` | Homebrew tap (arm64 bottle) |
 | Linux (Debian/Ubuntu) | Supported | the `ubuntu-latest` jobs in `ci.yml` | `.deb` + tarball from `release.yml` |
-| Windows (x86_64-msvc) | Builds and unit-tests; **no hardware path verified** | `windows` job in `ci.yml` | portable zip + winget |
+| Windows (x86_64-msvc) | Supported; power and video hardware-verified | `windows` job in `ci.yml` | portable zip + winget |
 
 All ten crates build, lint clean under `clippy -D warnings`, and pass their
 unit tests on all three. The `windows` CI job runs the same fmt/clippy/test
 triple as the Linux jobs, because a Unix-only CI cannot tell you whether the
 Windows `#[cfg]` arm still compiles.
 
-**What is not verified on Windows.** Everything below is compile-and-unit-test
-only — no Windows build has driven real hardware:
+**Hardware-verified on Windows** (bench host `brik`, 2026-08-28, against a
+Shelly Plug and an Openterface KVM-GO):
 
-- **hdmicap has no capture backend.** V4L2 and AVFoundation have no Windows
-  equivalent compiled in; a Media Foundation backend would have to be written.
-  Every capture entry point returns an explicit "no capture backend on this
-  platform" error rather than an empty device list, because an empty list reads
-  as "nothing plugged in" and sends you hunting a hardware fault.
+- **power** — `shellyplug` on/off/cycle, each confirmed by read-back.
+- **video** — `hdmicap` enumerates the capture device by its symbolic-link id
+  and captures native 3840x2160 frames through the Media Foundation backend;
+  daemon start, `shot` and `stop` all work.
+- **hid** — `ch9329` over a COM port reports `target_connected=true` and its
+  mouse moves wake the attached machine, which is how the first (black) capture
+  turned into a real frame. Keystroke delivery is confirmed by that wake rather
+  than by the CH9329's LED read-back, which stayed `false`.
+
+**What is still NOT verified on Windows:**
+
 - **usbhub cannot claim a hub.** Windows routes control transfers through a
   claimed interface, and USB hubs are owned by Microsoft's `usbhub.sys`, which
   does not permit claiming. `hub::ControlHandle::open` is structurally correct
   and expected to fail against a real hub; per-port power on Windows needs a
-  hub-driver route (`IOCTL_USB_HUB_CYCLE_PORT` or similar).
+  hub-driver route (`IOCTL_USB_HUB_CYCLE_PORT` or similar). Note that IOCTL only
+  *cycles* a port — it has no arbitrary on/off — so whether paniolo's power model
+  maps onto Windows at all is an open design question, not just unwritten code.
+- **netbootd falls back to `send_to`.** The `/dev/bpf` raw-frame sender and the
+  `SCM_RIGHTS` fd handoff are Unix-only, exactly as on Linux. Whether DHCP/TFTP
+  netboot works against a real target on Windows is untested, and `netif` has no
+  Windows implementation to configure the interface with.
 - **hidrig has no console bridge.** The PTY the `serial` channel points its
   `device =` at has no Windows analogue — ConPTY is not a substitute, since it
   exposes no filesystem node another process can open. HID and control are
   unaffected.
-- **netbootd falls back to `send_to`.** The `/dev/bpf` raw-frame sender and the
-  `SCM_RIGHTS` fd handoff are Unix-only, exactly as on Linux. Whether DHCP/TFTP
-  netboot actually works against a real target on Windows is untested.
-- **OCR is absent.** Neither Apple Vision nor Tesseract is wired up.
+- **OCR is absent.** Neither Apple Vision nor Tesseract has a Windows
+  counterpart wired up. `Windows.Media.Ocr` is the in-box candidate, and the
+  `windows` crate is already a hdmicap dependency for capture.
+- **Remote dispatch cannot target a Windows control host.** `ssh::remote_command`
+  emits POSIX shell (`VAR='v' paniolo …`); against brik's default PowerShell that
+  fails with "The term 'FOO=bar' is not recognized". Windows works as a *local*
+  control host, not yet as a remote one.
 
 ### Writing portable code here
 
@@ -1066,7 +1081,12 @@ Per-subsystem behavior:
     `require-simd` default makes nasm mandatory on x86-64). `make install` fails
     early with a hint if any are missing (`check-deps` in the Makefile);
     `paniolo setup` prints a reminder.
-  - *Windows:* no capture backend (Media Foundation would be the analogue).
+  - *Windows:* our own Media Foundation layer (`hdmicap/src/capture_mf.rs`),
+    delivering NV12 so it reuses the macOS pixel path. It enumerates the
+    device's *native* media types and selects one explicitly — the Windows form
+    of the AVFoundation lesson below, and the reason an Openterface captures at
+    its real 3840x2160 instead of a rescaled 1080p. MJPEG-only devices are not
+    yet supported.
 
 ## Known limitations / gotchas
 

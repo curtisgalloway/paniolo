@@ -272,9 +272,10 @@ jobs:
     # rather than ten, because the crates are small and a Windows runner minute
     # costs twice a Linux one. A per-crate failure still names the crate.
     #
-    # Not covered here, and not coverable: hdmicap has no capture backend on
-    # Windows and usbhub cannot claim a hub interface, so both compile and test
-    # but neither can talk to hardware. See AGENTS.md under **Platform support**.
+    # What CI cannot cover: anything needing the bench hardware. hdmicap's
+    # Media Foundation backend and the ch9329 HID path are verified by hand on
+    # `brik`, not here; usbhub cannot claim a hub on Windows at all. See
+    # AGENTS.md under **Platform support** for what is and is not verified.
     name: windows (all crates, fmt, clippy, test)
     runs-on: windows-latest
     steps:
