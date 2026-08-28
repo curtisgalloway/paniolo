@@ -135,7 +135,7 @@ pub fn hook_path() -> std::ffi::OsString {
 pub fn runtime_root() -> PathBuf {
     std::env::var_os("PANIOLO_RUNTIME_BASE")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .unwrap_or_else(crate::platform::default_runtime_root)
 }
 
 /// Stable per-user runtime base: `<root>/paniolo-<uid>`, identical in every
@@ -144,8 +144,7 @@ pub fn runtime_root() -> PathBuf {
 /// Keep in sync with `runtime_dir()` in hdmicap/src/daemon.rs and
 /// serialcap/src/daemon.rs.
 fn runtime_base() -> PathBuf {
-    // Safe: getuid is always successful.
-    let uid = unsafe { libc::getuid() };
+    let uid = crate::platform::current_uid();
     runtime_root().join(format!("paniolo-{uid}"))
 }
 
@@ -188,22 +187,8 @@ pub fn runtime_rel(name: &str, instance: Option<&str>) -> String {
 /// `instance` is `Some(target)` for per-target capture daemons (serialcap,
 /// hdmicap, hid), `None` for host-singleton daemons (zigplug, cambrionix, …).
 pub fn ensure_runtime_dir(name: &str, instance: Option<&str>) -> Result<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     let base = runtime_base();
-    match std::fs::DirBuilder::new().mode(0o700).create(&base) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let uid = unsafe { libc::getuid() };
-            let md = std::fs::symlink_metadata(&base)?;
-            if !md.is_dir() || md.uid() != uid {
-                return Err(anyhow!(
-                    "{} exists but is not a directory owned by uid {uid}",
-                    base.display()
-                ));
-            }
-        }
-        Err(e) => return Err(e.into()),
-    }
+    crate::platform::ensure_private_dir(&base)?;
     let dir = base.join(runtime_rel(name, instance));
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
@@ -306,8 +291,7 @@ pub fn start_failure(name: &str, instance: Option<&str>, timeout: Duration) -> a
 }
 
 fn pid_alive(pid: i32) -> bool {
-    // Safe: kill(pid, 0) only probes for existence.
-    unsafe { libc::kill(pid, 0) == 0 }
+    crate::platform::pid_alive(pid)
 }
 
 // ── binary staleness ─────────────────────────────────────────────────────────
@@ -511,11 +495,8 @@ pub fn list_stray_helpers(exclude_pids: &[i32]) -> Vec<(i32, String)> {
 }
 
 /// Send `signal` to `pid` (best-effort).
-pub fn signal_pid(pid: i32, signal: i32) {
-    // Safe: sending a signal to a pid we just enumerated; failure is fine.
-    unsafe {
-        libc::kill(pid, signal);
-    }
+pub fn signal_pid(pid: i32, signal: crate::platform::Signal) {
+    crate::platform::signal_pid(pid, signal);
 }
 
 /// Listen port of the named running daemon instance, or None if it isn't
@@ -629,10 +610,15 @@ mod tests {
 
     #[test]
     fn runtime_root_honors_env_default_tmp() {
-        // Default is /tmp; the override is read live, so just assert the
-        // default path shape (the env var is process-global in tests).
+        // With no override, the root is the platform default: the hardcoded
+        // /tmp on Unix, the per-user temp dir on Windows. The override is read
+        // live, so only assert the shape (the env var is process-global in
+        // tests).
         if std::env::var_os("PANIOLO_RUNTIME_BASE").is_none() {
-            assert_eq!(runtime_root(), PathBuf::from("/tmp"));
+            assert_eq!(runtime_root(), crate::platform::default_runtime_root());
+            if cfg!(unix) {
+                assert_eq!(runtime_root(), PathBuf::from("/tmp"));
+            }
         }
     }
 }

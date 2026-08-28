@@ -176,12 +176,12 @@ pub fn enumerate_capture() -> Result<Vec<DeviceInfo>> {
     Ok(devices)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 pub fn enumerate_capture() -> Result<Vec<DeviceInfo>> {
     enumerate()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 pub fn enumerate() -> Result<Vec<DeviceInfo>> {
     use std::ffi::{c_char, c_void, CStr};
 
@@ -287,10 +287,39 @@ pub fn open_backend(spec: &DeviceSpec) -> Result<Box<dyn CaptureBackend>> {
     {
         linux::LinuxV4LBackend::open(spec).map(|b| Box::new(b) as Box<dyn CaptureBackend>)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
         macos::AvfBackend::open(spec).map(|b| Box::new(b) as Box<dyn CaptureBackend>)
     }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = spec;
+        Err(unsupported())
+    }
+}
+
+/// Platforms with no capture backend compiled in.
+///
+/// Windows would need a Media Foundation implementation to sit beside the V4L2
+/// and AVFoundation ones; until that exists, every entry point fails with this
+/// rather than pretending there are zero devices attached — a silent empty list
+/// reads as "nothing plugged in" and sends you hunting for a hardware fault.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn unsupported() -> anyhow::Error {
+    anyhow!(
+        "hdmicap has no capture backend on this platform \
+         (V4L2 on Linux, AVFoundation on macOS; Windows would need Media Foundation)"
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn enumerate_capture() -> Result<Vec<DeviceInfo>> {
+    Err(unsupported())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn enumerate() -> Result<Vec<DeviceInfo>> {
+    Err(unsupported())
 }
 
 // ── Linux backend ─────────────────────────────────────────────────────────────
@@ -418,7 +447,7 @@ mod linux {
 
 // ── macOS backend ─────────────────────────────────────────────────────────────
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 mod macos {
     use std::ffi::{c_char, c_void, CStr, CString};
     use std::sync::Arc;

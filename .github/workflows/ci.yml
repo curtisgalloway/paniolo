@@ -262,6 +262,58 @@ jobs:
       - name: Test
         run: cargo test
 
+  windows:
+    # The Windows port. Every crate is built here, because the whole point of
+    # the port is that the `#[cfg]` branches in cli/src/platform.rs and its
+    # copies only ever compile on the platform they are written for — a Unix-only
+    # CI cannot tell you that the Windows arm still builds.
+    #
+    # This runs the same fmt/clippy/test triple as the Linux jobs, in one job
+    # rather than ten, because the crates are small and a Windows runner minute
+    # costs twice a Linux one. A per-crate failure still names the crate.
+    #
+    # Not covered here, and not coverable: hdmicap has no capture backend on
+    # Windows and usbhub cannot claim a hub interface, so both compile and test
+    # but neither can talk to hardware. See AGENTS.md under **Platform support**.
+    name: windows (all crates, fmt, clippy, test)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            cli
+            hdmicap
+            serialcap
+            netbootd
+            cambrionix
+            hidrig
+            ch9329
+            usbhub
+            shellyplug
+            amt
+      - name: Format, clippy and test every crate
+        shell: pwsh
+        run: |
+          $crates = "cli","hdmicap","serialcap","netbootd","cambrionix","hidrig","ch9329","usbhub","shellyplug","amt"
+          $failed = @()
+          foreach ($c in $crates) {
+            Write-Host "::group::$c"
+            Push-Location $c
+            cargo fmt --check;   if ($LASTEXITCODE -ne 0) { $failed += "$c (fmt)" }
+            cargo clippy --all-targets -- -D warnings; if ($LASTEXITCODE -ne 0) { $failed += "$c (clippy)" }
+            cargo test;          if ($LASTEXITCODE -ne 0) { $failed += "$c (test)" }
+            Pop-Location
+            Write-Host "::endgroup::"
+          }
+          if ($failed.Count -gt 0) {
+            Write-Host "::error::failed: $($failed -join ', ')"
+            exit 1
+          }
+
   macos:
     # Exercises the macOS-only stack the Linux jobs can't: hdmicap's AVFoundation
     # capture path and the Apple Vision OCR helper. fmt/clippy run on both Linux

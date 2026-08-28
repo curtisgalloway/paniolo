@@ -53,28 +53,14 @@ pub struct Discovery {
 /// fallback below is for standalone invocations and matches it:
 /// `/tmp/paniolo-<uid>/hid`.
 pub fn runtime_dir() -> Result<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     if let Some(dir) = std::env::var_os("PANIOLO_RUNTIME_DIR") {
         let dir = PathBuf::from(dir);
         fs::create_dir_all(&dir)?;
         return Ok(dir);
     }
-    // Safe: getuid always succeeds.
-    let uid = unsafe { libc::getuid() };
-    let base = PathBuf::from(format!("/tmp/paniolo-{uid}"));
-    match fs::DirBuilder::new().mode(0o700).create(&base) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let md = fs::symlink_metadata(&base)?;
-            if !md.is_dir() || md.uid() != uid {
-                return Err(anyhow!(
-                    "{} exists but is not a directory owned by uid {uid}",
-                    base.display()
-                ));
-            }
-        }
-        Err(e) => return Err(e.into()),
-    }
+    let uid = crate::platform::current_uid();
+    let base = crate::platform::runtime_root().join(format!("paniolo-{uid}"));
+    crate::platform::ensure_private_dir(&base)?;
     let dir = base.join(DISCOVERY_NAME);
     fs::create_dir_all(&dir)?;
     Ok(dir)
@@ -93,7 +79,7 @@ pub fn discover() -> Option<Discovery> {
     let s = fs::read_to_string(discovery_path().ok()?).ok()?;
     let d: Discovery = serde_json::from_str(&s).ok()?;
     // Liveness: the recorded pid still exists.
-    if unsafe { libc::kill(d.pid as i32, 0) } != 0 {
+    if !crate::platform::pid_alive(d.pid as i32) {
         return None;
     }
     Some(d)

@@ -15,14 +15,14 @@
 //! Hub-class control requests: per-port power switching and status.
 //!
 //! These are the standard requests from the USB hub class specification —
-//! the same ones uhubctl issues. No interface is claimed; the OS hub driver
-//! keeps running.
+//! the same ones uhubctl issues. On Unix no interface is claimed and the OS hub
+//! driver keeps running; Windows has no such route (see [`ControlHandle`]).
 
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use nusb::transfer::{ControlIn, ControlOut, ControlType, Recipient};
-use nusb::{Device, MaybeFuture};
+use nusb::MaybeFuture;
 
 use crate::topo::Side;
 
@@ -37,6 +37,61 @@ const DESC_HUB_USB2: u16 = 0x29;
 const DESC_HUB_USB3: u16 = 0x2a;
 const TIMEOUT: Duration = Duration::from_millis(1000);
 
+/// A device handle that can issue control transfers.
+///
+/// nusb exposes `Device::control_in`/`control_out` only on Linux, macOS and
+/// Android. On Windows the default control endpoint is reachable only through a
+/// *claimed interface*, because WinUSB binds per interface rather than per
+/// device — so the two platforms need different handles for the same request.
+/// This type is that difference, and nothing above it needs to care.
+///
+/// Note what claiming implies on Windows: an interface can only be claimed from
+/// a driver that permits it, and USB hubs are owned by Microsoft's `usbhub.sys`,
+/// which does not. So the Windows path compiles and is structurally correct, but
+/// `open` is expected to fail against a real hub until a hub-driver route
+/// (`IOCTL_USB_HUB_CYCLE_PORT` or similar) is written. It is not a tested
+/// hardware path — see AGENTS.md under **Platform support**.
+pub struct ControlHandle {
+    #[cfg(not(windows))]
+    inner: nusb::Device,
+    #[cfg(windows)]
+    inner: nusb::Interface,
+}
+
+impl ControlHandle {
+    /// Wrap an opened device in a handle able to issue control transfers.
+    #[cfg(not(windows))]
+    pub fn open(device: nusb::Device) -> Result<Self> {
+        Ok(ControlHandle { inner: device })
+    }
+
+    #[cfg(windows)]
+    pub fn open(device: nusb::Device) -> Result<Self> {
+        let inner = device.claim_interface(0).context(
+            "claiming interface 0 for hub-class control transfers (Windows routes \
+                 control transfers through a claimed interface; a hub bound to usbhub.sys \
+                 will refuse this)",
+        )?;
+        Ok(ControlHandle { inner })
+    }
+
+    fn control_in(
+        &self,
+        data: ControlIn,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, nusb::transfer::TransferError> {
+        self.inner.control_in(data, timeout).wait()
+    }
+
+    fn control_out(
+        &self,
+        data: ControlOut,
+        timeout: Duration,
+    ) -> Result<(), nusb::transfer::TransferError> {
+        self.inner.control_out(data, timeout).wait().map(|_| ())
+    }
+}
+
 /// The PORT_POWER status bit position differs between the two topologies:
 /// bit 8 on USB 2 hubs, bit 9 on SuperSpeed hubs.
 pub fn power_bit(side: Side) -> u16 {
@@ -47,7 +102,7 @@ pub fn power_bit(side: Side) -> u16 {
 }
 
 /// Hub-class GetPortStatus: the wPortStatus word for `port` (1-based).
-pub fn port_status(device: &Device, port: u8) -> Result<u16> {
+pub fn port_status(device: &ControlHandle, port: u8) -> Result<u16> {
     let data = device
         .control_in(
             ControlIn {
@@ -60,7 +115,6 @@ pub fn port_status(device: &Device, port: u8) -> Result<u16> {
             },
             TIMEOUT,
         )
-        .wait()
         .with_context(|| format!("GetPortStatus for port {port}"))?;
     if data.len() < 2 {
         anyhow::bail!(
@@ -72,7 +126,7 @@ pub fn port_status(device: &Device, port: u8) -> Result<u16> {
 }
 
 /// Set or clear PORT_POWER on `port` (1-based).
-pub fn set_port_power(device: &Device, port: u8, on: bool) -> Result<()> {
+pub fn set_port_power(device: &ControlHandle, port: u8, on: bool) -> Result<()> {
     let request = if on {
         REQ_SET_FEATURE
     } else {
@@ -90,7 +144,6 @@ pub fn set_port_power(device: &Device, port: u8, on: bool) -> Result<()> {
             },
             TIMEOUT,
         )
-        .wait()
         .with_context(|| {
             format!(
                 "{} PORT_POWER for port {port}",
@@ -101,7 +154,7 @@ pub fn set_port_power(device: &Device, port: u8, on: bool) -> Result<()> {
 }
 
 /// Whether the PORT_POWER status bit reads as on for `port`.
-pub fn port_power_is_on(device: &Device, side: Side, port: u8) -> Result<bool> {
+pub fn port_power_is_on(device: &ControlHandle, side: Side, port: u8) -> Result<bool> {
     Ok(port_status(device, port)? & power_bit(side) != 0)
 }
 
@@ -115,7 +168,7 @@ pub struct HubDescInfo {
 }
 
 /// Read the hub descriptor (type 0x29 or 0x2a by side) and summarize it.
-pub fn hub_descriptor(device: &Device, side: Side) -> Result<HubDescInfo> {
+pub fn hub_descriptor(device: &ControlHandle, side: Side) -> Result<HubDescInfo> {
     let desc_type = match side {
         Side::Usb2 => DESC_HUB_USB2,
         Side::Usb3 => DESC_HUB_USB3,
@@ -132,7 +185,6 @@ pub fn hub_descriptor(device: &Device, side: Side) -> Result<HubDescInfo> {
             },
             TIMEOUT,
         )
-        .wait()
         .context("GetDescriptor (hub)")?;
     if data.len() < 5 {
         anyhow::bail!("hub descriptor: short response ({} bytes)", data.len());

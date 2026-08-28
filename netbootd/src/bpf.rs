@@ -37,6 +37,7 @@
 //! TFTP falls back to ordinary `send_to`, matching the Python behavior.
 
 use std::net::Ipv4Addr;
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use netbootd::frame::build_udp_frame;
@@ -46,6 +47,10 @@ use tracing::warn;
 /// The descriptor is a `/dev/bpf` fd received from the privileged helper.
 pub struct BpfSender {
     src_mac: Option<[u8; 6]>,
+    /// The `/dev/bpf` descriptor. Windows has no such device and no file
+    /// descriptors to hold, so the field simply does not exist there and the
+    /// sender is permanently inert.
+    #[cfg(unix)]
     fd: Option<OwnedFd>,
 }
 
@@ -54,6 +59,7 @@ impl BpfSender {
     pub fn unavailable() -> Self {
         Self {
             src_mac: None,
+            #[cfg(unix)]
             fd: None,
         }
     }
@@ -62,6 +68,7 @@ impl BpfSender {
     /// helper (already bound to the interface with `BIOCSHDRCMPLT` set) and the
     /// interface's own MAC (read unprivileged by the caller).
     // Constructed only on the macOS send path; dead on a Linux build by design.
+    #[cfg(unix)]
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn from_handoff(fd: OwnedFd, src_mac: [u8; 6]) -> Self {
         tracing::info!(
@@ -75,14 +82,22 @@ impl BpfSender {
         }
     }
 
+    #[cfg(unix)]
     pub fn available(&self) -> bool {
         self.fd.is_some() && self.src_mac.is_some()
+    }
+
+    /// Always false off Unix: there is no raw-frame path to be available.
+    #[cfg(not(unix))]
+    pub fn available(&self) -> bool {
+        false
     }
 
     /// Inject `payload` as a UDP datagram in a raw frame to `dst_mac`. Returns
     /// false (caller should fall back to `send_to`) if unavailable or the write
     /// fails.
     // Called only from the macOS send path; dead on a Linux build by design.
+    #[cfg(unix)]
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn send_udp(
         &self,
@@ -121,6 +136,7 @@ impl BpfSender {
 }
 
 // Used only by `from_handoff` (macOS); dead on a Linux build.
+#[cfg(unix)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn mac_hex(m: &[u8; 6]) -> String {
     m.iter()

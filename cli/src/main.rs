@@ -28,6 +28,7 @@ mod labfile;
 mod model;
 mod netboot;
 mod netif;
+mod platform;
 mod power;
 mod serial;
 mod setup;
@@ -870,7 +871,7 @@ fn cmd_daemons_stop(names: &[String], all: bool, force: bool) -> Result<()> {
     }
 
     for (name, pid) in &victims {
-        daemons::signal_pid(*pid, libc::SIGTERM);
+        daemons::signal_pid(*pid, platform::Signal::Term);
         println!("TERM {name} (pid {pid})");
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -884,7 +885,7 @@ fn cmd_daemons_stop(names: &[String], all: bool, force: bool) -> Result<()> {
     victims.retain(|(_, pid)| state::is_pid_alive(*pid));
     for (name, pid) in &victims {
         if force {
-            daemons::signal_pid(*pid, libc::SIGKILL);
+            daemons::signal_pid(*pid, platform::Signal::Kill);
             println!("KILL {name} (pid {pid})");
         } else {
             eprintln!("still alive: {name} (pid {pid}) — re-run with --force to SIGKILL");
@@ -998,7 +999,7 @@ fn restart_capture_daemon(lab: &Lab, name: &str, target: &str) -> Result<String>
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         if state::is_pid_alive(pid) {
-            daemons::signal_pid(pid, libc::SIGKILL);
+            daemons::signal_pid(pid, platform::Signal::Kill);
             std::thread::sleep(std::time::Duration::from_millis(300));
         }
     }
@@ -3204,7 +3205,7 @@ fn ensure_hid_daemon_local(lab: &Lab, target: &str) -> Result<Option<u16>> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(log);
-    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    platform::detach(&mut command);
     command.spawn()?;
     Ok(Some(
         daemons::wait_for_daemon(HID_DAEMON, Some(target), std::time::Duration::from_secs(5))

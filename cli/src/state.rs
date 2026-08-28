@@ -80,9 +80,7 @@ pub fn remove_netboot_state(target: &str) {
 
 /// True if any process with this PID exists (signal-0 probe; EPERM = alive).
 pub fn is_pid_alive(pid: i32) -> bool {
-    // Safe: kill(pid, 0) only probes for existence.
-    let rc = unsafe { libc::kill(pid, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    crate::platform::pid_alive(pid)
 }
 
 /// The full command line of `pid`, or empty on failure.

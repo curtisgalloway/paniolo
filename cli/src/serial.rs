@@ -77,7 +77,7 @@ pub fn start_daemon(ifaces: &[SerialChannel], port: u16, target: &str) -> Result
     )?;
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
     // Detach into its own process group so it survives this CLI exiting.
-    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    crate::platform::detach(&mut cmd);
     cmd.spawn()?;
     Ok(())
 }
@@ -119,7 +119,7 @@ pub fn send_input(base_url: &str, interface: &str, data: &[u8], pace_ms: u32) ->
 pub fn exec_tio(device: &str, baud: i64) -> Result<()> {
     let tio = daemons::find_binary("tio")
         .ok_or_else(|| anyhow!("tio not found in PATH — install it (e.g. brew install tio)"))?;
-    let err = std::os::unix::process::CommandExt::exec(
+    let err = crate::platform::exec_replace(
         Command::new(tio)
             .arg("--baudrate")
             .arg(baud.to_string())

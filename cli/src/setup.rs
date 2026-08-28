@@ -326,9 +326,7 @@ pub fn run(repo: &Path, rust_only: bool) -> Result<()> {
         let dest = libexec.join("linuxocr");
         if source.is_file() {
             std::fs::copy(&source, &dest)?;
-            let mut perms = std::fs::metadata(&dest)?.permissions();
-            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-            std::fs::set_permissions(&dest, perms)?;
+            crate::platform::make_executable(&dest)?;
             println!("  ✓ {:12} {}", "linuxocr", dest.display());
         } else {
             println!("  … linuxocr: source not found, skipped");

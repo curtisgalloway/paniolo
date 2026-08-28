@@ -23,7 +23,6 @@
 //! existing per-channel dispatch; this module is only the local `adb` exec.
 
 use std::io::Write;
-use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -64,7 +63,7 @@ fn command(av: &[String]) -> Command {
 /// success). The console analog of `serial connect`.
 pub fn exec_shell(adb_cmd: Option<&str>, serial: Option<&str>) -> Result<()> {
     let av = argv(adb_cmd, serial, &["shell".to_string()]);
-    let err = command(&av).exec();
+    let err = crate::platform::exec_replace(&mut command(&av));
     Err(spawn_err(adb_cmd, err))
 }
 

@@ -852,46 +852,134 @@ when the `Makefile`, release `HELPERS`, or `HELPER_CRATES` lists omit a crate,
 so the mechanical ones can't drift again; the release smoke test also verifies
 every `HELPERS` binary landed in the installed `.deb`.
 
-## Linux support
+## Platform support
 
-Paniolo runs on Linux as well as macOS. Platform differences:
+Paniolo targets three host platforms. Support status:
 
-- **OCR backend is platform-specific.** macOS uses Apple Vision (`visionocr.swift`,
-  compiled by `paniolo setup`). Linux uses Tesseract (`ocr/linuxocr`, copied by
-  `paniolo setup`; requires `tesseract-ocr` system package). Both expose the same
-  stdin-PNG → stdout-text interface via `PANIOLO_VISIONOCR`.
-- **Netboot uses `sudo` internally on Linux.** DHCP (port 67) and TFTP (port 69)
-  require root on Linux; macOS 14+ allows them rootless. `paniolo netboot start`
-  auto-prepends `sudo` when spawning `netbootd` on Linux. With passwordless
-  sudoers this is transparent; otherwise sudo prompts for a password. Interface
-  config (`ip addr add`) also uses sudo, same as macOS uses it for `ifconfig`.
-- **Interface management uses `ip` on Linux.** `netif::configure_interface()`
-  runs `ip addr add`/`ip link set up` (iproute2) instead of
-  `networksetup`+`ifconfig`; `restore_interface()` flushes with
-  `ip addr flush dev <iface>`. (See `cli/src/netif.rs`.)
-- **ARP pinning uses `ip neigh replace` on Linux.** netbootd's ARP pin calls
-  `arp -s` on macOS and `ip neigh replace ... nud permanent` on Linux.
-- **BPF raw-frame sender is macOS-only.** netbootd's BPF sender uses `/dev/bpf*`
-  ioctls that don't exist on Linux; on Linux it is unavailable and the server
-  falls back to normal `sendto()` with retry. On macOS netbootd receives the
-  `/dev/bpf` descriptor from the setuid `netbootd-bpf-helper` and stays
-  unprivileged (see the **netbootd** section).
-- **hdmicap build deps on Linux.** Building hdmicap requires system packages:
-  `build-essential pkg-config libclang-dev clang` (for V4L2 bindgen via
-  `v4l2-sys-mit`) plus `cmake nasm` (the `turbojpeg` crate builds a vendored
-  libjpeg-turbo — Debian's system libturbojpeg is too old for its pkg-config
-  path, and the crate's `require-simd` default makes nasm mandatory on
-  x86-64). `make install` fails early with a hint if any are missing
-  (`check-deps` in the Makefile); `paniolo setup` prints a reminder.
-- **Interface listing uses sysfs on Linux.** `list_usb_ethernet_interfaces()`
-  reads `/sys/class/net/` (type, carrier) instead of `networksetup`.
-- **Serial device paths use by-path symlinks on Linux.** `list_serial_devices()`
-  returns `/dev/serial/by-path/` entries when available; `canonical_device_path()`
-  upgrades a raw `ttyUSBX` path to its stable symlink. Store by-path paths in
-  target configs so serial interfaces survive USB adapter re-enumeration. The
-  serialcap `--interface` parser accepts by-path paths (colons in the path are
-  not confused with the optional `:SENSE` suffix because only known signal names
-  `cts`, `dsr`, `dcd`, `ri` are treated as the sense suffix).
+| Platform | Status | CI | Release artifacts |
+| --- | --- | --- | --- |
+| macOS (Apple Silicon) | Supported | `macos-latest` job in `ci.yml` | Homebrew tap (arm64 bottle) |
+| Linux (Debian/Ubuntu) | Supported | all `ubuntu-latest` jobs in `ci.yml` | `.deb` + tarball from `release.yml` |
+| Windows (x86_64-msvc) | **Partial** — 3 of 10 crates build | none yet (bench host `brik`) | none |
+
+**Windows status (measured 2026-08-28 on `brik`, a Windows 11 26200 / AMD64
+box reachable over SSH; `x86_64-pc-windows-msvc`, rustc 1.97.1, VS Build Tools
+2022).** The MSVC linker is found automatically, so `cargo build` works without
+a Developer Prompt. Per-crate result of `cargo build --all-targets` at `fe8efc5`:
+
+| Crate | Windows | Blocker |
+| --- | --- | --- |
+| `cambrionix` | builds, 8 tests pass | — |
+| `shellyplug` | builds, 1 test passes | — |
+| `amt` | builds, 8 tests pass | — |
+| `cli` | fails | `std::os::unix`, `libc::{getuid,kill,SIGKILL}`, `CommandExt::exec` |
+| `hdmicap` | fails | `nix::{sys,unistd}`, `DirBuilderExt`/`MetadataExt`, `libc::getuid` |
+| `serialcap` | fails | same set as `hdmicap` (`nix`, `DirBuilderExt`, `getuid`) |
+| `netbootd` | fails | `std::os::fd`, `libc::{iovec,msghdr,CMSG_*,SOL_SOCKET}` |
+| `hidrig` | fails | `std::os::unix`, `libc::{getuid,kill,posix_openpt}` |
+| `ch9329` | fails | `std::os::unix::fs`, `libc::{getuid,kill}` |
+| `usbhub` | fails | `nusb::Device::{control_in,control_out}` — not the POSIX set |
+
+The three that pass are the pure-network / pure-serial helpers: they touch no
+daemon machinery. Every failure is one of four groups, and they are shared, so
+fixing them is mostly one job done once rather than seven:
+
+1. **Daemon runtime dir + liveness** (`cli`, `hdmicap`, `serialcap`, `hidrig`,
+   `ch9329`) — `libc::getuid` for the `/tmp/paniolo-<uid>` path,
+   `libc::kill(pid, 0)` for the is-it-alive probe, and `DirBuilderExt::mode` /
+   `MetadataExt::uid` for the 0700 ownership check. This is the single biggest
+   win: one portable abstraction over "runtime dir" and "is this pid alive"
+   unblocks five crates.
+2. **Process control** — `CommandExt::exec` (`cli`), `process_group`, and
+   `SIGTERM`/`SIGKILL` signalling. Windows has no `exec`; a spawn-and-wait or
+   job-object equivalent is needed.
+3. **Raw sockets and fd passing** (`netbootd`) — `SCM_RIGHTS`, `msghdr`,
+   `IP_BOUND_IF`, `/dev/bpf*`. The hardest group, and the one with no direct
+   Windows analogue.
+4. **PTY** (`hidrig`) — `posix_openpt`/`ptsname`/`unlockpt`, used by the
+   fake-REPL test harness, not the production path.
+
+`usbhub` is the outlier and the cheapest real fix: it is blocked only because
+`nusb` exposes `control_in`/`control_out` on `Device` on Unix but requires an
+`Interface` handle on Windows. No POSIX dependency is involved.
+
+Not yet assessed on Windows, because nothing that needs them builds: the OCR
+backends, capture (no Media Foundation equivalent to AVFoundation/V4L2),
+interface management, and the `paniolo setup` install flow. Do not assume a
+crate that compiles also *works* — `cambrionix`, `shellyplug` and `amt` have
+only been unit-tested there, never run against hardware.
+
+**Working on Windows:** `brik.h.curtisg.xyz` (10.66.30.58) is the Windows bench
+host; SSH lands in PowerShell 7 with the repo cloned at
+`C:\Users\curti\src\paniolo`. Note `$HOME` there is `C:\Users\curti`, not
+`curtisg`. There is no workspace `Cargo.toml` — each crate is a separate cargo
+project, so build them individually.
+
+Per-subsystem behavior:
+
+- **OCR backend.**
+  - *macOS:* Apple Vision (`visionocr.swift`, compiled by `paniolo setup`).
+  - *Linux:* Tesseract (`ocr/linuxocr`, copied by `paniolo setup`; requires the
+    `tesseract-ocr` system package).
+  - *Windows:* none. A port would supply a third binary behind the same
+    stdin-PNG → stdout-text interface that both current backends expose via
+    `PANIOLO_VISIONOCR`.
+- **Netboot privileges.**
+  - *macOS:* 14+ allows DHCP (port 67) and TFTP (port 69) rootless; `sudo` is
+    used only for interface config (`ifconfig`).
+  - *Linux:* both ports require root, so `paniolo netboot start` auto-prepends
+    `sudo` when spawning `netbootd`, and `ip addr add` uses sudo too. With
+    passwordless sudoers this is transparent; otherwise sudo prompts.
+  - *Windows:* no equivalent implemented (privileged-port and elevation model
+    both differ).
+- **Interface management** (`cli/src/netif.rs`, `netif::configure_interface()` /
+  `restore_interface()`).
+  - *macOS:* `networksetup` + `ifconfig`.
+  - *Linux:* iproute2 — `ip addr add` / `ip link set up`, flushed with
+    `ip addr flush dev <iface>`.
+  - *Windows:* not implemented.
+- **ARP pinning** (netbootd).
+  - *macOS:* `arp -s`.
+  - *Linux:* `ip neigh replace ... nud permanent`.
+  - *Windows:* not implemented.
+- **Raw-frame sender** (netbootd).
+  - *macOS:* BPF sender over `/dev/bpf*` ioctls; netbootd receives the `/dev/bpf`
+    descriptor from the setuid `netbootd-bpf-helper` and stays unprivileged (see
+    the **netbootd** section).
+  - *Linux:* no BPF path — the ioctls don't exist; the server falls back to a
+    normal `sendto()` with retry.
+  - *Windows:* not implemented.
+- **Interface listing** (`list_usb_ethernet_interfaces()`).
+  - *macOS:* `networksetup`.
+  - *Linux:* sysfs — `/sys/class/net/` (type, carrier).
+  - *Windows:* not implemented.
+- **Serial device paths** (`serial::list_devices()`, `cli/src/serial.rs`).
+  - *macOS:* scans `/dev` for `tty.usbserial-*` and `tty.usbmodem*` nodes.
+  - *Linux:* one entry per physical port, named by its stable `/dev/serial`
+    symlink — `by-id` preferred (names the adapter; what lab files typically
+    use), `by-path` as the fallback (port-derived; the only stable name for
+    adapters without a serial number), picked by `preferred_alias()`; raw
+    `/dev/ttyUSB*`/`ttyACM*` only if no symlinks exist. Store a stable symlink
+    path in target configs so serial interfaces survive USB adapter
+    re-enumeration. The serialcap `--interface` parser accepts these paths
+    (colons in a by-path name are not confused with the optional `:SENSE`
+    suffix because only the known signal names `cts`, `dsr`, `dcd`, `ri` are
+    treated as the sense suffix).
+  - *Windows:* not implemented (`COMn` naming has no stable by-path analogue
+    here).
+  - *Windows:* not implemented (`COMn` naming has no stable by-path analogue
+    here).
+- **hdmicap capture + build deps.**
+  - *macOS:* our own AVFoundation layer (`hdmicap/src/capture_avf.m`); no extra
+    system packages beyond the Xcode toolchain.
+  - *Linux:* V4L2 with a raw-MJPEG tee. Building requires `build-essential
+    pkg-config libclang-dev clang` (V4L2 bindgen via `v4l2-sys-mit`) plus `cmake
+    nasm` (the `turbojpeg` crate builds a vendored libjpeg-turbo — Debian's
+    system libturbojpeg is too old for its pkg-config path, and the crate's
+    `require-simd` default makes nasm mandatory on x86-64). `make install` fails
+    early with a hint if any are missing (`check-deps` in the Makefile);
+    `paniolo setup` prints a reminder.
+  - *Windows:* no capture backend (Media Foundation would be the analogue).
 
 ## Known limitations / gotchas
 

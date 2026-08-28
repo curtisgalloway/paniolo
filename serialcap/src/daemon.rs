@@ -55,32 +55,14 @@ pub struct Discovery {
 /// last session ends, breaking daemons that outlive the SSH session that
 /// started them). Keep in sync with daemons.rs `runtime_root`/`runtime_base`.
 pub fn runtime_dir() -> Result<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     if let Some(dir) = std::env::var_os("PANIOLO_RUNTIME_DIR") {
         let dir = PathBuf::from(dir);
         fs::create_dir_all(&dir)?;
         return Ok(dir);
     }
-    // Safe: getuid is always successful.
-    let uid = unsafe { libc::getuid() };
-    let root = std::env::var_os("PANIOLO_RUNTIME_BASE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    let base = root.join(format!("paniolo-{uid}"));
-    match fs::DirBuilder::new().mode(0o700).create(&base) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Guard against a squatter pre-creating the /tmp path.
-            let md = fs::symlink_metadata(&base)?;
-            if !md.is_dir() || md.uid() != uid {
-                return Err(anyhow!(
-                    "{} exists but is not a directory owned by uid {uid}",
-                    base.display()
-                ));
-            }
-        }
-        Err(e) => return Err(e.into()),
-    }
+    let uid = crate::platform::current_uid();
+    let base = crate::platform::runtime_root().join(format!("paniolo-{uid}"));
+    crate::platform::ensure_private_dir(&base)?;
     let dir = base.join("serialcap");
     fs::create_dir_all(&dir)?;
     Ok(dir)

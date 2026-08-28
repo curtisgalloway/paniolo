@@ -33,8 +33,7 @@ const CONTROL_PERSIST: &str = "300";
 const CONNECT_TIMEOUT: &str = "10";
 
 fn uid() -> u32 {
-    // Safe: getuid() has no preconditions and cannot fail.
-    unsafe { libc::getuid() }
+    crate::platform::current_uid()
 }
 
 /// Short directory holding paniolo's default ControlMaster sockets. Kept short

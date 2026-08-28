@@ -27,6 +27,12 @@ mod capture_thread;
 mod daemon;
 mod frame;
 mod pixel;
+// Not every helper needs every primitive in here (hdmicap and serialcap have
+// no pid-liveness probe of their own), and the file is kept byte-identical
+// across the crates that copy it, so unused items are expected rather than a
+// smell.
+#[allow(dead_code)]
+mod platform;
 mod server;
 
 use std::io::{Read, Write};
@@ -218,12 +224,8 @@ fn cmd_preview() -> Result<()> {
 }
 
 fn cmd_stop() -> Result<()> {
-    use nix::sys::signal::{kill, Signal};
-    use nix::unistd::Pid;
-
     let d = daemon::discover().context("is the daemon running?")?;
-    kill(Pid::from_raw(d.pid as i32), Signal::SIGTERM)
-        .context("failed to send SIGTERM to daemon")?;
+    crate::platform::terminate_pid(d.pid as i32).context("failed to send SIGTERM to daemon")?;
     println!("daemon (pid {}) stopping", d.pid);
     Ok(())
 }
