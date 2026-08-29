@@ -16,6 +16,49 @@ limitations under the License.
 
 # Paniolo — Agent Instructions
 
+## Never commit private infrastructure
+
+**This repository is public. The lab that exercises it is not** — it is
+described in a separate, private infrastructure repo, and nothing identifying
+it belongs here. This applies to *everything* committed: code, docs, tests,
+fixtures, eval scenarios, commit messages, and captured terminal output.
+
+Do not commit:
+
+- **Real hostnames or domains** of machines on a private network, including
+  bare short names used as lab-machine labels.
+- **Real addresses** on a private network — any RFC 1918 range (`10/8`,
+  `172.16/12`, `192.168/16`) — with the one product exception below.
+- **Home-directory paths carrying a real account name** (`/home/<user>/…`,
+  `/Users/<user>/…`). Use a neutral path or `~`.
+- **Identifiers read off real hardware**: MAC addresses, USB or device serial
+  numbers, service-processor account names.
+
+Use this vocabulary in examples instead:
+
+| For | Use |
+|---|---|
+| A control host | `bench1`, `lab-host-1` |
+| A target | `target-machine`, `pi5`, `nuc` |
+| An address | `192.0.2.10` (RFC 5737 TEST-NET-1, reserved for documentation) |
+| A path | `/srv/tftp/<target>`, `~/tftp/<target>` |
+| A serial or MAC | `AA00BB11CC22DD33`, `00:11:22:33:44:55` |
+
+**One exception:** `192.168.99.0/24` is paniolo's *own* default for the
+point-to-point netboot link (`DEFAULT_HOST_IP` in `cli/src/model.rs`). It is a
+product constant, not anyone's network, and belongs in docs and tests.
+
+**Captured output is the easy way to slip.** Terminal casts, screenshots, and
+screen recordings reproduce whatever the shell prompt, serial log, and command
+line happened to contain at the time. Read a cast before committing it, and
+look at a screenshot — a rendered image cannot be scrubbed by a later text
+edit, only re-made.
+
+Some material committed before this rule still violates it. That is known, is
+not urgent (it is private-range addresses and internal names, no credentials),
+and is being cleaned up opportunistically. Do not treat it as precedent, and do
+not launch an unrequested scrub.
+
 ## Before opening a PR
 
 **Precondition (hard gate): the PR may not be opened until all documentation
@@ -31,6 +74,11 @@ follow-up. Run through this checklist before calling `gh pr create`:
    - `README.md` — capabilities table, installation steps
    - `AGENTS.md` — module layout, command descriptions, architecture notes
    Include doc updates in the same PR, not a follow-up.
+
+   Also check the diff for private infrastructure — real hostnames, private
+   addresses, `/home/<user>` paths, hardware serials — per
+   [Never commit private infrastructure](#never-commit-private-infrastructure).
+   Captured casts and screenshots need reading, not just grepping.
 
 2. **Update the CLI usage help.** Every new/changed command, subcommand, flag,
    or argument must have an accurate clap doc comment (the `///` lines that
@@ -769,7 +817,9 @@ base honors `$PANIOLO_RUNTIME_BASE` (default `/tmp`).
 
 - **No hardcoded network addresses, URLs, or hostnames.** All site-specific
   values go in config files under `~/.config/paniolo/` and are populated via
-  setup commands. Error messages must be generic.
+  setup commands. Error messages must be generic. The same rule extends past
+  code to docs, fixtures, and captured output — see
+  [Never commit private infrastructure](#never-commit-private-infrastructure).
 - **No new dependencies without discussion.** Keep each crate's dependency set
   lean and justify any new crate in review. (The `zigplug` Zigbee helper is the
   one remaining Python component — its deps live in `zigplug/pyproject.toml`.)
