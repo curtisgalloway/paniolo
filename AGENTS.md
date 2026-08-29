@@ -725,7 +725,7 @@ Key differences from the Python servers:
 
 ## hidrig (USB HID injector)
 
-The `hidrig/` directory is contains code for a DIY USB HID injector: a Rust host CLI/daemon plus
+The `hidrig/` directory holds a DIY USB HID injector: a Rust host CLI/daemon plus
 CircuitPython 9.x firmware for the **dual-board "dumb pipe"** KB2040 rig.  This is only one of many HID injection devices paniolo can use.
 
 ### Architecture
