@@ -75,7 +75,7 @@ dashboard.
 After an upgrade or rebuild, a daemon still running the old binary is flagged
 **stale** by `paniolo serial show` and `paniolo daemons`. Re-running
 `paniolo serial watch` auto-restarts a stale daemon, or restart it explicitly
-with `paniolo daemons restart serialcap` (see [architecture](architecture.md)).
+with `paniolo daemons restart serialcap` (see [architecture](dev/architecture.md)).
 
 ---
 

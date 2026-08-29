@@ -11,3 +11,6 @@ packaging/stage/
 hidrig/host/hid_seize_reports
 hidrig/host/hid_capture_usb
 site/
+
+# macOS
+.DS_Store

@@ -16,8 +16,9 @@ power-cycle it, and read its state and power metering. No cloud account, no
 Home Assistant, no Matter controller. Pure Rust via
 [ureq](https://crates.io/crates/ureq); works on **macOS and Linux**.
 
-Each invocation is a single stateless HTTP request (`GET /rpc/<Method>`), so
-the tool is a plain one-shot — there is no daemon to run or supervise.
+Each invocation is a stateless one-shot of `GET /rpc/<Method>` requests
+(mutating commands follow the switch call with a status read-back to
+confirm), so there is no daemon to run or supervise.
 
 - **Supported:** Gen2/3/4 devices (the JSON-RPC API: `Switch.Set`,
   `Switch.GetStatus`, `Shelly.GetDeviceInfo`). The original **Gen1** devices

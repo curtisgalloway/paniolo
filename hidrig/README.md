@@ -20,7 +20,7 @@ bytes, wraps them in binary frames, and writes them to the control board's
 data CDC endpoint. The control board relays HID frames verbatim over I2C1 to
 the target board, which calls `send_report` — so neither board parses
 keycodes or mouse math. The design and rationale live in
-[`../docs/hid-dual-board-design.md`](../docs/hid-dual-board-design.md); the
+[`../docs/dev/hid-dual-board-design.md`](../docs/dev/hid-dual-board-design.md); the
 firmware bring-up runbook is in
 [`firmware/dual/README.md`](firmware/dual/README.md).
 
@@ -41,7 +41,7 @@ firmware bring-up runbook is in
 
 The command vocabulary (`type`, `key`, `combo`, `moveabs`, …) is the
 device-independent **HID serial protocol v1**
-([`../docs/hid-serial-protocol.md`](../docs/hid-serial-protocol.md)) — but in
+([`../docs/dev/hid-serial-protocol.md`](../docs/dev/hid-serial-protocol.md)) — but in
 this rig that protocol is the *external* interface only: `hidrig` (and the
 `serve` daemon) consume it and compose reports themselves, so the line
 protocol never travels on a wire. The boards see only binary frames.
@@ -269,8 +269,9 @@ reports leak into your live session.
 > `hid_capture_usb` when you need true exclusivity.
 
 `host/hid_bench.py` measures latency/throughput and `host/leak_check.py`
-asserts no cursor leak — both via `uv run --with pyserial …`. See
-`host/README.md`.
+asserts no cursor leak — both via `uv run --with pyserial …`. Note both still
+speak the **retired single-board firmware's** line protocol (they don't drive
+the dual-board rig's binary-frame CDC link). See `host/README.md`.
 
 ### macOS serial latency
 

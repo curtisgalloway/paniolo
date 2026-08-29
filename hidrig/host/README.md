@@ -60,7 +60,18 @@ still move the real cursor. Keep it only as a passive timestamped tap; use
 `hid_capture_usb` when you need true exclusivity. Requires `sudo` plus an Input
 Monitoring grant in System Settings.
 
-## hid_bench.py — latency / throughput
+## hid_bench.py — latency / throughput (retired single-board path)
+
+> **Note:** `hid_bench.py` and `leak_check.py` still speak the retired
+> single-board firmware's line protocol over a USB-serial adapter (`OK`/`ERR`
+> replies, 115200→460800 baud negotiation). The current dual-board rig's
+> control link is a USB-CDC port speaking binary frames with **no baud and no
+> text replies**, so these two tools do not drive it — they are kept for the
+> retired firmware (`hidrig/firmware/{boot,code,config}.py`) and as a
+> reference for a future bench port. `hid_capture_usb` and
+> `hid_seize_reports` observe the DUT-facing HID board (same VID/PID for the
+> retired single board and the dual-board target board), so they work with
+> either firmware when that board is plugged into this Mac.
 
 Drives the UART directly (it sets `IOSSDATALAT` itself) and times command
 round trips. Run leak-safe by starting `hid_capture_usb` first.
@@ -77,7 +88,7 @@ sets the macOS serial read-latency timer (1 ≈ floor; 0 leaves the default).
 Reference numbers (this bench, with the latency fix): `ping` ~3 ms, `moveabs`
 ~8 ms (USB `bInterval` floor), moveabs throughput ~123/s (bInterval-capped).
 
-## leak_check.py — assert no leak
+## leak_check.py — assert no leak (retired single-board path)
 
 Injects one centered `moveabs` and checks whether the real cursor moved,
 restoring it if so. Expect `NO LEAK` while `hid_capture_usb` holds the device.

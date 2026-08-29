@@ -1,20 +1,41 @@
 # USB HID injection
 
 paniolo can inject keyboard and mouse events into the target through any
-helper tool that drives a USB HID injector — by default the KB2040 rig in
-[`hidrig/`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md). The integration is a generic per-target
+helper tool that drives a USB HID injector. The integration is a generic per-target
 **hid channel**, an opaque command prefix exactly like the power hooks:
 paniolo appends arguments to it and runs it, staying agnostic to the device.
 
 ---
 
-## Architecture
+## Choosing a helper
 
-The default injector is the **dual-board KB2040 "dumb pipe"** rig: two KB2040s
-where the host composes the HID report bytes and the boards relay them without
-interpreting any HID semantics. The host-facing **control** board faces the
-control host over USB-CDC and is the I2C1 controller; the **target** board
-faces the DUT over USB-HID and is the I2C1 peripheral.
+paniolo never talks to injector hardware itself, so **which helper you use is
+decided by the hardware attached to your control host** — there is no default.
+Two helpers ship in-tree, as peers:
+
+| Helper | Drives | Bind with |
+|---|---|---|
+| [`ch9329`](https://github.com/curtisgalloway/paniolo/blob/main/ch9329/README.md) | Off-the-shelf KVM-over-USB devices whose keyboard/mouse half speaks the WCH CH9329 protocol: the **Openterface Mini-KVM**, the **Openterface KVM-Go** (a CH32V208 emulating the protocol rather than the chip — see the [KVM-Go notes](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-kvm-go.md)), and the **Sipeed NanoKVM-USB**. | `--cmd "ch9329 -d <uart>"` |
+| [`hidrig`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md) | The DIY dual-board KB2040 "dumb pipe" rig described below — build-it-yourself hardware, and the only option that also bridges the DUT's serial console and switches its power on the same USB device. | `--cmd "hidrig -d <data-cdc>"` |
+
+Anything else drops in the same way without touching paniolo: implement the
+command vocabulary, then point the channel at it. That vocabulary — `type`,
+`key`, `moveabs`, … — is the device-independent
+[HID serial protocol](dev/hid-serial-protocol.md).
+
+Baud rates differ by device: the `ch9329` helper autodetects among 115200
+(Openterface), 57600 (Sipeed NanoKVM-USB) and 9600 (a factory CH9329), and
+`-b <rate>` forces one — worth doing, since autodetect costs a probe on every
+session open.
+
+---
+
+## The dual-board KB2040 rig (`hidrig`)
+
+Two KB2040s where the host composes the HID report bytes and the boards relay
+them without interpreting any HID semantics. The host-facing **control** board
+faces the control host over USB-CDC and is the I2C1 controller; the **target**
+board faces the DUT over USB-HID and is the I2C1 peripheral.
 
 ```
 [Control host]
@@ -29,23 +50,11 @@ faces the DUT over USB-HID and is the I2C1 peripheral.
 [Target / DUT]
 ```
 
-The command vocabulary (`type`, `key`, `moveabs`, …) is the device-independent
-[HID serial protocol](hid-serial-protocol.md), but in this rig it is the
-*external* interface only: `hidrig` consumes it and composes HID reports
-itself, then writes binary frames to the control board's data CDC endpoint —
-the line protocol never travels on a wire. See
-[`hid-dual-board-design.md`](hid-dual-board-design.md) for the design and the
-frame format, and [`../hidrig/README.md`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md) for wiring and bring-up.
-Because the interface above `hidrig` is just the helper's CLI, any other
-injector drops in through the same generic `hid` channel without touching
-paniolo. One such injector ships in-tree: the
-[`ch9329`](https://github.com/curtisgalloway/paniolo/blob/main/ch9329/README.md)
-helper drives a WCH CH9329 UART→USB-HID bridge (the keyboard/mouse half of an
-Openterface Mini-KVM) with the same CLI surface, so
-`paniolo hid set -t <target> --cmd "ch9329 -d <uart>"` is the only difference.
-The same helper also drives the **Openterface KVM-Go**, whose CH32V208 MCU
-emulates the CH9329 protocol rather than being the chip — see the
-[KVM-Go notes](openterface-kvm-go.md).
+In this rig the HID serial protocol is the *external* interface only: `hidrig`
+consumes it and composes HID reports itself, then writes binary frames to the
+control board's data CDC endpoint — the line protocol never travels on a wire.
+See [`hid-dual-board-design.md`](dev/hid-dual-board-design.md) for the design and the
+frame format, and [`hidrig/README.md`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md) for wiring and bring-up.
 
 
 ---
@@ -53,12 +62,17 @@ emulates the CH9329 protocol rather than being the chip — see the
 ## Setup
 
 ```bash
-# Build and install the helper (once per control host; libexec, off PATH)
-cargo install --path hidrig --root ~/.local/libexec/paniolo   # or `make install`, which
-                                                              # rebuilds everything via `paniolo setup`
+# Build and install the helpers (once per control host; libexec, off PATH).
+# `make install` rebuilds everything via `paniolo setup`; to do just one:
+cargo install --path ch9329 --root ~/.local/libexec/paniolo
+cargo install --path hidrig --root ~/.local/libexec/paniolo
 
-# Bind the helper to the target in the lab file
-# -d is the control board's DATA CDC port (the second usbmodem of its pair)
+# Bind a helper to the target in the lab file — pick the one matching your
+# hardware. For ch9329, -d is the device's control UART:
+paniolo hid set -t nuc --cmd "ch9329 -d /dev/ttyUSB0 -b 57600"
+
+# For hidrig, -d is the control board's DATA CDC port (the second usbmodem
+# of its pair):
 paniolo hid set -t pi5 --cmd "hidrig -d /dev/cu.usbmodemXXXX"
 
 # Channel on a remote control host
@@ -68,9 +82,9 @@ paniolo hid set -t pi5 --cmd "hidrig -d /dev/ttyACM1" --host bench1
 paniolo hid rm -t pi5
 ```
 
-The bare `hidrig` in the cmd string resolves because paniolo prepends its
+The bare helper name in the cmd string resolves because paniolo prepends its
 libexec dir (`~/.local/libexec/paniolo/bin`) to PATH when running the hook;
-run the helper by hand with `paniolo helper hidrig …`. `paniolo doctor`
+run one by hand with `paniolo helper <name> …`. `paniolo doctor`
 checks the channel: an absolute-path helper is probed for existence on the
 channel's host; bare names are probed with `command -v` under the same
 libexec-then-PATH resolution.
@@ -149,7 +163,7 @@ held keys so nothing sticks on the target.
 
 Under the hood this is the **hid daemon**: the helper owns the control link and
 re-exposes the command vocabulary over a localhost WebSocket (the
-[HID serial protocol](hid-serial-protocol.md) §2 carrier). `paniolo console`
+[HID serial protocol](dev/hid-serial-protocol.md) §2 carrier). `paniolo console`
 starts it on demand; the browser streams `moveabs`/`down`/`up`/`scroll`
 commands to it. Because the daemon serializes every command — from the browser
 *and* from the CLI — onto the one wire, `paniolo hid send` injections intermix
@@ -184,6 +198,9 @@ firmware).
 ## Lab file shape
 
 ```toml
+[targets.nuc.hid]
+cmd = "ch9329 -d /dev/ttyUSB0 -b 57600"
+
 [targets.pi5.hid]
 cmd = "hidrig -d /dev/cu.usbmodemXXXX"
 # host = "bench1"            # if the injector hangs off a remote control host
@@ -191,14 +208,25 @@ cmd = "hidrig -d /dev/cu.usbmodemXXXX"
 
 ---
 
-## Host testing tools (macOS)
+## Host testing tools
 
-To exercise the full pipeline without a DUT, plug the **target** board's USB
-into the same Mac that drives the control link and capture its HID reports while
-injecting. Build with `cd hidrig/host && make`.
+**Injection itself is cross-platform** — the `hid` channel runs a helper, and
+both shipped helpers build and run on macOS, Linux and Windows. What is
+platform-specific is the optional *bench*: the tooling for exercising the full
+pipeline with no DUT attached, by plugging the **target** board into the control
+host and capturing the HID reports it emits while you inject.
 
-`hidrig/host/hid_capture_usb.m` is the **leak-safe** tool: it detaches
-the target board from the macOS HID stack via IOUSBHost whole-device capture and
+Capturing those reports means taking the device away from the host's own HID
+stack, and that is an OS-specific operation. The tools in `hidrig/host/` do it
+for macOS; the equivalents elsewhere are noted below but are **not shipped**.
+
+### macOS
+
+Build with `cd hidrig/host && make`, then plug the target board into the same
+Mac that drives the control link.
+
+`hidrig/host/hid_capture_usb.m` is the **leak-safe** tool: it detaches the
+target board from the macOS HID stack via IOUSBHost whole-device capture and
 prints timestamped interrupt-IN reports, so injected input reaches only the
 tool — not the focused app or the real cursor.
 
@@ -210,10 +238,28 @@ hidrig -d /dev/cu.usbmodemXXXX moveabs 16383 16383
 
 > The older `hid_seize_reports.c` (`IOHIDDeviceOpen(..SeizeDevice)`) is
 > **non-exclusive** on Darwin 24/25 — injected moves still move the real
-> cursor — so use it only as a passive tap. `hid_bench.py` (latency/throughput)
-> and `leak_check.py` round out the bench; see `hidrig/host/README.md`.
+> cursor — so use it only as a passive tap. `leak_check.py` (which imports
+> Quartz, so it is macOS-only too) checks that nothing leaked into the live
+> session; see `hidrig/host/README.md`.
 
-### Latency note
+### Linux
+
+No capture tool ships. The equivalent is to read the target board's reports
+from its `/dev/hidraw*` node — `usbhid-dump` or a few lines of Python will do
+it — and to unbind it from `usbhid` first if you need the leak-safe property
+that `hid_capture_usb` provides on macOS. Injection, the daemon, and
+`hid_bench.py` (below) all work; only the receive side is missing.
+
+### Windows
+
+No capture tool ships, and no equivalent has been worked out. Injection works;
+verify against a real DUT rather than a loopback bench.
+
+### Measuring latency
+
+`hidrig/host/hid_bench.py` sends `moveabs` commands with wall-clock send
+timestamps and is plain `pyserial`, so it runs anywhere. Correlating those sends
+with arrivals needs a capture tool on the receive side, which today means macOS.
 
 On macOS the daemon drops the serial read-latency timer (`IOSSDATALAT`) to its
 floor when it opens the control CDC endpoint; the default added ~230 ms to each

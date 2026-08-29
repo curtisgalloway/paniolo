@@ -54,14 +54,17 @@ to find and clear a stuck port).
 ```
 cd ~/src/paniolo
 make install               # cargo-installs the `paniolo` CLI, then `paniolo setup`
-                           # builds/installs hdmicap, serialcap, netbootd, cambrionix,
-                           # visionocr; on macOS also installs netbootd-bpf-helper
+                           # builds/installs the helper binaries (hdmicap, serialcap,
+                           # netbootd, cambrionix, hidrig, ch9329, shellyplug,
+                           # amt), the OCR helper, zigplug, and the bundled skills;
+                           # on macOS also installs netbootd-bpf-helper
                            # setuid-root (one sudo)
 ```
 
 Run once per machine; re-run after pulling or editing (it's a full rebuild).
 Only the `paniolo` CLI lands in `~/.cargo/bin` — make sure that's on `PATH`.
-The helpers (hdmicap, serialcap, netbootd, cambrionix, hidrig, zigplug, the
+The helpers (hdmicap, serialcap, netbootd, cambrionix, hidrig, ch9329,
+shellyplug, amt, zigplug, the
 OCR tool) live in the private libexec dir `~/.local/libexec/paniolo/bin`,
 off PATH; paniolo resolves them itself, and `paniolo helper [NAME] [ARGS…]`
 lists or runs one directly. If a different `paniolo` shadows the CLI on PATH
@@ -76,25 +79,36 @@ Config lives in one CLI-managed **lab file** (`~/.config/paniolo/lab.toml`, or
 
 ```
 paniolo target add <name> [--host <labhost>] [--description <text>]
-paniolo netboot set -t <name> --interface <iface> [--tftp-root <dir>] [--host-ip <ip>] [--boot-file grubaa64.efi] [--http-port 80]
-paniolo serial add console -t <name> --device <path> [--baud 115200] [--sense cts]
+paniolo netboot set -t <name> --interface <iface> [--tftp-root <dir>] [--host-ip <ip>] [--boot-file grubaa64.efi] [--http-port 80] [--content-type <mime>]
+paniolo serial add console -t <name> --device <path> [--baud 115200] [--sense cts] [--power-button]
 paniolo power set -t <name> [--cycle-cmd C] [--on-cmd C] [--off-cmd C] [--state-cmd C] [--serial-interface console]
 paniolo video set -t <name> --device "<capture id or name>"
 paniolo hid set -t <name> --cmd "hidrig -d <uart>"   # USB HID injection helper
-paniolo adb set -t <name> [--serial <adb-id>]        # an Android DUT over adb
+paniolo adb set -t <name> [--serial <adb-id>] [--adb <path>]  # an Android DUT over adb
 ```
 
+Every channel-config command also takes `[--host <labhost>]` to bind that
+channel to a remote control host (see the lab section below).
+
 - `paniolo netboot devices` lists candidate USB-Ethernet interfaces (the
-  primary NIC is excluded); `paniolo discover` lists all lab-relevant hardware;
+  primary NIC is excluded); `paniolo discover` (`--json` for machines) lists
+  all lab-relevant hardware;
   `paniolo configure <name> -H <host>` proposes a whole block to paste in.
-- Inspect: `paniolo config show` (whole lab) / `paniolo target show <name>`.
+- Hosts: `paniolo host add <name> --ssh <dest>` (plus `--description`,
+  `--hostname`, `--identity`, `--paniolo-cmd`, `--control-path`) manages the `[hosts.*]`
+  entries from the CLI; `host list` / `host show <name>` / `host set` /
+  `host rm` round it out.
+- Inspect: `paniolo config show` (whole lab; `config path` prints the file,
+  `config edit` opens it) / `paniolo target list` / `paniolo target show
+  <name>`; `paniolo target set <name>` updates its `--host`/`--description`.
 - Remove: `paniolo target rm <name>`, or per channel (`netboot rm`,
   `serial rm <iface> -t <name>`, `power rm`, `video rm`, `hid rm`, `adb rm`).
 - Rename: `paniolo target rename <old> <new>` carries all channels (and your
   lab-file comments) to the new name. Config-only — running daemons keep the
   old name, so `stop` and re-`watch`/`serve` them under the new one.
 - `paniolo doctor` probes every configured channel against reality (devices
-  exist, over SSH for remote hosts).
+  exist, over SSH for remote hosts); `doctor [target]` checks one target,
+  `doctor --host <name>` only channels on that host.
 
 ## Netboot (DHCP + TFTP + HTTP)
 
@@ -104,7 +118,7 @@ Boot a board over the direct USB-Ethernet link:
 paniolo netboot start [target]            # serve DHCP + TFTP + HTTP (netbootd)
 paniolo netboot tftp-root [target]        # print where to drop boot files
 paniolo netboot status [target]
-paniolo netboot logs -f [target]          # follow the combined log
+paniolo netboot logs -f [target]          # follow the combined log (-n N for last N lines)
 paniolo netboot stop [target]
 ```
 
@@ -251,10 +265,11 @@ paniolo serial reset [target] [-i name]        # soft reset via brief DTR pulse
 optional positional (omit it when the lab has one target); channel-config
 commands (`add`/`set`/`rm`) take `-t`. `serial send`/`serial log` accept
 `-t` too — `serial send` reads two positionals as `<target> <text>`, one as
-just the text. The sole `-t`-only runtime command is `hid send`, whose
-positional tail belongs to the helper.
+just the text. The `-t`-only runtime commands are `hid send`, `adb run`, and
+`adb input`, whose positional tails belong to the helper / to `adb`.
 
-`--name` defaults to `console`, so a single-interface setup needs no flags. With
+The interface name is a required positional on `add`/`set`/`rm` (`console` is
+just the conventional name for the main one). With
 one interface, `-i`/`--interface` can be omitted everywhere. Don't run `connect`
 and `watch` (or an external `screen`/`tio`) on the **same device** at once —
 start one, or `stop`/close the other first.
@@ -273,6 +288,7 @@ paniolo serial log --since 1840       # only lines after sequence #1840 (polling
 paniolo serial log --from 1800 --to 1860   # a specific line range
 paniolo serial log --json             # JSON Lines (seq, ts_ms, text) for parsing
 paniolo serial log --raw              # keep ANSI colors / control bytes
+paniolo serial log --no-pending       # omit the current unterminated line
 ```
 
 With more than one interface configured, pass `-i <name>` to choose one (omitting
@@ -410,12 +426,18 @@ rule (the variable must exist on the host that owns the power channel).
 
 ## HID injection — type and click into the target
 
-The default injector is the dual-board KB2040 "dumb pipe": the host-side
-`hidrig` composes HID reports and writes binary frames to the **control**
-board's USB-CDC port, which relays them over I2C1 to the **target** board that
-presents a USB keyboard + mouse to the DUT. The `hid` channel stores an opaque
-helper command (the `hidrig` CLI by default); `paniolo hid send` appends its
+Two bundled injector helpers speak the same command vocabulary; the `hid`
+channel stores an opaque helper command and `paniolo hid send` appends its
 arguments to it and runs it on the channel's host:
+
+- **`hidrig`** — the dual-board KB2040 "dumb pipe": the host-side CLI
+  composes HID reports and writes binary frames to the **control** board's
+  USB-CDC port, which relays them over I2C1 to the **target** board that
+  presents a USB keyboard + mouse to the DUT.
+- **`ch9329`** — the client for CH9329-based KVM devices (Openterface
+  Mini-KVM and KVM-Go, Sipeed NanoKVM-USB): `paniolo hid set -t <name> --cmd
+  "ch9329 -d <uart>"`. Same commands; it autodetects the link baud (115200 /
+  57600 / 9600) and adds `info` (target USB enumeration + lock LEDs).
 
 ```
 paniolo hid set -t <name> --cmd "hidrig -d /dev/cu.usbmodemXXXX" [--host <labhost>]
@@ -445,8 +467,8 @@ Sequences: `hidrig run <file>` runs a command file (one command per line,
 channel's host. The target board is powered by the DUT's USB port, so its HID
 goes silent while the DUT is off and reboots with it; the control board is
 host-powered and independent. Command vocabulary:
-`docs/hid-serial-protocol.md`; dual-board design + frame format:
-`docs/hid-dual-board-design.md`.
+`docs/dev/hid-serial-protocol.md`; dual-board design + frame format:
+`docs/dev/hid-dual-board-design.md`.
 
 **KVM in the console.** `paniolo console <name>` shows a **⌨ Capture input**
 toggle button over the video when the target has a `hid` channel: click it to
@@ -533,7 +555,8 @@ Notes:
 
 ### Authoring a lab (discovery + provisioning)
 
-After hand-writing a host's connection info (`[hosts.bench1] ssh = …`), let
+After declaring a host's connection info (`paniolo host add bench1 --ssh
+curtisg@bench1.local`, or hand-write `[hosts.bench1] ssh = …`), let
 paniolo discover its hardware and propose the target block:
 
 ```

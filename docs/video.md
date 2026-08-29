@@ -44,7 +44,7 @@ The `--device` value may be:
 - a **`/dev/video*` path** (Linux): accepted, but not stable across reboots.
 
 The device lives on the target's `video` channel in the lab file (see
-[config-redesign.md](https://github.com/curtisgalloway/paniolo/blob/main/docs/config-redesign.md)); `paniolo configure` proposes the
+[config-redesign.md](https://github.com/curtisgalloway/paniolo/blob/main/notes/config-redesign.md)); `paniolo configure` proposes the
 stable id (with the human name as a comment) when one non-built-in capture
 device is present, and lists id alternatives when there are several.
 
@@ -65,7 +65,7 @@ is printed — open it in a browser for the live preview.
 After an upgrade or rebuild, a daemon still running the old binary is flagged
 **stale** by `paniolo video show` and `paniolo daemons`; `watch` auto-restarts a
 stale daemon (no `--restart` needed), or restart it explicitly with
-`paniolo daemons restart hdmicap` (see [architecture](architecture.md)).
+`paniolo daemons restart hdmicap` (see [architecture](dev/architecture.md)).
 
 ---
 
@@ -120,12 +120,17 @@ label as you go.
 When the capture has **no video signal** (the
 target's display is off or unplugged) `read` errors with `no video signal`
 instead of returning empty text, so "display is off" and "screen is blank"
-stay distinguishable. On macOS this uses Apple Vision's
-`VNRecognizeTextRequest` — on-device, no network, no model download required.
+stay distinguishable. OCR is on-device on both platforms — no network, no
+model download: Apple Vision's `VNRecognizeTextRequest` on macOS, Tesseract
+on Linux.
 
-`paniolo setup` compiles `ocr/visionocr.swift` with `swiftc` into the private
-libexec dir (`~/.local/libexec/paniolo/bin/visionocr`); the hdmicap daemon
-finds it there (or via `PANIOLO_VISIONOCR`) and shells out to it per request.
+`paniolo setup` installs the platform's helper into the private libexec dir:
+on macOS it compiles `ocr/visionocr.swift` with `swiftc`
+(`~/.local/libexec/paniolo/bin/visionocr`); on Linux it installs `linuxocr`,
+a Python 3 script that shells out to Tesseract (`apt-get install
+tesseract-ocr`; Pillow is optional, for its upscale/pad preprocessing). The
+hdmicap daemon finds the helper there (or via `PANIOLO_VISIONOCR`, on both
+platforms) and shells out to it per request.
 
 **OCR tuning notes:**
 - `.fast` recognition level is used (not `.accurate` — the latter misses small

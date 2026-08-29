@@ -1,13 +1,13 @@
 # adb (Android targets)
 
-paniolo can drive an **Android target (DUT)** over the Android Debug Bridge.
+paniolo can drive an **Android target** over the Android Debug Bridge (`adb`).
 When the target is a phone, tablet, or Android-based SBC reachable via `adb`,
 the **adb channel** gives paniolo its console (`adb shell`), screen
 (`adb exec-out screencap`), and input injection (`adb shell input`) — the same
 verbs the serial/video/hid channels provide for wired bring-up hardware, but
 through one transport.
 
-adb is a *generic transport* like SSH, not a device-specific helper, so it
+`adb` is a *generic transport* like SSH, not a device-specific helper, so it
 lives in the core CLI (`cli/src/adb.rs`) rather than a libexec helper — paniolo
 shells out to the host's `adb` binary directly. The device is named by its
 `adb -s <serial>` id and bound to the control host it is physically plugged
