@@ -116,6 +116,90 @@ pub fn remote_command(argv: &[String], env: &[(String, String)]) -> String {
     parts.join(" ")
 }
 
+/// SSH options shared with [`base_args`], for `sftp` rather than `ssh`.
+///
+/// Same identity, timeout and multiplexing — an sftp that reuses the session's
+/// ControlMaster costs no extra handshake.
+fn transfer_args(host: &Host) -> Vec<String> {
+    let mut a = vec![
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        format!("ConnectTimeout={CONNECT_TIMEOUT}"),
+    ];
+    if let Some(id) = &host.identity {
+        a.push("-i".into());
+        a.push(expand_tilde(id).to_string_lossy().into_owned());
+        a.push("-o".into());
+        a.push("IdentitiesOnly=yes".into());
+    }
+    a.extend(control_args(host));
+    a
+}
+
+/// Quote a path for an sftp batch line.
+///
+/// sftp splits its command lines on whitespace and honours double quotes. It is
+/// not a shell, so only the quote and the escape character need care — and
+/// notably a Windows path's backslashes must survive, which is why this is not
+/// [`shell_quote`].
+fn sftp_quote(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn sftp_batch(host: &Host, script: &str) -> std::io::Result<()> {
+    let mut cmd = Command::new("sftp");
+    cmd.args(transfer_args(host));
+    cmd.arg("-b").arg("-").arg(&host.ssh);
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(script.as_bytes())?;
+    }
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(format!(
+            "sftp to {} failed: {}",
+            host.ssh,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Upload `local` to `remote_rel` on `host` over SFTP.
+///
+/// SFTP rather than a shell command on purpose. The remote's login shell is not
+/// ours to choose: a Windows control host answers with PowerShell, where
+/// `f=$(mktemp …) && cat > "$f"` is not a command at all. SFTP is a protocol, so
+/// it behaves identically whatever shell the far side runs.
+///
+/// `remote_rel` is deliberately **relative**. SFTP reports a Windows home as
+/// `/C:/Users/name` — an SFTP-protocol path no native Windows program can open —
+/// so an absolute path taken from `pwd` would be unusable as a `--lab` argument.
+/// Both platforms start an SSH session in the user's home, which is also SFTP's
+/// default directory, so a relative name resolves consistently on both.
+pub fn sftp_put(host: &Host, local: &std::path::Path, remote_rel: &str) -> std::io::Result<()> {
+    sftp_batch(
+        host,
+        &format!(
+            "put {} {}\n",
+            sftp_quote(&local.to_string_lossy()),
+            sftp_quote(remote_rel)
+        ),
+    )
+}
+
+/// Remove `remote_rel` on `host` over SFTP.
+///
+/// Also not a shell command: `rm -f` on a PowerShell host fails with "parameter
+/// 'f' is ambiguous. Possible matches include: -Filter -Force."
+pub fn sftp_rm(host: &Host, remote_rel: &str) -> std::io::Result<()> {
+    sftp_batch(host, &format!("rm {}\n", sftp_quote(remote_rel)))
+}
+
 /// Result of a captured remote command.
 pub struct Output {
     pub status: i32,
@@ -308,5 +392,40 @@ mod tests {
         assert!(a.contains("IdentitiesOnly=yes"), "{a}");
         // Interactive variant drops BatchMode (so a PTY/password can work).
         assert!(!base_args(&host, true, true).join(" ").contains("BatchMode"));
+    }
+
+    /// A Windows path is mostly backslashes, and the sftp batch parser treats a
+    /// backslash as an escape — so the quoting that works for a remote shell
+    /// (`shell_quote`) is the wrong tool here. Getting this wrong silently
+    /// uploads to a mangled filename.
+    #[test]
+    fn sftp_quote_preserves_windows_paths() {
+        assert_eq!(
+            sftp_quote(r"C:\Users\curti\.paniolo-lab-1.toml"),
+            r#""C:\\Users\\curti\\.paniolo-lab-1.toml""#
+        );
+    }
+
+    #[test]
+    fn sftp_quote_escapes_quotes_and_spaces() {
+        assert_eq!(sftp_quote("a b.toml"), r#""a b.toml""#);
+        assert_eq!(sftp_quote(r#"od"d.toml"#), r#""od\"d.toml""#);
+    }
+
+    /// sftp must not inherit `ssh`'s argv shape — it takes no `-o BatchMode`
+    /// positionally out of order, and it must keep the multiplexing options so
+    /// a dispatch reuses the session's existing master rather than
+    /// re-authenticating per file transfer.
+    #[test]
+    fn transfer_args_carry_identity_and_multiplexing() {
+        let host = Host {
+            ssh: "u@bench1".into(),
+            identity: Some("~/.ssh/id".into()),
+            ..Default::default()
+        };
+        let a = transfer_args(&host).join(" ");
+        assert!(a.contains("BatchMode=yes"), "{a}");
+        assert!(a.contains("IdentitiesOnly=yes"), "{a}");
+        assert!(a.contains("ControlMaster=auto"), "{a}");
     }
 }

@@ -134,22 +134,34 @@ pub fn subcommand_args() -> Vec<String> {
     strip_lab_option(&args)
 }
 
-const SHIP_SCRIPT: &str =
-    r#"f=$(mktemp "${TMPDIR:-/tmp}/paniolo-lab.XXXXXX") && cat > "$f" && printf %s "$f""#;
-
-/// Write `slice_toml` to a temp file on `host` over SSH and return its path.
+/// Write `slice_toml` to a file on `host` over SFTP and return its remote name.
+///
+/// This used to run a POSIX shell script (`f=$(mktemp …) && cat > "$f"`) to
+/// create the file and echo its path. That works on a Unix control host and is
+/// not a command at all on a Windows one, whose OpenSSH answers with PowerShell
+/// — which is what stopped paniolo dispatching to a Windows host. SFTP is a
+/// protocol rather than a shell, so it behaves the same on both.
+///
+/// The returned name is **relative**, and the remote `--lab` depends on that:
+/// see [`ssh::sftp_put`] for why an absolute path is not usable on Windows.
 pub fn ship_slice(host: &crate::model::Host, slice_toml: &str) -> std::io::Result<String> {
-    let argv = vec!["sh".to_string(), "-c".to_string(), SHIP_SCRIPT.to_string()];
-    let out = ssh::run(host, &argv, Some(slice_toml), &[])?;
-    let path = out.stdout.trim().to_string();
-    if out.status != 0 || path.is_empty() {
-        return Err(std::io::Error::other(format!(
-            "failed to ship lab slice to {}: {}",
-            host.ssh,
-            out.stderr.trim()
-        )));
-    }
-    Ok(path)
+    // Unique per invocation: several dispatches to one host can overlap, and a
+    // shared name would let one clobber another's lab slice mid-run.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let remote = format!(".paniolo-lab-{}-{stamp}.toml", std::process::id());
+
+    let mut local = std::env::temp_dir();
+    local.push(&remote);
+    std::fs::write(&local, slice_toml)?;
+    let sent = ssh::sftp_put(host, &local, &remote);
+    let _ = std::fs::remove_file(&local);
+    sent.map_err(|e| {
+        std::io::Error::other(format!("failed to ship lab slice to {}: {e}", host.ssh))
+    })?;
+    Ok(remote)
 }
 
 /// Re-exec `sub_argv` on `host` against a shipped slice; return the remote exit
@@ -174,12 +186,7 @@ pub fn dispatch(
     }?;
 
     // Best-effort cleanup of the shipped slice.
-    let _ = ssh::run(
-        &host,
-        &["rm".to_string(), "-f".to_string(), remote_path],
-        None,
-        &[],
-    );
+    let _ = ssh::sftp_rm(&host, &remote_path);
     Ok(code)
 }
 
@@ -198,12 +205,7 @@ pub fn run_subcommand(
     let mut argv = vec![host.paniolo(), "--lab".to_string(), remote_path.clone()];
     argv.extend(subargs.iter().map(|s| s.to_string()));
     let out = ssh::run(&host, &argv, None, &[]);
-    let _ = ssh::run(
-        &host,
-        &["rm".to_string(), "-f".to_string(), remote_path],
-        None,
-        &[],
-    );
+    let _ = ssh::sftp_rm(&host, &remote_path);
     Ok(out?)
 }
 
@@ -230,12 +232,7 @@ pub fn dispatch_stdout_to_file(
         std::fs::File::create(out_path).map_err(|e| anyhow::anyhow!("creating {out_path}: {e}"))?;
     let code = ssh::run_stdout_to(&host, &argv, &[], sink)?;
 
-    let _ = ssh::run(
-        &host,
-        &["rm".to_string(), "-f".to_string(), remote_path],
-        None,
-        &[],
-    );
+    let _ = ssh::sftp_rm(&host, &remote_path);
     if code != 0 {
         let _ = std::fs::remove_file(out_path);
     }

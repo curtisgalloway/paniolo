@@ -953,10 +953,49 @@ Shelly Plug and an Openterface KVM-GO):
 - **OCR is absent.** Neither Apple Vision nor Tesseract has a Windows
   counterpart wired up. `Windows.Media.Ocr` is the in-box candidate, and the
   `windows` crate is already a hdmicap dependency for capture.
-- **Remote dispatch cannot target a Windows control host.** `ssh::remote_command`
-  emits POSIX shell (`VAR='v' paniolo …`); against brik's default PowerShell that
-  fails with "The term 'FOO=bar' is not recognized". Windows works as a *local*
-  control host, not yet as a remote one.
+- **`paniolo doctor` cannot probe a Windows control host.** Probes run natively
+  when the host is local, but the SSH path still renders them as POSIX shell
+  (`sh -c 'test -e …'`), which a PowerShell host cannot run. Everything else
+  dispatches fine (see **Dispatching to a Windows control host** below); doctor
+  is the one remaining verb that speaks shell over the wire rather than pure
+  paniolo.
+
+### Dispatching to a Windows control host
+
+`paniolo <cmd> -t <target>` works when the target's host is Windows. The
+mechanism is worth knowing, because the thing that used to break it is a trap
+anywhere the remote shell is not ours to choose.
+
+Dispatch does three things over SSH: ship a lab slice, re-exec `paniolo` against
+it, and clean the slice up. Only the middle one was ever shell-safe.
+
+- **Shipping and cleanup now go over SFTP** (`ssh::sftp_put` / `ssh::sftp_rm`).
+  They used to be shell: `f=$(mktemp …) && cat > "$f" && printf %s "$f"` and
+  `rm -f`. On a PowerShell host the first is not a command at all, and the
+  second fails with *"parameter 'f' is ambiguous. Possible matches include:
+  -Filter -Force."* SFTP is a protocol, so it behaves identically whatever the
+  far side runs, and it reuses the session's ControlMaster so it costs no extra
+  handshake.
+- **The re-exec was already fine.** `remote_command` quotes each argument
+  POSIX-style, and PowerShell reads `'C:\Users\curti\lab.toml'` as the same
+  literal a POSIX shell would. Verified directly. The `VAR='v' cmd` env-prefix
+  form is *not* portable — but the dispatch path passes no env, so it never
+  appears there.
+- **The slice path is deliberately relative** (`.paniolo-lab-<pid>-<ns>.toml`).
+  SFTP reports a Windows home as `/C:/Users/name`, an SFTP-protocol path no
+  native Windows program can open, so an absolute path from `pwd` is unusable as
+  a `--lab` argument. Both platforms start an SSH session in the user's home,
+  which is also SFTP's default directory, so a relative name resolves on both.
+
+Verified end to end against `brik`: `paniolo hid send -t <target> info` returned
+real CH9329 state, `hid send … move` drove the KVM, `video show` read the
+channel, and the slice was cleaned up. Unix dispatch to `waldo` is unchanged.
+
+**What still speaks shell over the wire:** `doctor`. Its probes execute natively
+against a local host but render to `sh -c` for a remote one, so probing a
+Windows control host fails. Narrowing that to pure paniolo verbs — the remote
+side running `paniolo doctor` rather than the near side shipping shell — is the
+obvious fix and is not done.
 
 ### Writing portable code here
 
