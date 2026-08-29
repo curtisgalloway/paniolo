@@ -1,0 +1,14 @@
+{
+  "_source": "Transcribed by eye from the image, not from any engine's output.",
+  "_note": "Light grey text on a dark hexagonal-mesh wallpaper — low contrast over a strongly patterned background, which is the opposite failure mode to the BIOS pages' saturated widgets. Icon labels wrap across two lines and one is truncated by the OS itself ('Dell Comman...' for Dell Command Update), so the ellipsis is genuinely on screen and not an OCR artifact. The mesh is also a hallucination trap: repeating hexagon edges look like glyph strokes.",
+  "required_tokens": [
+    "Recycle Bin",
+    "Microsoft",
+    "Edge",
+    "Dell",
+    "SupportAssist",
+    "Search",
+    "11:52 AM",
+    "8/28/2026"
+  ]
+}

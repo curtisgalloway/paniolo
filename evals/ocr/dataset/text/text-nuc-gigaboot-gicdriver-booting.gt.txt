@@ -1,0 +1,30 @@
+GetGicDriver: unexpected interrupt controller type: 0x0
+GetGicDriver: unexpected interrupt controller type: 0x0
+GetGicDriver: unexpected interrupt controller type: 0x0
+GetGicDriver: unexpected interrupt controller type: 0x0
+GetGicDriver: unexpected interrupt controller type: 0x0
+GetGicDriver: unexpected interrupt controller type: 0x0
+GetGicDriver: unexpected interrupt controller type: 0x1
+GetGicDriver: unexpected interrupt controller type: 0x2
+GetGicDriver: unexpected interrupt controller type: 0x2
+GetGicDriver: unexpected interrupt controller type: 0x4
+GetGicDriver: unexpected interrupt controller type: 0x4
+GetGicDriver: unexpected interrupt controller type: 0x4
+GetGicDriver: unexpected interrupt controller type: 0x4
+GetGicDriver: unexpected interrupt controller type: 0x4
+GetGicDriver: unexpected interrupt controller type: 0x4
+GetGicDriver: unexpected interrupt controller type: 0x4
+GetGicDriver: unexpected interrupt controller type: 0x4
+GetGicDriver: unexpected interrupt controller type: 0x4
+GetGicDriver: unexpected interrupt controller type: 0x4
+GetGicDriver: unexpected interrupt controller type: 0x4
+GetGicDriver: unexpected interrupt controller type: 0x4
+GetGicDriver: unexpected interrupt controller type: 0x4
+GetGicDriver: unexpected interrupt controller type: 0x4
+GetGicDriver: unexpected interrupt controller type: 0x4
+GetGicDriver: unexpected interrupt controller type: 0x4
+GetGicDriver: no valid gicd found
+AddMadtItems: no gic cfg
+AddPsciDriver: no psci
+AddArmTimerDriver: no gtdt
+Booting zircon
