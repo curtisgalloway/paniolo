@@ -118,14 +118,24 @@ Apple Vision additionally reports **normalized, bottom-left-origin** boxes, so
 ## What paniolo does with it
 
 `hdmicap`'s `GET /ocr` runs the helper with `--json` and returns the envelope as
-`application/json`. `paniolo video read` prints `text` by default and the whole
-envelope under `--json`.
+`application/json`. `paniolo video read` prints `text` by default — what a human
+or an agent grepping the screen wants, and what the command printed before the
+envelope existed — and the whole envelope under `--json`.
 
-**Legacy helpers degrade rather than fail.** If a helper's stdout does not parse
-as an envelope, `/ocr` treats it as plain text from a pre-v1 helper, synthesizes
-an envelope with no lines and a warning naming the binary. A new CLI against an
-old installed helper then still reads screens, just without confidences —
-instead of failing in a way that looks like a broken capture.
+**Version skew degrades rather than fails, in both directions.** If a helper's
+stdout does not parse as an envelope, `/ocr` treats it as plain text from a
+pre-v1 helper and synthesizes an envelope with no `lines`, logging a warning
+that names the binary — omitting boxes is honest, fabricating them is not. And
+`paniolo video read` passes a non-envelope body through unchanged, so a CLI
+newer than the daemon it is talking to still reads screens.
+
+Both paths matter because the helper, the daemon and the CLI are installed
+separately and upgrade at different times. The failure they replace looks to an
+agent like a broken capture rather than a version mismatch.
+
+The envelope check is `version` being present, not merely "the body is JSON" —
+otherwise a screen that happens to *show* JSON containing a `text` key would be
+mined for it.
 
 ### Coordinates cross-check
 

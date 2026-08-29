@@ -701,6 +701,10 @@ enum VideoCmd {
         /// Timeout in ms for the stable wait.
         #[arg(long, default_value_t = 2000)]
         timeout: u64,
+        /// Emit the full OCR envelope (per-line text, confidence, bbox, and
+        /// which engine produced it) instead of just the text. See docs/ocr.md.
+        #[arg(long)]
+        json: bool,
     },
     /// Print the live-preview URL of the target's running daemon.
     Preview { target: Option<String> },
@@ -2773,11 +2777,13 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
             target,
             stable,
             timeout,
+            json,
         } => {
             let (target, _v) = video_runtime(lab_flag, target.as_deref())?;
-            let text = video::ocr(&target, stable, timeout)?;
-            print!("{text}");
-            if !text.ends_with('\n') {
+            let body = video::ocr(&target, stable, timeout)?;
+            let out = if json { body } else { video::text_of(&body) };
+            print!("{out}");
+            if !out.ends_with('\n') {
                 println!();
             }
             Ok(())
