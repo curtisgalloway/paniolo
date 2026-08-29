@@ -212,6 +212,13 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit 1 }
             Copy-Item "$h/target/release/$h.exe" "$stage/libexec/$h.exe"
           }
+          # The OCR helper is per-platform and not a workspace crate, so it is
+          # built explicitly rather than coming from $env:HELPERS. Without it a
+          # Windows install has no OCR at all — `paniolo video read` would have
+          # nothing to call. See docs/ocr.md.
+          cargo build --release --manifest-path ocr/winocr/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Copy-Item ocr/winocr/target/release/winocr.exe "$stage/libexec/winocr.exe"
           # netbootd's privileged BPF helper is a macOS-only setuid binary; it
           # builds to a stub off macOS and has no business in a Windows zip.
           Get-ChildItem "$stage/libexec" | Select-Object -ExpandProperty Name

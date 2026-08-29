@@ -328,7 +328,7 @@ fn visionocr_bin() -> std::ffi::OsString {
     }
     if let Ok(me) = std::env::current_exe() {
         if let Some(dir) = me.parent() {
-            for name in ["visionocr", "linuxocr"] {
+            for name in ["visionocr", "linuxocr", "winocr", "winocr.exe"] {
                 let sibling = dir.join(name);
                 if sibling.is_file() {
                     return sibling.into();
@@ -339,9 +339,29 @@ fn visionocr_bin() -> std::ffi::OsString {
     "visionocr".into()
 }
 
-/// OCR the current warm frame by shelling out to the `visionocr` tool (Apple
-/// Vision). The daemon doesn't link Vision itself — it pipes a PNG to the
-/// tool located by [`visionocr_bin`].
+/// Wrap plain text from a pre-v1 helper in a v1 envelope.
+///
+/// A new daemon against an old installed helper should still read screens —
+/// just without confidences — rather than failing in a way that looks like a
+/// broken capture. The synthesized envelope names the binary so the cause is
+/// visible, and carries no `lines`, because inventing boxes would be worse than
+/// omitting them. See docs/ocr.md.
+fn legacy_envelope(bin: &str, text: &str, width: u32, height: u32) -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "engine": "unknown",
+        "engine_detail": format!("pre-v1 helper ({bin}): plain text only, no confidences"),
+        "width": width,
+        "height": height,
+        "text": text.trim_end_matches('\n'),
+        "lines": [],
+    })
+}
+
+/// OCR the current warm frame by shelling out to the platform's OCR helper
+/// (`visionocr` / `winocr` / `linuxocr`). The daemon links no OCR engine
+/// itself — it pipes a PNG to the tool located by [`visionocr_bin`] and returns
+/// the v1 envelope the helper emits under `--json` (see docs/ocr.md).
 async fn ocr(State(s): State<AppState>) -> Response {
     let f = s.frames.borrow().clone();
     if f.effective_signal() == Signal::Stale {
@@ -364,8 +384,10 @@ async fn ocr(State(s): State<AppState>) -> Response {
         None => return (StatusCode::INTERNAL_SERVER_ERROR, "png encode failed").into_response(),
     };
 
+    let (fw, fh) = (f.width, f.height);
     let bin = visionocr_bin();
     let mut child = match tokio::process::Command::new(&bin)
+        .arg("--json")
         .arg("-")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -393,11 +415,28 @@ async fn ocr(State(s): State<AppState>) -> Response {
     }
 
     match child.wait_with_output().await {
-        Ok(out) if out.status.success() => (
-            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            out.stdout,
-        )
-            .into_response(),
+        Ok(out) if out.status.success() => {
+            let name = bin.to_string_lossy().into_owned();
+            // A v1 helper answers with the envelope. Anything else is treated
+            // as a pre-v1 helper's plain text rather than an error — see
+            // legacy_envelope.
+            let body = match serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                Ok(v) if v.get("version").is_some() => v,
+                _ => {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    tracing::warn!(
+                        "OCR helper {name} did not emit a v1 envelope; \
+                         treating its output as plain text (upgrade it with `paniolo setup`)"
+                    );
+                    legacy_envelope(&name, &text, fw, fh)
+                }
+            };
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                body.to_string(),
+            )
+                .into_response()
+        }
         Ok(out) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("visionocr failed: {}", String::from_utf8_lossy(&out.stderr)),
@@ -534,3 +573,24 @@ fn signal_name(s: Signal) -> &'static str {
 
 #[allow(unused_imports)]
 use watch as _watch;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pre-v1 helper's plain text must still reach the caller as an
+    /// envelope. Failing instead would look to an agent like a broken capture
+    /// rather than an out-of-date helper.
+    #[test]
+    fn legacy_envelope_wraps_plain_text() {
+        let v = legacy_envelope("linuxocr", "login:\nPassword:\n", 1280, 720);
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["text"], "login:\nPassword:");
+        assert_eq!(v["width"], 1280);
+        assert_eq!(v["height"], 720);
+        // No invented lines: omitting them is honest, fabricating boxes is not.
+        assert_eq!(v["lines"].as_array().map(|a| a.len()), Some(0));
+        // The binary is named so the cause is visible in the response itself.
+        assert!(v["engine_detail"].as_str().unwrap().contains("linuxocr"));
+    }
+}

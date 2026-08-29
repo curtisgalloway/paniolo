@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: 2026 Curtis Galloway
+# SPDX-License-Identifier: Apache-2.0
+
+[project]
+name = "paniolo-ocr-bench"
+version = "0.1.0"
+description = "Scores paniolo's OCR helpers against real dongle captures"
+requires-python = ">=3.11"
+dependencies = [
+    "jiwer>=3.0",
+    "numpy>=1.26",
+    "opencv-python-headless>=4.9",
+    "psutil>=5.9",
+]
+
+# RapidOCR is a *candidate* engine, not one paniolo ships, so it is optional:
+# the harness must run on a machine that only has the installed helpers. Install
+# with `uv sync --extra candidates` when evaluating it.
+#
+# Pinned to the v3 line deliberately. RapidOCR's API moved between the v1
+# `rapidocr_onnxruntime` package and the v3 unified `rapidocr` one, so an
+# unpinned install silently changes the call shape.
+[project.optional-dependencies]
+candidates = [
+    "rapidocr>=3.0,<4.0",
+    "onnxruntime>=1.17",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bench"]

@@ -37,7 +37,7 @@ pub fn daemon_url(target: &str) -> Option<String> {
 }
 
 /// OCR the target daemon's current frame via `GET /ocr` (optionally waiting for
-/// a stable signal first), returning the recognized text.
+/// a stable signal first), returning the raw v1 envelope (see docs/ocr.md).
 pub fn ocr(target: &str, stable: bool, timeout_ms: u64) -> Result<String> {
     let url = daemon_url(target)
         .ok_or_else(|| anyhow!("no video daemon running — start one with `paniolo video watch`"))?;
@@ -69,6 +69,25 @@ pub fn ocr(target: &str, stable: bool, timeout_ms: u64) -> Result<String> {
             }
         }
         Err(e) => Err(anyhow!("OCR failed: {e}")),
+    }
+}
+
+/// The recognized text from an OCR envelope.
+///
+/// `/ocr` returns the whole envelope so callers can reach confidences and
+/// boxes, but `paniolo video read` prints text by default — that is what a
+/// human or an agent grepping the screen wants, and it is what the command
+/// printed before the envelope existed. A body that is not an envelope is
+/// passed through unchanged rather than rejected, so a daemon older than this
+/// CLI still reads screens.
+pub fn text_of(body: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(v) if v.get("version").is_some() => v
+            .get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        _ => body.to_string(),
     }
 }
 
@@ -128,4 +147,32 @@ pub fn passthrough(args: &[String], instance: Option<&str>) -> Result<i32> {
         .envs(daemons::helper_env(DAEMON, instance))
         .status()?;
     Ok(status.code().unwrap_or(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_of_extracts_the_envelope_text() {
+        let body = r#"{"version":1,"engine":"visionocr","width":1280,"height":720,
+                       "text":"login:\nPassword:","lines":[]}"#;
+        assert_eq!(text_of(body), "login:\nPassword:");
+    }
+
+    /// A daemon older than this CLI still returns bare text. Reading a screen
+    /// must keep working against it rather than printing a parse error, which
+    /// would look like a capture fault rather than a version skew.
+    #[test]
+    fn text_of_passes_through_pre_envelope_output() {
+        assert_eq!(text_of("login:\nPassword:"), "login:\nPassword:");
+    }
+
+    /// JSON that is not an envelope is not an envelope. Without the version
+    /// check, a screen showing JSON would be silently mined for a "text" key.
+    #[test]
+    fn text_of_ignores_json_that_is_not_an_envelope() {
+        let body = r#"{"text":"not from us"}"#;
+        assert_eq!(text_of(body), body);
+    }
 }
