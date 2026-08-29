@@ -44,6 +44,7 @@
 | CORE-9 | Tunnelled `console` for a remote target (dashboard reachable locally) | S | ☑ | `remote_console` in `cli/src/main.rs`; `?serialws=` stitch |
 | CORE-10 | Multi-host targets (one target spanning control hosts) | C | ◐ | per-channel dispatch routes each command to its channel's host (`dispatch.rs`); composite `console` still requires co-located channels |
 | CORE-11 | Remote `setup --host` + discovery-assisted `configure` | C | ☑ | `paniolo setup --host`, `discover`, `configure` (`cli/src/main.rs`) |
+| CORE-12 | Carry a helper's required secrets to its **remote** control host, without exposing them in the host's process list | S | ☐ | Blocks routed `power-*` on AMT targets. The transport already takes env (`ssh::run*(.., env)`), but every `dispatch.rs` call site passes `&[]`, so nothing is forwarded. Naively populating it is not the fix: `ssh::remote_command` prepends `KEY=value` to the command line, where `ps` on the control host would expose it. Wants stdin or `SendEnv`/`AcceptEnv`. Today's workaround is manual — `op read … \| ssh waldo 'IFS= read -r AMT_PASSWORD; export AMT_PASSWORD; paniolo power-state …'` — i.e. the AMT target can only be driven *on* its control host |
 
 ## 2. Netboot / deploy
 
@@ -82,6 +83,7 @@
 | VID-1 | HDMI/USB capture via warm-stream `hdmicap` daemon | M | ☑ | `hdmicap/`; Linux V4L2 + macOS |
 | VID-2 | `video watch/preview/shot/read/devices/show/stop`; stable & changed-since capture | M | ☑ | |
 | VID-3 | On-device OCR (`video read`): Apple Vision (macOS), Tesseract (Linux) | S | ☑ | `ocr/` helpers via hdmicap `GET /ocr` (the legacy `--json` flag was not carried into the Rust CLI) |
+| VID-4 | Change detection sensitive enough for small-region edits | C | ☐ | `--changed-since` compares a 64-bit aHash over an 8x8 cell grid, so a change smaller than a cell — a moved text cursor, a single toggled BIOS checkbox — averages away and reads as "unchanged". Fine for whole-screen transitions, wrong for waiting on a UI to acknowledge a keystroke. Wants an opt-in finer comparison (region-of-interest, or a second finer hash) rather than a bigger default hash. Distinct from the `signal` bugs fixed in #103 |
 
 ## 6. HID injection
 
