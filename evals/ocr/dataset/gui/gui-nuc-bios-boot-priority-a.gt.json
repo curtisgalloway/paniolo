@@ -1,0 +1,18 @@
+{
+  "_source": "Transcribed by eye from the image, not from any engine's output. Deriving ground truth from OCR would measure agreement with itself.",
+  "_note": "The three Boot Option values sit inside cyan-filled dropdown widgets and are the hard part of this frame. They are also exactly what an agent asks this page for, so an engine that reads the headings and drops the values is useless here however well it scores overall.",
+  "required_tokens": [
+    "Boot Priority",
+    "Boot Option #1",
+    "UEFI: PXE IPv4 Intel(R) Ethernet C",
+    "Boot Option #2",
+    "UEFI: PXE IPv6 Intel(R) Ethernet C",
+    "Boot Option #3",
+    "UEFI OS (KINGSTON SA2000M825",
+    "Fast Boot",
+    "Boot USB Devices First",
+    "Unlimited Boot to Network Attempts",
+    "Total Memory: 8 GB",
+    "Processor: 11th Gen Intel(R) Core(TM) i5-1135G7 @ 2.40GHz"
+  ]
+}

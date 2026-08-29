@@ -1,0 +1,9 @@
+>>Checking Media Presence......
+>>Media Present......
+>>Start PXE over IPv6 on MAC: 54-B2-03-F0-B5-5C.
+PXE-E16: No valid offer received.
+Gigaboot main
+Secure Boot: Off
+Found TPM 2.0 EFI protocol.
+TPM 2.0 Capabilities:
+capability.StructureVersion.Major = 0x
