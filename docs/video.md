@@ -100,7 +100,24 @@ paniolo video read --stable [--timeout <ms>]   # wait for a steady frame first
 
 `read` wraps the running daemon's `GET /ocr` endpoint (also reachable directly
 — `curl -s "$(paniolo video preview)/ocr"` — and via the OCR button on the
-[web dashboard](dashboard.md)). When the capture has **no video signal** (the
+[web dashboard](dashboard.md)).
+
+**Two things `signal` used to get wrong**, both fixed and both worth knowing
+about if you read older captures. A *mostly black* screen — which is what every
+firmware, bootloader and console screen is — was classified as no-signal,
+because the sampling lattice was coarse enough to land on none of the text: a
+Gigaboot screen with 1.35% of its pixels lit reported `no_signal` for minutes.
+And a *stalled* capture kept reporting `stable`: the capture loop publishes only
+on success, so the last frame stayed in place with its old label, and a machine
+whose mains had been cut went on reporting `stable` on its pre-cut desktop. A
+frame older than `STALE_AFTER` now reports `stale`, and `/snapshot`, `/ocr` and
+`--stable` all refuse it.
+
+The lesson for anything collecting frames: **treat `signal` as a hint, save
+every frame, and de-duplicate by hash afterwards** rather than filtering on the
+label as you go.
+
+When the capture has **no video signal** (the
 target's display is off or unplugged) `read` errors with `no video signal`
 instead of returning empty text, so "display is off" and "screen is blank"
 stay distinguishable. On macOS this uses Apple Vision's
