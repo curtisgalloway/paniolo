@@ -71,20 +71,59 @@ provisional. Extending coverage is the highest-value work left here.
 
 ## What the numbers say so far
 
-On the frames that have ground truth, the ranking is consistent and matches
-what eyeballing suggested:
+Ground truth on 6 GUI and 2 text frames. The two screen types behave
+**differently**, which is the two-mode split the research predicted — but not
+quite in the shape it predicted.
 
-| Screen type | Best | Error |
+GUI screens (token-recall error, lower is better):
+
+| engine | best variant | error |
 | --- | --- | --- |
-| GUI | `visionocr` (`.accurate`) | 0.000–0.083 token recall error |
-| GUI | `linuxocr` (Tesseract) | 0.208 |
-| GUI | `visionocr --fast` | 0.417 |
-| text | `visionocr` (`.accurate`) | CER 0.008 |
-| text | `linuxocr` | CER 0.016 |
-| text | `visionocr --fast` | CER 0.078 |
+| `visionocr` (`.accurate`) | `luma_up2_nn` | **0.062** |
+| `linuxocr` (Tesseract) | `luma_up2_nn` | 0.312 |
+| `visionocr --fast` | `luma_up2` | 0.583 |
 
-`.accurate` beats `.fast` by roughly 10x on character error, which is the
-measured basis for the default having been changed.
+Text screens (CER, lower is better):
+
+| engine | best variant | error |
+| --- | --- | --- |
+| `visionocr` (`.accurate`) | `luma_up3_inv` | **0.016** |
+| `linuxocr` (Tesseract) | `luma_up2_otsu` | 0.019 |
+| `visionocr --fast` | `luma_up3_inv` | 0.053 |
+
+**Vision beats Tesseract about 5x on GUI screens and roughly ties it on text.**
+That is the practical finding: Tesseract is not a weak engine, it is a weak
+engine *on anti-aliased UI text*. Which means on Linux — where Vision does not
+exist and Tesseract is the default — the gap is GUI screens specifically, and
+that is exactly where the researched candidate (RapidOCR/PP-OCRv5) would earn
+its place. On macOS no routing is needed: Vision wins or ties both types.
+
+The best preprocessing *variant* also differs by type (`luma_up2_nn` for GUI,
+`luma_up3_inv` for text), though the spread between variants is much smaller
+than the spread between engines.
+
+### Hallucination is measurable, and recall alone will not show it
+
+`gui-pi-desktop-tooltip.png` has three real strings on a photographic gradient.
+Reading `lines` next to `recall`:
+
+| engine | lines emitted | recall |
+| --- | --- | --- |
+| `visionocr` | 2 | 0.67 |
+| `visionocr --fast` | 2 | **0.00** |
+| `linuxocr` | 5 | 0.33 |
+
+`--fast` emitted two lines and got *none* of the real text: pure invention.
+Tesseract emitted five lines where three exist. A recall score alone would rank
+the second and third of those as merely mediocre rather than as making things
+up, which for an agent acting on the output is a different kind of wrong.
+
+### What even the best config still misses
+
+`-rw-r--r--`, `11:52 AM`, `Wastebasket` — a permission string, a clock, an icon
+label. Permission strings are the interesting one: they differ from their
+neighbours by single characters in a fixed context, which is where an engine
+that smooths glyphs together fails and where a diff-based agent check would too.
 
 ## A question this harness cannot answer
 

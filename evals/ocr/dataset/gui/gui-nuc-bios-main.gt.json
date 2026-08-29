@@ -1,0 +1,31 @@
+{
+  "_source": "Transcribed by eye from the image, not from any engine's output.",
+  "_note": "Dense label/value page. The values are the point — a bring-up agent asks this page for cache sizes, CPUID, ME version. Mixed hex (0x806C1), units (1280 KB x 4), and dotted versions (15.0.10.1414) are where digit/letter confusion shows up.",
+  "required_tokens": [
+    "System Information",
+    "Processor Type",
+    "11th Gen Intel(R) Core(TM) i5-1135G7 @",
+    "Max Processor Turbo Frequency",
+    "4.20 GHz",
+    "Max Processor Non Turbo Frequency",
+    "2.40 GHz",
+    "Host Clock Frequency",
+    "100 MHz",
+    "L2 Cache",
+    "1280 KB x 4",
+    "L3 Cache",
+    "8 MB",
+    "CPUID",
+    "0x806C1",
+    "Microcode Update Revision",
+    "Total Memory Installed",
+    "Memory Speed",
+    "2667 MHz",
+    "SODIMM 0",
+    "SODIMM 1",
+    "Not Installed",
+    "Intel ME FW Version",
+    "15.0.10.1414",
+    "Bios Version: TNTGL357.0043.2020.1223.1022"
+  ]
+}

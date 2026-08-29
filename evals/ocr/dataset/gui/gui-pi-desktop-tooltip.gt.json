@@ -1,0 +1,9 @@
+{
+  "_source": "Transcribed by eye from the image, not from any engine's output.",
+  "_note": "Near-textless: three short strings over a photographic sunset gradient. Small anti-aliased type on a busy background is the hard read, but the frame's real value is as a FALSE-POSITIVE check — most of it is mountain silhouette, and an engine that invents text off gradient edges will show it here. Recall alone cannot see that, so read `lines` in raw.csv alongside: three is right, thirty means the engine is hallucinating. Vision --fast returned '>*' and 'q>) 17.35' on this frame where --accurate returned 'Terminal' and '17:35'.",
+  "required_tokens": [
+    "Terminal",
+    "Wastebasket",
+    "17:35"
+  ]
+}
