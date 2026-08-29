@@ -40,7 +40,7 @@ exists to remove both:
 ## Commands
 
 ```bash
-# Switch to netboot (IPv4 + DHCP + TFTP). Same as `paniolo netboot start`,
+# Switch to netboot (IPv4 + DHCP + TFTP + HTTP). Same as `paniolo netboot start`,
 # but first removes any ffx-mode IPv6 link-local.
 paniolo netif mode netboot <target>
 
@@ -74,7 +74,7 @@ up — never an unrelated address.
 
 ## What each mode does
 
-- **netboot** — removes the `fe80::1` host link-local, then starts DHCP + TFTP
+- **netboot** — removes the `fe80::1` host link-local, then starts DHCP + TFTP + HTTP
   via the normal netboot path (which still refuses a primary NIC and configures
   the IPv4 `host_ip`).
 - **link** — stops netboot if running and removes the `fe80::1` link-local, then

@@ -8,8 +8,8 @@
 > each command routes per-channel; only the composite `console` still requires
 > its channels co-located. Still design-only: cross-host composite commands,
 > `console --detach`, and multi-user locking (see the
-> [implementation plan](https://github.com/curtisgalloway/paniolo/blob/main/docs/distributed-control-plan.md) for the phasing). Compare
-> [related work: paniolo vs. labgrid](ci-integration/related-work.md),
+> [implementation plan](https://github.com/curtisgalloway/paniolo/blob/main/notes/distributed-control-plan.md) for the phasing). Compare
+> [related work: paniolo vs. labgrid](dev/ci-integration/related-work.md),
 > whose distributed model directly informs this.
 
 ## The problem
@@ -178,7 +178,7 @@ machinery is only for the browser dashboard, not the terminal CLI.
 
 The dashboard is the one place two subsystems interlock: hdmicap serves the page
 but reaches serialcap by an **absolute URL** (`ws://<host>:8724/stream`), with a
-`?serialws=` override (see [architecture §7](architecture.md)). So the browser
+`?serialws=` override (see [architecture §7](dev/architecture.md)). So the browser
 makes a *second* connection, to serialcap, possibly on a different port and a
 different host.
 
@@ -202,7 +202,7 @@ A per-host paniolo agent with its own RPC API (labgrid's exporter / "Option B" i
 `AGENTS.md`) would give cleaner streaming multiplexing and a natural home for
 multi-user locking. We chose against it for now because it directly trades away
 paniolo's stated identity — *zero-infrastructure, no coordinator/exporter/client
-to stand up* ([related-work](ci-integration/related-work.md)). SSH-tunnelling the
+to stand up* ([related-work](dev/ci-integration/related-work.md)). SSH-tunnelling the
 daemons that already exist gets local-feeling console with no always-on server and
 no new auth surface. The agent remains a *someday* option, gated on whether
 multi-user/board-farm scale ever becomes a goal — at which point paniolo would be
@@ -233,16 +233,17 @@ approved by a human.
 
 The flow is two-phase — **propose, then approve**:
 
-1. `paniolo configure fortune --serial bench1 --video bench2` runs discovery on
-   the named hosts over SSH and merges their inventories into a **proposed** target
-   definition.
-2. paniolo shows the **diff** against the current lab file and writes nothing
-   authoritative.
-3. The human reviews and approves; the change lands as a git commit to the lab
-   repo.
+1. `paniolo configure fortune -H bench1` runs discovery on
+   the named host over SSH and turns its inventory into a **proposed**
+   `[targets.fortune]` block — best-guessing the USB-Ethernet interface and
+   serial device, listing other candidates as comments.
+2. paniolo **prints** the proposed block (with a reconcile-by-hand note if the
+   target already exists) and writes nothing authoritative.
+3. The human reviews, pastes it into the lab file, and edits as needed; the
+   change lands as a git commit to the lab repo.
 
-An agent can drive step 1 and prepare the diff, but it can only *stage* a
-proposal — it never silently mutates the authoritative config. Because the lab
+An agent can drive step 1 and prepare the proposal, but it can only *stage*
+it — it never silently mutates the authoritative config. Because the lab
 file is in git, every change is a reviewable, revertible commit. Reconfiguration
 is the same flow against the existing file.
 
@@ -250,9 +251,12 @@ is the same flow against the existing file.
 
 Designed-for but **not** in the first implementation:
 
-- **Multi-host targets.** The schema (per-resource `host`) and the transport
-  (dev-machine rendezvous) both support it; the first cut handles same-host
-  targets only and rejects cross-host targets with a clear error.
+- **`console` on a cross-host target.** Per-channel host routing has since
+  shipped — a target's channels may live on different hosts, and each command
+  routes to the host of the channel it touches — but the composite `console`
+  still needs the **serial and video** channels it stitches together on one
+  host, and rejects a target whose serial and video live apart with a clear
+  error (other channels may sit anywhere).
 - **`console --detach`** and the local tunnel registry it requires.
 - **Multi-user / locking / reservations** (labgrid's coordinator-enforced
   *places*). Single-user is assumed.
@@ -267,7 +271,7 @@ exporters; SSH data plane ≈ labgrid's client→exporter-over-SSH data plane;
 discovery-assisted config ≈ a coordinator-as-registry, minus the always-on
 server. The deliberate divergence is **no coordinator and no exporter daemon** —
 a single git-tracked lab file plus SSH, preserving paniolo's zero-infrastructure,
-agent-in-the-loop niche. See [related work](ci-integration/related-work.md) for
+agent-in-the-loop niche. See [related work](dev/ci-integration/related-work.md) for
 the full comparison.
 
 ## Open questions (all since resolved)

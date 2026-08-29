@@ -36,7 +36,7 @@ networksetup -listallhardwareports
 
 ## Target configuration
 
-Config lives in the lab file (see [config-redesign.md](https://github.com/curtisgalloway/paniolo/blob/main/docs/config-redesign.md));
+Config lives in the lab file (see [config-redesign.md](https://github.com/curtisgalloway/paniolo/blob/main/notes/config-redesign.md));
 the netboot link is a per-target `netboot` channel:
 
 ```bash
@@ -215,7 +215,7 @@ identically on macOS and Linux.
 > **Verified end-to-end via PXE/IPv4** on an Indiedroid Nova (RK3588S / EDK2),
 > netbooting a UEFI Shell. **IPv6 and HTTPS are not supported** — netboot is IPv4
 > + plain HTTP/TFTP over the private point-to-point link. See
-> [`docs/uefi-http-boot-design.md`](https://github.com/curtisgalloway/paniolo/blob/main/docs/uefi-http-boot-design.md)
+> [`notes/uefi-http-boot-design.md`](https://github.com/curtisgalloway/paniolo/blob/main/notes/uefi-http-boot-design.md)
 > for the design, the hardware findings, and the IPv6 future work.
 
 ---

@@ -64,9 +64,14 @@ Four injectors are common and all speak the same `paniolo hid` commands:
   link runs at **57600** baud, not the Openterface's 115200), or
 - a **capture dongle + a KB2040** injector (the `hidrig` helper).
 
-The doctrine below is identical for all of them. A couple of CH9329-only conveniences
-are noted where relevant (`hid send info` reports target-USB enumeration; `hid
-send baud` persistently changes the link rate).
+The doctrine below is identical for all of them. A couple of CH9329-only
+conveniences are noted where relevant (`hid send info` reports target-USB
+enumeration and lock-LED state; `hid send baud <rate>` **persistently**
+reprograms the chip's link rate and re-enumerates it — the helper autodetects
+115200/57600/9600, so any other rate needs `-b <rate>` in the channel's
+`--cmd`. That is different from the protocol's optional *transient* `baud`
+capability, which the current dual-board KB2040 rig does not advertise at
+all).
 
 ## Orient before you touch anything (once per session)
 
@@ -197,6 +202,9 @@ paniolo hid send -t <target> click left
   to confirm you are over the right control before committing to the click.
 - Right-click is `click right`; double-click is two `click left` in quick
   succession (warm the daemon so they are not split across processes).
+- Scrolling is `scroll <amount>` (positive scrolls up, negative down — e.g.
+  `paniolo hid send -t <target> scroll -3`) — prefer it over dragging a
+  scrollbar or spamming arrow keys in scrollable lists and pages.
 
 If a click consistently lands a little off, your `screen_width`/`screen_height`
 is stale (the target changed resolution) — re-screenshot and re-read its size
@@ -234,7 +242,9 @@ so verify critical strings against a screenshot.
   anything you were not told to expect, **stop and ask** rather than entering
   guessed credentials or dismissing it.
 - When you are done, leave the target in a sane state (close what you opened,
-  release any held keys with `paniolo hid send releaseall`).
+  release any held keys with `paniolo hid send releaseall` — note it releases
+  **keyboard** state only; a mouse button held with `mdown` needs an explicit
+  `mup`).
 
 ## Troubleshooting
 
@@ -247,5 +257,5 @@ so verify critical strings against a screenshot.
 | `moveabs` didn't move the cursor where expected | you passed pixels, not logical `0..32767` — apply the scaling formula |
 | held modifier/drag doesn't work | one-shot processes don't carry held state — run through the daemon |
 | typed text garbled / wrong characters | non-US layout on the target, or you typed into a defocused window — click the field and confirm the caret first |
-| injector doesn't respond (`ping` fails) | target (which powers the injector) is off, or the hid channel's device/cmd is wrong — see the `paniolo` skill's `hid`/`doctor` |
+| injector doesn't respond (`ping` fails) | host-side problem: the hid channel's device/cmd is wrong, or the injector's control link is unplugged — see the `paniolo` skill's `hid`/`doctor`. (A passing `ping` does not prove the target sees input: on the dual-board rig the host-powered control board answers `ping` itself, and the Openterface Mini-KVM is powered from either side, so `ping` passes with the target off) |
 | CH9329: target sees no input though `ping` works | the target hasn't enumerated the emulated HID — check `paniolo hid send info` (`target_connected`); re-seat the target USB cable |

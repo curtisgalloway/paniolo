@@ -13,9 +13,9 @@
 # limitations under the License.
 
 # Build and install paniolo: the Rust CLI (cli/) plus the daemons and helpers
-# (hdmicap, serialcap, netbootd, cambrionix, hidrig, shellyplug), the
-# OCR helper, and the zigplug Zigbee helper (Python, installed by `paniolo
-# setup` as a uv tool).
+# (hdmicap, serialcap, netbootd, cambrionix, hidrig, ch9329, shellyplug,
+# amt), the OCR helper, and the zigplug Zigbee helper (Python, installed by
+# `paniolo setup` as a uv tool).
 # Only the `paniolo` CLI lands on PATH (~/.cargo/bin); the helpers install
 # into the private libexec dir (~/.local/libexec/paniolo/bin), run via
 # `paniolo helper <name> ...` when needed directly.

@@ -1,17 +1,6 @@
 <!--
-Copyright 2026 Curtis Galloway
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-FileCopyrightText: 2026 Curtis Galloway
+SPDX-License-Identifier: Apache-2.0
 -->
 
 # CH9329 USB-HID bridge — clean-room driver spec
@@ -21,7 +10,7 @@ limitations under the License.
 > `hid` channel like any other injector (`paniolo hid set --cmd "ch9329 -d
 > <uart>"`), with no device-specific code in `cli/`. It exposes the same CLI
 > surface as the KB2040 `hidrig`, translating each
-> [HID serial protocol](hid-serial-protocol.md) command into the binary frames
+> [HID serial protocol](../docs/dev/hid-serial-protocol.md) command into the binary frames
 > below. Both one-shot injection and the `serve`/`stop` KVM daemon (for
 > `paniolo console`) are implemented and hardware-verified. The facts below
 > remain the clean-room reference the implementation is built from.

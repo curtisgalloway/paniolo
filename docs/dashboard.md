@@ -47,8 +47,9 @@ bottom (default, 40 vh) and right-panel (380 px fixed, video fills remaining
 width) layouts. The choice persists in `localStorage`.
 
 **OCR button** — triggers `GET /ocr` on the hdmicap daemon, which OCRs the
-current frame via Apple Vision and displays the result. Requires
-`visionocr` to be installed (`paniolo setup`).
+current frame on-device (Apple Vision via `visionocr` on macOS, Tesseract via
+`linuxocr` on Linux) and displays the result. Requires the OCR helper to be
+installed (`paniolo setup`).
 
 **Capture input (KVM)** — when the target has a `hid` channel, the **⌨ Capture
 input** button toggles KVM mode (it becomes **⌨ Capturing** while active; click

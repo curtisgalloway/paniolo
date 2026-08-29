@@ -1,14 +1,14 @@
 # Recipe: adding a power-control helper for new hardware
 
-How to add paniolo support for a new power-switching device — a PDU, a relay
+**How to add paniolo support for a new power-switching device** — a PDU, a relay
 board, a smart plug family, a USB-PD hub, a BMC, anything that can turn a
-target's power on and off. Three shipped helpers serve as exemplars:
+target's power on and off. Three shipped helpers serve as examples:
 [`cambrionix/`](https://github.com/curtisgalloway/paniolo/tree/main/cambrionix) (Rust, Cambrionix USB hub control UART),
 [`shellyplug/`](https://github.com/curtisgalloway/paniolo/tree/main/shellyplug) (Rust, Shelly Gen2+ plugs over local HTTP RPC) and
 [`zigplug/`](https://github.com/curtisgalloway/paniolo/tree/main/zigplug) (Python, Zigbee smart plugs via a CC2652 coordinator
 dongle).
 
-**The design principle** (from [power.md](power.md)): device-specific control
+**The design principle** (from [power.md](../power.md)): device-specific control
 logic never goes in the core crates. It lives in a standalone helper binary,
 and paniolo drives it through four generic shell-command hooks on the target's
 power channel. Adding hardware support means writing a helper and wiring it in
@@ -162,7 +162,7 @@ paniolo power set -t <target> \
 All four hooks are optional and independent — wire what the hardware
 supports. Secrets (API tokens) come from the environment at call time, never
 hardcoded in the hook string (see the Home Assistant example in
-[power.md](power.md)).
+[power.md](../power.md)).
 
 ## 6. Docs + PR checklist
 

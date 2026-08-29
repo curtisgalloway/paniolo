@@ -1,11 +1,10 @@
 # Agent discoverability & usage evals
 
-How well can a *naive* agent — one that has never used paniolo — go from a
+This document specifies a reproducible eval suite to test how well a *naive* agent — one that has never used paniolo — can go from a
 plain-language goal ("boot this Pi over the network and show me the console") to
-the correct paniolo commands, **without inventing commands or flailing**? This
-doc specifies a reproducible eval suite that answers that question.
+the correct paniolo commands, **without inventing commands or flailing**.
 
-The suite is **no-hardware**: every scenario is either a *stated-commands*
+The suite runs **without hardware**: every scenario is either a *stated-commands*
 exercise (the agent says what it would run) or a *config-only* exercise (the
 agent really runs paniolo against a throwaway lab file). Both run on any machine
 with the `paniolo` CLI installed; neither touches a bench target.

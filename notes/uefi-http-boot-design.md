@@ -1,22 +1,15 @@
 <!--
-Copyright 2026 Curtis Galloway
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-FileCopyrightText: 2026 Curtis Galloway
+SPDX-License-Identifier: Apache-2.0
 -->
 
 # UEFI HTTP Boot (IPv4) for netbootd — design
 
-> **Status:** proposed, not yet built. **Date:** 2026-06-13.
+> **Status:** implemented (PRs #57, #58) — PXE/IPv4 is hardware-verified on
+> the Nova; HTTP Boot is served, but that board's EDK2 build only accepts
+> `https://` URLs, so PXE is the working path there. Shipped behavior is
+> documented in [netboot.md](../docs/netboot.md); this is the design record.
+> **Design date:** 2026-06-13.
 > Target hardware: **Indiedroid Nova** (Rockchip RK3588S) running Tianocore
 > **EDK2** firmware, which offers PXE and UEFI HTTP Boot over IPv4 and IPv6.
 > This doc designs **HTTP Boot over IPv4 only**. PXE/IPv4 is a near-sibling
@@ -36,7 +29,7 @@ The Nova's EDK2 firmware can netboot four ways (PXE/HTTP × IPv4/IPv6). Of those
   needs the same DHCP handshake (with two extra options) plus an HTTP GET in
   place of the TFTP transfer.
 - **It fixes a known weakness.** The TFTP path starves under host load (see
-  [netboot.md](netboot.md#known-issue-tftp-responsiveness-under-host-load)):
+  [netboot.md](../docs/netboot.md#known-issue-tftp-responsiveness-under-host-load)):
   lock-step 512-byte (or negotiated) blocks, one ACK per block, application-level
   retransmit. HTTP runs over kernel TCP, which gives us flow control, loss
   recovery, and large windows for free. Big images (kernels, UKIs, installers)
@@ -377,7 +370,7 @@ Settled 2026-06-13:
 
 Per the repo's standing PR checklist, the implementation PR must also update:
 
-- **[netboot.md](netboot.md)** — document HTTP Boot, the `boot_file`/`http_port`
+- **[netboot.md](../docs/netboot.md)** — document HTTP Boot, the `boot_file`/`http_port`
   fields, and that one `netbootd` serves Pi/PXE/HTTP from one config; revise the
   TFTP-starvation note to point at HTTP as the robust path for UEFI clients.
 - **[AGENTS.md](../AGENTS.md)** — netboot capabilities / lab schema.
