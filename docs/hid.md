@@ -208,15 +208,25 @@ cmd = "hidrig -d /dev/cu.usbmodemXXXX"
 
 ---
 
-<!-- CCG: this should cover all platforms -->
-## Host testing tools (macOS)
+## Host testing tools
 
-To exercise the full pipeline without a DUT, plug the **target** board's USB
-into the same Mac that drives the control link and capture its HID reports while
-injecting. Build with `cd hidrig/host && make`.
+**Injection itself is cross-platform** — the `hid` channel runs a helper, and
+both shipped helpers build and run on macOS, Linux and Windows. What is
+platform-specific is the optional *bench*: the tooling for exercising the full
+pipeline with no DUT attached, by plugging the **target** board into the control
+host and capturing the HID reports it emits while you inject.
 
-`hidrig/host/hid_capture_usb.m` is the **leak-safe** tool: it detaches
-the target board from the macOS HID stack via IOUSBHost whole-device capture and
+Capturing those reports means taking the device away from the host's own HID
+stack, and that is an OS-specific operation. The tools in `hidrig/host/` do it
+for macOS; the equivalents elsewhere are noted below but are **not shipped**.
+
+### macOS
+
+Build with `cd hidrig/host && make`, then plug the target board into the same
+Mac that drives the control link.
+
+`hidrig/host/hid_capture_usb.m` is the **leak-safe** tool: it detaches the
+target board from the macOS HID stack via IOUSBHost whole-device capture and
 prints timestamped interrupt-IN reports, so injected input reaches only the
 tool — not the focused app or the real cursor.
 
@@ -228,10 +238,28 @@ hidrig -d /dev/cu.usbmodemXXXX moveabs 16383 16383
 
 > The older `hid_seize_reports.c` (`IOHIDDeviceOpen(..SeizeDevice)`) is
 > **non-exclusive** on Darwin 24/25 — injected moves still move the real
-> cursor — so use it only as a passive tap. `hid_bench.py` (latency/throughput)
-> and `leak_check.py` round out the bench; see `hidrig/host/README.md`.
+> cursor — so use it only as a passive tap. `leak_check.py` (which imports
+> Quartz, so it is macOS-only too) checks that nothing leaked into the live
+> session; see `hidrig/host/README.md`.
 
-### Latency note
+### Linux
+
+No capture tool ships. The equivalent is to read the target board's reports
+from its `/dev/hidraw*` node — `usbhid-dump` or a few lines of Python will do
+it — and to unbind it from `usbhid` first if you need the leak-safe property
+that `hid_capture_usb` provides on macOS. Injection, the daemon, and
+`hid_bench.py` (below) all work; only the receive side is missing.
+
+### Windows
+
+No capture tool ships, and no equivalent has been worked out. Injection works;
+verify against a real DUT rather than a loopback bench.
+
+### Measuring latency
+
+`hidrig/host/hid_bench.py` sends `moveabs` commands with wall-clock send
+timestamps and is plain `pyserial`, so it runs anywhere. Correlating those sends
+with arrivals needs a capture tool on the receive side, which today means macOS.
 
 On macOS the daemon drops the serial read-latency timer (`IOSSDATALAT`) to its
 floor when it opens the control CDC endpoint; the default added ~230 ms to each
