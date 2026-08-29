@@ -21,4 +21,7 @@
 //! ([`handoff`]).
 
 pub mod frame;
+/// The privileged BPF fd handoff is built on `SCM_RIGHTS` over a Unix socket,
+/// which has no Windows equivalent, so the module exists only on Unix.
+#[cfg(unix)]
 pub mod handoff;

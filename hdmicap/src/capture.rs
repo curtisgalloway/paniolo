@@ -44,7 +44,14 @@ pub struct DeviceInfo {
 }
 
 /// How the user asked us to pick a device.
+///
+/// The payloads are read only when a capture backend resolves them, so a
+/// platform with no backend compiled in never touches them.
 #[derive(Clone, Debug)]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", windows)),
+    allow(dead_code)
+)]
 pub enum DeviceSpec {
     Auto,
     Index(u32),
@@ -69,6 +76,12 @@ impl DeviceSpec {
     }
 }
 
+// Only a real capture backend resolves a device, so on a backend-less platform
+// these are unreferenced by design rather than dead.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", windows)),
+    allow(dead_code)
+)]
 const BUILTIN_HINTS: &[&str] = &["facetime", "built-in", "integrated", "isight"];
 
 /// One captured frame in its native form. `jpeg` carries raw MJPEG bytes when
@@ -176,12 +189,12 @@ pub fn enumerate_capture() -> Result<Vec<DeviceInfo>> {
     Ok(devices)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 pub fn enumerate_capture() -> Result<Vec<DeviceInfo>> {
     enumerate()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 pub fn enumerate() -> Result<Vec<DeviceInfo>> {
     use std::ffi::{c_char, c_void, CStr};
 
@@ -243,6 +256,10 @@ pub fn resolve(spec: &DeviceSpec) -> Result<u32> {
 /// otherwise case-insensitive name substring, which must match exactly one
 /// device — a first-match-wins guess is how two identical dongles end up
 /// silently swapped.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", windows)),
+    allow(dead_code)
+)]
 fn resolve_in(devices: &[DeviceInfo], spec: &DeviceSpec) -> Result<u32> {
     if devices.is_empty() {
         return Err(anyhow!("no capture devices found"));
@@ -287,10 +304,59 @@ pub fn open_backend(spec: &DeviceSpec) -> Result<Box<dyn CaptureBackend>> {
     {
         linux::LinuxV4LBackend::open(spec).map(|b| Box::new(b) as Box<dyn CaptureBackend>)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
         macos::AvfBackend::open(spec).map(|b| Box::new(b) as Box<dyn CaptureBackend>)
     }
+    #[cfg(windows)]
+    {
+        capture_mf::MfBackend::open(spec).map(|b| Box::new(b) as Box<dyn CaptureBackend>)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = spec;
+        Err(unsupported())
+    }
+}
+
+/// Windows capture, in its own file because it is as substantial as the
+/// AVFoundation layer it parallels.
+#[cfg(windows)]
+#[path = "capture_mf.rs"]
+mod capture_mf;
+
+/// Platforms with no capture backend compiled in.
+///
+/// Windows would need a Media Foundation implementation to sit beside the V4L2
+/// and AVFoundation ones; until that exists, every entry point fails with this
+/// rather than pretending there are zero devices attached — a silent empty list
+/// reads as "nothing plugged in" and sends you hunting for a hardware fault.
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn unsupported() -> anyhow::Error {
+    anyhow!(
+        "hdmicap has no capture backend on this platform \
+         (V4L2 on Linux, AVFoundation on macOS; Windows would need Media Foundation)"
+    )
+}
+
+#[cfg(windows)]
+pub fn enumerate_capture() -> Result<Vec<DeviceInfo>> {
+    enumerate()
+}
+
+#[cfg(windows)]
+pub fn enumerate() -> Result<Vec<DeviceInfo>> {
+    capture_mf::enumerate()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub fn enumerate_capture() -> Result<Vec<DeviceInfo>> {
+    Err(unsupported())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub fn enumerate() -> Result<Vec<DeviceInfo>> {
+    Err(unsupported())
 }
 
 // ── Linux backend ─────────────────────────────────────────────────────────────
@@ -418,7 +484,7 @@ mod linux {
 
 // ── macOS backend ─────────────────────────────────────────────────────────────
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 mod macos {
     use std::ffi::{c_char, c_void, CStr, CString};
     use std::sync::Arc;

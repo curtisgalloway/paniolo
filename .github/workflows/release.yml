@@ -166,10 +166,133 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  package-windows:
+    name: package (windows x86_64)
+    runs-on: windows-latest
+    # `environment: release` is what puts `:environment:` in the OIDC subject
+    # the federated credential matches, exactly as in oh-brother. It also gates
+    # the whole job behind the environment's reviewer approval.
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x86_64
+          workspaces: |
+            cli
+            hdmicap
+            serialcap
+            netbootd
+            cambrionix
+            hidrig
+            ch9329
+            usbhub
+            shellyplug
+            amt
+
+      # The portable layout the CLI's helper lookup expects on Windows:
+      #   paniolo\paniolo.exe        <- the only thing that goes on PATH
+      #   paniolo\libexec\*.exe     <- helpers, found relative to the exe
+      # There is no bin/libexec split on Windows, so the exe's own directory is
+      # the install prefix (see `exe_relative_dirs` in cli/src/daemons.rs).
+      - name: Build every crate
+        shell: pwsh
+        run: |
+          $stage = "dist/paniolo"
+          New-Item -ItemType Directory -Force -Path "$stage/libexec" | Out-Null
+          cargo build --release --manifest-path cli/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Copy-Item cli/target/release/paniolo.exe "$stage/paniolo.exe"
+          foreach ($h in "$env:HELPERS".Split(" ")) {
+            cargo build --release --manifest-path "$h/Cargo.toml"
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+            Copy-Item "$h/target/release/$h.exe" "$stage/libexec/$h.exe"
+          }
+          # netbootd's privileged BPF helper is a macOS-only setuid binary; it
+          # builds to a stub off macOS and has no business in a Windows zip.
+          Get-ChildItem "$stage/libexec" | Select-Object -ExpandProperty Name
+
+      # ---- Signing (skips entirely until the Azure vars are set) ----
+      # Same Artifact Signing account and OIDC identity as oh-brother. No
+      # subscription-id and allow-no-subscriptions on purpose: the signing
+      # identity holds only the certificate-profile signer role, so an ordinary
+      # login dies with "No subscriptions found".
+      - name: Azure login (OIDC)
+        if: ${{ vars.AZURE_SIGNING_ACCOUNT != '' }}
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      # Every exe is signed *before* zipping: a zip carries no Authenticode
+      # signature, and SmartScreen judges the exe the user runs. That is ten
+      # files rather than oh-brother's three, but one glob covers them, and
+      # none of Burn's engine detach/reattach dance applies to a portable zip.
+      #
+      # timestamp-rfc3161 is set explicitly rather than left to the action's
+      # default: Artifact Signing certificates live 72 hours, so an
+      # untimestamped signature verifies on release day and dies three days
+      # later, in the field, where nobody is watching.
+      - name: Sign binaries
+        if: ${{ vars.AZURE_SIGNING_ACCOUNT != '' }}
+        uses: Azure/artifact-signing-action@v2.0.0
+        with:
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\dist\paniolo
+          files-folder-filter: exe
+          files-folder-recurse: true
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # Confirm the signing landed rather than trusting that it did, and assert
+      # the timestamp for the 72-hour reason above.
+      - name: Verify signatures
+        if: ${{ vars.AZURE_SIGNING_ACCOUNT != '' }}
+        shell: pwsh
+        run: |
+          $failed = $false
+          Get-ChildItem dist/paniolo -Recurse -Filter *.exe | ForEach-Object {
+            $sig = Get-AuthenticodeSignature $_.FullName
+            Write-Host "$($_.Name): $($sig.Status)"
+            if ($sig.Status -ne 'Valid') {
+              Write-Host "::error::$($_.Name) is not validly signed ($($sig.Status))"
+              $failed = $true
+            }
+            if (-not $sig.TimeStamperCertificate) {
+              Write-Host "::error::$($_.Name) has no RFC3161 timestamp; its signature dies with the 72-hour certificate"
+              $failed = $true
+            }
+          }
+          if ($failed) { exit 1 }
+
+      - name: Zip
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}" -replace '^v',''
+          if (-not $ver) { $ver = "dev" }
+          Compress-Archive -Path dist/paniolo -DestinationPath "dist/paniolo-$ver-x86_64-pc-windows-msvc.zip"
+          Get-FileHash "dist/paniolo-$ver-x86_64-pc-windows-msvc.zip" -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |
+            Out-File -Encoding ascii "dist/paniolo-$ver-x86_64-pc-windows-msvc.zip.sha256"
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: packages-windows-x86_64
+          path: dist/*.zip*
+          if-no-files-found: error
+
   release:
     name: attach to GitHub Release
     if: github.ref_type == 'tag'
-    needs: package
+    needs: [package, package-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -182,6 +305,31 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+
+  winget:
+    name: publish to winget
+    # Tag-only, and skips prereleases like v0.2.0-rc.1. A no-op until
+    # WINGET_TOKEN exists. The FIRST version must be submitted by hand
+    # (wingetcreate or komac) to create the package — this action only updates
+    # packages that already exist.
+    if: ${{ github.ref_type == 'tag' && !contains(github.ref_name, '-') }}
+    needs: release
+    runs-on: ubuntu-latest
+    env:
+      # The secrets context is not allowed in a step `if` (it is a parse error
+      # that invalidates the whole workflow) — test it through env.
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    steps:
+      - name: Publish to winget (update PR)
+        if: ${{ env.WINGET_TOKEN != '' }}
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: CurtisGalloway.Paniolo
+          installers-regex: '\.zip$'
+          token: ${{ secrets.WINGET_TOKEN }}
+      - name: Skipped (no WINGET_TOKEN)
+        if: ${{ env.WINGET_TOKEN == '' }}
+        run: echo "WINGET_TOKEN not set — skipping winget publish."
 
   bump-tap:
     name: bump Homebrew tap

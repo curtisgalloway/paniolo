@@ -77,7 +77,7 @@ pub fn start_daemon(ifaces: &[SerialChannel], port: u16, target: &str) -> Result
     )?;
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
     // Detach into its own process group so it survives this CLI exiting.
-    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    crate::platform::detach(&mut cmd);
     cmd.spawn()?;
     Ok(())
 }
@@ -119,7 +119,7 @@ pub fn send_input(base_url: &str, interface: &str, data: &[u8], pace_ms: u32) ->
 pub fn exec_tio(device: &str, baud: i64) -> Result<()> {
     let tio = daemons::find_binary("tio")
         .ok_or_else(|| anyhow!("tio not found in PATH — install it (e.g. brew install tio)"))?;
-    let err = std::os::unix::process::CommandExt::exec(
+    let err = crate::platform::exec_replace(
         Command::new(tio)
             .arg("--baudrate")
             .arg(baud.to_string())
@@ -134,7 +134,28 @@ pub fn exec_tio(device: &str, baud: i64) -> Result<()> {
 /// physical port, named by its stable /dev/serial symlink — by-id preferred
 /// (names the adapter; what lab files typically use), by-path as the fallback
 /// (port-derived; the only stable name for adapters without a serial number).
+/// On Windows the OS assigns `COM<n>` names and there is no stable by-path
+/// analogue, so the enumeration comes from the `serialport` crate as-is.
 pub fn list_devices() -> Vec<String> {
+    let mut out = enumerate_devices();
+    out.sort();
+    out
+}
+
+/// Windows enumeration: whatever the OS reports as a serial port.
+///
+/// COM numbers are assigned by the OS and can move when an adapter is
+/// re-enumerated, so a lab file pinned to `COM7` is not as stable as a Linux
+/// by-id path. There is no better handle to offer.
+#[cfg(windows)]
+fn enumerate_devices() -> Vec<String> {
+    serialport::available_ports()
+        .map(|ports| ports.into_iter().map(|p| p.port_name).collect())
+        .unwrap_or_default()
+}
+
+#[cfg(not(windows))]
+fn enumerate_devices() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if cfg!(target_os = "macos") {
         if let Ok(rd) = std::fs::read_dir("/dev") {
@@ -175,13 +196,13 @@ pub fn list_devices() -> Vec<String> {
             }
         }
     }
-    out.sort();
     out
 }
 
 /// The display name for one physical port's symlink aliases: the by-id name
 /// when the adapter has one, else the first (sorted) alias — which keeps the
 /// plain `usb` by-path variant ahead of its `usbv2` twin.
+#[cfg(not(windows))]
 fn preferred_alias(aliases: &[String]) -> Option<&String> {
     aliases
         .iter()
@@ -220,6 +241,9 @@ mod tests {
         );
     }
 
+    // `preferred_alias` serves the /dev/serial enumeration, which does not
+    // exist on Windows.
+    #[cfg(not(windows))]
     #[test]
     fn preferred_alias_picks_by_id_over_by_path() {
         let aliases = vec![
@@ -233,6 +257,9 @@ mod tests {
         );
     }
 
+    // `preferred_alias` serves the /dev/serial enumeration, which does not
+    // exist on Windows.
+    #[cfg(not(windows))]
     #[test]
     fn preferred_alias_falls_back_to_first_sorted_by_path() {
         // No by-id (adapter without a serial number): the plain `usb` by-path

@@ -39,8 +39,6 @@ thiserror = "2"
 # --- Paths ---------------------------------------------------------------
 dirs = "5"
 
-# --- uid for the per-user ControlMaster socket dir; daemon pid checks ----
-libc = "0.2"
 
 # --- talking to the serialcap/hdmicap daemons (localhost HTTP) -----------
 ureq = { version = "2", features = ["json"] }
@@ -48,6 +46,19 @@ serde_json = "1"
 
 # --- direct DTR control fallback when serialcap isn't running ------------
 serialport = "4"
+
+# --- process/identity primitives behind cli/src/platform.rs --------------
+# uid for the per-user runtime + ControlMaster dirs, and the daemon pid
+# probes. Each platform gets only what it can use: libc on Unix, the Win32
+# process APIs on Windows.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tempfile = "3"

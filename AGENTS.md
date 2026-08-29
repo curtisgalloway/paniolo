@@ -852,46 +852,241 @@ when the `Makefile`, release `HELPERS`, or `HELPER_CRATES` lists omit a crate,
 so the mechanical ones can't drift again; the release smoke test also verifies
 every `HELPERS` binary landed in the installed `.deb`.
 
-## Linux support
+## Platform support
 
-Paniolo runs on Linux as well as macOS. Platform differences:
+Paniolo runs on three host platforms:
 
-- **OCR backend is platform-specific.** macOS uses Apple Vision (`visionocr.swift`,
-  compiled by `paniolo setup`). Linux uses Tesseract (`ocr/linuxocr`, copied by
-  `paniolo setup`; requires `tesseract-ocr` system package). Both expose the same
-  stdin-PNG → stdout-text interface via `PANIOLO_VISIONOCR`.
-- **Netboot uses `sudo` internally on Linux.** DHCP (port 67) and TFTP (port 69)
-  require root on Linux; macOS 14+ allows them rootless. `paniolo netboot start`
-  auto-prepends `sudo` when spawning `netbootd` on Linux. With passwordless
-  sudoers this is transparent; otherwise sudo prompts for a password. Interface
-  config (`ip addr add`) also uses sudo, same as macOS uses it for `ifconfig`.
-- **Interface management uses `ip` on Linux.** `netif::configure_interface()`
-  runs `ip addr add`/`ip link set up` (iproute2) instead of
-  `networksetup`+`ifconfig`; `restore_interface()` flushes with
-  `ip addr flush dev <iface>`. (See `cli/src/netif.rs`.)
-- **ARP pinning uses `ip neigh replace` on Linux.** netbootd's ARP pin calls
-  `arp -s` on macOS and `ip neigh replace ... nud permanent` on Linux.
-- **BPF raw-frame sender is macOS-only.** netbootd's BPF sender uses `/dev/bpf*`
-  ioctls that don't exist on Linux; on Linux it is unavailable and the server
-  falls back to normal `sendto()` with retry. On macOS netbootd receives the
-  `/dev/bpf` descriptor from the setuid `netbootd-bpf-helper` and stays
-  unprivileged (see the **netbootd** section).
-- **hdmicap build deps on Linux.** Building hdmicap requires system packages:
-  `build-essential pkg-config libclang-dev clang` (for V4L2 bindgen via
-  `v4l2-sys-mit`) plus `cmake nasm` (the `turbojpeg` crate builds a vendored
-  libjpeg-turbo — Debian's system libturbojpeg is too old for its pkg-config
-  path, and the crate's `require-simd` default makes nasm mandatory on
-  x86-64). `make install` fails early with a hint if any are missing
-  (`check-deps` in the Makefile); `paniolo setup` prints a reminder.
-- **Interface listing uses sysfs on Linux.** `list_usb_ethernet_interfaces()`
-  reads `/sys/class/net/` (type, carrier) instead of `networksetup`.
-- **Serial device paths use by-path symlinks on Linux.** `list_serial_devices()`
-  returns `/dev/serial/by-path/` entries when available; `canonical_device_path()`
-  upgrades a raw `ttyUSBX` path to its stable symlink. Store by-path paths in
-  target configs so serial interfaces survive USB adapter re-enumeration. The
-  serialcap `--interface` parser accepts by-path paths (colons in the path are
-  not confused with the optional `:SENSE` suffix because only known signal names
-  `cts`, `dsr`, `dcd`, `ri` are treated as the sense suffix).
+| Platform | Status | CI | Release artifacts |
+| --- | --- | --- | --- |
+| macOS (Apple Silicon) | Supported | `macos` job in `ci.yml` | Homebrew tap (arm64 bottle) |
+| Linux (Debian/Ubuntu) | Supported | the `ubuntu-latest` jobs in `ci.yml` | `.deb` + tarball from `release.yml` |
+| Windows (x86_64-msvc) | Supported; power and video hardware-verified | `windows` job in `ci.yml` | portable zip + winget |
+
+All ten crates build, lint clean under `clippy -D warnings`, and pass their
+unit tests on all three. The `windows` CI job runs the same fmt/clippy/test
+triple as the Linux jobs, because a Unix-only CI cannot tell you whether the
+Windows `#[cfg]` arm still compiles.
+
+**Hardware-verified on Windows** (bench host `brik`, 2026-08-28, against a
+Shelly Plug and an Openterface KVM-GO):
+
+- **power** — `shellyplug` on/off/cycle, each confirmed by read-back.
+- **video** — `hdmicap` enumerates the capture device by its symbolic-link id
+  and captures native 3840x2160 frames through the Media Foundation backend;
+  daemon start, `shot` and `stop` all work.
+- **hid** — `ch9329` over a COM port reports `target_connected=true` and its
+  mouse moves wake the attached machine, which is how the first (black) capture
+  turned into a real frame. Keystroke delivery is confirmed by that wake rather
+  than by the CH9329's LED read-back, which stayed `false`.
+
+**What is still NOT verified on Windows:**
+
+- **usbhub cannot claim a hub.** Windows routes control transfers through a
+  claimed interface, and USB hubs are owned by Microsoft's `usbhub.sys`, which
+  does not permit claiming. `hub::ControlHandle::open` is structurally correct
+  and expected to fail against a real hub; per-port power on Windows needs a
+  hub-driver route (`IOCTL_USB_HUB_CYCLE_PORT` or similar). Note that IOCTL only
+  *cycles* a port — it has no arbitrary on/off — so whether paniolo's power model
+  maps onto Windows at all is an open design question, not just unwritten code.
+- **netbootd falls back to `send_to`.** The `/dev/bpf` raw-frame sender and the
+  `SCM_RIGHTS` fd handoff are Unix-only, exactly as on Linux. Whether DHCP/TFTP
+  netboot works against a real target on Windows is untested, and `netif` has no
+  Windows implementation to configure the interface with.
+- **hidrig has no console bridge.** The PTY the `serial` channel points its
+  `device =` at has no Windows analogue — ConPTY is not a substitute, since it
+  exposes no filesystem node another process can open. HID and control are
+  unaffected.
+- **OCR is absent.** Neither Apple Vision nor Tesseract has a Windows
+  counterpart wired up. `Windows.Media.Ocr` is the in-box candidate, and the
+  `windows` crate is already a hdmicap dependency for capture.
+- **Remote dispatch cannot target a Windows control host.** `ssh::remote_command`
+  emits POSIX shell (`VAR='v' paniolo …`); against brik's default PowerShell that
+  fails with "The term 'FOO=bar' is not recognized". Windows works as a *local*
+  control host, not yet as a remote one.
+
+### Writing portable code here
+
+The POSIX primitives paniolo depends on live behind `cli/src/platform.rs`, with
+one implementation per platform and a single documented contract each:
+`current_uid`, `runtime_root`, `ensure_private_dir`, `make_executable`,
+`pid_alive`, `signal_pid` / `try_signal_pid` / `terminate_pid`, `is_superuser`,
+`detach`, `exec_replace`. **Reach for those rather than `libc` or
+`std::os::unix` at a call site** — that is the rule the port established, and
+the reason it is one small module instead of `#[cfg]` scattered through twenty
+files.
+
+A trimmed copy of the module is duplicated into hdmicap, serialcap, ch9329 and
+hidrig. That is deliberate and matches how `daemon.rs` is already duplicated:
+these are standalone cargo projects with no crate between them. **Keep the five
+copies in sync.**
+
+Two semantic differences are worth knowing before you rely on them:
+
+- **Windows has no signals.** Both `Signal::Term` and `Signal::Kill` land on
+  `TerminateProcess`, so a Windows daemon never runs its graceful-shutdown path
+  (discovery-file removal, the 300 ms grace) and may leave a stale discovery
+  file for the next `pid_alive` probe to reap.
+- **Windows has no uid.** The runtime namespace uses an FNV hash of `%USERNAME%`
+  — stable per user, meaningless on its own, and never used for an
+  authorization decision. The 0700-plus-ownership check on the runtime dir
+  becomes "exists and is a directory", because the path sits inside the user's
+  own profile whose inherited ACL already excludes other non-admin users.
+
+### Testing the platform split
+
+A `#[cfg]` that compiles is not a `#[cfg]` that works, and the tests have to
+know the difference. `paniolo doctor` shipped in the first cut of the Windows
+port depending on `sh -c` — a binary Windows does not have — and CI was green,
+because the doctor tests asserted on the **text** of the generated shell script
+rather than running it. A string-shape test passes identically on every
+platform; it can only tell you what a command *would* say, never whether it can
+launch.
+
+So: **anything that spawns a process, touches the filesystem, or resolves a
+name gets a test that executes it.** The ones that matter live in
+`cli/src/platform.rs` (`pid_alive` against a real child, `shell_command`
+running a command and reading its exit code back, `ensure_private_dir`
+creating then revalidating), `cli/src/doctor.rs` (every `Probe` variant run
+natively via `run_local`), and `cli/src/daemons.rs` (`find_binary` resolving a
+bare name to a real file through `$PATH`).
+
+Two bugs were found by writing exactly those tests, one of them serious:
+
+- **Non-positive pids were unguarded on Unix.** `kill()` reads 0 as "every
+  process in my group" and -1 as "every process I may signal", so a zero or
+  corrupt pid in a discovery file made `pid_alive` answer *running* and would
+  have made `signal_pid(.., Kill)` take down paniolo and the shell that
+  launched it. `is_real_pid` now guards every entry point, in all five copies
+  of the module, with a test in each so the guard cannot quietly go missing.
+- **Opaque lab-file commands ran through `sh -c`.** Power hooks and the hid
+  `cmd` are user-written strings that need a shell; `platform::shell_command`
+  now supplies `sh` on Unix and `cmd.exe` on Windows.
+
+`doctor` no longer needs a shell locally at all. Probes are a `Probe` enum with
+two views — `run_local()` executes natively, `to_posix()` renders the POSIX
+script still used for the SSH hop to a Unix control host — so the local path
+and the remote path cannot drift apart silently.
+
+### Windows packaging
+
+The Windows artifact is a **portable zip**, not an MSI — paniolo is a CLI plus
+nine helpers, so the Windows analogue of the Homebrew tap and the `.deb` is a
+tarball of binaries, not an installer. (Contrast `~/src/oh-brother`, which needs
+WiX + a Burn bundle because it is a GUI app bootstrapping a WebView2 runtime.)
+
+The layout is flat, because Windows has no bin/libexec split to hang helpers
+off — the exe's own directory *is* the install prefix:
+
+```
+paniolo\
+  paniolo.exe          <- the only thing that goes on PATH
+  libexec\
+    hdmicap.exe  serialcap.exe  netbootd.exe  hidrig.exe  …
+```
+
+`daemons::exe_relative_dirs` adds `<exe dir>\libexec` on Windows, and
+`daemons::find_binary` tries `<name>.exe` before the bare name. `paniolo setup`
+on Windows does nothing but verify that layout: there is no setuid bit, no
+`dialout` group, and no OCR helper to build.
+
+Signing reuses oh-brother's Azure Artifact Signing setup — same account, same
+OIDC identity, same action. Three differences from that pipeline: the **exes are
+signed before zipping** (a zip carries no Authenticode signature, and SmartScreen
+judges the exe), it is **ten files rather than three** (one glob, no Burn engine
+detach/reattach — that dance is MSI-bundle-specific), and the RFC3161 timestamp
+is asserted in a verify step for the same reason as there: Artifact Signing
+certificates live 72 hours, so an untimestamped signature passes on release day
+and dies in the field three days later.
+
+`release.yml` gains `package-windows` (build → sign → verify → zip) and a
+`winget` job. Both no-op until their credentials exist: signing skips while
+`vars.AZURE_SIGNING_ACCOUNT` is unset, winget while `secrets.WINGET_TOKEN` is.
+**The first winget version must be submitted by hand** (`wingetcreate` or
+`komac`) — the action only updates a package that already exists.
+
+### Developing against Windows
+
+`brik.h.curtisg.xyz` (10.66.30.58) is the Windows bench host: SSH lands in
+PowerShell 7, `$HOME` is `C:\Users\curti` (not `curtisg`), and the repo is
+cloned at `C:\Users\curti\src\paniolo`. `scripts/sync-brik.sh <crate>…`
+pushes sources there (it excludes `target/`, which is gigabytes and stalls the
+transfer). The MSVC linker resolves without a Developer Prompt.
+
+A local `cargo check --target x86_64-pc-windows-msvc` catches most `#[cfg]`
+mistakes without leaving macOS, but **only for crates with no C dependency** —
+anything pulling `ring` (i.e. anything with TLS) fails at its build script for
+want of Windows headers. Those need the real host.
+
+Per-subsystem behavior:
+
+- **OCR backend.**
+  - *macOS:* Apple Vision (`visionocr.swift`, compiled by `paniolo setup`).
+  - *Linux:* Tesseract (`ocr/linuxocr`, copied by `paniolo setup`; requires the
+    `tesseract-ocr` system package).
+  - *Windows:* none. A port would supply a third binary behind the same
+    stdin-PNG → stdout-text interface that both current backends expose via
+    `PANIOLO_VISIONOCR`.
+- **Netboot privileges.**
+  - *macOS:* 14+ allows DHCP (port 67) and TFTP (port 69) rootless; `sudo` is
+    used only for interface config (`ifconfig`).
+  - *Linux:* both ports require root, so `paniolo netboot start` auto-prepends
+    `sudo` when spawning `netbootd`, and `ip addr add` uses sudo too. With
+    passwordless sudoers this is transparent; otherwise sudo prompts.
+  - *Windows:* neither port is privileged — Windows has no low-port
+    restriction — so `netbootd` is spawned directly with no `sudo` prefix.
+- **Interface management** (`cli/src/netif.rs`, `netif::configure_interface()` /
+  `restore_interface()`).
+  - *macOS:* `networksetup` + `ifconfig`.
+  - *Linux:* iproute2 — `ip addr add` / `ip link set up`, flushed with
+    `ip addr flush dev <iface>`.
+  - *Windows:* not implemented.
+- **ARP pinning** (netbootd).
+  - *macOS:* `arp -s`.
+  - *Linux:* `ip neigh replace ... nud permanent`.
+  - *Windows:* not implemented.
+- **Raw-frame sender** (netbootd).
+  - *macOS:* BPF sender over `/dev/bpf*` ioctls; netbootd receives the `/dev/bpf`
+    descriptor from the setuid `netbootd-bpf-helper` and stays unprivileged (see
+    the **netbootd** section).
+  - *Linux:* no BPF path — the ioctls don't exist; the server falls back to a
+    normal `sendto()` with retry.
+  - *Windows:* not implemented.
+- **Interface listing** (`list_usb_ethernet_interfaces()`).
+  - *macOS:* `networksetup`.
+  - *Linux:* sysfs — `/sys/class/net/` (type, carrier).
+  - *Windows:* not implemented.
+- **Serial device paths** (`serial::list_devices()`, `cli/src/serial.rs`).
+  - *macOS:* scans `/dev` for `tty.usbserial-*` and `tty.usbmodem*` nodes.
+  - *Linux:* one entry per physical port, named by its stable `/dev/serial`
+    symlink — `by-id` preferred (names the adapter; what lab files typically
+    use), `by-path` as the fallback (port-derived; the only stable name for
+    adapters without a serial number), picked by `preferred_alias()`; raw
+    `/dev/ttyUSB*`/`ttyACM*` only if no symlinks exist. Store a stable symlink
+    path in target configs so serial interfaces survive USB adapter
+    re-enumeration. The serialcap `--interface` parser accepts these paths
+    (colons in a by-path name are not confused with the optional `:SENSE`
+    suffix because only the known signal names `cts`, `dsr`, `dcd`, `ri` are
+    treated as the sense suffix).
+  - *Windows:* `serialport::available_ports()` returns the OS's `COM<n>`
+    names. There is no by-path analogue, so a lab file pinned to `COM7` is
+    less stable than a Linux by-id path — the number can move when an adapter
+    is re-enumerated.
+- **hdmicap capture + build deps.**
+  - *macOS:* our own AVFoundation layer (`hdmicap/src/capture_avf.m`); no extra
+    system packages beyond the Xcode toolchain.
+  - *Linux:* V4L2 with a raw-MJPEG tee. Building requires `build-essential
+    pkg-config libclang-dev clang` (V4L2 bindgen via `v4l2-sys-mit`) plus `cmake
+    nasm` (the `turbojpeg` crate builds a vendored libjpeg-turbo — Debian's
+    system libturbojpeg is too old for its pkg-config path, and the crate's
+    `require-simd` default makes nasm mandatory on x86-64). `make install` fails
+    early with a hint if any are missing (`check-deps` in the Makefile);
+    `paniolo setup` prints a reminder.
+  - *Windows:* our own Media Foundation layer (`hdmicap/src/capture_mf.rs`),
+    delivering NV12 so it reuses the macOS pixel path. It enumerates the
+    device's *native* media types and selects one explicitly — the Windows form
+    of the AVFoundation lesson below, and the reason an Openterface captures at
+    its real 3840x2160 instead of a rescaled 1080p. MJPEG-only devices are not
+    yet supported.
 
 ## Known limitations / gotchas
 

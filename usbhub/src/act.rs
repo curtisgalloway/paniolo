@@ -39,7 +39,7 @@ pub trait PortSwitch {
 /// Live topology snapshot plus the handles to open devices from it.
 pub struct DeviceTable {
     handles: HashMap<DevKey, nusb::DeviceInfo>,
-    open: HashMap<DevKey, nusb::Device>,
+    open: HashMap<DevKey, hub::ControlHandle>,
 }
 
 impl DeviceTable {
@@ -57,7 +57,7 @@ impl DeviceTable {
     }
 
     /// Open (or reuse) the live device for a snapshot record.
-    pub fn device(&mut self, rec: &DevRecord) -> Result<&nusb::Device> {
+    pub fn device(&mut self, rec: &DevRecord) -> Result<&hub::ControlHandle> {
         let key = rec.key();
         if !self.open.contains_key(&key) {
             let info = self.handles.get(&key).with_context(|| {
@@ -73,7 +73,8 @@ impl DeviceTable {
                     key
                 )
             })?;
-            self.open.insert(key.clone(), dev);
+            self.open
+                .insert(key.clone(), hub::ControlHandle::open(dev)?);
         }
         Ok(&self.open[&key])
     }

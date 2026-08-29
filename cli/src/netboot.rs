@@ -48,7 +48,7 @@ pub struct BootOptions {
 fn cleanup_stale(target: &str) {
     if let Some(s) = state::load_netboot_state(target) {
         if s.engine == "rust" && state::is_named_child_alive(s.dhcp_pid, "netbootd") {
-            unsafe { libc::kill(s.dhcp_pid, libc::SIGTERM) };
+            crate::platform::signal_pid(s.dhcp_pid, crate::platform::Signal::Term);
         }
     }
     state::remove_netboot_state(target);
@@ -96,7 +96,8 @@ pub fn start(
     let netbootd = resolve_netbootd()?;
     // Linux needs root for ports 67/69; sudo resets the env, so NO_COLOR rides
     // through `env` in the prefix. macOS runs unprivileged (bpf-helper).
-    let mut cmd = if cfg!(target_os = "macos") || unsafe { libc::getuid() } == 0 {
+    let needs_sudo = cfg!(target_os = "linux") && !crate::platform::is_superuser();
+    let mut cmd = if !needs_sudo {
         let mut c = Command::new(&netbootd);
         c.env("NO_COLOR", "1");
         c
@@ -122,7 +123,7 @@ pub fn start(
         cmd.arg("--content-type").arg(ct);
     }
     cmd.stdin(Stdio::null()).stdout(log).stderr(log_err);
-    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    crate::platform::detach(&mut cmd);
     let child = cmd.spawn()?;
 
     state::save_netboot_state(&NetbootState {
@@ -143,14 +144,14 @@ pub fn stop(target: &str) -> Result<()> {
     let s = state::load_netboot_state(target)
         .ok_or_else(|| anyhow!("no netboot state for '{target}'"))?;
     for pid in [s.dhcp_pid, s.tftp_pid] {
-        if state::is_pid_alive(pid) {
-            let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
-            if rc != 0 {
-                // Likely EPERM (started under sudo on Linux) — escalate.
-                let _ = Command::new("sudo")
-                    .args(["kill", "-TERM", &pid.to_string()])
-                    .status();
-            }
+        if state::is_pid_alive(pid)
+            && !crate::platform::try_signal_pid(pid, crate::platform::Signal::Term)
+        {
+            // Likely EPERM (started under sudo on Linux) — escalate.
+            #[cfg(unix)]
+            let _ = Command::new("sudo")
+                .args(["kill", "-TERM", &pid.to_string()])
+                .status();
         }
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);

@@ -51,6 +51,20 @@ pub fn system_libexec_dir() -> PathBuf {
     PathBuf::from("/usr/libexec/paniolo/bin")
 }
 
+/// Candidate file names for a helper in a directory.
+///
+/// Windows requires the `.exe` suffix to execute a file and the packaged
+/// helpers carry it, but every caller names helpers bare (`"hdmicap"`), so the
+/// suffixed name is tried first and the bare one kept as a fallback for a
+/// cross-built or extension-less binary. On Unix there is only ever one name.
+fn binary_names(name: &str) -> Vec<String> {
+    if cfg!(windows) && !name.ends_with(".exe") {
+        vec![format!("{name}.exe"), name.to_string()]
+    } else {
+        vec![name.to_string()]
+    }
+}
+
 /// Helper dirs relative to the running CLI binary, after resolving symlinks
 /// (Homebrew links `<prefix>/bin/paniolo` into the versioned keg):
 /// `../libexec/bin` (Homebrew keg layout) and `../libexec/paniolo/bin`
@@ -66,10 +80,19 @@ fn exe_relative_dirs() -> Vec<PathBuf> {
     let Some(prefix) = exe.parent().and_then(|d| d.parent()) else {
         return Vec::new();
     };
-    vec![
+    let mut dirs = vec![
         prefix.join("libexec/bin"),
         prefix.join("libexec/paniolo/bin"),
-    ]
+    ];
+    // The portable Windows layout is `paniolo\paniolo.exe` with the helpers in
+    // `paniolo\libexec` beside it — the exe's own directory is the install
+    // prefix there, since Windows has no bin/libexec split to hang them off.
+    if cfg!(windows) {
+        if let Some(exe_dir) = exe.parent() {
+            dirs.push(exe_dir.join("libexec"));
+        }
+    }
+    dirs
 }
 
 /// The paniolo helper directories, in resolution order: the per-user libexec
@@ -95,22 +118,30 @@ pub fn helper_dirs() -> Vec<PathBuf> {
 /// transitional fallback). Never the in-repo build tree, so a running daemon
 /// can't point at an ephemeral build artifact.
 pub fn find_binary(name: &str) -> Option<PathBuf> {
+    let names = binary_names(name);
     for dir in helper_dirs() {
-        let p = dir.join(name);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let p = dir.join(name);
+        for n in &names {
+            let p = dir.join(n);
             if p.is_file() {
                 return Some(p);
             }
         }
     }
-    let cargo = dirs::home_dir()?.join(".cargo/bin").join(name);
-    cargo.is_file().then_some(cargo)
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            for n in &names {
+                let p = dir.join(n);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    let cargo_bin = dirs::home_dir()?.join(".cargo/bin");
+    names
+        .iter()
+        .map(|n| cargo_bin.join(n))
+        .find(|p| p.is_file())
 }
 
 /// PATH value with the libexec dir prepended, for `sh -c` hook commands
@@ -135,7 +166,7 @@ pub fn hook_path() -> std::ffi::OsString {
 pub fn runtime_root() -> PathBuf {
     std::env::var_os("PANIOLO_RUNTIME_BASE")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .unwrap_or_else(crate::platform::default_runtime_root)
 }
 
 /// Stable per-user runtime base: `<root>/paniolo-<uid>`, identical in every
@@ -144,8 +175,7 @@ pub fn runtime_root() -> PathBuf {
 /// Keep in sync with `runtime_dir()` in hdmicap/src/daemon.rs and
 /// serialcap/src/daemon.rs.
 fn runtime_base() -> PathBuf {
-    // Safe: getuid is always successful.
-    let uid = unsafe { libc::getuid() };
+    let uid = crate::platform::current_uid();
     runtime_root().join(format!("paniolo-{uid}"))
 }
 
@@ -188,22 +218,8 @@ pub fn runtime_rel(name: &str, instance: Option<&str>) -> String {
 /// `instance` is `Some(target)` for per-target capture daemons (serialcap,
 /// hdmicap, hid), `None` for host-singleton daemons (zigplug, cambrionix, …).
 pub fn ensure_runtime_dir(name: &str, instance: Option<&str>) -> Result<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     let base = runtime_base();
-    match std::fs::DirBuilder::new().mode(0o700).create(&base) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let uid = unsafe { libc::getuid() };
-            let md = std::fs::symlink_metadata(&base)?;
-            if !md.is_dir() || md.uid() != uid {
-                return Err(anyhow!(
-                    "{} exists but is not a directory owned by uid {uid}",
-                    base.display()
-                ));
-            }
-        }
-        Err(e) => return Err(e.into()),
-    }
+    crate::platform::ensure_private_dir(&base)?;
     let dir = base.join(runtime_rel(name, instance));
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
@@ -306,8 +322,7 @@ pub fn start_failure(name: &str, instance: Option<&str>, timeout: Duration) -> a
 }
 
 fn pid_alive(pid: i32) -> bool {
-    // Safe: kill(pid, 0) only probes for existence.
-    unsafe { libc::kill(pid, 0) == 0 }
+    crate::platform::pid_alive(pid)
 }
 
 // ── binary staleness ─────────────────────────────────────────────────────────
@@ -511,11 +526,8 @@ pub fn list_stray_helpers(exclude_pids: &[i32]) -> Vec<(i32, String)> {
 }
 
 /// Send `signal` to `pid` (best-effort).
-pub fn signal_pid(pid: i32, signal: i32) {
-    // Safe: sending a signal to a pid we just enumerated; failure is fine.
-    unsafe {
-        libc::kill(pid, signal);
-    }
+pub fn signal_pid(pid: i32, signal: crate::platform::Signal) {
+    crate::platform::signal_pid(pid, signal);
 }
 
 /// Listen port of the named running daemon instance, or None if it isn't
@@ -627,12 +639,76 @@ mod tests {
         std::fs::remove_file(&other).ok();
     }
 
+    /// Helper lookup has to try `<name>.exe` on Windows: every caller names
+    /// helpers bare (`"hdmicap"`), and the packaged binaries carry the suffix,
+    /// so without this no helper resolves at all on a Windows install.
+    #[test]
+    fn binary_names_adds_the_windows_suffix() {
+        let names = binary_names("hdmicap");
+        if cfg!(windows) {
+            assert_eq!(names, vec!["hdmicap.exe", "hdmicap"]);
+        } else {
+            assert_eq!(names, vec!["hdmicap"]);
+        }
+        // An explicit .exe is never doubled up.
+        assert_eq!(binary_names("hdmicap.exe"), vec!["hdmicap.exe"]);
+    }
+
+    /// The lookup is exercised through $PATH, which `find_binary` searches on
+    /// every platform — so this runs the real resolution code rather than
+    /// asserting on the shape of a name.
+    #[test]
+    fn find_binary_resolves_a_helper_through_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = if cfg!(windows) {
+            "paniolo-fake-helper.exe"
+        } else {
+            "paniolo-fake-helper"
+        };
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+
+        let prev = std::env::var_os("PATH");
+        let mut paths = vec![dir.path().to_path_buf()];
+        if let Some(p) = &prev {
+            paths.extend(std::env::split_paths(p));
+        }
+        // Safe: single-threaded test process; PATH is restored below.
+        unsafe { std::env::set_var("PATH", std::env::join_paths(paths).unwrap()) };
+
+        // Named bare, as every caller names helpers.
+        let found = find_binary("paniolo-fake-helper");
+
+        match prev {
+            Some(p) => unsafe { std::env::set_var("PATH", p) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+
+        assert_eq!(
+            found.as_deref(),
+            Some(path.as_path()),
+            "a bare helper name must resolve to the real file"
+        );
+    }
+
     #[test]
     fn runtime_root_honors_env_default_tmp() {
-        // Default is /tmp; the override is read live, so just assert the
-        // default path shape (the env var is process-global in tests).
+        // With no override, the root is the platform default: the hardcoded
+        // /tmp on Unix, the per-user temp dir on Windows. The override is read
+        // live, so only assert the shape (the env var is process-global in
+        // tests).
         if std::env::var_os("PANIOLO_RUNTIME_BASE").is_none() {
-            assert_eq!(runtime_root(), PathBuf::from("/tmp"));
+            assert_eq!(runtime_root(), crate::platform::default_runtime_root());
+            if cfg!(unix) {
+                assert_eq!(runtime_root(), PathBuf::from("/tmp"));
+            }
         }
     }
 }

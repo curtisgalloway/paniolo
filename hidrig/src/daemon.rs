@@ -58,28 +58,14 @@ pub struct Discovery {
 /// `/tmp/paniolo-<uid>/hid` (deliberately not `$TMPDIR`/`$XDG_RUNTIME_DIR`
 /// — see the paniolo CLI's daemons.rs for why).
 pub fn runtime_dir() -> Result<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     if let Some(dir) = std::env::var_os("PANIOLO_RUNTIME_DIR") {
         let dir = PathBuf::from(dir);
         fs::create_dir_all(&dir)?;
         return Ok(dir);
     }
-    // Safe: getuid always succeeds.
-    let uid = unsafe { libc::getuid() };
-    let base = PathBuf::from(format!("/tmp/paniolo-{uid}"));
-    match fs::DirBuilder::new().mode(0o700).create(&base) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let md = fs::symlink_metadata(&base)?;
-            if !md.is_dir() || md.uid() != uid {
-                return Err(anyhow!(
-                    "{} exists but is not a directory owned by uid {uid}",
-                    base.display()
-                ));
-            }
-        }
-        Err(e) => return Err(e.into()),
-    }
+    let uid = crate::platform::current_uid();
+    let base = crate::platform::runtime_root().join(format!("paniolo-{uid}"));
+    crate::platform::ensure_private_dir(&base)?;
     let dir = base.join(DISCOVERY_NAME);
     fs::create_dir_all(&dir)?;
     Ok(dir)
@@ -98,7 +84,7 @@ pub fn discover() -> Option<Discovery> {
     let s = fs::read_to_string(discovery_path().ok()?).ok()?;
     let d: Discovery = serde_json::from_str(&s).ok()?;
     // Liveness: the recorded pid still exists.
-    if unsafe { libc::kill(d.pid as i32, 0) } != 0 {
+    if !crate::platform::pid_alive(d.pid as i32) {
         return None;
     }
     Some(d)
@@ -121,31 +107,7 @@ pub fn run(device: String, port: u16) -> Result<()> {
         // PTY allocation fails the daemon still serves HID/control, just without
         // a console. `console_link` is set only when we created a symlink, so
         // shutdown removes ours and never the /dev/pts node itself.
-        let mut console_master = None;
-        let mut console_path = None;
-        let mut console_link = None;
-        match crate::pty::open() {
-            Ok(p) => {
-                let link = runtime_dir()?.join("console");
-                let _ = fs::remove_file(&link);
-                match std::os::unix::fs::symlink(&p.slave_path, &link) {
-                    Ok(()) => {
-                        console_path = Some(link.to_string_lossy().into_owned());
-                        console_link = Some(link);
-                    }
-                    Err(e) => {
-                        warn!(
-                            "console symlink failed ({e}); exposing {} directly",
-                            p.slave_path
-                        );
-                        console_path = Some(p.slave_path.clone());
-                    }
-                }
-                info!("DUT console bridge at {}", console_path.as_deref().unwrap());
-                console_master = Some(p.master);
-            }
-            Err(e) => warn!("DUT console bridge unavailable: {e}"),
-        }
+        let (console_master, console_path, console_link) = open_console_bridge(&runtime_dir()?);
 
         let hid = HidHandle::spawn(device.clone(), console_master);
 
@@ -190,6 +152,47 @@ pub fn run(device: String, port: u16) -> Result<()> {
 
     drop(lock_file);
     Ok(())
+}
+
+/// Allocate the DUT console PTY and publish a stable symlink to its slave node.
+///
+/// Returns `(master, published path, symlink we own)`. Every element is `None`
+/// when no console could be brought up — the daemon then serves HID and control
+/// without a console, which is the documented best-effort behaviour.
+#[cfg(unix)]
+fn open_console_bridge(dir: &std::path::Path) -> (Option<File>, Option<String>, Option<PathBuf>) {
+    let p = match crate::pty::open() {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("DUT console bridge unavailable: {e}");
+            return (None, None, None);
+        }
+    };
+    let link = dir.join("console");
+    let _ = fs::remove_file(&link);
+    let (path, owned_link) = match std::os::unix::fs::symlink(&p.slave_path, &link) {
+        Ok(()) => (link.to_string_lossy().into_owned(), Some(link)),
+        Err(e) => {
+            warn!(
+                "console symlink failed ({e}); exposing {} directly",
+                p.slave_path
+            );
+            (p.slave_path.clone(), None)
+        }
+    };
+    info!("DUT console bridge at {path}");
+    (Some(p.master), Some(path), owned_link)
+}
+
+/// Windows has no PTY layer to hand a slave device path to paniolo's `serial`
+/// channel, so the console bridge is simply absent. (A ConPTY pseudoconsole is
+/// not a substitute: it has no filesystem node another process can open, which
+/// is the whole point of the published `console` path.) HID and control are
+/// unaffected.
+#[cfg(windows)]
+fn open_console_bridge(_dir: &std::path::Path) -> (Option<File>, Option<String>, Option<PathBuf>) {
+    warn!("DUT console bridge unavailable: no PTY support on Windows");
+    (None, None, None)
 }
 
 async fn shutdown_signal() {

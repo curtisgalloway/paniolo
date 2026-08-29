@@ -29,6 +29,10 @@
 
 mod daemon;
 mod keys;
+// The file is kept byte-identical across the crates that copy it, so a crate
+// may not use every primitive in it.
+#[allow(dead_code)]
+mod platform;
 mod proto;
 mod server;
 mod session;
@@ -305,16 +309,13 @@ fn cmd_run(tx: &mut Sender, file: &str, delay_ms: u64) -> Result<()> {
 /// Stop a running hid daemon by sending SIGTERM to its recorded pid.
 fn cmd_stop() -> Result<()> {
     match daemon::discover() {
-        Some(d) => {
-            // Safe: kill with SIGTERM to a pid we just confirmed alive.
-            let rc = unsafe { libc::kill(d.pid as i32, libc::SIGTERM) };
-            if rc == 0 {
+        Some(d) => match crate::platform::terminate_pid(d.pid as i32) {
+            Ok(()) => {
                 println!("hid daemon (pid {}) stopped", d.pid);
                 Ok(())
-            } else {
-                Err(anyhow!("failed to signal hid daemon pid {}", d.pid))
             }
-        }
+            Err(e) => Err(anyhow!("failed to signal hid daemon pid {}: {e}", d.pid)),
+        },
         None => {
             println!("no hid daemon running");
             Ok(())

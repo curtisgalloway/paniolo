@@ -25,7 +25,6 @@ clap = { version = "4", features = ["derive"] }
 
 # --- Daemon plumbing -----------------------------------------------------
 fs2 = "0.4"
-libc = "0.2"
 
 # --- Errors / logging / serde -------------------------------------------
 anyhow = "1"
@@ -37,7 +36,6 @@ serde_json = "1"
 
 # --- Client subcommands --------------------------------------------------
 ureq = "2"
-nix = { version = "0.29", features = ["signal", "process"] }
 
 # --- Preview stream ------------------------------------------------------
 async-stream = "0.3"
@@ -56,6 +54,27 @@ turbojpeg = { version = "1.4", features = ["image"] }
 
 [build-dependencies]
 cc = "1"
+
+# --- process/identity primitives behind src/platform.rs -----------------
+# Each platform gets only what it can use: libc on Unix, the Win32 process
+# APIs on Windows.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+# Media Foundation, for src/capture_mf.rs — the Windows capture backend. This
+# is Microsoft's own binding crate, the counterpart of talking to AVFoundation
+# directly on macOS and the `v4l` crate on Linux; no third-party camera
+# abstraction sits in between.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+] }
 
 [profile.release]
 opt-level = 3

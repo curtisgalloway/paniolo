@@ -155,6 +155,47 @@ fn setuid_bpf_helper(helper: &Path) {
 }
 
 /// Finish platform setup for a packaged install (Homebrew, .deb, tarball) —
+/// Verify the portable Windows layout: helpers alongside the CLI in `libexec`.
+///
+/// This is `paniolo setup`'s whole job on Windows — see [`run_packaged`]. It
+/// reports rather than repairs, because the fix (re-extract the zip, or
+/// reinstall via winget) is the user's to make.
+#[cfg(windows)]
+fn check_windows_layout() {
+    let helpers = [
+        "hdmicap",
+        "serialcap",
+        "netbootd",
+        "cambrionix",
+        "hidrig",
+        "ch9329",
+        "usbhub",
+        "shellyplug",
+        "amt",
+    ];
+    println!("\nChecking the installed helper layout…");
+    let mut missing = Vec::new();
+    for h in helpers {
+        match crate::daemons::find_binary(h) {
+            Some(p) => println!("  ✓ {h:12} {}", p.display()),
+            None => missing.push(h),
+        }
+    }
+    if missing.is_empty() {
+        return;
+    }
+    println!(
+        "  ! missing helpers: {}\n\
+         \x20   Expected them in a `libexec` directory beside paniolo.exe. \
+         Re-extract the release zip keeping its directory structure, or \
+         reinstall with `winget install CurtisGalloway.Paniolo`.",
+        missing.join(", ")
+    );
+}
+
+#[cfg(not(windows))]
+fn check_windows_layout() {}
+
 /// no source checkout, so no builds: setuid the installed bpf-helper on
 /// macOS (located via `find_binary`, which knows the per-user libexec, the
 /// Homebrew keg, and `/usr/libexec/paniolo/bin`), and check group
@@ -167,8 +208,13 @@ pub fn run_packaged() -> Result<()> {
             Some(helper) => setuid_bpf_helper(&helper),
             None => println!("  … netbootd-bpf-helper not found; skipping setuid install"),
         }
-    } else {
-        println!("\nChecking group membership…");
+    } else if cfg!(windows) {
+        // Nothing to grant on Windows: there is no setuid bit, no dialout
+        // group, and the OCR helper has no Windows build. The one thing worth
+        // checking is that the portable layout is intact, since a zip extracted
+        // without its `libexec` directory yields a CLI that runs and then fails
+        // on the first channel it needs a helper for.
+        check_windows_layout();
         if ensure_linux_groups() {
             println!(
                 "\nNote: group changes take effect after you log out and back in \
@@ -326,9 +372,7 @@ pub fn run(repo: &Path, rust_only: bool) -> Result<()> {
         let dest = libexec.join("linuxocr");
         if source.is_file() {
             std::fs::copy(&source, &dest)?;
-            let mut perms = std::fs::metadata(&dest)?.permissions();
-            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-            std::fs::set_permissions(&dest, perms)?;
+            crate::platform::make_executable(&dest)?;
             println!("  ✓ {:12} {}", "linuxocr", dest.display());
         } else {
             println!("  … linuxocr: source not found, skipped");

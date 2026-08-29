@@ -55,32 +55,14 @@ pub struct Discovery {
 /// last session ends, breaking daemons that outlive the SSH session that
 /// started them). Keep in sync with daemons.rs `runtime_root`/`runtime_base`.
 pub fn runtime_dir() -> Result<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     if let Some(dir) = std::env::var_os("PANIOLO_RUNTIME_DIR") {
         let dir = PathBuf::from(dir);
         fs::create_dir_all(&dir)?;
         return Ok(dir);
     }
-    // Safe: getuid is always successful.
-    let uid = unsafe { libc::getuid() };
-    let root = std::env::var_os("PANIOLO_RUNTIME_BASE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    let base = root.join(format!("paniolo-{uid}"));
-    match fs::DirBuilder::new().mode(0o700).create(&base) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Guard against a squatter pre-creating the /tmp path.
-            let md = fs::symlink_metadata(&base)?;
-            if !md.is_dir() || md.uid() != uid {
-                return Err(anyhow!(
-                    "{} exists but is not a directory owned by uid {uid}",
-                    base.display()
-                ));
-            }
-        }
-        Err(e) => return Err(e.into()),
-    }
+    let uid = crate::platform::current_uid();
+    let base = crate::platform::runtime_root().join(format!("paniolo-{uid}"));
+    crate::platform::ensure_private_dir(&base)?;
     let dir = base.join("serialcap");
     fs::create_dir_all(&dir)?;
     Ok(dir)
@@ -98,7 +80,18 @@ fn discovery_path() -> Result<PathBuf> {
 pub fn discover() -> Result<Discovery> {
     let p = discovery_path()?;
     let s = fs::read_to_string(&p).with_context(|| format!("daemon not running? {p:?}"))?;
-    Ok(serde_json::from_str(&s)?)
+    let d: Discovery = serde_json::from_str(&s)?;
+    // Liveness, as ch9329 and hidrig already do. A discovery file outlives the
+    // process that wrote it whenever the daemon did not exit gracefully — a
+    // crash or SIGKILL on Unix, and *every* stop on Windows, where
+    // `TerminateProcess` gives the daemon no chance to clean up. Without this
+    // check the next command dials a dead port and reports a connection
+    // refusal instead of "the daemon is not running".
+    if !crate::platform::pid_alive(d.pid as i32) {
+        let _ = fs::remove_file(&p);
+        return Err(anyhow!("daemon not running (stale {p:?} removed)"));
+    }
+    Ok(d)
 }
 
 /// Blocking entry point for `serialcap daemon`.
@@ -192,4 +185,43 @@ async fn shutdown_signal() {
         _ = term => {},
     }
     info!("shutdown signal received");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A discovery file outlives its process whenever the daemon did not exit
+    /// gracefully: a crash or SIGKILL on Unix, and every stop on Windows,
+    /// where `TerminateProcess` runs no cleanup. Reading one back without
+    /// checking liveness makes the next command dial a dead port and report a
+    /// connection refusal instead of "not running" — which is exactly what
+    /// happened on Windows.
+    #[test]
+    fn discover_rejects_and_reaps_a_stale_record() {
+        let dir = std::env::temp_dir().join(format!("paniolo-disc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Safe: this test owns the variable; it is restored below.
+        let prev = std::env::var_os("PANIOLO_RUNTIME_DIR");
+        unsafe { std::env::set_var("PANIOLO_RUNTIME_DIR", &dir) };
+
+        // A pid that cannot be running: 0 is never a real process, and the
+        // liveness guard rejects non-positive pids outright.
+        let path = dir.join("daemon.json");
+        std::fs::write(&path, br#"{"pid":0,"port":8723,"interfaces":[]}"#).unwrap();
+
+        let got = discover();
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("PANIOLO_RUNTIME_DIR", v) },
+            None => unsafe { std::env::remove_var("PANIOLO_RUNTIME_DIR") },
+        }
+
+        assert!(got.is_err(), "a dead pid must not look like a live daemon");
+        assert!(
+            !path.exists(),
+            "the stale file must be reaped, not left to fail again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

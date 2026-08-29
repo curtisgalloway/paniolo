@@ -27,7 +27,6 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 serialport = "4"
-libc = "0.2"
 
 # --- serve (daemon) mode: async runtime + HTTP/WebSocket --------------------
 # The CH9329 UART is driven by the blocking `serialport` path on a dedicated
@@ -44,6 +43,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = "2"
+
+# --- process/identity primitives behind src/platform.rs -----------------
+# Each platform gets only what it can use: libc on Unix, the Win32 process
+# APIs on Windows.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
 
 [profile.release]
 opt-level = 3

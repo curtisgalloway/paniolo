@@ -102,7 +102,7 @@ pub fn start_daemon(device: &str, port: u16, target: &str) -> Result<()> {
         daemons::ensure_runtime_dir(DAEMON, Some(target))?.join("daemon.log"),
     )?;
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
-    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    crate::platform::detach(&mut cmd);
     cmd.spawn()?;
     Ok(())
 }

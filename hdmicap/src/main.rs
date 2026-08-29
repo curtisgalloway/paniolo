@@ -26,7 +26,15 @@ mod capture;
 mod capture_thread;
 mod daemon;
 mod frame;
+// Pixel formats and conversions exist to serve a capture backend. On a
+// platform with none compiled in (Windows), nothing constructs them — that is
+// the design, not dead weight.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 mod pixel;
+// The file is kept byte-identical across the crates that copy it, so a crate
+// may not use every primitive in it.
+#[allow(dead_code)]
+mod platform;
 mod server;
 
 use std::io::{Read, Write};
@@ -218,12 +226,8 @@ fn cmd_preview() -> Result<()> {
 }
 
 fn cmd_stop() -> Result<()> {
-    use nix::sys::signal::{kill, Signal};
-    use nix::unistd::Pid;
-
     let d = daemon::discover().context("is the daemon running?")?;
-    kill(Pid::from_raw(d.pid as i32), Signal::SIGTERM)
-        .context("failed to send SIGTERM to daemon")?;
+    crate::platform::terminate_pid(d.pid as i32).context("failed to send SIGTERM to daemon")?;
     println!("daemon (pid {}) stopping", d.pid);
     Ok(())
 }
