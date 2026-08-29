@@ -16,7 +16,7 @@
 //!
 //! A *skill* is a markdown guide (`<dir>/<name>/SKILL.md`, with a `name:` +
 //! `description:` YAML frontmatter) that teaches an agent how to drive paniolo:
-//! the `paniolo` usage skill, the `kvm-puppeting` GUI doctrine, the `usbhub`
+//! the `paniolo` usage skill and the `kvm-puppeting` GUI doctrine
 //! power skill. They live in the source tree under `skills/` and install
 //! alongside the CLI; this command is how an agent finds and reads them without
 //! the harness having them pre-loaded.

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Build and install paniolo: the Rust CLI (cli/) plus the daemons and helpers
-# (hdmicap, serialcap, netbootd, cambrionix, hidrig, usbhub, shellyplug), the
+# (hdmicap, serialcap, netbootd, cambrionix, hidrig, shellyplug), the
 # OCR helper, and the zigplug Zigbee helper (Python, installed by `paniolo
 # setup` as a uv tool).
 # Only the `paniolo` CLI lands on PATH (~/.cargo/bin); the helpers install
@@ -22,7 +22,7 @@
 # `make install` from a fresh clone is the only command you need; re-run it
 # after editing anything to rebuild and reinstall.
 
-CRATES = cli hdmicap serialcap netbootd cambrionix hidrig ch9329 usbhub shellyplug amt
+CRATES = cli hdmicap serialcap netbootd cambrionix hidrig ch9329 shellyplug amt
 
 # The installed CLI, by absolute path: immune to a different `paniolo` shadowing
 # ~/.cargo/bin earlier in PATH (e.g. a Homebrew keg from the tap).
