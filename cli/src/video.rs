@@ -37,7 +37,7 @@ pub fn daemon_url(target: &str) -> Option<String> {
 }
 
 /// OCR the target daemon's current frame via `GET /ocr` (optionally waiting for
-/// a stable signal first), returning the raw v1 envelope (see docs/ocr.md).
+/// a stable signal first), returning the raw v1 envelope (see docs/dev/ocr.md).
 pub fn ocr(target: &str, stable: bool, timeout_ms: u64) -> Result<String> {
     let url = daemon_url(target)
         .ok_or_else(|| anyhow!("no video daemon running — start one with `paniolo video watch`"))?;
@@ -91,11 +91,39 @@ pub fn text_of(body: &str) -> String {
     }
 }
 
+/// The OCR helper for a target's screens.
+///
+/// The platform default is right everywhere except one case: a **Linux** host
+/// looking at **GUI** screens, where Tesseract loses whole rows of anti-aliased
+/// UI text that PP-OCRv6 reads cleanly (0.312 vs 0.083 token-recall error,
+/// measured on a Pi 5 — see evals/ocr). `ocr_mode = "gui"` selects `rapidocr`
+/// there.
+///
+/// Nothing is selected by mode on macOS or Windows: Apple Vision and
+/// `Windows.Media.Ocr` win both screen types on their own platforms, so a mode
+/// field there would only add a way to choose wrongly.
+fn ocr_helper(ocr_mode: Option<&str>) -> Option<std::path::PathBuf> {
+    if cfg!(target_os = "linux") && ocr_mode == Some("gui") {
+        if let Some(p) = daemons::find_binary("rapidocr") {
+            return Some(p);
+        }
+        eprintln!(
+            "note: video ocr_mode = \"gui\" but the rapidocr helper is not installed; \
+             falling back to the default engine, which loses rows of GUI text. \
+             Install it with `paniolo setup`."
+        );
+    }
+    daemons::find_binary("visionocr")
+        .or_else(|| daemons::find_binary("winocr"))
+        .or_else(|| daemons::find_binary("linuxocr"))
+}
+
 /// Start the `target`'s hdmicap daemon for `device`, detached; caller polls
 /// discovery. The target also names the per-target runtime dir (so multiple
 /// targets' daemons coexist) and rides along as `PANIOLO_TARGET` for the
-/// dashboard's power-cycle button.
-pub fn start_daemon(device: &str, port: u16, target: &str) -> Result<()> {
+/// dashboard's power-cycle button. `ocr_mode` picks the OCR helper the daemon
+/// will run — see [`ocr_helper`].
+pub fn start_daemon(device: &str, port: u16, target: &str, ocr_mode: Option<&str>) -> Result<()> {
     let binary = daemons::find_binary(DAEMON)
         .ok_or_else(|| anyhow!("hdmicap not found (libexec or PATH) — run `paniolo setup`"))?;
     // Record which binary this daemon runs, so a later upgrade/rebuild can be
@@ -108,10 +136,7 @@ pub fn start_daemon(device: &str, port: u16, target: &str) -> Result<()> {
         .arg("--port")
         .arg(port.to_string());
     cmd.envs(daemons::helper_env(DAEMON, Some(target)));
-    // visionocr on macOS, linuxocr (same interface) on Linux.
-    if let Some(ocr) =
-        daemons::find_binary("visionocr").or_else(|| daemons::find_binary("linuxocr"))
-    {
+    if let Some(ocr) = ocr_helper(ocr_mode) {
         cmd.env("PANIOLO_VISIONOCR", ocr);
     }
     cmd.env("PANIOLO_TARGET", target);
@@ -152,6 +177,51 @@ pub fn passthrough(args: &[String], instance: Option<&str>) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ocr_mode = "gui"` must reach `rapidocr` on Linux and must NOT change
+    /// anything anywhere else — Apple Vision and Windows.Media.Ocr win both
+    /// screen types on their own platforms, so honouring the field there would
+    /// only be a way to pick the wrong engine.
+    #[test]
+    fn gui_mode_selects_rapidocr_only_on_linux() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("rapidocr");
+        std::fs::write(&fake, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut p = std::fs::metadata(&fake).unwrap().permissions();
+            p.set_mode(0o755);
+            std::fs::set_permissions(&fake, p).unwrap();
+        }
+
+        let prev = std::env::var_os("PATH");
+        // Only our temp dir: otherwise a real visionocr/linuxocr on this
+        // machine decides the outcome and the test proves nothing.
+        // Safe: single-threaded test, restored below.
+        unsafe { std::env::set_var("PATH", dir.path()) };
+        let picked = ocr_helper(Some("gui"));
+        let default = ocr_helper(None);
+        match prev {
+            Some(p) => unsafe { std::env::set_var("PATH", p) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                picked.as_deref(),
+                Some(fake.as_path()),
+                "gui mode must select rapidocr on Linux"
+            );
+        } else {
+            assert!(
+                picked.as_deref() != Some(fake.as_path()),
+                "gui mode must not select rapidocr off Linux"
+            );
+        }
+        // With no mode set, rapidocr is never the answer on any platform.
+        assert!(default.as_deref() != Some(fake.as_path()));
+    }
 
     #[test]
     fn text_of_extracts_the_envelope_text() {

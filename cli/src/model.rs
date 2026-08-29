@@ -162,6 +162,24 @@ pub struct PowerChannel {
 pub struct VideoChannel {
     pub device: Option<String>,
     pub host: Option<String>,
+    /// Which OCR engine suits this target's screens: `"text"` for firmware,
+    /// bootloaders and consoles, `"gui"` for desktops and graphical BIOS pages.
+    ///
+    /// This exists because on Linux the two need different engines and the
+    /// choice cannot be inferred. Measured on a Pi 5 (evals/ocr): PP-OCRv6 via
+    /// RapidOCR scores 0.083 token-recall error on GUI screens against
+    /// Tesseract's 0.312, while Tesseract edges it on console text (0.019 vs
+    /// 0.025 CER) at a third of the latency.
+    ///
+    /// Confidence cannot decide it at runtime: Apple Vision reports a constant
+    /// value, `Windows.Media.Ocr` reports none, and Tesseract's GUI failure is
+    /// *silent omission* — it is confident about the rows it did read, so a
+    /// low-confidence fallback would never trigger. Hence a config field.
+    ///
+    /// Unset means the platform default (`visionocr` on macOS, `winocr` on
+    /// Windows, `linuxocr` on Linux), which is right for everything except a
+    /// Linux host looking at GUI screens.
+    pub ocr_mode: Option<String>,
 }
 
 /// USB HID input injection: an opaque helper command (e.g. `hidrig -d <uart>`)

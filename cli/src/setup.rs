@@ -154,6 +154,90 @@ fn setuid_bpf_helper(helper: &Path) {
 }
 
 /// Finish platform setup for a packaged install (Homebrew, .deb, tarball) —
+/// Build the venv `ocr/rapidocr` re-execs into, when a lab file asks for it.
+///
+/// Only built when some target sets `ocr_mode = "gui"`. It is ~317 MB
+/// (onnxruntime 58 MB, PP-OCRv6 models 31 MB, numpy/opencv the rest) and most
+/// control hosts never look at a GUI screen, so it is opt-in rather than part
+/// of every setup.
+///
+/// A venv rather than a system install because Pi OS is PEP 668-managed and
+/// refuses one — better a self-contained directory than asking anyone to reach
+/// for `--break-system-packages`.
+///
+/// `opencv-python-headless` is forced over the `opencv-python` rapidocr pulls
+/// in: the full build needs `libGL.so.1`, absent on a headless Pi OS, and the
+/// failure is an ImportError at first OCR rather than at install time.
+#[cfg(target_os = "linux")]
+fn install_rapidocr_venv(libexec: &Path) {
+    if !lab_wants_gui_ocr() {
+        println!(
+            "  … rapidocr venv: skipped (no target sets video ocr_mode = \"gui\"; \
+             it is ~317 MB — set the field and re-run to install)"
+        );
+        return;
+    }
+    let venv = libexec.join("ocr-venv");
+    if venv.join("bin/python3").is_file() {
+        println!("  ✓ {:12} {}", "ocr-venv", venv.display());
+        return;
+    }
+    println!("  … building the rapidocr venv (~317 MB, a few minutes)…");
+    let made = Command::new("python3")
+        .args(["-m", "venv"])
+        .arg(&venv)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !made {
+        println!("  ! rapidocr venv: `python3 -m venv` failed (is python3-venv installed?)");
+        return;
+    }
+    let pip = venv.join("bin/pip");
+    let installed = Command::new(&pip)
+        .args(["install", "--quiet", "rapidocr>=3,<4", "onnxruntime"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !installed {
+        println!("  ! rapidocr venv: pip install failed; GUI OCR falls back to tesseract");
+        return;
+    }
+    let _ = Command::new(&pip)
+        .args(["uninstall", "-y", "-q", "opencv-python"])
+        .status();
+    let headless = Command::new(&pip)
+        .args([
+            "install",
+            "--quiet",
+            "--force-reinstall",
+            "--no-deps",
+            "opencv-python-headless",
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if headless {
+        println!("  ✓ {:12} {}", "ocr-venv", venv.display());
+    } else {
+        println!("  ! rapidocr venv: headless opencv install failed; it will fail on libGL");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_rapidocr_venv(_libexec: &Path) {}
+
+/// Does the user's lab file ask for GUI-mode OCR anywhere?
+///
+/// Read as text rather than parsed: this runs before any lab is loaded, and the
+/// only question is whether to spend 317 MB.
+#[cfg(target_os = "linux")]
+fn lab_wants_gui_ocr() -> bool {
+    std::fs::read_to_string(crate::model::default_lab_path())
+        .map(|s| s.contains("ocr_mode") && s.contains("\"gui\""))
+        .unwrap_or(false)
+}
+
 /// Verify the portable Windows layout: helpers alongside the CLI in `libexec`.
 ///
 /// This is `paniolo setup`'s whole job on Windows — see [`run_packaged`]. It
@@ -395,6 +479,17 @@ pub fn run(repo: &Path, rust_only: bool) -> Result<()> {
             println!("  ✓ {:12} {}", "linuxocr", dest.display());
         } else {
             println!("  … linuxocr: source not found, skipped");
+        }
+        // rapidocr: the GUI-mode engine on Linux. The script is small and always
+        // copied; the heavy part is its venv, installed only when a lab file
+        // actually asks for GUI OCR.
+        let rsrc = repo.join("ocr/rapidocr");
+        if rsrc.is_file() {
+            let rdest = libexec.join("rapidocr");
+            std::fs::copy(&rsrc, &rdest)?;
+            crate::platform::make_executable(&rdest)?;
+            println!("  ✓ {:12} {}", "rapidocr", rdest.display());
+            install_rapidocr_venv(&libexec);
         }
         if crate::daemons::find_binary("tesseract").is_none() {
             println!(
