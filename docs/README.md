@@ -22,7 +22,7 @@ on Debian/Raspberry Pi OS the quickest route is the [apt repository](https://cur
 | [Netboot](netboot.md) | `paniolo netboot` | DHCP + TFTP over a direct USB-Ethernet link (single-binary Rust `netbootd`). |
 | [Link mode](netif.md) | `paniolo netif` | Atomically switch the link between netboot and ffx-over-IPv6 modes (stops netboot, sets up the host `fe80::1`). |
 | [Serial](serial.md) | `paniolo serial` | `serialcap` daemon (timestamped JSONL log + WebSocket terminal) and interactive `tio`. |
-| [Power](power.md) | `paniolo power on/off`, `power-cycle`, `power-state`, `serial dtr/reset` | DTR power-button wiring (J2; opt-in per serial interface) and generic shell-command hooks; `cambrionix` hub, `usbhub` per-port USB hub power, `zigplug` Zigbee smart-plug, `shellyplug` Shelly Gen2+ plug/relay (local HTTP RPC), and `amt` Intel AMT/vPro (WS-Man, with true power-state readback) helpers. |
+| [Power](power.md) | `paniolo power on/off`, `power-cycle`, `power-state`, `serial dtr/reset` | DTR power-button wiring (J2; opt-in per serial interface) and generic shell-command hooks; `cambrionix` hub, `zigplug` Zigbee smart-plug, `shellyplug` Shelly Gen2+ plug/relay (local HTTP RPC), and `amt` Intel AMT/vPro (WS-Man, with true power-state readback) helpers. |
 | [Video](video.md) | `paniolo video` | `hdmicap` warm-stream HDMI capture + on-device OCR. |
 | [Dashboard](dashboard.md) | `paniolo console` | Combined video + serial web UI. |
 | [HID injection](hid.md) | `paniolo hid` | USB keyboard/mouse injection via a generic helper hook; `hidrig` KB2040 injector and `ch9329` CH9329 bridge (Openterface Mini-KVM); KVM input from the web console. |
@@ -62,7 +62,7 @@ orchestration or results.
 
 ## For contributors / agents
 
-- **Bundled agent skills** — paniolo ships agent guides under [`skills/`](https://github.com/curtisgalloway/paniolo/tree/main/skills) (`paniolo` for driving a target, `kvm-puppeting` for GUI puppeting, `usbhub` for hub power). They install alongside the CLI; `paniolo skill` lists them (with descriptions) and `paniolo skill <name>` prints one's `SKILL.md` — so an agent can discover and read them straight from the CLI, without the harness pre-loading them.
+- **Bundled agent skills** — paniolo ships agent guides under [`skills/`](https://github.com/curtisgalloway/paniolo/tree/main/skills) (`paniolo` for driving a target, `kvm-puppeting` for GUI puppeting). They install alongside the CLI; `paniolo skill` lists them (with descriptions) and `paniolo skill <name>` prints one's `SKILL.md` — so an agent can discover and read them straight from the CLI, without the harness pre-loading them.
 - [Agent discoverability & usage evals](agent-evals.md) — a no-hardware eval suite measuring how well a naive agent goes from a plain-language goal to the right paniolo command via the self-describing surface (`--help` → `paniolo skill` → docs); discovery conditions, stated-command vs config-only tiers, rubric, and scenario catalog.
 - [Serial agent benchmark](serial-agent-benchmark.md) — a hardware-in-the-loop, head-to-head eval (the complement to the discovery suite): does paniolo produce better serial-task outcomes than the alternatives an agent would otherwise use — improvising ("YOLO") or the idiomatic `fx serial` — across Claude Code and Antigravity (`agy`)? Approach ladder, real-board Fuchsia bring-up, nonce-injected ground truth, and pre-registered predictions.
 - [`AGENTS.md`](https://github.com/curtisgalloway/paniolo/blob/main/AGENTS.md) — module-by-module internals, source constraints, and how to add a subsystem.

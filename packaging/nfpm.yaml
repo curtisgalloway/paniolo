@@ -39,7 +39,7 @@ license: Apache-2.0
 description: |
   Agent-controlled target machine wrangler — distributed bring-up control over SSH.
   Installs the paniolo CLI plus its helper daemons (hdmicap, serialcap,
-  netbootd, cambrionix, hidrig, ch9329, usbhub, shellyplug, amt), the
+  netbootd, cambrionix, hidrig, ch9329, shellyplug, amt), the
   linuxocr OCR helper, and the bundled agent skills (`paniolo skill`).
   Run `paniolo setup` once per user for group membership and the
   optional zigplug Zigbee helper.
@@ -64,7 +64,7 @@ contents:
       mode: 0o755
   # Bundled agent skills — read straight from the repo tree (the workflow
   # builds inside the checkout). One explicit file→file entry per skill: a
-  # glob (`skills/*/SKILL.md`) maps by basename, which would collide all three
+  # glob (`skills/*/SKILL.md`) maps by basename, which would collide the
   # SKILL.md at one dst. Add a line when you add a skill (the release
   # smoke-test checks the paniolo one).
   - src: skills/paniolo/SKILL.md
@@ -73,18 +73,6 @@ contents:
       mode: 0o644
   - src: skills/kvm-puppeting/SKILL.md
     dst: /usr/share/paniolo/skills/kvm-puppeting/SKILL.md
-    file_info:
-      mode: 0o644
-  - src: skills/usbhub/SKILL.md
-    dst: /usr/share/paniolo/skills/usbhub/SKILL.md
-    file_info:
-      mode: 0o644
-  # Bundled usbhub hub profiles — human-verified per-port power maps the usbhub
-  # helper searches under /usr/share/paniolo/usbhub/profiles (after the user's
-  # own config dir). Model filenames are unique, so a glob maps cleanly by
-  # basename — no per-file entry needed (unlike SKILL.md above).
-  - src: usbhub/profiles/*.toml
-    dst: /usr/share/paniolo/usbhub/profiles/
     file_info:
       mode: 0o644
   - src: LICENSE

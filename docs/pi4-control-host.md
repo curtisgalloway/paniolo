@@ -181,7 +181,7 @@ Validate each layer on its own so a failure points at one thing:
    confirm boot log capture from the target.
 3. **Video.** Plug the UVC dongle, `paniolo video devices` → `video set` → `video watch`,
    confirm `/preview` and a `shot`. Sanity-check `video read` (Tesseract) accuracy.
-4. **Power.** Wire the chosen helper (zigplug/shellyplug/usbhub/relay), confirm
+4. **Power.** Wire the chosen helper (zigplug/shellyplug/relay), confirm
    `paniolo power-cycle` and `power-state`.
 5. **Netboot.** Bring up the secondary NIC as the direct link, `paniolo netboot`,
    confirm the target TFTP-boots.

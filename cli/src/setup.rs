@@ -35,14 +35,13 @@ use anyhow::{anyhow, bail, Result};
 
 /// The helper crates `setup` builds and installs into libexec, in order. The
 /// `cli` crate (the `paniolo` binary itself) installs separately onto PATH.
-const HELPER_CRATES: [&str; 9] = [
+const HELPER_CRATES: [&str; 8] = [
     "hdmicap",
     "serialcap",
     "netbootd",
     "cambrionix",
     "hidrig",
     "ch9329",
-    "usbhub",
     "shellyplug",
     "amt",
 ];
@@ -169,7 +168,6 @@ fn check_windows_layout() {
         "cambrionix",
         "hidrig",
         "ch9329",
-        "usbhub",
         "shellyplug",
         "amt",
     ];
@@ -457,23 +455,6 @@ pub fn run(repo: &Path, rust_only: bool) -> Result<()> {
         Err(e) => eprintln!("  ! skills: {e}"),
     }
 
-    // usbhub hub profiles: same idea as skills — copy the bundled, human-
-    // verified per-port power profiles into the per-user data dir so the usbhub
-    // helper finds them when run outside this tree. (Linux packages ship them
-    // to /usr/share/paniolo/usbhub/profiles.)
-    match crate::usbhub_profiles::install_bundled(repo) {
-        Ok(0) => {}
-        Ok(n) => {
-            let dst = crate::usbhub_profiles::user_dir().unwrap_or_default();
-            println!(
-                "  ✓ {:12} {n} installed → {}",
-                "hub profiles",
-                dst.display()
-            );
-        }
-        Err(e) => eprintln!("  ! usbhub profiles: {e}"),
-    }
-
     println!("\nSetup complete.");
     println!(
         "Helpers live in {} — list or run them via `paniolo helper`.",
@@ -503,7 +484,7 @@ mod tests {
     /// of them was deleted from the repo. That is exactly how the
     /// `pyproject.toml` marker outlived the legacy Python CLI removal and
     /// silently broke `paniolo setup --rust-only` (and, quietly, the
-    /// repo-checkout branch of the skill and usbhub-profile search paths).
+    /// repo-checkout branch of the skill search path).
     /// Assert against the actual checkout so marker drift fails the build.
     #[test]
     fn repo_root_detects_the_real_checkout() {
