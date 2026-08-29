@@ -293,6 +293,20 @@ jobs:
             exit 1
           }
 
+      # The OCR helper is not a workspace crate (it lives under ocr/ with its
+      # Swift and Python siblings), so ci-coverage-check.sh does not see it and
+      # it needs covering explicitly. Windows-only by nature.
+      - name: winocr (fmt, clippy, build)
+        shell: pwsh
+        working-directory: ocr/winocr
+        run: |
+          cargo fmt --check
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cargo clippy --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cargo build
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
   macos:
     # Exercises the macOS-only stack the Linux jobs can't: hdmicap's AVFoundation
     # capture path and the Apple Vision OCR helper. fmt/clippy run on both Linux

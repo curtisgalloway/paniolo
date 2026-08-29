@@ -343,8 +343,29 @@ pub fn run(repo: &Path, rust_only: bool) -> Result<()> {
         }
     }
 
-    // OCR helper: visionocr (swiftc) on macOS, linuxocr copy on Linux.
-    if cfg!(target_os = "macos") {
+    // OCR helper, one per platform: visionocr (swiftc) on macOS, winocr (cargo)
+    // on Windows, a linuxocr copy on Linux. See docs/ocr.md.
+    if cfg!(windows) {
+        let source = repo.join("ocr/winocr");
+        if !source.join("Cargo.toml").is_file() {
+            println!("  … winocr: source not found, skipped");
+        } else {
+            let ok = Command::new(&cargo)
+                .args(["build", "--release", "--manifest-path"])
+                .arg(source.join("Cargo.toml"))
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            let built = source.join("target/release/winocr.exe");
+            if ok && built.is_file() {
+                let dest = libexec.join("winocr.exe");
+                std::fs::copy(&built, &dest)?;
+                println!("  ✓ {:12} {}", "winocr", dest.display());
+            } else {
+                println!("  … winocr: build failed, skipped");
+            }
+        }
+    } else if cfg!(target_os = "macos") {
         let source = repo.join("ocr/visionocr.swift");
         let dest = libexec.join("visionocr");
         if !source.is_file() {

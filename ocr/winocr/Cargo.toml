@@ -1,0 +1,46 @@
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Lives under ocr/ with the other OCR helpers rather than at the repo root,
+# because that is what it is — the Windows sibling of ocr/visionocr.swift and
+# ocr/linuxocr. It being a cargo project is an implementation detail; it is not
+# a paniolo helper crate in the HELPER_CRATES sense, and scripts/
+# ci-coverage-check.sh scans only top-level manifests, so it correctly does not
+# demand a .deb entry for a Windows-only binary.
+[package]
+name = "winocr"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Windows OCR helper for paniolo — Windows.Media.Ocr, on-device, offline"
+
+[[bin]]
+name = "winocr"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Globalization",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Storage_Streams",
+] }
+
+[profile.release]
+opt-level = 3
