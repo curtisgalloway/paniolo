@@ -26,4 +26,5 @@ If you are looking for how paniolo works *today*, start at
 | [openterface-kvm-go.md](openterface-kvm-go.md) | Bench findings for the Openterface KVM-Go (2026-08-24): both paniolo channels work unmodified. |
 | [openterface-deep-control.md](openterface-deep-control.md) | Deep-control findings for the Openterface Mini-KVM, with the parts that remain unverified or blocked. |
 | [console-front-door.md](console-front-door.md) | A parked design: one stable port with server-side fan-out for the remote dashboard. Not built. |
-| [pi4-control-host.md](pi4-control-host.md) | The original bring-up plan for a self-contained Pi control host. Superseded by the working image; see the `control-host-provisioning` branch. |
+| [control-host-provisioning.md](control-host-provisioning.md) | The cloud-init seed recipe for standing up a Linux control host (x86 or Pi) from blank hardware, plus the hardware-validated findings from the first `pi-sd` build (a Pi 5 on Pi OS Trixie, 2026-08-20). The generator itself is not built. |
+| [pi4-control-host.md](pi4-control-host.md) | The original bring-up plan for a self-contained Pi control host. Largely superseded — see control-host-provisioning.md; the unbuilt part is the Linux USB-HID-gadget backend. |

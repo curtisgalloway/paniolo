@@ -1,6 +1,14 @@
 # Pi 4 as a self-contained control host
 
-<!-- CCG: the docs should cover the current state - which is that there is a working image. -->
+> **Status: superseded in part.** A Pi control host is no longer hypothetical:
+> a Pi 5 on Raspberry Pi OS Trixie, provisioned from a cloud-init seed on
+> 2026-08-20, has been running a CI rack since. The recipe and its
+> hardware-validated findings are in
+> [control-host-provisioning.md](control-host-provisioning.md). What remains
+> unbuilt from this plan is the **Linux USB-HID-gadget backend** below — that
+> deployment uses external injectors (`ch9329` KVM devices) over the normal
+> `hid` channel instead.
+
 This is a bring-up plan for running the **entire** paniolo control host on a single
 Raspberry Pi 4 (Linux, ARM64) sitting next to one target — netboot, HDMI capture +
 OCR, serial console, HID injection, and power control, with the Pi reachable as a
