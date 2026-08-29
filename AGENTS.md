@@ -337,7 +337,7 @@ hdmicap/         Rust crate: warm-stream HDMI capture daemon
                  NSException on those setters
     capture_thread.rs  std::thread owning device, publishes into watch channel
     frame.rs     FrameState, Signal enum, one-pass strided classification
-                 (aHash + no-signal from ~1k luma samples, resolution-independent)
+                 (aHash + no-signal from 4k luma samples, resolution-independent)
     pixel.rs     PixelData (Rgb/Nv12/Empty) + NV12/YUYV -> RGB converters
     server.rs    axum HTTP API: GET / (dashboard), /status, /snapshot, /preview,
                  /ocr, /devices, POST /power-cycle, and /xterm.* static assets

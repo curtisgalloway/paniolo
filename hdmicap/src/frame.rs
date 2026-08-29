@@ -26,6 +26,19 @@ use serde::Serialize;
 
 use crate::pixel::PixelData;
 
+/// How old the newest frame may be before it stops describing the screen.
+///
+/// The capture loop publishes only on success: a frame error does `continue`,
+/// leaving the previous `FrameState` in the watch channel with its previous
+/// label. So a dead capture path reads as `Stable` forever, and callers acted
+/// on it — a machine whose mains had been cut kept reporting `stable` on its
+/// pre-cut desktop. Age is the only thing that distinguishes "the screen has
+/// not changed" from "we have stopped being told what the screen is".
+///
+/// Generous next to the 10 fps capture cap, so an occasional slow frame is not
+/// reported as a fault, and far below the minutes-long staleness observed.
+pub const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// How many consecutive same-resolution, non-black frames we require before
 /// trusting the signal as `Stable`. A booting machine renegotiates HDMI at
 /// firmware -> bootloader -> OS handoffs; the dongle emits black/torn frames
@@ -47,6 +60,11 @@ pub enum Signal {
     ModeSwitching,
     /// Frame is trustworthy for OCR / agent reading.
     Stable,
+    /// The last frame is too old to describe what is on screen now. The
+    /// capture loop has stopped delivering — the device errored, the source
+    /// lost power, or a mode change is in flight — and what remains in the
+    /// watch channel is whatever was last seen.
+    Stale,
 }
 
 /// Immutable snapshot of "what's on screen right now", shared via `watch`.
@@ -72,6 +90,21 @@ pub struct FrameState {
 }
 
 impl FrameState {
+    /// The signal as it applies *now*, downgrading a frame that has aged out.
+    ///
+    /// Read this rather than the `signal` field. The stored value describes the
+    /// frame when it was captured; this describes whether it still describes
+    /// the screen. `NoDevice` and `NoSignal` are already terminal answers and
+    /// pass through unchanged.
+    pub fn effective_signal(&self) -> Signal {
+        match self.signal {
+            Signal::Stable | Signal::ModeSwitching if self.captured_at.elapsed() > STALE_AFTER => {
+                Signal::Stale
+            }
+            other => other,
+        }
+    }
+
     pub fn no_device() -> Self {
         FrameState {
             jpeg: None,
@@ -100,7 +133,7 @@ pub struct StatusDto {
 impl From<&FrameState> for StatusDto {
     fn from(f: &FrameState) -> Self {
         StatusDto {
-            signal: f.signal,
+            signal: f.effective_signal(),
             width: f.width,
             height: f.height,
             hash: format!("{:016x}", f.hash),
@@ -110,13 +143,26 @@ impl From<&FrameState> for StatusDto {
     }
 }
 
-/// Samples per hash cell edge: each of the 64 aHash cells averages a 4x4
-/// sample grid, 1024 luma reads total — resolution-independent cost.
-const CELL_SAMPLES: u32 = 4;
-const GRID: u32 = 8 * CELL_SAMPLES; // 32x32 sample lattice
+/// Samples per hash cell edge: each of the 64 aHash cells averages an 8x8
+/// sample grid, 4096 luma reads total — resolution-independent cost.
+///
+/// This was 4 (a 32x32 lattice, 1024 reads) and that was too coarse to *see*
+/// console text. On a 1280x720 Gigaboot screen — 1.35% of pixels at luma 255 —
+/// a 32x32 lattice landed on no glyph at all: max luma seen 20, so the frame
+/// classified as blank and hdmicap reported `no_signal` on a perfectly
+/// readable screen. At 64x64 the same frame yields max luma 255 across 42
+/// samples. See evals/ocr/dataset/README.md for the measurements.
+///
+/// The 8x8 cell grid, and therefore the 64-bit hash, is unchanged.
+const CELL_SAMPLES: u32 = 8;
+const GRID: u32 = 8 * CELL_SAMPLES; // 64x64 sample lattice
+
+/// A luma level that cannot come from an unlit panel. Well above the noise of a
+/// black frame from a capture dongle, well below any legible text.
+const BRIGHT: u32 = 64;
 
 /// One-pass strided classification: 8x8 aHash + (near-)black no-signal
-/// detection from the same 1024 luma samples. `luma_at(x, y)` must return
+/// detection from the same 4096 luma samples. `luma_at(x, y)` must return
 /// FULL-RANGE luma (0-255); callers normalize video-range sources.
 ///
 /// Replaces the old grayscale()+resize() aHash and full-image no-signal scan,
@@ -130,6 +176,7 @@ pub fn classify<F: FnMut(u32, u32) -> u8>(w: u32, h: u32, mut luma_at: F) -> (u6
     let mut cells = [0u32; 64];
     let mut sum = 0u64;
     let mut sum_sq = 0u64;
+    let mut max = 0u32;
 
     for gy in 0..GRID {
         // Center each sample within its lattice slot.
@@ -140,15 +187,21 @@ pub fn classify<F: FnMut(u32, u32) -> u8>(w: u32, h: u32, mut luma_at: F) -> (u6
             cells[((gy / CELL_SAMPLES) * 8 + gx / CELL_SAMPLES) as usize] += l;
             sum += l as u64;
             sum_sq += (l * l) as u64;
+            max = max.max(l);
         }
     }
 
     let n = (GRID * GRID) as u64;
     let mean = sum / n;
     let var = (sum_sq / n).saturating_sub(mean * mean);
-    // Thresholds carried over from the full-scan implementation: low mean +
-    // low variance => HDMI blank / lens-capped. Conservative on purpose.
-    let no_signal = mean < 10 && var < 64;
+    // Low mean + low variance => HDMI blank / lens-capped. The max-luma term is
+    // the guard that mean and variance cannot provide: a screen showing a
+    // handful of bright glyphs on black has a near-zero mean and, if the
+    // lattice happens to miss them, a near-zero variance too. One sample above
+    // BRIGHT is enough to prove something is lit, whatever the average says.
+    // Conservative on purpose — this decides whether an agent is allowed to
+    // read the screen at all.
+    let no_signal = mean < 10 && var < 64 && max < BRIGHT;
 
     // Bit per cell: cell's sample sum vs the global mean of cell sums.
     let cell_mean = (sum / 64) as u32;
@@ -186,6 +239,7 @@ pub fn classify_rgb(rgb: &[u8], w: u32, h: u32) -> (u64, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn solid_rgb(r: u8, g: u8, b: u8, w: u32, h: u32) -> Vec<u8> {
         (0..w * h).flat_map(|_| [r, g, b]).collect()
@@ -212,6 +266,94 @@ mod tests {
         let buf = solid_rgb(128, 128, 128, 320, 240);
         let (_, no_sig) = classify_rgb(&buf, 320, 240);
         assert!(!no_sig);
+    }
+
+    /// A boot screen is mostly black, and that must not read as "no signal".
+    ///
+    /// This is the regression for a real failure: hdmicap reported `no_signal`
+    /// for minutes at a time across a NUC's PXE/Gigaboot phase, and labelled a
+    /// clean, fully readable capture `no_signal` too. The screen was 1.35%
+    /// bright pixels on black, and the sampling lattice was coarse enough to
+    /// land on none of them — so mean, variance and max all said "blank".
+    ///
+    /// The frame below mimics that: thin bright text rows on black, at roughly
+    /// the same bright fraction, positioned off the old lattice. It fails with
+    /// the pre-fix `CELL_SAMPLES = 4`.
+    #[test]
+    fn sparse_bright_text_on_black_is_not_no_signal() {
+        let (w, h) = (1280u32, 720u32);
+        let mut buf = vec![0u8; (w * h * 3) as usize];
+        // Nine 2px text rows, at y positions the PRE-FIX 32x32 lattice misses
+        // entirely and the 64x64 lattice hits. Calibrated deliberately: a row
+        // spacing chosen by eye happens to collide with the old lattice, the
+        // test passes against the old code, and the regression it is supposed
+        // to guard goes unguarded. If the lattice geometry changes, recompute
+        // these rather than assuming they still straddle it.
+        const ROWS: [u32; 9] = [4, 83, 162, 240, 319, 398, 477, 555, 634];
+        let mut lit = 0u32;
+        for y0 in ROWS {
+            for y in y0..(y0 + 2).min(h) {
+                // Dashes with gaps, like glyphs rather than a solid rule.
+                for x in (0..w).filter(|x| (x / 4) % 3 != 0) {
+                    let i = ((y * w + x) * 3) as usize;
+                    buf[i] = 255;
+                    buf[i + 1] = 255;
+                    buf[i + 2] = 255;
+                    lit += 1;
+                }
+            }
+        }
+        // Sanity: this is a sparse screen, not a bright one.
+        let frac = lit as f64 / (w * h) as f64;
+        assert!(frac < 0.03, "test frame should be sparse, got {frac:.4}");
+
+        let (_, no_sig) = classify_rgb(&buf, w, h);
+        assert!(
+            !no_sig,
+            "a readable boot screen classified as no_signal ({:.2}% of pixels lit)",
+            frac * 100.0
+        );
+    }
+
+    /// A frame that has aged out must stop claiming to be the screen.
+    ///
+    /// The capture loop publishes only on success, so a stalled capture leaves
+    /// the last good frame in place with its old label. Observed twice on real
+    /// hardware: across a mode change, and on a machine whose mains had been
+    /// cut — which kept reporting `stable` on its pre-cut desktop. `--stable`
+    /// and `/ocr` both gate on this, so an agent trusted a dead screen.
+    #[test]
+    fn an_aged_out_frame_is_stale_not_stable() {
+        let fresh = FrameState {
+            jpeg: None,
+            pixels: PixelData::Empty,
+            width: 1280,
+            height: 720,
+            hash: 1,
+            signal: Signal::Stable,
+            resolution_epoch: 0,
+            captured_at: Instant::now(),
+        };
+        assert_eq!(fresh.effective_signal(), Signal::Stable);
+
+        let stalled = FrameState {
+            captured_at: Instant::now() - (STALE_AFTER + Duration::from_millis(1)),
+            ..fresh.clone()
+        };
+        assert_eq!(
+            stalled.effective_signal(),
+            Signal::Stale,
+            "a frame older than STALE_AFTER must not read as Stable"
+        );
+
+        // A device that is genuinely gone keeps saying so; staleness does not
+        // overwrite a terminal answer with a vaguer one.
+        let gone = FrameState {
+            signal: Signal::NoDevice,
+            captured_at: Instant::now() - (STALE_AFTER * 10),
+            ..fresh.clone()
+        };
+        assert_eq!(gone.effective_signal(), Signal::NoDevice);
     }
 
     #[test]

@@ -125,7 +125,7 @@ async fn snapshot(State(s): State<AppState>, Query(q): Query<SnapReq>) -> Respon
         let ready = {
             let f = rx.borrow_and_update();
             match (want_stable, changed_since) {
-                (true, _) => f.signal == Signal::Stable,
+                (true, _) => f.effective_signal() == Signal::Stable,
                 (_, Some(h)) => f.hash != h,
                 _ => true,
             }
@@ -203,6 +203,14 @@ fn encode_png(f: &FrameState) -> Option<Vec<u8>> {
 /// Lazily encode the current RGB buffer to PNG. PNG for agent snapshots: text
 /// edges matter for OCR and the dongle already adds MJPEG artifacts.
 fn png_response(f: &FrameState, timed_out: bool) -> Response {
+    if f.effective_signal() == Signal::Stale {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::HeaderName::from_static("x-signal"), "stale")],
+            "capture stalled; the last frame is too old to be the screen",
+        )
+            .into_response();
+    }
     if f.signal == Signal::NoDevice || f.width == 0 {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -336,6 +344,13 @@ fn visionocr_bin() -> std::ffi::OsString {
 /// tool located by [`visionocr_bin`].
 async fn ocr(State(s): State<AppState>) -> Response {
     let f = s.frames.borrow().clone();
+    if f.effective_signal() == Signal::Stale {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "capture stalled; the last frame is too old to be the screen",
+        )
+            .into_response();
+    }
     if f.signal == Signal::NoDevice || f.width == 0 {
         return (StatusCode::SERVICE_UNAVAILABLE, "no capture device").into_response();
     }
@@ -510,6 +525,7 @@ async fn devices() -> Response {
 fn signal_name(s: Signal) -> &'static str {
     match s {
         Signal::Stable => "stable",
+        Signal::Stale => "stale",
         Signal::ModeSwitching => "mode_switching",
         Signal::NoSignal => "no_signal",
         Signal::NoDevice => "no_device",
