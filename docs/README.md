@@ -13,6 +13,7 @@ on Debian/Raspberry Pi OS the quickest route is the [apt repository](https://cur
 | [**Architecture**](architecture.md) | The whole system in its current state: deployment model, the CLI + per-subsystem daemons, config/state model, data flows, host-OS differences. **Read this first.** |
 | [Requirements & progress](requirements.md) | Project-wide requirements tracker (shipped capabilities + planned work + decisions), with status per item. |
 | [Tested hardware](hardware.md) | The bench hardware each subsystem is verified with, by category, with purchase links. |
+| [Demos](demos.md) | Recorded runs from the CI rack — a NUC's BIOS puppeted through the KVM, a live desktop driven by emulated HID, out-of-band power over Intel AMT, a Pi cold-booted through a relay — each capture beside the transcript of what the agent typed. |
 
 ## Subsystem guides
 
