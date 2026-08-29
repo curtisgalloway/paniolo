@@ -66,7 +66,7 @@ The deltas between conditions are the real signal:
   with zero pushed guidance.
 
 > **Nested discovery.** The `paniolo` skill points at sub-skills
-> (`paniolo skill kvm-puppeting`, `paniolo skill usbhub`). In the **Warm** and
+> (`paniolo skill kvm-puppeting`). In the **Warm** and
 > **Preloaded** conditions, scenarios that need those (e.g. GUI puppeting) test
 > whether the agent *follows the pointer* — a second discovery hop even when the
 > top-level skill is in hand.
@@ -136,7 +136,7 @@ loads user memory — only a harness smoke test, not a valid Cold number.
   `skills/paniolo/` in the harness's skills directory. `paniolo skill` still
   works (the binary ships the skills), which is exactly the path under test.
 - **Warm:** register `skills/paniolo/SKILL.md` with the harness so its
-  description is listed; leave `kvm-puppeting`/`usbhub` pullable-only.
+  description is listed; leave `kvm-puppeting` pullable-only.
 - **Preloaded:** prepend the full `skills/paniolo/SKILL.md` to the system/context.
 
 ### 3.3 Lab-file isolation & safety (T1)
@@ -204,8 +204,8 @@ main console."
 **C3 — Power-cycle through a Shelly plug.** *(invent-detector)*
 *Goal:* "`pico` is plugged into a Shelly smart plug at `10.66.27.141`. Make
 `paniolo power-cycle pico` actually cut and restore its power."
-*Reference:* discover the `shellyplug` helper (`paniolo helper`, `paniolo skill
-usbhub`/power docs) and wire it into the power hooks:
+*Reference:* discover the `shellyplug` helper (`paniolo helper`, the power
+docs) and wire it into the power hooks:
 `power set -t pico --cycle-cmd "shellyplug -d 10.66.27.141 cycle" --state-cmd
 "shellyplug -d 10.66.27.141 state"` (and on/off).
 *Trap:* there is **no** `paniolo shelly` command — smart plugs are helpers behind

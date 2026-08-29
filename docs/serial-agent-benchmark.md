@@ -94,12 +94,13 @@ Board reset and disruption are both **automated** (see §6):
 
 - **Reset between trials:** the pi5's power is a Zigbee plug via `zigplug`, so a
   clean power-cycle is one command.
-- **Programmable hot-unplug:** if the USB-serial adapter sits on the switchable
-  RSH hub, the `usbhub` power helper can cut/restore that port's VBUS — a scripted
-  hot-unplug that exercises paniolo's reconnect loop and kills a YOLO/`fx serial`
-  reader. A VBUS cycle between *every* trial also forces clean re-enumeration, so
-  no leftover port handle from a prior arm leaks a spurious "resource busy" into
-  the next. **(To verify: that the bench adapter is on a controllable hub port.)**
+- **Programmable hot-unplug:** cutting and restoring the USB-serial adapter's
+  VBUS would be a scripted hot-unplug that exercises paniolo's reconnect loop and
+  kills a YOLO/`fx serial` reader, and a cycle between *every* trial would force
+  clean re-enumeration so no leftover port handle leaks a spurious "resource
+  busy" into the next arm. **(No shipped helper does per-port VBUS any more —
+  see AGENTS.md on why `usbhub` was removed. A switchable-port hub or a relay in
+  the adapter's supply would be needed.)**
 
 ---
 

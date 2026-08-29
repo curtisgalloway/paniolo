@@ -75,7 +75,7 @@ follow-up. Run through this checklist before calling `gh pr create`:
    To catch the Linux-only failures without a round-trip, run
    `scripts/ci-local.sh` — it mirrors every GitHub Linux CI job (`cli`,
    `serialcap`, `netbootd`, `hdmicap`, `cambrionix`, `ch9329`, `hidrig`,
-   `usbhub`, `shellyplug`) in a Linux environment, e.g. a Lima VM:
+   `shellyplug`) in a Linux environment, e.g. a Lima VM:
    `limactl shell <instance> -- bash -l scripts/ci-local.sh`. It needs a Linux
    box or VM — it apt-installs and copies the tree — so treat it as the fuller
    check rather than the quick one; the three commands above are the minimum
@@ -93,7 +93,7 @@ follow-up. Run through this checklist before calling `gh pr create`:
    script **with the reason written down** — never weaken or delete the check.
 
    The rule exists because five crates (`cambrionix`, `ch9329`, `hidrig`,
-   `usbhub`, `shellyplug`) went months with no CI at all: jobs were added
+   `shellyplug`) went months with no CI at all: jobs were added
    per-crate as each one happened to matter, and nothing noticed the ones that
    were skipped.
 
@@ -193,7 +193,7 @@ Current capabilities:
 - Combined video+serial web dashboard (hdmicap's `GET /`: video on top, xterm.js terminal below)
 - On-device OCR of the captured screen (`paniolo video read [target] [--stable]`, which wraps hdmicap's `GET /ocr`; also the dashboard OCR button): Apple Vision on macOS, Tesseract on Linux
 - USB HID input (keyboard/mouse injection) via a generic helper hook (`paniolo hid send`); the `hidrig` helper drives the dual-board KB2040 injector — it composes HID reports in Rust and writes binary frames to the control board's USB-CDC endpoint, which relays them over I2C1 to the target board (the "dumb pipe", docs/hid-dual-board-design.md; command vocabulary in docs/hid-serial-protocol.md). `hidrig serve` runs a daemon that owns the control link and re-exposes the command vocabulary over a WebSocket, so `paniolo console` works as a **KVM** — stream the browser's keyboard + absolute mouse (`moveabs`) to the target, intermixed with CLI injection on the one wire. The same control board can also **bridge the DUT serial console** (its hardware UART, re-exported by the daemon as a PTY into the `serial` channel) and **switch DUT power** via a relay (`hidrig power off|on|cycle`), so one USB device backs the target's HID, console, and power (design §6–§7; the relay/power path is hardware-verified, incl. NVM state persistence across a control-board reset — the console bridge is not yet)
-- Power control via DTR (J2 wiring; **opt-in per serial interface** via `power_button = true` — `serial dtr`/`reset` refuse interfaces that haven't declared it) or generic shell-command hooks (`on_cmd`, `off_cmd`, `cycle_cmd`, `state_cmd`): `paniolo serial dtr`, `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`. Note: "reboot over the serial console" means `serial send <t> "reboot"` (software), *not* the DTR `serial reset` (hardware). Helpers that wire into the hooks: `cambrionix` (Cambrionix hub port power via control UART), `zigplug` (Zigbee smart plugs via a CC2652 coordinator dongle), `usbhub` (per-port VBUS switching on off-the-shelf USB hubs via hub-class requests, with human-verified port profiles built by `usbhub learn`), `shellyplug` (Shelly Gen2+ smart plugs/relays over the device's local HTTP RPC API — no cloud/HA/Matter), and `amt` (Intel AMT/vPro machines over WS-Management on port 16992 with HTTP Digest auth — per-target power with no plug hardware, plus true power-state readback from the ME; password only via `AMT_PASSWORD` env). The dual-board `hidrig` control board can also drive a DUT power relay (`hidrig power off|on|cycle`) as a power-helper backend, consolidating HID + console + power on one USB device
+- Power control via DTR (J2 wiring; **opt-in per serial interface** via `power_button = true` — `serial dtr`/`reset` refuse interfaces that haven't declared it) or generic shell-command hooks (`on_cmd`, `off_cmd`, `cycle_cmd`, `state_cmd`): `paniolo serial dtr`, `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`. Note: "reboot over the serial console" means `serial send <t> "reboot"` (software), *not* the DTR `serial reset` (hardware). Helpers that wire into the hooks: `cambrionix` (Cambrionix hub port power via control UART), `zigplug` (Zigbee smart plugs via a CC2652 coordinator dongle), `shellyplug` (Shelly Gen2+ smart plugs/relays over the device's local HTTP RPC API — no cloud/HA/Matter), and `amt` (Intel AMT/vPro machines over WS-Management on port 16992 with HTTP Digest auth — per-target power with no plug hardware, plus true power-state readback from the ME; password only via `AMT_PASSWORD` env). The dual-board `hidrig` control board can also drive a DUT power relay (`hidrig power off|on|cycle`) as a power-helper backend, consolidating HID + console + power on one USB device
 
 ## Architecture
 
@@ -236,7 +236,7 @@ Python tree below:
   libexec prepended to PATH, so lab files keep referencing helpers by bare
   name. `paniolo helper [NAME] [ARGS…]` lists or runs them directly.
 - **Bundled skills are self-describing**: the agent skills under `skills/`
-  (`paniolo`, `kvm-puppeting`, `usbhub`) install to
+  (`paniolo`, `kvm-puppeting`) install to
   `~/.local/share/paniolo/skills` (and `/usr/share/paniolo/skills` for the
   Linux packages). `paniolo skill [NAME]` lists them with their frontmatter
   descriptions, or prints one `SKILL.md` (`--path` for the file path) — the
@@ -349,17 +349,6 @@ cambrionix/      Rust crate: standalone helper binary for Cambrionix USB hub con
                  Commands: `state [port]`, `on <port>`, `off <port>`, `cycle <port>`
                  `state <port>` prints exactly `on` or `off` (matches paniolo state_cmd
                  contract). Built/installed by `make install` / `paniolo setup`.
-
-usbhub/          Rust crate: standalone helper for per-port USB hub power control
-                 via hub-class requests (pure Rust, nusb; uhubctl mechanism, works
-                 on macOS + Linux). Hubs addressed by model profile (signature-first
-                 resolution of the internal chip cascade, both USB3 + USB2 sides);
-                 ports by physical silkscreen number. Switching refused unless a
-                 human verified the port cuts power — profiles are built with the
-                 resumable `usbhub learn` step commands (agent-drivable) or the
-                 `learn run` guided wizard (rustyline prompts, history). Probe
-                 detection is by bus topology, not speed. `state <port>` prints
-                 exactly `on`/`off` (state_cmd contract). See docs/power.md.
 
 shellyplug/      Rust crate: standalone helper for Shelly Gen2+ smart plugs/
                  relays (Plus/Pro/Gen3/Gen4) over the device's local HTTP RPC
@@ -818,7 +807,7 @@ ssh control-mac "paniolo netboot stop target-machine"
 a standalone helper binary wired in via the generic power hooks. Follow
 [docs/adding-power-helpers.md](docs/adding-power-helpers.md) (hook contract,
 helper CLI conventions, Rust/Python skeletons, verification ladder, PR
-checklist); `cambrionix/`, `zigplug/`, `usbhub/`, and `shellyplug/` (the
+checklist); `cambrionix/`, `zigplug/`, and `shellyplug/` (the
 simplest one — a stateless HTTP one-shot) are the exemplars.
 
 For a genuine new subsystem (a channel with its own commands/daemon), in the
@@ -881,13 +870,6 @@ Shelly Plug and an Openterface KVM-GO):
 
 **What is still NOT verified on Windows:**
 
-- **usbhub cannot claim a hub.** Windows routes control transfers through a
-  claimed interface, and USB hubs are owned by Microsoft's `usbhub.sys`, which
-  does not permit claiming. `hub::ControlHandle::open` is structurally correct
-  and expected to fail against a real hub; per-port power on Windows needs a
-  hub-driver route (`IOCTL_USB_HUB_CYCLE_PORT` or similar). Note that IOCTL only
-  *cycles* a port — it has no arbitrary on/off — so whether paniolo's power model
-  maps onto Windows at all is an open design question, not just unwritten code.
 - **netbootd falls back to `send_to`.** The `/dev/bpf` raw-frame sender and the
   `SCM_RIGHTS` fd handoff are Unix-only, exactly as on Linux. Whether DHCP/TFTP
   netboot works against a real target on Windows is untested, and `netif` has no
@@ -1087,6 +1069,41 @@ Per-subsystem behavior:
     of the AVFoundation lesson below, and the reason an Openterface captures at
     its real 3840x2160 instead of a rescaled 1080p. MJPEG-only devices are not
     yet supported.
+
+## Removed: `usbhub` (per-port USB hub power)
+
+paniolo shipped a `usbhub` helper that switched VBUS on individual ports of
+off-the-shelf hubs via USB hub-class requests — the uhubctl mechanism, in pure
+Rust. It was removed in full. Do not rebuild it without reading this.
+
+Why it went:
+
+- **The `learn` procedure was unusable.** Hubs do not report which port maps to
+  which silkscreen number, and chips routinely claim per-port switching with no
+  VBUS MOSFETs behind it. So a profile could only be built by a human physically
+  watching a device lose power, port by port, through a resumable wizard. That is
+  a lot of ceremony to configure one power hook, and it had to be redone per hub
+  model.
+- **The hardware is hard to get and unreliable.** Hubs with genuinely switchable
+  per-port VBUS are a shrinking niche, and the ones that work are not
+  consistently available.
+- **Port state did not survive the hub losing power.** Power-cycling the hub
+  turned every port back on, so the helper's state could silently disagree with
+  reality.
+
+It was also the only power helper with device-specific support inside `cli/`
+(`usbhub_profiles.rs`, a `USBHUB_LIBRARY_PATH` special case in
+`daemons::helper_env`, and a bundled profile library in the `.deb`). That
+contradicted the rule in **Source code constraints** that device knowledge lives
+in helper binaries behind the generic hooks — so removing it took a carve-out
+out of the core as well as a crate out of the tree.
+
+**What to use instead:** `shellyplug` (Shelly Gen2+ over local HTTP RPC),
+`zigplug` (Zigbee), `amt` (Intel AMT/vPro, with true power-state readback),
+`cambrionix` (Cambrionix hub ports), or a relay driven through the generic
+hooks — which is what the CI rack actually uses. If per-port USB power is ever
+needed again, the git history has the implementation; the mechanism was never
+the problem.
 
 ## Known limitations / gotchas
 

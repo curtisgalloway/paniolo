@@ -35,7 +35,6 @@ mod setup;
 mod skills;
 mod ssh;
 mod state;
-mod usbhub_profiles;
 mod video;
 
 use std::path::PathBuf;
@@ -175,7 +174,7 @@ enum Command {
     /// (the guides that teach an agent how to drive a target). Omit NAME to
     /// list them.
     Skill {
-        /// Skill to print (e.g. paniolo, kvm-puppeting, usbhub).
+        /// Skill to print (e.g. paniolo, kvm-puppeting).
         name: Option<String>,
         /// Print the SKILL.md file path instead of its contents.
         #[arg(long)]

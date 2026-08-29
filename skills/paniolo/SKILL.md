@@ -472,7 +472,6 @@ even on a packaged install:
 ```
 paniolo skill                  # list bundled skills with their descriptions
 paniolo skill kvm-puppeting    # print a skill's SKILL.md (e.g. GUI puppeting)
-paniolo skill usbhub           # per-port USB-hub power control
 paniolo skill paniolo --path   # the file path, to open or Read it
 ```
 

@@ -199,27 +199,6 @@ jobs:
       - name: Test
         run: cargo test
 
-  usbhub:
-    name: usbhub (fmt, clippy, test)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: usbhub
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: usbhub
-      - name: Format check
-        run: cargo fmt --check
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Test
-        run: cargo test
-
   shellyplug:
     name: shellyplug (fmt, clippy, test)
     runs-on: ubuntu-latest
@@ -274,8 +253,8 @@ jobs:
     #
     # What CI cannot cover: anything needing the bench hardware. hdmicap's
     # Media Foundation backend and the ch9329 HID path are verified by hand on
-    # `brik`, not here; usbhub cannot claim a hub on Windows at all. See
-    # AGENTS.md under **Platform support** for what is and is not verified.
+    # `brik`, not here. See AGENTS.md under **Platform support** for what is
+    # and is not verified.
     name: windows (all crates, fmt, clippy, test)
     runs-on: windows-latest
     steps:
@@ -293,13 +272,12 @@ jobs:
             cambrionix
             hidrig
             ch9329
-            usbhub
             shellyplug
             amt
       - name: Format, clippy and test every crate
         shell: pwsh
         run: |
-          $crates = "cli","hdmicap","serialcap","netbootd","cambrionix","hidrig","ch9329","usbhub","shellyplug","amt"
+          $crates = "cli","hdmicap","serialcap","netbootd","cambrionix","hidrig","ch9329","shellyplug","amt"
           $failed = @()
           foreach ($c in $crates) {
             Write-Host "::group::$c"

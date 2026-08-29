@@ -38,7 +38,7 @@ caught on serial.
 | [Link mode](docs/netif.md) | `paniolo netif` | Atomically switch the link between netboot, ffx-over-IPv6, bare-link (`link`), and `off` modes; toggle `link`/`off` to test the link up/down, or `down-hard` to force a real carrier drop (WoL off + admin-down) |
 | [Video](docs/video.md) | `paniolo video` | HDMI capture via warm-stream daemon; on-device OCR |
 | [Serial](docs/serial.md) | `paniolo serial` | Serial console — interactive (tio) or daemon-backed with timestamped rolling log |
-| [Power control](docs/power.md) | `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`, `paniolo serial dtr/reset` | DTR-based hardware power button (J2 header; opt-in per serial interface) and generic shell-command hooks (on/off/cycle/state); helpers: `cambrionix` (Cambrionix hub ports), `usbhub` (off-the-shelf USB hub ports), `zigplug` (Zigbee smart plugs), `shellyplug` (Shelly Gen2+ plugs/relays over local HTTP RPC), `amt` (Intel AMT/vPro over WS-Man, with true power-state readback) |
+| [Power control](docs/power.md) | `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`, `paniolo serial dtr/reset` | DTR-based hardware power button (J2 header; opt-in per serial interface) and generic shell-command hooks (on/off/cycle/state); helpers: `cambrionix` (Cambrionix hub ports), `zigplug` (Zigbee smart plugs), `shellyplug` (Shelly Gen2+ plugs/relays over local HTTP RPC), `amt` (Intel AMT/vPro over WS-Man, with true power-state readback) |
 | [HID injection](docs/hid.md) | `paniolo hid` | USB keyboard/mouse injection via a generic helper hook (`hidrig` KB2040 injector); KVM input from the web console |
 | [adb (Android targets)](docs/adb.md) | `paniolo adb` | Drive an Android DUT over adb — console (`shell`/`run`), screen (`screencap`), and input — one USB cable, no capture/HID/serial rig |
 | [Dashboard](docs/dashboard.md) | `paniolo console` | Combined video + serial web UI; auto-starts daemons; `-i <name>` preselects a serial interface |
@@ -102,7 +102,7 @@ make install           # paniolo CLI + daemons + OCR helper, in one step
 `make install` bootstraps the CLI with `cargo install --path cli`, then runs
 `paniolo setup`, which compiles and installs all of paniolo's binaries. Only
 the `paniolo` CLI lands on PATH (`~/.cargo/bin`); the daemons and helpers
-(`hdmicap`, `serialcap`, `netbootd`, `cambrionix`, `hidrig`, `usbhub`,
+(`hdmicap`, `serialcap`, `netbootd`, `cambrionix`, `hidrig`,
 `shellyplug`, `amt`) and the OCR
 helper (`visionocr` on macOS via `swiftc`, `linuxocr` on Linux) install into
 the private libexec dir `~/.local/libexec/paniolo/bin`, where paniolo finds
@@ -138,7 +138,6 @@ cargo install --path ~/src/paniolo/serialcap --root ~/.local/libexec/paniolo  # 
 cargo install --path ~/src/paniolo/netbootd  --root ~/.local/libexec/paniolo  # if netbootd changed (re-run `paniolo setup` to re-setuid the helper on macOS)
 cargo install --path ~/src/paniolo/cambrionix --root ~/.local/libexec/paniolo # if cambrionix changed
 cargo install --path ~/src/paniolo/hidrig    --root ~/.local/libexec/paniolo  # if hidrig changed
-cargo install --path ~/src/paniolo/usbhub    --root ~/.local/libexec/paniolo  # if usbhub changed
 cargo install --path ~/src/paniolo/shellyplug --root ~/.local/libexec/paniolo # if shellyplug changed
 cargo install --path ~/src/paniolo/amt       --root ~/.local/libexec/paniolo  # if amt changed
 UV_TOOL_BIN_DIR=~/.local/libexec/paniolo/bin uv tool install --force ~/src/paniolo/zigplug # if zigplug changed
