@@ -7,6 +7,26 @@ reins while you're writing bootloaders, firmware, or OS bring-up code — paniol
 gives it the controls to netboot the target, watch its output, send it input,
 and power-cycle it without human intervention at each iteration.
 
+## See it work
+
+An agent on a laptop drives an Intel NUC's firmware setup on a CI rack in
+another room: exit, catch `F2` during POST through the KVM's emulated
+keyboard, confirm re-entry by OCR, then navigate by absolute mouse. What the
+dashboard saw:
+
+![NUC BIOS, driven over the KVM from another room](docs/demo/nuc-bios-puppet-screen.gif)
+
+```console
+$ paniolo hid send -t lab-nuc-1 key ENTER          # discard & exit → the NUC reboots
+$ for i in $(seq 30); do paniolo hid send -t lab-nuc-1 key F2 >/dev/null; done
+$ until paniolo video read lab-nuc-1 | grep -q -i "bios version"; do sleep 2; done
+$ paniolo hid send -t lab-nuc-1 moveabs 19583 5871 ; paniolo hid send -t lab-nuc-1 click left
+```
+
+More on the [demos page](docs/demos.md): a live desktop puppeted over HID,
+out-of-band power over Intel AMT, and a Pi cold-booted through a relay and
+caught on serial.
+
 ---
 
 ## Capabilities
@@ -30,7 +50,8 @@ and power-cycle it without human intervention at each iteration.
 
 Full docs live in [`docs/`](docs/README.md). Start with the
 [**architecture overview**](docs/architecture.md) for the whole-system design, then the
-per-subsystem guides linked above. The [tested-hardware list](docs/hardware.md) covers the
+per-subsystem guides linked above. The [demos page](docs/demos.md) shows recorded runs
+from the CI rack, and the [tested-hardware list](docs/hardware.md) covers the
 bench gear each subsystem is verified with. Hardware-CI integration (KernelCI/LAVA,
 Fuchsia/botanist) design and the project requirements tracker are under
 [`docs/`](docs/README.md) as well.
