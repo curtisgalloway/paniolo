@@ -45,7 +45,7 @@ This document is **normative for the command vocabulary**. Consumers:
 | `hidrig` CLI / `serve` daemon (`hidrig/src/`) | Reference host implementation — composes the vocabulary into HID reports |
 | `hidrig/firmware/dual/` — dual-board KB2040 "dumb pipe" | Default rig: relays composed report bytes, does **not** parse this protocol |
 | `hidrig/firmware/` — single-board KB2040 line-protocol firmware | **Retired** reference device implementation (spoke this over a UART) |
-| WCH CH9329 bridge (see [ch9329-spec.md](https://github.com/curtisgalloway/paniolo/blob/main/docs/ch9329-spec.md)) | Implemented — the host-side [`ch9329`](https://github.com/curtisgalloway/paniolo/blob/main/ch9329/README.md) crate speaks this protocol (one-shot CLI + `serve` daemon); a separate helper backend that drops into the same `hid` channel |
+| WCH CH9329 bridge (see [ch9329-spec.md](https://github.com/curtisgalloway/paniolo/blob/main/notes/ch9329-spec.md)) | Implemented — the host-side [`ch9329`](https://github.com/curtisgalloway/paniolo/blob/main/ch9329/README.md) crate speaks this protocol (one-shot CLI + `serve` daemon); a separate helper backend that drops into the same `hid` channel |
 
 The host-side client is the `hidrig` CLI (`hidrig/src/`); above it, paniolo and
 the dashboard speak only this vocabulary, so any injector behind the generic

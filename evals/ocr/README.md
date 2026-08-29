@@ -32,7 +32,7 @@ its own to pick a config.
 
 ## The adapter is paniolo's OCR envelope
 
-Engines are driven through the **v1 envelope** (`docs/ocr.md`) rather than a
+Engines are driven through the **v1 envelope** (`docs/dev/ocr.md`) rather than a
 Python protocol invented here. That is a departure from the plan this harness
 was specced from, and the reason is that the envelope arrived in between: it
 already carries text, per-line confidence, boxes and engine identity in one

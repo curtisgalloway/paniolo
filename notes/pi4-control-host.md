@@ -1,5 +1,6 @@
 # Pi 4 as a self-contained control host
 
+<!-- CCG: the docs should cover the current state - which is that there is a working image. -->
 This is a bring-up plan for running the **entire** paniolo control host on a single
 Raspberry Pi 4 (Linux, ARM64) sitting next to one target — netboot, HDMI capture +
 OCR, serial console, HID injection, and power control, with the Pi reachable as a
@@ -8,7 +9,7 @@ always-on box per bench instead of tying up a workstation.
 
 paniolo's daemons are already cross-platform, so most of this is configuration. The
 **one piece that needs building** is a Linux USB-HID-gadget backend — today HID is
-delegated to an external KB2040 over serial (see [hid.md](hid.md)); on a Pi 4 the
+delegated to an external KB2040 over serial (see [hid.md](../docs/hid.md)); on a Pi 4 the
 control host can *be* the HID device on its own USB-C port. That backend is small
 (it reuses the existing Rust report composition and only swaps the transport), but
 it does not exist yet.
@@ -23,13 +24,13 @@ it does not exist yet.
 
 | Subsystem | On the Pi 4 | Notes |
 |---|---|---|
-| Netboot ([netboot.md](netboot.md)) | ✅ works | Single-binary Rust `netbootd`, ARM64-native. Needs a **secondary** NIC for the direct link — see topology below. |
-| Video capture ([video.md](video.md)) | ✅ works | V4L2 path (`v4l` + `turbojpeg`), no macOS-only deps. MJPEG dongles tee compressed frames straight to `/preview` — cheap on a Pi. |
+| Netboot ([netboot.md](../docs/netboot.md)) | ✅ works | Single-binary Rust `netbootd`, ARM64-native. Needs a **secondary** NIC for the direct link — see topology below. |
+| Video capture ([video.md](../docs/video.md)) | ✅ works | V4L2 path (`v4l` + `turbojpeg`), no macOS-only deps. MJPEG dongles tee compressed frames straight to `/preview` — cheap on a Pi. |
 | OCR | ⚠️ works, weaker | Linux uses Tesseract (`linuxocr`), not Apple Vision. Real accuracy regression on small console fonts — fine for coarse screen state, weaker for exact text. |
-| Serial console ([serial.md](serial.md)) | ✅ works | Any `/dev/tty*` works as the `--device`, including the Pi's own GPIO UART. Voltage + UART-routing caveats below. |
-| Power control ([power.md](power.md)) | ✅ works | Generic `cycle_cmd`/`on_cmd`/`off_cmd`/`state_cmd` hooks call a helper that talks to a plug/relay/hub. The Pi switches nothing itself. |
-| HID injection ([hid.md](hid.md)) | 🔨 needs building | New USB-HID-gadget backend on the USB-C port (`/dev/hidg0`). See [HID gadget backend](#hid-gadget-backend-net-new) below. |
-| Remote control ([distributed-control.md](distributed-control.md)) | ✅ works | The Pi is just another host in the lab file; the dev machine tunnels to it over SSH. |
+| Serial console ([serial.md](../docs/serial.md)) | ✅ works | Any `/dev/tty*` works as the `--device`, including the Pi's own GPIO UART. Voltage + UART-routing caveats below. |
+| Power control ([power.md](../docs/power.md)) | ✅ works | Generic `cycle_cmd`/`on_cmd`/`off_cmd`/`state_cmd` hooks call a helper that talks to a plug/relay/hub. The Pi switches nothing itself. |
+| HID injection ([hid.md](../docs/hid.md)) | 🔨 needs building | New USB-HID-gadget backend on the USB-C port (`/dev/hidg0`). See [HID gadget backend](#hid-gadget-backend-net-new) below. |
+| Remote control ([distributed-control.md](../docs/distributed-control.md)) | ✅ works | The Pi is just another host in the lab file; the dev machine tunnels to it over SSH. |
 
 ---
 
@@ -71,7 +72,7 @@ point-to-point wire. So the Pi needs **two** interfaces:
   USB-A port.
 
 Either is fine; the deciding factor is whether you want the management uplink wired.
-See [netif.md](netif.md) for how the link flips between netboot and ffx modes.
+See [netif.md](../docs/netif.md) for how the link flips between netboot and ffx modes.
 
 ---
 
@@ -131,7 +132,7 @@ match, or you need a shifter inline:
 | RS-232 (±12 V) | **Needs a transceiver** (MAX3232-class). Direct connection destroys the Pi GPIO. |
 
 > **Why this matters more than it used to.** The current rig uses a level-*selectable*
-> USB-TTL cable (the DSD TECH SH-U09C5 does 1.8/2.5/3.3/5 V — see [hardware.md](hardware.md)),
+> USB-TTL cable (the DSD TECH SH-U09C5 does 1.8/2.5/3.3/5 V — see [hardware.md](../docs/hardware.md)),
 > which quietly absorbs this problem. Going to the raw GPIO UART removes that buffer, so
 > the level decision becomes yours to make per target.
 
@@ -154,7 +155,7 @@ This is the only software that doesn't exist yet. The shape:
 - **paniolo backend** — a new HID transport that writes raw HID reports to the hidg
   character device. Crucially, this **reuses the existing Rust report-composition
   code** (the same logic that today frames reports to the KB2040's CDC, per
-  [hid-dual-board-design.md](hid-dual-board-design.md)); only the output sink changes
+  [hid-dual-board-design.md](../docs/dev/hid-dual-board-design.md)); only the output sink changes
   from "frame to serial" to "write to `/dev/hidg0`". No external board, no firmware, no
   baud negotiation — arguably simpler than the current path.
 - **Wiring into the lab file** — exposed on the target's `hid` channel like any other

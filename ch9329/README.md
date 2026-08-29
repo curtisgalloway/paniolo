@@ -22,7 +22,7 @@ the keyboard/mouse half of an **[Openterface Mini-KVM](https://openterface.com/)
 unmodified, the **Openterface KVM-Go** (a CH32V208 emulating the CH9329
 protocol over its own USB-CDC port; it reports `chip_version=0x01` instead of
 a real chip's `0x38` — see
-[`docs/openterface-kvm-go.md`](../docs/openterface-kvm-go.md)) and should
+[`notes/openterface-kvm-go.md`](../notes/openterface-kvm-go.md)) and should
 drive the **Sipeed NanoKVM-USB** (same protocol, linked at 57600 baud; not
 bench-verified here). It is a sibling of
 [`hidrig`](../hidrig/README.md) (the KB2040 injector client): it exposes the
@@ -30,11 +30,11 @@ bench-verified here). It is a sibling of
 `paniolo hid send` drives it identically.
 
 The difference is underneath. `hidrig` forwards the line-based
-[HID serial protocol](../docs/hid-serial-protocol.md) over a UART to a KB2040
+[HID serial protocol](../docs/dev/hid-serial-protocol.md) over a UART to a KB2040
 running firmware that does the HID. The CH9329 *is itself* the USB HID device,
 so `ch9329` parses each command and speaks the chip's **binary frame protocol**
 directly (`HEAD 57 AB · ADDR · CMD · LEN · DATA · SUM`). The protocol facts are
-the clean-room reference in [`docs/ch9329-spec.md`](../docs/ch9329-spec.md).
+the clean-room reference in [`notes/ch9329-spec.md`](../notes/ch9329-spec.md).
 
 ## Wiring it into a target
 
@@ -59,7 +59,7 @@ Pair it with a `video` channel pointed at the same Openterface's MS2109 capture
 
 ## Commands
 
-The full [HID serial protocol](../docs/hid-serial-protocol.md) §3 surface:
+The full [HID serial protocol](../docs/dev/hid-serial-protocol.md) §3 surface:
 `type`, `key`, `combo`, `down`, `up`, `releaseall`, `move`, `moveabs`, `click`,
 `mdown`, `mup`, `scroll`, `ping`, `version`, and `run <file>` for command
 sequences. Key names are `adafruit_hid` Keycode names (`A`–`Z`, `ENTER`,
@@ -98,7 +98,7 @@ behavior.
   positioning, clicking, and right-click all drive the desktop correctly.
   The **Openterface KVM-Go** is bench-verified end-to-end too
   (`chip_version=0x01`, 115200 — see
-  [`docs/openterface-kvm-go.md`](../docs/openterface-kvm-go.md)); the
+  [`notes/openterface-kvm-go.md`](../notes/openterface-kvm-go.md)); the
   NanoKVM-USB speaks the same protocol but is not bench-verified here.
   A tap or chord involving a **lock key** (`CAPS_LOCK` etc.) is held for
   200 ms before release — macOS debounces short lock-key presses (against a
@@ -134,7 +134,7 @@ behavior.
   is per-invocation there; `combo` and `run` sequences still compose within one
   process.
 - **Baud changing is implemented and hardware-verified** via the `baud`
-  command (the `SET_PARA_CFG` flash-and-reset procedure, `docs/ch9329-spec.md`
+  command (the `SET_PARA_CFG` flash-and-reset procedure, `notes/ch9329-spec.md`
   §5) — round-tripped 115200 → 9600 → 115200 on real hardware, the change
   surviving a fresh process (it's persisted to flash). It is *persistent*, not
   the protocol's transient renegotiation, so it is not advertised as a `baud`

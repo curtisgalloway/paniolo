@@ -44,7 +44,7 @@ The `--device` value may be:
 - a **`/dev/video*` path** (Linux): accepted, but not stable across reboots.
 
 The device lives on the target's `video` channel in the lab file (see
-[config-redesign.md](https://github.com/curtisgalloway/paniolo/blob/main/docs/config-redesign.md)); `paniolo configure` proposes the
+[config-redesign.md](https://github.com/curtisgalloway/paniolo/blob/main/notes/config-redesign.md)); `paniolo configure` proposes the
 stable id (with the human name as a comment) when one non-built-in capture
 device is present, and lists id alternatives when there are several.
 
@@ -65,7 +65,7 @@ is printed — open it in a browser for the live preview.
 After an upgrade or rebuild, a daemon still running the old binary is flagged
 **stale** by `paniolo video show` and `paniolo daemons`; `watch` auto-restarts a
 stale daemon (no `--restart` needed), or restart it explicitly with
-`paniolo daemons restart hdmicap` (see [architecture](architecture.md)).
+`paniolo daemons restart hdmicap` (see [architecture](dev/architecture.md)).
 
 ---
 

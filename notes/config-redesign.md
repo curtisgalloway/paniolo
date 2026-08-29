@@ -25,7 +25,7 @@ transitions; a real TFTP boot — Fuchsia shim + ZBI on the Pi 5 — verified
 2026-06-04). Remaining: live remote-host dispatch test (needs a second control
 host) and docs/cutover. (The Openterface CH9329 HID backend, formerly listed
 here as deferred, shipped as the `ch9329` helper crate — see
-docs/ch9329-spec.md. OCR landed 2026-06-05: `paniolo video read` wraps the
+notes/ch9329-spec.md. OCR landed 2026-06-05: `paniolo video read` wraps the
 hdmicap daemon's `GET /ocr`.)
 
 Helper state/runtime-dir API (landed 2026-06-05): paniolo exports
@@ -35,7 +35,7 @@ whenever it invokes a helper (hooks, `paniolo helper`, daemon spawns).
 Helpers prefer the env vars and fall back to the same literal paths when run
 standalone; hdmicap/serialcap/hidrig/zigplug all read them, and zigplug
 auto-migrated its `zigbee.db` from the top of `~/.config/paniolo/` into its
-namespaced dir. Contract documented in docs/adding-power-helpers.md.
+namespaced dir. Contract documented in docs/dev/adding-power-helpers.md.
 The Python Stages 1–4 were the original tested reference; the Python tree
 (`src/paniolo/` + its pytest suite) has since been **removed** now that the Rust
 `cli/` crate is the only control-plane implementation.
@@ -98,7 +98,7 @@ Lab
   serial_interface), `video` (device). Every channel may carry `host =`.
   *Since this design: `power` grew `on_cmd`/`off_cmd`/`state_cmd` (the generic
   hook block) and a `hid` channel (`cmd`) was added — see
-  [power.md](power.md) and [hid.md](hid.md) for the current shapes.*
+  [power.md](../docs/power.md) and [hid.md](../docs/hid.md) for the current shapes.*
 
 ### Identity & uniqueness rules
 

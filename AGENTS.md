@@ -68,12 +68,12 @@ follow-up. Run through this checklist before calling `gh pr create`:
 
 1. **Update docs that the PR affects.** For each changed subsystem, check:
    - `docs/<subsystem>.md` — commands, config fields, workflows
-   - `docs/architecture.md` — whole-system design, data flows, runtime paths (if structure changed)
+   - `docs/dev/architecture.md` — whole-system design, data flows, runtime paths (if structure changed)
    - `docs/README.md` — the docs index (if a doc was added/removed)
    - `mkdocs.yml` — a new `docs/*.md` needs a `nav:` entry (end-user doc) or an
      `exclude_docs:` entry (repo-only design record); the docs build runs
      `mkdocs build --strict`
-   - `docs/requirements.md` — the requirements tracker status (if scope/progress changed)
+   - `docs/dev/requirements.md` — the requirements tracker status (if scope/progress changed)
    - `README.md` — capabilities table, installation steps
    - `AGENTS.md` — module layout, command descriptions, architecture notes
    - `evals/scenarios/*.toml` — the agent-eval scenarios assert CLI behavior;
@@ -257,27 +257,22 @@ Current capabilities:
   timestamped rolling capture log queryable by line range (`paniolo serial log -i <name>`)
 - Combined video+serial web dashboard (hdmicap's `GET /`: video on top, xterm.js terminal below)
 - On-device OCR of the captured screen (`paniolo video read [target] [--stable]`, which wraps hdmicap's `GET /ocr`; also the dashboard OCR button): Apple Vision on macOS, Tesseract on Linux
-- USB HID input (keyboard/mouse injection) via a generic helper hook (`paniolo hid send`); the `hidrig` helper drives the dual-board KB2040 injector — it composes HID reports in Rust and writes binary frames to the control board's USB-CDC endpoint, which relays them over I2C1 to the target board (the "dumb pipe", docs/hid-dual-board-design.md; command vocabulary in docs/hid-serial-protocol.md). `hidrig serve` runs a daemon that owns the control link and re-exposes the command vocabulary over a WebSocket, so `paniolo console` works as a **KVM** — stream the browser's keyboard + absolute mouse (`moveabs`) to the target, intermixed with CLI injection on the one wire. The same control board can also **bridge the DUT serial console** (its hardware UART, re-exported by the daemon as a PTY into the `serial` channel) and **switch DUT power** via a relay (`hidrig power off|on|cycle`), so one USB device backs the target's HID, console, and power (design §6–§7; the relay/power path is hardware-verified, incl. NVM state persistence across a control-board reset — the console bridge is not yet)
+- USB HID input (keyboard/mouse injection) via a generic helper hook (`paniolo hid send`); the `hidrig` helper drives the dual-board KB2040 injector — it composes HID reports in Rust and writes binary frames to the control board's USB-CDC endpoint, which relays them over I2C1 to the target board (the "dumb pipe", docs/dev/hid-dual-board-design.md; command vocabulary in docs/dev/hid-serial-protocol.md). `hidrig serve` runs a daemon that owns the control link and re-exposes the command vocabulary over a WebSocket, so `paniolo console` works as a **KVM** — stream the browser's keyboard + absolute mouse (`moveabs`) to the target, intermixed with CLI injection on the one wire. The same control board can also **bridge the DUT serial console** (its hardware UART, re-exported by the daemon as a PTY into the `serial` channel) and **switch DUT power** via a relay (`hidrig power off|on|cycle`), so one USB device backs the target's HID, console, and power (design §6–§7; the relay/power path is hardware-verified, incl. NVM state persistence across a control-board reset — the console bridge is not yet)
 - Power control via DTR (J2 wiring; **opt-in per serial interface** via `power_button = true` — `serial dtr`/`reset` refuse interfaces that haven't declared it) or generic shell-command hooks (`on_cmd`, `off_cmd`, `cycle_cmd`, `state_cmd`): `paniolo serial dtr`, `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`. Note: "reboot over the serial console" means `serial send <t> "reboot"` (software), *not* the DTR `serial reset` (hardware). Helpers that wire into the hooks: `cambrionix` (Cambrionix hub port power via control UART), `zigplug` (Zigbee smart plugs via a CC2652 coordinator dongle), `shellyplug` (Shelly Gen2+ smart plugs/relays over the device's local HTTP RPC API — no cloud/HA/Matter), and `amt` (Intel AMT/vPro machines over WS-Management on port 16992 with HTTP Digest auth — per-target power with no plug hardware, plus true power-state readback from the ME; password only via `AMT_PASSWORD` env). The dual-board `hidrig` control board can also drive a DUT power relay (`hidrig power off|on|cycle`) as a power-helper backend, consolidating HID + console + power on one USB device
 
 ## Architecture
 
-**Option A (current):** one daemon per subsystem, controlled via SSH. No
-long-running parent process; state lives in JSON + PID files under
+One daemon per hardware subsystem, controlled via SSH. No
+long-running parent process for control operations; state lives in JSON + PID files under
 `~/.local/share/paniolo/<target>/`. The `paniolo` binary is the only process
 that needs to persist in PATH; each subsystem daemon is a backgrounded
 subprocess.
 
-**Option B (future):** single long-running server with socket-based RPC,
-enabling inter-subsystem coordination (e.g., "stream serial output whenever
-a netboot attempt fires"). Will be implemented in Rust when the complexity
-of option A is no longer sufficient.
-
-## Rust control plane (`cli/` — the current implementation)
+## Rust control plane (`cli/`)
 
 The CLI + orchestration + device glue is rewritten in Rust (the `cli/` crate),
 finishing the Python→Rust migration the daemons started. Design + status:
-[`docs/config-redesign.md`](docs/config-redesign.md). Key differences from the
+[`notes/config-redesign.md`](notes/config-redesign.md). Key differences from the
 Python tree below:
 
 - **Config is one CLI-managed lab file** (`~/.config/paniolo/lab.toml`, or
@@ -367,12 +362,6 @@ cli/src/
                 one SKILL.md (or --path), install_bundled() for setup.rs
 ```
 
-The Openterface CH9329 HID backend (once deferred in
-docs/config-redesign.md) is **implemented and hardware-verified**: the `ch9329/`
-crate is a helper that speaks the HID serial protocol surface into the existing
-`hid` channel, with no device-specific code in `cli/`. Clean-room protocol
-reference: docs/ch9329-spec.md.
-
 **Helper state/runtime-dir API** (daemons.rs `helper_env`): paniolo exports
 `PANIOLO_STATE_DIR` (`~/.config/paniolo/helpers/<name>/`, durable) and
 `PANIOLO_RUNTIME_DIR` (`/tmp/paniolo-<uid>/<name>/`, discovery/locks/logs) —
@@ -388,7 +377,7 @@ publishes under `hid`). Helpers prefer the env vars, falling back to the same
 literal paths standalone; hdmicap/serialcap/hidrig/zigplug all do, and
 zigplug lazily migrates its `zigbee.db` from the legacy top-level
 `~/.config/paniolo/` location into its namespaced dir. Contract for new
-helpers: docs/adding-power-helpers.md.
+helpers: docs/dev/adding-power-helpers.md.
 
 ## Module layout
 
@@ -546,14 +535,14 @@ hidrig/          USB HID injector: host CLI + daemon (Rust) + dual-board KB2040 
                    and prints raw input reports — for pipeline testing without
                    keystrokes reaching the focused app. Build with host/Makefile.
   README.md        topology, wiring, frame protocol, CLI usage. The command
-                   vocabulary spec is docs/hid-serial-protocol.md; the dual-board
-                   design + frame format is docs/hid-dual-board-design.md
+                   vocabulary spec is docs/dev/hid-serial-protocol.md; the dual-board
+                   design + frame format is docs/dev/hid-dual-board-design.md
 
 ch9329/          Rust crate: the *other* hid helper — a WCH CH9329 UART->USB-HID
                  bridge client, hardware-verified against an Openterface
                  Mini-KVM and an Openterface KVM-Go (a CH32V208 emulating the
                  CH9329 protocol; reports chip_version=0x01, not a real chip's
-                 0x38 — see docs/openterface-kvm-go.md). The Sipeed
+                 0x38 — see notes/openterface-kvm-go.md). The Sipeed
                  NanoKVM-USB speaks the same frame protocol at 57600 but is
                  not bench-verified here. Same
                  CLI surface as hidrig, so it drops into a `hid` channel
@@ -561,7 +550,7 @@ ch9329/          Rust crate: the *other* hid helper — a WCH CH9329 UART->USB-H
                  chip *is* the HID device, so it speaks the binary frame
                  protocol (HEAD 57 AB / ADDR / CMD / LEN / DATA / SUM) rather
                  than relaying the line protocol. Clean-room spec:
-                 docs/ch9329-spec.md
+                 notes/ch9329-spec.md
   src/proto.rs     the HID serial protocol grammar executed against a Session
                    instead of forwarded to a microcontroller; `execute_line` is
                    the one backend for CLI subcommands and `run` files, so the
@@ -736,8 +725,8 @@ Key differences from the Python servers:
 
 ## hidrig (USB HID injector)
 
-The `hidrig/` directory is the USB HID injector: a Rust host CLI/daemon plus
-CircuitPython 9.x firmware for the **dual-board "dumb pipe"** KB2040 rig.
+The `hidrig/` directory is contains code for a DIY USB HID injector: a Rust host CLI/daemon plus
+CircuitPython 9.x firmware for the **dual-board "dumb pipe"** KB2040 rig.  This is only one of many HID injection devices paniolo can use.
 
 ### Architecture
 
@@ -753,11 +742,11 @@ CircuitPython 9.x firmware for the **dual-board "dumb pipe"** KB2040 rig.
 The host composes HID reports (`src/compose.rs`) and writes binary frames to the
 **control** board's data CDC endpoint; the control board relays `0x01` HID
 frames verbatim over I2C1 to the **target** board, which calls `send_report` —
-neither board parses HID semantics (the "dumb pipe", `docs/hid-dual-board-design.md`).
+neither board parses HID semantics (the "dumb pipe", `docs/dev/hid-dual-board-design.md`).
 The target board's USB faces the DUT as a device-mode HID keyboard + absolute
 mouse (and is DUT-powered, so it reboots with the DUT); the control board is
 independently host-powered. The command vocabulary (`type`/`key`/`moveabs`/…)
-is the device-independent **HID serial protocol v1** (`docs/hid-serial-protocol.md`),
+is the device-independent **HID serial protocol v1** (`docs/dev/hid-serial-protocol.md`),
 but it is the *external* interface only — `hidrig` consumes it and composes; the
 line protocol never reaches a wire. `hidrig` (`src/main.rs`, `src/compose.rs`,
 `src/proto.rs`) is the host client; `firmware/dual/{control,target}/` are the
@@ -886,7 +875,7 @@ ssh control-mac "paniolo netboot stop target-machine"
 
 **Adding support for new power-switching hardware is not a subsystem** — it's
 a standalone helper binary wired in via the generic power hooks. Follow
-[docs/adding-power-helpers.md](docs/adding-power-helpers.md) (hook contract,
+[docs/dev/adding-power-helpers.md](docs/dev/adding-power-helpers.md) (hook contract,
 helper CLI conventions, Rust/Python skeletons, verification ladder, PR
 checklist); `cambrionix/`, `zigplug/`, and `shellyplug/` (the
 simplest one — a stateless HTTP one-shot) are the exemplars.

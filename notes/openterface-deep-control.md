@@ -1,3 +1,4 @@
+<!-- CCG: replace with SPDX short version, or nothing -->
 <!--
 Copyright 2026 Curtis Galloway
 

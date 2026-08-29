@@ -1,9 +1,9 @@
 # Paniolo — System architecture
 
 > The whole design of paniolo in its **current state**. Start here for the big picture, then
-> drop into a [subsystem guide](README.md) for command-level detail. Internal module-by-module
+> drop into a [subsystem guide](../README.md) for command-level detail. Internal module-by-module
 > notes for contributors/agents live in [`AGENTS.md`](https://github.com/curtisgalloway/paniolo/blob/main/AGENTS.md); the forward-looking
-> hardware-CI design lives under [`ci-integration/`](README.md#hardware-ci-integration-in-design).
+> hardware-CI design lives under [`ci-integration/`](../README.md#hardware-ci-integration-in-design).
 >
 > Keep this in sync as the system changes.
 
@@ -12,14 +12,14 @@
 ## 1. What paniolo is
 
 Paniolo is an **agent-controlled target-machine wrangler** for low-level software development
-(bootloaders, firmware, OS bring-up). It gives an AI agent (or a human, or a script) the
+(bootloaders, firmware, embedded software, OS bring-up). It gives an AI agent (or a human, or a script) the
 physical controls of a target board: **netboot it, watch its output, send it input, power-cycle
 it** — without a person at the bench each iteration.
 
 It is deliberately a **device-control / "wrangling" layer**, not a test orchestrator. It owns
 power, serial, deploy (netboot), video, HID, and adb. It does *not* decide what tests to run or
 produce verdicts — when integrated with hardware-CI ecosystems those concerns sit *above* it
-(see [`ci-integration/`](README.md#hardware-ci-integration-in-design)).
+(see [`ci-integration/`](../README.md#hardware-ci-integration-in-design)).
 
 ## 2. Deployment model
 
@@ -41,7 +41,7 @@ produce verdicts — when integrated with hardware-CI ecosystems those concerns 
 - The **control host** is physically wired to one or more **targets** and runs paniolo.
 - The simplest driver is an **agent or script that SSHes into the control host** and runs
   `paniolo …` commands (the remote-control pattern in the root [`README.md`](https://github.com/curtisgalloway/paniolo/blob/main/README.md)).
-- **Or point paniolo at a [lab file](distributed-control.md)** (`--lab` / `PANIOLO_LAB`): the dev
+- **Or point paniolo at a [lab file](../distributed-control.md)** (`--lab` / `PANIOLO_LAB`): the dev
   machine then drives a target on its control host *transparently* — commands re-exec over SSH and
   `console` tunnels the dashboard back — so you don't SSH by hand. The dev machine is the data-plane
   hub; control hosts hold only runtime state. See §5 "Distributed control".
@@ -160,7 +160,7 @@ The runtime base honors `$PANIOLO_RUNTIME_BASE` (default `/tmp`) (`cli/src/daemo
 
 ## 5. Subsystems
 
-### Netboot / deploy ([`netboot.md`](netboot.md))
+### Netboot / deploy ([`netboot.md`](../netboot.md))
 A minimal **DHCP + TFTP + HTTP** server — the single-binary `netbootd` (Rust), all three as
 tokio tasks — over a **direct USB-Ethernet link**: no router, switch, or upstream DHCP.
 `paniolo netboot start` assigns the static `host_ip` to the interface, then spawns `netbootd`;
@@ -170,7 +170,7 @@ hands the target a fixed lease and points it at the TFTP root via BOOTP `siaddr`
 66; TFTP is read-only (RFC 1350 + blksize/tsize). For **UEFI clients**, netbootd reads the
 DHCP vendor class and dispatches: a `PXEClient` gets the configured `boot_file` over TFTP,
 an `HTTPClient` gets an `http://…/<boot_file>` URL and the file over HTTP (HTTP Boot — see
-[`netboot.md`](netboot.md)). No external daemons (`dnsmasq` etc.) are
+[`netboot.md`](../netboot.md)). No external daemons (`dnsmasq` etc.) are
 required at runtime.
 
 `paniolo netboot start` refuses an interface that carries the system default route (a primary
@@ -181,7 +181,7 @@ On macOS, `netbootd`'s raw-frame send path (the Sequoia workaround) gets a `/dev
 from a setuid-root `netbootd-bpf-helper` over `SCM_RIGHTS`, so the daemon itself stays
 unprivileged — the helper is the only root component, installed by `paniolo setup`.
 
-### Link mode: netboot · link · ffx · off ([`netif.md`](netif.md))
+### Link mode: netboot · link · ffx · off ([`netif.md`](../netif.md))
 The same USB-Ethernet link serves **mutually-exclusive** roles: netboot (IPv4 + DHCP + TFTP +
 HTTP, the target TFTP-boots), bare `link` (host IP up, no daemon — for link up/down testing),
 ffx (host IPv6 link-local `fe80::1`/64, the target boots from SD and is
@@ -198,7 +198,7 @@ Wake-on-LAN (which otherwise keeps the PHY energized) and admin-downs the interf
 peer sees carrier drop. Privileged steps reuse the same
 `sudo` path as netboot — no new privilege model.
 
-### Serial console ([`serial.md`](serial.md))
+### Serial console ([`serial.md`](../serial.md))
 The `serialcap` daemon is the heart of the design. One daemon **per target exclusively owns all of
 that target's serial interfaces** (two targets on one host run two serialcap daemons); per interface a *supervisor* task owns the port (with a reconnect
 loop) and **fans every byte out three ways**: (1) broadcast to live WebSocket clients
@@ -210,7 +210,7 @@ so it works whether or not the daemon is running. A separate, dependency-light *
 path (`paniolo serial connect`) execs `tio` for a foreground terminal — it holds the port
 exclusively and so conflicts with the daemon.
 
-### Power control ([`power.md`](power.md))
+### Power control ([`power.md`](../power.md))
 Two mechanisms, both driven through serial/config: **DTR via FTDI** (the serial adapter's DTR
 line wired to the board's J2 power-button header — `serial dtr`/`serial reset`, ≤500 ms soft /
 ≥3 s hard PMIC off), and the **generic power hooks** — arbitrary shell commands on the target's
@@ -224,7 +224,7 @@ back to an optional **power-sense**
 signal (a modem-control input wired to the target rail) via the serialcap daemon's `/status`
 when no `state_cmd` is set.
 
-### Video + OCR ([`video.md`](video.md))
+### Video + OCR ([`video.md`](../video.md))
 `hdmicap` keeps a UVC HDMI capture device open continuously (avoiding multi-second per-capture
 reopen latency) and serves the current frame as PNG/MJPEG plus the dashboard over HTTP.
 `paniolo video read` (wrapping hdmicap's `GET /ocr`) and the dashboard OCR button run
@@ -232,7 +232,7 @@ reopen latency) and serves the current frame as PNG/MJPEG plus the dashboard ove
 (`linuxocr`) on Linux — tuned for thin console fonts (2× upscale, black-pad,
 `.fast`/lowered min text height).
 
-### HID injection ([`hid.md`](hid.md))
+### HID injection ([`hid.md`](../hid.md))
 The dual-board "dumb pipe" rig presents as a USB HID keyboard + mouse to the DUT: `hidrig`
 composes HID reports on the host and writes binary frames to the **control** board's USB-CDC
 port, which relays them over I2C1 to the **target** board that injects them
@@ -242,7 +242,7 @@ interface only — `hidrig` consumes and composes it. paniolo integrates the hel
 generic per-target `hid` channel — an opaque command prefix (`paniolo hid send` appends
 arguments), exactly like the power hooks.
 
-### adb / Android targets ([`adb.md`](adb.md))
+### adb / Android targets ([`adb.md`](../adb.md))
 When the target is an Android device, the per-target `adb` channel binds it (by `adb -s <serial>`)
 to the control host it's plugged into and gives paniolo the same verbs over one transport:
 console (`paniolo adb shell` interactive, `adb run` one-shot), screen (`adb screencap`, via
@@ -251,11 +251,11 @@ transport like SSH — not a device-specific helper — so it lives in the core 
 and shells out to the host's `adb` binary, routed per-channel by the same dispatch as every other
 channel. Reboot/power needs no new code: wire `adb reboot` through the generic power hooks.
 
-### Dashboard ([`dashboard.md`](dashboard.md))
+### Dashboard ([`dashboard.md`](../dashboard.md))
 `paniolo console` opens hdmicap's `GET /` — a two-pane web UI (live video on top, xterm.js
 terminal(s) below). See §7 for how the two daemons connect.
 
-### Distributed control ([`distributed-control.md`](distributed-control.md))
+### Distributed control ([`distributed-control.md`](../distributed-control.md))
 Drives targets on **remote control hosts** from the dev machine, over SSH only — no agent or
 coordinator daemon. The lab file names the hosts and binds each target's channels to one
 (`cli/src/model.rs`); `cli/src/ssh.rs` is the transport (per-host ControlMaster,
@@ -266,7 +266,7 @@ override. `setup --host` provisions a host; `discover`/`configure` propose a lab
 discovered hardware for the human to review and commit. Channels of one target may live on
 different hosts — each command routes per-channel; only the composite `console` still requires
 its channels co-located. `console --detach` and locking remain design-only (see
-[`distributed-control-plan.md`](https://github.com/curtisgalloway/paniolo/blob/main/docs/distributed-control-plan.md)).
+[`distributed-control-plan.md`](https://github.com/curtisgalloway/paniolo/blob/main/notes/distributed-control-plan.md)).
 
 ## 6. Representative data flows
 

@@ -49,13 +49,22 @@ caught on serial.
 
 ## Documentation
 
-Full docs live in [`docs/`](docs/README.md). Start with the
-[**architecture overview**](docs/architecture.md) for the whole-system design, then the
-per-subsystem guides linked above. The [demos page](docs/demos.md) shows recorded runs
-from the CI rack, and the [tested-hardware list](docs/hardware.md) covers the
-bench gear each subsystem is verified with. Hardware-CI integration (KernelCI/LAVA,
-Fuchsia/botanist) design and the project requirements tracker are under
-[`docs/`](docs/README.md) as well.
+Full docs live in [`docs/`](docs/README.md) and describe paniolo's verified
+current state. The per-subsystem guides linked above are the user documentation;
+the [demos page](docs/demos.md) shows recorded runs from the CI rack, and the
+[tested-hardware list](docs/hardware.md) covers the bench gear each subsystem is
+verified with.
+
+Developer documentation is published alongside it under
+[`docs/dev/`](docs/dev): start with the
+[**architecture overview**](docs/dev/architecture.md) for the whole-system
+design, then the [requirements tracker](docs/dev/requirements.md), the interface
+specs, and the Hardware-CI integration (KernelCI/LAVA, Fuchsia/botanist) design.
+
+Point-in-time records — the design a feature was built from, a bring-up's
+findings, a plan that has shipped — live in [`notes/`](notes/README.md). They are
+kept for the record, are not maintained against the current code, and are not
+published.
 
 ---
 
@@ -119,7 +128,7 @@ single-binary `netbootd` (Rust) engine. (On macOS, `setup` also installs
 `netbootd-bpf-helper` setuid-root — one sudo — for the `netbootd` raw-frame
 send path.) Configuration is one CLI-managed lab file
 (`~/.config/paniolo/lab.toml`); see
-[docs/config-redesign.md](docs/config-redesign.md).
+[notes/config-redesign.md](notes/config-redesign.md).
 
 To pick up code changes after pulling or editing, just re-run it:
 
@@ -146,7 +155,7 @@ UV_TOOL_BIN_DIR=~/.local/libexec/paniolo/bin uv tool install --force ~/src/panio
 ```
 
 USB HID injection (`paniolo hid`) shells out to a helper speaking the
-[HID serial protocol](docs/hid-serial-protocol.md) — `hidrig`, the client
+[HID serial protocol](docs/dev/hid-serial-protocol.md) — `hidrig`, the client
 for the KB2040 injector, or `ch9329` for CH9329-based KVM devices
 (Openterface Mini-KVM / KVM-Go, Sipeed NanoKVM-USB); see
 [docs/hid.md](docs/hid.md).

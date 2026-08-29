@@ -2,13 +2,13 @@
 
 > **Status: historical — Phases 0–5 shipped** (#20 for 0–3, #22 for 4–5;
 > 2026-06-01), **then superseded by the Rust control plane** (see
-> [config-redesign.md](https://github.com/curtisgalloway/paniolo/blob/main/docs/config-redesign.md)). This doc records the original
+> [config-redesign.md](https://github.com/curtisgalloway/paniolo/blob/main/notes/config-redesign.md)). This doc records the original
 > *Python* phasing; the mechanisms it names (`@remote_capable`,
 > `PANIOLO_TARGET_CONFIG`, the `targets/*.toml` fallback) are not how the Rust
 > CLI works — dispatch now ships a lab slice as a temp file and re-invokes with
 > `--lab` (`cli/src/dispatch.rs`), and the legacy targets dir is never read.
 > This sequences the build of the
-> [distributed-control design](distributed-control.md) into self-contained,
+> [distributed-control design](../docs/distributed-control.md) into self-contained,
 > independently mergeable phases. Read the design doc first — this is the *how*
 > and *in what order*, not the *what* and *why*.
 >

@@ -1,8 +1,7 @@
 # USB HID injection
 
 paniolo can inject keyboard and mouse events into the target through any
-helper tool that drives a USB HID injector — by default the KB2040 rig in
-[`hidrig/`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md). The integration is a generic per-target
+helper tool that drives a USB HID injector. The integration is a generic per-target
 **hid channel**, an opaque command prefix exactly like the power hooks:
 paniolo appends arguments to it and runs it, staying agnostic to the device.
 
@@ -10,6 +9,7 @@ paniolo appends arguments to it and runs it, staying agnostic to the device.
 
 ## Architecture
 
+<!-- CCG: There shouldn't be a "default" HID injector because it completely depends on what control hardware you have installed.  -->
 The default injector is the **dual-board KB2040 "dumb pipe"** rig: two KB2040s
 where the host composes the HID report bytes and the boards relay them without
 interpreting any HID semantics. The host-facing **control** board faces the
@@ -30,11 +30,11 @@ faces the DUT over USB-HID and is the I2C1 peripheral.
 ```
 
 The command vocabulary (`type`, `key`, `moveabs`, …) is the device-independent
-[HID serial protocol](hid-serial-protocol.md), but in this rig it is the
+[HID serial protocol](dev/hid-serial-protocol.md), but in this rig it is the
 *external* interface only: `hidrig` consumes it and composes HID reports
 itself, then writes binary frames to the control board's data CDC endpoint —
 the line protocol never travels on a wire. See
-[`hid-dual-board-design.md`](hid-dual-board-design.md) for the design and the
+[`hid-dual-board-design.md`](dev/hid-dual-board-design.md) for the design and the
 frame format, and [`../hidrig/README.md`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md) for wiring and bring-up.
 Because the interface above `hidrig` is just the helper's CLI, any other
 injector drops in through the same generic `hid` channel without touching
@@ -45,7 +45,7 @@ Openterface Mini-KVM) with the same CLI surface, so
 `paniolo hid set -t <target> --cmd "ch9329 -d <uart>"` is the only difference.
 The same helper also drives the **Openterface KVM-Go**, whose CH32V208 MCU
 emulates the CH9329 protocol rather than being the chip — see the
-[KVM-Go notes](https://github.com/curtisgalloway/paniolo/blob/main/docs/openterface-kvm-go.md).
+[KVM-Go notes](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-kvm-go.md).
 
 
 ---
@@ -149,7 +149,7 @@ held keys so nothing sticks on the target.
 
 Under the hood this is the **hid daemon**: the helper owns the control link and
 re-exposes the command vocabulary over a localhost WebSocket (the
-[HID serial protocol](hid-serial-protocol.md) §2 carrier). `paniolo console`
+[HID serial protocol](dev/hid-serial-protocol.md) §2 carrier). `paniolo console`
 starts it on demand; the browser streams `moveabs`/`down`/`up`/`scroll`
 commands to it. Because the daemon serializes every command — from the browser
 *and* from the CLI — onto the one wire, `paniolo hid send` injections intermix
@@ -191,6 +191,7 @@ cmd = "hidrig -d /dev/cu.usbmodemXXXX"
 
 ---
 
+<!-- CCG: this should cover all platforms -->
 ## Host testing tools (macOS)
 
 To exercise the full pipeline without a DUT, plug the **target** board's USB

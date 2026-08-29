@@ -17,7 +17,7 @@ limitations under the License.
 # paniolo agent-eval suite
 
 Runnable fixtures for the eval design in
-[`docs/agent-evals.md`](../docs/agent-evals.md): can a *naive* agent go from a
+[`docs/dev/agent-evals.md`](../docs/dev/agent-evals.md): can a *naive* agent go from a
 plain-language goal to the correct paniolo command via the CLI's self-describing
 surface (`paniolo --help` → `paniolo skill` → docs), without inventing commands?
 
@@ -65,7 +65,7 @@ result save; a `daemons stop --all` sweep after each agent run.
 **Known platform limits:** `serial_loopback.py` is Linux-only (macOS pty → ENOTTY,
 SKIPs); `--isolation home` needs valid creds (macOS Keychain `.credentials.json`
 can be stale → 401). agy bypasses the PATH shim, so its T1 allowlist isn't
-enforced (graded on `lab.toml` outcome). See `docs/agent-evals.md` §3.1, §6.2, §8.
+enforced (graded on `lab.toml` outcome). See `docs/dev/agent-evals.md` §3.1, §6.2, §8.
 
 ## Layout
 
@@ -159,7 +159,7 @@ into the sandbox `HOME`, but on a macOS setup that authenticates via the
 `401 Invalid authentication credentials` and runs nothing. If you hit that,
 either export a valid `ANTHROPIC_API_KEY` (it's passed through to the agent) or
 mint a fresh token into the sandbox home before the run. See
-`docs/agent-evals.md` §3.1 and §8.
+`docs/dev/agent-evals.md` §3.1 and §8.
 
 ## Serial — the operating workhorse
 

@@ -12,7 +12,7 @@ You may obtain a copy of the License at
 
 > **Status: design only — parked.** Captures a design converged on 2026-06-10.
 > Not started; queued behind the hidrig/ch9329 work. Builds on
-> [distributed-control.md](distributed-control.md) (the SSH-tunnel transport and
+> [distributed-control.md](../docs/distributed-control.md) (the SSH-tunnel transport and
 > the hub principle) and supersedes that doc's `?serialws=`-stitching approach to
 > the remote dashboard. Phasing: **B first, then C** (see below).
 
@@ -45,7 +45,7 @@ origin.
 
 ## The reframe: a *hub-side* proxy is not the proxy we rejected
 
-[distributed-control.md](distributed-control.md) ("why multi-host rules out a
+[distributed-control.md](../docs/distributed-control.md) ("why multi-host rules out a
 reverse-proxy") rejected making **hdmicap reverse-proxy serialcap**, because that
 forces hdmicap *on one control host* to reach serialcap *on another* — violating
 principle 1 (control hosts cannot be assumed to reach each other; only the dev
@@ -138,7 +138,7 @@ across sessions.
   everything" ergonomics — a real server, not a CLI invocation.
 - **Cost / the line it crosses:** reintroduces a **local tunnel registry /
   transient runtime state on the dev machine** — exactly what `console --detach`
-  was deferred over ([distributed-control.md](distributed-control.md), "Console
+  was deferred over ([distributed-control.md](../docs/distributed-control.md), "Console
   lifecycle"). Taken on deliberately, only because the persistent-tab ergonomics
   earn it.
 

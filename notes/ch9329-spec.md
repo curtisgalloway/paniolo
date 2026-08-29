@@ -21,7 +21,7 @@ limitations under the License.
 > `hid` channel like any other injector (`paniolo hid set --cmd "ch9329 -d
 > <uart>"`), with no device-specific code in `cli/`. It exposes the same CLI
 > surface as the KB2040 `hidrig`, translating each
-> [HID serial protocol](hid-serial-protocol.md) command into the binary frames
+> [HID serial protocol](../docs/dev/hid-serial-protocol.md) command into the binary frames
 > below. Both one-shot injection and the `serve`/`stop` KVM daemon (for
 > `paniolo console`) are implemented and hardware-verified. The facts below
 > remain the clean-room reference the implementation is built from.

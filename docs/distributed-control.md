@@ -8,8 +8,8 @@
 > each command routes per-channel; only the composite `console` still requires
 > its channels co-located. Still design-only: cross-host composite commands,
 > `console --detach`, and multi-user locking (see the
-> [implementation plan](https://github.com/curtisgalloway/paniolo/blob/main/docs/distributed-control-plan.md) for the phasing). Compare
-> [related work: paniolo vs. labgrid](ci-integration/related-work.md),
+> [implementation plan](https://github.com/curtisgalloway/paniolo/blob/main/notes/distributed-control-plan.md) for the phasing). Compare
+> [related work: paniolo vs. labgrid](dev/ci-integration/related-work.md),
 > whose distributed model directly informs this.
 
 ## The problem
@@ -178,7 +178,7 @@ machinery is only for the browser dashboard, not the terminal CLI.
 
 The dashboard is the one place two subsystems interlock: hdmicap serves the page
 but reaches serialcap by an **absolute URL** (`ws://<host>:8724/stream`), with a
-`?serialws=` override (see [architecture §7](architecture.md)). So the browser
+`?serialws=` override (see [architecture §7](dev/architecture.md)). So the browser
 makes a *second* connection, to serialcap, possibly on a different port and a
 different host.
 
@@ -202,7 +202,7 @@ A per-host paniolo agent with its own RPC API (labgrid's exporter / "Option B" i
 `AGENTS.md`) would give cleaner streaming multiplexing and a natural home for
 multi-user locking. We chose against it for now because it directly trades away
 paniolo's stated identity — *zero-infrastructure, no coordinator/exporter/client
-to stand up* ([related-work](ci-integration/related-work.md)). SSH-tunnelling the
+to stand up* ([related-work](dev/ci-integration/related-work.md)). SSH-tunnelling the
 daemons that already exist gets local-feeling console with no always-on server and
 no new auth surface. The agent remains a *someday* option, gated on whether
 multi-user/board-farm scale ever becomes a goal — at which point paniolo would be
@@ -271,7 +271,7 @@ exporters; SSH data plane ≈ labgrid's client→exporter-over-SSH data plane;
 discovery-assisted config ≈ a coordinator-as-registry, minus the always-on
 server. The deliberate divergence is **no coordinator and no exporter daemon** —
 a single git-tracked lab file plus SSH, preserving paniolo's zero-infrastructure,
-agent-in-the-loop niche. See [related work](ci-integration/related-work.md) for
+agent-in-the-loop niche. See [related work](dev/ci-integration/related-work.md) for
 the full comparison.
 
 ## Open questions (all since resolved)

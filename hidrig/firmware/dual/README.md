@@ -11,7 +11,7 @@ You may obtain a copy of the License at
 # Dual-board KB2040 rig — firmware
 
 Two KB2040s, the "dumb pipe" design in
-[`docs/hid-dual-board-design.md`](../../../docs/hid-dual-board-design.md). The
+[`docs/dev/hid-dual-board-design.md`](../../../docs/dev/hid-dual-board-design.md). The
 **control** board faces the control host (CDC); the **target** board faces the
 DUT (USB-HID). They are joined by **I2C1** — `D10 = GP10 = SDA`,
 `MOSI = GP19 = SCL` (those are the KB2040 pin labels) — with the target at

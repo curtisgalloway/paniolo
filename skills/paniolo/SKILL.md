@@ -467,8 +467,8 @@ Sequences: `hidrig run <file>` runs a command file (one command per line,
 channel's host. The target board is powered by the DUT's USB port, so its HID
 goes silent while the DUT is off and reboots with it; the control board is
 host-powered and independent. Command vocabulary:
-`docs/hid-serial-protocol.md`; dual-board design + frame format:
-`docs/hid-dual-board-design.md`.
+`docs/dev/hid-serial-protocol.md`; dual-board design + frame format:
+`docs/dev/hid-dual-board-design.md`.
 
 **KVM in the console.** `paniolo console <name>` shows a **⌨ Capture input**
 toggle button over the video when the target has a `hid` channel: click it to

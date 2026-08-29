@@ -9,8 +9,8 @@
 > video, HID). It deliberately does **not** own test orchestration or result production — when
 > integrated with hardware-CI ecosystems, those stay above paniolo (see §9).
 >
-> Companion design docs live under [`docs/ci-integration/`](ci-integration/gap-analysis.md) (gap analysis +
-> integration design) and per-feature docs under [`docs/`](README.md). **Update the Status column as
+> Companion design docs live under [`docs/dev/ci-integration/`](ci-integration/gap-analysis.md) (gap analysis +
+> integration design) and per-feature docs under [`docs/`](../README.md). **Update the Status column as
 > work lands.**
 >
 > Last updated: 2026-06-05.
@@ -39,7 +39,7 @@
 | CORE-4 | Rust daemons (`hdmicap`, `serialcap`) + Swift `visionocr` helper build & install | M | ☑ | `paniolo setup` |
 | CORE-5 | Predictable runtime paths (configs, daemon discovery, capture logs) | M | ☑ | [architecture.md §4](architecture.md#4-configuration-and-state-model) |
 | CORE-6 | Agent-oriented guidance kept current (`AGENTS.md`) as the surface changes | M | ◐ | Must track power/serial changes in §9 |
-| CORE-7 | One-file **lab** model (`--lab`/`PANIOLO_LAB`): hosts + targets, per-channel host binding | S | ☑ | `cli/src/model.rs`, `labfile.rs`; [distributed-control](distributed-control.md) (the Rust CLI reads no legacy targets dir) |
+| CORE-7 | One-file **lab** model (`--lab`/`PANIOLO_LAB`): hosts + targets, per-channel host binding | S | ☑ | `cli/src/model.rs`, `labfile.rs`; [distributed-control](../distributed-control.md) (the Rust CLI reads no legacy targets dir) |
 | CORE-8 | Transparent re-exec of host-operating commands on a target's **remote control host** over SSH | S | ☑ | `cli/src/dispatch.rs` (ships a lab slice + `--lab`); `cli/src/ssh.rs` transport |
 | CORE-9 | Tunnelled `console` for a remote target (dashboard reachable locally) | S | ☑ | `remote_console` in `cli/src/main.rs`; `?serialws=` stitch |
 | CORE-10 | Multi-host targets (one target spanning control hosts) | C | ◐ | per-channel dispatch routes each command to its channel's host (`dispatch.rs`); composite `console` still requires co-located channels |
@@ -90,7 +90,7 @@
 | ID | Requirement | Pri | Status | Notes |
 |---|---|---|---|---|
 | HID-1 | USB keyboard/mouse injection via KB2040 injector (dual-board "dumb pipe": host composes, control board CDC → I2C1 → target HID) | S | ☑ | `hidrig/` crate + `firmware/dual/` |
-| HID-2 | Device-independent HID serial protocol (v1) so other microcontrollers can implement the injector | S | ☑ | `docs/hid-serial-protocol.md` |
+| HID-2 | Device-independent HID serial protocol (v1) so other microcontrollers can implement the injector | S | ☑ | `docs/dev/hid-serial-protocol.md` |
 | HID-3 | Generic `hid` lab channel: `paniolo hid set/rm/send` appends args to an opaque helper cmd | S | ☑ | mirrors power hooks; SSH dispatch |
 | HID-4 | Absolute mouse (`moveabs`, advertised capability) for click-where-you-point | S | ☑ | abs-pointer HID descriptor in firmware |
 | HID-5 | `hidrig serve` daemon: owns the control link, re-exposes the command vocabulary over a WebSocket; one-shots route through it | S | ☑ | `paniolo hid serve/stop` |
@@ -102,7 +102,7 @@
 Findings from the Openterface Mini-KVM's open hardware design (v1.9
 schematic/BOM/datasheet): the switchable USB-A port and the CH340's modem
 lines make a stock unit a small programmable USB fixture. Details + bench
-test checklist: [`openterface-deep-control.md`](https://github.com/curtisgalloway/paniolo/blob/main/docs/openterface-deep-control.md).
+test checklist: [`openterface-deep-control.md`](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-deep-control.md).
 **OTF-1 verified 2026-08-18** as far as this bench allows: DTR/`SW_GND` and
 RTS/`HIDRESET` are both characterized, `DATAFLIP` is not observable from the
 host, EEPROM dumped, switch semantics resolved from vendor docs. The only

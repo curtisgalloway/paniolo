@@ -16,9 +16,9 @@
 #   uvx --with mkdocs-material mkdocs serve
 # Deployed to GitHub Pages by .github/workflows/docs.yml.
 #
-# Design records (point-in-time design/decision docs, not end-user
-# documentation) stay in docs/ for repo browsing but are excluded from the
-# published site below.
+# Design records and bring-up notes (point-in-time, not documentation of the
+# verified current state) live in the top-level notes/ directory, outside this
+# docs tree — they are readable in the repo but never published.
 
 site_name: paniolo
 site_description: >-
@@ -54,16 +54,6 @@ theme:
     - search.suggest
     - content.code.copy
 
-exclude_docs: |
-  config-redesign.md
-  ch9329-spec.md
-  distributed-control-plan.md
-  uefi-http-boot-design.md
-  openterface-deep-control.md
-  openterface-kvm-go.md
-  console-front-door.md
-  pi4-control-host.md
-
 markdown_extensions:
   - admonition
   - attr_list
@@ -77,8 +67,6 @@ markdown_extensions:
 nav:
   - Home: README.md
   - Demos: demos.md
-  - Architecture: architecture.md
-  - Requirements & progress: requirements.md
   - Tested hardware: hardware.md
   - Subsystem guides:
       - Netboot: netboot.md
@@ -88,16 +76,21 @@ nav:
       - Video + OCR: video.md
       - Dashboard: dashboard.md
       - HID injection: hid.md
-      - HID serial protocol: hid-serial-protocol.md
-      - HID dual-board design: hid-dual-board-design.md
       - adb (Android targets): adb.md
   - Distributed control: distributed-control.md
-  - Hardware-CI integration:
-      - Gap analysis: ci-integration/gap-analysis.md
-      - Integration design: ci-integration/design.md
-      - Related work: ci-integration/related-work.md
-      - Redfish provider: ci-integration/redfish-provider.md
-  - Contributing:
-      - Adding power helpers: adding-power-helpers.md
-      - Agent evals: agent-evals.md
-      - Serial agent benchmark: serial-agent-benchmark.md
+  - Developer docs:
+      - Architecture: dev/architecture.md
+      - Requirements & progress: dev/requirements.md
+      - Interfaces:
+          - HID serial protocol: dev/hid-serial-protocol.md
+          - OCR helper protocol: dev/ocr.md
+          - HID dual-board design: dev/hid-dual-board-design.md
+      - Extending paniolo:
+          - Adding power helpers: dev/adding-power-helpers.md
+          - Agent evals: dev/agent-evals.md
+          - Serial agent benchmark: dev/serial-agent-benchmark.md
+      - Hardware-CI integration:
+          - Gap analysis: dev/ci-integration/gap-analysis.md
+          - Integration design: dev/ci-integration/design.md
+          - Related work: dev/ci-integration/related-work.md
+          - Redfish provider: dev/ci-integration/redfish-provider.md

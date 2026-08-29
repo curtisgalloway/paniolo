@@ -39,8 +39,8 @@ See the [HID guide](hid.md) and [`hidrig/README.md`](https://github.com/curtisga
 |---|---|
 | 2× Adafruit KB2040 | Reference HID injector — the dual-board "dumb pipe" (CircuitPython firmware in [`hidrig/`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md)): a **control** board (host USB-CDC, I2C1 controller) and a **target** board (DUT USB-HID, I2C1 peripheral), joined by I2C1 (GP10 SDA / GP19 SCL, 4.7 kΩ pull-ups). Any CircuitPython-capable RP2040 board with a free I2C1 works with minor pin edits. |
 | 2× 4.7 kΩ resistors | I2C1 pull-ups (SDA→3.3 V, SCL→3.3 V) between the two KB2040 boards — required; the control board won't open the bus without them. No USB-serial adapter is needed (the control link is the control board's native USB-CDC). |
-| [Openterface KVM-Go (HDMI)](https://openterface.com/product/kvm-go/) | CH32V208 emulating the CH9329 protocol — drives the target's keyboard/mouse over its host-side USB-CDC port. Works with the [`ch9329`](https://github.com/curtisgalloway/paniolo/blob/main/ch9329/README.md) helper unmodified; reports `chip_version=0x01` rather than a real CH9329's `0x38`. See [KVM-Go notes](https://github.com/curtisgalloway/paniolo/blob/main/docs/openterface-kvm-go.md). |
-| [Openterface Mini-KVM](https://openterface.com/) | Predecessor: a real CH9329 behind a CH340C USB-serial adapter. Same `ch9329` helper. Its extra modem-line control surface is documented in [deep-control notes](https://github.com/curtisgalloway/paniolo/blob/main/docs/openterface-deep-control.md). |
+| [Openterface KVM-Go (HDMI)](https://openterface.com/product/kvm-go/) | CH32V208 emulating the CH9329 protocol — drives the target's keyboard/mouse over its host-side USB-CDC port. Works with the [`ch9329`](https://github.com/curtisgalloway/paniolo/blob/main/ch9329/README.md) helper unmodified; reports `chip_version=0x01` rather than a real CH9329's `0x38`. See [KVM-Go notes](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-kvm-go.md). |
+| [Openterface Mini-KVM](https://openterface.com/) | Predecessor: a real CH9329 behind a CH340C USB-serial adapter. Same `ch9329` helper. Its extra modem-line control surface is documented in [deep-control notes](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-deep-control.md). |
 
 ## Video capture
 
@@ -50,7 +50,7 @@ See the [video guide](video.md).
 |---|---|
 | [Generic 4K HDMI capture dongle (MS2109-class, UVC)](https://www.amazon.com/dp/B09FLN63B3) | Target HDMI out → `hdmicap` warm stream + OCR. Any UVC capture card works; MS2109-class dongles are the tested baseline. |
 | [IPEVO V4K 8 MP USB document camera (UVC)](https://www.amazon.com/dp/B079DLTG9F) | UVC camera source used to verify `hdmicap` against non-capture-card devices; also handy for watching the physical bench. |
-| [Openterface KVM-Go (HDMI)](https://openterface.com/product/kvm-go/) | Combined capture + HID in one keychain-sized unit — MS2130S UVC capture (up to 4K; 1080p60 default) with a built-in male HDMI plug. Works with `hdmicap` unmodified. See [KVM-Go notes](https://github.com/curtisgalloway/paniolo/blob/main/docs/openterface-kvm-go.md). |
+| [Openterface KVM-Go (HDMI)](https://openterface.com/product/kvm-go/) | Combined capture + HID in one keychain-sized unit — MS2130S UVC capture (up to 4K; 1080p60 default) with a built-in male HDMI plug. Works with `hdmicap` unmodified. See [KVM-Go notes](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-kvm-go.md). |
 
 ## Netboot link
 
