@@ -18,7 +18,8 @@
 //
 //   visionocr [--fast] [--json] [PATH | -]
 //
-//   --fast   use the fast recognition level (lower latency, less accurate)
+//   --fast   use the fast recognition level (lower latency, worse on every
+//            frame measured — see the note at recognitionLevel below)
 //   --json   emit the v1 OCR envelope (see docs/ocr.md): engine identity,
 //            source dimensions, joined text, and per-line text + confidence +
 //            [x, y, w, h] bbox in SOURCE pixels, origin top-left
@@ -54,13 +55,13 @@ func upscaleAndPad(_ img: CGImage, scale: CGFloat, pad: Int) -> CGImage? {
     return ctx.makeImage()
 }
 
-var accurate = false
+var accurate = true
 var json = false
 var path: String? = nil
 for arg in CommandLine.arguments.dropFirst() {
     switch arg {
     case "--accurate": accurate = true
-    case "--fast": accurate = false  // default; accepted for compatibility
+    case "--fast": accurate = false
     case "--json": json = true
     case "-": path = nil
     default: path = arg
@@ -90,9 +91,23 @@ let appliedScale: CGFloat = upscaled == nil ? 1.0 : preScale
 let appliedPad: CGFloat = upscaled == nil ? 0.0 : CGFloat(prePad)
 
 let request = VNRecognizeTextRequest()
-// Counterintuitively, .fast detects small thin console fonts that .accurate
-// (tuned for natural document text) misses entirely. Default to .fast; let
-// callers opt into .accurate for large, clean text.
+// This defaulted to .fast, on the belief that .accurate (tuned for natural
+// document text) missed small thin console fonts entirely. Measured against 13
+// real dongle captures in evals/ocr/dataset, that is not what happens —
+// .accurate is better or equal on every one, including the console frames the
+// old default existed to protect:
+//
+//   BIOS dropdowns   .accurate reads "UEFI: PXE IPv4 Intel(R) Ethernet C";
+//                    .fast garbles it to "UEFI: PXE11*4 IntellR> Ethemet c"
+//   PXE/Gigaboot     .accurate reads the MAC "54-B2-03-F0-B5-5C" correctly;
+//                    .fast returns "54-B2-03-FO-B5-5C" — letter O for zero
+//   repeated lines   .accurate finds 21 of 24 "GetGicDriver" lines; .fast 15
+//
+// The one frame where .fast returns more is a Fuchsia virtcon showing an
+// ASCII-art logo: .fast emits 29 lines of hallucinated text off the artwork
+// ("ff ffftfflflff ff") and .accurate emits none. Neither reads that frame's
+// real status line, so .fast is not finding anything there — it is inventing,
+// which is worse for a caller that cannot tell the difference.
 request.recognitionLevel = accurate ? .accurate : .fast
 // Console/boot/code text is not natural language; correction hurts more than
 // it helps (it "fixes" identifiers, hex, paths).
