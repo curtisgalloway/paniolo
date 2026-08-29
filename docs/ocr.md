@@ -127,6 +127,25 @@ an envelope with no lines and a warning naming the binary. A new CLI against an
 old installed helper then still reads screens, just without confidences —
 instead of failing in a way that looks like a broken capture.
 
+### Coordinates cross-check
+
+The three helpers arrive at boxes from three different native conventions —
+Apple Vision reports normalized, bottom-left-origin boxes against an upscaled
+and padded buffer; Tesseract reports pixels on that same preprocessed image;
+`Windows.Media.Ocr` reports pixels on the source. On the same frame's first
+line they converge:
+
+| Helper | bbox |
+| --- | --- |
+| `visionocr` | `[0, 33, 396, 21]` |
+| `linuxocr` | `[2, 34, 390, 16]` |
+| `winocr` | `[2, 34, 391, 17]` |
+
+Agreement within a few pixels across three independent implementations is the
+check that the mapping-back rule is actually being applied, rather than each
+helper reporting something self-consistent and wrong. Worth re-running when a
+helper's preprocessing changes.
+
 ## What the engines actually do
 
 Measured on the 13 dongle captures in `evals/ocr/dataset`, same bytes to each.

@@ -19,6 +19,12 @@ Reads a PNG from stdin (pass '-') or a file path, applies 2x upscale and
 black padding (same preprocessing as visionocr for small console fonts),
 then pipes to tesseract and prints the recognized text.
 
+With --json, emits the v1 OCR envelope (see docs/ocr.md) instead: engine
+identity, source dimensions, joined text, and per-line text + confidence +
+bbox. Bboxes are mapped back through the upscale and padding to SOURCE image
+coordinates — the preprocessed image is a different size, and a box in its
+coordinates would aim a crop or a hid click at the wrong place.
+
 Requires: tesseract-ocr  (sudo apt-get install tesseract-ocr)
 Optional: Pillow         (pip install Pillow) — used for preprocessing;
           without it, the raw PNG is passed directly to tesseract.
@@ -26,6 +32,7 @@ Optional: Pillow         (pip install Pillow) — used for preprocessing;
 
 import argparse
 import io
+import json
 import os
 import subprocess
 import sys
@@ -49,12 +56,109 @@ def _preprocess(png: bytes) -> bytes:
         return png
 
 
+def _png_size(png: bytes) -> "tuple[int, int]":
+    """Width and height from the PNG IHDR, without needing Pillow.
+
+    The envelope reports SOURCE dimensions, and they must be known even on the
+    no-Pillow path where nothing decodes the image.
+    """
+    if len(png) < 24 or png[:8] != b"\x89PNG\r\n\x1a\n":
+        return (0, 0)
+    return (int.from_bytes(png[16:20], "big"), int.from_bytes(png[20:24], "big"))
+
+
+def _tesseract(tmp: str, tsv: bool) -> str:
+    args = ["tesseract", tmp, "stdout", "--psm", "6", "--oem", "1"]
+    if tsv:
+        args.append("tsv")
+    result = subprocess.run(args, capture_output=True, text=True)
+    if result.returncode != 0:
+        sys.stderr.write(result.stderr)
+        sys.exit(1)
+    return result.stdout
+
+
+def _lines_from_tsv(tsv: str, scale: int, pad: int, src_w: int, src_h: int) -> list:
+    """Group tesseract's per-word TSV rows into lines, in source coordinates.
+
+    Tesseract emits one row per word with a (block, paragraph, line) key; the
+    line's box is the union of its words' and its confidence their mean.
+    Confidence is 0-100 here and -1 for "no text recognized" — the latter is
+    dropped rather than reported as 0.0, which would read as certainty that the
+    line is wrong rather than an absence of evidence.
+    """
+    rows = tsv.splitlines()
+    if not rows:
+        return []
+    header = rows[0].split("\t")
+    try:
+        idx = {k: header.index(k) for k in
+               ("block_num", "par_num", "line_num", "left", "top",
+                "width", "height", "conf", "text")}
+    except ValueError:
+        return []
+
+    grouped: dict = {}
+    order: list = []
+    for row in rows[1:]:
+        f = row.split("\t")
+        if len(f) <= idx["text"]:
+            continue
+        text = f[idx["text"]].strip()
+        if not text:
+            continue
+        try:
+            conf = float(f[idx["conf"]])
+            left, top = int(f[idx["left"]]), int(f[idx["top"]])
+            wid, hgt = int(f[idx["width"]]), int(f[idx["height"]])
+        except ValueError:
+            continue
+        key = (f[idx["block_num"]], f[idx["par_num"]], f[idx["line_num"]])
+        if key not in grouped:
+            grouped[key] = {"words": [], "confs": [],
+                            "x0": left, "y0": top,
+                            "x1": left + wid, "y1": top + hgt}
+            order.append(key)
+        g = grouped[key]
+        g["words"].append(text)
+        if conf >= 0:
+            g["confs"].append(conf / 100.0)
+        g["x0"] = min(g["x0"], left)
+        g["y0"] = min(g["y0"], top)
+        g["x1"] = max(g["x1"], left + wid)
+        g["y1"] = max(g["y1"], top + hgt)
+
+    def to_source(v: int) -> int:
+        return max(0, round((v - pad) / scale))
+
+    out = []
+    for key in order:
+        g = grouped[key]
+        x = to_source(g["x0"])
+        y = to_source(g["y0"])
+        w = max(0, round((g["x1"] - g["x0"]) / scale))
+        h = max(0, round((g["y1"] - g["y0"]) / scale))
+        if src_w:
+            w = min(w, src_w - x)
+        if src_h:
+            h = min(h, src_h - y)
+        line = {"text": " ".join(g["words"]), "bbox": [x, y, w, h]}
+        if g["confs"]:
+            line["confidence"] = round(sum(g["confs"]) / len(g["confs"]), 4)
+        out.append(line)
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="OCR a PNG image using Tesseract (Linux visionocr replacement)."
     )
     ap.add_argument("input", nargs="?", default="-", help="PNG file path, or - for stdin")
-    ap.add_argument("--json", action="store_true", help="Ignored (reserved for future use)")
+    ap.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the v1 OCR envelope (docs/ocr.md) instead of plain text",
+    )
     args = ap.parse_args()
 
     if args.input == "-":
@@ -63,22 +167,35 @@ def main() -> None:
         with open(args.input, "rb") as f:
             png = f.read()
 
-    png = _preprocess(png)
+    src_w, src_h = _png_size(png)
+    processed = _preprocess(png)
+    # _preprocess is identity when Pillow is missing, and then no mapping back
+    # is needed. Detect that rather than assuming, so the bboxes stay correct
+    # on a host without Pillow.
+    scaled = processed is not png
+    scale, pad = (2, 10) if scaled else (1, 0)
 
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
-        tf.write(png)
+        tf.write(processed)
         tmp = tf.name
 
     try:
-        result = subprocess.run(
-            ["tesseract", tmp, "stdout", "--psm", "6", "--oem", "1"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            sys.stderr.write(result.stderr)
-            sys.exit(1)
-        sys.stdout.write(result.stdout)
+        if not args.json:
+            sys.stdout.write(_tesseract(tmp, tsv=False))
+            return
+        lines = _lines_from_tsv(_tesseract(tmp, tsv=True), scale, pad, src_w, src_h)
+        envelope = {
+            "version": 1,
+            "engine": "linuxocr",
+            "engine_detail": "Tesseract --psm 6 --oem 1"
+            + ("" if scaled else " (no Pillow: unscaled)"),
+            "width": src_w,
+            "height": src_h,
+            "text": "\n".join(ln["text"] for ln in lines),
+            "lines": lines,
+        }
+        json.dump(envelope, sys.stdout, indent=2)
+        sys.stdout.write("\n")
     finally:
         os.unlink(tmp)
 
