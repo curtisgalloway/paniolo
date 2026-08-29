@@ -30,7 +30,7 @@ paniolo is actually running on:
 | Platform | Helper | Engine | Installed by |
 | --- | --- | --- | --- |
 | macOS | `visionocr` | Apple Vision (`VNRecognizeTextRequest`) | `paniolo setup` compiles `ocr/visionocr.swift` with `swiftc` |
-| Windows | `winocr` | `Windows.Media.Ocr` (in-box, offline) | shipped in the release zip's `libexec` |
+| Windows | `winocr` | `Windows.Media.Ocr` (in-box, offline) | `paniolo setup` builds `ocr/winocr`; the release zip ships it in `libexec` |
 | Linux | `linuxocr` | Tesseract 5 | `paniolo setup` copies `ocr/linuxocr`; needs `tesseract-ocr` |
 
 `$PANIOLO_VISIONOCR` overrides the choice with an explicit path.
@@ -70,9 +70,24 @@ running the helper by hand.
 - `width` / `height` — **the source image's** dimensions, in pixels.
 - `text` — every line joined with `\n`, in reading order. Retained so consumers
   that only want text do not have to reassemble it.
-- `lines[].confidence` — `0.0`–`1.0`. Engines that report otherwise are
-  normalized by their helper: Tesseract's `0`–`100` is divided by 100, and its
-  `-1` ("no text") means the line is omitted, never reported as `0.0`.
+- `lines[].confidence` — `0.0`–`1.0`, and **optional**. Engines that report on
+  another scale are normalized by their helper: Tesseract's `0`–`100` is divided
+  by 100, and its `-1` ("no text") means the line is omitted, never reported as
+  `0.0`. An engine with no confidence to report omits the field; a consumer must
+  not read its absence as zero.
+
+  Confidence turned out to be the least dependable part of this contract, so do
+  not design around it:
+
+  | Engine | Confidence |
+  | --- | --- |
+  | Tesseract | Real per-word values |
+  | Apple Vision | **Constant** — 0.5 for every line in `--fast`, 1.0 in `--accurate`. Measured over a 56-line frame: one distinct value. It indicates the recognition level, not quality. |
+  | `Windows.Media.Ocr` | **Not exposed at all** — the field is absent |
+
+  That is why routing between engines or recognition levels is configured rather
+  than inferred from confidence: on two of three platforms there is nothing to
+  infer from.
 - `lines[].bbox` — `[x, y, w, h]` in **pixels, origin top-left, in source-image
   coordinates**.
 
@@ -111,6 +126,34 @@ as an envelope, `/ocr` treats it as plain text from a pre-v1 helper, synthesizes
 an envelope with no lines and a warning naming the binary. A new CLI against an
 old installed helper then still reads screens, just without confidences —
 instead of failing in a way that looks like a broken capture.
+
+## What the engines actually do
+
+Measured on the 13 dongle captures in `evals/ocr/dataset`, same bytes to each.
+The hardest frame is an AMI BIOS page whose boot-order values sit inside
+cyan-filled dropdown widgets:
+
+| Engine | Boot Option values |
+| --- | --- |
+| Apple Vision `--accurate` | `UEFI: PXE IPv4 Intel(R) Ethernet C` — exact |
+| `Windows.Media.Ocr` | `UEFI: PXE IPva Intel(R) Ethernet C` — reads them, fumbles digits |
+| Tesseract | **None.** The widget text does not survive at all |
+
+Tesseract's failure there is the dangerous one: it returns well-formed text with
+whole rows missing, so an agent asking "what is the boot order?" gets a
+confident, complete-looking, wrong answer. Vision and winocr garble visibly.
+
+Digit/letter confusion is the common weakness, and it lands hardest on exactly
+the strings bring-up cares about. On a PXE screen's MAC address:
+
+| Engine | Result |
+| --- | --- |
+| Apple Vision `--accurate` | `54-B2-03-F0-B5-5C` — exact |
+| `Windows.Media.Ocr` | `S4-B2-03-FO-BS-SC` — 5→S, 0→O |
+| Apple Vision `--fast` | `54-B2-03-FO-B5-5C` — one 0→O |
+
+So match on such strings loosely, or corroborate them, rather than trusting an
+exact compare.
 
 ## Adding an engine
 

@@ -328,7 +328,7 @@ fn visionocr_bin() -> std::ffi::OsString {
     }
     if let Ok(me) = std::env::current_exe() {
         if let Some(dir) = me.parent() {
-            for name in ["visionocr", "linuxocr"] {
+            for name in ["visionocr", "linuxocr", "winocr", "winocr.exe"] {
                 let sibling = dir.join(name);
                 if sibling.is_file() {
                     return sibling.into();
