@@ -114,6 +114,10 @@ jobs:
             install -m 0755 "$helper/target/release/$helper" packaging/stage/libexec/
           done
           install -m 0755 ocr/linuxocr packaging/stage/libexec/
+          # The GUI-mode engine. The script ships; its ~317 MB venv does not —
+          # `paniolo setup` builds that only when a lab file sets
+          # `ocr_mode = "gui"`, so a .deb stays a .deb.
+          install -m 0755 ocr/rapidocr packaging/stage/libexec/
 
       - name: Install nfpm
         run: |
@@ -153,6 +157,7 @@ jobs:
             test -x "/usr/libexec/paniolo/bin/$helper"
           done
           test -x /usr/libexec/paniolo/bin/linuxocr
+          test -x /usr/libexec/paniolo/bin/rapidocr
           test -f /usr/share/paniolo/skills/paniolo/SKILL.md
           /usr/bin/paniolo --help
           # Run outside the checkout so `skill` resolves the packaged copy
@@ -213,7 +218,7 @@ jobs:
           # The OCR helper is per-platform and not a workspace crate, so it is
           # built explicitly rather than coming from $env:HELPERS. Without it a
           # Windows install has no OCR at all — `paniolo video read` would have
-          # nothing to call. See docs/ocr.md.
+          # nothing to call. See docs/dev/ocr.md.
           cargo build --release --manifest-path ocr/winocr/Cargo.toml
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Copy-Item ocr/winocr/target/release/winocr.exe "$stage/libexec/winocr.exe"

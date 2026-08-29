@@ -40,7 +40,8 @@ description: |
   Agent-controlled target machine wrangler — distributed bring-up control over SSH.
   Installs the paniolo CLI plus its helper daemons (hdmicap, serialcap,
   netbootd, cambrionix, hidrig, ch9329, shellyplug, amt), the
-  linuxocr OCR helper, and the bundled agent skills (`paniolo skill`).
+  linuxocr and rapidocr OCR helpers, and the bundled agent skills
+  (`paniolo skill`).
   Run `paniolo setup` once per user for group membership and the
   optional zigplug Zigbee helper.
 depends:

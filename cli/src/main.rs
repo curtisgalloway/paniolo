@@ -969,7 +969,9 @@ fn restart_capture_daemon(lab: &Lab, name: &str, target: &str) -> Result<String>
     // Resolve start parameters up front so a stop failure can't strand us.
     enum Start {
         Serial(Vec<model::SerialChannel>),
-        Video(String),
+        // Device plus the channel's OCR mode: the daemon is handed its OCR
+        // helper at spawn, so the mode has to travel with the device.
+        Video(String, Option<String>),
     }
     let start = if name == serial::DAEMON {
         let serials = local_serials(lab, target)?;
@@ -978,10 +980,12 @@ fn restart_capture_daemon(lab: &Lab, name: &str, target: &str) -> Result<String>
         }
         Start::Serial(serials)
     } else if name == video::DAEMON {
-        let device = local_video(lab, target)?
+        let v = local_video(lab, target)?;
+        let device = v
             .device
+            .clone()
             .ok_or_else(|| anyhow!("video channel for '{target}' has no device set"))?;
-        Start::Video(device)
+        Start::Video(device, v.ocr_mode.clone())
     } else {
         bail!("'{name}' is not a restartable capture daemon");
     };
@@ -991,7 +995,7 @@ fn restart_capture_daemon(lab: &Lab, name: &str, target: &str) -> Result<String>
         Start::Serial(_) => {
             let _ = serial::stop_daemon(target);
         }
-        Start::Video(_) => {
+        Start::Video(..) => {
             let _ = video::stop_daemon(target);
         }
     }
@@ -1009,7 +1013,7 @@ fn restart_capture_daemon(lab: &Lab, name: &str, target: &str) -> Result<String>
 
     match start {
         Start::Serial(serials) => serial::start_daemon(&serials, 0, target)?,
-        Start::Video(device) => video::start_daemon(&device, 0, target)?,
+        Start::Video(device, mode) => video::start_daemon(&device, 0, target, mode.as_deref())?,
     }
     daemons::wait_for_daemon(name, Some(target), std::time::Duration::from_secs(5)).ok_or_else(
         || daemons::start_failure(name, Some(target), std::time::Duration::from_secs(5)),
@@ -2015,9 +2019,10 @@ fn cmd_console(
             let v = local_video(&lab, &target)?;
             let device = v
                 .device
+                .clone()
                 .ok_or_else(|| anyhow!("video channel for '{target}' has no device set"))?;
             eprintln!("Starting video daemon…");
-            video::start_daemon(&device, 0, &target)?;
+            video::start_daemon(&device, 0, &target, v.ocr_mode.as_deref())?;
             daemons::wait_for_daemon(
                 video::DAEMON,
                 Some(&target),
@@ -2678,7 +2683,7 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
             eprintln!("Starting video daemon for '{target}' ('{device}')…");
-            video::start_daemon(&device, port, &target)?;
+            video::start_daemon(&device, port, &target, v.ocr_mode.as_deref())?;
             match daemons::wait_for_daemon(
                 video::DAEMON,
                 Some(&target),

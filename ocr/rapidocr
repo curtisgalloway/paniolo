@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Linux GUI-mode OCR helper: PP-OCRv6 via RapidOCR, on ONNX Runtime.
+
+The third OCR helper, and the only one that exists because of a measurement
+rather than a platform. On a Pi 5 control host, over the benchmark set in
+evals/ocr:
+
+    GUI screens   rapidocr 0.083 token-recall error   tesseract 0.312
+    text screens  tesseract 0.019 CER                 rapidocr 0.025
+
+So this is the **GUI** engine on Linux and `linuxocr` stays the text one. It is
+about 4x better where anti-aliased UI text is involved and slightly worse on
+console text, at roughly 2.5x the latency (~4.2 s vs ~1.7 s per 720p frame).
+
+Two things that argument rests on, worth keeping in view if it is revisited:
+
+- The latency is affordable because OCR is not in any polling loop. Change
+  detection uses the frame hash (`/status`, `--changed-since`); this runs only
+  when something explicitly asks what the screen says.
+- Tesseract's GUI failure mode is *silent omission* — well-formed text with
+  whole rows missing, and no confidence signal, because it is confident about
+  what it did read. That is why the obvious "run tesseract, fall back on low
+  confidence" hybrid cannot work, and why the slower engine wins here.
+
+**No preprocessing.** The benchmark swept upscaling, inversion and binarisation:
+every variant was slower than `raw` and none was more accurate. Unlike
+`visionocr` and `linuxocr`, which both upscale internally, this helper hands the
+frame over untouched.
+
+Requires the `rapidocr` and `onnxruntime` packages. `paniolo setup` builds a
+dedicated venv beside this script (see `_reexec_into_venv`), because Pi OS is
+PEP 668-managed and a system-wide install is refused.
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import os
+import sys
+from pathlib import Path
+
+VENV_NAMES = ("ocr-venv",)
+
+
+def _reexec_into_venv() -> None:
+    """Re-exec under a sibling venv's interpreter if rapidocr is not importable.
+
+    The helper is invoked by hdmicap as a bare executable, so it cannot rely on
+    a virtualenv being active. `paniolo setup` creates `ocr-venv/` next to this
+    script; if the ambient interpreter lacks rapidocr but that venv has it, hand
+    over rather than failing with an ImportError the caller cannot act on.
+    """
+    if os.environ.get("PANIOLO_RAPIDOCR_REEXEC"):
+        return  # Already tried; do not loop.
+    here = Path(__file__).resolve().parent
+    for name in VENV_NAMES:
+        python = here / name / "bin" / "python3"
+        if python.is_file():
+            os.environ["PANIOLO_RAPIDOCR_REEXEC"] = "1"
+            os.execv(str(python), [str(python), str(Path(__file__).resolve()), *sys.argv[1:]])
+
+
+def die(msg: str) -> "None":
+    sys.stderr.write(f"rapidocr: {msg}\n")
+    raise SystemExit(1)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="OCR a PNG using PP-OCRv6 via RapidOCR (Linux GUI-mode helper)."
+    )
+    ap.add_argument("input", nargs="?", default="-", help="PNG file path, or - for stdin")
+    ap.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the v1 OCR envelope (docs/dev/ocr.md) instead of plain text",
+    )
+    args = ap.parse_args()
+
+    try:
+        import numpy as np
+        from rapidocr import RapidOCR
+        import cv2
+    except ImportError as e:
+        die(
+            f"{e}. Install the OCR venv with `paniolo setup`, or "
+            "pip install 'rapidocr>=3,<4' onnxruntime opencv-python-headless"
+        )
+
+    png = sys.stdin.buffer.read() if args.input == "-" else Path(args.input).read_bytes()
+    if not png:
+        die("no image data")
+
+    img = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        die("could not decode image")
+    height, width = img.shape[:2]
+
+    # Four threads matches a Pi's core count. The key is nested under the
+    # engine, not Global — RapidOCR validates keys strictly and raises on an
+    # unknown one, so a guess fails loudly rather than running single-threaded.
+    engine = RapidOCR(params={"EngineConfig.onnxruntime.intra_op_num_threads": 4})
+    out = engine(img)
+
+    # `x or []` is wrong here: these are numpy arrays, whose __bool__ raises
+    # "truth value of an array with more than one element is ambiguous".
+    def as_list(attr: str) -> list:
+        v = getattr(out, attr, None)
+        return [] if v is None else list(v)
+
+    boxes, txts, scores = as_list("boxes"), as_list("txts"), as_list("scores")
+
+    lines = []
+    for i, txt in enumerate(txts):
+        line = {"text": str(txt)}
+        if i < len(scores):
+            line["confidence"] = round(float(scores[i]), 4)
+        if i < len(boxes) and boxes[i] is not None:
+            pts = np.asarray(boxes[i]).reshape(-1, 2)
+            x0, y0 = int(pts[:, 0].min()), int(pts[:, 1].min())
+            x1, y1 = int(pts[:, 0].max()), int(pts[:, 1].max())
+            # Source coordinates, origin top-left: this helper does no
+            # preprocessing, so there is no transform to undo.
+            line["bbox"] = [x0, y0, x1 - x0, y1 - y0]
+        lines.append(line)
+
+    if not args.json:
+        for line in lines:
+            print(line["text"])
+        return
+
+    json.dump(
+        {
+            "version": 1,
+            "engine": "rapidocr",
+            "engine_detail": "PP-OCRv6 via RapidOCR on ONNX Runtime",
+            "width": width,
+            "height": height,
+            "text": "\n".join(line["text"] for line in lines),
+            "lines": lines,
+        },
+        sys.stdout,
+        indent=2,
+    )
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    _reexec_into_venv()
+    main()

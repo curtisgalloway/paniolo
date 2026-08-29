@@ -151,8 +151,13 @@ class RapidOcrEngine:
             from rapidocr import RapidOCR
 
             # Four threads matches the Pi's core count, which is the target
-            # this engine exists to serve.
-            self._engine = RapidOCR(params={"Global.intra_op_num_threads": 4})
+            # this engine exists to serve. The key is nested under the engine
+            # rather than Global — RapidOCR validates keys strictly and raises
+            # on an unknown one, so a guess fails loudly rather than silently
+            # running single-threaded.
+            self._engine = RapidOCR(
+                params={"EngineConfig.onnxruntime.intra_op_num_threads": 4}
+            )
         return self._engine
 
     def warmup(self) -> None:
@@ -167,9 +172,16 @@ class RapidOcrEngine:
         h, w = img.shape[:2]
         out = engine(img)
         lines: list[Line] = []
-        boxes = getattr(out, "boxes", None) or []
-        txts = getattr(out, "txts", None) or []
-        scores = getattr(out, "scores", None) or []
+
+        # `x or []` is wrong here: RapidOCR returns numpy arrays, and their
+        # __bool__ raises "truth value of an array with more than one element is
+        # ambiguous". That failed 116 of 117 runs while looking like an engine
+        # problem rather than an adapter one.
+        def as_list(attr: str) -> list:
+            v = getattr(out, attr, None)
+            return [] if v is None else list(v)
+
+        boxes, txts, scores = as_list("boxes"), as_list("txts"), as_list("scores")
         for i, txt in enumerate(txts):
             bbox = None
             if i < len(boxes) and boxes[i] is not None:

@@ -20,7 +20,8 @@ paniolo is actually running on:
 | --- | --- | --- | --- |
 | macOS | `visionocr` | Apple Vision (`VNRecognizeTextRequest`) | `paniolo setup` compiles `ocr/visionocr.swift` with `swiftc` |
 | Windows | `winocr` | `Windows.Media.Ocr` (in-box, offline) | `paniolo setup` builds `ocr/winocr`; the release zip ships it in `libexec` |
-| Linux | `linuxocr` | Tesseract 5 | `paniolo setup` copies `ocr/linuxocr`; needs `tesseract-ocr` |
+| Linux (console/firmware screens) | `linuxocr` | Tesseract 5 | `paniolo setup` copies `ocr/linuxocr`; needs `tesseract-ocr` |
+| Linux (GUI screens) | `rapidocr` | PP-OCRv6 via RapidOCR on ONNX Runtime | `paniolo setup` copies `ocr/rapidocr` and, when a lab file asks for it, builds its venv |
 
 `$PANIOLO_VISIONOCR` overrides the choice with an explicit path.
 
@@ -29,6 +30,49 @@ which control host owns the video channel, so an agent's behaviour can be
 host-dependent. Two things make that tractable rather than mysterious: every
 result names the engine that produced it (`engine`, `engine_detail`), and the
 override above lets a lab force one engine across hosts when comparing runs.
+
+### Linux needs two engines; the other platforms need one
+
+Selected by `ocr_mode` on the target's `video` channel — `"text"` (the default)
+or `"gui"`. Measured on a Pi 5 control host against `evals/ocr`:
+
+| screen type | rapidocr | linuxocr (Tesseract) |
+| --- | --- | --- |
+| GUI | **0.083** token-recall error, ~4.2 s | 0.312, ~1.7 s |
+| text | 0.025 CER, ~6.5 s | **0.019**, ~2.0 s |
+
+So it is a genuine split rather than a better engine: ~4x more accurate on
+anti-aliased UI text, slightly worse on console text, at 2-3x the latency.
+
+Three things make that trade worth taking on GUI screens, and they are the
+reasoning to revisit if this is ever reopened:
+
+1. **Latency is affordable because OCR is not in a polling loop.** Change
+   detection uses the frame hash (`/status`, `--changed-since`); OCR runs only
+   when something asks what the screen says, usually once after a state change,
+   against a boot that took tens of seconds.
+2. **Tesseract's GUI failure is silent omission.** On a BIOS boot-order page it
+   returned the headings and dropped every value. An agent asking "what is the
+   boot order?" gets a confident, complete-looking, wrong answer — worse than a
+   slow correct one.
+3. **That also rules out the obvious hybrid.** "Run Tesseract, fall back on low
+   confidence" cannot work: Tesseract is confident about the rows it *did* read,
+   so the missing ones raise no signal to fall back on.
+
+`ocr_mode` exists because the choice cannot be inferred at runtime — see the
+confidence table below.
+
+**No preprocessing for rapidocr.** The benchmark swept upscaling, inversion and
+binarisation: every variant was slower than `raw` and none more accurate. Unlike
+`visionocr` and `linuxocr`, which upscale internally, it gets the frame
+untouched.
+
+**The venv is opt-in.** ~317 MB (onnxruntime 58 MB, models 31 MB, numpy/opencv
+the rest), built by `paniolo setup` only when some target sets
+`ocr_mode = "gui"`. Pi OS is PEP 668-managed, so a venv rather than a system
+install. `opencv-python-headless` is forced over the `opencv-python` RapidOCR
+pulls in — the full build needs `libGL.so.1`, absent on a headless Pi OS, and it
+fails at first OCR rather than at install.
 
 ## The contract
 
