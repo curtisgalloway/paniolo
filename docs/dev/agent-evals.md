@@ -349,10 +349,10 @@ fixture (fake-DUT banner + command responses + `expect` substrings).
 [`evals/serial_loopback.py`](https://github.com/curtisgalloway/paniolo/blob/main/evals/serial_loopback.py) opens a PTY, plays the
 DUT on the far end, drives `serial watch`/`send`/`log` against the near end, and
 asserts on the captured log — turning these from stated-command into
-*executed*, deterministically-graded tests. **macOS limitation:** serialcap's
-`serialport`-crate open issues a serial-only ioctl that BSD ptys reject with
-ENOTTY ("Not a typewriter") — verified — so on macOS the harness SKIPs; run it
-on a Linux control host or in CI.
+*executed*, deterministically-graded tests. Runs on macOS and Linux: macOS
+support required serialcap to open a pty without setting a line rate (see
+`open_baud()` in `serialcap/src/serial_io.rs`), since the `IOSSIOSPEED` ioctl
+that applies one returns ENOTTY on a pty.
 
 ### Meta / discovery (T0 — judge)
 

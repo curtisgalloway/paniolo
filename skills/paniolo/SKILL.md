@@ -274,6 +274,14 @@ one interface, `-i`/`--interface` can be omitted everywhere. Don't run `connect`
 and `watch` (or an external `screen`/`tio`) on the **same device** at once —
 start one, or `stop`/close the other first.
 
+**A VM's console is a serial interface.** A pty path (`/dev/ttysNNN` on macOS,
+`/dev/pts/N` on Linux — `utmctl attach <vm>` prints it, qemu's `-serial pty`
+reports it at startup) can be added like any device, which is how you watch a
+guest's firmware or unattended installer before SSH exists. `--baud` is recorded
+but not applied — a pty has no line rate. Use `serial watch`, not
+`serial connect`: `tio` opens a pty and immediately disconnects. The pty number
+is reassigned on each VM boot, so re-point the interface after a restart.
+
 ### Reading captured output
 
 While `watch` is running, the daemon keeps a **rolling, timestamped capture log**
