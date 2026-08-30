@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Executable harness for the 'operating serial' scenarios (Linux).
+"""Executable harness for the 'operating serial' scenarios.
 
 Most serial scenarios (s2–s10) are graded as stated commands by an LLM judge,
 because driving the capture daemon needs a real device. This harness upgrades
@@ -21,11 +21,11 @@ fake DUT on the far end (banner + optional command responses), drives paniolo's
 `serial watch` / `send` / `log` against the near end, and asserts on the
 captured log. No hardware.
 
-**Platform.** This is Linux-only. On macOS the `serialport` crate that backs
-serialcap issues a serial-only ioctl on open that BSD ptys reject with ENOTTY
-("Not a typewriter"), so the daemon can never open a pty — verified directly.
-On macOS (and as a safety net if the ENOTTY surfaces elsewhere) every scenario
-reports SKIP, not FAIL.
+**Platform.** Runs on macOS and Linux. macOS applies a line rate with the
+`IOSSIOSPEED` ioctl, which ptys reject with ENOTTY ("Not a typewriter"); until
+serialcap learned to open a pty without one this harness could only run on
+Linux. The ENOTTY check below is kept as a safety net — if it ever fires again
+the scenario SKIPs rather than reporting a misleading FAIL.
 
 Usage:
   python3.12 serial_loopback.py                 # all loopback scenarios
@@ -46,6 +46,7 @@ import time
 import tomllib
 import tty
 from pathlib import Path
+from select import select as _poll_fd
 
 HERE = Path(__file__).resolve().parent
 CAP_TIMEOUT = 6.0  # seconds to wait for the daemon to capture anything
@@ -84,9 +85,18 @@ def serialcap_daemon_log() -> str:
 
 
 def max_seq(run, iface: str) -> int:
+    """Highest seq whose line is *finished*, which is what `--since` means.
+
+    A trailing `*` marks the line still being written to (a `login:` prompt with
+    no newline yet). Counting it as seen loses whatever completes it: the next
+    write appends into that same line, and `--since <that seq>` then skips it.
+    """
     o = run("serial", "log", "dut", "-i", iface, "--tail", "1").stdout
-    m = re.findall(r"#(\d+)", o)
-    return int(m[-1]) if m else 0
+    m = re.findall(r"#(\d+)(\*?)", o)
+    if not m:
+        return 0
+    seq, unterminated = m[-1]
+    return int(seq) - 1 if unterminated else int(seq)
 
 
 def wait_capture(run, iface: str, needles=None, timeout=CAP_TIMEOUT) -> str:
@@ -100,12 +110,17 @@ def wait_capture(run, iface: str, needles=None, timeout=CAP_TIMEOUT) -> str:
     return last
 
 
-def cleanup(sb: Path, fds, stop_evt, run) -> None:
+def cleanup(sb: Path, fds, stop_evt, run, dut=None) -> None:
     stop_evt.set()
+    if dut is not None:
+        dut.join(timeout=2.0)
     run("serial", "stop", "dut")
     run("daemons", "stop", "--all")
     for m, s in fds:
-        for fd in (m, s):
+        # Slave first: with the reader thread already stopped, dropping the
+        # slave lets any pending read on the master resolve instead of pinning
+        # the close.
+        for fd in (s, m):
             try:
                 os.close(fd)
             except OSError:
@@ -143,6 +158,12 @@ def run_scenario(sc: dict, real: str) -> str:
     def fake_dut():
         while not stop_evt.is_set():
             try:
+                # Poll rather than block: `stop_evt` is only observed between
+                # reads, and on macOS closing the master while a thread sits in
+                # os.read() on it deadlocks close(2) — the reader waits for the
+                # close and the close waits for the reader.
+                if not _poll_fd([drv_m], [], [], 0.2)[0]:
+                    continue
                 data = os.read(drv_m, 1024)
             except OSError:
                 break
@@ -156,14 +177,15 @@ def run_scenario(sc: dict, real: str) -> str:
             except OSError:
                 break
 
-    threading.Thread(target=fake_dut, daemon=True).start()
+    dut = threading.Thread(target=fake_dut, daemon=True)
+    dut.start()
 
     run("serial", "watch", "dut")
     time.sleep(0.7)
     dlog = serialcap_daemon_log()
     if "Not a typewriter" in dlog:
-        cleanup(sb, fds, stop_evt, run)
-        out("SKIP", sid, "serialcap ENOTTY on pty (serial loopback is Linux-only)")
+        cleanup(sb, fds, stop_evt, run, dut)
+        out("SKIP", sid, "serialcap ENOTTY on pty — see open_baud() in serialcap")
         return "SKIP"
 
     os.write(drv_m, lb["banner"].encode())
@@ -206,7 +228,7 @@ def run_scenario(sc: dict, real: str) -> str:
             ok = all(e in o for e in expect)
             detail = o[:160]
     finally:
-        cleanup(sb, fds, stop_evt, run)
+        cleanup(sb, fds, stop_evt, run, dut)
 
     out("PASS" if ok else "FAIL", sid,
         "" if ok else f"missing {expect}  ::  {detail!r}")
@@ -219,12 +241,6 @@ def main() -> int:
         print("no loopback scenarios selected")
         return 0
     print(f"serial loopback: {len(scs)} scenario(s)")
-    if sys.platform == "darwin":
-        for sc in scs:
-            out("SKIP", sc["id"],
-                "macOS pty -> serialcap ENOTTY ('Not a typewriter'); Linux-only")
-        print("\n(0 run; macOS cannot open a pty as a serial port — run on Linux)")
-        return 0
     real = shutil.which("paniolo")
     if not real:
         print("paniolo not found on PATH")

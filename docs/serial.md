@@ -44,6 +44,51 @@ paniolo serial show [target-machine]
 
 ---
 
+## Virtual machine consoles
+
+A VM's serial console is a pseudo-terminal, so it can be a paniolo serial
+interface like any other port. This is the way to watch a guest through the
+window where nothing else can reach it — firmware, the bootloader, an
+unattended installer — before SSH or a guest agent exists.
+
+Find the device path. It is allocated per VM boot and changes across restarts:
+
+```bash
+utmctl attach <vm-name>          # UTM: prints "PTTY: /dev/ttys006"
+                                 # qemu: -serial pty prints the path at startup
+```
+
+Then configure it as an ordinary interface and use daemon mode:
+
+```bash
+paniolo serial add console -t winvm --device /dev/ttys006 --baud 115200
+paniolo serial watch winvm
+paniolo serial log winvm --tail 50
+```
+
+**`--baud` is recorded but not applied.** A pty has no line rate, and macOS
+applies one with an ioctl that pseudo-terminals reject outright, so serialcap
+detects a pty and opens it without one — the daemon logs `is a pty — opening
+without a line rate`. Set the baud your hardware would use; nothing depends
+on it.
+
+**Use `serial watch`, not `serial connect`.** The interactive path goes through
+`tio`, which opens a pty and then immediately reports `Disconnected`. Daemon
+mode gives you the rolling capture log and the dashboard terminal, which is what
+you want for an install you are waiting on anyway.
+
+**Re-point the interface after a VM restart**, since the pty number is reassigned:
+
+```bash
+paniolo serial set console -t winvm --device "$(utmctl attach winvm | sed -n 's/^PTTY: //p')"
+```
+
+A VM's lifecycle can also be wired to the [power](power.md) hooks
+(`on_cmd`/`off_cmd`/`state_cmd`) — `utmctl start|stop`, with a `state_cmd` that
+translates `utmctl status` into the `on`/`off` the contract requires.
+
+---
+
 ## Interactive mode
 
 ```bash

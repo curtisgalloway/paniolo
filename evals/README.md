@@ -62,8 +62,7 @@ ran `netif mode ffx` blocked on `sudo`); per-scenario 360 s timeout that's caugh
 (one hang ≠ dead batch); `stdin=DEVNULL`; per-scenario `try/except` + incremental
 result save; a `daemons stop --all` sweep after each agent run.
 
-**Known platform limits:** `serial_loopback.py` is Linux-only (macOS pty → ENOTTY,
-SKIPs); `--isolation home` needs valid creds (macOS Keychain `.credentials.json`
+**Known platform limits:** `--isolation home` needs valid creds (macOS Keychain `.credentials.json`
 can be stale → 401). agy bypasses the PATH shim, so its T1 allowlist isn't
 enforced (graded on `lab.toml` outcome). See `docs/dev/agent-evals.md` §3.1, §6.2, §8.
 
@@ -182,11 +181,10 @@ python3.12 serial_loopback.py            # all exec serial scenarios
 python3.12 serial_loopback.py s4 s2      # by id
 ```
 
-> **macOS can't run these.** serialcap's `serialport`-crate open issues a
-> serial-only ioctl that BSD ptys reject with ENOTTY ("Not a typewriter") —
-> verified directly — so on macOS every loopback scenario reports **SKIP**, not
-> FAIL. Run the harness on a Linux control host or in CI. (The Linux path is
-> designed but unverified from the macOS dev box.)
+> **Runs on macOS and Linux.** macOS needed serialcap to learn to open a pty
+> without setting a line rate (see `open_baud()` in `serialcap/src/serial_io.rs`);
+> before that every scenario here reported **SKIP**. Verified 6/6 PASS on
+> macOS 26.6 / Apple Silicon.
 
 ## Adding a scenario
 

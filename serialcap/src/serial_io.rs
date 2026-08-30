@@ -254,6 +254,39 @@ fn spawn_capture(capture_dir: PathBuf, buffer_lines: u64) -> stdmpsc::Sender<Byt
     tx
 }
 
+/// True when `device` names a pseudo-terminal slave rather than a real serial
+/// port: `/dev/ttysNNN` on macOS, `/dev/pts/N` on Linux. That is what
+/// `utmctl attach` prints for a UTM guest's console and what qemu reports for
+/// `-serial pty`, so it is the shape a VM's console arrives in.
+///
+/// A path test rather than an fd test on purpose — the decision has to be made
+/// *before* the open, because on macOS it changes how the open is performed.
+fn is_pty(device: &str) -> bool {
+    let numbered = |rest: &str| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit());
+    device.strip_prefix("/dev/ttys").is_some_and(numbered)
+        || device.strip_prefix("/dev/pts/").is_some_and(numbered)
+}
+
+/// The baud rate to *open* `device` with, which is not always the configured one.
+///
+/// macOS applies a serial port's line rate with the `IOSSIOSPEED` ioctl, which
+/// pseudo-terminals do not implement: the open fails outright with `ENOTTY`
+/// ("Not a typewriter"), so before this paniolo could not attach to a VM
+/// console at all. The `serialport` crate skips that ioctl when the requested
+/// rate is 0, which is its documented way to open a pty — and a pty has no line
+/// rate to set in the first place, so nothing is lost by not setting one.
+///
+/// Linux needs no such thing (its ptys accept the ordinary termios path) and
+/// must not be given it: there a rate of 0 is written into `c_ospeed` as `B0`,
+/// which means *hang up the line*.
+fn open_baud(device: &str, baud: u32) -> u32 {
+    if cfg!(target_os = "macos") && is_pty(device) {
+        0
+    } else {
+        baud
+    }
+}
+
 /// Read one modem-control sense signal and translate it to `power_on`.
 ///
 /// The target's 3.3 V rail is wired (with a pull-down) to the chosen FTDI input
@@ -290,6 +323,14 @@ async fn supervisor(
     // Track whether we've ever connected so the first open shows "connected"
     // and later opens show "reconnected".
     let mut ever_connected = false;
+
+    // A pty (a VM's console) is both opened and torn down differently from a
+    // real port; see `open_baud` and the `Ok(0)` arm of the read loop.
+    let pty = is_pty(&device);
+    let baud = open_baud(&device, baud);
+    if pty {
+        info!("{device} is a pty — opening without a line rate");
+    }
 
     loop {
         let port = match tokio_serial::new(&device, baud).open_native_async() {
@@ -333,8 +374,16 @@ async fn supervisor(
         let exit = loop {
             tokio::select! {
                 read = rd.read(&mut buf) => match read {
+                    Ok(0) if pty => {
+                        // A pty *does* have an EOF: `Ok(0)` means the far end
+                        // closed — the VM powered off, or its hypervisor let go
+                        // of the master. Treat it as the disconnect it is rather
+                        // than spinning, so the marker is emitted and the
+                        // reconnect loop can pick the console back up.
+                        break InnerExit::Disconnect;
+                    }
                     Ok(0) => {
-                        // Serial ports don't have EOF; Ok(0) means the async
+                        // Real serial ports don't have EOF; Ok(0) means the async
                         // read resolved without data. Yield to avoid a spin loop.
                         tokio::time::sleep(Duration::from_millis(1)).await;
                     }
@@ -610,5 +659,124 @@ mod tests {
             .await
             .unwrap();
         assert!(rx.try_recv().is_err());
+    }
+
+    // ── pty consoles (a VM's serial port) ───────────────────────────────────
+
+    #[test]
+    fn is_pty_recognizes_platform_pty_paths() {
+        assert!(is_pty("/dev/ttys006"), "macOS pty slave");
+        assert!(is_pty("/dev/pts/3"), "Linux pty slave");
+    }
+
+    #[test]
+    fn is_pty_rejects_real_serial_devices() {
+        for dev in [
+            "/dev/tty.usbserial-BG03U7X9", // macOS FTDI
+            "/dev/cu.usbmodem14201",       // macOS CDC-ACM
+            "/dev/ttyS0",                  // Linux 16550
+            "/dev/ttyUSB0",
+            "/dev/ttyACM0",
+            "/dev/serial/by-id/usb-FTDI_FT232R-if00-port0",
+            "/dev/ttys", // prefix with no number
+            "/dev/pts/", // ditto
+        ] {
+            assert!(!is_pty(dev), "{dev} is not a pty");
+        }
+    }
+
+    #[test]
+    fn open_baud_drops_the_line_rate_for_a_pty_on_macos_only() {
+        // Linux must keep the configured rate: there a 0 becomes B0, "hang up".
+        let want = if cfg!(target_os = "macos") {
+            0
+        } else {
+            115_200
+        };
+        assert_eq!(open_baud("/dev/ttys006", 115_200), want);
+        // A real port always keeps its rate, on every platform.
+        assert_eq!(open_baud("/dev/tty.usbserial-BG03U7X9", 115_200), 115_200);
+    }
+
+    /// A pty pair, as a hypervisor hands one out: the returned fd is the end
+    /// UTM/qemu keeps, and the path is what it prints for you to attach to.
+    #[cfg(unix)]
+    fn open_pty_master() -> (std::os::unix::io::RawFd, String) {
+        use std::ffi::CStr;
+        unsafe {
+            let fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(fd >= 0, "posix_openpt: {}", std::io::Error::last_os_error());
+            assert_eq!(libc::grantpt(fd), 0, "grantpt");
+            assert_eq!(libc::unlockpt(fd), 0, "unlockpt");
+            let name = libc::ptsname(fd);
+            assert!(!name.is_null(), "ptsname");
+            (fd, CStr::from_ptr(name).to_string_lossy().into_owned())
+        }
+    }
+
+    /// The regression this whole path exists for: before `open_baud`, this open
+    /// failed on macOS with ENOTTY ("Not a typewriter") and paniolo could not
+    /// attach to a VM console at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opens_a_real_pty_and_carries_data_both_ways() {
+        use std::os::unix::io::FromRawFd;
+
+        let (master, device) = open_pty_master();
+        let baud = open_baud(&device, 115_200);
+        let mut port = tokio_serial::new(&device, baud)
+            .open_native_async()
+            .unwrap_or_else(|e| panic!("opening pty {device} at baud {baud}: {e}"));
+        let mut far = unsafe { std::fs::File::from_raw_fd(master) };
+
+        std::io::Write::write_all(&mut far, b"boot: hello\r\n").unwrap();
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(
+            Duration::from_secs(5),
+            AsyncReadExt::read(&mut port, &mut buf),
+        )
+        .await
+        .expect("read from pty timed out")
+        .expect("read from pty failed");
+        assert_eq!(&buf[..n], b"boot: hello\r\n");
+
+        AsyncWriteExt::write_all(&mut port, b"reply\r\n")
+            .await
+            .unwrap();
+        let mut back = [0u8; 64];
+        let n = std::io::Read::read(&mut far, &mut back).unwrap();
+        assert_eq!(&back[..n], b"reply\r\n");
+    }
+
+    /// The premise behind the supervisor's `Ok(0) if pty` arm: when the far end
+    /// goes away the read must *resolve* — never hang, never yield data — so the
+    /// loop can emit "disconnected" and start reconnecting. macOS reports this
+    /// as EOF, Linux as EIO; both break the loop, a hang would not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_closed_pty_far_end_resolves_the_read() {
+        use std::os::unix::io::FromRawFd;
+
+        let (master, device) = open_pty_master();
+        let mut port = tokio_serial::new(&device, open_baud(&device, 115_200))
+            .open_native_async()
+            .expect("pty open");
+        drop(unsafe { std::fs::File::from_raw_fd(master) }); // the VM went away
+
+        let mut buf = [0u8; 32];
+        let read = tokio::time::timeout(
+            Duration::from_secs(5),
+            AsyncReadExt::read(&mut port, &mut buf),
+        )
+        .await;
+        match read.expect("read hung after the pty far end closed") {
+            Ok(0) => {}
+            Ok(n) => panic!("read {n} bytes from a pty whose far end is closed"),
+            Err(e) => assert_ne!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock,
+                "WouldBlock would spin the supervisor instead of reconnecting"
+            ),
+        }
     }
 }

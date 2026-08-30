@@ -29,7 +29,10 @@ type = "judge"
 
 [loopback]
 banner = "root@dut:~# "
+# `expect` must precede the sub-table: after `[[loopback.respond]]` opens, any
+# further keys belong to that entry, not to `[loopback]`.
+expect = ["Linux version 6.6.0"]
+
 [[loopback.respond]]
 match = "cat /proc/version"
 reply = "\r\nLinux version 6.6.0 (build@dut) #1 SMP\r\nroot@dut:~# "
-expect = ["Linux version 6.6.0"]

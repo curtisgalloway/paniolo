@@ -1282,10 +1282,14 @@ the problem.
 - **Serial ports are exclusive.** Only one of `tio`/`screen`/serialcap can hold
   a port at a time. `paniolo serial watch` and `paniolo serial connect` conflict
   on the same device — use one or the other.
-- **macOS serialport can't open PTYs.** The `serialport` crate sets baud via the
-  `IOSSIOSPEED` ioctl, which returns ENOTTY ("Not a typewriter") on pseudo-
-  terminals. serialcap byte-flow can only be tested against a real serial device,
-  not a `pty.openpty()` pair.
+- **A pty is opened without a line rate.** The `serialport` crate applies baud on
+  macOS with the `IOSSIOSPEED` ioctl, which returns ENOTTY ("Not a typewriter") on
+  a pseudo-terminal, so serialcap detects a pty by path and opens it at baud 0 —
+  the crate's documented pty path, and a pty has no line rate to set anyway. See
+  `open_baud()`/`is_pty()` in `serialcap/src/serial_io.rs`. **Do not extend this to
+  Linux**: there a rate of 0 is written to `c_ospeed` as `B0`, meaning *hang up*.
+  This is what lets serialcap attach to a VM console (`utmctl attach`, qemu
+  `-serial pty`) and what lets `evals/serial_loopback.py` run on macOS.
 - **OCR character confusions on small console fonts.** Both visionocr and linuxocr
   2×-upscale and black-pad before recognition, but thin terminal fonts still
   produce confusions (`1`↔`l`↔`I`, `2`↔`Z`, colon spacing in IPv6). Accuracy
