@@ -72,10 +72,26 @@ detects a pty and opens it without one — the daemon logs `is a pty — opening
 without a line rate`. Set the baud your hardware would use; nothing depends
 on it.
 
-**Use `serial watch`, not `serial connect`.** The interactive path goes through
-`tio`, which opens a pty and then immediately reports `Disconnected`. Daemon
-mode gives you the rolling capture log and the dashboard terminal, which is what
-you want for an install you are waiting on anyway.
+**Both console modes work.** `serial connect` gives an interactive `tio`
+terminal; `serial watch` gives the rolling capture log and the dashboard, which
+is what you want for an install you are waiting on. As with any device the two
+conflict — the port is exclusive, so run one at a time.
+
+**Writing to the console is a real keypress.** The pty is bidirectional, and
+firmware reads it as console input: on an EDK2 guest the virt machine's PL011
+is registered as ConIn, so `serial send` answers a boot prompt with no display
+attached. This is how you get past bootmgr's "Press any key to boot from CD or
+DVD" headlessly. The window is short and lands unpredictably (firmware USB
+enumeration makes boot timing vary by tens of seconds), so send on a loop
+rather than sleeping a fixed interval and sending once:
+
+```bash
+for i in $(seq 120); do paniolo serial send winvm " "; sleep 1; done
+```
+
+Input stops working once the guest OS takes over the input stack — a Windows
+guest stops reading UEFI ConIn when WinPE starts. Serial is an input path for
+firmware and the bootloader, not for a booted OS.
 
 **Re-point the interface after a VM restart**, since the pty number is reassigned:
 
