@@ -12,6 +12,18 @@ firmware patch at XDATA `0xDF00` (finding 9). Driving the mux is still blocked
 on the MS2109 firmware-patch wall (finding 7), with two untried leads in
 finding 8. Tracker: requirements §6.1 (OTF-1…6).*
 
+> **Correction (2026-08-30): OTF-3 is not blocked, and the firmware-patch wall
+> was never the vendor's path.** A clean-room investigation of the vendor host
+> applications shows they drive this mux with **no 8051 patching at all** — a
+> read-modify-write of XDATA `0xDF01` (the byte immediately after the `0xDF00`
+> slide-switch byte of finding 9) over the same MS2109 HID config interface this
+> bench already reads from successfully, using XDATA opcodes `0xB5` and `0xB6`.
+> Findings 7 and 8 remain accurate about what *ms-tools* cannot do; they were
+> wrong only in inferring that the vendor needed it. We stopped one address
+> short. Protocol and the firmware-dependent bit selection:
+> [openterface-usb-mux-spec.md](openterface-usb-mux-spec.md). Untested on this
+> hardware — the Mini-KVM was not on the bench when this was established.
+
 > **This doc is about the Mini-KVM.** For its successor see
 > [Openterface KVM-Go](openterface-kvm-go.md), which uses a different chipset
 > (MS2130S + CH32V208 instead of MS2109 + CH340C/CH9329). Findings 2 and 3

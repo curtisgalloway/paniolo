@@ -1,0 +1,52 @@
+# Exact file list read during this investigation (for verifiers only; NOT a reading list
+# for any implementation context). Pinned commits:
+#   TechxArtisanStudio/Openterface_QT      @ f176cf9665e8cc3370dca45de9e3e0dbe258377f
+#   TechxArtisanStudio/Openterface_Core    @ b1e6d62182b44f2fd2e9e44ad914d87390d88573
+#   TechxArtisanStudio/Openterface_MacOS   @ 4a51de39fc21080a9ca74e057cb3b4e8116f49e6
+#   TechxArtisanStudio/Openterface_Android @ f8a80938f5ee152492c62124fe7209514443c425 (searched, nothing relevant)
+
+Openterface_Core/include/openterface/usb_mode.h
+Openterface_Core/include/openterface/protocol_ch9329.h
+Openterface_Core/include/openterface/chip.h
+Openterface_Core/include/openterface/capability.h
+Openterface_Core/include/openterface/profile.h
+Openterface_Core/src/usb_mode/usb_mode_internal.h
+Openterface_Core/src/usb_mode/usb_mode_controller.c
+Openterface_Core/src/usb_mode/usb_mode_serial.c
+Openterface_Core/src/usb_mode/usb_mode_ms21xx.c
+Openterface_Core/src/protocol/ch9329/protocol_ch9329.c
+Openterface_Core/src/input/input_packet.c
+Openterface_Core/src/chip/chip_detector.c
+Openterface_Core/src/chip/video_chip_controller.c
+Openterface_Core/src/profile/profile.c
+
+Openterface_QT/serial/ch9329.h
+Openterface_QT/serial/SerialPortManager.cpp
+Openterface_QT/serial/SerialPortManager.h
+Openterface_QT/serial/SerialCommandCoordinator.cpp
+Openterface_QT/serial/SerialCommandCoordinator.h
+Openterface_QT/serial/FactoryResetManager.cpp
+Openterface_QT/serial/protocol/SerialProtocol.cpp
+Openterface_QT/serial/protocol/SerialProtocol.h
+Openterface_QT/serial/chipstrategy/CH32V208Strategy.h
+Openterface_QT/serial/chipstrategy/CH32V208Strategy.cpp
+Openterface_QT/serial/chipstrategy/CH9329Strategy.h
+Openterface_QT/serial/chipstrategy/ChipStrategyFactory.h
+Openterface_QT/serial/chipstrategy/ChipStrategyFactory.cpp
+Openterface_QT/video/ms2109.h
+Openterface_QT/video/ms2109s.h
+Openterface_QT/video/ms2130s.h
+Openterface_QT/video/videohid.cpp
+Openterface_QT/video/videohid_register.cpp
+Openterface_QT/video/videohidchip.cpp
+Openterface_QT/video/videohidchip.h
+Openterface_QT/ui/mainwindow.cpp
+Openterface_QT/server/mcp/mcpToolHandler.cpp
+
+Openterface_MacOS/openterface/Managers/serial/SerialProtocolCommands.swift
+Openterface_MacOS/openterface/Managers/serial/SerialPortManger.swift
+Openterface_MacOS/openterface/Managers/serial/SerialResponseHandler.swift
+Openterface_MacOS/openterface/Managers/SwitchableUSBManager.swift
+Openterface_MacOS/openterface/Managers/HIDManager.swift
+Openterface_MacOS/openterface/Core/Control/CH32V208ControlChipset.swift
+Openterface_MacOS/openterface/Core/ControlChipsetHAL.swift
