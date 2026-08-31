@@ -47,6 +47,22 @@ const CMD_GET_PARA_CFG: u8 = 0x08;
 const CMD_SET_PARA_CFG: u8 = 0x09;
 const CMD_RESET: u8 = 0x0F;
 
+/// Vendor extension implemented by Openterface MCUs that *emulate* the CH9329
+/// (the KVM-Go's CH32V208), not by a real CH9329: drive or query the USB mux
+/// that shares the onboard microSD reader between the host and the target.
+/// See `notes/openterface-usb-mux-spec.md`.
+const CMD_USB_SWITCH: u8 = 0x17;
+
+/// `CMD_USB_SWITCH` payload length. Load-bearing: only the last of the five
+/// bytes selects a direction, but the four leading zeros are part of the
+/// declared payload. Trimming them shifts where the checksum lands and the
+/// device rejects the frame outright.
+const USB_SWITCH_LEN: usize = 5;
+
+const USB_SWITCH_TO_HOST: u8 = 0x00;
+const USB_SWITCH_TO_TARGET: u8 = 0x01;
+const USB_SWITCH_QUERY: u8 = 0x03;
+
 /// Length of the CH9329 parameter-config block (`docs/ch9329-spec.md` §5).
 const PARA_CFG_LEN: usize = 50;
 /// Byte offset of the 4-byte big-endian baud field within the config block.
@@ -106,6 +122,18 @@ const TYPE_GAP: Duration = Duration::from_millis(15);
 
 /// Hold duration for a tap/chord: [`LOCK_HOLD`] if any key is a lock key,
 /// [`HOLD`] otherwise.
+/// Whether a reply's payload begins with real data rather than an ACK status
+/// byte.
+///
+/// Most ACKs lead with a status byte that is non-zero on failure. Three
+/// commands do not: GET_INFO and GET_PARA_CFG return data blocks, and
+/// USB_SWITCH returns the *resulting* mux position — where `0x01` means "now
+/// on the target side", not "error 1". Reading that as a status would make
+/// every successful switch to the target report a failure.
+fn reply_payload_is_data(cmd: u8) -> bool {
+    matches!(cmd, CMD_GET_INFO | CMD_GET_PARA_CFG | CMD_USB_SWITCH)
+}
+
 fn hold_for(keys: &[Key]) -> Duration {
     if keys.iter().any(|k| k.is_lock()) {
         LOCK_HOLD
@@ -133,6 +161,40 @@ pub struct Info {
     pub scroll_lock: bool,
 }
 
+/// Which side of the USB mux the shared device is attached to. The mux is
+/// exclusive: the microSD reader is visible to the host or the target, never
+/// both, and the position does not survive the device losing power (it returns
+/// to [`MuxSide::Host`]), so it must be read rather than remembered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MuxSide {
+    Host,
+    Target,
+}
+
+impl MuxSide {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MuxSide::Host => "host",
+            MuxSide::Target => "target",
+        }
+    }
+
+    fn selector(self) -> u8 {
+        match self {
+            MuxSide::Host => USB_SWITCH_TO_HOST,
+            MuxSide::Target => USB_SWITCH_TO_TARGET,
+        }
+    }
+
+    fn from_status(b: u8) -> Option<MuxSide> {
+        match b {
+            USB_SWITCH_TO_HOST => Some(MuxSide::Host),
+            USB_SWITCH_TO_TARGET => Some(MuxSide::Target),
+            _ => None,
+        }
+    }
+}
+
 pub struct Session {
     port: Box<dyn SerialPort>,
     baud: u32,
@@ -155,11 +217,12 @@ impl Session {
         let mut last_err: Option<anyhow::Error> = None;
         let last_index = candidates.len() - 1;
         for (i, &rate) in candidates.iter().enumerate() {
-            let port = serialport::new(device, rate)
+            let mut port = serialport::new(device, rate)
                 .data_bits(serialport::DataBits::Eight)
                 .parity(serialport::Parity::None)
                 .stop_bits(serialport::StopBits::One)
                 .timeout(Duration::from_millis(500))
+                .dtr_on_open(false)
                 .open_native()
                 .with_context(|| format!("cannot open {device}"))?;
             #[cfg(target_os = "macos")]
@@ -167,6 +230,16 @@ impl Session {
                 use std::os::unix::io::AsRawFd;
                 set_low_read_latency(port.as_raw_fd());
             }
+            // The modem lines are not cosmetic on the devices this helper
+            // drives. On the KVM-Go's CH32V208, RTS is a hardware reset of the
+            // MCU — the vendor's own reset path asserts it for four seconds —
+            // and on the Mini-KVM, DTR floats the switchable port's ground
+            // return, so an asserted line unplugs whatever is in that port.
+            // Deassert both. A brief assertion during open itself cannot be
+            // prevented on Linux without kernel changes; it has not been
+            // observed to disturb either device.
+            port.write_request_to_send(false).ok();
+            port.write_data_terminal_ready(false).ok();
             let mut s = Session {
                 port: Box::new(port),
                 baud: rate,
@@ -266,9 +339,7 @@ impl Session {
         if rcmd != cmd | 0x80 {
             bail!("unexpected reply cmd {rcmd:#04x} to {cmd:#04x}");
         }
-        // Most ACKs carry a status byte first; GET_INFO and GET_PARA_CFG
-        // instead return a data block whose first byte is real data.
-        if cmd != CMD_GET_INFO && cmd != CMD_GET_PARA_CFG {
+        if !reply_payload_is_data(cmd) {
             if let Some(&status) = payload.first() {
                 if status != 0x00 {
                     bail!("cmd {cmd:#04x} failed: {}", status_name(status));
@@ -292,6 +363,49 @@ impl Session {
             caps_lock: p[2] & 0x02 != 0,
             scroll_lock: p[2] & 0x04 != 0,
         })
+    }
+
+    // -- USB mux -------------------------------------------------------------
+
+    /// Which side the USB mux is on, without changing it.
+    pub fn usb_query(&mut self) -> Result<MuxSide> {
+        self.usb_cmd(USB_SWITCH_QUERY)
+    }
+
+    /// Drive the USB mux to `side`, and confirm it actually landed there.
+    ///
+    /// The reply carries the *resulting* position rather than a success code,
+    /// so a device that ignored the request still answers with a well-formed
+    /// frame stating the old position. Comparing the two is the only success
+    /// criterion the protocol offers. The operation is idempotent — switching
+    /// to the side it is already on is harmless — so callers may retry.
+    pub fn usb_set(&mut self, side: MuxSide) -> Result<MuxSide> {
+        let got = self.usb_cmd(side.selector())?;
+        if got != side {
+            bail!(
+                "USB mux did not move: asked for {}, device reports {}",
+                side.as_str(),
+                got.as_str()
+            );
+        }
+        Ok(got)
+    }
+
+    fn usb_cmd(&mut self, selector: u8) -> Result<MuxSide> {
+        let mut data = [0u8; USB_SWITCH_LEN];
+        data[USB_SWITCH_LEN - 1] = selector;
+        let p = self.send(CMD_USB_SWITCH, &data).map_err(|e| {
+            anyhow!(
+                "{e}\nA device with no switchable USB mux does not answer this \
+                 command at all — the protocol has no negative ack for an \
+                 unknown opcode — so a timeout here means unsupported rather \
+                 than broken."
+            )
+        })?;
+        match (p.len(), p.first().copied().and_then(MuxSide::from_status)) {
+            (1, Some(side)) => Ok(side),
+            _ => bail!("this device does not support USB mux switching (reply {p:02x?})"),
+        }
     }
 
     /// Persistently change the CH9329's serial baud (`docs/ch9329-spec.md` §5).
@@ -604,6 +718,66 @@ mod tests {
         // 115200 = 00 01 C2 00, 9600 = 00 00 25 80.
         assert_eq!(115_200u32.to_be_bytes(), [0x00, 0x01, 0xC2, 0x00]);
         assert_eq!(9_600u32.to_be_bytes(), [0x00, 0x00, 0x25, 0x80]);
+    }
+
+    #[test]
+    fn usb_switch_frames_match_hardware() {
+        // Exactly the bytes an Openterface KVM-Go accepted on the bench
+        // (notes/openterface-usb-mux-spec.md). The four leading zero payload
+        // bytes are load-bearing: trimming them moves the checksum and the
+        // device rejects the frame.
+        let f = |sel| Session::frame(CMD_USB_SWITCH, &[0, 0, 0, 0, sel]);
+        assert_eq!(
+            f(USB_SWITCH_TO_HOST),
+            vec![0x57, 0xAB, 0x00, 0x17, 0x05, 0, 0, 0, 0, 0x00, 0x1E]
+        );
+        assert_eq!(
+            f(USB_SWITCH_TO_TARGET),
+            vec![0x57, 0xAB, 0x00, 0x17, 0x05, 0, 0, 0, 0, 0x01, 0x1F]
+        );
+        assert_eq!(
+            f(USB_SWITCH_QUERY),
+            vec![0x57, 0xAB, 0x00, 0x17, 0x05, 0, 0, 0, 0, 0x03, 0x21]
+        );
+    }
+
+    #[test]
+    fn usb_switch_reply_payload_is_data_not_status() {
+        // The regression this guards: the mux-switch reply's single byte is
+        // the resulting position, so a successful switch to the target answers
+        // 0x01. Classified as an ACK status byte, that reads as "error 1" and
+        // every switch to the target would be reported as a failure.
+        assert!(reply_payload_is_data(CMD_USB_SWITCH));
+        assert!(reply_payload_is_data(CMD_GET_INFO));
+        assert!(reply_payload_is_data(CMD_GET_PARA_CFG));
+        assert!(!reply_payload_is_data(CMD_KB_GENERAL));
+        assert!(!reply_payload_is_data(CMD_SET_PARA_CFG));
+    }
+
+    #[test]
+    fn usb_switch_status_decoding() {
+        assert_eq!(MuxSide::from_status(0x00), Some(MuxSide::Host));
+        assert_eq!(MuxSide::from_status(0x01), Some(MuxSide::Target));
+        // 0x03 selects "query" in a *request*; it is never a reply status,
+        // and 0x02 is undefined in both directions. Either means the device
+        // does not really implement the command.
+        assert_eq!(MuxSide::from_status(0x02), None);
+        assert_eq!(MuxSide::from_status(0x03), None);
+        assert_eq!(MuxSide::from_status(0xFF), None);
+    }
+
+    #[test]
+    fn usb_switch_selectors_round_trip() {
+        assert_eq!(
+            MuxSide::from_status(MuxSide::Host.selector()),
+            Some(MuxSide::Host)
+        );
+        assert_eq!(
+            MuxSide::from_status(MuxSide::Target.selector()),
+            Some(MuxSide::Target)
+        );
+        assert_eq!(MuxSide::Host.as_str(), "host");
+        assert_eq!(MuxSide::Target.as_str(), "target");
     }
 
     #[test]

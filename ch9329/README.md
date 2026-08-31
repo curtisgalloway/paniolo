@@ -71,6 +71,17 @@ Extras beyond hidrig's surface:
   target has enumerated the emulated HID (`target_connected`), lock-LED state,
   and the negotiated baud. Useful for `paniolo doctor`-style checks; the KB2040
   can't report target enumeration, the CH9329 can.
+- `ch9329 -d <dev> usb host|target|state` — switch or query the USB mux that
+  shares one onboard microSD reader between the host and the target. Present on
+  the **Openterface KVM-Go**, whose CH32V208 drives the mux select line; a real
+  CH9329 does not implement it. The device's reply reports the *resulting* mux
+  position rather than a success code, so `host`/`target` compare it against
+  what was asked and fail if it did not move; all three print the resulting
+  side. A device without a mux does not answer at all — the protocol has no
+  negative ack for an unknown opcode — so unsupported hardware surfaces as a
+  timeout, and the error says so. Wired into paniolo as the `usb` channel
+  (`paniolo usb attach-host|attach-target|state`, docs/usb.md); protocol in
+  notes/openterface-usb-mux-spec.md.
 - `ch9329 -d <dev> baud <rate>` — **persistently** set the chip's serial baud
   (`SET_PARA_CFG` → flash → `RESET` to activate), then reconnect at the new
   rate. Datasheet range 1200..=115200 (Openterface default 115200;

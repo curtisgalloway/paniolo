@@ -23,7 +23,7 @@
 use anyhow::{anyhow, bail, Result};
 
 use crate::keys::name_to_key;
-use crate::session::Session;
+use crate::session::{MuxSide, Session};
 
 /// `version` reply data (the part after `OK`): protocol version, impl id, and
 /// the optional capabilities this injector advertises. The CH9329 has a true
@@ -118,6 +118,20 @@ pub fn execute_line(s: &mut Session, line: &str) -> Result<String> {
                  115200, 57600, then 9600 — for other rates reconnect with -b \
                  {rate})"
             ));
+        }
+        "usb" => {
+            // Openterface USB-mux control, another CH9329-family extension
+            // rather than part of the HID serial protocol: the shared microSD
+            // reader is visible to exactly one side at a time. `state` reports
+            // the current side; `host`/`target` drive it and verify it landed.
+            // All three answer with the resulting side.
+            let side = match one_arg(rest, "usb")? {
+                "state" => s.usb_query()?,
+                "host" => s.usb_set(MuxSide::Host)?,
+                "target" => s.usb_set(MuxSide::Target)?,
+                other => bail!("usb takes host, target, or state (got {other:?})"),
+            };
+            return Ok(side.as_str().to_string());
         }
         other => bail!("unknown command: {other}"),
     }

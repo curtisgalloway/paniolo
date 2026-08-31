@@ -452,6 +452,19 @@ impl LabFile {
         self.remove_singleton(target, "hid")
     }
 
+    pub fn set_usb(
+        &mut self,
+        target: &str,
+        cmd: Option<&str>,
+        host: Option<&str>,
+    ) -> Result<(), LabError> {
+        self.set_singleton(target, "usb", &[("cmd", cmd), ("host", host)])
+    }
+
+    pub fn remove_usb(&mut self, target: &str) -> Result<(), LabError> {
+        self.remove_singleton(target, "usb")
+    }
+
     pub fn set_adb(
         &mut self,
         target: &str,

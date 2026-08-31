@@ -112,6 +112,13 @@ enum Command {
         #[command(subcommand)]
         cmd: HidCmd,
     },
+    /// Switch a shared USB device between the control host and the target —
+    /// an Openterface KVM-Go's onboard microSD card, or a Mini-KVM's
+    /// switchable USB-A port. Only one side sees it at a time.
+    Usb {
+        #[command(subcommand)]
+        cmd: UsbCmd,
+    },
     /// Drive an Android target over adb (console, screencap, input).
     Adb {
         #[command(subcommand)]
@@ -589,6 +596,44 @@ enum HidCmd {
 }
 
 #[derive(Subcommand)]
+enum UsbCmd {
+    /// Configure the target's usb channel (one per target).
+    Set {
+        #[arg(long, short)]
+        target: String,
+        /// Mux helper command. paniolo appends a fixed verb — `usb host`,
+        /// `usb target`, or `usb state` (e.g. "ch9329 -d /dev/cu.usbmodemXXXX").
+        #[arg(long)]
+        cmd: String,
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Remove the target's usb channel.
+    Rm {
+        #[arg(long, short)]
+        target: String,
+    },
+    /// Route the shared device to the control host — where you can write an
+    /// image to it, then hand it to the target with `attach-target`.
+    AttachHost {
+        #[arg(long, short)]
+        target: Option<String>,
+    },
+    /// Route the shared device to the target, where it appears as ordinary
+    /// physical media (visible to firmware, unlike streamed virtual media).
+    AttachTarget {
+        #[arg(long, short)]
+        target: Option<String>,
+    },
+    /// Report which side the shared device is on. Always ask rather than
+    /// assuming: the position does not survive the KVM losing power.
+    State {
+        #[arg(long, short)]
+        target: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum AdbCmd {
     /// Configure the target's adb channel (one per target).
     Set {
@@ -738,6 +783,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Power { cmd } => power_cmd(lab_flag, cmd),
         Command::Video { cmd } => video_cmd(lab_flag, cmd),
         Command::Hid { cmd } => hid_cmd(lab_flag, cmd),
+        Command::Usb { cmd } => usb_cmd(lab_flag, cmd),
         Command::Adb { cmd } => adb_cmd(lab_flag, cmd),
         Command::Console { target, interface } => {
             cmd_console(lab_flag, target.as_deref(), interface.as_deref())
@@ -3171,6 +3217,81 @@ fn hid_cmd(lab_flag: Option<&str>, cmd: HidCmd) -> Result<()> {
 
 /// The `hid` daemon discovery name (must match hidrig's DISCOVERY_NAME).
 const HID_DAEMON: &str = "hid";
+
+fn usb_cmd(lab_flag: Option<&str>, cmd: UsbCmd) -> Result<()> {
+    match cmd {
+        UsbCmd::Set { target, cmd, host } => {
+            edit_lab(lab_flag, |lf| {
+                lf.set_usb(&target, Some(&cmd), host.as_deref())
+            })?;
+            println!("usb channel set for '{target}'.");
+            Ok(())
+        }
+        UsbCmd::Rm { target } => {
+            edit_lab(lab_flag, |lf| lf.remove_usb(&target))?;
+            println!("usb channel removed from '{target}'.");
+            Ok(())
+        }
+        UsbCmd::AttachHost { target } => cmd_usb_run(lab_flag, target.as_deref(), "host"),
+        UsbCmd::AttachTarget { target } => cmd_usb_run(lab_flag, target.as_deref(), "target"),
+        UsbCmd::State { target } => cmd_usb_run(lab_flag, target.as_deref(), "state"),
+    }
+}
+
+/// Run the target's usb helper as `<cmd> usb <verb>`, propagating its exit
+/// code. paniolo stays agnostic to the helper, like the power hooks — but the
+/// vocabulary is fixed rather than passed through, so a constrained remote
+/// host only ever sees the three verbs.
+///
+/// A successful `host`/`target` means the *mux* moved, which the helper
+/// confirms by reading the resulting position back. It does **not** mean the
+/// media has finished enumerating on the receiving side: switching physically
+/// detaches and reattaches a USB device, and the block device can take a few
+/// seconds to appear. Wait for the device, not for this command.
+fn cmd_usb_run(lab_flag: Option<&str>, target: Option<&str>, verb: &str) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    let target = resolve_single_target(&lab, target)?;
+    if let Some(code) = dispatch::maybe_dispatch(
+        &lab,
+        &target,
+        model::ChannelKind::Usb,
+        None,
+        dispatch::Mode::Reexec,
+    )? {
+        std::process::exit(code);
+    }
+    let t = lab
+        .targets
+        .get(&target)
+        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+    let dh = t.default_host().to_string();
+    let u = t.usb.clone().ok_or_else(|| {
+        anyhow!("target '{target}' has no usb channel (paniolo usb set -t {target} --cmd ...)")
+    })?;
+    if !channel_is_local(&lab, u.host.as_deref(), &dh) {
+        bail!("usb channel for '{target}' is not on this host");
+    }
+    let cmd = u.cmd.ok_or_else(|| {
+        anyhow!(
+            "no usb cmd configured for '{target}' \
+             (paniolo usb set -t {target} --cmd 'ch9329 -d /dev/...')"
+        )
+    })?;
+    // Deliberately the *hid* daemon's runtime dir, not a usb one. On the
+    // devices this drives, the mux and the HID injector are the same MCU behind
+    // the same serial port, so when `paniolo console` has a hid daemon running
+    // it owns that port. The helper discovers the daemon through this directory
+    // and routes the switch through it; without it, every switch attempted
+    // while the console is up would fail on a busy port.
+    let status = platform::shell_command(&format!("{cmd} usb {verb}"))
+        .env("PATH", daemons::hook_path())
+        .envs(daemons::helper_env(HID_DAEMON, Some(&target)))
+        .status()?;
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
 
 /// Ensure the hid injection daemon is running locally for `target`, returning
 /// its port, or None when the target has no local hid channel. The helper's

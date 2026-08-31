@@ -5,8 +5,11 @@ SPDX-License-Identifier: Apache-2.0
 
 # Openterface KVM-Go — architecture and paniolo support
 
-*Status: **bench-verified 2026-08-24.** Both paniolo channels work with no code
-changes. Sibling of the
+*Status: **bench-verified 2026-08-24; microSD mux driven from software
+2026-08-30.** Both paniolo channels work with no code changes, and the microSD
+mux is now switchable over the existing control port — protocol in
+[openterface-usb-mux-spec.md](openterface-usb-mux-spec.md), bench results in
+"microSD mux switching" below. Sibling of the
 [Mini-KVM deep-control notes](openterface-deep-control.md), which this device
 supersedes in several important ways.*
 
@@ -16,11 +19,20 @@ built-in male video connector (HDMI, DisplayPort, or VGA — this doc covers the
 HDMI variant). Hardware design files are published under CERN-OHL-S v2 at
 [TechxArtisanStudio/Openterface_KVM-GO_Hardware](https://github.com/TechxArtisanStudio/Openterface_KVM-GO_Hardware).
 
-**Source discipline** (unchanged from the Mini-KVM notes): everything below
-comes from the open *hardware* design files, the vendor datasheet, the vendor's
-published documentation, or our own bench probing and USB captures. The
-Openterface host applications were **not** read — they are AGPL, and paniolo
-must not derive its implementation from them.
+**Source discipline** (updated 2026-08-30): everything below comes from the
+open *hardware* design files, the vendor datasheet, the vendor's published
+documentation, or our own bench probing and USB captures — with one deliberate
+exception. The mux protocol in
+[openterface-usb-mux-spec.md](openterface-usb-mux-spec.md) was obtained by a
+**clean-room investigation**: a separate investigator context read the vendor
+host applications and returned facts and mechanism prose only, and paniolo's
+implementation was written from that report rather than from the applications.
+No vendor source, identifier, or code structure crossed into the implementation
+context, and the report was leak-scanned before it did. That is the sanctioned
+route, not a relaxation of the wall — reading those applications directly into
+an implementation context remains forbidden. They are AGPL-3.0, except
+`Openterface_Core`, which carries **no licence at all** and is therefore more
+encumbered, not less.
 
 ## Bottom line for paniolo
 
@@ -28,7 +40,7 @@ must not derive its implementation from them.
 |---|---|---|
 | `video` | `hdmicap` (AVFoundation / UVC) | ✅ works unmodified |
 | `hid` | `ch9329` | ✅ works unmodified |
-| microSD | — | enumerates; mux control not yet driven by paniolo |
+| microSD | `ch9329` | ✅ switchable in software (serial `0x17`), hardware-verified |
 
 Wiring it into a target needs nothing new:
 
@@ -79,20 +91,25 @@ Key parts (from the published BOMs):
 
 ## Differences from the Mini-KVM that matter
 
-1. **No CH340, so no modem-line tricks.** The Mini-KVM's `DTR → SW_GND`
-   (A-port disconnect) and `RTS → HIDRESET` findings — items 2 and 3 in the
-   [deep-control notes](openterface-deep-control.md) — **do not apply here**.
-   DTR/RTS are now a CDC class request (`SET_CONTROL_LINE_STATE`) that the
-   firmware may act on or ignore. The upside: opening the control tty no longer
-   yanks a USB device off the bus, which was the load-bearing constraint on the
-   Mini-KVM.
+1. **No CH340 — but the modem lines still bite.** The Mini-KVM's specific
+   `DTR → SW_GND` (A-port disconnect) and `RTS → HIDRESET` wiring — items 2 and
+   3 in the [deep-control notes](openterface-deep-control.md) — does not exist
+   here. DTR/RTS arrive as a CDC class request (`SET_CONTROL_LINE_STATE`) the
+   firmware is free to act on, and **corrected 2026-08-30: it does act on RTS,
+   which is a hardware reset of the CH32V208** (see "RTS resets the MCU"
+   below). The original upside still holds — opening the control tty does not
+   yank a USB device off the bus, which was the load-bearing constraint on the
+   Mini-KVM — but "no CH340, therefore the lines are inert" was the wrong
+   inference to draw from it.
 
 2. **The USB mux select is on the MCU, not the video chip.** The KM schematic
    labels it plainly: `USB_SW` → FSUSB42 `Sel`, driven by the CH32V208.
    Also `SDPOWER_SW` → SY6280 enable (SD power) and `SD_STATE` ← GL823K
-   activity. On the Mini-KVM the equivalent `Sel` hung off the MS2109 GPIO and
-   was unreachable, which is what dead-ended **OTF-3**. Here it sits behind a
-   serial port paniolo already talks to.
+   activity. On the Mini-KVM the equivalent `Sel` hangs off the MS2109 GPIO,
+   which is what dead-ended **OTF-3** — though that turned out on 2026-08-30 to
+   be reachable after all, by a register write rather than the firmware patch we
+   had assumed (see the correction at the top of the deep-control notes). Here
+   it sits behind a serial port paniolo already talks to.
 
 3. **The switched device is onboard** — a microSD reader rather than an
    external USB-A port. True hands-free virtual media with no stick to plug.
@@ -218,16 +235,69 @@ SuperSpeed link it *will* choose 3840×2160. That has not been shown to cause a
 problem, but it is an accidental default rather than a considered one, and
 worth a deliberate decision before relying on it.
 
+## microSD mux switching (2026-08-30)
+
+One CH9329-family serial command on the existing CDC control port drives the
+mux; frames, reply semantics and the capability gate are in
+[openterface-usb-mux-spec.md](openterface-usb-mux-spec.md). Recorded here is
+what this bench established that a source investigation could not.
+
+**Verified end to end.** Query, switch-to-target and switch-to-host were each
+exercised against our unit with the host side on a Linux box and the target side
+on a Mac. The reply's status byte matched the requested position every time, and
+the media genuinely moved: a nonce file written on one side read back
+byte-identical on the other, filesystem intact. A reply alone proves nothing —
+it reports the resulting position, so an ignored request still yields a
+well-formed frame stating the old one.
+
+**RTS resets the MCU — deassert it explicitly on open.** This is the correction
+that matters most, because the assumption in the original architecture notes was
+that with no CH340 on this board the modem lines would be inert. They are not:
+RTS is a hardware reset of the CH32V208. Many serial stacks assert RTS and DTR
+at open by default. Brief assertion appeared harmless across roughly a dozen
+opens here — every `GET_INFO` answered normally — but that is an observation,
+not a guarantee, and the vendor's own reset path holds RTS for four seconds.
+
+**The mux resets to the host side on power loss.** Observed directly: after the
+unit was unplugged and re-cabled, a card that had been switched to the target
+came back host-side. Nothing persists the position, so `state` must be read, never
+assumed from the last `attach-*` issued.
+
+**The physical button flips the mux in firmware**, with no host software running
+anywhere — proven before any command was known. This is the opposite of the
+Mini-KVM's slide switch, which is only *monitored*. It means the MCU already
+owns the flip path and the serial command merely triggers it.
+
+**A flip does not disturb the control channel.** `ch9329 info` answered normally
+with `target_connected=true` immediately after switching, and the receiving side
+enumerated the reader cleanly with nothing in `dmesg`. None of the
+re-enumeration storms the Mini-KVM showed under VM passthrough appeared here.
+
+**There is no card-presence state to read.** `GET_INFO` was byte-identical
+across ~120 s spanning both mux positions, and the investigation confirms why:
+no card-presence, "no card", or transfer-active state exists anywhere in the
+protocol, over either transport. The LED must drive those from firmware-local
+`SD_STATE`. Do not look for a query that does not exist.
+
+**macOS will not release the card on request.** `diskutil unmount` failed
+reproducibly, dissented by Spotlight (`mds` / `mds_stores`) indexing the freshly
+formatted volume. Both test flips therefore happened with the volume still
+mounted, and the exFAT filesystem survived intact — helped by the reader
+reporting `Write cache: disabled`. Surviving twice is not a guarantee: a macOS
+unmount path needs `diskutil unmount force`, or a Spotlight exclusion.
+
 ## Not yet done
 
-- [ ] Drive the microSD mux from paniolo (`USB_SW` via the CH32V208). This is
-      the Mini-KVM's blocked OTF-3 made reachable — the command is not in the
-      vendor's public documentation, so it needs USB capture of the app
-      toggling the switch, not a source read.
+- [x] Drive the microSD mux from paniolo (`USB_SW` via the CH32V208) — **done
+      2026-08-30**, and it needed no USB capture. A clean-room investigation of
+      the vendor applications produced the command directly; see
+      [openterface-usb-mux-spec.md](openterface-usb-mux-spec.md).
 - [ ] Decide `hdmicap` format-selection policy (see "4K is experimental").
 - [ ] Decide whether the no-signal stall should exit or become a reported
       state.
 - [ ] Read the DS18B20 temperature sensor and RGB LED, if the MCU exposes them.
 - [ ] Characterise the BLE interface (vendor lists a future iPadOS app).
-- [ ] Confirm whether `SET_CONTROL_LINE_STATE` (DTR/RTS) has any hardware
-      effect on this design, as it did on the Mini-KVM.
+- [x] Confirm whether `SET_CONTROL_LINE_STATE` (DTR/RTS) has any hardware
+      effect on this design, as it did on the Mini-KVM — **it does, and RTS is
+      the dangerous one.** See "RTS resets the MCU" below. DTR's effect here is
+      still unverified.

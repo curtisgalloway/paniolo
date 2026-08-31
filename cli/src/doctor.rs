@@ -313,7 +313,7 @@ fn check_channel(lab: &Lab, ch: &ResolvedChannel, rt: &ResolvedTarget) -> (Statu
                 (Status::Ok, configured.join(","))
             }
         }
-        ChannelKind::Hid => match field(ch, "cmd") {
+        ChannelKind::Hid | ChannelKind::Usb => match field(ch, "cmd") {
             None => (Status::Incomplete, "no cmd set".to_string()),
             // Like the power hooks: absolute-path helpers are probed for
             // existence; bare names are probed under libexec-then-PATH.
