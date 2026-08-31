@@ -84,6 +84,7 @@ paniolo serial add console -t <name> --device <path> [--baud 115200] [--sense ct
 paniolo power set -t <name> [--cycle-cmd C] [--on-cmd C] [--off-cmd C] [--state-cmd C] [--serial-interface console]
 paniolo video set -t <name> --device "<capture id or name>"
 paniolo hid set -t <name> --cmd "hidrig -d <uart>"   # USB HID injection helper
+paniolo usb set -t <name> --cmd "ch9329 -d <uart>"   # switchable USB media (KVM-Go microSD)
 paniolo adb set -t <name> [--serial <adb-id>] [--adb <path>]  # an Android DUT over adb
 ```
 
@@ -102,7 +103,8 @@ channel to a remote control host (see the lab section below).
   `config edit` opens it) / `paniolo target list` / `paniolo target show
   <name>`; `paniolo target set <name>` updates its `--host`/`--description`.
 - Remove: `paniolo target rm <name>`, or per channel (`netboot rm`,
-  `serial rm <iface> -t <name>`, `power rm`, `video rm`, `hid rm`, `adb rm`).
+  `serial rm <iface> -t <name>`, `power rm`, `video rm`, `hid rm`, `usb rm`,
+  `adb rm`).
 - Rename: `paniolo target rename <old> <new>` carries all channels (and your
   lab-file comments) to the new name. Config-only — running daemons keep the
   old name, so `stop` and re-`watch`/`serve` them under the new one.
@@ -434,6 +436,41 @@ for one there before composing the fetch by hand. Without the variable the
 hook fails with a message saying exactly this. See "Setting up the
 credential source" in `docs/power.md` for the patterns and the placement
 rule (the variable must exist on the host that owns the power channel).
+
+## Switchable USB media — hand a card between host and target
+
+Some KVM devices route one physical USB device to either side, never both.
+The `usb` channel drives that mux; today only the **Openterface KVM-Go**'s
+onboard microSD is supported, through the same `ch9329` helper and the same
+serial port as its `hid` channel (setting both channels to the same `--cmd`
+is normal).
+
+```
+paniolo usb state         -t <name>   # -> host | target
+paniolo usb attach-host   -t <name>   # route the card to the control host
+paniolo usb attach-target -t <name>   # hand it to the target
+```
+
+The use case is hands-free *physical* boot media: image the card host-side,
+attach it to the target, and firmware sees a real mass-storage device — which
+it generally will not for streamed virtual media.
+
+Four rules, all of which will bite you otherwise:
+
+- **Unmount before switching.** The switch physically detaches the device from
+  whichever side has it; a mounted filesystem there is a surprise removal.
+  paniolo cannot see mount state and will not stop you. On macOS use
+  `diskutil unmount force` — plain `unmount` usually loses to Spotlight.
+- **Exit 0 means the mux moved, not that the media is ready.** The USB device
+  still has to enumerate on the receiving side, which takes seconds. Poll for
+  the block device.
+- **Always `usb state`; never assume.** The position resets to the host side
+  when the KVM loses power, and a physical button can move it too.
+- **A device with no mux does not answer at all** — there is no "unsupported"
+  reply in the protocol — so it surfaces as a timeout, which the helper
+  reports as unsupported rather than broken.
+
+Full guide: `docs/usb.md`. Protocol: `notes/openterface-usb-mux-spec.md`.
 
 ## HID injection — type and click into the target
 

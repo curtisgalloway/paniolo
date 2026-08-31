@@ -155,6 +155,16 @@ enum Cmd {
     /// Unlike the protocol's
     /// transient `baud`, this is stored in flash and survives a power-cycle.
     Baud { rate: u32 },
+    /// Switch or query the Openterface USB mux, which shares one onboard
+    /// microSD reader between the host and the target (never both at once).
+    /// Present on the KVM-Go; a real CH9329 does not implement it and answers
+    /// with silence, which surfaces here as a timeout meaning "unsupported".
+    Usb {
+        /// `host` and `target` drive the mux and verify it landed there;
+        /// `state` reports the current side without changing it.
+        #[arg(value_parser = ["host", "target", "state"])]
+        action: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -207,6 +217,10 @@ fn main() -> Result<()> {
         Cmd::Run { file, delay_ms } => cmd_run(&mut tx, &file, delay_ms),
         Cmd::Baud { rate } => {
             println!("{}", tx.run_line(&format!("baud {rate}"))?);
+            Ok(())
+        }
+        Cmd::Usb { action } => {
+            println!("{}", tx.run_line(&format!("usb {action}"))?);
             Ok(())
         }
         Cmd::Serve { .. } | Cmd::Stop => unreachable!("handled above"),

@@ -76,6 +76,7 @@ nav:
       - Video + OCR: video.md
       - Dashboard: dashboard.md
       - HID injection: hid.md
+      - Switchable USB media: usb.md
       - adb (Android targets): adb.md
   - Distributed control: distributed-control.md
   - Developer docs:

@@ -195,6 +195,18 @@ pub struct HidChannel {
 /// `adb -s <serial>` id (omit for the sole attached device); `adb` overrides
 /// the binary. Like SSH this is a generic transport, not a device-specific
 /// helper, so `paniolo adb …` shells out to it directly on the bound host.
+/// A shared USB device that a KVM can route to either side — the Openterface
+/// KVM-Go's onboard microSD reader, or the Mini-KVM's switchable USB-A port.
+/// Like `hid`, the device-specific tool lives outside paniolo in an opaque
+/// helper command; unlike `hid send`, paniolo appends a *fixed* verb rather
+/// than passing arguments through, so a remote host only ever sees
+/// `usb host`, `usb target`, or `usb state`.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct UsbChannel {
+    pub cmd: Option<String>,
+    pub host: Option<String>,
+}
+
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct AdbChannel {
     pub serial: Option<String>,
@@ -216,6 +228,7 @@ pub struct Target {
     pub power: Option<PowerChannel>,
     pub video: Option<VideoChannel>,
     pub hid: Option<HidChannel>,
+    pub usb: Option<UsbChannel>,
     pub adb: Option<AdbChannel>,
 }
 
@@ -242,6 +255,7 @@ pub enum ChannelKind {
     Power,
     Video,
     Hid,
+    Usb,
     Adb,
 }
 
@@ -253,6 +267,7 @@ impl ChannelKind {
             ChannelKind::Power => "power",
             ChannelKind::Video => "video",
             ChannelKind::Hid => "hid",
+            ChannelKind::Usb => "usb",
             ChannelKind::Adb => "adb",
         }
     }
@@ -372,6 +387,16 @@ impl Lab {
                 kind: ChannelKind::Hid,
                 name: "hid".into(),
                 host: host_of(&h.host),
+                fields: f,
+            });
+        }
+        if let Some(u) = &t.usb {
+            let mut f = Vec::new();
+            push_opt(&mut f, "cmd", &u.cmd);
+            channels.push(ResolvedChannel {
+                kind: ChannelKind::Usb,
+                name: "usb".into(),
+                host: host_of(&u.host),
                 fields: f,
             });
         }

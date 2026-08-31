@@ -23,6 +23,7 @@ on Debian/Raspberry Pi OS the quickest route is the [apt repository](https://cur
 | [Power](power.md) | `paniolo power on/off`, `power-cycle`, `power-state`, `serial dtr/reset` | DTR power-button wiring (J2; opt-in per serial interface) and generic shell-command hooks; `cambrionix` hub, `zigplug` Zigbee smart-plug, `shellyplug` Shelly Gen2+ plug/relay (local HTTP RPC), and `amt` Intel AMT/vPro (WS-Man, with true power-state readback) helpers. |
 | [Video](video.md) | `paniolo video` | `hdmicap` warm-stream HDMI capture + on-device OCR. |
 | [Dashboard](dashboard.md) | `paniolo console` | Combined video + serial web UI. |
+| [Switchable USB media](usb.md) | `paniolo usb` | Route a shared USB device — an Openterface KVM-Go's onboard microSD card — to the control host or the target, for hands-free physical boot media that firmware can see. |
 | [HID injection](hid.md) | `paniolo hid` | USB keyboard/mouse injection via a generic helper hook; `hidrig` KB2040 injector and `ch9329` CH9329 bridge (Openterface Mini-KVM / KVM-Go, Sipeed NanoKVM-USB); KVM input from the web console. |
 | [adb (Android targets)](adb.md) | `paniolo adb` | Drive an Android DUT over adb — console (`adb shell`/`run`), screen (`screencap`), and input (`adb input`); one transport, no capture/HID/serial rig. |
 
