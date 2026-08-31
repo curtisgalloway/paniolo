@@ -89,9 +89,11 @@ rather than sleeping a fixed interval and sending once:
 for i in $(seq 120); do paniolo serial send winvm " "; sleep 1; done
 ```
 
-Input stops working once the guest OS takes over the input stack — a Windows
-guest stops reading UEFI ConIn when WinPE starts. Serial is an input path for
-firmware and the bootloader, not for a booted OS.
+**The input window closes earlier than you'd expect.** It is firmware only —
+bootloader menus, the UEFI Shell, boot prompts. On a Windows guest UEFI ConIn
+stops being read the moment WinPE starts, so the window shuts before Windows
+Setup runs, let alone before anything you would call the OS. Do not plan on
+typing into a guest past its bootloader.
 
 **Re-point the interface after a VM restart**, since the pty number is reassigned:
 

@@ -281,8 +281,8 @@ guest's firmware or unattended installer before SSH exists. `--baud` is recorded
 but not applied — a pty has no line rate. Both `watch` and `connect` work
 against it. The pty is bidirectional and firmware reads it as console input, so
 `serial send` answers a bootloader prompt headlessly (loop it — boot timing
-varies by tens of seconds); that stops once the guest OS takes over the input
-stack. The pty number is reassigned on each VM boot, so re-point the interface
+varies by tens of seconds). That window is firmware-only and shuts early: on a
+Windows guest ConIn stops being read when WinPE starts, before Setup runs. The pty number is reassigned on each VM boot, so re-point the interface
 after a restart.
 
 ### Reading captured output
