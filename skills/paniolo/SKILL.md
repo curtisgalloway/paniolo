@@ -278,9 +278,12 @@ start one, or `stop`/close the other first.
 `/dev/pts/N` on Linux — `utmctl attach <vm>` prints it, qemu's `-serial pty`
 reports it at startup) can be added like any device, which is how you watch a
 guest's firmware or unattended installer before SSH exists. `--baud` is recorded
-but not applied — a pty has no line rate. Use `serial watch`, not
-`serial connect`: `tio` opens a pty and immediately disconnects. The pty number
-is reassigned on each VM boot, so re-point the interface after a restart.
+but not applied — a pty has no line rate. Both `watch` and `connect` work
+against it. The pty is bidirectional and firmware reads it as console input, so
+`serial send` answers a bootloader prompt headlessly (loop it — boot timing
+varies by tens of seconds). That window is firmware-only and shuts early: on a
+Windows guest ConIn stops being read when WinPE starts, before Setup runs. The pty number is reassigned on each VM boot, so re-point the interface
+after a restart.
 
 ### Reading captured output
 
