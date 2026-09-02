@@ -16,9 +16,9 @@
 //!
 //! Subcommands:
 //!   state [port]         Print a table of all ports, or `on`/`off` for one port.
-//!   on <port>            Set a port to charge mode (mode c).
-//!   off <port>           Set a port off (mode o).
-//!   cycle <port>         Power-cycle a port: off → delay → restore → confirm.
+//!   on <port>            Set a port to charge mode (mode c) and confirm by read-back.
+//!   off <port>           Set a port off (mode o) and confirm by read-back.
+//!   cycle <port>         Power-cycle a port: off → confirm → delay → restore → confirm.
 
 mod proto;
 
@@ -28,7 +28,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 
-use proto::{open_port, parse_state, run_command, PortRow};
+use proto::{mode_confirms, open_port, parse_state, run_command, PortRow};
 
 #[derive(Parser)]
 #[command(
@@ -50,25 +50,27 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Print port state. Without <port>, prints a table of all ports.
-    /// With <port>, prints exactly `on` or `off` (machine-readable).
+    /// With <port>, prints exactly `on` or `off` (machine-readable); a mode
+    /// letter this helper does not know is an error, not a guess.
     State {
         /// Port number to query (1–15). Omit to print the full table.
         #[arg(value_parser = clap::value_parser!(u8).range(1..=15))]
         port: Option<u8>,
     },
-    /// Set a port to charge mode (mode c <port>).
+    /// Set a port to charge mode (mode c <port>) and confirm by read-back.
     On {
         /// Port number (1–15).
         #[arg(value_parser = clap::value_parser!(u8).range(1..=15))]
         port: u8,
     },
-    /// Set a port off (mode o <port>).
+    /// Set a port off (mode o <port>) and confirm by read-back.
     Off {
         /// Port number (1–15).
         #[arg(value_parser = clap::value_parser!(u8).range(1..=15))]
         port: u8,
     },
-    /// Power-cycle a port: turn it off, wait, then restore its previous mode.
+    /// Power-cycle a port: turn it off (confirmed), wait, then restore its
+    /// previous mode (confirmed).
     Cycle {
         /// Port number (1–15).
         #[arg(value_parser = clap::value_parser!(u8).range(1..=15))]
@@ -119,6 +121,28 @@ fn find_port(rows: &[PortRow], port_num: u8) -> Result<&PortRow> {
         .ok_or_else(|| anyhow!("port {port_num} not found in hub response"))
 }
 
+/// Re-read the port table and require `port_num` to report a mode that
+/// confirms the commanded transition (see [`mode_confirms`]). The hub
+/// accepts a `mode` command without any acknowledgement, so this read-back
+/// is the only evidence the transition happened.
+fn confirm_port(
+    port: &mut Box<dyn serialport::SerialPort>,
+    port_num: u8,
+    want_on: bool,
+) -> Result<PortRow> {
+    let rows = fetch_state(port)?;
+    let row = find_port(&rows, port_num)?;
+    if mode_confirms(row.mode, want_on) {
+        Ok(row.clone())
+    } else {
+        Err(anyhow!(
+            "port {port_num}: commanded {} but the hub reports mode {}",
+            if want_on { "on" } else { "off" },
+            row.mode
+        ))
+    }
+}
+
 fn cmd_state(device: &str, port_filter: Option<u8>) -> Result<()> {
     let mut port = connect(device)?;
     let rows = fetch_state(&mut port)?;
@@ -149,7 +173,7 @@ fn cmd_state(device: &str, port_filter: Option<u8>) -> Result<()> {
         }
         Some(p) => {
             let r = find_port(&rows, p)?;
-            if r.is_on() {
+            if r.is_on()? {
                 println!("on");
             } else {
                 println!("off");
@@ -163,7 +187,8 @@ fn cmd_on(device: &str, port_num: u8) -> Result<()> {
     let mut port = connect(device)?;
     flush_input(&mut port);
     run_command(&mut port, &format!("mode c {port_num}"))?;
-    println!("port {port_num}: charge mode enabled");
+    let row = confirm_port(&mut port, port_num, true)?;
+    println!("port {port_num}: on (mode {})", row.mode);
     Ok(())
 }
 
@@ -171,6 +196,7 @@ fn cmd_off(device: &str, port_num: u8) -> Result<()> {
     let mut port = connect(device)?;
     flush_input(&mut port);
     run_command(&mut port, &format!("mode o {port_num}"))?;
+    confirm_port(&mut port, port_num, false)?;
     println!("port {port_num}: off");
     Ok(())
 }
@@ -180,12 +206,12 @@ fn cmd_cycle(device: &str, port_num: u8, delay_ms: u64) -> Result<()> {
 
     // Read the current mode so we can restore it afterwards.
     let rows = fetch_state(&mut port)?;
-    let row = find_port(&rows, port_num)?;
-    let prev_mode = row.mode;
+    let prev_mode = find_port(&rows, port_num)?.mode;
 
-    // Turn the port off.
+    // Turn the port off and make sure it actually went off before holding.
     flush_input(&mut port);
     run_command(&mut port, &format!("mode o {port_num}"))?;
+    confirm_port(&mut port, port_num, false)?;
 
     thread::sleep(Duration::from_millis(delay_ms));
 
@@ -199,18 +225,10 @@ fn cmd_cycle(device: &str, port_num: u8, delay_ms: u64) -> Result<()> {
     run_command(&mut port, &restore_cmd)?;
 
     // Confirm the port is back on.
-    let rows_after = fetch_state(&mut port)?;
-    let after = find_port(&rows_after, port_num)?;
-    if after.is_on() {
-        println!(
-            "port {port_num}: cycled (was mode {prev_mode}, restored to mode {}, now on)",
-            after.mode
-        );
-    } else {
-        return Err(anyhow!(
-            "port {port_num}: cycled but port reports mode {} (off) after restore",
-            after.mode
-        ));
-    }
+    let after = confirm_port(&mut port, port_num, true)?;
+    println!(
+        "port {port_num}: cycled (was mode {prev_mode}, restored to mode {}, now on)",
+        after.mode
+    );
     Ok(())
 }

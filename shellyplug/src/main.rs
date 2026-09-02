@@ -19,7 +19,7 @@
 //! paniolo helper conventions (docs/adding-power-helpers.md):
 //!   state <id>    prints exactly `on` or `off`
 //!   on/off <id>   switch + read-back confirm
-//!   cycle <id>    off → delay → on → confirm
+//!   cycle <id>    off → confirm → delay → on → confirm
 
 mod rpc;
 
@@ -94,7 +94,7 @@ enum Cmd {
         #[arg(default_value_t = 0)]
         id: u32,
     },
-    /// Power-cycle: off → delay → on → confirm (hook: cycle_cmd).
+    /// Power-cycle: off → confirm → delay → on → confirm (hook: cycle_cmd).
     Cycle {
         /// Switch component id (default 0).
         #[arg(default_value_t = 0)]
@@ -135,16 +135,36 @@ fn onoff(on: bool) -> &'static str {
     }
 }
 
+/// The two operations the hook sequencing needs from a device: command the
+/// relay, and read its state back. Abstracted so the on/off/cycle logic can
+/// be exercised against a fake, which is the only way to prove the
+/// confirmation steps actually run without a plug on the bench.
+trait Switch {
+    fn set(&self, id: u32, on: bool) -> Result<()>;
+    fn is_on(&self, id: u32) -> Result<bool>;
+}
+
+impl Switch for Client {
+    fn set(&self, id: u32, on: bool) -> Result<()> {
+        self.switch_set(id, on)
+    }
+
+    fn is_on(&self, id: u32) -> Result<bool> {
+        Ok(self.switch_status(id)?.output)
+    }
+}
+
 fn cmd_state(client: &Client, id: u32) -> Result<()> {
     let st = client.switch_status(id)?;
     println!("{}", onoff(st.output));
     Ok(())
 }
 
-fn cmd_switch(client: &Client, id: u32, on: bool) -> Result<()> {
-    client.switch_set(id, on)?;
+/// Command the relay and confirm by read-back, failing on a mismatch.
+fn set_confirmed(sw: &impl Switch, id: u32, on: bool) -> Result<()> {
+    sw.set(id, on)?;
     thread::sleep(SETTLE);
-    let now = client.switch_status(id)?.output;
+    let now = sw.is_on(id)?;
     if now != on {
         bail!(
             "switch {id}: commanded {} but device reports {}",
@@ -152,18 +172,23 @@ fn cmd_switch(client: &Client, id: u32, on: bool) -> Result<()> {
             onoff(now)
         );
     }
-    println!("switch {id}: {}", onoff(now));
     Ok(())
 }
 
-fn cmd_cycle(client: &Client, id: u32, delay_ms: u64) -> Result<()> {
-    client.switch_set(id, false)?;
+fn cmd_switch(sw: &impl Switch, id: u32, on: bool) -> Result<()> {
+    set_confirmed(sw, id, on)?;
+    println!("switch {id}: {}", onoff(on));
+    Ok(())
+}
+
+/// off → confirm → delay → on → confirm. The off phase is confirmed before
+/// the hold starts: a relay that ignored the off command would otherwise
+/// produce a "cycle" that never removed power, with the final read-back
+/// happily reporting on.
+fn cmd_cycle(sw: &impl Switch, id: u32, delay_ms: u64) -> Result<()> {
+    set_confirmed(sw, id, false).map_err(|e| anyhow!("{e} (cycle aborted before the off-hold)"))?;
     thread::sleep(Duration::from_millis(delay_ms));
-    client.switch_set(id, true)?;
-    thread::sleep(SETTLE);
-    if !client.switch_status(id)?.output {
-        bail!("switch {id}: cycled but device reports off after restore");
-    }
+    set_confirmed(sw, id, true).map_err(|e| anyhow!("{e} (after the off-hold)"))?;
     println!("switch {id}: cycled ({delay_ms} ms off)");
     Ok(())
 }
@@ -203,4 +228,98 @@ fn cmd_status(client: &Client, id: u32) -> Result<()> {
         println!("  energy   {e:.1} Wh total");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    /// A relay that records every call and can be told to ignore commands,
+    /// standing in for a plug whose `Switch.Set` returned OK without acting.
+    struct Fake {
+        on: Cell<bool>,
+        ignore_off: bool,
+        ignore_on: bool,
+        log: RefCell<Vec<String>>,
+    }
+
+    impl Fake {
+        fn new(on: bool) -> Self {
+            Fake {
+                on: Cell::new(on),
+                ignore_off: false,
+                ignore_on: false,
+                log: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Switch for Fake {
+        fn set(&self, id: u32, on: bool) -> Result<()> {
+            self.log
+                .borrow_mut()
+                .push(format!("set {id} {}", onoff(on)));
+            let ignored = if on { self.ignore_on } else { self.ignore_off };
+            if !ignored {
+                self.on.set(on);
+            }
+            Ok(())
+        }
+
+        fn is_on(&self, id: u32) -> Result<bool> {
+            self.log.borrow_mut().push(format!("status {id}"));
+            Ok(self.on.get())
+        }
+    }
+
+    #[test]
+    fn cycle_confirms_off_then_on() {
+        let plug = Fake::new(true);
+        cmd_cycle(&plug, 0, 0).unwrap();
+        assert!(plug.on.get());
+        assert_eq!(
+            *plug.log.borrow(),
+            ["set 0 off", "status 0", "set 0 on", "status 0"]
+        );
+    }
+
+    #[test]
+    fn cycle_aborts_before_the_hold_when_off_did_not_take() {
+        let plug = Fake {
+            ignore_off: true,
+            ..Fake::new(true)
+        };
+        let err = cmd_cycle(&plug, 3, 0).expect_err("a relay stuck on must fail the cycle");
+        assert!(err.to_string().contains("commanded off"), "{err}");
+        // It must stop right there: no power-on was ever sent.
+        assert_eq!(*plug.log.borrow(), ["set 3 off", "status 3"]);
+    }
+
+    #[test]
+    fn cycle_fails_when_on_did_not_take() {
+        let plug = Fake {
+            ignore_on: true,
+            ..Fake::new(true)
+        };
+        let err = cmd_cycle(&plug, 0, 0).expect_err("a relay stuck off must fail the cycle");
+        assert!(err.to_string().contains("commanded on"), "{err}");
+        assert!(!plug.on.get());
+    }
+
+    #[test]
+    fn on_and_off_confirm_by_read_back() {
+        let plug = Fake::new(false);
+        cmd_switch(&plug, 1, true).unwrap();
+        assert!(plug.on.get());
+        cmd_switch(&plug, 1, false).unwrap();
+        assert!(!plug.on.get());
+
+        let stuck = Fake {
+            ignore_on: true,
+            ..Fake::new(false)
+        };
+        let err = cmd_switch(&stuck, 1, true).unwrap_err();
+        assert!(err.to_string().contains("device reports off"), "{err}");
+    }
 }

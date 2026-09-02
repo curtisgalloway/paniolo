@@ -51,16 +51,21 @@ amt -d <host> status                # firmware identity + power state detail
 amt -d <host> state                 # prints exactly "on" or "off"
 amt -d <host> on                    # power on, confirm by read-back
 amt -d <host> off                   # power off (hard, not a graceful shutdown)
-amt -d <host> cycle [--delay-ms 3000]   # off → delay → on → confirm
+amt -d <host> cycle [--delay-ms 3000]   # off → confirm → delay → on → confirm
 ```
 
-`state` prints `on` only when the host is running (PowerState 2); sleep,
-hibernate, and soft-off all print `off`. `off` is the CIM "Off - Soft"
-unconditional power-off — equivalent to holding the power button, not an OS
-shutdown. `cycle` is built as off → delay → on (rather than the fixed CIM
-power-cycle state) so the off-hold duration is controllable and matches the
-other paniolo power helpers' `--delay-ms` semantics; all three mutating
-commands confirm by read-back and exit non-zero if the machine did not comply.
+`<host>` is a hostname, IPv4 address, or bracketed IPv6 literal (`[fe80::1]`),
+optionally with a `:port` (default 16992); anything else URL-shaped is
+rejected. `state` prints `on` only when the host is running (PowerState 2);
+sleep, hibernate, and soft-off all print `off`, and any other reported state
+is an error rather than a guess. `off` is the CIM "Off - Soft" unconditional
+power-off — equivalent to holding the power button, not an OS shutdown.
+`cycle` is built as off → confirm → delay → on → confirm (rather than the
+fixed CIM power-cycle state) so the off-hold duration is controllable and
+matches the other paniolo power helpers' `--delay-ms` semantics; it holds off
+any host not already soft-off, so a sleeping or hibernating machine cold-boots
+instead of resuming. All three mutating commands confirm by read-back and exit
+non-zero if the machine did not comply.
 
 ## paniolo integration
 
