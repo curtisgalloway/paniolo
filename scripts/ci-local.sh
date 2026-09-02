@@ -23,7 +23,10 @@
 #   bash scripts/ci-local.sh
 #
 # It mirrors every Linux crate job in ci.yml; scripts/ci-coverage-check.sh
-# enforces that the two stay in sync.
+# enforces that the two stay in sync. The lint jobs (shellcheck, zigplug,
+# evals-check, actions-pinned) are deliberately not mirrored: none needs a
+# Linux box, so run them on the host -- "Before opening a PR" in AGENTS.md
+# has the one-line command for each.
 #
 # It installs the toolchain if missing (rustup + uv + apt build deps) and copies
 # the working tree to a VM-local dir before building, so nothing is written to a

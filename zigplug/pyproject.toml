@@ -26,6 +26,7 @@ build-backend = "setuptools.build_meta"
 
 [dependency-groups]
 dev = [
+    "pyink>=26.5.1",
     "pytest>=9.0.3",
 ]
 

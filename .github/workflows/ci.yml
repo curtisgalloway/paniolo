@@ -51,6 +51,68 @@ jobs:
       - name: Check every action reference is a commit SHA
         run: bash scripts/ci-actions-pinned.sh
 
+  shellcheck:
+    # Every tracked shell script, at shellcheck's default (info) severity. A
+    # finding that is intended carries a `# shellcheck disable=` directive
+    # with its reason on the comment line above.
+    name: shellcheck (every tracked *.sh)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - name: shellcheck
+        run: |
+          shellcheck --version
+          git ls-files -z '*.sh' | xargs -0 shellcheck
+
+  zigplug:
+    # The Python power helper: a locked install, Google-style formatting at
+    # 88 columns (pyink, configured in pyproject.toml), a byte-compile of the
+    # package, and pytest once zigplug/tests exists.
+    name: zigplug (pyink, compileall, pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: zigplug
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+      - name: Sync from the lockfile
+        run: uv sync --frozen
+      - name: Format check
+        run: uv run pyink --check --diff .
+      - name: Byte-compile
+        run: uv run python -m compileall -q src
+      - name: Test
+        run: |
+          if [ -d tests ]; then
+            uv run pytest -q tests
+          else
+            echo "zigplug/tests does not exist yet; nothing to run."
+          fi
+
+  evals-check:
+    # evals/scenarios/*.toml assert the CLI surface; run.py --check re-walks
+    # the live `paniolo --help` tree and fails when a scenario references a
+    # command or flag that no longer exists. It needs a real binary, so this
+    # job builds cli (debug, cached) rather than trusting a stale dump.
+    name: evals check (scenario references vs live CLI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: cli
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Build paniolo
+        run: cargo build --manifest-path cli/Cargo.toml
+      - name: Drift check
+        run: PATH="$PWD/cli/target/debug:$PATH" python3 evals/run.py --check
+
   serialcap:
     name: serialcap (fmt, clippy, test)
     runs-on: ubuntu-latest
