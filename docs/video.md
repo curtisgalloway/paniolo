@@ -59,8 +59,18 @@ paniolo video stop  [target-machine]   # stop it (on the target's host)
 paniolo video show  [target-machine]   # show daemon URL and status
 ```
 
-`watch` starts `hdmicap daemon` detached and polls for startup. The daemon URL
-is printed — open it in a browser for the live preview.
+`watch` starts `hdmicap daemon` detached and polls for startup. The dashboard
+URL is printed — open exactly that URL in a browser for the live preview: it
+carries the daemon's `?token=`, and the daemon answers nothing without it.
+
+**Every request to the daemon needs its token.** hdmicap generates a fresh one
+each start and publishes it as `token` in its discovery file (see *Runtime
+paths*), readable by the operator's uid only. paniolo's own commands (`shot`,
+`read`, `console`, …) send it automatically; by hand, send it as
+`Authorization: Bearer <token>` or `?token=<token>`. The daemon also requires a
+loopback `Host` and `Origin`, so a web page open in your browser cannot reach
+it. A daemon started by a paniolo older than the token has none;
+`paniolo daemons restart --stale` replaces it.
 
 After an upgrade or rebuild, a daemon still running the old binary is flagged
 **stale** by `paniolo video show` and `paniolo daemons`; `watch` auto-restarts a
@@ -98,9 +108,16 @@ paniolo video read [target-machine]            # OCR the current frame, text to 
 paniolo video read --stable [--timeout <ms>]   # wait for a steady frame first
 ```
 
-`read` wraps the running daemon's `GET /ocr` endpoint (also reachable directly
-— `curl -s "$(paniolo video preview)/ocr"` — and via the OCR button on the
-[web dashboard](dashboard.md)).
+`read` wraps the running daemon's `GET /ocr` endpoint (also reachable via the
+OCR button on the [web dashboard](dashboard.md), or directly with the token
+from the discovery file:
+
+```bash
+d=/tmp/paniolo-$(id -u)/hdmicap/target-machine/daemon.json
+curl -s -H "Authorization: Bearer $(jq -r .token "$d")" \
+    "http://127.0.0.1:$(jq -r .port "$d")/ocr"
+```
+).
 
 **Two things `signal` used to get wrong**, both fixed and both worth knowing
 about if you read older captures. A *mostly black* screen — which is what every
@@ -146,7 +163,7 @@ platforms) and shells out to it per request.
 | Purpose | Path |
 |---|---|
 | Video config | the target's `video` channel in the lab file (`~/.config/paniolo/lab.toml`) |
-| hdmicap discovery | `/tmp/paniolo-<uid>/hdmicap/<target>/daemon.json` (`{pid, port}`) |
+| hdmicap discovery | `/tmp/paniolo-<uid>/hdmicap/<target>/daemon.json` (`{pid, port, token}`; owner-only, it holds the token) |
 | hdmicap advisory lock | `/tmp/paniolo-<uid>/hdmicap/<target>/daemon.lock` |
 | hdmicap stderr log | `/tmp/paniolo-<uid>/hdmicap/<target>/daemon.log` (truncated on each start; shown on start timeout) |
 

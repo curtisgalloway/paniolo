@@ -2040,9 +2040,9 @@ fn cmd_serial_dtr(
     }
     let serials = local_serials(&lab, &target)?;
     let ch = pick_serial(&serials, Some(&iface))?;
-    if let Some(url) = serial::daemon_url(&target) {
+    if let Some(daemon) = serial::daemon(&target) {
         eprintln!("{label} on '{target}' ({ms} ms via serialcap daemon)");
-        power::dtr_press_daemon(&url, &ch.name, ms)?;
+        power::dtr_press_daemon(&daemon, &ch.name, ms)?;
     } else {
         eprintln!("{label} on '{target}' ({ms} ms via {} directly)", ch.device);
         power::dtr_press_direct(&ch.device, ms)?;
@@ -2143,37 +2143,54 @@ fn dtr_opt_in_hint(target: &str, t: &model::Target, iface: Option<&str>) -> Stri
 
 // ── console (composite: video + serial dashboard) ───────────────────────────
 
-/// Daemon endpoints the dashboard needs, as URL query parameters. Each daemon
-/// passes either a cross-port `*ws` URL (the remote/tunnel path) or a bare
-/// `port` (the local same-host path); the page builds the WebSocket URL.
+/// The other daemons the dashboard connects to, as URL query parameters. Each
+/// is a complete cross-port WebSocket URL with that daemon's own token inside
+/// (`daemons::Endpoint::ws_url`) — the local and the remote/tunnel paths look
+/// the same to the page.
 #[derive(Default)]
 struct DashboardLinks<'a> {
     serial_ws: Option<&'a str>,
-    serial_port: Option<u16>,
     interface: Option<&'a str>,
     hid_ws: Option<&'a str>,
-    hid_port: Option<u16>,
 }
 
-fn dashboard_url(video_base: &str, links: &DashboardLinks) -> String {
+/// Percent-encode a query-parameter value: everything but RFC 3986's
+/// unreserved characters. A nested URL (`?serialws=ws://…/stream?token=…`)
+/// has to survive as one value; the page decodes it with `URLSearchParams`.
+fn query_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// The dashboard URL: the video daemon's `GET /`, its token as `?token=` (the
+/// page reads it back and puts it on every request it makes), plus the links.
+fn dashboard_url(video: &daemons::Endpoint, links: &DashboardLinks) -> String {
     let mut params: Vec<String> = Vec::new();
+    if let Some(t) = &video.token {
+        params.push(format!("token={}", query_escape(t)));
+    }
     if let Some(ws) = links.serial_ws {
-        params.push(format!("serialws={ws}"));
-    } else if let Some(port) = links.serial_port {
-        params.push(format!("serial={port}"));
+        params.push(format!("serialws={}", query_escape(ws)));
     }
     if let Some(i) = links.interface {
-        params.push(format!("interface={i}"));
+        params.push(format!("interface={}", query_escape(i)));
     }
     if let Some(ws) = links.hid_ws {
-        params.push(format!("hidws={ws}"));
-    } else if let Some(port) = links.hid_port {
-        params.push(format!("hid={port}"));
+        params.push(format!("hidws={}", query_escape(ws)));
     }
+    let base = video.base_url();
     if params.is_empty() {
-        video_base.to_string()
+        base
     } else {
-        format!("{video_base}/?{}", params.join("&"))
+        format!("{base}/?{}", params.join("&"))
     }
 }
 
@@ -2217,31 +2234,28 @@ fn cmd_console(
     }
 
     // Local: ensure both daemons (OS-assigned ports; discovery finds them).
-    let video_url = match video::daemon_url(&target) {
-        Some(u) => u,
-        None => {
-            let v = local_video(&lab, &target)?;
-            let device = v
-                .device
-                .clone()
-                .ok_or_else(|| anyhow!("video channel for '{target}' has no device set"))?;
-            eprintln!("Starting video daemon…");
-            video::start_daemon(&device, 0, &target, v.ocr_mode.as_deref())?;
-            daemons::wait_for_daemon(
+    if video::daemon(&target).is_none() {
+        let v = local_video(&lab, &target)?;
+        let device = v
+            .device
+            .clone()
+            .ok_or_else(|| anyhow!("video channel for '{target}' has no device set"))?;
+        eprintln!("Starting video daemon…");
+        video::start_daemon(&device, 0, &target, v.ocr_mode.as_deref())?;
+        daemons::wait_for_daemon(
+            video::DAEMON,
+            Some(&target),
+            std::time::Duration::from_secs(5),
+        )
+        .ok_or_else(|| {
+            daemons::start_failure(
                 video::DAEMON,
                 Some(&target),
                 std::time::Duration::from_secs(5),
             )
-            .ok_or_else(|| {
-                daemons::start_failure(
-                    video::DAEMON,
-                    Some(&target),
-                    std::time::Duration::from_secs(5),
-                )
-            })?
-        }
-    };
-    if serial::daemon_url(&target).is_none() {
+        })?;
+    }
+    if serial::daemon(&target).is_none() {
         let serials = local_serials(&lab, &target)?;
         if serials.is_empty() {
             bail!("no serial interfaces configured for '{target}' (paniolo serial add ...)");
@@ -2262,23 +2276,26 @@ fn cmd_console(
         })?;
     }
     // Optional KVM leg: if the target has a local hid channel, ensure its
-    // daemon and hand the dashboard its port (?hid=PORT). Absent/remote hid
-    // channels just leave the console without input injection.
-    let hid_port = ensure_hid_daemon_local(&lab, &target).unwrap_or_else(|e| {
+    // daemon and hand the dashboard its WebSocket URL (?hidws=). Absent/remote
+    // hid channels just leave the console without input injection.
+    let hid = ensure_hid_daemon_local(&lab, &target).unwrap_or_else(|e| {
         eprintln!("hid (KVM) disabled: {e}");
         None
     });
 
-    // The dashboard's panes can't discover the daemons' OS-assigned ports
-    // themselves — hand them over as ?serial=PORT / ?hid=PORT.
-    let serial_port = daemons::daemon_port(serial::DAEMON, Some(&target));
+    // The dashboard's panes can't discover the daemons' OS-assigned ports or
+    // tokens themselves — hand each over as a complete WebSocket URL, token
+    // inside (?serialws= / ?hidws=), and the page's own token as ?token=.
+    let video = video::daemon(&target)
+        .ok_or_else(|| anyhow!("video daemon for '{target}' is not running"))?;
+    let serial_ws = serial::daemon(&target).map(|d| d.ws_url("/stream"));
+    let hid_ws = hid.map(|d| d.ws_url("/hid"));
     let url = dashboard_url(
-        &video_url,
+        &video,
         &DashboardLinks {
-            serial_port,
+            serial_ws: serial_ws.as_deref(),
             interface,
-            hid_port,
-            ..Default::default()
+            hid_ws: hid_ws.as_deref(),
         },
     );
     open_in_browser(&url);
@@ -2304,15 +2321,25 @@ fn remote_console(lab: &Lab, target: &str, host_name: &str, interface: Option<&s
             );
         }
     }
-    let video_port =
-        dispatch::remote_daemon_port(&host, &daemons::runtime_rel("hdmicap", Some(target)))
+    let video =
+        dispatch::remote_daemon_endpoint(&host, &daemons::runtime_rel("hdmicap", Some(target)))
             .ok_or_else(|| anyhow!("could not read the hdmicap daemon port on {host_name}"))?;
-    let serial_port =
-        dispatch::remote_daemon_port(&host, &daemons::runtime_rel("serialcap", Some(target)))
+    let serial =
+        dispatch::remote_daemon_endpoint(&host, &daemons::runtime_rel("serialcap", Some(target)))
             .ok_or_else(|| anyhow!("could not read the serialcap daemon port on {host_name}"))?;
 
-    let fwd_video = ssh::forward(&host, video_port)?;
-    let fwd_serial = ssh::forward(&host, serial_port)?;
+    let fwd_video = ssh::forward(&host, video.port)?;
+    let fwd_serial = ssh::forward(&host, serial.port)?;
+    // Through the tunnels the daemons answer on local ports; their tokens
+    // travel unchanged.
+    let video = daemons::Endpoint {
+        port: fwd_video.local_port,
+        ..video
+    };
+    let serial = daemons::Endpoint {
+        port: fwd_serial.local_port,
+        ..serial
+    };
 
     // Optional KVM leg: start the hid daemon on the host if its channel lives
     // there too, then tunnel its port. A KVM-less console still works.
@@ -2330,15 +2357,20 @@ fn remote_console(lab: &Lab, target: &str, host_name: &str, interface: Option<&s
     let mut _fwd_hid = None;
     let hid_ws: Option<String> = if hid_on_host {
         match dispatch::run_subcommand(lab, target, host_name, &["hid", "serve", target]) {
-            Ok(out) if out.status == 0 => {
-                dispatch::remote_daemon_port(&host, &daemons::runtime_rel(HID_DAEMON, Some(target)))
-                    .and_then(|p| ssh::forward(&host, p).ok())
-                    .map(|fwd| {
-                        let url = format!("ws://127.0.0.1:{}/hid", fwd.local_port);
-                        _fwd_hid = Some(fwd);
-                        url
-                    })
-            }
+            Ok(out) if out.status == 0 => dispatch::remote_daemon_endpoint(
+                &host,
+                &daemons::runtime_rel(HID_DAEMON, Some(target)),
+            )
+            .and_then(|ep| ssh::forward(&host, ep.port).ok().map(|fwd| (ep, fwd)))
+            .map(|(ep, fwd)| {
+                let url = daemons::Endpoint {
+                    port: fwd.local_port,
+                    ..ep
+                }
+                .ws_url("/hid");
+                _fwd_hid = Some(fwd);
+                url
+            }),
             _ => {
                 eprintln!("hid (KVM) disabled: could not start the hid daemon on {host_name}");
                 None
@@ -2348,13 +2380,13 @@ fn remote_console(lab: &Lab, target: &str, host_name: &str, interface: Option<&s
         None
     };
 
+    let serial_ws = serial.ws_url("/stream");
     let url = dashboard_url(
-        &format!("http://127.0.0.1:{}", fwd_video.local_port),
+        &video,
         &DashboardLinks {
-            serial_ws: Some(&format!("ws://127.0.0.1:{}/stream", fwd_serial.local_port)),
+            serial_ws: Some(&serial_ws),
             interface,
             hid_ws: hid_ws.as_deref(),
-            ..Default::default()
         },
     );
     open_in_browser(&url);
@@ -2546,10 +2578,10 @@ fn cmd_power_state(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
                  (paniolo power set -t {target} --serial-interface <name>)"
             )
         })?;
-        let url = serial::daemon_url(&target).ok_or_else(|| {
+        let daemon = serial::daemon(&target).ok_or_else(|| {
             anyhow!("serialcap daemon not running — start it with `paniolo serial watch`")
         })?;
-        match power::read_power_state(&url, &si) {
+        match power::read_power_state(&daemon, &si) {
             Some(true) => {
                 println!("Power ON  ({target})");
                 Ok(())
@@ -2688,7 +2720,7 @@ fn cmd_serial_send(
 ) -> Result<()> {
     let (target, serials) = serial_runtime(lab_flag, target, interface, dispatch::Mode::Reexec)?;
     let ch = pick_serial(&serials, interface)?;
-    let url = serial::daemon_url(&target).ok_or_else(|| {
+    let daemon = serial::daemon(&target).ok_or_else(|| {
         anyhow!("serialcap daemon not running — start it with `paniolo serial watch`")
     })?;
     let mut payload = text.as_bytes().to_vec();
@@ -2705,7 +2737,7 @@ fn cmd_serial_send(
         payload.len(),
         ch.name
     );
-    serial::send_input(&url, &ch.name, &payload, pace_ms)?;
+    serial::send_input(&daemon, &ch.name, &payload, pace_ms)?;
     println!("Sent.");
     Ok(())
 }
@@ -2871,7 +2903,7 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
             let device = v
                 .device
                 .ok_or_else(|| anyhow!("video channel for '{target}' has no device set"))?;
-            if let Some(url) = video::daemon_url(&target) {
+            if let Some(url) = video::preview_url(&target) {
                 let stale = daemons::binary_is_stale(video::DAEMON, Some(&target)) == Some(true);
                 if !restart && !stale {
                     println!("Video daemon for '{target}' already running at {url}");
@@ -2892,6 +2924,9 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
                 std::time::Duration::from_secs(5),
             ) {
                 Some(url) => {
+                    // A browser can only present the token as ?token=, so the
+                    // URL a human opens carries it.
+                    let url = video::preview_url(&target).unwrap_or(url);
                     println!("Video daemon started. Preview at {url}");
                     Ok(())
                 }
@@ -2996,7 +3031,7 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
         }
         VideoCmd::Preview { target } => {
             let (target, _v) = video_runtime(lab_flag, target.as_deref())?;
-            match video::daemon_url(&target) {
+            match video::preview_url(&target) {
                 Some(url) => {
                     println!("{url}");
                     Ok(())
@@ -3010,7 +3045,7 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
         VideoCmd::Show { target } => {
             let (target, v) = video_runtime(lab_flag, target.as_deref())?;
             println!("device\t{}", v.device.as_deref().unwrap_or("(not set)"));
-            match video::daemon_url(&target) {
+            match video::preview_url(&target) {
                 Some(url) => {
                     println!(
                         "daemon\trunning at {url}{}",
@@ -3469,7 +3504,7 @@ fn exec_prefixed(cmd: &str) -> String {
     }
 }
 
-fn ensure_hid_daemon_local(lab: &Lab, target: &str) -> Result<Option<u16>> {
+fn ensure_hid_daemon_local(lab: &Lab, target: &str) -> Result<Option<daemons::Endpoint>> {
     let t = lab
         .targets
         .get(target)
@@ -3482,8 +3517,8 @@ fn ensure_hid_daemon_local(lab: &Lab, target: &str) -> Result<Option<u16>> {
     if !channel_is_local(lab, h.host.as_deref(), &dh) {
         return Ok(None);
     }
-    if let Some(port) = daemons::daemon_port(HID_DAEMON, Some(target)) {
-        return Ok(Some(port));
+    if let Some(ep) = daemons::daemon_endpoint(HID_DAEMON, Some(target)) {
+        return Ok(Some(ep));
     }
     let cmd = h.cmd.clone().ok_or_else(|| {
         anyhow!("hid channel for '{target}' has no cmd (paniolo hid set -t {target} --cmd ...)")
@@ -3503,7 +3538,7 @@ fn ensure_hid_daemon_local(lab: &Lab, target: &str) -> Result<Option<u16>> {
     command.spawn()?;
     Ok(Some(
         daemons::wait_for_daemon(HID_DAEMON, Some(target), std::time::Duration::from_secs(5))
-            .and_then(|_| daemons::daemon_port(HID_DAEMON, Some(target)))
+            .and_then(|_| daemons::daemon_endpoint(HID_DAEMON, Some(target)))
             .ok_or_else(|| {
                 daemons::start_failure(HID_DAEMON, Some(target), std::time::Duration::from_secs(5))
             })?,
@@ -3523,8 +3558,8 @@ fn cmd_hid_serve(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
         std::process::exit(code);
     }
     match ensure_hid_daemon_local(&lab, &target)? {
-        Some(port) => {
-            println!("hid daemon running for '{target}' (port {port}).");
+        Some(ep) => {
+            println!("hid daemon running for '{target}' (port {}).", ep.port);
             Ok(())
         }
         None => bail!("target '{target}' has no hid channel on this host"),
@@ -3811,6 +3846,64 @@ fn print_resolved_target(rt: &ResolvedTarget) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_escape_keeps_unreserved_and_encodes_the_rest() {
+        assert_eq!(query_escape("abc-_.~09"), "abc-_.~09");
+        assert_eq!(
+            query_escape("ws://127.0.0.1:5/stream?token=a&b"),
+            "ws%3A%2F%2F127.0.0.1%3A5%2Fstream%3Ftoken%3Da%26b"
+        );
+    }
+
+    /// The dashboard URL carries the video daemon's token for the page itself
+    /// and each other daemon's complete WebSocket URL — that daemon's token
+    /// inside, encoded as one value — so the page can authenticate to all
+    /// three without any of them sharing a secret.
+    #[test]
+    fn dashboard_url_carries_every_daemons_token() {
+        let video = daemons::Endpoint {
+            pid: 1,
+            port: 1000,
+            token: Some("vt".into()),
+        };
+        let serial = daemons::Endpoint {
+            pid: 2,
+            port: 2000,
+            token: Some("st".into()),
+        };
+        let hid = daemons::Endpoint {
+            pid: 3,
+            port: 3000,
+            token: None,
+        };
+        let serial_ws = serial.ws_url("/stream");
+        let hid_ws = hid.ws_url("/hid");
+        let url = dashboard_url(
+            &video,
+            &DashboardLinks {
+                serial_ws: Some(&serial_ws),
+                interface: Some("console"),
+                hid_ws: Some(&hid_ws),
+            },
+        );
+        assert_eq!(
+            url,
+            "http://127.0.0.1:1000/?token=vt\
+             &serialws=ws%3A%2F%2F127.0.0.1%3A2000%2Fstream%3Ftoken%3Dst\
+             &interface=console\
+             &hidws=ws%3A%2F%2F127.0.0.1%3A3000%2Fhid"
+        );
+        // A tokenless (older) video daemon and no links: the bare base URL.
+        let old = daemons::Endpoint {
+            token: None,
+            ..video
+        };
+        assert_eq!(
+            dashboard_url(&old, &DashboardLinks::default()),
+            "http://127.0.0.1:1000"
+        );
+    }
 
     // Regression: the per-channel runtime helpers must use the same
     // self-identification as the dispatch layer ([`model::Host::is_local`]).
