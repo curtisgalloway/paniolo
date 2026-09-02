@@ -123,7 +123,8 @@ possible — run evals in a clean sandbox/container or a stripped Agent SDK
 session, never an interactive session on the bench machine. The `evals/` runner
 does this with `--isolation home` (a sandbox `HOME` with no user `CLAUDE.md` or
 memory). **macOS caveat:** if Claude Code authenticates via the Keychain, the
-copyable `~/.claude/.credentials.json` may be stale and the clean-HOME agent
+`~/.claude/.credentials.json` the runner links into the sandbox `HOME` may be
+stale and the clean-HOME agent
 gets `401 Invalid authentication credentials`; supply a valid
 `ANTHROPIC_API_KEY` (passed through) or mint a fresh token into the sandbox home
 first. The default `--isolation light` keeps your real `HOME` (auth works) but

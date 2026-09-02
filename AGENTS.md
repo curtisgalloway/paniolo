@@ -76,9 +76,14 @@ follow-up. Run through this checklist before calling `gh pr create`:
    - `docs/dev/requirements.md` — the requirements tracker status (if scope/progress changed)
    - `README.md` — capabilities table, installation steps
    - `AGENTS.md` — module layout, command descriptions, architecture notes
-   - `evals/scenarios/*.toml` — the agent-eval scenarios assert CLI behavior;
-     `python3.12 evals/run.py --check` (Python ≥ 3.11) flags expectations the
-     surface change broke
+   - `evals/scenarios/*.toml` — the agent-eval scenarios assert CLI behavior.
+     `python3.12 evals/run.py --check` (Python ≥ 3.11) verifies only that every
+     *single-line* `reference` entry names a real subcommand path with flags
+     that subcommand accepts, and that the T1-safe allowlist
+     (`evals/graders/t1_config.SAFE`) names real groups/subcommands. It does
+     **not** check positional arguments, flag values, multi-line (prose)
+     references, or a scenario's `goal`/grader expectations — read the
+     scenarios that mention the changed command yourself.
    Include doc updates in the same PR, not a follow-up.
 
    Also check the diff for private infrastructure — real hostnames, private
@@ -1130,10 +1135,17 @@ Per-subsystem behavior:
     restriction — so `netbootd` is spawned directly with no `sudo` prefix.
 - **Interface management** (`cli/src/netif.rs`, `netif::configure_interface()` /
   `restore_interface()`).
-  - *macOS:* `networksetup` + `ifconfig`.
-  - *Linux:* iproute2 — `ip addr add` / `ip link set up`, flushed with
-    `ip addr flush dev <iface>`.
+  - *macOS:* `networksetup -setmanual <service> <ip> <mask> <router>` (router
+    = the host IP; the four-argument form is required) + `ifconfig`, which is
+    what makes the address live — a `networksetup` failure is a warning.
+  - *Linux:* iproute2 — `ip addr replace` first, then `ip addr del` of any
+    other IPv4 address (parsed from `ip -4 -o addr show dev <iface>`), then
+    `ip link set up`; a failed assignment never leaves the link addressless.
+    `restore_interface` still flushes with `ip addr flush dev <iface>`.
   - *Windows:* not implemented.
+  - Every mode change (`mode_*`, `down_hard`) and `netboot::start` refuse the
+    interface carrying the system default route (`is_primary_interface`; the
+    pure decision is `is_default_route_interface`, unit-tested).
 - **ARP pinning** (netbootd).
   - *macOS:* `arp -s`.
   - *Linux:* `ip neigh replace ... nud permanent`.
@@ -1238,8 +1250,10 @@ the problem.
   bring it back up; WoL stays off until re-enabled or the adapter is replugged.
   (macOS WoL is a system-wide `pmset womp` pref, so `down-hard` relies on
   admin-down there.) Heads-up: `del_host_ip` releases the macOS static IP via
-  `networksetup -setdhcp` (an `ifconfig` delete won't unset a `-setmanual` IP),
-  so `mode off` from `link` mode actually clears the address on macOS.
+  `networksetup -setdhcp` (an `ifconfig` delete won't unset a `-setmanual` IP)
+  *and then* `ifconfig <iface> inet <ip> -alias` (so an alias left by
+  `ifconfig` can't outlive the service reset), so `mode off` from `link` mode
+  actually clears the address on macOS.
 - **Interface configuration requires root.** `netif::configure_interface()`
   needs NOPASSWD sudo (`ifconfig`/`networksetup` on macOS, `ip` on Linux).
 - **SSH PATH.** Non-interactive SSH shells often lack `/opt/homebrew/bin`;

@@ -179,10 +179,44 @@ fn default_route_interface() -> Option<String> {
     }
 }
 
-/// True if `interface` carries the system default route — netboot must never
-/// reconfigure the primary NIC.
+/// The pure decision behind [`is_primary_interface`]: `default_route` is the
+/// interface carrying the system default route (if any), and `interface` is
+/// primary when it is that one. Free of probing so it can be unit-tested.
+fn is_default_route_interface(interface: &str, default_route: Option<&str>) -> bool {
+    default_route == Some(interface)
+}
+
+/// True if `interface` carries the system default route — netboot and every
+/// netif mode change must never reconfigure the primary NIC.
 pub fn is_primary_interface(interface: &str) -> bool {
-    default_route_interface().as_deref() == Some(interface)
+    is_default_route_interface(interface, default_route_interface().as_deref())
+}
+
+/// The refusal every mode change shares with `netboot::start`: never touch the
+/// interface carrying the system default route. A lab file naming the host's
+/// real NIC would otherwise let `mode link` replace the control host's only
+/// address, or `down-hard` admin-down it — an SSH lockout on a remote control
+/// host. Pure: `default_route` is what [`default_route_interface`] returned, so
+/// both the decision and the message are unit-testable; `what` names the verb.
+fn refuse_primary_interface(
+    what: &str,
+    interface: &str,
+    default_route: Option<&str>,
+) -> Result<()> {
+    if is_default_route_interface(interface, default_route) {
+        bail!(
+            "refusing netif {what} on '{interface}': it carries the system default \
+             route (your primary network interface). netif would reconfigure it and \
+             break host networking. Use a dedicated USB-Ethernet adapter for the \
+             netboot link."
+        );
+    }
+    Ok(())
+}
+
+/// [`refuse_primary_interface`] against the live routing table.
+fn guard_primary_interface(what: &str, interface: &str) -> Result<()> {
+    refuse_primary_interface(what, interface, default_route_interface().as_deref())
 }
 
 /// The interface's addresses: (inet, inet6) with IPv6 scope suffixes stripped.
@@ -246,18 +280,72 @@ pub fn ipv6_peers(interface: &str) -> Vec<String> {
 
 // ── privileged interface mutation ───────────────────────────────────────────
 
+/// What a failed command said: stderr, or stdout when stderr is empty
+/// (`networksetup` reports its `** Error:` lines on stdout).
+fn failure_text(o: &std::process::Output) -> String {
+    let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+    if err.is_empty() {
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    } else {
+        err
+    }
+}
+
+/// The IPv4 addresses (`addr/prefix`, as printed) in `ip -4 -o addr show dev
+/// <iface>` output: one address per line, the token after `inet`. Pure, so the
+/// format is pinned by a test.
+fn ipv4_addrs(show_output: &str) -> Vec<String> {
+    show_output
+        .lines()
+        .filter_map(|line| {
+            let mut toks = line.split_whitespace();
+            toks.find(|t| *t == "inet")?;
+            toks.next().map(str::to_string)
+        })
+        .collect()
+}
+
+/// Linux: `ip addr replace` — idempotent, and it lands the address before
+/// anything else is touched.
+fn ip_addr_replace(interface: &str, cidr: &str) -> Result<()> {
+    let o = run(&["sudo", "ip", "addr", "replace", cidr, "dev", interface])?;
+    if !o.status.success() {
+        bail!(
+            "ip addr replace {cidr} dev {interface} failed: {}\n{SUDO_HINT}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// Assign the static netboot host IP to the interface (sudo).
 pub fn configure_interface(interface: &str, host_ip: &str) -> Result<()> {
     if macos() {
         if let Some(service) = find_network_service(interface) {
-            let _ = run(&[
+            // Tell configd the service is manual, so a carrier flap (every
+            // target power-cycle) doesn't hand the link back to DHCP.
+            // `-setmanual` takes four arguments — service, ip, subnet, router —
+            // and rejects the call without the router; the host IP itself is
+            // the customary router for a point-to-point link with no gateway.
+            // `ifconfig` below is what makes the address live, so a failure
+            // here is a warning, not a failure of the call.
+            let manual = run(&[
                 "sudo",
                 "networksetup",
                 "-setmanual",
                 &service,
                 host_ip,
                 "255.255.255.0",
+                host_ip,
             ]);
+            match manual {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => eprintln!(
+                    "warning: networksetup -setmanual '{service}' failed: {}",
+                    failure_text(&o)
+                ),
+                Err(e) => eprintln!("warning: networksetup -setmanual '{service}' failed: {e}"),
+            }
         }
         let o = run(&[
             "sudo",
@@ -275,15 +363,24 @@ pub fn configure_interface(interface: &str, host_ip: &str) -> Result<()> {
             );
         }
     } else {
-        let _ = run(&["sudo", "ip", "addr", "flush", "dev", interface]);
+        // Replace first, remove the rest after: a failed assignment leaves the
+        // interface as it was, never addressless (flush-then-add did).
         let cidr = format!("{host_ip}/24");
-        let o = run(&["sudo", "ip", "addr", "add", &cidr, "dev", interface])?;
-        let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
-        if !o.status.success() && !stderr.contains("already assigned") {
-            bail!(
-                "ip addr add {cidr} dev {interface} failed: {}\n{SUDO_HINT}",
-                stderr.trim()
-            );
+        ip_addr_replace(interface, &cidr)?;
+        let others: Vec<String> = match run(&["ip", "-4", "-o", "addr", "show", "dev", interface]) {
+            Ok(o) => ipv4_addrs(&String::from_utf8_lossy(&o.stdout))
+                .into_iter()
+                .filter(|a| *a != cidr)
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        for other in &others {
+            let _ = run(&["sudo", "ip", "addr", "del", other, "dev", interface]);
+        }
+        if !others.is_empty() {
+            // Deleting a primary address takes its secondaries with it unless
+            // promote_secondaries is on; re-assert ours either way.
+            ip_addr_replace(interface, &cidr)?;
         }
         let _ = run(&["sudo", "ip", "link", "set", interface, "up"]);
     }
@@ -317,7 +414,7 @@ pub fn tune_arp_for_silent_client() {
 
 fn add_host_ll(interface: &str) -> Result<()> {
     if macos() {
-        let _ = run(&[
+        let o = run(&[
             "sudo",
             "ifconfig",
             interface,
@@ -326,7 +423,15 @@ fn add_host_ll(interface: &str) -> Result<()> {
             "prefixlen",
             "64",
             "up",
-        ]);
+        ])?;
+        let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+        // Re-adding an address that is already there is the idempotent re-run.
+        if !o.status.success() && !stderr.to_lowercase().contains("exists") {
+            bail!(
+                "ifconfig {interface} inet6 {FFX_HOST_LL} failed: {}\n{SUDO_HINT}",
+                stderr.trim()
+            );
+        }
         return Ok(());
     }
     let sysctl_key = format!("net/ipv6/conf/{interface}/disable_ipv6=0");
@@ -369,6 +474,10 @@ fn del_host_ip(interface: &str, host_ip: &str) {
         if let Some(service) = find_network_service(interface) {
             let _ = run(&["sudo", "networksetup", "-setdhcp", &service]);
         }
+        // `-setdhcp` reconfigures the service, but the address `ifconfig` put
+        // on the interface can outlive it as an alias; release it explicitly so
+        // a stale host IP cannot survive `mode off`.
+        let _ = run(&["sudo", "ifconfig", interface, "inet", host_ip, "-alias"]);
         return;
     }
     let cidr = format!("{host_ip}/24");
@@ -407,6 +516,7 @@ pub fn mode_netboot(
     tftp_root: &str,
     opts: &crate::netboot::BootOptions,
 ) -> Result<()> {
+    guard_primary_interface("mode netboot", interface)?;
     del_host_ll(interface);
     if crate::state::is_netboot_running(target) {
         return Ok(());
@@ -421,6 +531,7 @@ pub fn mode_netboot(
 /// physical carrier down (the NIC can hold the link up for Wake-on-LAN — see
 /// docs/netif.md).
 pub fn mode_link(target: &str, interface: &str, host_ip: &str) -> Result<()> {
+    guard_primary_interface("mode link", interface)?;
     if crate::state::is_netboot_running(target) {
         crate::netboot::stop(target)?;
     }
@@ -430,6 +541,7 @@ pub fn mode_link(target: &str, interface: &str, host_ip: &str) -> Result<()> {
 
 /// ffx mode: stop netboot first, then add the host IPv6 link-local.
 pub fn mode_ffx(target: &str, interface: &str) -> Result<()> {
+    guard_primary_interface("mode ffx", interface)?;
     if crate::state::is_netboot_running(target) {
         crate::netboot::stop(target)?;
     }
@@ -438,6 +550,7 @@ pub fn mode_ffx(target: &str, interface: &str) -> Result<()> {
 
 /// off: stop netboot, remove the ffx LL and any stale IPv4.
 pub fn mode_off(target: &str, interface: &str, host_ip: &str) -> Result<()> {
+    guard_primary_interface("mode off", interface)?;
     if crate::state::is_netboot_running(target) {
         crate::netboot::stop(target)?;
     }
@@ -454,6 +567,7 @@ pub fn mode_off(target: &str, interface: &str, host_ip: &str) -> Result<()> {
 /// loss. Bring the link back with `mode link`/`mode netboot`; WoL stays disabled
 /// until re-enabled (`ethtool -s <iface> wol g`) or the adapter is replugged.
 pub fn down_hard(target: &str, interface: &str, host_ip: &str) -> Result<()> {
+    guard_primary_interface("down-hard", interface)?;
     mode_off(target, interface, host_ip)?;
     disable_wol(interface);
     admin_down(interface);
@@ -499,5 +613,59 @@ pub fn get_status(target: &str, interface: &str, host_ip: &str) -> NetifStatus {
         inet,
         inet6,
         peers,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_route_interface_is_primary() {
+        assert!(is_default_route_interface("en0", Some("en0")));
+        assert!(!is_default_route_interface("en14", Some("en0")));
+        // No default route at all (an offline control host): nothing is primary.
+        assert!(!is_default_route_interface("en0", None));
+    }
+
+    #[test]
+    fn every_mode_change_refuses_the_primary_interface() {
+        for what in [
+            "mode netboot",
+            "mode link",
+            "mode ffx",
+            "mode off",
+            "down-hard",
+        ] {
+            let err = refuse_primary_interface(what, "en0", Some("en0"))
+                .expect_err("the default-route interface must be refused");
+            let msg = err.to_string();
+            assert!(
+                msg.starts_with(&format!("refusing netif {what} on 'en0'")),
+                "{msg}"
+            );
+            assert!(msg.contains("system default route"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn a_dedicated_adapter_passes_the_guard() {
+        assert!(refuse_primary_interface("mode link", "en14", Some("en0")).is_ok());
+        assert!(refuse_primary_interface("down-hard", "en14", None).is_ok());
+    }
+
+    #[test]
+    fn ipv4_addrs_parses_the_one_line_ip_listing() {
+        // Captured shape of `ip -4 -o addr show dev eth1`: `-o` joins the
+        // lifetime line onto the address line with a backslash, and a second
+        // (secondary) address is a second line.
+        let sample = "\
+3: eth1    inet 192.0.2.10/24 brd 192.0.2.255 scope global eth1\\       valid_lft forever preferred_lft forever
+3: eth1    inet 198.51.100.7/16 brd 198.51.255.255 scope global secondary dynamic eth1\\       valid_lft 3242sec preferred_lft 3242sec
+";
+        assert_eq!(ipv4_addrs(sample), vec!["192.0.2.10/24", "198.51.100.7/16"]);
+        assert!(ipv4_addrs("").is_empty());
+        // Only `inet` entries count.
+        assert!(ipv4_addrs("3: eth1    <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n").is_empty());
     }
 }

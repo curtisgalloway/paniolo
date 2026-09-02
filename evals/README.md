@@ -60,7 +60,9 @@ just the headline command.
 `--help`/`skill` but don't execute the operational commands" guard (an agent that
 ran `netif mode ffx` blocked on `sudo`); per-scenario 360 s timeout that's caught
 (one hang ≠ dead batch); `stdin=DEVNULL`; per-scenario `try/except` + incremental
-result save; a `daemons stop --all` sweep after each agent run.
+result save; a `daemons stop --all` sweep after each agent run (scoped to the
+sandbox's own `PANIOLO_RUNTIME_BASE`, so it never touches the operator's
+daemons).
 
 **Known platform limits:** `--isolation home` needs valid creds (macOS Keychain `.credentials.json`
 can be stale → 401). agy bypasses the PATH shim, so its T1 allowlist isn't
@@ -152,8 +154,10 @@ Use `--isolation home` to run with a sandbox `HOME` (no user `CLAUDE.md`/memory)
 *settings* — fine for smoke-testing the harness, **not** for real Cold numbers
 (your user memory loads, and if it names paniolo the agent isn't naive).
 
-**Auth under `home` isolation.** The runner copies `~/.claude/.credentials.json`
-into the sandbox `HOME`, but on a macOS setup that authenticates via the
+**Auth under `home` isolation.** The runner symlinks `~/.claude/.credentials.json`
+into the sandbox `HOME` for the duration of the run (a token refresh lands in
+the real file; the link is removed when the run ends, so a kept sandbox holds
+no credential copy), but on a macOS setup that authenticates via the
 **Keychain** that file can be stale — the agent then dies with
 `401 Invalid authentication credentials` and runs nothing. If you hit that,
 either export a valid `ANTHROPIC_API_KEY` (it's passed through to the agent) or

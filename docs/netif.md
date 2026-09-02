@@ -70,6 +70,22 @@ link-local is ephemeral (lost on a control-host reboot), re-running
 if netboot is already running, and `netif mode off` removes only what netif set
 up — never an unrelated address.
 
+**Interface safety:** every mode change (`mode netboot|link|ffx|off`) and
+`down-hard` **refuses** an interface that carries the system default route (a
+primary NIC) — the same guard `netboot start` applies — with
+
+```
+refusing netif mode link on 'en0': it carries the system default route (your
+primary network interface). netif would reconfigure it and break host
+networking. Use a dedicated USB-Ethernet adapter for the netboot link.
+```
+
+A lab file that names the control host's real NIC would otherwise let
+`mode link` replace its only address, or `down-hard` admin-down it — on a
+remote control host, an SSH lockout. Fix the target's `interface` in the lab
+file (`paniolo discover` lists the candidates; the primary NIC is excluded)
+rather than working around the refusal.
+
 ---
 
 ## What each mode does
@@ -79,16 +95,23 @@ up — never an unrelated address.
   the IPv4 `host_ip`).
 - **link** — stops netboot if running and removes the `fe80::1` link-local, then
   assigns just the IPv4 `host_ip`/24 and brings the interface up (the same
-  privileged step netboot uses, minus the daemon). This is the bare host side of
-  the link with nothing serving on it — use it to test that the link comes up,
-  then `mode off` to take it down.
+  privileged step netboot uses, minus the daemon). On Linux the address is set
+  with `ip addr replace` *first* and any other IPv4 address on the interface is
+  removed only afterwards, so a failed assignment never leaves the link
+  addressless; on macOS the adapter's network service is set to manual
+  (`networksetup -setmanual`, so a carrier flap doesn't hand it back to DHCP)
+  and the address is applied with `ifconfig` — `ifconfig` is what makes it
+  live, so a `networksetup` error is printed as a warning, not a failure. This
+  is the bare host side of the link with nothing serving on it — use it to test
+  that the link comes up, then `mode off` to take it down.
 - **ffx** — stops netboot first (so the next power-cycle boots from SD), then
   enables IPv6 on the interface and adds `fe80::1`/64. On Linux this is
   `sysctl net/ipv6/conf/<iface>/disable_ipv6=0` + `ip -6 addr add`; on macOS it
   is an `ifconfig … inet6 … alias`. The privileged steps reuse the same `sudo`
   path netboot already uses.
 - **off** — stops netboot, removes the `fe80::1` link-local, and clears a
-  lingering `host_ip`/24.
+  lingering `host_ip`/24 (on macOS: returns the service to DHCP *and* releases
+  the `ifconfig` alias, so a stale host IP cannot survive `mode off`).
 
 ---
 
@@ -170,6 +193,31 @@ cd ~/src/fuchsia && ./.jiri_root/bin/ffx target list   # expect RCS:Y
 ```
 
 To go back to TFTP bring-up: `paniolo netif mode netboot fortune`.
+
+---
+
+## Gotchas
+
+- **The primary NIC is refused, in every mode.** `refusing netif <verb> on
+  '<iface>': it carries the system default route …` means the lab file's
+  `interface` is the control host's real NIC, not the netboot adapter. Point it
+  at the dedicated USB-Ethernet adapter (see *Interface safety* above); do not
+  run `ifconfig`/`ip` by hand to get past it.
+- **`mode off` is the soft down.** It releases the host IP but leaves the
+  carrier alone — a Wake-on-LAN-capable NIC keeps the link LED lit and
+  `carrier up`. Use `down-hard` when the target must see link loss (see
+  *Testing the link up and down*).
+- **macOS service order.** `mode link`/`mode netboot` set the adapter's
+  network service to a manual address whose router is the host IP itself (a
+  point-to-point link has no gateway, and `networksetup -setmanual` requires
+  one). macOS picks its primary service — the one whose router becomes the
+  default route — from the *highest* service in
+  `networksetup -listnetworkserviceorder` that has a router, so keep the
+  netboot adapter *below* your real NIC in that order; otherwise the default
+  route can move onto the link while it is up.
+- **`mode ffx` now reports a failed `ifconfig … inet6` add on macOS** instead
+  of silently returning success — a NOPASSWD sudo gap shows up here, not later
+  as an inexplicable `RCS:N`.
 
 ---
 
