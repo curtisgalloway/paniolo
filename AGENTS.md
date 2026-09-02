@@ -1126,11 +1126,15 @@ and dies in the field three days later.
 
 ### Developing against Windows
 
-`brik.h.curtisg.xyz` (10.66.30.58) is the Windows bench host: SSH lands in
-PowerShell 7, `$HOME` is `C:\Users\curti` (not `curtisg`), and the repo is
-cloned at `C:\Users\curti\src\paniolo`. `scripts/sync-brik.sh <crate>…`
-pushes sources there (it excludes `target/`, which is gigabytes and stalls the
-transfer). The MSVC linker resolves without a Developer Prompt.
+The Windows bench host (`brik`; its address and checkout path are private
+infrastructure and live outside this repo) is reached over SSH, which lands
+in PowerShell 7. Note `$HOME` there is the Windows account's `C:\Users\…`,
+a different account name than on the Mac, and the repo is cloned under it.
+`BRIK_HOST=<ssh host> BRIK_DEST=<checkout, forward slashes>
+scripts/sync-brik.sh <crate>…` pushes sources there; both variables are
+required, with no defaults, and the script excludes `target/`, which is
+gigabytes and stalls the transfer. The MSVC linker resolves without a
+Developer Prompt.
 
 A local `cargo check --target x86_64-pc-windows-msvc` catches most `#[cfg]`
 mistakes without leaving macOS, but **only for crates with no C dependency** —
