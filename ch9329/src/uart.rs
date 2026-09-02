@@ -45,10 +45,20 @@ const TRANSCRIPT_CAP: usize = 256;
 /// every later client queued behind it (and their WebSocket loops with them).
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// One queued command awaiting its reply.
-struct Request {
-    line: String,
-    reply: oneshot::Sender<Result<String, String>>,
+/// One item on the owner's queue.
+enum Request {
+    /// A command line, answered on `reply` with the `OK` data or the
+    /// `ERR`/transport message.
+    Line {
+        line: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    /// Shutdown: release every held key, modifier and button, so the target
+    /// is not left with one down after the daemon — the only thing that
+    /// remembers what it pressed — exits. Answered on `done` once the report
+    /// is written or there was no open link to write it to. Never touches the
+    /// USB mux.
+    Release { done: oneshot::Sender<()> },
 }
 
 /// A transcript event broadcast to every WebSocket observer: the command that
@@ -100,7 +110,7 @@ impl HidHandle {
         let (tx, rx) = oneshot::channel();
         let round_trip = async {
             self.req_tx
-                .send(Request { line, reply: tx })
+                .send(Request::Line { line, reply: tx })
                 .await
                 .map_err(|_| "hid daemon stopped".to_string())?;
             rx.await
@@ -111,6 +121,27 @@ impl HidHandle {
             Err(_) => Err(format!(
                 "hid daemon did not answer within {} s",
                 limit.as_secs()
+            )),
+        }
+    }
+
+    /// Shutdown hook: release every held key, modifier and button. Bounded by
+    /// `limit`; the error is informational — the daemon exits either way.
+    pub async fn release_for_shutdown(&self, limit: Duration) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        let round_trip = async {
+            self.req_tx
+                .send(Request::Release { done: tx })
+                .await
+                .map_err(|_| "hid control link owner is gone".to_string())?;
+            rx.await
+                .map_err(|_| "hid control link owner dropped the release".to_string())
+        };
+        match tokio::time::timeout(limit, round_trip).await {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "hid control link did not release keys within {} ms",
+                limit.as_millis()
             )),
         }
     }
@@ -132,6 +163,27 @@ fn is_transport_error(msg: &str) -> bool {
         || msg.starts_with("CH9329 did not respond")
 }
 
+/// True for the specific "no reply within the timeout" shape, the subset of
+/// [`is_transport_error`] worth one retry before it is believed.
+fn is_timeout(msg: &str) -> bool {
+    msg.starts_with("timed out")
+}
+
+/// Try `attempt`, and if it fails with what looks like a timeout, try it once
+/// more before accepting the failure. A slow target or a momentarily busy
+/// host can lose a single round trip without the link itself being gone —
+/// reopening for that is worse than one retry: each reopen briefly toggles
+/// DTR/RTS, which on a KVM-Go is a hardware reset of its MCU.
+fn retry_once_on_timeout<F: FnMut() -> Result<String, String>>(
+    mut attempt: F,
+) -> Result<String, String> {
+    let first = attempt();
+    match &first {
+        Err(msg) if is_timeout(msg) => attempt(),
+        _ => first,
+    }
+}
+
 /// The owner loop (blocking thread): drain requests, execute each against the
 /// one persistent [`Session`], broadcast the outcome.
 fn run(device: String, mut req_rx: mpsc::Receiver<Request>, transcript: broadcast::Sender<Event>) {
@@ -144,6 +196,19 @@ fn run(device: String, mut req_rx: mpsc::Receiver<Request>, transcript: broadcas
     info!("ch9329 UART owner started for {device}");
 
     while let Some(req) = req_rx.blocking_recv() {
+        let (line, reply) = match req {
+            Request::Line { line, reply } => (line, reply),
+            Request::Release { done } => {
+                if let Some(s) = session.as_mut() {
+                    if let Err(e) = s.release_everything() {
+                        warn!("ch9329 shutdown release failed: {e}");
+                    }
+                }
+                let _ = done.send(());
+                continue;
+            }
+        };
+
         if session.is_none() {
             match Session::open_preferring(&device, last_baud) {
                 Ok(s) => {
@@ -152,15 +217,15 @@ fn run(device: String, mut req_rx: mpsc::Receiver<Request>, transcript: broadcas
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    broadcast_event(&transcript, &req.line, &Err(msg.clone()));
-                    let _ = req.reply.send(Err(msg));
+                    broadcast_event(&transcript, &line, &Err(msg.clone()));
+                    let _ = reply.send(Err(msg));
                     continue;
                 }
             }
         }
 
         let s = session.as_mut().unwrap();
-        let result = execute_line(s, &req.line).map_err(|e| e.to_string());
+        let result = retry_once_on_timeout(|| execute_line(s, &line).map_err(|e| e.to_string()));
         // Recorded after every command: a `baud` command moves the chip, and
         // the next reopen must probe where it went.
         last_baud = Some(s.baud());
@@ -170,8 +235,8 @@ fn run(device: String, mut req_rx: mpsc::Receiver<Request>, transcript: broadcas
                 session = None;
             }
         }
-        broadcast_event(&transcript, &req.line, &result);
-        let _ = req.reply.send(result);
+        broadcast_event(&transcript, &line, &result);
+        let _ = reply.send(result);
     }
     info!("ch9329 UART owner stopped for {device}");
 }
@@ -230,5 +295,71 @@ mod tests {
             "CH9329 rejected cmd 0x02: bad parameter (0xe5)"
         ));
         assert!(!is_transport_error("unknown command: foo"));
+    }
+
+    /// A lost reply gets one retry before the caller sees a failure at all.
+    #[test]
+    fn a_timeout_gets_one_retry_then_the_result_stands() {
+        let mut calls = 0;
+        let result = retry_once_on_timeout(|| {
+            calls += 1;
+            if calls == 1 {
+                Err("timed out waiting for CH9329 reply".to_string())
+            } else {
+                Ok("ok".to_string())
+            }
+        });
+        assert_eq!(result, Ok("ok".to_string()));
+        assert_eq!(calls, 2);
+    }
+
+    /// A second consecutive timeout is accepted as failure, not retried again
+    /// — one retry, not an unbounded loop.
+    #[test]
+    fn a_second_timeout_is_not_retried_again() {
+        let mut calls = 0;
+        let result = retry_once_on_timeout(|| {
+            calls += 1;
+            Err("timed out waiting for CH9329 reply".to_string())
+        });
+        assert_eq!(calls, 2);
+        assert!(result.is_err());
+    }
+
+    /// A non-timeout failure (a genuine NAK, say) is not retried at all —
+    /// retrying would just repeat a board-level rejection.
+    #[test]
+    fn a_non_timeout_error_is_not_retried() {
+        let mut calls = 0;
+        let result = retry_once_on_timeout(|| {
+            calls += 1;
+            Err("CH9329 rejected cmd 0x02: bad parameter (0xe5)".to_string())
+        });
+        assert_eq!(calls, 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn timeout_classification() {
+        assert!(is_timeout("timed out waiting for CH9329 reply"));
+        assert!(!is_timeout(
+            "CH9329 rejected cmd 0x02: bad parameter (0xe5)"
+        ));
+        assert!(!is_timeout("cannot open /dev/x: busy"));
+    }
+
+    /// The shutdown release is answered even when the board is absent (the
+    /// port cannot open): "nothing held on a closed link", not a request left
+    /// queued behind the reopen loop until the daemon's grace runs out.
+    #[tokio::test]
+    async fn release_for_shutdown_is_answered_without_a_board() {
+        let hid = HidHandle::spawn("/nonexistent/ch9329-release-test".into());
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            hid.release_for_shutdown(Duration::from_secs(3)),
+        )
+        .await
+        .expect("bounded by its own limit");
+        assert_eq!(result, Ok(()));
     }
 }
