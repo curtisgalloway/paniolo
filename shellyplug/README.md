@@ -50,7 +50,7 @@ shellyplug -d 10.0.0.5 status     # device info + switch state and power
 shellyplug -d 10.0.0.5 state      # prints exactly "on" or "off"
 shellyplug -d 10.0.0.5 on         # switch on, confirm by read-back
 shellyplug -d 10.0.0.5 off        # switch off, confirm by read-back
-shellyplug -d 10.0.0.5 cycle      # off → 3 s → on → confirm (--delay-ms to change)
+shellyplug -d 10.0.0.5 cycle      # off → confirm → 3 s → on → confirm (--delay-ms to change)
 ```
 
 ## Addressing
@@ -69,12 +69,14 @@ shellyplug -d 10.0.0.5 cycle      # off → 3 s → on → confirm (--delay-ms t
 shellyplug -d <host> status [id]          device info + switch state and power metering
 shellyplug -d <host> state  [id]          print exactly "on" or "off"
 shellyplug -d <host> on|off [id]          switch + read-back confirm
-shellyplug -d <host> cycle  [id]          off → delay → on → confirm  [--delay-ms 3000]
+shellyplug -d <host> cycle  [id]          off → confirm → delay → on → confirm  [--delay-ms 3000]
 ```
 
 `on`/`off`/`cycle` confirm the result by reading `Switch.GetStatus` back and
 exit non-zero on mismatch, so a command that silently failed surfaces as an
-error rather than a wrong assumption.
+error rather than a wrong assumption. `cycle` confirms the off phase before
+the hold begins, so a relay that ignored the off command aborts the cycle
+instead of reporting a "cycle" that never removed power.
 
 ## macOS Local Network permission
 

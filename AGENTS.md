@@ -411,7 +411,11 @@ cambrionix/      Rust crate: standalone helper binary for Cambrionix USB hub con
                  (control UART, 115200 8N1); wired into paniolo via generic power hooks.
                  Commands: `state [port]`, `on <port>`, `off <port>`, `cycle <port>`
                  `state <port>` prints exactly `on` or `off` (matches paniolo state_cmd
-                 contract). Built/installed by `make install` / `paniolo setup`.
+                 contract; C/S/I → on, O → off, any other mode letter is an error).
+                 `on`/`off`/`cycle` confirm every transition by re-reading the port
+                 table (C, S or I confirms on, O confirms off). Responses are
+                 bounded (3 s, 64 KiB) and hub error lines fail
+                 the command. Built/installed by `make install` / `paniolo setup`.
 
 shellyplug/      Rust crate: standalone helper for Shelly Gen2+ smart plugs/
                  relays (Plus/Pro/Gen3/Gen4) over the device's local HTTP RPC
@@ -429,16 +433,21 @@ amt/             Rust crate: standalone helper for Intel AMT (vPro) machine
                  Management Engine, so `state` is a true sensor (ME answers
                  with the host on, off, or bare-metal). HTTP Digest (MD5,
                  RFC 2617) implemented in-crate — AMT 11+ is Digest-only.
-                 Addressed by `-d <ip|host>` and `-u <user>` (default admin);
-                 password ONLY via the AMT_PASSWORD env var (never in the lab
-                 file). Commands: `status`, `state` (prints exactly `on`/
-                 `off`; PowerState 2 = on, sleep/hibernate/off = off), `on`,
-                 `off` (hard power-off), `cycle [--delay-ms 3000]` (off →
-                 delay → on, a genuine cold boot). Requests and read-back
-                 retry transient transport errors ~20 s — the AMT NIC drops
-                 link around host power transitions. TLS AMT (16993) is
-                 unsupported (clear error). Hardware-verified against a Dell
-                 OptiPlex 7060 (AMT 12). See docs/power.md.
+                 Addressed by `-d <host|ipv4|[ipv6]>[:port]` (strictly parsed;
+                 anything else URL-shaped is rejected) and `-u <user>` (default
+                 admin); password ONLY via the AMT_PASSWORD env var (never in
+                 the lab file). Commands: `status`, `state` (prints exactly
+                 `on`/`off`; PowerState 2 = on, sleep/hibernate/off = off, any
+                 other value is an error, never a guess), `on`, `off` (hard
+                 power-off, confirmed as Off - Soft), `cycle [--delay-ms 3000]`
+                 (off → confirm → delay → on → confirm; holds off any host not
+                 already soft-off, so a sleeping/hibernating host cold-boots
+                 rather than resumes). Requests and read-back retry transient
+                 transport errors (connection/IO/DNS kinds only) within a ~20 s
+                 budget that also bounds each attempt — the AMT NIC drops link
+                 around host power transitions. TLS AMT (16993) is unsupported
+                 (clear error). Hardware-verified against a Dell OptiPlex 7060
+                 (AMT 12). See docs/power.md.
 
 zigplug/         Python (uv) helper: Zigbee smart plug control via a CC2652 (ZNP)
                  coordinator dongle, using zigpy-znp. CLI wired into paniolo

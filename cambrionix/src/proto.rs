@@ -15,10 +15,19 @@
 //! Cambrionix serial protocol: command framing, response parsing, and the
 //! `state` table parser.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use serialport::SerialPort;
 use std::io::{BufRead, BufReader, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Wall-clock bound on collecting one command's response. The hub answers
+/// `state` in well under a second; this stops a `-d` that points at some
+/// other chatty UART from holding a power hook open indefinitely.
+pub const RESPONSE_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Byte cap on one command's response, for the same reason: the largest
+/// legitimate answer (a 15-port `state` table) is a few hundred bytes.
+pub const RESPONSE_CAP: usize = 64 * 1024;
 
 /// A single row from the hub's `state` output.
 #[derive(Debug, Clone, PartialEq)]
@@ -38,10 +47,33 @@ pub struct PortRow {
 }
 
 impl PortRow {
-    /// Returns `true` when the port is considered **on** (mode is not `O`).
-    pub fn is_on(&self) -> bool {
-        !self.mode.eq_ignore_ascii_case(&'O')
+    /// Whether the port is **on**, from an allow-list of the mode letters
+    /// this crate knows: `C` (charge), `S` (sync), and `I` (idle) are on,
+    /// `O` is off. Any other letter is an error carrying the raw value — the
+    /// `state_cmd` contract wants a real read-back, not a guess about a mode
+    /// the hub has never shown us.
+    pub fn is_on(&self) -> Result<bool> {
+        match self.mode.to_ascii_uppercase() {
+            'C' | 'S' | 'I' => Ok(true),
+            'O' => Ok(false),
+            other => bail!(
+                "port {}: hub reports mode {other:?}, which this helper does not map to on or off",
+                self.port
+            ),
+        }
     }
+}
+
+/// Whether a read-back mode letter confirms a commanded transition: any
+/// powered profile (`C` charge, `S` sync, `I` idle) after `mode c`, and `O`
+/// after `mode o`. Idle counts as on because a port with nothing attached can
+/// report it while VBUS is enabled; what the check must catch is the hub
+/// leaving the port `O` (or answering with something unmapped) after an `on`.
+pub fn mode_confirms(mode: char, want_on: bool) -> bool {
+    matches!(
+        (mode.to_ascii_uppercase(), want_on),
+        ('C' | 'S' | 'I', true) | ('O', false)
+    )
 }
 
 /// Parse the multi-line text returned by the `state` command into a Vec of
@@ -111,7 +143,9 @@ pub fn open_port(device: &str) -> Result<Box<dyn SerialPort>> {
 }
 
 /// Send a command to the hub and collect the response lines up to (but not
-/// including) the `>>` prompt line.
+/// including) the `>>` prompt line, bounded by [`RESPONSE_DEADLINE`] and
+/// [`RESPONSE_CAP`]. Errors if the hub reports an error (see
+/// [`is_error_line`]).
 ///
 /// The caller is responsible for clearing any stale input before calling here.
 pub fn run_command(port: &mut Box<dyn SerialPort>, cmd: &str) -> Result<String> {
@@ -120,24 +154,71 @@ pub fn run_command(port: &mut Box<dyn SerialPort>, cmd: &str) -> Result<String> 
     port.write_all(msg.as_bytes())
         .map_err(|e| anyhow!("write error: {e}"))?;
 
-    // Read lines until we see the `>>` prompt or we time out.
     let mut reader = BufReader::new(&mut **port);
+    collect_response(&mut reader, RESPONSE_DEADLINE, RESPONSE_CAP)
+}
+
+/// Whether a response line is the hub reporting an error. The exact form
+/// the Cambrionix command-line API uses is not documented in this repo, so
+/// this is a deliberately broad heuristic: a line starting with `E` followed
+/// by a digit (an error code) or containing "error" in any case. `state`
+/// rows start with a port number and command echoes with the command word,
+/// so neither can match.
+fn is_error_line(line: &str) -> bool {
+    let t = line.trim_start();
+    let coded = t
+        .strip_prefix('E')
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
+    coded || t.to_ascii_lowercase().contains("error")
+}
+
+/// Read response lines from `reader` until the `>>` prompt, EOF, or a read
+/// timeout, whichever comes first — or fail once `budget` of wall-clock time
+/// or `cap` bytes have gone by without a prompt, so a chatty UART that is
+/// not a Cambrionix hub cannot hang the hook or grow the buffer unbounded.
+/// A partial trailing line (no newline yet) is dropped, as before. Bytes are
+/// consumed chunk-wise rather than line-wise so the deadline is checked even
+/// when the input never contains a newline.
+fn collect_response<R: BufRead>(reader: &mut R, budget: Duration, cap: usize) -> Result<String> {
+    let deadline = Instant::now() + budget;
+    let mut pending: Vec<u8> = Vec::new();
     let mut output = String::new();
-    let mut line = String::new();
+    let mut total = 0usize;
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break, // EOF (shouldn't happen on serial, but handle it)
-            Ok(_) => {
-                let trimmed = line.trim_end_matches(['\r', '\n']);
-                if trimmed.starts_with(">>") {
-                    break;
-                }
-                output.push_str(trimmed);
-                output.push('\n');
-            }
+        if Instant::now() >= deadline {
+            bail!(
+                "no `>>` prompt from the hub within {:.1}s — is -d the hub's control UART?",
+                budget.as_secs_f64()
+            );
+        }
+        let chunk = match reader.fill_buf() {
+            Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
             Err(e) => return Err(anyhow!("read error: {e}")),
+        };
+        if chunk.is_empty() {
+            break; // EOF (shouldn't happen on serial, but handle it)
+        }
+        let n = chunk.len().min(cap - total);
+        pending.extend_from_slice(&chunk[..n]);
+        reader.consume(n);
+        total += n;
+
+        while let Some(nl) = pending.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = pending.drain(..=nl).collect();
+            let text = String::from_utf8_lossy(&line);
+            let trimmed = text.trim_end_matches(['\r', '\n']);
+            if trimmed.starts_with(">>") {
+                return Ok(output);
+            }
+            if is_error_line(trimmed) {
+                bail!("hub reported an error: {trimmed}");
+            }
+            output.push_str(trimmed);
+            output.push('\n');
+        }
+        if total >= cap {
+            bail!("hub sent {cap} bytes without a `>>` prompt — is -d the hub's control UART?");
         }
     }
     Ok(output)
@@ -146,6 +227,7 @@ pub fn run_command(port: &mut Box<dyn SerialPort>, cmd: &str) -> Result<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Cursor, Read};
 
     const SAMPLE: &str = "\
  0, 0531, 0000, P F -, 121, 6795, 0.00
@@ -178,7 +260,7 @@ mod tests {
         let r = rows.iter().find(|r| r.port == 4).unwrap();
         assert_eq!(r.attach, 'A');
         assert_eq!(r.mode, 'C');
-        assert!(r.is_on(), "port 4 mode C should be on");
+        assert!(r.is_on().unwrap(), "port 4 mode C should be on");
         assert_eq!(r.volts_raw, 509);
         assert_eq!(r.milliamps, 538);
     }
@@ -189,7 +271,10 @@ mod tests {
         let rows = parse_state(SAMPLE);
         let r = rows.iter().find(|r| r.port == 2).unwrap();
         assert_eq!(r.mode, 'I');
-        assert!(r.is_on(), "port 2 mode I (idle) should be considered on");
+        assert!(
+            r.is_on().unwrap(),
+            "port 2 mode I (idle) should be considered on"
+        );
     }
 
     #[test]
@@ -197,7 +282,7 @@ mod tests {
         let rows = parse_state(SAMPLE);
         let r = rows.iter().find(|r| r.port == 3).unwrap();
         assert_eq!(r.mode, 'I');
-        assert!(r.is_on());
+        assert!(r.is_on().unwrap());
     }
 
     #[test]
@@ -205,7 +290,47 @@ mod tests {
         // A synthetic line with mode 'O' → is_on() == false.
         let row = parse_state_line(" 5, 0000, 0000, D O -, 0, x, 0.00").unwrap();
         assert_eq!(row.mode, 'O');
-        assert!(!row.is_on(), "mode O should be off");
+        assert!(!row.is_on().unwrap(), "mode O should be off");
+    }
+
+    #[test]
+    fn is_on_is_an_allow_list() {
+        let with_mode = |mode: char| PortRow {
+            port: 7,
+            volts_raw: 0,
+            milliamps: 0,
+            attach: 'D',
+            mode,
+            rest: String::new(),
+        };
+        for m in ['C', 'S', 'I', 'c', 's', 'i'] {
+            assert!(with_mode(m).is_on().unwrap(), "mode {m}");
+        }
+        for m in ['O', 'o'] {
+            assert!(!with_mode(m).is_on().unwrap(), "mode {m}");
+        }
+        // The host-row flag and anything undocumented are errors that carry
+        // the raw letter, not a guessed `on`.
+        for m in ['F', 'X', '-', '?'] {
+            let err = with_mode(m).is_on().expect_err(&format!("mode {m}"));
+            assert!(err.to_string().contains(&format!("{m:?}")), "{err}");
+        }
+    }
+
+    #[test]
+    fn mode_confirms_only_the_commanded_profile() {
+        for m in ['C', 'S', 'I', 'c', 's', 'i'] {
+            assert!(mode_confirms(m, true), "{m} confirms on");
+        }
+        for m in ['O', 'F', 'X'] {
+            assert!(!mode_confirms(m, true), "{m} must not confirm on");
+        }
+        for m in ['O', 'o'] {
+            assert!(mode_confirms(m, false), "{m} confirms off");
+        }
+        for m in ['C', 'S', 'I', 'F'] {
+            assert!(!mode_confirms(m, false), "{m} must not confirm off");
+        }
     }
 
     #[test]
@@ -229,6 +354,124 @@ some garbage line\n\
         let r = rows.iter().find(|r| r.port == 1).unwrap();
         assert_eq!(r.volts_raw, 509);
         assert_eq!(r.milliamps, 245);
-        assert!(r.is_on());
+        assert!(r.is_on().unwrap());
+    }
+
+    #[test]
+    fn error_marker_lines() {
+        for l in [
+            "E01: Unrecognised command",
+            "E1",
+            " E42 bad port",
+            "Error: no",
+            "some error here",
+            "ERROR",
+        ] {
+            assert!(is_error_line(l), "{l:?}");
+        }
+        for l in [
+            "mode c 4",
+            "state",
+            " 1, 0509, 0245, A C -, 489675, x, 168.67",
+            "E",
+            "Extra",
+            "Enable",
+            ">> ",
+        ] {
+            assert!(!is_error_line(l), "{l:?}");
+        }
+    }
+
+    /// A reader that repeats `pattern` forever, never blocking.
+    struct Chatty {
+        pattern: &'static [u8],
+        pos: usize,
+    }
+
+    impl Read for Chatty {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            for b in buf.iter_mut() {
+                *b = self.pattern[self.pos];
+                self.pos = (self.pos + 1) % self.pattern.len();
+            }
+            Ok(buf.len())
+        }
+    }
+
+    /// A reader that yields one byte per call after `delay`, never a newline
+    /// or a prompt — the shape of a serial line that is slowly emitting
+    /// something that is not a Cambrionix hub.
+    struct Slow {
+        delay: Duration,
+    }
+
+    impl Read for Slow {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(self.delay);
+            buf[0] = b'z';
+            Ok(1)
+        }
+    }
+
+    const LONG: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn collects_lines_up_to_the_prompt() {
+        let mut r = Cursor::new(
+            b"mode c 4\r\n 4, 0509, 0538, A C -, 85285, x, 54.47\r\n>> \r\ntrailing\r\n",
+        );
+        let out = collect_response(&mut r, LONG, RESPONSE_CAP).unwrap();
+        assert_eq!(out, "mode c 4\n 4, 0509, 0538, A C -, 85285, x, 54.47\n");
+    }
+
+    #[test]
+    fn eof_without_prompt_returns_what_arrived() {
+        let mut r = Cursor::new(b"state\r\n 0, 0531, 0000, P F -, 121, 6795, 0.00\r\npartial");
+        let out = collect_response(&mut r, LONG, RESPONSE_CAP).unwrap();
+        assert_eq!(out, "state\n 0, 0531, 0000, P F -, 121, 6795, 0.00\n");
+    }
+
+    #[test]
+    fn hub_error_lines_fail_the_command() {
+        let mut r = Cursor::new(b"mode c 99\r\nE01: Unrecognised command\r\n>> ");
+        let err = collect_response(&mut r, LONG, RESPONSE_CAP).unwrap_err();
+        assert!(err.to_string().contains("E01"), "{err}");
+    }
+
+    #[test]
+    fn endless_lines_stop_at_the_byte_cap() {
+        let mut r = BufReader::new(Chatty {
+            pattern: b"garbage line\n",
+            pos: 0,
+        });
+        let start = Instant::now();
+        let err = collect_response(&mut r, LONG, 4096).unwrap_err();
+        assert!(err.to_string().contains("4096"), "{err}");
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn endless_bytes_without_newline_stop_at_the_byte_cap() {
+        let mut r = BufReader::new(Chatty {
+            pattern: b"x",
+            pos: 0,
+        });
+        let err = collect_response(&mut r, LONG, 4096).unwrap_err();
+        assert!(err.to_string().contains("4096"), "{err}");
+    }
+
+    #[test]
+    fn slow_stream_without_prompt_stops_at_the_deadline() {
+        let mut r = BufReader::new(Slow {
+            delay: Duration::from_millis(10),
+        });
+        let start = Instant::now();
+        let err = collect_response(&mut r, Duration::from_millis(150), RESPONSE_CAP).unwrap_err();
+        assert!(err.to_string().contains("prompt"), "{err}");
+        let took = start.elapsed();
+        assert!(
+            took >= Duration::from_millis(150) && took < Duration::from_secs(2),
+            "took {took:?}"
+        );
     }
 }

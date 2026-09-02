@@ -67,7 +67,7 @@ Mirror the existing helpers so hooks read uniformly across hardware:
 <helper> -d <device> on <id>                  # switch on; confirm if the hw can report
 <helper> -d <device> off <id>                 # switch off; confirm
 <helper> -d <device> state <id>               # print exactly "on" or "off"
-<helper> -d <device> cycle <id> [--delay-ms 3000]   # off → delay → on → confirm
+<helper> -d <device> cycle <id> [--delay-ms 3000]   # off → confirm → delay → on → confirm
 <helper> -d <device> state                    # (optional) human-readable table of all ids
 ```
 
@@ -77,8 +77,13 @@ Mirror the existing helpers so hooks read uniformly across hardware:
   configuration-free.
 - **Confirm by read-back wherever the hardware can report state.** `on`/`off`
   should verify the result and exit non-zero on mismatch (`zigplug` reads the
-  OnOff attribute back; `cambrionix` re-reads the port table after `cycle`).
-  A power-cycle that silently failed costs a whole debugging session.
+  OnOff attribute back; `cambrionix` re-reads the port table after every
+  `mode` command). `cycle` should confirm *both* phases — that power actually
+  went off before the hold, not just that it came back — because a relay that
+  ignored the off command otherwise produces a "cycle" that never removed
+  power. And `state` must map only the readings it understands: an unknown
+  value is an error carrying the raw reading, never a guessed `off`. A
+  power-cycle that silently failed costs a whole debugging session.
 - `cycle` defaults to a 3000 ms off-hold (both exemplars) — long enough for
   target PSU caps to drain.
 - Device lifecycle commands beyond the contract are fine (`zigplug form` /

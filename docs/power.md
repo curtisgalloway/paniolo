@@ -239,15 +239,25 @@ through `paniolo helper cambrionix …`.
 ```bash
 cambrionix -d <device> state              # table of all ports (volts, mA, attach/mode)
 cambrionix -d <device> state <port>       # print exactly "on" or "off" (state_cmd contract)
-cambrionix -d <device> on <port>          # mode c (charging/on)
-cambrionix -d <device> off <port>         # mode o (off)
+cambrionix -d <device> on <port>          # mode c (charging/on), confirm by read-back
+cambrionix -d <device> off <port>         # mode o (off), confirm by read-back
 cambrionix -d <device> cycle <port> [--delay-ms 3000]
-                                          # off → delay → restore prior mode → confirm on
+                                          # off → confirm → delay → restore prior mode → confirm
 ```
 
 Ports 1–15 are accepted. Port 0 is the hub's own host/system row (read-only in
 the table output). `cycle` restores the previous mode: Sync (`s`) if it was
 Sync, otherwise charging (`c`).
+
+Every transition is confirmed by re-reading the port table — the hub accepts
+a `mode` command without acknowledging it, so the read-back is the only
+evidence it took. `on` requires the port to report mode `C` or `S`, `off`
+requires `O`, and `cycle` checks both phases; a mismatch exits non-zero
+instead of printing success. `state <port>` maps `C`/`S`/`I` to `on` and `O`
+to `off`, and errors on any other mode letter rather than guessing. Each
+response is bounded (3 s, 64 KiB) and a line the hub flags as an error fails
+the command, so a `-d` that points at some other chatty UART fails fast
+instead of hanging the hook.
 
 ### Wiring into paniolo power hooks
 
@@ -441,7 +451,7 @@ shellyplug -d <host> state  [id]          # print exactly "on" or "off" (state_c
 shellyplug -d <host> on     [id]          # switch on, confirm by read-back
 shellyplug -d <host> off    [id]          # switch off, confirm by read-back
 shellyplug -d <host> cycle  [id] [--delay-ms 3000]
-                                          # off → delay → on → confirm
+                                          # off → confirm → delay → on → confirm
 ```
 
 ### Wiring into paniolo power hooks
@@ -576,18 +586,29 @@ amt -d <host> status                 # firmware identity + power state detail
 amt -d <host> state                  # print exactly "on" or "off" (state_cmd contract)
 amt -d <host> on                     # power on, confirm by read-back
 amt -d <host> off                    # power off (hard), confirm by read-back
-amt -d <host> cycle [--delay-ms 3000]  # off → delay → on → confirm
+amt -d <host> cycle [--delay-ms 3000]  # off → confirm → delay → on → confirm
 ```
 
-- `-d <host>` is an IP or hostname, optionally with a port (default 16992);
-  `-u <user>` sets the Digest username (default `admin`).
+- `-d <host>` is a hostname, IPv4 address, or bracketed IPv6 literal
+  (`[fe80::1]`), optionally with a port (default 16992); an `http://` prefix
+  is tolerated. Anything else URL-shaped — a path, query, userinfo, or an
+  unbracketed IPv6 address — is rejected with a clear error rather than sent
+  as part of the request. `-u <user>` sets the Digest username (default
+  `admin`).
 - `state` prints `on` only when the host is running (PowerState 2); sleep,
-  hibernate, and soft-off all print `off`.
+  hibernate, and soft-off all print `off`. Any other reported PowerState
+  (`Other`, or one of the transitional power-cycle/reset values) is an error
+  naming the raw value — the hook never guesses.
 - `off` is the CIM "Off - Soft" **unconditional power-off** — equivalent to
-  holding the power button, not a graceful OS shutdown.
-- `cycle` is built as off → delay → on rather than the fixed CIM power-cycle
-  state, so the off-hold matches the other helpers' `--delay-ms` semantics;
-  it produces a genuine cold boot (POST) and confirms by read-back.
+  holding the power button, not a graceful OS shutdown — and is confirmed by
+  waiting for the ME to report Off - Soft.
+- `cycle` is built as off → confirm → delay → on → confirm rather than the
+  fixed CIM power-cycle state, so the off-hold matches the other helpers'
+  `--delay-ms` semantics. The off phase runs for any host **not already at
+  Off - Soft** — a sleeping (S3) or hibernating host is powered off and held,
+  not merely resumed — and each phase is confirmed by read-back, so the
+  result is a genuine cold boot (POST). Only a host already soft-off skips
+  straight to power-on.
 
 ### Wiring into paniolo power hooks
 
@@ -610,11 +631,15 @@ set (the `op run … bash -c '…'` pattern above).
   requests fail with "no route to host" (observed on a Dell OptiPlex 7060:
   the power-on succeeded but the immediate read-back could not connect). The
   helper absorbs this: power requests and read-back polling retry transient
-  transport errors for up to 20 s. If a machine stays unreachable longer
-  than that, treat it as real.
+  transport errors (connection failures, I/O timeouts, DNS) within a 20 s
+  budget that also bounds each individual attempt. Deterministic failures —
+  a bad address, an unparseable response, a proxy problem — fail
+  immediately. If a machine stays unreachable longer than 20 s, treat it as
+  real.
 - **`state` reflects the host, not the outlet.** Sleep (S3) and hibernate
   report `off` — the OS isn't running — even though the PSU has power. `on`
-  from any of those states boots/wakes the machine.
+  from any of those states boots/wakes the machine; `cycle` from any of them
+  holds the machine off first, so it cold-boots rather than resumes.
 - **BIOS "AC Recovery" is irrelevant here** (unlike outlet-based helpers):
   AMT's power-on is an explicit command to the ME, not a power restore, so
   it works regardless of the AC-recovery BIOS setting.
