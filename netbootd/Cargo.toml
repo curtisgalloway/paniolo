@@ -31,7 +31,7 @@ path = "src/bin/netbootd-bpf-helper.rs"
 
 [dependencies]
 # --- Async runtime -------------------------------------------------------
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util", "fs", "process"] }
 
 # --- Socket options (SO_REUSEADDR, interface-pinned reply sockets) -------
 socket2 = "0.5"

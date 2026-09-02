@@ -28,16 +28,33 @@
 //! **no `/dev/bpf` raw-frame path, no setuid helper, no static ARP pin.** Path
 //! resolution reuses [`crate::served::resolve`], so traversal safety is shared
 //! with TFTP.
+//!
+//! The listener is pinned to the netboot interface (see `pin`) — an unpinned
+//! wildcard listener would serve the root directory to the host's primary
+//! NIC too — and stays IPv4, which is what macOS `IP_BOUND_IF` applies to.
+//! Against a peer that is not a well-behaved boot client: a request head (and
+//! any body it declares) must arrive within [`HEAD_TIMEOUT`]; at most
+//! [`MAX_CONNECTIONS`] connections are served at once; HTTP/1.0 defaults to
+//! `Connection: close`; and a body is exactly the `Content-Length` announced
+//! for it, whatever the file does underneath us, so keep-alive framing can
+//! never desync.
 
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
 use tracing::{info, warn};
 
-use crate::served::resolve;
+use crate::pin::pin_socket_to_interface;
+use crate::served::{loggable, resolve};
 
 const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 /// Streaming copy buffer for GET bodies (boot payloads can be tens of MB, so we
@@ -47,21 +64,81 @@ const COPY_CHUNK: usize = 64 * 1024;
 /// head is a few hundred bytes; this just stops a peer from streaming forever
 /// without a terminator.
 const MAX_HEAD_BYTES: usize = 16 * 1024;
+/// How long a connection may take to deliver one request head (and drain the
+/// body it declared). A boot client sends its head in one segment; a peer that
+/// trickles bytes, or connects and says nothing, is cut off here.
+pub const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
+/// Concurrent connections served at once. One boot client opens a handful;
+/// beyond this, new connections wait in the kernel backlog.
+pub const MAX_CONNECTIONS: usize = 64;
+/// Listen backlog: how many not-yet-accepted connections the kernel queues.
+const BACKLOG: i32 = 128;
 
-/// Run the HTTP server until the task is cancelled.
-pub async fn serve(root: PathBuf, port: u16, content_type: Option<String>) -> Result<()> {
+/// Bind the HTTP listen socket on `0.0.0.0:port`, pinned to the netboot
+/// interface. The pin is what keeps the file server off every other interface
+/// on the host, so a pin that cannot be applied is fatal. IPv4 only: on macOS
+/// `IP_BOUND_IF` is an IPv4 socket option, and the boot URL we advertise is
+/// an IPv4 literal anyway.
+///
+/// `SO_REUSEADDR` stays on for this TCP listener: after a restart the previous
+/// instance's connections may still sit in TIME_WAIT on this port, and without
+/// it `bind` fails with EADDRINUSE for up to 2×MSL. It does not let a second
+/// live listener share the port (that would need `SO_REUSEPORT`).
+pub fn bind_server(port: u16, interface: &str) -> Result<TcpListener> {
+    let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    sock.set_reuse_address(true)?;
+    pin_socket_to_interface(&sock, interface)
+        .with_context(|| format!("pin HTTP socket to interface {interface}"))?;
+    let addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port);
+    sock.bind(&addr.into()).with_context(|| {
+        format!("bind HTTP port {port} (need root/CAP_NET_BIND_SERVICE on Linux)")
+    })?;
+    sock.listen(BACKLOG)?;
+    sock.set_nonblocking(true)?;
+    Ok(TcpListener::from_std(sock.into())?)
+}
+
+/// What every connection handler needs.
+struct ConnConfig {
+    root: PathBuf,
+    ctype: String,
+    /// [`HEAD_TIMEOUT`] in service; the tests shrink it.
+    head_timeout: Duration,
+}
+
+/// Run the HTTP server on an already-bound listener until the task is
+/// cancelled.
+pub async fn serve(
+    listener: TcpListener,
+    root: PathBuf,
+    content_type: Option<String>,
+) -> Result<()> {
     let root = root
         .canonicalize()
         .with_context(|| format!("HTTP root {} does not exist", root.display()))?;
-    let listener = TcpListener::bind(("0.0.0.0", port))
-        .await
-        .with_context(|| {
-            format!("bind HTTP port {port} (need root/CAP_NET_BIND_SERVICE on Linux)")
-        })?;
     let content_type = content_type.unwrap_or_else(|| DEFAULT_CONTENT_TYPE.to_string());
-    info!(root = %root.display(), content_type, "HTTP listening on 0.0.0.0:{port}");
+    info!(
+        root = %root.display(),
+        content_type,
+        "HTTP listening on {}",
+        listener.local_addr()?
+    );
+    let cfg = Arc::new(ConnConfig {
+        root,
+        ctype: content_type,
+        head_timeout: HEAD_TIMEOUT,
+    });
+    let limiter = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
     loop {
+        // Take the slot before accepting: at the cap, new connections queue in
+        // the backlog until a handler finishes (and every handler is bounded
+        // by the head timeout, so a slot always comes back).
+        let permit = limiter
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("connection limiter is never closed");
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
@@ -69,10 +146,10 @@ pub async fn serve(root: PathBuf, port: u16, content_type: Option<String>) -> Re
                 continue;
             }
         };
-        let root = root.clone();
-        let ctype = content_type.clone();
+        let cfg = cfg.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(stream, root, ctype).await {
+            let _slot = permit;
+            if let Err(e) = handle_conn(stream, &cfg).await {
                 warn!("HTTP {peer}: {e:#}");
             }
         });
@@ -115,8 +192,12 @@ async fn read_head<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Head>> {
     let mut it = req_line.split_whitespace();
     let method = it.next().unwrap_or("").to_string();
     let target = it.next().unwrap_or("").to_string();
+    let version = it.next().unwrap_or("");
 
-    let mut keep_alive = true; // HTTP/1.1 default
+    // Persistence is per protocol version: HTTP/1.1 keeps the connection open
+    // unless told otherwise, HTTP/1.0 (and anything unrecognised) closes it
+    // unless the client asks for keep-alive. `Connection:` then overrides.
+    let mut keep_alive = version.eq_ignore_ascii_case("HTTP/1.1");
     let mut content_length = 0usize;
     for h in lines {
         let Some((name, value)) = h.split_once(':') else {
@@ -125,7 +206,14 @@ async fn read_head<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Head>> {
         let name = name.trim().to_ascii_lowercase();
         let value = value.trim();
         match name.as_str() {
-            "connection" => keep_alive = !value.eq_ignore_ascii_case("close"),
+            "connection" => {
+                let mut tokens = value.split(',').map(str::trim);
+                if tokens.clone().any(|t| t.eq_ignore_ascii_case("close")) {
+                    keep_alive = false;
+                } else if tokens.any(|t| t.eq_ignore_ascii_case("keep-alive")) {
+                    keep_alive = true;
+                }
+            }
             "content-length" => content_length = value.parse().unwrap_or(0),
             _ => {}
         }
@@ -138,24 +226,55 @@ async fn read_head<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Head>> {
     }))
 }
 
-async fn handle_conn(stream: TcpStream, root: PathBuf, ctype: String) -> Result<()> {
+/// Discard `remaining` bytes of a declared request body. `Ok(false)` if the
+/// peer closed before sending them all.
+async fn drain_body<R: AsyncRead + Unpin>(r: &mut R, mut remaining: usize) -> Result<bool> {
+    let mut sink = [0u8; 4096];
+    while remaining > 0 {
+        let want = remaining.min(sink.len());
+        let got = r.read(&mut sink[..want]).await?;
+        if got == 0 {
+            return Ok(false);
+        }
+        remaining -= got;
+    }
+    Ok(true)
+}
+
+async fn handle_conn(stream: TcpStream, cfg: &ConnConfig) -> Result<()> {
     let mut reader = BufReader::new(stream);
     loop {
-        let Some(head) = read_head(&mut reader).await? else {
-            return Ok(());
+        let head = match timeout(cfg.head_timeout, read_head(&mut reader)).await {
+            Ok(Ok(Some(head))) => head,
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => anyhow::bail!(
+                "no complete request head within {:?}; closing",
+                cfg.head_timeout
+            ),
         };
+        // The method and target come off the wire; only their sanitized forms
+        // reach the log.
+        let method = loggable(&head.method);
+        let target = loggable(&head.target);
 
         // GET/HEAD carry no body, but drain a declared one so the next request
-        // on a kept-alive connection stays framed.
-        let mut remaining = head.content_length;
-        let mut sink = [0u8; 4096];
-        while remaining > 0 {
-            let want = remaining.min(sink.len());
-            let got = reader.read(&mut sink[..want]).await?;
-            if got == 0 {
-                return Ok(());
-            }
-            remaining -= got;
+        // on a kept-alive connection stays framed — on the same clock as the
+        // head, so a declared-but-never-sent body cannot park the connection.
+        match timeout(
+            cfg.head_timeout,
+            drain_body(&mut reader, head.content_length),
+        )
+        .await
+        {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => return Ok(()),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => anyhow::bail!(
+                "declared {}-byte body not delivered within {:?}; closing",
+                head.content_length,
+                cfg.head_timeout
+            ),
         }
 
         let head_only = head.method.eq_ignore_ascii_case("HEAD");
@@ -163,7 +282,7 @@ async fn handle_conn(stream: TcpStream, root: PathBuf, ctype: String) -> Result<
         let stream = reader.get_mut();
 
         if !is_get && !head_only {
-            info!("{} {} -> 405", head.method, head.target);
+            info!("{method} {target} -> 405");
             write_status(
                 stream,
                 405,
@@ -172,18 +291,18 @@ async fn handle_conn(stream: TcpStream, root: PathBuf, ctype: String) -> Result<
                 head_only,
             )
             .await?;
-        } else if let Some(path) = resolve_target(&root, &head.target) {
+        } else if let Some(path) = resolve_target(&cfg.root, &head.target) {
             serve_file(
                 stream,
                 &path,
-                &ctype,
+                &cfg.ctype,
                 head.keep_alive,
                 head_only,
-                &head.target,
+                &target,
             )
             .await?;
         } else {
-            info!("{} {} -> 404", head.method, head.target);
+            info!("{method} {target} -> 404");
             write_status(stream, 404, "Not Found", head.keep_alive, head_only).await?;
         }
 
@@ -238,6 +357,15 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Send `path` as a 200 response. `target` is the already-sanitized
+/// request-target, for the log line only.
+///
+/// The body is exactly the `Content-Length` announced in the header — the
+/// file's size at the moment it was opened. If the file grows meanwhile the
+/// extra bytes are not sent (they would be read as the start of the next
+/// response on a kept-alive connection); if it shrinks, the announced length
+/// cannot be honoured and the connection is dropped, so the client sees a
+/// truncated body rather than a mis-framed one.
 async fn serve_file<W: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut W,
     path: &Path,
@@ -268,12 +396,18 @@ async fn serve_file<W: AsyncRead + AsyncWrite + Unpin>(
     if !head_only {
         let mut file = file;
         let mut buf = vec![0u8; COPY_CHUNK];
-        loop {
-            let n = file.read(&mut buf).await?;
+        let mut remaining = len;
+        while remaining > 0 {
+            let want = remaining.min(COPY_CHUNK as u64) as usize;
+            let n = file.read(&mut buf[..want]).await?;
             if n == 0 {
-                break;
+                anyhow::bail!(
+                    "{target}: file shrank mid-transfer ({remaining} of {len} bytes unsent); \
+                     dropping the connection rather than mis-frame it"
+                );
             }
             stream.write_all(&buf[..n]).await?;
+            remaining -= n as u64;
         }
     }
     stream.flush().await?;
@@ -319,6 +453,14 @@ mod tests {
         p
     }
 
+    fn cfg(root: PathBuf, ctype: &str, head_timeout: Duration) -> ConnConfig {
+        ConnConfig {
+            root,
+            ctype: ctype.to_string(),
+            head_timeout,
+        }
+    }
+
     fn split_response(resp: &[u8]) -> (String, Vec<u8>) {
         let sep = b"\r\n\r\n";
         let pos = resp
@@ -339,21 +481,26 @@ mod tests {
     }
 
     /// Drive one request through `handle_conn` over a real loopback TCP pair and
-    /// return the raw response bytes. The request must close the connection
-    /// (`Connection: close`) so the client's read-to-EOF completes.
+    /// return the raw response bytes. The request must make the server close
+    /// the connection (`Connection: close`, or HTTP/1.0) so the client's
+    /// read-to-EOF completes — and it must do so within a few seconds, or the
+    /// server is holding the connection open when it should not.
     async fn roundtrip(root: PathBuf, ctype: &str, request: &[u8]) -> Vec<u8> {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let ctype = ctype.to_string();
+        let cfg = cfg(root, ctype, HEAD_TIMEOUT);
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_conn(stream, root, ctype).await.unwrap();
+            handle_conn(stream, &cfg).await.unwrap();
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
         client.write_all(request).await.unwrap();
         let mut resp = Vec::new();
-        client.read_to_end(&mut resp).await.unwrap();
+        timeout(Duration::from_secs(5), client.read_to_end(&mut resp))
+            .await
+            .expect("server closed the connection after the response")
+            .unwrap();
         server.await.unwrap();
         resp
     }
@@ -470,6 +617,191 @@ mod tests {
             body, b"set timeout=0\n",
             "query string stripped, file served"
         );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// HTTP/1.0 has no persistent connections unless the client asks: with no
+    /// `Connection:` header at all the server must close after the response.
+    #[tokio::test]
+    async fn http10_without_connection_header_closes() {
+        let root = tmp();
+        fs::write(root.join("boot.efi"), b"v1.0").unwrap();
+
+        // `roundtrip` itself fails (5 s read-to-EOF timeout) if the server
+        // keeps the connection open.
+        let resp = roundtrip(
+            root.clone(),
+            "application/octet-stream",
+            b"GET /boot.efi HTTP/1.0\r\n\r\n",
+        )
+        .await;
+        let (head, body) = split_response(&resp);
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "head: {head}");
+        assert_eq!(header_value(&head, "Connection"), Some("close"));
+        assert_eq!(body, b"v1.0");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// HTTP/1.1 still defaults to keep-alive: two pipelined requests are both
+    /// answered on the one connection, and it closes only when asked.
+    #[tokio::test]
+    async fn http11_keeps_the_connection_until_told_to_close() {
+        let root = tmp();
+        fs::write(root.join("a"), b"first").unwrap();
+        fs::write(root.join("b"), b"second").unwrap();
+
+        let resp = roundtrip(
+            root.clone(),
+            "application/octet-stream",
+            b"GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let text = String::from_utf8_lossy(&resp);
+        assert_eq!(text.matches("HTTP/1.1 200 OK").count(), 2, "{text}");
+        assert!(text.contains("first") && text.contains("second"), "{text}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn read_head_persistence_follows_version_then_connection_header() {
+        async fn keep_alive(req: &[u8]) -> bool {
+            read_head(&mut &req[..]).await.unwrap().unwrap().keep_alive
+        }
+        assert!(keep_alive(b"GET / HTTP/1.1\r\n\r\n").await);
+        assert!(!keep_alive(b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n").await);
+        assert!(!keep_alive(b"GET / HTTP/1.0\r\n\r\n").await);
+        assert!(keep_alive(b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n").await);
+        assert!(keep_alive(b"GET / HTTP/1.0\r\nConnection: Keep-Alive, TE\r\n\r\n").await);
+        assert!(!keep_alive(b"GET / HTTP/1.1\r\nConnection: TE, close\r\n\r\n").await);
+        assert!(
+            !keep_alive(b"GET / HTTP/0.9\r\n\r\n").await,
+            "unknown version closes"
+        );
+    }
+
+    /// A client that connects and sends only part of a head (or nothing) is
+    /// cut off at the head timeout instead of holding a slot forever.
+    #[tokio::test]
+    async fn slow_head_is_timed_out() {
+        let root = tmp();
+        fs::write(root.join("boot.efi"), b"x").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cfg = cfg(
+            root.clone(),
+            "application/octet-stream",
+            Duration::from_millis(200),
+        );
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_conn(stream, &cfg).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        // A request line but never the blank-line terminator.
+        client
+            .write_all(b"GET /boot.efi HTTP/1.1\r\nHost: x\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        let started = std::time::Instant::now();
+        timeout(Duration::from_secs(3), client.read_to_end(&mut resp))
+            .await
+            .expect("server must close the connection at the head timeout")
+            .unwrap();
+        assert!(resp.is_empty(), "no response to an incomplete request");
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "closed only after the timeout, not on the first read"
+        );
+        let err = server
+            .await
+            .unwrap()
+            .expect_err("handler reports the timeout");
+        assert!(
+            err.to_string().contains("no complete request head"),
+            "{err}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Serve a file through `serve_file` over an in-memory pipe so small that
+    /// the server blocks on every kilobyte — which lets the test change the
+    /// file underneath it, deterministically, before the body is through.
+    /// Returns (server result, response bytes).
+    async fn serve_while<F>(path: PathBuf, meddle: F) -> (Result<()>, Vec<u8>)
+    where
+        F: FnOnce(&Path),
+    {
+        let (mut srv, mut cli) = tokio::io::duplex(1024);
+        let p = path.clone();
+        let server = tokio::spawn(async move {
+            serve_file(&mut srv, &p, "application/octet-stream", false, false, "/f").await
+            // `srv` drops here, which is the client's EOF.
+        });
+
+        // Read until the header terminator, so the server is committed to a
+        // Content-Length but has streamed at most one chunk of the body.
+        let mut resp = Vec::new();
+        let mut buf = [0u8; 256];
+        while !resp.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = cli.read(&mut buf).await.unwrap();
+            assert!(n > 0, "server closed before finishing the header");
+            resp.extend_from_slice(&buf[..n]);
+        }
+        meddle(&path);
+        cli.read_to_end(&mut resp).await.unwrap();
+        (server.await.unwrap(), resp)
+    }
+
+    /// A file that grows while it is being served yields exactly the
+    /// `Content-Length` announced — never the extra bytes, which on a
+    /// kept-alive connection would be parsed as the next response.
+    #[tokio::test]
+    async fn body_is_bounded_by_content_length_when_the_file_grows() {
+        let root = tmp();
+        let path = root.join("f");
+        let original: Vec<u8> = (0..256 * 1024u32).map(|i| (i % 251) as u8).collect();
+        fs::write(&path, &original).unwrap();
+
+        let (result, resp) = serve_while(path.clone(), |p| {
+            let mut f = fs::OpenOptions::new().append(true).open(p).unwrap();
+            std::io::Write::write_all(&mut f, &vec![0xEEu8; 64 * 1024]).unwrap();
+        })
+        .await;
+        result.unwrap();
+        let (head, body) = split_response(&resp);
+        assert_eq!(
+            header_value(&head, "Content-Length"),
+            Some("262144"),
+            "length announced up front"
+        );
+        assert_eq!(
+            body.len(),
+            original.len(),
+            "not one byte past Content-Length"
+        );
+        assert_eq!(body, original);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A file that shrinks cannot honour the announced length: the connection
+    /// is dropped (an error from the handler) rather than padded or left
+    /// short with keep-alive framing intact.
+    #[tokio::test]
+    async fn shrinking_file_drops_the_connection() {
+        let root = tmp();
+        let path = root.join("f");
+        fs::write(&path, vec![0x5Au8; 256 * 1024]).unwrap();
+
+        let (result, resp) = serve_while(path.clone(), |p| {
+            fs::write(p, b"").unwrap();
+        })
+        .await;
+        let err = result.expect_err("cannot honour Content-Length");
+        assert!(err.to_string().contains("shrank"), "{err}");
+        let (_, body) = split_response(&resp);
+        assert!(body.len() < 256 * 1024, "body cut short, not padded");
         fs::remove_dir_all(&root).ok();
     }
 

@@ -12,15 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Traversal-safe path resolution shared by the file servers (TFTP + HTTP).
+//! What the file servers (TFTP + HTTP) share: traversal-safe path resolution
+//! and a sanitizer for the peer-supplied names they log.
 //!
 //! Both servers expose a single rooted directory and must never let a request
 //! escape it. [`resolve`] joins the requested name under `root`, canonicalizes
 //! it, and confirms the result is still inside the canonicalized root —
-//! rejecting `..` traversal, symlink escapes, and (because `canonicalize` fails
-//! on a missing path) probes for files that do not exist.
+//! rejecting `..` traversal, symlink escapes (a symlink *inside* the root that
+//! points outside it canonicalizes to the outside path and is refused), and
+//! (because `canonicalize` fails on a missing path) probes for files that do
+//! not exist.
 
 use std::path::{Path, PathBuf};
+
+/// Longest peer-supplied string [`loggable`] lets into the log.
+const MAX_LOG_CHARS: usize = 128;
 
 /// Resolve a requested filename inside `root`, rejecting traversal outside it.
 ///
@@ -33,6 +39,27 @@ pub fn resolve(root: &Path, filename: &str) -> Option<PathBuf> {
     let canon = candidate.canonicalize().ok()?;
     let root_canon = root.canonicalize().ok()?;
     canon.starts_with(&root_canon).then_some(canon)
+}
+
+/// A peer-supplied string (an HTTP request-target, a TFTP filename) made safe
+/// to write into `netboot.log`: anything but printable ASCII becomes `?`, so a
+/// terminal escape or a stray newline cannot forge log lines, and it is cut at
+/// [`MAX_LOG_CHARS`] (with a trailing `…`) so a 16 KB request head cannot
+/// land in the log whole.
+pub fn loggable(s: &str) -> String {
+    let mut out = String::with_capacity(s.len().min(MAX_LOG_CHARS + 4));
+    for (i, c) in s.chars().enumerate() {
+        if i == MAX_LOG_CHARS {
+            out.push('…');
+            break;
+        }
+        out.push(if c.is_ascii_graphic() || c == ' ' {
+            c
+        } else {
+            '?'
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -109,5 +136,46 @@ mod tests {
         // whether a sibling outside root exists).
         assert!(resolve(&root, "nope.img").is_none());
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_rejects_symlink_pointing_outside_root() {
+        // base/secret exists; base/served/link -> ../secret. The link lives
+        // inside the root but resolves outside it, so it must be refused.
+        let base = tmp();
+        let served = base.join("served");
+        fs::create_dir_all(&served).unwrap();
+        fs::write(base.join("secret"), b"top secret").unwrap();
+        std::os::unix::fs::symlink(base.join("secret"), served.join("link")).unwrap();
+
+        assert!(resolve(&served, "link").is_none(), "symlink escape");
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn loggable_passes_ordinary_names_through() {
+        assert_eq!(loggable("kernel_2712.img"), "kernel_2712.img");
+        assert_eq!(loggable("/grub/grub.cfg?v=1"), "/grub/grub.cfg?v=1");
+        assert_eq!(loggable("with space"), "with space");
+    }
+
+    #[test]
+    fn loggable_neutralises_control_bytes_and_non_ascii() {
+        // A terminal escape and a CR/LF (a forged log line) come out as `?`.
+        assert_eq!(loggable("a\x1b[31mb"), "a?[31mb");
+        assert_eq!(loggable("x\r\nINFO forged"), "x??INFO forged");
+        assert_eq!(loggable("\u{7f}\u{85}é"), "???");
+    }
+
+    #[test]
+    fn loggable_caps_the_length() {
+        let long = "a".repeat(10_000);
+        let shown = loggable(&long);
+        assert_eq!(shown.chars().count(), MAX_LOG_CHARS + 1);
+        assert!(shown.ends_with('…'));
+        // Exactly at the cap: nothing is cut and no ellipsis is added.
+        let exact = "b".repeat(MAX_LOG_CHARS);
+        assert_eq!(loggable(&exact), exact);
     }
 }

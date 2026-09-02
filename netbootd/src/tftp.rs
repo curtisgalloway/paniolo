@@ -18,6 +18,9 @@
 //! (RFC 2349) options the Raspberry Pi bootloader negotiates.
 //!
 //! Delivery model:
+//!   * **Listen socket pinning** — the port-69 socket is pinned to the netboot
+//!     interface (see `pin`) so requests arriving on any other interface are
+//!     never seen; a pin that fails is fatal.
 //!   * **Egress pinning** — each reply socket is tied to the netboot interface.
 //!     On macOS that's `IP_BOUND_IF` (survives the brief link-flap windows where
 //!     the interface IP is momentarily absent); elsewhere we bind the reply
@@ -27,7 +30,18 @@
 //!     (we *always* prefer it when available: on Sequoia `send_to` reports
 //!     success but silently misdelivers). ACKs are still received on the normal
 //!     UDP reply socket. If BPF is unavailable we fall back to `send_to`.
+//!
+//! Robustness against the other end of the link:
+//!   * a file is streamed one block at a time from disk, never read whole;
+//!   * each retransmit attempt has a fixed deadline, so a peer that keeps
+//!     sending junk cannot hold a transfer open past
+//!     `MAX_RETRIES × ACK_TIMEOUT`;
+//!   * a second RRQ from a client TID that already has a transfer in flight
+//!     replaces that transfer instead of adding a parallel sender;
+//!   * when replies go out as raw frames the negotiated `blksize` is capped so
+//!     a DATA block always fits one Ethernet frame ([`cap_blksize`]).
 
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,13 +49,17 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use socket2::{Domain, Protocol, Socket, Type};
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
-use tokio::time::timeout;
+use tokio::task::JoinHandle;
+use tokio::time::{timeout_at, Instant};
 use tracing::{info, warn};
 
 use crate::bpf::BpfSender;
-use crate::served::resolve;
+use crate::pin::pin_socket_to_interface;
+use crate::served::{loggable, resolve};
 
 const OP_RRQ: u16 = 1;
 const OP_WRQ: u16 = 2;
@@ -57,6 +75,24 @@ const ERR_ILLEGAL: u16 = 4;
 const DEFAULT_BLKSIZE: usize = 512;
 const ACK_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_RETRIES: usize = 6;
+/// The largest DATA payload that fits one untagged Ethernet frame:
+/// 1500 (MTU) − 20 (IPv4) − 8 (UDP) − 4 (TFTP opcode + block). The raw-frame
+/// sender builds a single frame per packet with DF set (`frame.rs`), so a
+/// bigger block could neither be fragmented nor transmitted.
+const MAX_RAW_FRAME_BLKSIZE: usize = 1468;
+
+/// The `blksize` to serve with. A client may ask for up to 65 464 bytes (RFC
+/// 2348); that is fine through the kernel, which fragments, but a DATA block
+/// sent as a raw frame must fit one Ethernet frame, so it is capped at
+/// [`MAX_RAW_FRAME_BLKSIZE`] whenever raw frames are what will go out. The
+/// OACK echoes the capped value, which is how TFTP negotiates down.
+fn cap_blksize(requested: usize, raw_frames: bool) -> usize {
+    if raw_frames {
+        requested.min(MAX_RAW_FRAME_BLKSIZE)
+    } else {
+        requested
+    }
+}
 
 /// Per-transfer context shared by the send helpers.
 #[derive(Clone)]
@@ -64,6 +100,17 @@ struct Xfer {
     host_ip: Ipv4Addr,
     bpf: Arc<BpfSender>,
     client_mac: Option<[u8; 6]>,
+    /// How long one attempt waits for its ACK before the block is resent.
+    /// [`ACK_TIMEOUT`] in service; the tests shrink it.
+    ack_timeout: Duration,
+}
+
+impl Xfer {
+    /// Whether replies will leave as raw frames (BPF available *and* the
+    /// client MAC known) rather than through the kernel.
+    fn raw_frames(&self) -> bool {
+        self.bpf.available() && self.client_mac.is_some()
+    }
 }
 
 struct Rrq {
@@ -117,35 +164,8 @@ fn error_packet(code: u16, msg: &str) -> Vec<u8> {
     p
 }
 
-/// macOS: pin a socket's traffic to `iface` via `IP_BOUND_IF`. This is the
-/// documented analogue of Linux `SO_BINDTODEVICE` and, unlike binding to the
-/// interface IP, keeps working when that IP momentarily disappears on a flap.
-#[cfg(target_os = "macos")]
-fn bind_socket_to_interface(sock: &Socket, iface: &str) -> std::io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let cname = std::ffi::CString::new(iface)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "iface has NUL"))?;
-    let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
-    if idx == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let idx: libc::c_uint = idx;
-    let rc = unsafe {
-        libc::setsockopt(
-            sock.as_raw_fd(),
-            libc::IPPROTO_IP,
-            libc::IP_BOUND_IF,
-            &idx as *const libc::c_uint as *const libc::c_void,
-            std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// Create a reply socket pinned to the netboot interface.
+/// Create a reply socket pinned to the netboot interface (`None` — the
+/// loopback tests — leaves it unpinned).
 fn bind_reply_socket(host_ip: Ipv4Addr, interface: Option<&str>) -> Result<UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
 
@@ -153,12 +173,13 @@ fn bind_reply_socket(host_ip: Ipv4Addr, interface: Option<&str>) -> Result<UdpSo
     {
         // Egress is pinned via IP_BOUND_IF, not the bind address, so host_ip is
         // unused here. Bind a wildcard ephemeral port so we do not depend on the
-        // interface IP being present at this instant.
+        // interface IP being present at this instant. A pin that fails aborts
+        // this transfer: an unpinned reply socket could send the block out of
+        // the wrong interface and receive ACKs on any of them.
         let _ = host_ip;
         if let Some(iface) = interface {
-            if let Err(e) = bind_socket_to_interface(&sock, iface) {
-                warn!("IP_BOUND_IF {iface} failed: {e}");
-            }
+            pin_socket_to_interface(&sock, iface)
+                .with_context(|| format!("pin TFTP reply socket to {iface}"))?;
         }
         let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
         sock.bind(&addr.into())
@@ -166,6 +187,9 @@ fn bind_reply_socket(host_ip: Ipv4Addr, interface: Option<&str>) -> Result<UdpSo
     }
     #[cfg(not(target_os = "macos"))]
     {
+        // Bound to the interface IP rather than pinned with SO_BINDTODEVICE:
+        // on Linux this runs after the privilege drop, and kernels before 5.7
+        // need CAP_NET_RAW for the pin. The source address selects the link.
         let _ = interface;
         let addr: SocketAddr = SocketAddr::new(host_ip.into(), 0);
         sock.bind(&addr.into())
@@ -204,6 +228,12 @@ async fn send_pkt(sock: &UdpSocket, packet: &[u8], peer: SocketAddr, xfer: &Xfer
 
 /// Send a packet and wait for an ACK of `expect_block`, retransmitting on
 /// timeout. Returns Ok(true) on ACK, Ok(false) on give-up/peer error.
+///
+/// Each attempt gets one fixed deadline, `ack_timeout` after its send. A
+/// datagram that is not the ACK we want (a duplicate ACK, a stray packet,
+/// deliberate junk) is skipped *without* touching that deadline, so the most
+/// a peer can make this wait is `MAX_RETRIES × ack_timeout` — it cannot keep
+/// a transfer alive by sending anything but the ACK.
 async fn send_and_wait_ack(
     sock: &UdpSocket,
     packet: &[u8],
@@ -214,8 +244,9 @@ async fn send_and_wait_ack(
     let mut ackbuf = [0u8; 64];
     for _ in 0..MAX_RETRIES {
         send_pkt(sock, packet, peer, xfer).await?;
+        let deadline = Instant::now() + xfer.ack_timeout;
         loop {
-            match timeout(ACK_TIMEOUT, sock.recv_from(&mut ackbuf)).await {
+            match timeout_at(deadline, sock.recv_from(&mut ackbuf)).await {
                 Ok(Ok((n, raddr))) => {
                     if raddr != peer || n < 4 {
                         continue;
@@ -229,14 +260,28 @@ async fn send_and_wait_ack(
                         warn!("ERROR from {peer} waiting for ACK of block {expect_block}");
                         return Ok(false);
                     }
-                    // stray packet; keep waiting within this attempt
+                    // Not our ACK; keep waiting out the same deadline.
                 }
                 Ok(Err(e)) => return Err(e.into()),
-                Err(_) => break, // timeout → retransmit
+                Err(_) => break, // deadline passed → retransmit
             }
         }
     }
     Ok(false)
+}
+
+/// Read the block at `offset` (up to `blksize` bytes; fewer at end of file)
+/// into `buf`, replacing its contents.
+async fn read_block(
+    file: &mut File,
+    offset: u64,
+    blksize: usize,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    buf.clear();
+    file.seek(SeekFrom::Start(offset)).await?;
+    file.take(blksize as u64).read_to_end(buf).await?;
+    Ok(())
 }
 
 async fn handle_rrq(
@@ -263,6 +308,8 @@ async fn handle_rrq(
         .await;
         return;
     };
+    // The filename comes off the wire; only its sanitized form reaches the log.
+    let shown = loggable(&rrq.filename);
     if rrq.mode != "octet" {
         let _ = send_pkt(
             &sock,
@@ -277,7 +324,7 @@ async fn handle_rrq(
     let path = match resolve(&root, &rrq.filename) {
         Some(p) if p.is_file() => p,
         _ => {
-            info!("RRQ {} from {peer} -> NOT FOUND", rrq.filename);
+            info!("RRQ {shown} from {peer} -> NOT FOUND");
             let _ = send_pkt(
                 &sock,
                 &error_packet(ERR_NOT_FOUND, "file not found"),
@@ -289,10 +336,25 @@ async fn handle_rrq(
         }
     };
 
-    let contents = match tokio::fs::read(&path).await {
-        Ok(c) => c,
+    // Open once and stream block by block: boot payloads run to tens of MB and
+    // there is no reason to hold one in memory per request.
+    let (mut file, size) = match File::open(&path).await {
+        Ok(f) => match f.metadata().await {
+            Ok(m) => (f, m.len()),
+            Err(e) => {
+                warn!("stat {}: {e}", path.display());
+                let _ = send_pkt(
+                    &sock,
+                    &error_packet(ERR_NOT_FOUND, "read error"),
+                    peer,
+                    &xfer,
+                )
+                .await;
+                return;
+            }
+        },
         Err(e) => {
-            warn!("read {}: {e}", path.display());
+            warn!("open {}: {e}", path.display());
             let _ = send_pkt(
                 &sock,
                 &error_packet(ERR_NOT_FOUND, "read error"),
@@ -303,13 +365,9 @@ async fn handle_rrq(
             return;
         }
     };
-    let size = contents.len();
-    let blksize = rrq.blksize.unwrap_or(DEFAULT_BLKSIZE);
+    let blksize = cap_blksize(rrq.blksize.unwrap_or(DEFAULT_BLKSIZE), xfer.raw_frames());
 
-    info!(
-        "RRQ {} from {peer} -> serving {size} bytes (blksize={blksize})",
-        rrq.filename
-    );
+    info!("RRQ {shown} from {peer} -> serving {size} bytes (blksize={blksize})");
 
     // OACK if the client requested any option we honor.
     if rrq.blksize.is_some() || rrq.want_tsize {
@@ -334,40 +392,59 @@ async fn handle_rrq(
         }
     }
 
-    // DATA/ACK loop. Block numbers wrap at 0xFFFF.
+    // DATA/ACK loop. Block numbers wrap at 0xFFFF. Each block is read from the
+    // file at its offset just before it is first sent; a retransmit resends
+    // those same bytes (a peer whose ACK was lost must get an identical block).
     let mut block: u16 = 1;
-    let mut offset = 0usize;
+    let mut offset = 0u64;
+    let mut chunk = Vec::with_capacity(blksize);
+    let mut packet = Vec::with_capacity(4 + blksize);
     loop {
-        let end = (offset + blksize).min(size);
-        let chunk = &contents[offset..end];
-        let mut packet = Vec::with_capacity(4 + chunk.len());
+        if let Err(e) = read_block(&mut file, offset, blksize, &mut chunk).await {
+            warn!("read {} at {offset}: {e}", path.display());
+            let _ = send_pkt(
+                &sock,
+                &error_packet(ERR_NOT_FOUND, "read error"),
+                peer,
+                &xfer,
+            )
+            .await;
+            return;
+        }
+        packet.clear();
         packet.extend_from_slice(&OP_DATA.to_be_bytes());
         packet.extend_from_slice(&block.to_be_bytes());
-        packet.extend_from_slice(chunk);
+        packet.extend_from_slice(&chunk);
 
         match send_and_wait_ack(&sock, &packet, peer, block, &xfer).await {
             Ok(true) => {}
             _ => {
-                warn!(
-                    "transfer of {} to {peer} failed at block {block}",
-                    rrq.filename
-                );
+                warn!("transfer of {shown} to {peer} failed at block {block}");
                 return;
             }
         }
-        offset = end;
+        offset += chunk.len() as u64;
         block = block.wrapping_add(1);
         if chunk.len() < blksize {
             break; // last (possibly empty) block was ACKed
         }
     }
-    info!("completed {} to {peer}", rrq.filename);
+    info!("completed {shown} to {peer}");
 }
 
-/// Bind the main TFTP listen socket on `0.0.0.0:port`.
-fn bind_server(port: u16) -> Result<UdpSocket> {
+/// Bind the TFTP listen socket on `0.0.0.0:port`, pinned to the netboot
+/// interface. The pin is what keeps the file server off every other interface
+/// on the host, so a pin that cannot be applied is fatal.
+///
+/// No `SO_REUSEADDR`: UDP has no TIME_WAIT to wait out on restart, and on
+/// Linux it would let a second netbootd bind the same port on the same
+/// interface and silently take some of the requests. Without it a duplicate
+/// fails here with EADDRINUSE. (A macOS duplicate wildcard bind would need
+/// `SO_REUSEPORT` either way.)
+pub fn bind_server(port: u16, interface: &str) -> Result<UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    sock.set_reuse_address(true)?;
+    pin_socket_to_interface(&sock, interface)
+        .with_context(|| format!("pin TFTP socket to interface {interface}"))?;
     let addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
     sock.bind(&addr.into()).with_context(|| {
         format!("bind TFTP port {port} (need root/CAP_NET_BIND_SERVICE on Linux)")
@@ -376,27 +453,53 @@ fn bind_server(port: u16) -> Result<UdpSocket> {
     Ok(UdpSocket::from_std(sock.into())?)
 }
 
-/// Run the TFTP server until the task is cancelled.
+/// Run the TFTP server on an already-bound listen socket until the task is
+/// cancelled.
 pub async fn serve(
+    sock: UdpSocket,
     host_ip: Ipv4Addr,
     root: PathBuf,
-    port: u16,
-    interface: Option<String>,
+    interface: String,
     bpf: Arc<BpfSender>,
     mac_rx: watch::Receiver<Option<[u8; 6]>>,
 ) -> Result<()> {
     let root = root
         .canonicalize()
         .with_context(|| format!("TFTP root {} does not exist", root.display()))?;
-    let sock = bind_server(port)?;
     info!(
         %host_ip,
         root = %root.display(),
         bpf = bpf.available(),
-        "TFTP listening on 0.0.0.0:{port}"
+        "TFTP listening on {} via {interface}",
+        sock.local_addr()?
     );
+    run(
+        sock,
+        root,
+        host_ip,
+        Some(interface),
+        bpf,
+        mac_rx,
+        ACK_TIMEOUT,
+    )
+    .await
+}
 
+/// The request dispatcher: one task per RRQ, keyed by the client's TID (its
+/// source address) so a repeated RRQ from a TID with a transfer in flight
+/// replaces that transfer — a client that restarted its request gets one
+/// sender, not one per attempt.
+async fn run(
+    sock: UdpSocket,
+    root: PathBuf,
+    host_ip: Ipv4Addr,
+    interface: Option<String>,
+    bpf: Arc<BpfSender>,
+    mac_rx: watch::Receiver<Option<[u8; 6]>>,
+    ack_timeout: Duration,
+) -> Result<()> {
     let mut buf = vec![0u8; 4096];
+    let mut inflight: HashMap<SocketAddr, JoinHandle<()>> = HashMap::new();
     loop {
         let (n, peer) = match sock.recv_from(&mut buf).await {
             Ok(v) => v,
@@ -414,13 +517,23 @@ pub async fn serve(
             host_ip,
             bpf: bpf.clone(),
             client_mac: *mac_rx.borrow(),
+            ack_timeout,
         };
         match opcode {
             OP_RRQ => {
+                inflight.retain(|_, h| !h.is_finished());
+                if let Some(old) = inflight.remove(&peer) {
+                    info!("RRQ from {peer} while a transfer to it is in flight; replacing it");
+                    old.abort();
+                }
                 let data = buf[..n].to_vec();
                 let root = root.clone();
                 let interface = interface.clone();
-                tokio::spawn(async move { handle_rrq(root, data, peer, interface, xfer).await });
+                let task =
+                    tokio::spawn(
+                        async move { handle_rrq(root, data, peer, interface, xfer).await },
+                    );
+                inflight.insert(peer, task);
             }
             OP_WRQ => {
                 // Read-only server: reject writes.
@@ -549,6 +662,34 @@ mod tests {
         assert_eq!(*p.last().unwrap(), 0, "error message is NUL-terminated");
     }
 
+    /// With the raw-frame sender active a block must fit one Ethernet frame;
+    /// through the kernel the client's request stands.
+    #[test]
+    fn blksize_is_capped_only_for_raw_frames() {
+        assert_eq!(cap_blksize(4096, true), MAX_RAW_FRAME_BLKSIZE);
+        assert_eq!(cap_blksize(65464, true), MAX_RAW_FRAME_BLKSIZE);
+        assert_eq!(
+            cap_blksize(MAX_RAW_FRAME_BLKSIZE, true),
+            MAX_RAW_FRAME_BLKSIZE
+        );
+        assert_eq!(cap_blksize(1024, true), 1024, "under the cap is untouched");
+        assert_eq!(cap_blksize(DEFAULT_BLKSIZE, true), DEFAULT_BLKSIZE);
+        assert_eq!(cap_blksize(4096, false), 4096, "kernel path: no cap");
+        assert_eq!(cap_blksize(65464, false), 65464);
+        // 1468 is exactly what fits: MTU minus IPv4, UDP and TFTP headers.
+        assert_eq!(MAX_RAW_FRAME_BLKSIZE, 1500 - 20 - 8 - 4);
+    }
+
+    /// The raw-frame decision needs both halves: a sender *and* a MAC to
+    /// address. The inert sender used everywhere in these tests never counts.
+    #[test]
+    fn raw_frames_requires_sender_and_client_mac() {
+        let mut x = loopback_xfer();
+        assert!(!x.raw_frames());
+        x.client_mac = Some([1, 2, 3, 4, 5, 6]);
+        assert!(!x.raw_frames(), "no sender: MAC alone is not enough");
+    }
+
     // Path resolution (the shared `resolve`) is tested in the `served` module.
 
     // ── Loopback transfer tests ──────────────────────────────────────────────
@@ -564,6 +705,7 @@ mod tests {
             host_ip: Ipv4Addr::LOCALHOST,
             bpf: Arc::new(BpfSender::unavailable()),
             client_mac: None,
+            ack_timeout: ACK_TIMEOUT,
         }
     }
 
@@ -675,6 +817,32 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// Larger than any read chunk the engine might use internally, with a
+    /// non-repeating pattern, so a seek/offset slip anywhere in the streamed
+    /// read shows up as a byte mismatch.
+    #[tokio::test]
+    async fn transfer_streams_a_large_file_block_by_block() {
+        let root = tmp();
+        let contents: Vec<u8> = (0..300_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        fs::write(root.join("big.img"), &contents).unwrap();
+
+        let (sock, peer) = client_socket().await;
+        let server = handle_rrq(
+            root.clone(),
+            rrq("big.img", "octet", &[("blksize", "1428")]),
+            peer,
+            None,
+            loopback_xfer(),
+        );
+        let (_, (got, blocks)) = tokio::join!(server, recv_transfer(&sock, 1428));
+
+        assert_eq!(got, contents);
+        assert_eq!(blocks.len(), 300_000_usize.div_ceil(1428));
+        fs::remove_dir_all(&root).ok();
+    }
+
     #[tokio::test]
     async fn transfer_with_oack_negotiates_blksize_and_tsize() {
         let root = tmp();
@@ -772,6 +940,63 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// A peer that never ACKs but keeps sending *something* (here: ACKs for the
+    /// wrong block, faster than the ACK timeout) must not keep the transfer
+    /// alive. The server sends block 1 exactly MAX_RETRIES times, each attempt
+    /// on its own fixed deadline, and gives up.
+    #[tokio::test]
+    async fn junk_from_the_peer_does_not_extend_the_ack_deadline() {
+        let root = tmp();
+        fs::write(root.join("k.img"), vec![0x22u8; 100]).unwrap();
+
+        let (sock, peer) = client_socket().await;
+        let ack_timeout = Duration::from_millis(150);
+        let mut xfer = loopback_xfer();
+        xfer.ack_timeout = ack_timeout;
+        let mut server = tokio::spawn(handle_rrq(
+            root.clone(),
+            rrq("k.img", "octet", &[]),
+            peer,
+            None,
+            xfer,
+        ));
+
+        // Well past MAX_RETRIES × ack_timeout (900 ms) but far short of forever.
+        let give_up_by = Instant::now() + Duration::from_secs(4);
+        let mut junk = tokio::time::interval(Duration::from_millis(40));
+        let mut copies_of_block_1 = 0usize;
+        let mut server_port: Option<SocketAddr> = None;
+        let mut buf = vec![0u8; 2048];
+        loop {
+            tokio::select! {
+                _ = &mut server => break,
+                r = sock.recv_from(&mut buf) => {
+                    let (n, from) = r.unwrap();
+                    assert!(n >= 4);
+                    assert_eq!(u16::from_be_bytes([buf[0], buf[1]]), OP_DATA);
+                    assert_eq!(u16::from_be_bytes([buf[2], buf[3]]), 1);
+                    copies_of_block_1 += 1;
+                    server_port = Some(from);
+                }
+                _ = junk.tick() => {
+                    if let Some(to) = server_port {
+                        // A plausible-looking but wrong ACK (block 7).
+                        sock.send_to(&ack(7), to).await.unwrap();
+                    }
+                }
+                _ = tokio::time::sleep_until(give_up_by) => {
+                    panic!("server still waiting after {copies_of_block_1} copies of block 1: \
+                            junk is re-arming the ACK timer");
+                }
+            }
+        }
+        assert_eq!(
+            copies_of_block_1, MAX_RETRIES,
+            "one send per attempt, then give up"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
     #[tokio::test]
     async fn missing_file_returns_error_packet() {
         let root = tmp();
@@ -821,6 +1046,77 @@ mod tests {
         let (_, (opcode, code)) = tokio::join!(server, client);
         assert_eq!(opcode, OP_ERROR);
         assert_eq!(code, ERR_ILLEGAL);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // ── Dispatcher tests ─────────────────────────────────────────────────────
+    //
+    // These go through `run` — the listen loop that spawns one sender per RRQ —
+    // over a loopback UDP pair, exactly as `serve` does minus the port-69 bind
+    // and the interface pin.
+
+    /// Two RRQs from the same TID, back to back: the first (a big file the
+    /// client never ACKs) must be *replaced* by the second (a small one),
+    /// leaving a single sender. With parallel senders the abandoned first one
+    /// would keep retransmitting its block 1 after the small file completed.
+    #[tokio::test]
+    async fn duplicate_rrq_from_the_same_tid_replaces_the_transfer() {
+        let root = tmp();
+        fs::write(root.join("big.img"), vec![0xB1u8; 200_000]).unwrap();
+        let small = b"tiny".to_vec();
+        fs::write(root.join("small.img"), &small).unwrap();
+
+        let listen = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listen.local_addr().unwrap();
+        let (_tx, rx) = watch::channel::<Option<[u8; 6]>>(None);
+        let ack_timeout = Duration::from_millis(200);
+        let dispatcher = tokio::spawn(run(
+            listen,
+            root.clone(),
+            Ipv4Addr::LOCALHOST,
+            None,
+            Arc::new(BpfSender::unavailable()),
+            rx,
+            ack_timeout,
+        ));
+
+        let (sock, _) = client_socket().await;
+        sock.send_to(&rrq("big.img", "octet", &[]), server_addr)
+            .await
+            .unwrap();
+        sock.send_to(&rrq("small.img", "octet", &[]), server_addr)
+            .await
+            .unwrap();
+
+        // ACK only the small file's data; leave anything from big unanswered.
+        let mut buf = vec![0u8; 2048];
+        let done_by = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (n, from) = timeout_at(done_by, sock.recv_from(&mut buf))
+                .await
+                .expect("the small file should arrive")
+                .unwrap();
+            assert_eq!(u16::from_be_bytes([buf[0], buf[1]]), OP_DATA);
+            if buf[4..n] == small[..] {
+                sock.send_to(&ack(1), from).await.unwrap();
+                break;
+            }
+        }
+
+        // Quiet period longer than two ACK timeouts: a surviving big sender
+        // would retransmit its block 1 in here.
+        let quiet_until = Instant::now() + ack_timeout * 3;
+        match timeout_at(quiet_until, sock.recv_from(&mut buf)).await {
+            Err(_) => {} // nothing arrived: one sender, as required
+            Ok(r) => {
+                let (n, from) = r.unwrap();
+                panic!(
+                    "unexpected packet from {from} after the replacement transfer \
+                     completed ({n} bytes): the first RRQ's sender is still alive"
+                );
+            }
+        }
+        dispatcher.abort();
         fs::remove_dir_all(&root).ok();
     }
 

@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! netbootd — single-client netboot daemon: DHCP + read-only TFTP in one
-//! process.
+//! netbootd — single-client netboot daemon: DHCP + read-only TFTP (+ HTTP) in
+//! one process.
 //!
 //! Proof-of-concept port of paniolo's `_dhcp.py` + `_tftp.py`. Unlike the
 //! Python version (two `sudo python -m …` subprocesses coordinating through an
@@ -26,14 +26,21 @@
 //! in-process — no `client-mac` file. On Linux (and when BPF is unavailable)
 //! TFTP uses ordinary `send_to`, matching the Python behavior.
 //!
-//! Privileged ports 67/69 still require root or `CAP_NET_BIND_SERVICE`, and the
-//! BPF path needs `access_bpf` group membership or root — exactly as with the
-//! Python servers.
+//! Every listen socket is pinned to the one netboot interface (`--interface`,
+//! required — see [`pin`]) before anything is served, so the DHCP server and
+//! the file servers are unreachable from any other interface on the host.
+//! Startup is: validate → bind and pin all listeners → drop root (Linux, see
+//! [`privdrop`]) → serve. Privileged ports 67/69 still require root or
+//! `CAP_NET_BIND_SERVICE` on Linux, which is why `paniolo netboot start`
+//! spawns netbootd through `sudo` there; the daemon gives that root back as
+//! soon as the sockets are bound. The BPF path on macOS needs no privilege in
+//! the daemon at all (the setuid helper opens the descriptor).
 
 mod bpf;
 mod dhcp;
 mod http;
 mod netcfg;
+mod pin;
 mod served;
 mod tftp;
 
@@ -43,15 +50,23 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Parser)]
 #[command(name = "netbootd", version, about)]
 struct Cli {
-    /// Interface IP — bound as the host address and advertised as the TFTP
-    /// server (DHCP option 66 / siaddr).
+    /// Interface IP — assigned to the netboot interface and advertised as the
+    /// TFTP/HTTP server (DHCP option 66 / siaddr) and router. The client's
+    /// lease is derived from it unless `--client-ip` says otherwise.
     #[arg(long)]
     host_ip: Ipv4Addr,
+
+    /// IP leased to the (single) netboot client. Must be in the same /24 as
+    /// `--host-ip`: the lease carries a 255.255.255.0 mask and `--host-ip` as
+    /// router and boot server. Defaults to the host's /24 with a last octet of
+    /// 100 (101 when the host itself is .100).
+    #[arg(long)]
+    client_ip: Option<Ipv4Addr>,
 
     /// TFTP root directory (must exist).
     #[arg(long)]
@@ -61,9 +76,12 @@ struct Cli {
     #[arg(long, default_value = "kernel_2712.img")]
     boot_file: String,
 
-    /// Interface device name (e.g. en11 / eth0) for ARP pinning + IP monitor.
+    /// Interface device name (e.g. en11 / eth0) — the dedicated netboot link.
+    /// Every listen socket (DHCP, TFTP, HTTP) is pinned to it, so nothing is
+    /// served on any other interface; it is also where the ARP pin and the IP
+    /// monitor act. Required; must not carry the system default route.
     #[arg(long)]
-    interface: Option<String>,
+    interface: String,
 
     #[arg(long, default_value_t = 67)]
     dhcp_port: u16,
@@ -73,7 +91,9 @@ struct Cli {
 
     /// HTTP server port, also embedded in the UEFI HTTP Boot URL advertised in
     /// DHCP option 67. Defaults to 80 (omitted from the URL); choose an
-    /// unprivileged high port to avoid needing root for the bind.
+    /// unprivileged high port to avoid needing root for the bind. If the port
+    /// cannot be bound netbootd logs a warning and runs without HTTP Boot
+    /// (DHCP + TFTP only).
     #[arg(long, default_value_t = 80)]
     http_port: u16,
 
@@ -99,30 +119,66 @@ async fn main() -> Result<()> {
         anyhow::bail!("TFTP root {} does not exist", cli.tftp_root.display());
     }
 
+    // The one lease we hand out has to be reachable from the host IP, or the
+    // client boots into nothing. Derive it, or check the override.
+    let client_ip = cli
+        .client_ip
+        .unwrap_or_else(|| dhcp::derive_client_ip(cli.host_ip));
+    dhcp::validate_client_ip(cli.host_ip, client_ip).context("--client-ip")?;
+
     // Refuse to run on a primary NIC: netbootd reconfigures its interface to the
     // static host IP, which would clobber the host's real networking. The
     // netboot link must be a dedicated secondary interface.
-    if let Some(iface) = cli.interface.as_deref() {
-        if netcfg::is_primary_interface(iface) {
-            anyhow::bail!(
-                "refusing to run on {iface}: it carries the system default route \
-                 (a primary NIC). netboot would force {} onto it and break host \
-                 networking. Use a dedicated USB-Ethernet adapter.",
-                cli.host_ip
-            );
-        }
+    if netcfg::is_primary_interface(&cli.interface) {
+        anyhow::bail!(
+            "refusing to run on {}: it carries the system default route \
+             (a primary NIC). netboot would force {} onto it and break host \
+             networking. Use a dedicated USB-Ethernet adapter.",
+            cli.interface,
+            cli.host_ip
+        );
     }
 
     info!(
         host_ip = %cli.host_ip,
+        %client_ip,
         tftp_root = %cli.tftp_root.display(),
         boot_file = cli.boot_file,
-        interface = cli.interface.as_deref().unwrap_or("-"),
+        interface = cli.interface,
         "netbootd starting"
     );
 
-    // Optional interface-IP enforcement (matches _dhcp.py's monitor thread).
-    if let Some(iface) = cli.interface.clone() {
+    // Bind and pin every listener up front, before anything runs concurrently
+    // and while we still hold whatever privilege the low ports and the pin
+    // need. A DHCP or TFTP socket that cannot be bound or pinned is fatal.
+    let dhcp_sock = dhcp::bind_server(cli.dhcp_port, &cli.interface)?;
+    let tftp_sock = tftp::bind_server(cli.tftp_port, &cli.interface)?;
+    // HTTP is the one optional transport: a port-80 clash must not take DHCP
+    // and TFTP (the Pi and PXE paths) down with it.
+    let http_listener = match http::bind_server(cli.http_port, &cli.interface) {
+        Ok(l) => Some(l),
+        Err(e) => {
+            warn!(
+                "HTTP listener on port {} unavailable ({e:#}); continuing with DHCP + TFTP \
+                 only. HTTP Boot will not work — an HTTPClient DHCP request is still \
+                 answered with an http:// URL, but the fetch will fail. Free the port or \
+                 set --http-port to an unused one.",
+                cli.http_port
+            );
+            None
+        }
+    };
+
+    // Raw-frame sender: on macOS the bound /dev/bpf descriptor is obtained from
+    // the setuid-root helper via SCM_RIGHTS (netbootd itself stays unprivileged).
+    // Linux uses the kernel send path, matching the Python servers. Constructed
+    // unconditionally as a type, so the TFTP call sites stay compiled and checked
+    // on every platform.
+    let bpf = Arc::new(build_bpf_sender(&cli.interface));
+
+    // Interface-IP enforcement (matches _dhcp.py's monitor thread).
+    {
+        let iface = cli.interface.clone();
         let host_ip = cli.host_ip;
         tokio::spawn(async move { netcfg::monitor_interface(iface, host_ip).await });
     }
@@ -130,40 +186,38 @@ async fn main() -> Result<()> {
     // In-process DHCP→TFTP client-MAC handoff (replaces the on-disk file).
     let (mac_tx, mac_rx) = tokio::sync::watch::channel::<Option<[u8; 6]>>(None);
 
-    // Raw-frame sender: on macOS the bound /dev/bpf descriptor is obtained from
-    // the setuid-root helper via SCM_RIGHTS (netbootd itself stays unprivileged).
-    // Linux uses the kernel send path, matching the Python servers. Constructed
-    // unconditionally as a type, so the TFTP call sites stay compiled and checked
-    // on every platform.
-    let bpf = Arc::new(build_bpf_sender(cli.interface.as_deref()));
-
     let dhcp = tokio::spawn(dhcp::serve(
+        dhcp_sock,
         cli.host_ip,
+        client_ip,
         cli.boot_file.clone(),
         cli.interface.clone(),
-        cli.dhcp_port,
         cli.http_port,
         mac_tx,
     ));
     let tftp = tokio::spawn(tftp::serve(
+        tftp_sock,
         cli.host_ip,
         cli.tftp_root.clone(),
-        cli.tftp_port,
         cli.interface.clone(),
         bpf,
         mac_rx,
     ));
     // HTTP serves UEFI HTTP Boot clients over ordinary kernel TCP — no BPF, no
-    // ARP pin (a UEFI client answers ARP, unlike the silent Pi). Always on; the
-    // client picks TFTP vs HTTP by how it DHCPs.
-    let http = tokio::spawn(http::serve(
-        cli.tftp_root.clone(),
-        cli.http_port,
-        cli.content_type.clone(),
-    ));
+    // ARP pin (a UEFI client answers ARP, unlike the silent Pi). The client
+    // picks TFTP vs HTTP by how it DHCPs. Without a listener the task simply
+    // never completes, so the select below is unchanged.
+    let http = match http_listener {
+        Some(listener) => tokio::spawn(http::serve(
+            listener,
+            cli.tftp_root.clone(),
+            cli.content_type.clone(),
+        )),
+        None => tokio::spawn(std::future::pending()),
+    };
 
-    // Any server task exiting (always an error — they loop forever) or Ctrl-C
-    // brings the whole daemon down.
+    // Any server task exiting (always an error — they loop forever) or a
+    // shutdown signal brings the whole daemon down.
     tokio::select! {
         r = dhcp => match r {
             Ok(Ok(())) => {}
@@ -180,29 +234,54 @@ async fn main() -> Result<()> {
             Ok(Err(e)) => { error!("HTTP server failed: {e:#}"); return Err(e); }
             Err(e) => return Err(e).context("HTTP task panicked"),
         },
-        _ = tokio::signal::ctrl_c() => {
-            info!("netbootd shutting down");
+        sig = shutdown_signal() => {
+            info!("netbootd shutting down ({sig})");
         }
     }
     Ok(())
 }
 
+/// Resolve when the daemon is asked to stop: Ctrl-C (SIGINT) or, on Unix,
+/// SIGTERM — which is what `paniolo netboot stop` sends. Yields the name of
+/// the signal for the log.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => "SIGINT",
+                    _ = term.recv() => "SIGTERM",
+                }
+            }
+            Err(e) => {
+                warn!("cannot listen for SIGTERM ({e}); only Ctrl-C shuts down cleanly");
+                let _ = tokio::signal::ctrl_c().await;
+                "SIGINT"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "Ctrl-C"
+    }
+}
+
 /// Construct the raw-frame sender. On macOS, request a bound `/dev/bpf`
 /// descriptor from the privileged helper and pair it with the interface's MAC
-/// (read here, unprivileged). Any failure — no interface, helper missing, helper
-/// error — is non-fatal: we log it and return an inert sender so TFTP falls back
-/// to the kernel `send_to` path, exactly as on Linux.
-fn build_bpf_sender(interface: Option<&str>) -> bpf::BpfSender {
+/// (read here, unprivileged). Any failure — helper missing, helper error — is
+/// non-fatal: we log it and return an inert sender so TFTP falls back to the
+/// kernel `send_to` path, exactly as on Linux.
+fn build_bpf_sender(interface: &str) -> bpf::BpfSender {
     #[cfg(target_os = "macos")]
     {
-        let Some(iface) = interface else {
+        let Some(src_mac) = mac_of(interface) else {
+            error!("no MAC address for {interface}; BPF disabled, using kernel send_to");
             return bpf::BpfSender::unavailable();
         };
-        let Some(src_mac) = mac_of(iface) else {
-            error!("no MAC address for {iface}; BPF disabled, using kernel send_to");
-            return bpf::BpfSender::unavailable();
-        };
-        match netbootd::handoff::request_bpf_fd(iface) {
+        match netbootd::handoff::request_bpf_fd(interface) {
             Ok(fd) => bpf::BpfSender::from_handoff(fd, src_mac),
             Err(e) => {
                 error!(
