@@ -33,7 +33,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,11 @@ const MAX_SEGMENTS: usize = 5;
 /// Hard cap on a single unterminated line; bytes past this are force-flushed so a
 /// newline-less stream can't grow the pending buffer without bound.
 const MAX_PENDING: usize = 64 * 1024;
+/// Ceiling on how often the pending-line sidecar is rewritten (~10/s). It is a
+/// UI nicety for a reader that wants to see an in-flight line, not the record
+/// of truth (that's the JSONL segments), so a busy console doing a write+rename
+/// on every ingested chunk was needless disk churn. See `LineLog::sidecar_due`.
+const SIDECAR_DEBOUNCE: Duration = Duration::from_millis(100);
 
 const ACTIVE: &str = "serial.jsonl";
 const PENDING: &str = "pending.json";
@@ -131,6 +136,14 @@ pub struct LineLog {
     active_lines: u64,
     pending: Vec<u8>,
     pending_ts: Option<u64>,
+    /// True when `pending` has changed on disk since the sidecar last mirrored
+    /// it — see [`Self::sidecar_due`].
+    sidecar_dirty: bool,
+    last_sidecar_write: Option<Instant>,
+    /// Real disk writes the sidecar has made. Test-only instrumentation for
+    /// proving the debounce actually bounds them.
+    #[cfg(test)]
+    sidecar_writes: u64,
 }
 
 impl LineLog {
@@ -154,11 +167,16 @@ impl LineLog {
             active_lines,
             pending: Vec::new(),
             pending_ts: None,
+            sidecar_dirty: false,
+            last_sidecar_write: None,
+            #[cfg(test)]
+            sidecar_writes: 0,
         }
     }
 
     /// Feed a chunk of received bytes. Completed lines are appended to the log;
-    /// any trailing partial line is mirrored to the sidecar.
+    /// any trailing partial line is mirrored to the sidecar (debounced — see
+    /// [`Self::sidecar_due`]).
     pub fn ingest(&mut self, bytes: &[u8]) {
         for &b in bytes {
             if b == b'\n' {
@@ -175,14 +193,21 @@ impl LineLog {
                 }
                 self.pending.push(b);
                 if self.pending.len() >= MAX_PENDING {
-                    let text = String::from_utf8_lossy(&self.pending).into_owned();
+                    // Force-flush at a UTF-8 boundary: splitting mid-sequence
+                    // would turn a character that just needed one more byte
+                    // into U+FFFD once `from_utf8_lossy` runs on this half.
+                    let boundary = utf8_floor_boundary(&self.pending);
+                    let text = String::from_utf8_lossy(&self.pending[..boundary]).into_owned();
                     let ts = self.pending_ts.take().unwrap_or_else(now_ms);
                     self.commit(ts, text);
-                    self.pending.clear();
+                    self.pending.drain(..boundary);
+                    if !self.pending.is_empty() {
+                        self.pending_ts = Some(now_ms());
+                    }
                 }
             }
         }
-        self.write_pending_sidecar();
+        self.note_pending_dirty();
     }
 
     fn commit(&mut self, ts_ms: u64, text: String) {
@@ -247,6 +272,78 @@ impl LineLog {
                 let _ = fs::rename(&tmp, &path);
             }
         }
+    }
+
+    /// Mark the pending line changed and write the sidecar now if the
+    /// debounce window has elapsed since the last write, or leave it dirty
+    /// for [`Self::sidecar_due`]/[`Self::flush_sidecar`] to pick up later.
+    fn note_pending_dirty(&mut self) {
+        self.sidecar_dirty = true;
+        self.maybe_flush_sidecar(Instant::now());
+    }
+
+    fn maybe_flush_sidecar(&mut self, now: Instant) {
+        if !self.sidecar_dirty {
+            return;
+        }
+        let due = match self.last_sidecar_write {
+            None => true,
+            Some(last) => now.duration_since(last) >= SIDECAR_DEBOUNCE,
+        };
+        if due {
+            self.write_pending_sidecar();
+            self.last_sidecar_write = Some(now);
+            self.sidecar_dirty = false;
+            #[cfg(test)]
+            {
+                self.sidecar_writes += 1;
+            }
+        }
+    }
+
+    /// How long the capture thread should wait before an outstanding,
+    /// debounced sidecar write becomes due; `None` when nothing is pending
+    /// (safe to block indefinitely on the next chunk). Lets an idle port
+    /// still get its last partial line mirrored within the debounce window
+    /// rather than only on the next byte received — see `spawn_capture` in
+    /// `serial_io.rs`.
+    pub fn sidecar_due(&self, now: Instant) -> Option<Duration> {
+        if !self.sidecar_dirty {
+            return None;
+        }
+        let last = self.last_sidecar_write?;
+        Some(SIDECAR_DEBOUNCE.saturating_sub(now.duration_since(last)))
+    }
+
+    /// Write the sidecar now regardless of the debounce window, clearing the
+    /// dirty flag. Called when [`Self::sidecar_due`]'s deadline elapses, and
+    /// on capture-thread shutdown so the last partial line is never lost to
+    /// a debounce window that never got to close.
+    pub fn flush_sidecar(&mut self) {
+        if self.sidecar_dirty {
+            self.write_pending_sidecar();
+            self.last_sidecar_write = Some(Instant::now());
+            self.sidecar_dirty = false;
+            #[cfg(test)]
+            {
+                self.sidecar_writes += 1;
+            }
+        }
+    }
+}
+
+/// The largest prefix of `bytes` that is safe to treat as complete UTF-8:
+/// the whole slice, unless it ends mid-way through an otherwise-valid
+/// multibyte sequence — in which case the incomplete tail is excluded, so a
+/// force-flush (`MAX_PENDING`) can't turn a character that just needed one
+/// more byte into a replacement character. An invalid byte that is *not* at
+/// the end needs no such care: `from_utf8_lossy` already replaces exactly
+/// that byte wherever the text is decoded, so only end-of-buffer truncation
+/// shortens the boundary.
+fn utf8_floor_boundary(bytes: &[u8]) -> usize {
+    match std::str::from_utf8(bytes) {
+        Ok(_) => bytes.len(),
+        Err(e) => e.error_len().map_or(e.valid_up_to(), |_| bytes.len()),
     }
 }
 
@@ -511,8 +608,13 @@ pub fn strip_ansi(s: &str) -> String {
                         i += 1;
                     }
                 }
-                b']' => {
-                    // OSC: until BEL or ST (ESC \).
+                b']' | b'P' | b'_' | b'^' | b'X' => {
+                    // OSC (]), DCS (P), APC (_), PM (^), SOS (X): all run
+                    // until BEL or ST (ESC \). The other four used to fall
+                    // into the two-byte-escape catch-all below, which only
+                    // consumed the introducer and left their payload —
+                    // whatever the target wrote between the introducer and
+                    // its terminator — in the "clean" text.
                     i += 1;
                     while i < bytes.len() {
                         if bytes[i] == 0x07 {
@@ -542,8 +644,33 @@ pub fn strip_ansi(s: &str) -> String {
     };
     cleaned
         .chars()
-        .filter(|&c| c == '\t' || !c.is_control())
+        .filter(|&c| (c == '\t' || !c.is_control()) && !is_format_char(c))
         .collect()
+}
+
+/// True for the Unicode "format" (Cf) characters that matter in text pulled
+/// off a terminal-derived stream: the bidirectional overrides/embeddings/
+/// isolates (the U+202E RIGHT-TO-LEFT OVERRIDE class — printed text can
+/// visually reorder itself, hiding what a reader or an agent parsing
+/// `serialcap log` actually sees), the zero-width spacing/joining marks, and
+/// the byte-order mark. `char::is_control` (Cc) does not cover these — they
+/// are not control characters, just invisible or reordering ones. This is a
+/// curated subset of Cf, not the whole category (which also has rare
+/// non-BMP annotation and language-tag characters); it is the part that can
+/// plausibly reach a captured console line.
+fn is_format_char(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' // soft hyphen
+        | '\u{0600}'..='\u{0605}' // Arabic number/sign marks
+        | '\u{061C}' // Arabic letter mark
+        | '\u{06DD}' // Arabic end of ayah
+        | '\u{070F}' // Syriac abbreviation mark
+        | '\u{200B}'..='\u{200F}' // ZWSP, ZWNJ, ZWJ, LRM, RLM
+        | '\u{202A}'..='\u{202E}' // LRE, RLE, PDF, LRO, RLO
+        | '\u{2060}'..='\u{2064}' // word joiner, invisible separators
+        | '\u{2066}'..='\u{2069}' // LRI, RLI, FSI, PDI
+        | '\u{FEFF}' // BOM / zero width no-break space
+    )
 }
 
 #[cfg(test)]
@@ -701,6 +828,140 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    // ── sidecar debounce (Review low e) ──────────────────────────────────
+
+    /// A burst of changes inside the debounce window must not each rewrite
+    /// the sidecar; the first change (nothing written yet) and the first
+    /// change past the window each do.
+    #[test]
+    fn pending_sidecar_writes_are_debounced_but_eventually_flush() {
+        let dir = tmp();
+        let mut log = LineLog::open(dir.clone(), DEFAULT_BUFFER_LINES);
+
+        log.ingest(b"a");
+        assert_eq!(
+            log.sidecar_writes, 1,
+            "nothing written yet: goes straight through"
+        );
+
+        for _ in 0..50 {
+            log.ingest(b"b");
+        }
+        assert_eq!(
+            log.sidecar_writes, 1,
+            "debounced: no extra writes inside the window"
+        );
+
+        std::thread::sleep(SIDECAR_DEBOUNCE + Duration::from_millis(50));
+        log.ingest(b"c");
+        assert_eq!(log.sidecar_writes, 2, "past the window: writes again");
+
+        // Debouncing must not lose data, only the intermediate writes: the
+        // final on-disk content reflects everything ingested.
+        let pending = read_lines(
+            &dir,
+            &Query {
+                include_pending: true,
+                ..Default::default()
+            },
+        );
+        let want = format!("a{}c", "b".repeat(50));
+        assert_eq!(pending.last().unwrap().text, want);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The pure state machine behind the debounce: dirty/last-write tracking
+    /// and the deadline `sidecar_due` reports, driven directly rather than by
+    /// real sleeps.
+    #[test]
+    fn sidecar_due_and_flush_sidecar_state_transitions() {
+        let dir = tmp();
+        let mut log = LineLog::open(dir.clone(), DEFAULT_BUFFER_LINES);
+        let now = Instant::now();
+
+        assert_eq!(log.sidecar_due(now), None, "nothing pending yet");
+
+        log.sidecar_dirty = true;
+        log.last_sidecar_write = Some(now);
+        assert_eq!(log.sidecar_due(now), Some(SIDECAR_DEBOUNCE));
+        assert_eq!(
+            log.sidecar_due(now + SIDECAR_DEBOUNCE + Duration::from_millis(1)),
+            Some(Duration::ZERO)
+        );
+
+        log.pending = b"partial".to_vec();
+        log.flush_sidecar();
+        assert!(!log.sidecar_dirty, "flush_sidecar clears the dirty flag");
+        assert!(log.last_sidecar_write.is_some());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── UTF-8-safe force flush (Review low f) ────────────────────────────
+
+    #[test]
+    fn utf8_floor_boundary_flushes_whole_valid_input() {
+        assert_eq!(utf8_floor_boundary("hello".as_bytes()), 5);
+    }
+
+    #[test]
+    fn utf8_floor_boundary_holds_back_a_truncated_trailing_sequence() {
+        let full = "a€".as_bytes(); // 'a' (1 byte) + '€' (3 bytes) = 4 bytes.
+        assert_eq!(utf8_floor_boundary(full), 4, "complete input flushes whole");
+        assert_eq!(
+            utf8_floor_boundary(&full[..3]),
+            1,
+            "2 of 3 continuation bytes: hold the lead byte back too"
+        );
+        assert_eq!(
+            utf8_floor_boundary(&full[..2]),
+            1,
+            "1 of 3 continuation bytes: hold back"
+        );
+        assert_eq!(
+            utf8_floor_boundary(&full[..1]),
+            1,
+            "just 'a': already a complete char"
+        );
+    }
+
+    #[test]
+    fn utf8_floor_boundary_flushes_past_an_interior_invalid_byte() {
+        // 0xFF is never valid UTF-8 and it is not at the end, so it is not a
+        // truncation — from_utf8_lossy's usual per-byte replacement handles
+        // it; no boundary protection is needed.
+        let bytes = [b'a', 0xFF, b'b'];
+        assert_eq!(utf8_floor_boundary(&bytes), 3);
+    }
+
+    /// A force-flush landing mid-character must not turn the last legible
+    /// character into U+FFFD; it must hold the incomplete tail back for the
+    /// next chunk to complete.
+    #[test]
+    fn force_flush_does_not_mangle_a_multibyte_char_at_the_boundary() {
+        let dir = tmp();
+        let mut log = LineLog::open(dir.clone(), DEFAULT_BUFFER_LINES);
+        log.ingest(&vec![b'a'; MAX_PENDING - 1]);
+        log.ingest("€".as_bytes());
+        log.flush_sidecar(); // bypass the debounce so the read below is current
+        let lines = read_lines(
+            &dir,
+            &Query {
+                include_pending: true,
+                ..Default::default()
+            },
+        );
+        let joined: String = lines.iter().map(|l| l.text.as_str()).collect();
+        assert!(
+            !joined.contains('\u{FFFD}'),
+            "a multibyte char was split: {joined:?}"
+        );
+        assert!(
+            joined.ends_with('€'),
+            "the character must survive intact: {joined:?}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn strip_ansi_removes_color_and_handles_cr() {
         assert_eq!(strip_ansi("\x1b[1;32mgreen\x1b[0m text"), "green text");
@@ -709,6 +970,45 @@ mod tests {
         assert_eq!(strip_ansi("bell\x07gone"), "bellgone");
         // OSC title sequence terminated by BEL.
         assert_eq!(strip_ansi("\x1b]0;my title\x07shell"), "shell");
+    }
+
+    /// Review lows (f). DCS/APC/PM/SOS used to fall into the generic
+    /// two-byte-escape case, which only ate the introducer and left the
+    /// sequence's own payload — anything the target wrote before the
+    /// terminator — sitting in the "clean" text. Each must be consumed like
+    /// OSC, to its own BEL or ST (ESC \) terminator.
+    #[test]
+    fn strip_ansi_consumes_dcs_apc_pm_sos_payloads_to_their_terminator() {
+        // DCS (ESC P) terminated by ST.
+        assert_eq!(
+            strip_ansi("before\x1bPsome dcs payload\x1b\\after"),
+            "beforeafter"
+        );
+        // APC (ESC _) terminated by BEL.
+        assert_eq!(strip_ansi("before\x1b_hidden apc\x07after"), "beforeafter");
+        // PM (ESC ^) terminated by ST.
+        assert_eq!(
+            strip_ansi("before\x1b^private message\x1b\\after"),
+            "beforeafter"
+        );
+        // SOS (ESC X) terminated by ST.
+        assert_eq!(
+            strip_ansi("before\x1bXstart of string\x1b\\after"),
+            "beforeafter"
+        );
+    }
+
+    /// Review lows (f). Unicode format characters (Cf) are invisible or
+    /// reordering, not `char::is_control`, so the old filter let them
+    /// through. U+202E in particular can make an extension like "evil.exe"
+    /// display as something else entirely.
+    #[test]
+    fn strip_ansi_removes_bidi_override_and_zero_width_format_chars() {
+        assert_eq!(strip_ansi("safe\u{202E}evil.exe"), "safeevil.exe");
+        assert_eq!(
+            strip_ansi("zero\u{200B}width\u{FEFF}space"),
+            "zerowidthspace"
+        );
     }
 
     #[test]

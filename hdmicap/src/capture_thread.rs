@@ -46,7 +46,45 @@ pub fn spawn(spec: DeviceSpec) -> (FrameRx, thread::JoinHandle<()>) {
     (rx, handle)
 }
 
+/// Consecutive times a flagged stall (see the watchdog in `capture_loop`) has
+/// forced a backend reopen with no healthy frame in between. Review low (h):
+/// the watchdog used to `process::exit(1)` on every stall, with nothing to
+/// restart the daemon afterward. Reopening in place handles the common case
+/// (the device recovers); this tracks how many times in a row that has
+/// *not* worked, so a device that is genuinely gone still gets a bounded
+/// number of tries before the daemon exits — the same last-resort escape
+/// hatch the immediate-exit watchdog always was, just not the first resort.
+const MAX_CONSECUTIVE_STALLS: u32 = 8;
+
+struct StallTracker {
+    consecutive: u32,
+}
+
+impl StallTracker {
+    fn new() -> Self {
+        StallTracker { consecutive: 0 }
+    }
+
+    /// A frame arrived: the device is healthy again.
+    fn recovered(&mut self) {
+        self.consecutive = 0;
+    }
+
+    /// A stall forced a reopen. `true` when this was the last straw and
+    /// nothing is left to try but exiting for an external restart.
+    fn stalled(&mut self) -> bool {
+        self.consecutive += 1;
+        self.consecutive >= MAX_CONSECUTIVE_STALLS
+    }
+
+    fn count(&self) -> u32 {
+        self.consecutive
+    }
+}
+
 fn capture_loop(spec: DeviceSpec, tx: watch::Sender<Arc<FrameState>>) {
+    let mut stalls = StallTracker::new();
+
     // Reconnect loop: if the device is absent or vanishes mid-run, publish
     // NoDevice and keep retrying so hot-plug just works.
     loop {
@@ -69,14 +107,28 @@ fn capture_loop(spec: DeviceSpec, tx: watch::Sender<Arc<FrameState>>) {
             }
         };
 
-        // Watchdog: fallback for any stall the v4l timeout doesn't catch.
-        // The cancel flag is set when we exit the inner loop normally so the
-        // watchdog doesn't fire across reconnect iterations.
+        // Watchdog: fallback for any stall the v4l/AVFoundation frame
+        // timeout doesn't catch. The cancel flag is set when we exit the
+        // inner loop normally so the watchdog doesn't fire across reconnect
+        // iterations.
+        //
+        // `stalled` is how the watchdog hands a detected stall back to the
+        // main thread rather than acting unilaterally: it sets the flag,
+        // and `capture_loop`'s frame loop notices it the next time
+        // `backend.frame()` returns (bounded by that call's own internal
+        // timeout) and reopens the backend in place — cheaper than killing
+        // the whole process, and the daemon needs no external supervisor to
+        // come back from it. If the flag is *still* set a full POLL later,
+        // `backend.frame()` itself never returned to let the main thread see
+        // it — genuinely wedged, not just slow — and there is nothing left
+        // to do in-process; that is the only remaining `process::exit`.
         let frame_count = Arc::new(AtomicU64::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
+        let stalled = Arc::new(AtomicBool::new(false));
         {
             let frame_count = frame_count.clone();
             let cancelled = cancelled.clone();
+            let stalled = stalled.clone();
             thread::Builder::new()
                 .name("stall-watchdog".into())
                 .spawn(move || {
@@ -88,8 +140,8 @@ fn capture_loop(spec: DeviceSpec, tx: watch::Sender<Arc<FrameState>>) {
                     }
                     let mut prev = frame_count.load(Ordering::Relaxed);
                     if prev == 0 {
-                        warn!("no frames in {GRACE:?} after device open — exiting for restart");
-                        std::process::exit(1);
+                        warn!("no frames in {GRACE:?} after device open — flagging a stall");
+                        stalled.store(true, Ordering::Relaxed);
                     }
                     loop {
                         thread::sleep(POLL);
@@ -98,8 +150,17 @@ fn capture_loop(spec: DeviceSpec, tx: watch::Sender<Arc<FrameState>>) {
                         }
                         let cur = frame_count.load(Ordering::Relaxed);
                         if cur == prev {
-                            warn!("capture stalled ({POLL:?} with no new frames) — exiting for restart");
-                            std::process::exit(1);
+                            if stalled.swap(true, Ordering::Relaxed) {
+                                warn!(
+                                    "capture thread did not respond to a flagged stall \
+                                     within {POLL:?} — backend.frame() appears wedged; \
+                                     exiting for restart"
+                                );
+                                std::process::exit(1);
+                            }
+                            warn!(
+                                "capture stalled ({POLL:?} with no new frames) — flagging a stall"
+                            );
                         }
                         prev = cur;
                     }
@@ -126,9 +187,32 @@ fn capture_loop(spec: DeviceSpec, tx: watch::Sender<Arc<FrameState>>) {
                 return;
             }
 
+            // Review low (h). The watchdog flagged a stall: drop and reopen
+            // the backend rather than waiting for `backend.frame()` to error
+            // out on its own (which may never happen — that is exactly the
+            // stall the v4l/AVFoundation timeout didn't catch).
+            if stalled.swap(false, Ordering::Relaxed) {
+                let exit = stalls.stalled();
+                warn!(
+                    "reopening the capture backend after a flagged stall ({}/{MAX_CONSECUTIVE_STALLS})",
+                    stalls.count()
+                );
+                cancelled.store(true, Ordering::Relaxed);
+                let _ = tx.send(Arc::new(FrameState::no_device()));
+                if exit {
+                    warn!(
+                        "giving up after {MAX_CONSECUTIVE_STALLS} consecutive stalls \
+                         — exiting for restart"
+                    );
+                    std::process::exit(1);
+                }
+                break;
+            }
+
             let captured = match backend.frame() {
                 Ok(f) => {
                     consecutive_errors = 0;
+                    stalls.recovered();
                     f
                 }
                 Err(e) => {
@@ -212,4 +296,49 @@ fn capture_loop(spec: DeviceSpec, tx: watch::Sender<Arc<FrameState>>) {
 
 fn all_receivers_gone(tx: &watch::Sender<Arc<FrameState>>) -> bool {
     tx.receiver_count() == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review low (h): the escalation threshold behind "exit only after ~8
+    /// consecutive reopen failures". The Nth stall in a row (not before) is
+    /// the one that says "give up".
+    #[test]
+    fn stall_tracker_gives_up_only_on_the_nth_consecutive_stall() {
+        let mut t = StallTracker::new();
+        for n in 1..MAX_CONSECUTIVE_STALLS {
+            assert!(!t.stalled(), "stall #{n} should not give up yet");
+            assert_eq!(t.count(), n);
+        }
+        assert!(
+            t.stalled(),
+            "stall #{MAX_CONSECUTIVE_STALLS} should be the last straw"
+        );
+        assert_eq!(t.count(), MAX_CONSECUTIVE_STALLS);
+    }
+
+    /// A run of healthy frames between stalls resets the count: a device
+    /// that mostly works and stalls only occasionally must not be exiled
+    /// after enough *total* stalls across its whole uptime.
+    #[test]
+    fn stall_tracker_resets_on_recovery() {
+        let mut t = StallTracker::new();
+        for _ in 0..MAX_CONSECUTIVE_STALLS - 1 {
+            assert!(!t.stalled());
+        }
+        t.recovered();
+        assert_eq!(t.count(), 0);
+        for n in 1..MAX_CONSECUTIVE_STALLS {
+            assert!(
+                !t.stalled(),
+                "stall #{n} after recovery should not give up yet"
+            );
+        }
+        assert!(
+            t.stalled(),
+            "a fresh run of stalls still gives up at the threshold"
+        );
+    }
 }

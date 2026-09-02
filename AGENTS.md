@@ -445,17 +445,40 @@ hdmicap/         Rust crate: warm-stream HDMI capture daemon
                  native resolution with NV12 delivery, blocking frame wait.
                  Never sets frame durations — MS2109-class HDMI sticks throw
                  NSException on those setters
-    capture_thread.rs  std::thread owning device, publishes into watch channel
+    capture_thread.rs  std::thread owning device, publishes into watch channel.
+                 A watchdog thread flags (not kills) a stall — no new frame for
+                 12s after open, or 4s of no progress thereafter — and the main
+                 loop reopens the backend in place the next time backend.frame()
+                 returns, publishing no_device while it does; StallTracker exits
+                 the process only after 8 consecutive stalls with no healthy
+                 frame in between. If the flag is still set a full watchdog poll
+                 later (backend.frame() itself never returned to let the main
+                 thread see it), that IS the wedged case and it still exits
     frame.rs     FrameState, Signal enum, one-pass strided classification
                  (aHash + no-signal from 4k luma samples, resolution-independent)
     pixel.rs     PixelData (Rgb/Nv12/Empty) + NV12/YUYV -> RGB converters
     server.rs    axum HTTP API: GET / (dashboard; CSP frame-ancestors 'none'),
                  /status, /snapshot, /preview, /ocr, /devices, POST /power-cycle,
-                 and /xterm.* static assets (the only token-exempt routes)
+                 and /xterm.* static assets (the only token-exempt routes).
+                 /snapshot matches the inner Result of `rx.changed()`, not just
+                 the outer timeout — otherwise a dropped capture-thread Sender
+                 makes it spin at 100% CPU until the deadline instead of
+                 answering 503 "capture thread gone" right away. PNG
+                 encode/decode (incl. Linux turbojpeg) and the preview JPEG
+                 fallback run on spawn_blocking, not inline on a tokio worker;
+                 PNG encoding and the OCR subprocess share AppState.expensive
+                 (a 2-permit Semaphore) so repeated dashboard clicks queue
+                 rather than piling up CPU work or visionocr children. The OCR
+                 child sets kill_on_drop(true) and is awaited under a 30 s
+                 timeout (wait_with_timeout) — 504 on timeout, process killed
     auth.rs      token + loopback Host/Origin layer over the whole router
                  (byte-identical in serialcap/hidrig/ch9329)
     daemon.rs    advisory lock, discovery file (pid, port, token; owner-only),
-                 tokio runtime, graceful shutdown
+                 tokio runtime, graceful shutdown. Shutdown removes daemon.json
+                 only — NOT the lock file, which stays open (flock'd) until
+                 this process exits; unlinking it while still held would let a
+                 next daemon lock a fresh inode at the same path while this
+                 process (and its lock on the old inode) is still alive
   assets/        index.html (combined dashboard) + vendored xterm.js/css/fit addon
 
 cambrionix/      Rust crate: standalone helper binary for Cambrionix USB hub control
@@ -531,24 +554,57 @@ serialcap/       Rust crate: serial console daemon (parallels hdmicap)
     serial_io.rs one supervisor per interface: tokio-serial port owner; reconnect
                  loop; broadcast fan-out to WS clients; mpsc client->port; 64KB
                  scrollback ring; tees every chunk to that interface's capture
-                 thread (off the live fan-out path). `Serials` holds the named set
+                 thread (off the live fan-out path). `Serials` holds the named set.
+                 Outbound writes queue in an `Outbox` and drain at most 256 B per
+                 select! pass, so a large /input paste can't starve the read arm
+                 (was write_all-to-completion, ~6s of dead reads at 115200 baud
+                 for 64 KiB — bytes lost to a full kernel tty buffer). A DTR press
+                 (`dtr_press`) pulses the already-open port and stays on it — it
+                 does not close/reopen, since the OS raises/drops DTR on
+                 open/close and a reopen would add a second, driver-timed press;
+                 opens with `.dtr_on_open(false)` for the same reason. `attach()`
+                 (scrollback snapshot + broadcast subscribe under one lock)
+                 replaces separate scrollback()+subscribe() calls, which could
+                 double-deliver or drop a chunk at the attach boundary.
+                 `OpenFailures` backs off a missing device's log line from every
+                 750ms retry to once a minute. `is_pty` resolves symlinks
+                 (`resolve_links`, read_link-based — canonicalize needs the
+                 target to exist) before the path-prefix test, so a stable
+                 symlink to a pty (e.g. hidrig's console bridge) is recognized
     capture.rs   line assembler: splits bytes into timestamped, sequence-numbered
                  lines; appends them to a rotating on-disk JSONL log under
                  capture/<name>/ (survives restarts; resumes the seq counter);
-                 mirrors the current unterminated line to a pending sidecar. Also
-                 the `log` reader (interface select; tail / range / since,
-                 ANSI-stripped by default) + UTC formatting
+                 mirrors the current unterminated line to a pending sidecar,
+                 debounced to ~10 writes/s (SIDECAR_DEBOUNCE) rather than a
+                 write+rename per ingested chunk — spawn_capture in serial_io.rs
+                 waits on `sidecar_due()`'s deadline so an idle port still gets
+                 the last partial line mirrored. A MAX_PENDING force-flush splits
+                 at a UTF-8 char boundary (`utf8_floor_boundary`), not a raw byte
+                 offset, so a chunk boundary mid-multibyte-character doesn't turn
+                 into a U+FFFD. `strip_ansi` also consumes DCS/APC/PM/SOS
+                 (ESC P/_/^/X) payloads to their own terminator (previously only
+                 the introducer was eaten, leaking the payload) and drops Unicode
+                 format (Cf) characters — bidi overrides like U+202E, zero-width
+                 marks — that `char::is_control` doesn't cover. Also the `log`
+                 reader (interface select; tail / range / since, ANSI-stripped by
+                 default) + UTC formatting
     server.rs    axum: GET /stream (bidirectional WebSocket, 64 KiB messages),
                  /status, /interfaces, /devices; POST /button (DTR pulse),
                  /input (write bytes to port, 64 KiB body cap; ?pace_ms=N drips
                  one byte per N ms for a slow polled console, capped at 10 000).
                  Per-interface endpoints take ?interface=NAME, defaulting to the
-                 first configured interface
+                 first configured interface. A `/stream` client that falls behind
+                 the broadcast channel (RecvError::Lagged) gets an in-band marker
+                 in its own stream, not just a debug log; client->port keystrokes
+                 use write_tx.send().await (backpressure), not try_send (which
+                 silently dropped input once the 256-message queue filled)
     auth.rs      token + loopback Host/Origin layer over the whole router
                  (byte-identical in hdmicap/hidrig/ch9329)
     daemon.rs    advisory lock, discovery file (pid, port, token; owner-only),
                  tokio runtime, graceful shutdown; spawns one supervisor per
-                 interface
+                 interface. Shutdown removes daemon.json only — NOT the lock
+                 file, which stays open (flock'd) until this process exits; see
+                 the identical note on hdmicap's daemon.rs above
 
 ocr/             OCR helpers (compiled/installed binaries are gitignored):
                    visionocr.swift  Apple Vision OCR (macOS); built by paniolo setup via swiftc

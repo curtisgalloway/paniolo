@@ -72,6 +72,15 @@ detects a pty and opens it without one — the daemon logs `is a pty — opening
 without a line rate`. Set the baud your hardware would use; nothing depends
 on it.
 
+**`--device` can be a symlink to the pty, not just its raw path.** serialcap
+resolves symlinks before deciding whether a device is a pty, so a stable
+symlink pointing at a pty slave is recognized the same way the raw path
+would be — this is the shape the `hidrig` console bridge publishes a DUT's
+serial console in (see
+[hid-dual-board-design.md](dev/hid-dual-board-design.md)), since its
+allocated pty path isn't otherwise stable across daemon restarts. Point
+`--device` at either one.
+
 **Both console modes work.** `serial connect` gives an interactive `tio`
 terminal; `serial watch` gives the rolling capture log and the dashboard, which
 is what you want for an install you are waiting on. As with any device the two
@@ -248,6 +257,16 @@ When the dashboard page loads, serialcap replays up to 64 KB of scrollback
 immediately on WebSocket connect, so the terminal isn't blank mid-session.
 Keystrokes typed in the terminal are forwarded to the serial port in real time.
 
+If a client falls too far behind the live stream to keep up (a slow network
+link, a busy browser tab), the daemon drops that client's oldest buffered
+output rather than blocking every other client on it — this only ever
+affects the lagging client's own view, never the capture log or other
+connections. The gap is not silent: a marker is written into that client's
+stream in the same styled, timestamped form as the connect/disconnect/button
+markers — `── serial client lagged, dropped N chunks [HH:MM:SS UTC] ──` — so
+missing output reads as a known gap rather than looking like nothing was
+sent.
+
 The page authenticates to serialcap with serialcap's own token: `paniolo
 console` reads it from the daemon's discovery file and embeds it in the
 `?serialws=` URL it hands the page. serialcap echoes only that loopback origin
@@ -278,6 +297,24 @@ paniolo serial reset [-i console] [target-machine]             # soft reset (200
 > **This is a hardware reset, not a console `reboot`.** "Reboot over the serial
 > console" means typing `reboot` into a logged-in shell — `paniolo serial send
 > <target> "reboot"` — which is unrelated to the DTR power-button toggle above.
+
+**A press does not close and reopen the port.** The daemon pulses DTR on the
+already-open port and stays on it — it does not drop the connection and
+reconnect. This matters because the OS itself raises DTR on open and drops
+it on close (Linux's tty core does this unconditionally), so closing and
+reopening around a press used to add a second, driver-timed press
+immediately after the deliberate one — and dropped whatever the target sent
+in the brief window the port was closed. The same OS behavior means the very
+first open (daemon start, and every reconnect after a disconnect) also
+asserts DTR briefly; the daemon opens with DTR de-asserted to avoid adding a
+press there too, but cannot suppress the transition the kernel makes during
+the open call itself.
+
+> This has not been confirmed against real target hardware. To verify: watch
+> the DTR line with a scope or an LED across a `paniolo serial dtr` call —
+> there should be exactly one pulse, not two — or, if `--sense` is wired,
+> watch `power_on` in `paniolo serial show`/`GET /status` settle once rather
+> than flickering.
 
 See [power.md](power.md) for wiring diagrams, the generic power hooks
 (`cycle_cmd`/`on_cmd`/`off_cmd`/`state_cmd`), and a full command reference.

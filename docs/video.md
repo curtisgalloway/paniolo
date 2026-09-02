@@ -77,6 +77,16 @@ After an upgrade or rebuild, a daemon still running the old binary is flagged
 stale daemon (no `--restart` needed), or restart it explicitly with
 `paniolo daemons restart hdmicap` (see [architecture](dev/architecture.md)).
 
+**A stalled capture recovers on its own, most of the time.** The capture
+thread runs a watchdog that notices when no new frame has arrived for a
+while (12s after opening the device, or a further 4s of no progress after
+that) and reopens the capture device in place, publishing `no_device` while
+it does — no restart needed, and this is why `/snapshot`/`/status` briefly
+show `no_device` rather than a frozen frame during a stall. Only a device
+that keeps stalling right after every reopen (8 in a row with no healthy
+frame in between) makes the daemon give up and exit; at that point `paniolo
+video watch` (or `daemons restart --stale`) is what brings it back.
+
 ---
 
 ## Capturing frames
@@ -98,6 +108,21 @@ wait for the screen to change.
 the target's video channel lives on a remote control host: the remote shot
 streams over SSH and the PNG is written locally (a failed capture removes the
 stub file). No copy-back step needed.
+
+`--stable`/`--changed-since` wait by polling the daemon's internal frame
+channel, not by re-hitting the endpoint; `GET /snapshot` returns **503** in
+three distinct cases, each worth telling apart when scripting against it:
+- `x-signal: stale` — the last frame is too old to describe the screen now
+  (capture has stopped delivering, even though the daemon process is up).
+- `x-signal: no_device` — no capture device is open.
+- **no `x-signal` header, body `capture thread gone`** — the daemon's
+  internal capture thread has exited and is not coming back (this daemon
+  process needs `paniolo video watch --restart`, not another `shot`).
+
+PNG encoding (and, on Linux, the MJPEG decode feeding it) is real CPU work
+that `/snapshot` and `/ocr` share a small concurrency limit for, so a burst
+of clicks queues briefly rather than piling up unbounded work — see *OCR*
+below.
 
 ---
 
@@ -140,6 +165,14 @@ instead of returning empty text, so "display is off" and "screen is blank"
 stay distinguishable. OCR is on-device on both platforms — no network, no
 model download: Apple Vision's `VNRecognizeTextRequest` on macOS, Tesseract
 on Linux.
+
+**OCR is bounded, so a wedged or merely slow helper can't hang the daemon.**
+`GET /ocr` gives the `visionocr`/`linuxocr`/`winocr` subprocess 30 seconds;
+past that, the daemon kills it and answers **504** rather than waiting
+indefinitely. PNG encoding and the OCR subprocess together share a small
+concurrency limit (2 at a time), so repeated OCR/snapshot clicks from the
+dashboard queue briefly instead of spawning an unbounded pile of helper
+processes or CPU work — a burst of clicks is slower, not runaway.
 
 `paniolo setup` installs the platform's helper into the private libexec dir:
 on macOS it compiles `ocr/visionocr.swift` with `swiftc`

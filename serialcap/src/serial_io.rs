@@ -24,10 +24,10 @@
 //! means a slow disk can never stall the live WebSocket fan-out.
 
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc as stdmpsc;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use serialport::SerialPort;
@@ -42,6 +42,16 @@ const RING_BYTES: usize = 64 * 1024;
 const BROADCAST_CAP: usize = 1024;
 const WRITE_CAP: usize = 256;
 const REOPEN_DELAY: Duration = Duration::from_millis(750);
+/// Bytes handed to the port per pass of the supervisor loop (see [`Outbox`]).
+const WRITE_CHUNK: usize = 256;
+/// Bytes queued in the supervisor before it stops draining `write_tx`, so a
+/// flood of input backs up to the HTTP/WebSocket senders (which wait on the
+/// channel) instead of growing the queue without bound.
+const OUTBOX_HIGH_WATER: usize = 256 * 1024;
+/// After the first "open failed" warning, repeat it at most this often.
+const OPEN_FAIL_LOG_EVERY: Duration = Duration::from_secs(60);
+/// Symlink hops followed when deciding whether a device path is a pty.
+const MAX_LINK_HOPS: usize = 16;
 
 #[derive(Clone)]
 pub struct Status {
@@ -136,13 +146,16 @@ pub struct SerialHandle {
 }
 
 impl SerialHandle {
-    pub fn subscribe(&self) -> broadcast::Receiver<Bytes> {
-        self.to_clients.subscribe()
-    }
-
-    /// Snapshot of recent output for a newly-connected client.
-    pub fn scrollback(&self) -> Vec<u8> {
-        self.ring.lock().unwrap().iter().copied().collect()
+    /// The scrollback snapshot and a live subscription for a new client, taken
+    /// together under the ring lock so the two tile exactly: every chunk the
+    /// supervisor publishes lands either in the snapshot or on the
+    /// subscription — never both, never neither. (`publish` appends to the
+    /// ring and broadcasts under the same lock.) Taking them separately left a
+    /// window in which a chunk was delivered twice, or not at all.
+    pub fn attach(&self) -> (Vec<u8>, broadcast::Receiver<Bytes>) {
+        let ring = self.ring.lock().unwrap();
+        let rx = self.to_clients.subscribe();
+        (ring.iter().copied().collect(), rx)
     }
 
     pub fn status(&self) -> Status {
@@ -239,29 +252,82 @@ pub fn spawn_interface(
 /// Start the OS thread that owns the line log and return a non-blocking sender
 /// for raw byte chunks. An unbounded channel means the supervisor never blocks
 /// on capture; serial throughput is tiny, so the queue can't grow meaningfully.
+///
+/// The log defers rewrites of its pending-line sidecar (see
+/// `LineLog::sidecar_due`); when one is outstanding the thread waits with a
+/// deadline so an idle port still gets its last partial line mirrored.
 fn spawn_capture(capture_dir: PathBuf, buffer_lines: u64) -> stdmpsc::Sender<Bytes> {
     let (tx, rx) = stdmpsc::channel::<Bytes>();
     std::thread::Builder::new()
         .name("serialcap-capture".into())
         .spawn(move || {
+            use stdmpsc::RecvTimeoutError;
             let mut log = LineLog::open(capture_dir, buffer_lines);
-            // Iteration ends when every sender has dropped (daemon shutting down).
-            for chunk in rx {
-                log.ingest(&chunk);
+            loop {
+                let next = match log.sidecar_due(Instant::now()) {
+                    None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+                    Some(wait) => rx.recv_timeout(wait),
+                };
+                match next {
+                    Ok(chunk) => log.ingest(&chunk),
+                    Err(RecvTimeoutError::Timeout) => log.flush_sidecar(),
+                    // Every sender has dropped: the daemon is shutting down.
+                    Err(RecvTimeoutError::Disconnected) => {
+                        log.flush_sidecar();
+                        break;
+                    }
+                }
             }
         })
         .expect("spawn capture thread");
     tx
 }
 
-/// True when `device` names a pseudo-terminal slave rather than a real serial
-/// port: `/dev/ttysNNN` on macOS, `/dev/pts/N` on Linux. That is what
-/// `utmctl attach` prints for a UTM guest's console and what qemu reports for
-/// `-serial pty`, so it is the shape a VM's console arrives in.
+/// `device` with symlinks followed, so a link to a pty (the hidrig console
+/// bridge publishes one) is judged by where it points rather than by its own
+/// name. Resolved link by link with `read_link` rather than `canonicalize`,
+/// which needs the target to exist — this is decided before the open, and a
+/// VM's console may not be there yet. `..` and `.` components are folded
+/// lexically so a relative link target still yields a `/dev/...` path.
+fn resolve_links(device: &str) -> String {
+    let mut path = PathBuf::from(device);
+    for _ in 0..MAX_LINK_HOPS {
+        let Ok(target) = std::fs::read_link(&path) else {
+            break;
+        };
+        path = if target.is_absolute() {
+            target
+        } else {
+            let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
+            base.join(target)
+        };
+    }
+    let mut folded = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::ParentDir => {
+                folded.pop();
+            }
+            Component::CurDir => {}
+            other => folded.push(other),
+        }
+    }
+    folded.to_string_lossy().into_owned()
+}
+
+/// True when `device` names (or links to) a pseudo-terminal slave rather than
+/// a real serial port: `/dev/ttysNNN` on macOS, `/dev/pts/N` on Linux. That
+/// is what `utmctl attach` prints for a UTM guest's console and what qemu
+/// reports for `-serial pty`, so it is the shape a VM's console arrives in.
 ///
 /// A path test rather than an fd test on purpose — the decision has to be made
 /// *before* the open, because on macOS it changes how the open is performed.
 fn is_pty(device: &str) -> bool {
+    is_pty_path(&resolve_links(device))
+}
+
+/// The pure prefix test behind [`is_pty`], on an already-resolved path.
+fn is_pty_path(device: &str) -> bool {
     let numbered = |rest: &str| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit());
     device.strip_prefix("/dev/ttys").is_some_and(numbered)
         || device.strip_prefix("/dev/pts/").is_some_and(numbered)
@@ -304,6 +370,118 @@ fn read_power_sense(port: &mut impl SerialPort, signal: &str) -> Option<bool> {
     }
 }
 
+/// Bytes waiting to go out to the port, handed over at most [`WRITE_CHUNK`]
+/// at a time.
+///
+/// The supervisor used to `write_all` each input message to completion before
+/// it polled the port again: a 64 KiB paste at 115200 baud is ~6 s of line
+/// time during which nothing was read — the kernel's tty buffer overflowed and
+/// bytes vanished from the stream, the scrollback and the capture, and a
+/// `/button` press queued behind it. Queueing input here and writing one
+/// bounded slice per pass of the loop keeps the read arm live throughout.
+#[derive(Default)]
+struct Outbox {
+    queue: VecDeque<Bytes>,
+    /// Bytes of `queue.front()` already written.
+    cursor: usize,
+    /// Bytes not yet written, across the whole queue.
+    pending: usize,
+}
+
+impl Outbox {
+    fn push(&mut self, data: Bytes) {
+        if data.is_empty() {
+            return;
+        }
+        self.pending += data.len();
+        self.queue.push_back(data);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending == 0
+    }
+
+    /// Bytes still to be written.
+    fn pending(&self) -> usize {
+        self.pending
+    }
+
+    /// The next slice to write: up to [`WRITE_CHUNK`] bytes, empty when
+    /// nothing is waiting.
+    fn front(&self) -> &[u8] {
+        match self.queue.front() {
+            Some(head) => &head[self.cursor..(self.cursor + WRITE_CHUNK).min(head.len())],
+            None => &[],
+        }
+    }
+
+    /// Account for `n` bytes of `front()` having been written. A short write
+    /// leaves the cursor mid-message; the rest goes out next pass.
+    fn consume(&mut self, n: usize) {
+        let Some(head) = self.queue.front() else {
+            return;
+        };
+        let n = n.min(head.len() - self.cursor);
+        self.cursor += n;
+        self.pending -= n;
+        if self.cursor >= head.len() {
+            self.queue.pop_front();
+            self.cursor = 0;
+        }
+    }
+}
+
+/// Rate limit for the "open failed" warning. A missing device is retried every
+/// [`REOPEN_DELAY`], and warning on every attempt wrote 10-15 MB a day to
+/// daemon.log for one unplugged adapter. Log the first failure, then at most
+/// one a minute, then once on recovery.
+struct OpenFailures {
+    attempts: u64,
+    last_logged: Option<Instant>,
+}
+
+impl OpenFailures {
+    fn new() -> Self {
+        OpenFailures {
+            attempts: 0,
+            last_logged: None,
+        }
+    }
+
+    /// Record a failed attempt; `Some(attempts so far)` when this one should
+    /// be logged.
+    fn failed(&mut self, now: Instant) -> Option<u64> {
+        self.attempts += 1;
+        let due = match self.last_logged {
+            None => true,
+            Some(last) => now.duration_since(last) >= OPEN_FAIL_LOG_EVERY,
+        };
+        if due {
+            self.last_logged = Some(now);
+            Some(self.attempts)
+        } else {
+            None
+        }
+    }
+
+    /// Record a successful open; `Some(failed attempts)` when failures
+    /// preceded it, so the recovery can be logged once.
+    fn recovered(&mut self) -> Option<u64> {
+        self.last_logged = None;
+        let n = std::mem::take(&mut self.attempts);
+        (n > 0).then_some(n)
+    }
+}
+
+/// Why the supervisor's read/write loop stopped.
+enum InnerExit {
+    Disconnect,
+    DtrPress {
+        duration_ms: u64,
+        resp_tx: oneshot::Sender<()>,
+    },
+}
+
 async fn supervisor(
     spec: InterfaceSpec,
     to_clients: broadcast::Sender<Bytes>,
@@ -323,6 +501,7 @@ async fn supervisor(
     // Track whether we've ever connected so the first open shows "connected"
     // and later opens show "reconnected".
     let mut ever_connected = false;
+    let mut open_failures = OpenFailures::new();
 
     // A pty (a VM's console) is both opened and torn down differently from a
     // real port; see `open_baud` and the `Ok(0)` arm of the read loop.
@@ -333,9 +512,23 @@ async fn supervisor(
     }
 
     loop {
-        let port = match tokio_serial::new(&device, baud).open_native_async() {
+        // DTR may be the target's power button (see `dtr_press`), so the port
+        // is opened with it de-asserted rather than left at the OS default:
+        // Linux raises DTR on open and drops it on close, which made every
+        // open — daemon start, every reconnect — a driver-timed press. Linux
+        // still pulses it for the duration of the open itself; that is in the
+        // tty core and out of reach from here.
+        let port = match tokio_serial::new(&device, baud)
+            .dtr_on_open(false)
+            .open_native_async()
+        {
             Ok(mut p) => {
-                info!("serial port opened: {device} @ {baud}");
+                match open_failures.recovered() {
+                    Some(n) => {
+                        info!("serial port opened: {device} @ {baud} (after {n} failed attempts)")
+                    }
+                    None => info!("serial port opened: {device} @ {baud}"),
+                }
                 {
                     let mut st = status.lock().unwrap();
                     st.connected = true;
@@ -353,7 +546,14 @@ async fn supervisor(
                 p
             }
             Err(e) => {
-                warn!("open {device} failed: {e}");
+                match open_failures.failed(Instant::now()) {
+                    Some(1) => warn!(
+                        "open {device} failed: {e} (retrying every {REOPEN_DELAY:?}; \
+                         further failures are logged once a minute)"
+                    ),
+                    Some(n) => warn!("open {device} still failing after {n} attempts: {e}"),
+                    None => {}
+                }
                 status.lock().unwrap().connected = false;
                 tokio::time::sleep(REOPEN_DELAY).await;
                 continue;
@@ -362,100 +562,98 @@ async fn supervisor(
 
         let (mut rd, mut wr) = tokio::io::split(port);
         let mut buf = [0u8; 65536];
+        let mut outbox = Outbox::default();
 
-        enum InnerExit {
-            Disconnect,
-            DtrPress {
-                duration_ms: u64,
-                resp_tx: oneshot::Sender<()>,
-            },
-        }
-
-        let exit = loop {
-            tokio::select! {
-                read = rd.read(&mut buf) => match read {
-                    Ok(0) if pty => {
-                        // A pty *does* have an EOF: `Ok(0)` means the far end
-                        // closed — the VM powered off, or its hypervisor let go
-                        // of the master. Treat it as the disconnect it is rather
-                        // than spinning, so the marker is emitted and the
-                        // reconnect loop can pick the console back up.
-                        break InnerExit::Disconnect;
-                    }
-                    Ok(0) => {
-                        // Real serial ports don't have EOF; Ok(0) means the async
-                        // read resolved without data. Yield to avoid a spin loop.
-                        tokio::time::sleep(Duration::from_millis(1)).await;
-                    }
-                    Ok(n) => {
-                        let chunk = Bytes::copy_from_slice(&buf[..n]);
-                        push_ring(&ring, &chunk);
-                        if line_tx.send(chunk.clone()).is_err() {
-                            warn!("capture thread dead — bytes lost");
+        // One open port. A DTR press pauses this loop but does not leave it;
+        // only a disconnect does.
+        loop {
+            let exit = loop {
+                tokio::select! {
+                    read = rd.read(&mut buf) => match read {
+                        Ok(0) if pty => {
+                            // A pty *does* have an EOF: `Ok(0)` means the far end
+                            // closed — the VM powered off, or its hypervisor let go
+                            // of the master. Treat it as the disconnect it is rather
+                            // than spinning, so the marker is emitted and the
+                            // reconnect loop can pick the console back up.
+                            break InnerExit::Disconnect;
                         }
-                        // Err just means no subscribers; that's fine.
-                        let _ = to_clients.send(chunk);
+                        Ok(0) => {
+                            // Real serial ports don't have EOF; Ok(0) means the async
+                            // read resolved without data. Yield to avoid a spin loop.
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                        Ok(n) => {
+                            publish(&ring, &to_clients, &line_tx, Bytes::copy_from_slice(&buf[..n]));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                        Err(e) => { warn!("serial read error: {e}"); break InnerExit::Disconnect; }
+                    },
+                    // One bounded slice per pass, so the read arm above keeps
+                    // its turn while a large paste drains (see `Outbox`).
+                    written = wr.write(outbox.front()), if !outbox.is_empty() => match written {
+                        Ok(0) => tokio::time::sleep(Duration::from_millis(1)).await,
+                        Ok(n) => outbox.consume(n),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                        Err(e) => { warn!("serial write error: {e}"); break InnerExit::Disconnect; }
+                    },
+                    // Past the high-water mark the queue is left in the
+                    // channel, where senders wait on it.
+                    Some(data) = write_rx.recv(), if outbox.pending() < OUTBOX_HIGH_WATER => {
+                        outbox.push(data);
+                    },
+                    Some((duration_ms, resp_tx)) = dtr_rx.recv() => {
+                        break InnerExit::DtrPress { duration_ms, resp_tx };
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        tokio::time::sleep(Duration::from_millis(1)).await;
-                    }
-                    Err(e) => { warn!("serial read error: {e}"); break InnerExit::Disconnect; }
-                },
-                Some(data) = write_rx.recv() => {
-                    if let Err(e) = wr.write_all(&data).await {
-                        warn!("serial write error: {e}");
-                        break InnerExit::Disconnect;
-                    }
-                },
-                Some((duration_ms, resp_tx)) = dtr_rx.recv() => {
-                    break InnerExit::DtrPress { duration_ms, resp_tx };
                 }
-            }
-        };
+            };
 
-        match exit {
-            InnerExit::DtrPress {
-                duration_ms,
-                resp_tx,
-            } => {
-                // Rejoin the split halves to regain the SerialPort trait methods.
-                let mut port = rd.unsplit(wr);
-                emit_marker(&ring, &to_clients, &line_tx, "button press", 35); // magenta
-                port.write_data_terminal_ready(true).ok();
-                tokio::time::sleep(Duration::from_millis(duration_ms)).await;
-                port.write_data_terminal_ready(false).ok();
-                // Read power state immediately after releasing the button — the
-                // 3.3 V rail may have dropped (long press → power-off).
-                if let Some(sig) = &power_sense_signal {
-                    status.lock().unwrap().power_on = read_power_sense(&mut port, sig);
+            match exit {
+                InnerExit::DtrPress {
+                    duration_ms,
+                    resp_tx,
+                } => {
+                    // Rejoin the split halves to regain the SerialPort trait methods.
+                    let mut port = rd.unsplit(wr);
+                    emit_marker(&ring, &to_clients, &line_tx, "button press", 35); // magenta
+                    port.write_data_terminal_ready(true).ok();
+                    tokio::time::sleep(Duration::from_millis(duration_ms)).await;
+                    port.write_data_terminal_ready(false).ok();
+                    // Read power state immediately after releasing the button — the
+                    // 3.3 V rail may have dropped (long press → power-off).
+                    if let Some(sig) = &power_sense_signal {
+                        status.lock().unwrap().power_on = read_power_sense(&mut port, sig);
+                    }
+                    resp_tx.send(()).ok();
+                    // Keep the port open. Closing and reopening it here let the
+                    // OS drop and re-raise DTR on the way back in — a second,
+                    // driver-timed button press after every deliberate one.
+                    let (r, w) = tokio::io::split(port);
+                    rd = r;
+                    wr = w;
                 }
-                resp_tx.send(()).ok();
-                // Drop the port and re-enter the outer reconnect loop immediately.
-                drop(port);
-                continue;
-            }
-            InnerExit::Disconnect => {
-                // We only reach here after a successful open, so this is a real
-                // disconnect (link dropped / device unplugged), not a failed open.
-                status.lock().unwrap().connected = false;
-                emit_marker(&ring, &to_clients, &line_tx, "disconnected", 31); // red
-                tokio::time::sleep(REOPEN_DELAY).await;
+                InnerExit::Disconnect => {
+                    // We only reach here after a successful open, so this is a real
+                    // disconnect (link dropped / device unplugged), not a failed open.
+                    status.lock().unwrap().connected = false;
+                    emit_marker(&ring, &to_clients, &line_tx, "disconnected", 31); // red
+                    tokio::time::sleep(REOPEN_DELAY).await;
+                    break;
+                }
             }
         }
     }
 }
 
-/// Inject a styled, timestamped status line into the stream and scrollback so the
-/// web terminal shows exactly when the serial link dropped or came back. ANSI
-/// color `code` (31 red / 32 green / 36 cyan); only the WS terminal renders it —
-/// `tio` uses a different path.
-fn emit_marker(
-    ring: &Arc<Mutex<VecDeque<u8>>>,
-    to_clients: &broadcast::Sender<Bytes>,
-    line_tx: &stdmpsc::Sender<Bytes>,
-    label: &str,
-    code: u8,
-) {
+/// A styled, timestamped status line for the stream, so the web terminal
+/// shows exactly when the serial link dropped or came back. ANSI color `code`
+/// (31 red / 32 green / 33 yellow / 36 cyan); only the WS terminal renders
+/// it — `tio` uses a different path.
+pub(crate) fn marker_line(label: &str, code: u8) -> Bytes {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -467,21 +665,49 @@ fn emit_marker(
         (sod % 3600) / 60,
         sod % 60,
     );
-    let bytes = Bytes::from(line.into_bytes());
-    push_ring(ring, &bytes);
-    let _ = line_tx.send(bytes.clone());
-    let _ = to_clients.send(bytes);
+    Bytes::from(line.into_bytes())
 }
 
-fn push_ring(ring: &Arc<Mutex<VecDeque<u8>>>, chunk: &[u8]) {
-    // try_lock: if scrollback() holds the lock, skip rather than blocking
-    // the supervisor OS thread (which stalls the read loop and risks FIFO overflow).
-    if let Ok(mut r) = ring.try_lock() {
-        r.extend(chunk.iter().copied());
-        let overflow = r.len().saturating_sub(RING_BYTES);
-        if overflow > 0 {
-            r.drain(0..overflow);
-        }
+/// Inject a [`marker_line`] into the stream and scrollback.
+fn emit_marker(
+    ring: &Arc<Mutex<VecDeque<u8>>>,
+    to_clients: &broadcast::Sender<Bytes>,
+    line_tx: &stdmpsc::Sender<Bytes>,
+    label: &str,
+    code: u8,
+) {
+    publish(ring, to_clients, line_tx, marker_line(label, code));
+}
+
+/// Fan one chunk out: the capture thread, the scrollback ring and every live
+/// client. The ring is appended and the broadcast sent under the ring lock,
+/// so a client attaching at the same moment (`SerialHandle::attach`, which
+/// snapshots and subscribes under that lock) sees the chunk exactly once.
+/// The critical section is a ≤64 KiB memcpy, so the lock is taken outright —
+/// the old `try_lock` skipped the ring whenever a client was reading it,
+/// leaving holes in the scrollback.
+fn publish(
+    ring: &Arc<Mutex<VecDeque<u8>>>,
+    to_clients: &broadcast::Sender<Bytes>,
+    line_tx: &stdmpsc::Sender<Bytes>,
+    chunk: Bytes,
+) {
+    if line_tx.send(chunk.clone()).is_err() {
+        warn!("capture thread dead — bytes lost");
+    }
+    let mut r = ring.lock().unwrap();
+    push_ring(&mut r, &chunk);
+    // Err just means no subscribers; that's fine.
+    let _ = to_clients.send(chunk);
+}
+
+/// Append `chunk` to the scrollback ring, evicting the oldest bytes past
+/// [`RING_BYTES`].
+fn push_ring(ring: &mut VecDeque<u8>, chunk: &[u8]) {
+    ring.extend(chunk.iter().copied());
+    let overflow = ring.len().saturating_sub(RING_BYTES);
+    if overflow > 0 {
+        ring.drain(0..overflow);
     }
 }
 
@@ -515,29 +741,25 @@ mod tests {
     use super::*;
     use tokio_serial::{SerialPortType, UsbPortInfo};
 
-    fn ring() -> Arc<Mutex<VecDeque<u8>>> {
-        Arc::new(Mutex::new(VecDeque::new()))
-    }
-
-    fn snapshot(r: &Arc<Mutex<VecDeque<u8>>>) -> Vec<u8> {
-        r.lock().unwrap().iter().copied().collect()
+    fn snapshot(r: &VecDeque<u8>) -> Vec<u8> {
+        r.iter().copied().collect()
     }
 
     // ── push_ring: scrollback ring-buffer truncation ────────────────────────
 
     #[test]
     fn push_ring_accumulates_in_order() {
-        let r = ring();
-        push_ring(&r, b"hello ");
-        push_ring(&r, b"world");
+        let mut r = VecDeque::new();
+        push_ring(&mut r, b"hello ");
+        push_ring(&mut r, b"world");
         assert_eq!(snapshot(&r), b"hello world");
     }
 
     #[test]
     fn push_ring_truncates_to_capacity_keeping_newest() {
-        let r = ring();
-        push_ring(&r, &vec![b'A'; RING_BYTES]); // fill exactly to capacity
-        push_ring(&r, b"XYZ"); // 3 bytes over -> 3 oldest dropped
+        let mut r = VecDeque::new();
+        push_ring(&mut r, &vec![b'A'; RING_BYTES]); // fill exactly to capacity
+        push_ring(&mut r, b"XYZ"); // 3 bytes over -> 3 oldest dropped
         let snap = snapshot(&r);
         assert_eq!(snap.len(), RING_BYTES, "never grows past RING_BYTES");
         assert_eq!(&snap[snap.len() - 3..], b"XYZ", "newest bytes retained");
@@ -549,9 +771,9 @@ mod tests {
 
     #[test]
     fn push_ring_single_oversized_chunk_keeps_tail() {
-        let r = ring();
+        let mut r = VecDeque::new();
         let big: Vec<u8> = (0..(RING_BYTES as u32 + 100)).map(|i| i as u8).collect();
-        push_ring(&r, &big);
+        push_ring(&mut r, &big);
         let snap = snapshot(&r);
         assert_eq!(snap.len(), RING_BYTES);
         assert_eq!(
@@ -559,6 +781,190 @@ mod tests {
             big[big.len() - RING_BYTES..],
             "keeps the most-recent window"
         );
+    }
+
+    // ── publish + attach: a chunk reaches a client exactly once ─────────────
+
+    /// A client attaching while output is flowing must see every chunk once:
+    /// in its scrollback snapshot or on its subscription, never both, never
+    /// neither. Taking the snapshot and the subscription separately (and
+    /// skipping the ring under `try_lock`) left windows for both.
+    ///
+    /// The producer publishes consecutive numbers as fast as it can while the
+    /// test attaches over and over; each attach checks that its snapshot is
+    /// gap-free and that the first chunk on its subscription continues the
+    /// snapshot's sequence.
+    #[test]
+    fn attach_tiles_scrollback_and_subscription_exactly() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let ring = Arc::new(Mutex::new(VecDeque::new()));
+        let (to_clients, _) = broadcast::channel::<Bytes>(BROADCAST_CAP);
+        let (line_tx, line_rx) = stdmpsc::channel::<Bytes>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let producer = {
+            let (ring, to_clients, stop) = (ring.clone(), to_clients.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut n: u32 = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    publish(
+                        &ring,
+                        &to_clients,
+                        &line_tx,
+                        Bytes::copy_from_slice(&n.to_le_bytes()),
+                    );
+                    n += 1;
+                    // Give the sampling thread a turn so it is not perpetually
+                    // lagged behind the producer on a loaded machine.
+                    std::thread::yield_now();
+                }
+                n
+            })
+        };
+        // Drain the capture side so its queue does not grow unboundedly.
+        let drain = std::thread::spawn(move || for _ in line_rx {});
+
+        let handle = SerialHandle {
+            to_clients: to_clients.clone(),
+            write_tx: mpsc::channel(1).0,
+            ring: ring.clone(),
+            status: Arc::new(Mutex::new(Status {
+                device: "test".into(),
+                baud: 0,
+                connected: true,
+                power_on: None,
+            })),
+            dtr_tx: mpsc::channel(1).0,
+        };
+
+        // Sample until enough verdicts are in; a lagged sample yields none, and
+        // how often that happens depends on machine load, not on correctness.
+        let mut checked = 0;
+        for _ in 0..50_000 {
+            if checked >= 100 {
+                break;
+            }
+            let (snap, mut rx) = handle.attach();
+            let mut nums = snap
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c));
+            let Some(mut last) = nums.next() else {
+                continue;
+            };
+            for n in nums {
+                assert_eq!(n, last + 1, "hole in the scrollback: {last} then {n}");
+                last = n;
+            }
+            // The first live chunk must be the one after the snapshot's last.
+            let first = loop {
+                match rx.try_recv() {
+                    Ok(b) => break Some(u32::from_le_bytes(b[..].try_into().unwrap())),
+                    Err(broadcast::error::TryRecvError::Empty) => std::thread::yield_now(),
+                    // Fell behind the producer between attach and recv: no
+                    // verdict from this sample.
+                    Err(_) => break None,
+                }
+            };
+            if let Some(first) = first {
+                assert_eq!(
+                    first,
+                    last + 1,
+                    "snapshot ended at {last}, subscription began at {first}"
+                );
+                checked += 1;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        let produced = producer.join().unwrap();
+        drop(to_clients);
+        drain.join().unwrap();
+        assert!(produced > 100, "producer barely ran ({produced} chunks)");
+        assert!(
+            checked >= 100,
+            "too few verdicts to mean anything ({checked})"
+        );
+    }
+
+    // ── Outbox: bounded writes per loop pass ────────────────────────────────
+
+    #[test]
+    fn outbox_hands_out_at_most_one_chunk_per_pass_in_order() {
+        let mut ob = Outbox::default();
+        let data: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+        ob.push(Bytes::from(data.clone()));
+        assert_eq!(ob.pending(), 1000);
+        let mut written = Vec::new();
+        let mut passes = 0;
+        while !ob.is_empty() {
+            let slice = ob.front();
+            assert!(
+                slice.len() <= WRITE_CHUNK,
+                "a pass wrote {} bytes",
+                slice.len()
+            );
+            assert!(!slice.is_empty());
+            written.extend_from_slice(slice);
+            let n = slice.len();
+            ob.consume(n);
+            passes += 1;
+        }
+        assert_eq!(written, data, "bytes reach the port intact and in order");
+        assert_eq!(passes, 1000_usize.div_ceil(WRITE_CHUNK));
+        assert!(ob.front().is_empty());
+    }
+
+    #[test]
+    fn outbox_short_write_resumes_mid_message_and_crosses_messages() {
+        let mut ob = Outbox::default();
+        ob.push(Bytes::from_static(b"abcdef"));
+        ob.push(Bytes::from_static(b"gh"));
+        assert_eq!(ob.front(), b"abcdef");
+        ob.consume(2); // the port took only two bytes
+        assert_eq!(ob.front(), b"cdef");
+        assert_eq!(ob.pending(), 6);
+        ob.consume(4);
+        assert_eq!(ob.front(), b"gh", "moves on to the next message");
+        ob.consume(2);
+        assert!(ob.is_empty());
+        ob.consume(1); // nothing to consume: harmless
+        assert!(ob.is_empty());
+    }
+
+    #[test]
+    fn outbox_ignores_empty_messages() {
+        let mut ob = Outbox::default();
+        ob.push(Bytes::new());
+        assert!(ob.is_empty());
+        assert!(ob.front().is_empty());
+    }
+
+    // ── OpenFailures: one warning, then one a minute, then the recovery ──────
+
+    #[test]
+    fn open_failures_log_first_then_once_a_minute_then_recovery() {
+        let t0 = Instant::now();
+        let mut f = OpenFailures::new();
+        assert_eq!(f.failed(t0), Some(1), "the first failure is logged");
+        assert_eq!(f.failed(t0 + Duration::from_millis(750)), None);
+        assert_eq!(f.failed(t0 + Duration::from_secs(30)), None);
+        assert_eq!(
+            f.failed(t0 + OPEN_FAIL_LOG_EVERY),
+            Some(4),
+            "a minute later it is logged again, with the attempt count"
+        );
+        assert_eq!(
+            f.failed(t0 + OPEN_FAIL_LOG_EVERY + Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(
+            f.recovered(),
+            Some(5),
+            "recovery reports the failed attempts"
+        );
+        assert_eq!(f.recovered(), None, "a clean open has nothing to report");
+        assert_eq!(f.failed(t0), Some(1), "the cycle restarts after recovery");
     }
 
     // ── describe: port-type formatting ──────────────────────────────────────
@@ -612,7 +1018,7 @@ mod tests {
         let handle = SerialHandle {
             to_clients,
             write_tx,
-            ring: ring(),
+            ring: Arc::new(Mutex::new(VecDeque::new())),
             status,
             dtr_tx,
         };
@@ -663,6 +1069,7 @@ mod tests {
 
     // ── pty consoles (a VM's serial port) ───────────────────────────────────
 
+    #[cfg(unix)]
     #[test]
     fn is_pty_recognizes_platform_pty_paths() {
         assert!(is_pty("/dev/ttys006"), "macOS pty slave");
@@ -683,6 +1090,58 @@ mod tests {
         ] {
             assert!(!is_pty(dev), "{dev} is not a pty");
         }
+    }
+
+    #[cfg(unix)]
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("serialcap-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// A symlink to a pty is a pty: the hidrig console bridge publishes its
+    /// console as a link with a stable name, and by that name alone the
+    /// prefix test said "real port" — so on macOS the open applied a line
+    /// rate and failed with ENOTTY. The link targets here do not exist, which
+    /// is the point: the decision is made before the open, from the path.
+    #[cfg(unix)]
+    #[test]
+    fn is_pty_follows_symlinks_to_the_device() {
+        use std::os::unix::fs::symlink;
+        let dir = tmp_dir("pty-links");
+
+        let to_mac_pty = dir.join("console");
+        symlink("/dev/ttys004", &to_mac_pty).unwrap();
+        assert!(is_pty(to_mac_pty.to_str().unwrap()), "link to a macOS pty");
+
+        let to_linux_pty = dir.join("guest");
+        symlink("/dev/pts/7", &to_linux_pty).unwrap();
+        assert!(
+            is_pty(to_linux_pty.to_str().unwrap()),
+            "link to a Linux pty"
+        );
+
+        let chained = dir.join("chained");
+        symlink(&to_linux_pty, &chained).unwrap();
+        assert!(is_pty(chained.to_str().unwrap()), "link to a link to a pty");
+
+        let relative = dir.join("relative");
+        symlink("./guest", &relative).unwrap();
+        assert!(is_pty(relative.to_str().unwrap()), "relative link target");
+
+        let to_real = dir.join("uart");
+        symlink("/dev/tty.usbserial-0001", &to_real).unwrap();
+        assert!(!is_pty(to_real.to_str().unwrap()), "link to a real port");
+
+        let plain = dir.join("ttys004");
+        std::fs::write(&plain, b"").unwrap();
+        assert!(
+            !is_pty(plain.to_str().unwrap()),
+            "a plain file named like a pty"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -723,6 +1182,7 @@ mod tests {
         use std::os::unix::io::FromRawFd;
 
         let (master, device) = open_pty_master();
+        assert!(is_pty(&device), "{device} should be recognised as a pty");
         let baud = open_baud(&device, 115_200);
         let mut port = tokio_serial::new(&device, baud)
             .open_native_async()
@@ -746,6 +1206,29 @@ mod tests {
         let mut back = [0u8; 64];
         let n = std::io::Read::read(&mut far, &mut back).unwrap();
         assert_eq!(&back[..n], b"reply\r\n");
+    }
+
+    /// The same open through a symlink — the shape the hidrig console bridge
+    /// publishes. On macOS this only succeeds if the link is recognised as a
+    /// pty (baud 0); with a line rate the open fails with ENOTTY.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opens_a_pty_through_a_symlink() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::io::FromRawFd;
+
+        let (master, device) = open_pty_master();
+        let far = unsafe { std::fs::File::from_raw_fd(master) };
+        let dir = tmp_dir("pty-symlink-open");
+        let link = dir.join("console");
+        symlink(&device, &link).unwrap();
+        let link = link.to_str().unwrap().to_string();
+
+        let baud = open_baud(&link, 115_200);
+        let port = tokio_serial::new(&link, baud).open_native_async();
+        std::fs::remove_dir_all(&dir).ok();
+        port.unwrap_or_else(|e| panic!("opening pty via symlink {link} at baud {baud}: {e}"));
+        drop(far);
     }
 
     /// The premise behind the supervisor's `Ok(0) if pty` arm: when the far end
@@ -778,5 +1261,106 @@ mod tests {
                 "WouldBlock would spin the supervisor instead of reconnecting"
             ),
         }
+    }
+
+    // ── the supervisor on a real pty ────────────────────────────────────────
+
+    /// A supervisor on the slave end of a fresh pty, with the master end (the
+    /// "target") returned for the test to drive. The capture thread writes to
+    /// a scratch directory.
+    #[cfg(unix)]
+    fn spawn_on_pty(tag: &str) -> (SerialHandle, std::fs::File, PathBuf) {
+        use std::os::unix::io::FromRawFd;
+        let (master, device) = open_pty_master();
+        let far = unsafe { std::fs::File::from_raw_fd(master) };
+        let dir = tmp_dir(tag);
+        let handle = spawn_interface(
+            InterfaceSpec {
+                name: "console".into(),
+                device,
+                baud: 115_200,
+                power_sense_signal: None,
+            },
+            dir.clone(),
+            100,
+        );
+        (handle, far, dir)
+    }
+
+    /// Wait until the client-side stream has carried `needle`, returning
+    /// everything received so far.
+    #[cfg(unix)]
+    async fn recv_until(rx: &mut broadcast::Receiver<Bytes>, needle: &[u8]) -> Vec<u8> {
+        let mut got = Vec::new();
+        loop {
+            let chunk = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "timed out waiting for {:?}; received so far: {:?}",
+                        String::from_utf8_lossy(needle),
+                        String::from_utf8_lossy(&got)
+                    )
+                })
+                .expect("stream closed");
+            got.extend_from_slice(&chunk);
+            if got.windows(needle.len()).any(|w| w == needle) {
+                return got;
+            }
+        }
+    }
+
+    /// Review M18. A large write must not stop the port being read. The
+    /// target here never reads, so the pty's buffer fills after a few KiB and
+    /// the rest of the 64 KiB paste cannot go out; the supervisor must still
+    /// pick up and fan out what the target prints in the meantime. Before the
+    /// outbox, `write_all` held the loop until the paste finished, so this
+    /// timed out.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stuck_write_does_not_starve_reads() {
+        let (handle, mut far, dir) = spawn_on_pty("stuck-write");
+        let (_, mut rx) = handle.attach();
+        recv_until(&mut rx, b"serial connected").await;
+
+        handle
+            .write_tx
+            .send(Bytes::from(vec![b'x'; 64 * 1024]))
+            .await
+            .unwrap();
+        // Give the supervisor time to start the write and wedge on the full
+        // pty buffer before the target speaks.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        std::io::Write::write_all(&mut far, b"target says hi\r\n").unwrap();
+        recv_until(&mut rx, b"target says hi").await;
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Review M19. A DTR press must not close and reopen the port: the OS
+    /// drops and re-raises DTR across a reopen, which was a second, driver-
+    /// timed button press after every deliberate one (and the read stream lost
+    /// whatever arrived meanwhile). The tell is the marker: a reopen emits
+    /// "reconnected". Data must keep flowing on the same port afterwards.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dtr_press_keeps_the_port_open() {
+        let (handle, mut far, dir) = spawn_on_pty("dtr-press");
+        let (_, mut rx) = handle.attach();
+        recv_until(&mut rx, b"serial connected").await;
+
+        handle.dtr_press(20).await.unwrap();
+
+        std::io::Write::write_all(&mut far, b"after the press\r\n").unwrap();
+        let got = recv_until(&mut rx, b"after the press").await;
+        let text = String::from_utf8_lossy(&got);
+        assert!(text.contains("serial button press"), "{text}");
+        assert!(
+            !text.contains("reconnected") && !text.contains("disconnected"),
+            "the press reopened the port: {text}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

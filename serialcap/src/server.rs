@@ -252,10 +252,10 @@ async fn stream(
 
 async fn handle_ws(socket: WebSocket, serial: SerialHandle) {
     let (mut sender, mut receiver) = socket.split();
-    let mut rx = serial.subscribe();
+    // Scrollback and subscription together, under one lock, so no chunk is
+    // ever delivered twice or missed (see `SerialHandle::attach`).
+    let (snapshot, mut rx) = serial.attach();
 
-    // Send recent scrollback so a mid-stream connection isn't blank.
-    let snapshot = serial.scrollback();
     if !snapshot.is_empty() && sender.send(Message::Binary(snapshot)).await.is_err() {
         return;
     }
@@ -271,6 +271,16 @@ async fn handle_ws(socket: WebSocket, serial: SerialHandle) {
                 }
                 Err(RecvError::Lagged(n)) => {
                     debug!("ws client lagged, dropped {n} messages");
+                    // The debug log alone is invisible to whoever is reading
+                    // the terminal; put the loss in the stream itself, in the
+                    // style of the connect/disconnect/button markers.
+                    let marker = crate::serial_io::marker_line(
+                        &format!("client lagged, dropped {n} chunks"),
+                        33, // yellow
+                    );
+                    if sender.send(Message::Binary(marker.to_vec())).await.is_err() {
+                        break;
+                    }
                 }
                 Err(RecvError::Closed) => break,
             }
@@ -282,11 +292,19 @@ async fn handle_ws(socket: WebSocket, serial: SerialHandle) {
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
             match msg {
+                // `send` rather than `try_send`: a full queue backpressures
+                // the client's WebSocket read instead of silently dropping
+                // keystrokes (the queue only fills when the port itself is
+                // the bottleneck, e.g. a paced `/input` send in progress).
                 Message::Binary(b) => {
-                    let _ = write_tx.try_send(Bytes::from(b));
+                    if write_tx.send(Bytes::from(b)).await.is_err() {
+                        break;
+                    }
                 }
                 Message::Text(t) => {
-                    let _ = write_tx.try_send(Bytes::from(t.into_bytes()));
+                    if write_tx.send(Bytes::from(t.into_bytes())).await.is_err() {
+                        break;
+                    }
                 }
                 Message::Close(_) => break,
                 _ => {}
