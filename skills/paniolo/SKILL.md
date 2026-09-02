@@ -82,7 +82,7 @@ paniolo target add <name> [--host <labhost>] [--description <text>]
 paniolo netboot set -t <name> --interface <iface> [--tftp-root <dir>] [--host-ip <ip>] [--boot-file grubaa64.efi] [--http-port 80] [--content-type <mime>]
 paniolo serial add console -t <name> --device <path> [--baud 115200] [--sense cts] [--power-button]
 paniolo power set -t <name> [--cycle-cmd C] [--on-cmd C] [--off-cmd C] [--state-cmd C] [--serial-interface console]
-paniolo video set -t <name> --device "<capture id or name>"
+paniolo video set -t <name> --device "<capture id or name>" [--ocr-mode text|gui]
 paniolo hid set -t <name> --cmd "hidrig -d <uart>"   # USB HID injection helper
 paniolo usb set -t <name> --cmd "ch9329 -d <uart>"   # switchable USB media (KVM-Go microSD)
 paniolo adb set -t <name> [--serial <adb-id>] [--adb <path>]  # an Android DUT over adb
@@ -205,7 +205,9 @@ passwordless `sudo` requirement as netboot (`ip` on Linux, `ifconfig` on macOS).
 
 ```
 paniolo video devices                 # list capture devices (with stable ids)
-paniolo video set -t <target> --device "<id-or-name>"   # configure the video channel
+paniolo video set -t <target> --device "<id-or-name>" [--ocr-mode text|gui]  # configure the video channel
+                                           #   --ocr-mode gui is a Linux-only accuracy switch
+                                           #   for GUI screens (unset = platform default)
 paniolo video watch [target] [--restart]   # start the capture daemon (background);
                                            #   --restart force-restarts a stalled one
 paniolo video preview                 # print the daemon's dashboard URL (no browser)
@@ -359,7 +361,10 @@ paniolo adb input -t <target> <args...>  # adb shell input: keyevent/text/tap/sw
   put `-t` first and use `--` before a leading-dash argument
   (`paniolo adb run -t pixel -- logcat -d -t 50`).
 - `adb run -t <t> getprop ro.product.model` is the read workhorse for agents;
-  `adb screencap -o -` pipes a PNG back (works on a remote control host too).
+  `-o <path>` on `screencap` always means *this* machine's filesystem — it
+  works the same whether the adb channel is local or on a remote control host
+  (like `video shot`), so `-o frame.png` and `-o -` (stdout) are equally safe
+  to use against a remote target.
 - Reboot/power: no adb-specific command — wire `adb reboot` through the power
   hooks (`paniolo power set -t <t> --cycle-cmd "adb -s <id> reboot"`).
 - The device must be authorized (`adb devices` shows it as `device`, not
@@ -442,9 +447,13 @@ quotes — the parent shell must not expand it). 1Password is only one option:
 any secret manager works, usually via a committed reference file or a small
 fetch-and-exec wrapper next to the automation that invokes paniolo — look
 for one there before composing the fetch by hand. Without the variable the
-hook fails with a message saying exactly this. See "Setting up the
-credential source" in `docs/power.md` for the patterns and the placement
-rule (the variable must exist on the host that owns the power channel).
+hook fails with a message saying exactly this. Setting it only where *you*
+run the command is enough — if the target's power channel lives on a remote
+control host, paniolo's own dispatch carries `AMT_PASSWORD` the rest of the
+way (over the remote command's stdin, never its argv, so `ps` on the control
+host never shows it); there is nothing to install on the control host for
+this specific variable. See "Setting up the credential source" in
+`docs/power.md` for the patterns.
 
 ## Switchable USB media — hand a card between host and target
 

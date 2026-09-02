@@ -174,6 +174,40 @@ machinery is only for the browser dashboard, not the terminal CLI.
   `-i <key> -o IdentitiesOnly=yes`, offering exactly one. (This is the user's ssh
   setup, not something paniolo can fix for them — but the lab field is the lever.)
 
+### Env forwarding to a control host
+
+A re-exec inherits the far side's own environment, not the caller's — the same
+way any non-interactive `ssh host cmd` does. That's a problem for the one
+helper whose credential paniolo deliberately keeps out of the lab file and
+every flag: AMT's `AMT_PASSWORD` (see [power.md](power.md#credentials)). For
+`power-cycle nuc` to work when `nuc`'s power channel lives on a remote host,
+`AMT_PASSWORD` has to reach *that* host's `paniolo`, without landing on its
+command line — a plain `KEY=value` prefix would sit in `argv`, which `ps`
+shows to every local user on the control host.
+
+The fix is a small, fixed allowlist (`ssh::FORWARDED_ENV` — today, just
+`AMT_PASSWORD`) and a **stdin prelude**. When a listed variable is set in the
+dispatching process's own environment, the re-exec'd remote command is wrapped
+as
+
+```sh
+sh -c 'IFS= read -r AMT_PASSWORD && export AMT_PASSWORD && exec "$@"' sh paniolo …
+```
+
+and the value is written to the child's stdin — one line per variable, in a
+fixed order — ahead of whatever the command's own stdin carries (a `serial
+send` payload, say). The value is never in the command string; only the
+*name* is, so it's visible only as "this hook expects `AMT_PASSWORD`", never
+as the secret itself.
+
+This applies to every **non-interactive** dispatch (`run`, `run_passthrough`,
+`run_stdout_to` in `cli/src/ssh.rs` — i.e. `power-cycle`, `power on/off/state`,
+and any other re-exec or captured command). **`run_interactive`** (`serial
+connect`, `adb shell`, `setup --host`) forwards nothing, by construction: its
+stdin *is* the terminal you're typing into, so there's no stdin channel to put
+a secret on ahead of the command that your own keystrokes wouldn't also share
+— and those commands don't need `AMT_PASSWORD` anyway.
+
 ### The dashboard, and why multi-host rules out a reverse-proxy
 
 The dashboard is the one place two subsystems interlock: hdmicap serves the page

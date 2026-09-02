@@ -72,8 +72,8 @@ paniolo adb run -t pixel getprop ro.product.model   # one-shot, captured
 paniolo adb run -t pixel -- logcat -d -t 50         # `--` guards leading flags
 
 # Screen
-paniolo adb screencap pixel -o shot.png       # PNG to a file
-paniolo adb screencap pixel -o - > shot.png   # PNG to stdout (works remote)
+paniolo adb screencap pixel -o shot.png       # PNG to a file — always this machine's
+paniolo adb screencap pixel -o - > shot.png   # PNG to stdout
 
 # Input
 paniolo adb input -t pixel keyevent KEYCODE_HOME
@@ -93,8 +93,11 @@ target (like `hid send`) rather than a positional — put `-t` first, and use `-
 before any argument that starts with a dash.
 
 `screencap` uses `adb exec-out screencap -p`, which is binary-clean (no CRLF
-mangling). As with `video shot`, `-o -` streams the PNG back over SSH for a
-remote channel; an `-o <file>` path is written on the **channel's host**.
+mangling). `-o <path>` always means **this machine's** filesystem, exactly
+like `video shot`: for a remote channel, `-o` streams the PNG over SSH into a
+local sibling temp file and renames it onto `-o`'s path only on success, so a
+failed or interrupted capture never truncates or half-writes whatever was
+already at that path. `-o -` (the default) streams the PNG to stdout instead.
 
 ---
 
