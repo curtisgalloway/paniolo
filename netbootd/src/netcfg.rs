@@ -17,11 +17,19 @@
 //! Like the Python version, this shells out to the platform tools rather than
 //! going native (netlink / route sockets). For the PoC that keeps the surface
 //! small; going native is a follow-up if we want to drop the `sudo` shell-outs.
+//!
+//! The shell-outs that run while the daemon is serving (`set_arp` from the
+//! DHCP task, the `ifconfig`/`ip` probes and re-apply from the IP monitor) go
+//! through `tokio::process` so a slow or prompting `sudo` parks one task
+//! instead of a whole runtime worker; only the one-shot default-route lookup
+//! at startup blocks. On Linux these `sudo` calls run *after* the daemon has
+//! dropped root (see `privdrop`), which is why passwordless sudo is a
+//! documented requirement there.
 
 use std::net::Ipv4Addr;
-use std::process::Command;
 use std::time::Duration;
 
+use tokio::process::Command;
 use tracing::warn;
 
 /// The interface carrying the system default route, if any.
@@ -39,7 +47,7 @@ fn default_route_interface() -> Option<String> {
 /// Linux: `ip route show default` emits `default via <gw> dev en0 ...`.
 #[cfg(not(target_os = "macos"))]
 fn default_route_interface() -> Option<String> {
-    let out = Command::new("ip")
+    let out = std::process::Command::new("ip")
         .args(["route", "show", "default"])
         .output()
         .ok()?;
@@ -68,28 +76,29 @@ pub fn is_primary_interface(interface: &str) -> bool {
 /// the MAC we just saw in the DHCP frame directly. Needs root.
 ///
 /// - macOS: `arp -s <ip> <mac>`
-/// - Linux: `ip neigh replace <ip> lladdr <mac> nud permanent [dev <iface>]`
-pub fn set_arp(ip: Ipv4Addr, mac: &str, interface: Option<&str>) {
+/// - Linux: `ip neigh replace <ip> lladdr <mac> nud permanent dev <iface>`
+pub async fn set_arp(ip: Ipv4Addr, mac: &str, interface: &str) {
     let status = if cfg!(target_os = "macos") {
         Command::new("sudo")
             .args(["arp", "-s", &ip.to_string(), mac])
             .status()
+            .await
     } else {
-        let mut cmd = Command::new("sudo");
-        cmd.args([
-            "ip",
-            "neigh",
-            "replace",
-            &ip.to_string(),
-            "lladdr",
-            mac,
-            "nud",
-            "permanent",
-        ]);
-        if let Some(iface) = interface {
-            cmd.args(["dev", iface]);
-        }
-        cmd.status()
+        Command::new("sudo")
+            .args([
+                "ip",
+                "neigh",
+                "replace",
+                &ip.to_string(),
+                "lladdr",
+                mac,
+                "nud",
+                "permanent",
+                "dev",
+                interface,
+            ])
+            .status()
+            .await
     };
     match status {
         Ok(s) if s.success() => {}
@@ -99,17 +108,19 @@ pub fn set_arp(ip: Ipv4Addr, mac: &str, interface: Option<&str>) {
 }
 
 /// Whether `host_ip` is currently assigned to `interface`.
-fn has_interface_ip(interface: &str, host_ip: Ipv4Addr) -> bool {
+async fn has_interface_ip(interface: &str, host_ip: Ipv4Addr) -> bool {
     if cfg!(target_os = "macos") {
         Command::new("ifconfig")
             .arg(interface)
             .output()
+            .await
             .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("inet {host_ip} ")))
             .unwrap_or(false)
     } else {
         Command::new("ip")
             .args(["addr", "show", "dev", interface])
             .output()
+            .await
             .map(|o| {
                 let s = String::from_utf8_lossy(&o.stdout);
                 s.contains(&format!("inet {host_ip}/")) || s.contains(&format!("inet {host_ip} "))
@@ -118,21 +129,28 @@ fn has_interface_ip(interface: &str, host_ip: Ipv4Addr) -> bool {
     }
 }
 
-fn is_link_up(interface: &str) -> bool {
+async fn is_link_up(interface: &str) -> bool {
     if cfg!(target_os = "macos") {
         Command::new("ifconfig")
             .arg(interface)
             .output()
+            .await
             .map(|o| String::from_utf8_lossy(&o.stdout).contains("status: active"))
             .unwrap_or(false)
     } else {
-        std::fs::read_to_string(format!("/sys/class/net/{interface}/carrier"))
+        tokio::fs::read_to_string(format!("/sys/class/net/{interface}/carrier"))
+            .await
             .map(|s| s.trim() == "1")
             .unwrap_or(false)
     }
 }
 
-fn apply_interface_ip(interface: &str, host_ip: Ipv4Addr) {
+/// (Re-)assign `host_ip` to the interface. The netmask is the fixed /24 the
+/// whole netboot link is built on: DHCP advertises the same
+/// `255.255.255.0` and derives the client's lease inside it
+/// (`dhcp::derive_client_ip`), and `paniolo netboot start` configures the
+/// interface with the same mask before spawning us.
+async fn apply_interface_ip(interface: &str, host_ip: Ipv4Addr) {
     let _ = if cfg!(target_os = "macos") {
         Command::new("sudo")
             .args([
@@ -144,6 +162,7 @@ fn apply_interface_ip(interface: &str, host_ip: Ipv4Addr) {
                 "up",
             ])
             .status()
+            .await
     } else {
         Command::new("sudo")
             .args([
@@ -155,6 +174,7 @@ fn apply_interface_ip(interface: &str, host_ip: Ipv4Addr) {
                 interface,
             ])
             .status()
+            .await
     };
 }
 
@@ -177,10 +197,10 @@ pub async fn monitor_interface(interface: String, host_ip: Ipv4Addr) {
     let mut had_ip = true;
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let has_ip = has_interface_ip(&interface, host_ip);
-        let active = is_link_up(&interface);
+        let has_ip = has_interface_ip(&interface, host_ip).await;
+        let active = is_link_up(&interface).await;
         if !has_ip && active {
-            apply_interface_ip(&interface, host_ip);
+            apply_interface_ip(&interface, host_ip).await;
             if had_ip {
                 warn!("interface {interface} lost IP {host_ip} — restoring");
             }

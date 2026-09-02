@@ -42,10 +42,18 @@ pub fn inet_checksum(data: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+/// The largest UDP payload one IPv4 datagram can carry: the 16-bit IP total
+/// length, less the 20-byte IPv4 header and the 8-byte UDP header.
+pub const MAX_UDP_PAYLOAD: usize = 65_535 - 20 - 8;
+
 /// Build a complete Ethernet (EtherType IPv4) / IPv4 / UDP frame with the given
 /// source MAC preserved. The destination MAC is written verbatim — the whole
 /// point of the BPF path is to bypass the kernel's (wrong) ARP resolution and
 /// address the Pi bootloader's real DHCP MAC directly.
+///
+/// `None` when `payload` is longer than [`MAX_UDP_PAYLOAD`]: the IP and UDP
+/// length fields are 16 bits, and a length that wrapped would describe a
+/// datagram other than the one on the wire.
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 pub fn build_udp_frame(
     src_mac: [u8; 6],
@@ -55,11 +63,11 @@ pub fn build_udp_frame(
     src_port: u16,
     dst_port: u16,
     payload: &[u8],
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     let src_a = src_ip.octets();
     let dst_a = dst_ip.octets();
-    let udp_len = (8 + payload.len()) as u16;
-    let ip_len = 20 + udp_len;
+    let ip_len = u16::try_from(20 + 8 + payload.len()).ok()?;
+    let udp_len = ip_len - 20;
 
     // --- IPv4 header (20 bytes, no options) ---
     let mut ip_hdr = Vec::with_capacity(20);
@@ -104,7 +112,7 @@ pub fn build_udp_frame(
     frame.extend_from_slice(&[0x08, 0x00]); // EtherType IPv4
     frame.extend_from_slice(&ip_hdr);
     frame.extend_from_slice(&udp);
-    frame
+    Some(frame)
 }
 
 #[cfg(test)]
@@ -114,7 +122,7 @@ mod tests {
     const SRC_MAC: [u8; 6] = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
     const DST_MAC: [u8; 6] = [0xdc, 0xa6, 0x32, 0x01, 0x02, 0x03];
 
-    fn sample(payload: &[u8]) -> Vec<u8> {
+    fn try_sample(payload: &[u8]) -> Option<Vec<u8>> {
         build_udp_frame(
             SRC_MAC,
             DST_MAC,
@@ -124,6 +132,10 @@ mod tests {
             45678,
             payload,
         )
+    }
+
+    fn sample(payload: &[u8]) -> Vec<u8> {
+        try_sample(payload).expect("payload fits a datagram")
     }
 
     #[test]
@@ -178,5 +190,24 @@ mod tests {
         let payload = vec![0xabu8; 1400];
         let f = sample(&payload);
         assert_eq!(f.len(), 14 + 20 + 8 + payload.len());
+    }
+
+    /// The length fields are 16 bits. A payload that would wrap them is refused
+    /// rather than silently described as a much shorter datagram.
+    #[test]
+    fn oversized_payload_is_refused_not_truncated() {
+        let max = vec![0u8; MAX_UDP_PAYLOAD];
+        let f = try_sample(&max).expect("the largest legal payload builds");
+        let ip = &f[14..34];
+        assert_eq!(u16::from_be_bytes([ip[2], ip[3]]), 65_535);
+        let udp_len = u16::from_be_bytes([f[38], f[39]]);
+        assert_eq!(udp_len as usize, 8 + MAX_UDP_PAYLOAD);
+
+        let too_big = vec![0u8; MAX_UDP_PAYLOAD + 1];
+        assert!(try_sample(&too_big).is_none(), "one byte over must fail");
+        // The old `as u16` cast would have produced a "valid" 8-byte-long UDP
+        // header for a 65 536-byte payload; make sure that never comes back.
+        let wrap = vec![0u8; 65_536];
+        assert!(try_sample(&wrap).is_none());
     }
 }

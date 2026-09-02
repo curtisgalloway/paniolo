@@ -17,25 +17,38 @@
 //! Broadcast-only replies — no raw sockets, no BPF. Handles
 //! DISCOVER→OFFER and REQUEST→ACK for a single netboot client, advertising
 //! the host as both TFTP server (option 66 / `siaddr`) and bootfile source.
+//!
+//! One lease, always the same: the client IP is derived from the host IP
+//! inside the host's /24 ([`derive_client_ip`]) unless overridden, and a
+//! REQUEST for any other address is NAKed rather than ACKed with a different
+//! `yiaddr` ([`request_verdict`]). The listen socket is pinned to the netboot
+//! interface (see `pin`), and a pin that fails is fatal — an unpinned DHCP
+//! server on the wildcard address would answer DISCOVERs on the host's
+//! primary NIC too.
 
 use std::net::Ipv4Addr;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::netcfg;
+use crate::pin::pin_socket_to_interface;
 
 const BOOTREQUEST: u8 = 1;
 const BOOTREPLY: u8 = 2;
 const HTYPE_ETHERNET: u8 = 1;
+/// Hardware-address length of an Ethernet client. Anything else is not the
+/// board on the other end of the link.
+const HLEN_ETHERNET: u8 = 6;
 const MAGIC: [u8; 4] = [0x63, 0x82, 0x53, 0x63];
 
 const OPT_SUBNET: u8 = 1;
 const OPT_ROUTER: u8 = 3;
 const OPT_VENDOR_SPECIFIC: u8 = 43;
+const OPT_REQUESTED_IP: u8 = 50;
 const OPT_LEASE: u8 = 51;
 const OPT_MSG_TYPE: u8 = 53;
 const OPT_SERVER_ID: u8 = 54;
@@ -60,16 +73,71 @@ const DHCP_DISCOVER: u8 = 1;
 const DHCP_OFFER: u8 = 2;
 const DHCP_REQUEST: u8 = 3;
 const DHCP_ACK: u8 = 5;
+const DHCP_NAK: u8 = 6;
 
 const LEASE_SECONDS: u32 = 12 * 3600;
-/// Fixed single-client lease (matches `_dhcp.py`).
-const ASSIGNED_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 99, 100);
+/// The lease's subnet mask. The whole netboot link is a fixed /24: the host
+/// interface is configured with this mask (by `paniolo netboot start` and by
+/// `netcfg::monitor_interface`), and the client is leased an address inside
+/// it so the advertised router — the host — is reachable.
+const SUBNET_MASK: [u8; 4] = [255, 255, 255, 0];
+/// Last octet of the derived client IP (`_dhcp.py` leased `.100` on the
+/// default `192.168.99.0/24`); `.101` when the host itself is `.100`.
+const DEFAULT_CLIENT_OCTET: u8 = 100;
+
+/// The IP leased to the netboot client, derived from the host IP: the same
+/// /24 with the last octet replaced by [`DEFAULT_CLIENT_OCTET`] — or one more
+/// when the host is already that address. `192.168.99.1` → `192.168.99.100`,
+/// so the default lease is unchanged from the Python server's.
+pub fn derive_client_ip(host_ip: Ipv4Addr) -> Ipv4Addr {
+    let [a, b, c, d] = host_ip.octets();
+    let last = if d == DEFAULT_CLIENT_OCTET {
+        DEFAULT_CLIENT_OCTET + 1
+    } else {
+        DEFAULT_CLIENT_OCTET
+    };
+    Ipv4Addr::new(a, b, c, last)
+}
+
+/// Refuse a client IP the lease could not make bootable: the reply carries a
+/// `255.255.255.0` mask and `host_ip` as the router and TFTP/HTTP server, so
+/// the client must sit in the host's /24, must not *be* the host, and must
+/// not be the network or broadcast address.
+pub fn validate_client_ip(host_ip: Ipv4Addr, client_ip: Ipv4Addr) -> Result<()> {
+    let h = host_ip.octets();
+    let c = client_ip.octets();
+    if h[..3] != c[..3] {
+        bail!(
+            "client IP {client_ip} is not in the host's /24 ({}.{}.{}.0/24): the lease \
+             advertises a 255.255.255.0 mask and {host_ip} as router and TFTP/HTTP \
+             server, so the client could never reach them",
+            h[0],
+            h[1],
+            h[2]
+        );
+    }
+    if client_ip == host_ip {
+        bail!("client IP {client_ip} is the host IP itself");
+    }
+    if c[3] == 0 || c[3] == 255 {
+        bail!("client IP {client_ip} is the network or broadcast address of the /24");
+    }
+    Ok(())
+}
 
 /// Parsed view of the fields we care about from an inbound BOOTP/DHCP packet.
 struct Request {
     xid: [u8; 4],
     chaddr: [u8; 16],
+    /// `ciaddr` — the address a client in RENEWING/REBINDING (or INIT-REBOOT
+    /// with some stacks) claims to already have. Zero for a fresh boot.
+    ciaddr: Ipv4Addr,
     msg_type: u8,
+    /// Option 50, the address a REQUEST asks for (SELECTING / INIT-REBOOT).
+    requested_ip: Option<Ipv4Addr>,
+    /// Option 54, the server a REQUEST is addressed to (SELECTING). A REQUEST
+    /// naming another server is that server's business, not ours.
+    server_id: Option<Ipv4Addr>,
     /// Option 60 vendor class identifier (e.g. `HTTPClient:Arch:00019:…`), used
     /// to distinguish a UEFI HTTP Boot client from the legacy Pi bootloader.
     vendor_class: Option<String>,
@@ -94,13 +162,24 @@ impl Request {
     }
 }
 
+fn ipv4_at(data: &[u8], at: usize) -> Ipv4Addr {
+    Ipv4Addr::new(data[at], data[at + 1], data[at + 2], data[at + 3])
+}
+
 fn parse_request(data: &[u8]) -> Option<Request> {
     // Fixed BOOTP header is 236 bytes; options (magic + TLVs) follow.
     if data.len() < 240 || data[0] != BOOTREQUEST {
         return None;
     }
+    // Only Ethernet clients with a 6-byte hardware address: `chaddr[..6]` is
+    // what we ARP-pin and address raw frames to, so anything else would be
+    // pinned to garbage.
+    if data[1] != HTYPE_ETHERNET || data[2] != HLEN_ETHERNET {
+        return None;
+    }
     let mut xid = [0u8; 4];
     xid.copy_from_slice(&data[4..8]);
+    let ciaddr = ipv4_at(data, 12);
     let mut chaddr = [0u8; 16];
     chaddr.copy_from_slice(&data[28..44]);
 
@@ -109,6 +188,8 @@ fn parse_request(data: &[u8]) -> Option<Request> {
         return None;
     }
     let mut msg_type = 0u8;
+    let mut requested_ip = None;
+    let mut server_id = None;
     let mut vendor_class = None;
     let mut arch = None;
     let mut i = 4;
@@ -133,6 +214,8 @@ fn parse_request(data: &[u8]) -> Option<Request> {
         let val = &opts[val_start..val_end];
         match tag {
             OPT_MSG_TYPE if len >= 1 => msg_type = val[0],
+            OPT_REQUESTED_IP if len == 4 => requested_ip = Some(ipv4_at(val, 0)),
+            OPT_SERVER_ID if len == 4 => server_id = Some(ipv4_at(val, 0)),
             OPT_VENDOR_CLASS if len >= 1 => {
                 vendor_class = Some(String::from_utf8_lossy(val).into_owned());
             }
@@ -147,10 +230,42 @@ fn parse_request(data: &[u8]) -> Option<Request> {
     Some(Request {
         xid,
         chaddr,
+        ciaddr,
         msg_type,
+        requested_ip,
+        server_id,
         vendor_class,
         arch,
     })
+}
+
+/// What to do with a DHCPREQUEST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// The client wants our lease (or names no address): ACK it.
+    Ack,
+    /// The client asked us for an address we do not lease: NAK, so it goes
+    /// back to DISCOVER instead of booting on a stale address we never ACKed.
+    Nak,
+    /// The REQUEST is addressed to another server (option 54): not ours.
+    Ignore,
+}
+
+/// Decide a REQUEST's fate. Only `client_ip` is ever leased here, so a REQUEST
+/// that names another address — in option 50 or by claiming it in `ciaddr` —
+/// is refused rather than answered with an ACK whose `yiaddr` differs from
+/// what the client asked for (RFC 2131 §4.3.2 says NAK).
+fn request_verdict(req: &Request, server_ip: Ipv4Addr, client_ip: Ipv4Addr) -> Verdict {
+    if req.server_id.is_some_and(|s| s != server_ip) {
+        return Verdict::Ignore;
+    }
+    if req.requested_ip.is_some_and(|r| r != client_ip) {
+        return Verdict::Nak;
+    }
+    if !req.ciaddr.is_unspecified() && req.ciaddr != client_ip {
+        return Verdict::Nak;
+    }
+    Verdict::Ack
 }
 
 fn encode_option(buf: &mut Vec<u8>, tag: u8, value: &[u8]) {
@@ -237,16 +352,41 @@ fn http_boot_url(host_ip: Ipv4Addr, port: u16, boot_file: &str) -> String {
     }
 }
 
-fn build_reply(req: &Request, msg_type: u8, server_ip: Ipv4Addr, advert: &BootAdvert) -> Vec<u8> {
+/// The fixed BOOTP header of a reply to `req`: everything up to the options,
+/// with the given `yiaddr` / `siaddr` and the client's `chaddr` echoed. The
+/// broadcast flag is always set — our client has no address to unicast to.
+fn reply_header(req: &Request, yiaddr: [u8; 4], siaddr: [u8; 4], file: &[u8; 128]) -> Vec<u8> {
+    let mut pkt = Vec::with_capacity(236 + 64);
+    pkt.extend_from_slice(&[BOOTREPLY, HTYPE_ETHERNET, HLEN_ETHERNET, 0]); // op, htype, hlen, hops
+    pkt.extend_from_slice(&req.xid);
+    pkt.extend_from_slice(&[0, 0]); // secs
+    pkt.extend_from_slice(&[0x80, 0x00]); // flags: broadcast
+    pkt.extend_from_slice(&[0; 4]); // ciaddr
+    pkt.extend_from_slice(&yiaddr); // yiaddr
+    pkt.extend_from_slice(&siaddr); // siaddr (next-server = TFTP, else 0)
+    pkt.extend_from_slice(&[0; 4]); // giaddr
+    pkt.extend_from_slice(&req.chaddr); // chaddr (16)
+    pkt.extend_from_slice(&[0; 64]); // sname
+    pkt.extend_from_slice(file); // file (null-padded)
+    pkt
+}
+
+fn build_reply(
+    req: &Request,
+    msg_type: u8,
+    server_ip: Ipv4Addr,
+    client_ip: Ipv4Addr,
+    advert: &BootAdvert,
+) -> Vec<u8> {
     let server_b = server_ip.octets();
-    let client_b = ASSIGNED_IP.octets();
+    let client_b = client_ip.octets();
 
     let mut opts = Vec::with_capacity(64);
     opts.extend_from_slice(&MAGIC);
     encode_option(&mut opts, OPT_MSG_TYPE, &[msg_type]);
     encode_option(&mut opts, OPT_SERVER_ID, &server_b);
     encode_option(&mut opts, OPT_LEASE, &LEASE_SECONDS.to_be_bytes());
-    encode_option(&mut opts, OPT_SUBNET, &[255, 255, 255, 0]);
+    encode_option(&mut opts, OPT_SUBNET, &SUBNET_MASK);
     encode_option(&mut opts, OPT_ROUTER, &server_b);
     if advert.tftp {
         encode_option(&mut opts, OPT_TFTP_SERVER, server_ip.to_string().as_bytes());
@@ -267,25 +407,29 @@ fn build_reply(req: &Request, msg_type: u8, server_ip: Ipv4Addr, advert: &BootAd
 
     // siaddr (next-server) only for the TFTP path; HTTP carries the full URL.
     let siaddr = if advert.tftp { server_b } else { [0u8; 4] };
-
-    let mut pkt = Vec::with_capacity(236 + opts.len());
-    pkt.extend_from_slice(&[BOOTREPLY, HTYPE_ETHERNET, 6, 0]); // op, htype, hlen, hops
-    pkt.extend_from_slice(&req.xid);
-    pkt.extend_from_slice(&[0, 0]); // secs
-    pkt.extend_from_slice(&[0x80, 0x00]); // flags: broadcast
-    pkt.extend_from_slice(&[0; 4]); // ciaddr
-    pkt.extend_from_slice(&client_b); // yiaddr
-    pkt.extend_from_slice(&siaddr); // siaddr (next-server = TFTP, else 0)
-    pkt.extend_from_slice(&[0; 4]); // giaddr
-    pkt.extend_from_slice(&req.chaddr); // chaddr (16)
-    pkt.extend_from_slice(&[0; 64]); // sname
-    let mut file = [0u8; 128]; // file (null-padded)
+    let mut file = [0u8; 128];
     if advert.tftp {
         let fb = advert.boot_file.as_bytes();
         let n = fb.len().min(127);
         file[..n].copy_from_slice(&fb[..n]);
     }
-    pkt.extend_from_slice(&file);
+
+    let mut pkt = reply_header(req, client_b, siaddr, &file);
+    pkt.extend_from_slice(&opts);
+    pkt
+}
+
+/// A DHCPNAK for `req`: no address, no lease, just "not from this server"
+/// (RFC 2131 table 3 — message type and server identifier are all a NAK
+/// carries; `yiaddr`/`siaddr`/`file` are zero).
+fn build_nak(req: &Request, server_ip: Ipv4Addr) -> Vec<u8> {
+    let mut opts = Vec::with_capacity(16);
+    opts.extend_from_slice(&MAGIC);
+    encode_option(&mut opts, OPT_MSG_TYPE, &[DHCP_NAK]);
+    encode_option(&mut opts, OPT_SERVER_ID, &server_ip.octets());
+    opts.push(OPT_END);
+
+    let mut pkt = reply_header(req, [0; 4], [0; 4], &[0u8; 128]);
     pkt.extend_from_slice(&opts);
     pkt
 }
@@ -298,76 +442,27 @@ fn mac_string(chaddr: &[u8; 16]) -> String {
         .join(":")
 }
 
-/// Pin a socket to `iface` so limited-broadcast (255.255.255.255) replies
-/// egress the netboot link rather than the host's default-route interface.
-/// macOS uses `IP_BOUND_IF`; Linux uses `SO_BINDTODEVICE` (needs root, which the
-/// daemon already has on Linux). A no-op elsewhere.
-#[cfg(target_os = "macos")]
-fn pin_socket_to_interface(sock: &Socket, iface: &str) -> std::io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let cname = std::ffi::CString::new(iface)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "iface has NUL"))?;
-    let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
-    if idx == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let rc = unsafe {
-        libc::setsockopt(
-            sock.as_raw_fd(),
-            libc::IPPROTO_IP,
-            libc::IP_BOUND_IF,
-            &idx as *const libc::c_uint as *const libc::c_void,
-            std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn pin_socket_to_interface(sock: &Socket, iface: &str) -> std::io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let rc = unsafe {
-        libc::setsockopt(
-            sock.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_BINDTODEVICE,
-            iface.as_ptr() as *const libc::c_void,
-            iface.len() as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn pin_socket_to_interface(_sock: &Socket, _iface: &str) -> std::io::Result<()> {
-    Ok(())
-}
-
-/// Bind a broadcast-capable UDP socket on `0.0.0.0:67`, pinned to the netboot
-/// interface.
+/// Bind the broadcast-capable DHCP listen socket on `0.0.0.0:port`, pinned to
+/// the netboot interface.
 ///
-/// Wildcard bind keeps this rootless on macOS 14+; on Linux port 67 still
-/// needs root or `CAP_NET_BIND_SERVICE`. The interface pin makes replies sent to
-/// the limited broadcast `255.255.255.255` leave via the netboot link (the
-/// kernel would otherwise pick the default-route interface for that address).
-fn bind_server(port: u16, interface: Option<&str>) -> Result<UdpSocket> {
+/// The wildcard bind keeps this rootless on macOS 14+ (and working through the
+/// link flaps where the interface IP is momentarily gone); on Linux port 67
+/// still needs root or `CAP_NET_BIND_SERVICE`. The pin is what confines the
+/// server to the netboot link — it makes the limited-broadcast
+/// `255.255.255.255` replies leave via that link instead of the default-route
+/// interface, and it stops DISCOVERs arriving on any other interface from
+/// being answered — so a pin that cannot be applied is fatal.
+///
+/// No `SO_REUSEADDR`: UDP has no TIME_WAIT, so a restart never needs it, and
+/// on Linux it would let a second netbootd bind the same port on the same
+/// interface and silently split the DISCOVERs with this one. With it off, a
+/// duplicate fails here with EADDRINUSE. (On macOS a duplicate wildcard bind
+/// needs `SO_REUSEPORT` regardless, so nothing is lost there either.)
+pub fn bind_server(port: u16, interface: &str) -> Result<UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    sock.set_reuse_address(true)?;
     sock.set_broadcast(true)?;
-    if let Some(iface) = interface {
-        if let Err(e) = pin_socket_to_interface(&sock, iface) {
-            warn!(
-                "pin DHCP socket to {iface} failed: {e}; \
-                 255.255.255.255 replies may egress the wrong interface"
-            );
-        }
-    }
+    pin_socket_to_interface(&sock, interface)
+        .with_context(|| format!("pin DHCP socket to interface {interface}"))?;
     let addr: std::net::SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
     sock.bind(&addr.into()).with_context(|| {
         format!("bind DHCP port {port} (need root/CAP_NET_BIND_SERVICE on Linux)")
@@ -376,23 +471,25 @@ fn bind_server(port: u16, interface: Option<&str>) -> Result<UdpSocket> {
     Ok(UdpSocket::from_std(sock.into())?)
 }
 
-/// Run the DHCP server until the task is cancelled.
+/// Run the DHCP server on an already-bound listen socket until the task is
+/// cancelled.
 ///
 /// `mac_tx` publishes the client's hardware address (from `chaddr`) to the TFTP
 /// task in-process, so the BPF send path can address frames to the Pi's real
 /// DHCP MAC without the on-disk `client-mac` file the Python version needs.
 pub async fn serve(
+    sock: UdpSocket,
     host_ip: Ipv4Addr,
+    client_ip: Ipv4Addr,
     boot_file: String,
-    interface: Option<String>,
-    port: u16,
+    interface: String,
     http_port: u16,
     mac_tx: watch::Sender<Option<[u8; 6]>>,
 ) -> Result<()> {
-    let sock = bind_server(port, interface.as_deref())?;
     info!(
-        %host_ip, boot_file,
-        "DHCP listening on 0.0.0.0:{port} (replies broadcast to 255.255.255.255)"
+        %host_ip, %client_ip, boot_file,
+        "DHCP listening on {} via {interface} (replies broadcast to 255.255.255.255)",
+        sock.local_addr()?
     );
 
     let mut buf = vec![0u8; 4096];
@@ -411,10 +508,35 @@ pub async fn serve(
 
         let (reply_type, label) = match req.msg_type {
             DHCP_DISCOVER => (DHCP_OFFER, "DHCPDISCOVER"),
-            DHCP_REQUEST => (DHCP_ACK, "DHCPREQUEST"),
+            DHCP_REQUEST => match request_verdict(&req, host_ip, client_ip) {
+                Verdict::Ack => (DHCP_ACK, "DHCPREQUEST"),
+                Verdict::Nak => (DHCP_NAK, "DHCPREQUEST"),
+                Verdict::Ignore => {
+                    info!(
+                        "DHCPREQUEST from {mac} is addressed to server {}; ignoring",
+                        req.server_id.unwrap_or(Ipv4Addr::UNSPECIFIED)
+                    );
+                    continue;
+                }
+            },
             _ => continue,
         };
         info!("{label} from {mac}");
+
+        if reply_type == DHCP_NAK {
+            let nak = build_nak(&req, host_ip);
+            if let Err(e) = sock.send_to(&nak, (Ipv4Addr::BROADCAST, 68)).await {
+                warn!("DHCP send_to 255.255.255.255:68 failed: {e}");
+                continue;
+            }
+            info!(
+                "DHCPNAK -> {mac}  requested={}  ciaddr={}  (only {client_ip} is leased here)",
+                req.requested_ip
+                    .map_or_else(|| "-".to_string(), |ip| ip.to_string()),
+                req.ciaddr
+            );
+            continue;
+        }
 
         // Publish the client MAC to the TFTP task (for the macOS BPF send path).
         let mut mac_bytes = [0u8; 6];
@@ -424,7 +546,7 @@ pub async fn serve(
         // Pin the client's MAC so the host kernel can deliver to the silent
         // Pi bootloader (it never answers ARP). On macOS 15+ the kernel path is
         // unreliable for TFTP regardless — that's what the BPF send path covers.
-        netcfg::set_arp(ASSIGNED_IP, &mac, interface.as_deref());
+        netcfg::set_arp(client_ip, &mac, &interface).await;
 
         // Branch on the client's vendor class (option 60):
         //   * HTTPClient → self-contained http:// URL in option 67 + the required
@@ -441,7 +563,7 @@ pub async fn serve(
             (BootAdvert::tftp(&boot_file), "tftp")
         };
 
-        let reply = build_reply(&req, reply_type, host_ip, &advert);
+        let reply = build_reply(&req, reply_type, host_ip, client_ip, &advert);
         // RFC 2131: with the broadcast flag set and giaddr=0 (our single-client
         // direct link), reply to the limited broadcast 255.255.255.255 — not the
         // subnet-directed broadcast. A strict UEFI client (EDK2) at 0.0.0.0 drops
@@ -457,7 +579,7 @@ pub async fn serve(
             _ => "DHCPACK",
         };
         info!(
-            "{what} -> {mac}  ip={ASSIGNED_IP}  {style}  arch={:?}  boot={}",
+            "{what} -> {mac}  ip={client_ip}  {style}  arch={:?}  boot={}",
             req.arch, advert.boot_file
         );
     }
@@ -469,6 +591,8 @@ mod tests {
 
     const XID: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];
     const MAC6: [u8; 6] = [0xdc, 0xa6, 0x32, 0x01, 0x02, 0x03];
+    /// The lease the tests hand out (what `derive_client_ip(192.168.99.1)` gives).
+    const CLIENT: Ipv4Addr = Ipv4Addr::new(192, 168, 99, 100);
 
     /// Build a minimal but well-formed BOOTREQUEST/DHCP packet with the given
     /// message type. `trailing_opts` are appended (TLV bytes) before OPT_END.
@@ -486,6 +610,28 @@ mod tests {
         pkt.extend_from_slice(trailing_opts);
         pkt.push(OPT_END);
         pkt
+    }
+
+    /// A DHCPREQUEST with the given option 50 / option 54 / `ciaddr`.
+    fn request_for(
+        requested: Option<Ipv4Addr>,
+        server: Option<Ipv4Addr>,
+        ciaddr: Ipv4Addr,
+    ) -> Request {
+        let mut opts = Vec::new();
+        if let Some(r) = requested {
+            opts.push(OPT_REQUESTED_IP);
+            opts.push(4);
+            opts.extend_from_slice(&r.octets());
+        }
+        if let Some(s) = server {
+            opts.push(OPT_SERVER_ID);
+            opts.push(4);
+            opts.extend_from_slice(&s.octets());
+        }
+        let mut pkt = request_packet(BOOTREQUEST, Some(DHCP_REQUEST), &opts);
+        pkt[12..16].copy_from_slice(&ciaddr.octets());
+        parse_request(&pkt).expect("REQUEST parses")
     }
 
     /// Collect the options TLVs from a reply packet into (tag -> value) pairs,
@@ -514,6 +660,9 @@ mod tests {
         assert_eq!(req.xid, XID);
         assert_eq!(&req.chaddr[..6], &MAC6);
         assert_eq!(req.msg_type, DHCP_DISCOVER);
+        assert!(req.ciaddr.is_unspecified());
+        assert_eq!(req.requested_ip, None);
+        assert_eq!(req.server_id, None);
     }
 
     #[test]
@@ -522,6 +671,8 @@ mod tests {
         // msg_type option sits after them.
         let mut p = vec![0u8; 236];
         p[0] = BOOTREQUEST;
+        p[1] = HTYPE_ETHERNET;
+        p[2] = 6;
         p[28..34].copy_from_slice(&MAC6);
         p.extend_from_slice(&MAGIC);
         p.extend_from_slice(&[0u8, 0, 0]); // three pad options
@@ -540,6 +691,26 @@ mod tests {
     fn parse_rejects_non_bootrequest() {
         let pkt = request_packet(BOOTREPLY, Some(DHCP_DISCOVER), &[]);
         assert!(parse_request(&pkt).is_none(), "op must be BOOTREQUEST");
+    }
+
+    #[test]
+    fn parse_rejects_non_ethernet_htype() {
+        let mut pkt = request_packet(BOOTREQUEST, Some(DHCP_DISCOVER), &[]);
+        pkt[1] = 6; // IEEE 802
+        assert!(parse_request(&pkt).is_none(), "htype must be Ethernet (1)");
+        pkt[1] = 0;
+        assert!(parse_request(&pkt).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_hardware_address_length_other_than_six() {
+        let mut pkt = request_packet(BOOTREQUEST, Some(DHCP_DISCOVER), &[]);
+        pkt[2] = 8; // an EUI-64 would not fit our 6-byte ARP pin / frame dst
+        assert!(parse_request(&pkt).is_none(), "hlen must be 6");
+        pkt[2] = 0;
+        assert!(parse_request(&pkt).is_none());
+        pkt[2] = 6;
+        assert!(parse_request(&pkt).is_some(), "hlen 6 is the accepted case");
     }
 
     #[test]
@@ -565,12 +736,168 @@ mod tests {
         let bogus = [OPT_TFTP_SERVER, 200]; // claims 200 bytes, none follow
         let mut p = vec![0u8; 236];
         p[0] = BOOTREQUEST;
+        p[1] = HTYPE_ETHERNET;
+        p[2] = 6;
         p[28..34].copy_from_slice(&MAC6);
         p.extend_from_slice(&MAGIC);
         p.extend_from_slice(&bogus);
         // no OPT_END, no msg_type
         assert!(parse_request(&p).is_none());
     }
+
+    #[test]
+    fn parse_extracts_ciaddr_requested_ip_and_server_id() {
+        let req = request_for(
+            Some(Ipv4Addr::new(10, 0, 0, 7)),
+            Some(Ipv4Addr::new(10, 0, 0, 1)),
+            Ipv4Addr::new(10, 0, 0, 9),
+        );
+        assert_eq!(req.requested_ip, Some(Ipv4Addr::new(10, 0, 0, 7)));
+        assert_eq!(req.server_id, Some(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(req.ciaddr, Ipv4Addr::new(10, 0, 0, 9));
+    }
+
+    #[test]
+    fn parse_ignores_malformed_requested_ip_and_server_id() {
+        // Option 50 / 54 with a length other than 4 carry no address.
+        let opts = [OPT_REQUESTED_IP, 2, 1, 2, OPT_SERVER_ID, 5, 1, 2, 3, 4, 5];
+        let req = parse_request(&request_packet(BOOTREQUEST, Some(DHCP_REQUEST), &opts)).unwrap();
+        assert_eq!(req.requested_ip, None);
+        assert_eq!(req.server_id, None);
+    }
+
+    // ── REQUEST verdict ──────────────────────────────────────────────────────
+
+    const SERVER: Ipv4Addr = Ipv4Addr::new(192, 168, 99, 1);
+
+    #[test]
+    fn bare_request_is_acked() {
+        let req = request_for(None, None, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(request_verdict(&req, SERVER, CLIENT), Verdict::Ack);
+    }
+
+    #[test]
+    fn request_for_our_lease_from_us_is_acked() {
+        let req = request_for(Some(CLIENT), Some(SERVER), Ipv4Addr::UNSPECIFIED);
+        assert_eq!(request_verdict(&req, SERVER, CLIENT), Verdict::Ack);
+        // Renewing with ciaddr = the lease is fine too.
+        let req = request_for(None, None, CLIENT);
+        assert_eq!(request_verdict(&req, SERVER, CLIENT), Verdict::Ack);
+    }
+
+    #[test]
+    fn request_addressed_to_another_server_is_ignored() {
+        let other = Ipv4Addr::new(192, 168, 99, 2);
+        let req = request_for(Some(CLIENT), Some(other), Ipv4Addr::UNSPECIFIED);
+        assert_eq!(request_verdict(&req, SERVER, CLIENT), Verdict::Ignore);
+        // Even when the address it wants is one we would NAK: not our REQUEST.
+        let req = request_for(
+            Some(Ipv4Addr::new(10, 1, 1, 1)),
+            Some(other),
+            Ipv4Addr::UNSPECIFIED,
+        );
+        assert_eq!(request_verdict(&req, SERVER, CLIENT), Verdict::Ignore);
+    }
+
+    #[test]
+    fn request_for_a_different_address_is_naked() {
+        let stale = Ipv4Addr::new(192, 168, 99, 50);
+        let req = request_for(Some(stale), None, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(request_verdict(&req, SERVER, CLIENT), Verdict::Nak);
+        let req = request_for(Some(stale), Some(SERVER), Ipv4Addr::UNSPECIFIED);
+        assert_eq!(request_verdict(&req, SERVER, CLIENT), Verdict::Nak);
+    }
+
+    #[test]
+    fn request_claiming_a_different_ciaddr_is_naked() {
+        let stale = Ipv4Addr::new(10, 0, 0, 5);
+        let req = request_for(None, None, stale);
+        assert_eq!(request_verdict(&req, SERVER, CLIENT), Verdict::Nak);
+    }
+
+    #[test]
+    fn nak_carries_no_address_and_names_us() {
+        let req = request_for(
+            Some(Ipv4Addr::new(10, 0, 0, 5)),
+            None,
+            Ipv4Addr::UNSPECIFIED,
+        );
+        let nak = build_nak(&req, SERVER);
+        assert_eq!(nak[0], BOOTREPLY);
+        assert_eq!(&nak[4..8], &XID, "xid echoed");
+        assert_eq!(&nak[10..12], &[0x80, 0x00], "NAKs are broadcast");
+        assert_eq!(&nak[16..20], &[0, 0, 0, 0], "yiaddr zero");
+        assert_eq!(&nak[20..24], &[0, 0, 0, 0], "siaddr zero");
+        assert_eq!(&nak[28..34], &MAC6, "chaddr echoed");
+        assert!(nak[108..236].iter().all(|&b| b == 0), "file field empty");
+        let opts = reply_options(&nak);
+        assert_eq!(
+            opts,
+            vec![
+                (OPT_MSG_TYPE, vec![DHCP_NAK]),
+                (OPT_SERVER_ID, SERVER.octets().to_vec()),
+            ],
+            "a NAK carries only message type + server id"
+        );
+    }
+
+    // ── Client IP derivation ─────────────────────────────────────────────────
+
+    #[test]
+    fn derive_client_ip_takes_dot_100_in_the_hosts_slash_24() {
+        assert_eq!(derive_client_ip(Ipv4Addr::new(192, 168, 99, 1)), CLIENT);
+        assert_eq!(
+            derive_client_ip(Ipv4Addr::new(10, 20, 30, 1)),
+            Ipv4Addr::new(10, 20, 30, 100)
+        );
+        assert_eq!(
+            derive_client_ip(Ipv4Addr::new(172, 16, 5, 254)),
+            Ipv4Addr::new(172, 16, 5, 100)
+        );
+    }
+
+    #[test]
+    fn derive_client_ip_steps_to_101_when_the_host_is_100() {
+        assert_eq!(
+            derive_client_ip(Ipv4Addr::new(192, 168, 99, 100)),
+            Ipv4Addr::new(192, 168, 99, 101)
+        );
+    }
+
+    #[test]
+    fn derived_client_ip_always_validates() {
+        for host in [
+            Ipv4Addr::new(192, 168, 99, 1),
+            Ipv4Addr::new(192, 168, 99, 100),
+            Ipv4Addr::new(10, 0, 0, 254),
+        ] {
+            validate_client_ip(host, derive_client_ip(host)).unwrap();
+        }
+    }
+
+    #[test]
+    fn validate_client_ip_rejects_other_subnets() {
+        let err = validate_client_ip(Ipv4Addr::new(10, 1, 2, 1), Ipv4Addr::new(10, 1, 3, 100))
+            .unwrap_err();
+        assert!(err.to_string().contains("10.1.2.0/24"), "{err}");
+        assert!(validate_client_ip(
+            Ipv4Addr::new(192, 168, 99, 1),
+            Ipv4Addr::new(192, 168, 98, 100)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn validate_client_ip_rejects_host_network_and_broadcast() {
+        let host = Ipv4Addr::new(192, 168, 99, 1);
+        assert!(validate_client_ip(host, host).is_err(), "client == host");
+        assert!(validate_client_ip(host, Ipv4Addr::new(192, 168, 99, 0)).is_err());
+        assert!(validate_client_ip(host, Ipv4Addr::new(192, 168, 99, 255)).is_err());
+        validate_client_ip(host, Ipv4Addr::new(192, 168, 99, 2)).unwrap();
+        validate_client_ip(host, Ipv4Addr::new(192, 168, 99, 254)).unwrap();
+    }
+
+    // ── Reply building ───────────────────────────────────────────────────────
 
     #[test]
     fn build_offer_header_fields() {
@@ -580,6 +907,7 @@ mod tests {
             &req,
             DHCP_OFFER,
             server,
+            CLIENT,
             &BootAdvert::tftp("kernel_2712.img"),
         );
 
@@ -588,7 +916,7 @@ mod tests {
         assert_eq!(reply[2], 6, "hlen");
         assert_eq!(&reply[4..8], &XID, "xid echoed back");
         assert_eq!(&reply[10..12], &[0x80, 0x00], "broadcast flag set");
-        assert_eq!(&reply[16..20], &ASSIGNED_IP.octets(), "yiaddr = assigned");
+        assert_eq!(&reply[16..20], &CLIENT.octets(), "yiaddr = assigned");
         assert_eq!(&reply[20..24], &server.octets(), "siaddr = next-server");
         assert_eq!(&reply[28..34], &MAC6, "chaddr echoed");
         // file field (offset 108, 128 bytes) carries the bootfile, null-padded.
@@ -597,10 +925,34 @@ mod tests {
     }
 
     #[test]
+    fn build_reply_leases_the_given_client_ip() {
+        // A non-default host gets a lease in its own /24, not 192.168.99.100.
+        let req = parse_request(&request_packet(BOOTREQUEST, Some(DHCP_DISCOVER), &[])).unwrap();
+        let host = Ipv4Addr::new(10, 20, 30, 1);
+        let client = derive_client_ip(host);
+        let reply = build_reply(&req, DHCP_OFFER, host, client, &BootAdvert::tftp("k.img"));
+        assert_eq!(
+            &reply[16..20],
+            &[10, 20, 30, 100],
+            "yiaddr in the host's /24"
+        );
+        let opts = reply_options(&reply);
+        let get = |tag: u8| opts.iter().find(|(t, _)| *t == tag).map(|(_, v)| v.clone());
+        assert_eq!(get(OPT_ROUTER), Some(host.octets().to_vec()));
+        assert_eq!(get(OPT_SUBNET), Some(vec![255, 255, 255, 0]));
+    }
+
+    #[test]
     fn build_offer_options_match_spec() {
         let req = parse_request(&request_packet(BOOTREQUEST, Some(DHCP_DISCOVER), &[])).unwrap();
         let server = Ipv4Addr::new(10, 0, 0, 5);
-        let reply = build_reply(&req, DHCP_OFFER, server, &BootAdvert::tftp("boot.img"));
+        let reply = build_reply(
+            &req,
+            DHCP_OFFER,
+            server,
+            Ipv4Addr::new(10, 0, 0, 100),
+            &BootAdvert::tftp("boot.img"),
+        );
         let opts = reply_options(&reply);
 
         let get = |tag: u8| opts.iter().find(|(t, _)| *t == tag).map(|(_, v)| v.clone());
@@ -622,6 +974,7 @@ mod tests {
             &req,
             DHCP_ACK,
             Ipv4Addr::new(192, 168, 99, 1),
+            CLIENT,
             &BootAdvert::tftp("k.img"),
         );
         let opts = reply_options(&reply);
@@ -637,6 +990,7 @@ mod tests {
             &req,
             DHCP_OFFER,
             Ipv4Addr::new(1, 2, 3, 4),
+            Ipv4Addr::new(1, 2, 3, 100),
             &BootAdvert::tftp(&long),
         );
         // The fixed 128-byte file field holds at most 127 chars + a NUL terminator.
@@ -715,7 +1069,7 @@ mod tests {
         let req = parse_request(&request_packet(BOOTREQUEST, Some(DHCP_DISCOVER), &[])).unwrap();
         let server = Ipv4Addr::new(192, 168, 99, 1);
         let url = http_boot_url(server, 80, "grubaa64.efi");
-        let reply = build_reply(&req, DHCP_OFFER, server, &BootAdvert::http(&url));
+        let reply = build_reply(&req, DHCP_OFFER, server, CLIENT, &BootAdvert::http(&url));
         let opts = reply_options(&reply);
         let get = |tag: u8| opts.iter().find(|(t, _)| *t == tag).map(|(_, v)| v.clone());
 
@@ -781,7 +1135,13 @@ mod tests {
     fn pxe_reply_echoes_class_and_keeps_tftp_fields() {
         let req = parse_request(&request_packet(BOOTREQUEST, Some(DHCP_DISCOVER), &[])).unwrap();
         let server = Ipv4Addr::new(192, 168, 99, 1);
-        let reply = build_reply(&req, DHCP_OFFER, server, &BootAdvert::pxe("ipxe.efi"));
+        let reply = build_reply(
+            &req,
+            DHCP_OFFER,
+            server,
+            CLIENT,
+            &BootAdvert::pxe("ipxe.efi"),
+        );
         let opts = reply_options(&reply);
         let get = |tag: u8| opts.iter().find(|(t, _)| *t == tag).map(|(_, v)| v.clone());
 

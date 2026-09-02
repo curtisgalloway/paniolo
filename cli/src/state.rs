@@ -124,6 +124,24 @@ pub fn is_netboot_running(target: &str) -> bool {
     }
 }
 
+/// Every target whose netboot engine is alive right now, found via the
+/// per-target state files under [`state_dir`], sorted by target name.
+pub fn running_netboots() -> Vec<(String, NetbootState)> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(state_dir()) {
+        for e in entries.flatten() {
+            let target = e.file_name().to_string_lossy().into_owned();
+            if let Some(st) = load_netboot_state(&target) {
+                if is_netboot_running(&target) {
+                    out.push((target, st));
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 pub fn now_epoch() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

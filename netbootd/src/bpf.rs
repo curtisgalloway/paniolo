@@ -118,9 +118,15 @@ impl BpfSender {
         let (Some(src_mac), Some(fd)) = (self.src_mac, self.fd.as_ref()) else {
             return false;
         };
-        let frame = build_udp_frame(
+        let Some(frame) = build_udp_frame(
             src_mac, dst_mac, src_ip, dst_ip, src_port, dst_port, payload,
-        );
+        ) else {
+            warn!(
+                "BPF: {}-byte payload does not fit one UDP datagram; not sent",
+                payload.len()
+            );
+            return false;
+        };
         // A single write(2) to a BPF descriptor transmits exactly one frame and
         // is atomic, so concurrent senders need no extra locking.
         let n = unsafe {

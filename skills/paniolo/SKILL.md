@@ -125,9 +125,17 @@ paniolo netboot stop [target]
 ```
 
 `start` refuses an interface that carries the system default route (a primary
-NIC) — the netboot link must be a dedicated USB-Ethernet adapter. Netboot is
-served by the single-binary `netbootd` (Rust). On macOS its BPF send path uses
-the setuid `netbootd-bpf-helper` installed by `paniolo setup`.
+NIC) — the netboot link must be a dedicated USB-Ethernet adapter — and refuses
+to start a second target on an interface another target's netboot already runs
+on (one netboot per interface; `netboot stop` the other first). It watches the
+daemon for ~2 s before reporting success: if netbootd exits during startup (a
+port in use, an interface it cannot pin), `start` fails and quotes the last
+lines of the log — read them, do not just retry. Netboot is served by the
+single-binary `netbootd` (Rust), which listens only on the netboot interface. On
+macOS its BPF send path uses the setuid `netbootd-bpf-helper` installed by
+`paniolo setup`. If only the HTTP port is taken, netbootd keeps serving DHCP +
+TFTP and logs a warning; HTTP Boot is then unavailable until `--http-port` is
+changed.
 
 Put boot files in the target's TFTP root (for a Raspberry Pi 5, the kernel goes
 in as `kernel_2712.img`). Needs passwordless `sudo` for `ifconfig` (it assigns

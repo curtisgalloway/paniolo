@@ -62,8 +62,8 @@ netboot channel fields:
 
 | Field | Default | Description |
 |---|---|---|
-| `--interface` | (required) | USB-Ethernet interface name (e.g. `en3`) |
-| `--host-ip` | `192.168.99.1` | Static IP assigned to the interface; also the TFTP/HTTP server address |
+| `--interface` | (required) | USB-Ethernet interface name (e.g. `en3`). Every netbootd listener is pinned to it — see [Interface pinning](#interface-pinning) |
+| `--host-ip` | `192.168.99.1` | Static IP assigned to the interface; also the TFTP/HTTP server address and the router the client is told about. The client's lease is derived from it (same /24, last octet `100` — `192.168.99.100` by default) — see [Lease](#dhcp--tftp-behavior-notes) |
 | `--tftp-root` | (none) | Directory whose contents are served over TFTP **and** HTTP |
 | `--boot-file` | `kernel_2712.img` | Boot program (filename under the root, e.g. `grubaa64.efi`); served as a TFTP filename to PXE and wrapped in an `http://` URL for HTTP Boot |
 | `--http-port` | `80` | HTTP server port; also embedded in the HTTP Boot URL (omitted from the URL when 80) |
@@ -85,8 +85,22 @@ paniolo netboot stop  [target-machine]
 `start` assigns the static `host_ip` to the interface, then launches paniolo's
 own **DHCP + TFTP + HTTP server** — the single `netbootd` binary (Rust), serving
 all three protocols from one background process. No external daemons (`dnsmasq`,
-`tftp-now`) are required at runtime. `stop` sends SIGTERM and clears the state
-file.
+`tftp-now`) are required at runtime. `stop` sends SIGTERM (which netbootd
+handles as a clean shutdown, same as Ctrl-C) and clears the state file.
+
+**`start` confirms the daemon came up.** netbootd validates its configuration
+and binds every listener *before* it serves anything, so a port already in use,
+an interface it cannot pin, or a bad client IP shows up as an early exit.
+`start` watches the new process for about two seconds and only then records it
+as running; if it exits in that window, `start` fails with the last 20 lines of
+its log (`netbootd exited with … during startup; last lines of
+~/.local/share/paniolo/<name>/netboot.log: …`) and writes no state file, so
+`netboot status` never reports a daemon that is not there.
+
+**One netboot per interface.** `start` refuses to start a second target on an
+interface where another target's netbootd is already alive (`netboot for
+'<other>' is already running on <iface> … stop it first`). Two servers on one
+link would only fight for the DHCP/TFTP ports; give each target its own adapter.
 
 **Privileged ports (67/69, and 80 by default):** macOS 10.14+ allows binding
 `0.0.0.0` on privileged ports without root, so on macOS the only step needing
@@ -97,10 +111,42 @@ the control host for unattended agent use. To avoid privileged-port binds for
 HTTP entirely, set `--http-port` to an unprivileged high port (e.g. `8080`) — it
 is embedded in the boot URL, so the UEFI client follows it.
 
+**netbootd gives root back (Linux).** Root is only needed to bind the low ports
+and pin the sockets. Once that is done — before the first packet is served —
+netbootd drops to the user who ran `sudo` (from the `SUDO_UID`/`SUDO_GID` sudo
+sets) with `setgroups`/`setgid`/`setuid`, and refuses to start if any of the
+three fails. The log records `dropped privileges to uid N gid M`. The ARP pin
+(`ip neigh`) and the interface-IP monitor (`ip addr add`) then run through
+`sudo` *as that user*, which is why the passwordless-sudo requirement above is
+not optional on Linux. Started as root directly (no `sudo`, so no `SUDO_UID`),
+netbootd stays root and says so in its log. On macOS netbootd never had root
+(the setuid helper below holds the only privilege), so nothing changes there.
+
+**HTTP is optional; DHCP and TFTP are not.** If the HTTP port cannot be bound
+(something else owns port 80, say), netbootd logs a warning naming the port and
+keeps serving DHCP + TFTP — the Pi and UEFI PXE paths still work. HTTP Boot is
+then unavailable: an `HTTPClient` DHCP request still gets its `http://` offer,
+but the fetch fails. Free the port or set `--http-port` to an unused one. A DHCP
+or TFTP socket that cannot be bound or pinned is fatal.
+
 **Interface safety:** `start` **refuses** an interface that carries your system
 default route (a primary NIC). netboot reconfigures the interface to the static
 `host_ip`, which would break your real networking — the netboot link must be a
 dedicated USB-Ethernet adapter.
+
+### Interface pinning
+
+netbootd answers every DHCP DISCOVER it hears with a lease, and hands out
+whatever is in the TFTP root to anyone who asks — so it must only ever hear the
+netboot link. Every listen socket (DHCP 67, TFTP 69, HTTP) is **pinned to the
+netboot interface** before it is bound: `IP_BOUND_IF` on macOS,
+`SO_BINDTODEVICE` on Linux. Requests arriving on any other interface — your
+office LAN on the primary NIC — are never seen, and replies (including the
+limited-broadcast DHCP offers) can only leave via the netboot link. A pin that
+cannot be applied is fatal: netbootd refuses to start rather than serve
+unpinned, and `netbootd`'s `--interface` flag is therefore required, not
+optional. The sockets still bind the wildcard address so they keep working
+through the link flaps where the interface IP is momentarily gone.
 
 **Just the link, no daemon.** `start`/`stop` bring the link up *and* run (or
 stop) the DHCP/TFTP server together. To bring the **bare link** up or down on its
@@ -242,17 +288,50 @@ identically on macOS and Linux.
 
 ## DHCP / TFTP behavior notes
 
-The DHCP server hands the target a fixed lease and sets **both** `siaddr` (the
-BOOTP next-server) and **DHCP option 66** (TFTP server name) to `host_ip`. The
-Pi 5 EEPROM reads option 66 preferentially, but setting both ensures
-compatibility with older EEPROM firmware. Replies are broadcast to the **limited
-broadcast `255.255.255.255`** (per RFC 2131), not the subnet-directed `.255`
-broadcast, and the DHCP socket is pinned to the netboot interface so they still
-egress it. This matters for strict clients: a UEFI IP4 stack sitting at `0.0.0.0`
-drops a packet addressed to a subnet it has no address on, so it never sees a
-*directed*-broadcast offer — the Pi firmware is lenient and accepts either, but
-EDK2 is not. The TFTP server is **read-only** (RFC 1350) and negotiates
-`blksize`/`tsize` options. Both servers log to the combined log at
+**Lease.** The DHCP server hands the target one fixed lease, **derived from
+`host_ip`**: the same /24, with the last octet replaced by `100` (or `101` when
+the host itself is `.100`) — so the default `192.168.99.1` leases
+`192.168.99.100`, and a host at `10.20.30.1` leases `10.20.30.100`. The lease
+carries a `255.255.255.0` mask and `host_ip` as the router, matching the /24
+`start` configures on the interface. `netbootd` itself accepts a `--client-ip`
+override (it must be in the host's /24 and be neither the host nor the
+network/broadcast address, or netbootd refuses to start); the lab file does not
+yet expose it. The reply sets **both** `siaddr` (the BOOTP next-server) and
+**DHCP option 66** (TFTP server name) to `host_ip`. The Pi 5 EEPROM reads option
+66 preferentially, but setting both ensures compatibility with older EEPROM
+firmware. Replies are broadcast to the **limited broadcast `255.255.255.255`**
+(per RFC 2131), not the subnet-directed `.255` broadcast, and the DHCP socket is
+pinned to the netboot interface so they still egress it. This matters for strict
+clients: a UEFI IP4 stack sitting at `0.0.0.0` drops a packet addressed to a
+subnet it has no address on, so it never sees a *directed*-broadcast offer — the
+Pi firmware is lenient and accepts either, but EDK2 is not.
+
+A DHCPREQUEST that asks for any address other than the lease (in option 50, or
+by claiming it in `ciaddr`) is answered with a **DHCPNAK** rather than an ACK
+carrying a different address, so a client holding a stale lease from elsewhere
+goes back to DISCOVER; a REQUEST addressed to another server (option 54) is
+ignored; and only Ethernet clients with a 6-byte hardware address are answered
+at all.
+
+**TFTP.** The TFTP server is **read-only** (RFC 1350) and negotiates
+`blksize`/`tsize` options. Files are streamed from disk one block at a time
+(never read whole), each retransmit attempt has a fixed one-second deadline so a
+peer sending anything but the awaited ACK cannot keep a transfer alive past six
+attempts, and a repeated RRQ from the same client port replaces the transfer in
+flight rather than starting a parallel one. When replies go out as raw frames
+(the macOS BPF path) the negotiated `blksize` is capped at 1468 bytes so every
+DATA block fits one Ethernet frame. A symlink inside the TFTP root that points
+outside it is refused like any other escape (TFTP `file not found`, HTTP 404):
+only regular files whose real path is under the root are served.
+
+**HTTP.** The HTTP server sends exactly the `Content-Length` it announced even
+if the file changes underneath it (a file that grows is cut at the announced
+length; one that shrinks drops the connection), closes HTTP/1.0 connections
+after the response unless the client asks for keep-alive, cuts off a connection
+that has not delivered a complete request within 10 s, and serves at most 64
+connections at once. Request names are sanitized before they are logged.
+
+Both servers log to the combined log at
 `~/.local/share/paniolo/<name>/netboot.log`.
 
 > **Switching to ffx-over-network?** With NET-first boot order, leaving netboot

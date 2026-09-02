@@ -811,21 +811,7 @@ fn run(cli: Cli) -> Result<()> {
 // ── daemon inventory ────────────────────────────────────────────────────────
 
 /// Running netboot engines, found via their per-target state files.
-fn running_netboots() -> Vec<(String, state::NetbootState)> {
-    let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(state::state_dir()) {
-        for e in entries.flatten() {
-            let target = e.file_name().to_string_lossy().into_owned();
-            if let Some(st) = state::load_netboot_state(&target) {
-                if state::is_netboot_running(&target) {
-                    out.push((target, st));
-                }
-            }
-        }
-    }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
-}
+use state::running_netboots;
 
 /// One unified view of every paniolo background process on this host: the
 /// discovery-file daemons, netbootd (state files), and stray helper
