@@ -45,8 +45,20 @@ pub fn clamp_abs(v: i32) -> i32 {
 /// Execute one protocol command line. Returns the `OK` reply data (empty for a
 /// bare `OK`, the capability string for `version`). Errors map to the `ERR`
 /// the protocol requires.
+///
+/// The line is the frame: one trailing line terminator is stripped, and a
+/// CR/LF anywhere else is refused rather than typed as Enter — this is the
+/// direct path (a one-shot with no daemon running), so it must refuse an
+/// embedded newline itself; the daemon's queue (`uart.rs`) refuses it too
+/// before it ever reaches here. `type` text is the remainder after the one
+/// separator, verbatim (trailing spaces included); every other verb takes
+/// whitespace-separated tokens.
 pub fn execute_line(s: &mut Session, line: &str) -> Result<String> {
-    let line = line.trim();
+    let line = line.trim_end_matches(['\r', '\n']);
+    if line.contains(['\r', '\n']) {
+        return Err(anyhow!("command contains a newline: {line:?}"));
+    }
+    let line = line.trim_start();
     let (head, rest) = line.split_once(' ').unwrap_or((line, ""));
     let rest = rest.trim();
     match head.to_ascii_lowercase().as_str() {
@@ -176,34 +188,47 @@ pub enum Step {
     Delay(f64),
 }
 
+/// Longest pause a sequence file may ask for, in seconds (ported from hidrig).
+const MAX_PAUSE_SECS: f64 = 3600.0;
+
 /// Parse a command file into steps: non-blank, non-`#` lines are commands;
-/// `delay <ms>` / `sleep <seconds>` are timing directives.
+/// `delay <ms>` / `sleep <seconds>` are timing directives, each a finite value
+/// between 0 and one hour. Command lines pass through with only their leading
+/// whitespace removed (a `type` line's trailing spaces are part of its text).
 pub fn parse_sequence(text: &str) -> Result<Vec<Step>> {
     let mut steps = Vec::new();
     for raw in text.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
+        let line = raw.trim_start();
+        if line.trim_end().is_empty() || line.starts_with('#') {
             continue;
         }
         let (head, rest) = line.split_once(' ').unwrap_or((line, ""));
         let value = rest.split_whitespace().next().unwrap_or("");
         match head.to_ascii_lowercase().as_str() {
-            "delay" => {
-                let ms: f64 = value
-                    .parse()
-                    .map_err(|_| anyhow!("invalid delay value: {rest:?}"))?;
-                steps.push(Step::Delay(ms / 1000.0));
-            }
-            "sleep" => {
-                let secs: f64 = value
-                    .parse()
-                    .map_err(|_| anyhow!("invalid sleep value: {rest:?}"))?;
-                steps.push(Step::Delay(secs));
-            }
+            "delay" => steps.push(Step::Delay(pause_secs(value, 1000.0, "delay", rest)?)),
+            "sleep" => steps.push(Step::Delay(pause_secs(value, 1.0, "sleep", rest)?)),
             _ => steps.push(Step::Cmd(line.to_string())),
         }
     }
     Ok(steps)
+}
+
+/// A pause directive's value in seconds: `value` is in units of
+/// `1/per_second` s, and must be finite, non-negative and at most
+/// [`MAX_PAUSE_SECS`] — `Duration::from_secs_f64` panics on a negative,
+/// infinite or NaN value, and an hours-long pause in a sequence is a typo.
+fn pause_secs(value: &str, per_second: f64, what: &str, rest: &str) -> Result<f64> {
+    let v: f64 = value
+        .parse()
+        .map_err(|_| anyhow!("invalid {what} value: {rest:?}"))?;
+    let secs = v / per_second;
+    if !secs.is_finite() || secs < 0.0 || secs > MAX_PAUSE_SECS {
+        return Err(anyhow!(
+            "{what} must be between 0 and {MAX_PAUSE_SECS} seconds: {rest:?}"
+        ));
+    }
+    // -0.0 is not < 0.0 but is sign-negative; normalise it.
+    Ok(if secs == 0.0 { 0.0 } else { secs })
 }
 
 #[cfg(test)]
@@ -259,5 +284,37 @@ mod tests {
     fn button_defaulting() {
         assert_eq!(button_or_default(""), "left");
         assert_eq!(button_or_default("right"), "right");
+    }
+
+    /// A pause must be a finite, non-negative duration of at most an hour:
+    /// `Duration::from_secs_f64` panics on a negative, infinite or NaN value,
+    /// and a multi-hour sleep in a sequence file is a mistake, not a plan.
+    #[test]
+    fn delay_and_sleep_are_bounded() {
+        for bad in [
+            "delay -1",
+            "sleep -0.5",
+            "sleep inf",
+            "delay inf",
+            "sleep nan",
+            "delay NaN",
+            "sleep 3600.5",
+            "delay 3600001",
+        ] {
+            assert!(parse_sequence(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            parse_sequence("sleep 3600\ndelay 3600000\nsleep 0\n").unwrap(),
+            vec![Step::Delay(3600.0), Step::Delay(3600.0), Step::Delay(0.0)]
+        );
+    }
+
+    /// A `type` line's trailing spaces are part of its text; the parser strips
+    /// only leading whitespace (blank and comment detection is unchanged).
+    #[test]
+    fn command_lines_keep_trailing_whitespace() {
+        let steps = parse_sequence("  type hi  \n").unwrap();
+        assert_eq!(steps, vec![Step::Cmd("type hi  ".into())]);
+        assert!(parse_sequence("   \n\t\n").unwrap().is_empty());
     }
 }
