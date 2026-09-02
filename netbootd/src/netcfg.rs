@@ -26,33 +26,31 @@ use tracing::warn;
 
 /// The interface carrying the system default route, if any.
 ///
-/// - macOS: `route -n get default` emits a line `  interface: en0`.
-/// - Linux: `ip route show default` emits `default via <gw> dev en0 ...`.
+/// macOS: the library's [`netbootd::route::default_route_interface`]
+/// (`/sbin/route -n get default`), shared with the setuid helper so the
+/// daemon's guard and the helper's refusal can never disagree.
+#[cfg(target_os = "macos")]
 fn default_route_interface() -> Option<String> {
-    if cfg!(target_os = "macos") {
-        let out = Command::new("route")
-            .args(["-n", "get", "default"])
-            .output()
-            .ok()?;
-        let s = String::from_utf8_lossy(&out.stdout);
-        s.lines()
-            .filter_map(|l| l.trim().strip_prefix("interface:"))
-            .map(|v| v.trim().to_string())
-            .next()
-    } else {
-        let out = Command::new("ip")
-            .args(["route", "show", "default"])
-            .output()
-            .ok()?;
-        let s = String::from_utf8_lossy(&out.stdout);
-        let mut toks = s.split_whitespace();
-        while let Some(tok) = toks.next() {
-            if tok == "dev" {
-                return toks.next().map(str::to_string);
-            }
+    netbootd::route::default_route_interface()
+}
+
+/// The interface carrying the system default route, if any.
+///
+/// Linux: `ip route show default` emits `default via <gw> dev en0 ...`.
+#[cfg(not(target_os = "macos"))]
+fn default_route_interface() -> Option<String> {
+    let out = Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut toks = s.split_whitespace();
+    while let Some(tok) = toks.next() {
+        if tok == "dev" {
+            return toks.next().map(str::to_string);
         }
-        None
     }
+    None
 }
 
 /// Whether `interface` is a primary NIC — i.e. it carries the system default

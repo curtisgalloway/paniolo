@@ -179,7 +179,9 @@ dedicated secondary (USB-Ethernet) interface.
 
 On macOS, `netbootd`'s raw-frame send path (the Sequoia workaround) gets a `/dev/bpf` descriptor
 from a setuid-root `netbootd-bpf-helper` over `SCM_RIGHTS`, so the daemon itself stays
-unprivileged — the helper is the only root component, installed by `paniolo setup`.
+unprivileged — the helper is the only root component, installed by `paniolo setup`. The
+descriptor is write-only with a reject-all filter (it can inject, never capture), and the helper
+serves only the user who installed it and never the default-route interface.
 
 ### Link mode: netboot · link · ffx · off ([`netif.md`](../netif.md))
 The same USB-Ethernet link serves **mutually-exclusive** roles: netboot (IPv4 + DHCP + TFTP +

@@ -25,3 +25,8 @@ pub mod frame;
 /// which has no Windows equivalent, so the module exists only on Unix.
 #[cfg(unix)]
 pub mod handoff;
+/// The default-route lookup the setuid helper uses to refuse the primary NIC.
+/// It runs `/sbin/route`, which only exists on macOS — the only platform with
+/// the helper.
+#[cfg(target_os = "macos")]
+pub mod route;

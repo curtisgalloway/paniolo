@@ -24,12 +24,13 @@
 //! Privilege model: opening `/dev/bpf` needs root, but netbootd runs
 //! unprivileged. So the bound, `BIOCSHDRCMPLT`-set descriptor is opened by the
 //! setuid-root `netbootd-bpf-helper` and handed over via `SCM_RIGHTS` (see
-//! [`crate::handoff`] in the binary / `netbootd::handoff` in the lib). This
-//! `BpfSender` only ever *writes* complete frames to that descriptor with
-//! `libc::write` — the raw "libc BPF path" the previous `pnet_datalink`-based
-//! version left unimplemented. Because `BIOCSHDRCMPLT` is set once on the fd by
-//! the helper, we avoid the macOS bug where toggling it per-write breaks
-//! injection.
+//! `netbootd::handoff` in the lib). The descriptor arrives **write-only** with
+//! a reject-all filter installed — it can inject, never capture — which is all
+//! this `BpfSender` needs: it only ever *writes* complete frames to that
+//! descriptor with `libc::write` — the raw "libc BPF path" the previous
+//! `pnet_datalink`-based version left unimplemented. Because `BIOCSHDRCMPLT` is
+//! set once on the fd by the helper, we avoid the macOS bug where toggling it
+//! per-write breaks injection.
 //!
 //! Portability: this module compiles on every platform so the TFTP call sites
 //! stay type-checked, but netbootd only constructs a live sender on macOS via

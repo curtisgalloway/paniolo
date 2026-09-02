@@ -128,7 +128,27 @@ fn ensure_linux_groups() -> bool {
 /// sole job is opening /dev/bpf and handing the fd to the unprivileged
 /// netbootd. Installs and upgrades (cargo and packages alike) reset the mode,
 /// so the setuid bit must be re-applied after each one.
+///
+/// Mode 4755 (world-executable) is acceptable because the helper gates
+/// itself rather than relying on the file mode: it refuses any caller whose
+/// real uid is not the owner of the directory it lives in (the installing
+/// user), refuses to bind the default-route interface, and hands out only a
+/// write-only descriptor with a reject-all filter. Another local user can
+/// run it and gets nothing from it.
+///
+/// Before touching the file, [`helper_safe_to_setuid`] confirms it is what
+/// the invoking user installed — a regular file (not a symlink) they own, or
+/// the root-owned setuid helper a previous run already produced. Anything
+/// else is refused rather than promoted to setuid-root.
 fn setuid_bpf_helper(helper: &Path) {
+    if let Err(why) = helper_safe_to_setuid(helper) {
+        eprintln!(
+            "  ! refusing to setuid {}: {why}. Reinstall the helper \
+             (`make install` or `brew reinstall paniolo`) and re-run `paniolo setup`.",
+            helper.display()
+        );
+        return;
+    }
     println!("  … installing netbootd-bpf-helper setuid-root (one-time sudo)");
     let chown = Command::new("sudo")
         .args(["chown", "root:wheel"])
@@ -151,6 +171,44 @@ fn setuid_bpf_helper(helper: &Path) {
              `paniolo setup` with sudo access to fix."
         );
     }
+}
+
+/// Whether `helper` is a file `paniolo setup` may promote to setuid-root:
+/// a regular file — `symlink_metadata`, so a symlink is seen as a symlink and
+/// refused rather than followed — that is either owned by the invoking user
+/// (freshly installed by `cargo install` / `make install` / the keg) or
+/// already root-owned with the setuid bit (a previous run). A file some other
+/// uid placed there is refused: `sudo chown root` + `chmod 4755` on it would
+/// hand that uid a root-run binary of their choosing.
+#[cfg(unix)]
+fn helper_safe_to_setuid(helper: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = std::fs::symlink_metadata(helper).map_err(|e| anyhow!("cannot stat: {e}"))?;
+    if !meta.file_type().is_file() {
+        bail!("not a regular file (a symlink?)");
+    }
+    // Direct getuid rather than platform::current_uid(): that wrapper's
+    // contract excludes authorization decisions (it is a hash on Windows), and
+    // this compares against a real file owner. Unix-only, so it is exact here.
+    let me = unsafe { libc::getuid() };
+    // POSIX setuid bit; spelled out because libc::S_ISUID is u16 on macOS and
+    // u32 on Linux, so a cast is needed on one and flagged on the other.
+    const S_ISUID: u32 = 0o4000;
+    let already_setuid_root = meta.uid() == 0 && meta.mode() & S_ISUID != 0;
+    if meta.uid() != me && !already_setuid_root {
+        bail!(
+            "owned by uid {}, not the invoking user (uid {me})",
+            meta.uid()
+        );
+    }
+    Ok(())
+}
+
+/// setuid is a Unix concept; the macOS-only caller never runs here.
+#[cfg(not(unix))]
+fn helper_safe_to_setuid(_helper: &Path) -> Result<()> {
+    bail!("setuid is not supported on this platform")
 }
 
 /// Finish platform setup for a packaged install (Homebrew, .deb, tarball) —
@@ -571,6 +629,27 @@ pub fn run(repo: &Path, rust_only: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `setup` promotes the bpf-helper to setuid-root, so it must only do so
+    /// to a regular file the invoking user owns — never to a symlink, which
+    /// `chown`/`chmod` would follow to wherever it points.
+    #[cfg(unix)]
+    #[test]
+    fn helper_safe_to_setuid_accepts_own_file_and_refuses_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("netbootd-bpf-helper");
+        std::fs::write(&real, b"").unwrap();
+        helper_safe_to_setuid(&real).expect("own regular file is accepted");
+
+        let link = dir.path().join("netbootd-bpf-helper-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = helper_safe_to_setuid(&link).unwrap_err().to_string();
+        assert!(err.contains("not a regular file"), "{err}");
+
+        let missing = dir.path().join("absent");
+        let err = helper_safe_to_setuid(&missing).unwrap_err().to_string();
+        assert!(err.contains("cannot stat"), "{err}");
+    }
 
     /// The markers `is_repo_root` keys off must match the *real* tree.
     ///
