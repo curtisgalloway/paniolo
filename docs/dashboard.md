@@ -14,7 +14,9 @@ paniolo console                  # open in the default browser
 
 `paniolo console` starts any daemon that isn't already running — hdmicap,
 serialcap, and the hid daemon when the target has a `hid` channel — then opens
-the dashboard. (`paniolo video watch` / `paniolo serial watch` still start them
+the dashboard. The URL it opens (and prints) carries each daemon's token —
+hdmicap's as `?token=`, the others' inside their `?serialws=`/`?hidws=` URLs —
+so open that URL, not a bare `http://127.0.0.1:<port>/`. (`paniolo video watch` / `paniolo serial watch` still start them
 individually.) The page fetches the serialcap interface list and builds one
 terminal pane per interface, displayed side by side in the serial panel (or
 stacked in right-panel layout). With a single interface the panel looks the
@@ -73,19 +75,30 @@ action — merely loading the dashboard never powers the target.
 
 | Parameter | Effect |
 |---|---|
-| `?serial=<port>` | Connect terminal to serialcap on a non-default port |
-| `?serialws=<url>` | Connect terminal to an explicit WebSocket URL |
+| `?token=<token>` | hdmicap's own token; the page puts it on every request it makes back to hdmicap |
+| `?serialws=<url>` | Connect the terminal to this serialcap WebSocket URL, which carries serialcap's `?token=` inside (what `paniolo console` passes; percent-encoded) |
+| `?serial=<port>` | Connect the terminal to serialcap on this local port — no token, so only a daemon started without one accepts it |
 | `?interface=<name>` | Preselect a named serial interface |
-| `?hid=<port>` | Enable KVM input via the hid daemon on a local port |
-| `?hidws=<url>` | Enable KVM input via an explicit hid WebSocket URL |
+| `?hidws=<url>` | Enable KVM input via this hid WebSocket URL, hid's `?token=` inside (what `paniolo console` passes) |
+| `?hid=<port>` | Enable KVM input via the hid daemon on this local port (no token, as for `?serial=`) |
+
+`serialws`/`hidws` (and the URLs built from `serial`/`hid`) must be loopback
+— `127.0.0.1`, `localhost` or `[::1]`; the page refuses anything else with an
+inline error and makes no connection, so a crafted link cannot point your
+keystrokes, or the tokens in those URLs, somewhere else. The page also refuses
+to render inside another page's frame (`Content-Security-Policy:
+frame-ancestors 'none'`), so its power buttons cannot be clickjacked.
 
 ---
 
 ## Connecting the daemons
 
-`paniolo console` supplies the serial connection automatically: the local path
-passes serialcap's OS-assigned port as `?serial=PORT`, and the remote/tunnel
-path passes an explicit `?serialws=` URL. The `?serial=` / `?serialws=`
-parameters let you point a hand-opened page at serialcap yourself; without
-them the page falls back to `ws://<host>:8724/stream` (the standalone
-`serialcap --port` default).
+`paniolo console` supplies every connection automatically. It reads each
+daemon's discovery file (port and token) and passes the page one complete
+loopback WebSocket URL per daemon — `?serialws=ws://127.0.0.1:<port>/stream?token=…`
+and `?hidws=…/hid?token=…` — on the local path as well as the remote/tunnel
+path, where `<port>` is the tunnel's local end. hdmicap's own token rides as
+`?token=`. The `?serial=` / `?hid=` port forms let you point a hand-opened page
+at a daemon yourself, but they cannot carry a token, so they work only against
+a daemon started by an older paniolo; without any of them the page falls back
+to `ws://<host>:8724/stream` (the standalone `serialcap --port` default).

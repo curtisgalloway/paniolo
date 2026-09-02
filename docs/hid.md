@@ -185,6 +185,21 @@ When a daemon is running for a device, `hidrig -d <device> …` one-shots route
 through it automatically (the UART has a single owner), so the CLI and the web
 console never contend for the port.
 
+**The daemon's API needs its token.** Like serialcap and hdmicap, the hid
+daemon generates a token each start and publishes it in its discovery file
+(`/tmp/paniolo-<uid>/hid/<target>/daemon.json`, owner-only); every request
+must carry it as `Authorization: Bearer <token>` or `?token=<token>`, and only
+loopback `Host`/`Origin` values are accepted. One-shots routed through the
+daemon send it automatically, and `paniolo console` embeds it in the `?hidws=`
+URL it hands the dashboard — so a web page in your browser cannot inject
+keystrokes into the target. A daemon from an older paniolo has no token;
+`paniolo daemons restart --stale` replaces it.
+
+**Limits.** One `type` command takes at most 4096 characters, a `move` or
+`scroll` moves at most 32 767 units per axis per call (`ch9329`), a `/send`
+body or WebSocket message is at most 4 KiB, and a command the injector never
+answers fails after 30 s instead of stalling every other client behind it.
+
 **Latency.** HID frames are fire-and-forget over the USB-CDC link (no
 per-frame round-trip), so cursor streaming stays responsive; the dashboard also
 **coalesces mouse moves** to one `moveabs` per animation frame (newest position

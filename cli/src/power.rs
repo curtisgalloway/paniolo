@@ -24,11 +24,13 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 
+use crate::daemons::Endpoint;
+
 /// Assert DTR for `ms` via the running serialcap daemon (it owns the port).
-pub fn dtr_press_daemon(base_url: &str, interface: &str, ms: u64) -> Result<()> {
-    let url = format!("{base_url}/button?interface={interface}&ms={ms}");
+pub fn dtr_press_daemon(daemon: &Endpoint, interface: &str, ms: u64) -> Result<()> {
     let timeout = std::cmp::max(15_000, ms + 5_000);
-    ureq::post(&url)
+    daemon
+        .post(&format!("/button?interface={interface}&ms={ms}"))
         .timeout(Duration::from_millis(timeout))
         .send_bytes(&[])
         .map(|_| ())
@@ -51,8 +53,9 @@ pub fn dtr_press_direct(device: &str, ms: u64) -> Result<()> {
 
 /// Current power state from the daemon's sense line: Some(on) or None when the
 /// sense signal isn't configured (power_on is null) or the daemon is unreachable.
-pub fn read_power_state(base_url: &str, interface: &str) -> Option<bool> {
-    let resp = ureq::get(&format!("{base_url}/status?interface={interface}"))
+pub fn read_power_state(daemon: &Endpoint, interface: &str) -> Option<bool> {
+    let resp = daemon
+        .get(&format!("/status?interface={interface}"))
         .timeout(Duration::from_secs(2))
         .call()
         .ok()?;

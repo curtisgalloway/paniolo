@@ -184,10 +184,12 @@ different host.
 
 The clean answer uses the override and the hub principle together: forward each
 daemon's port to the dev machine, then open the dashboard at
-`http://127.0.0.1:<local-hdmi>/?serialws=ws://127.0.0.1:<local-serial>/stream`.
-The `?serialws=` knob — which already exists — stitches the two together and does
-not care that the daemons are on different hosts, only that both resolve as
-forwarded local ports. This needs **zero changes to hdmicap or serialcap.**
+`http://127.0.0.1:<local-hdmi>/?token=<hdmi-token>&serialws=ws://127.0.0.1:<local-serial>/stream?token=<serial-token>`
+(the nested URL percent-encoded; the tokens come from each daemon's `daemon.json`,
+read over the same SSH session). The `?serialws=` knob — which already exists —
+stitches the two together and does not care that the daemons are on different
+hosts, only that both resolve as forwarded local ports. This needs **zero
+changes to hdmicap or serialcap.**
 
 We explicitly considered, and rejected, making hdmicap **reverse-proxy** serialcap
 to collapse the dashboard to one origin/one forward. It would require hdmicap on

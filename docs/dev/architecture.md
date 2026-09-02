@@ -133,7 +133,11 @@ old per-target files (`~/.config/paniolo/targets/<name>.toml`, `video.toml`) fro
 pre-lab-file layout are not read.
 
 **Runtime state, discovery, and capture** live outside the config tree. Each daemon writes a
-**discovery file** (pid + port) and holds an **advisory lock**; at spawn the CLI also records the
+**discovery file** (pid + port + a per-start bearer **token**, owner-only) and holds an
+**advisory lock**; every request to a daemon must carry that token (`Authorization: Bearer` from
+the CLI, `?token=` from the dashboard), and the daemons accept only loopback `Host`/`Origin`
+values — binding 127.0.0.1 keeps other machines out, the token and origin checks keep other
+*web pages* out (`cli/src/daemons.rs` `Endpoint`, each daemon's `auth.rs`). At spawn the CLI also records the
 daemon's binary identity (`binmeta.json`), so a daemon still running an older binary after an
 upgrade/rebuild is flagged **stale** in `paniolo daemons` and healed by `paniolo daemons restart`.
 The per-target capture daemons
@@ -300,11 +304,13 @@ its channels co-located. `console --detach` and locking remain design-only (see
 ## 7. Cross-subsystem coupling (the dashboard)
 
 The dashboard is the **only** place two subsystems interlock, and they stay decoupled: hdmicap
-**serves the page** but references serialcap **only by URL** — `paniolo console` passes the
-daemon's OS-assigned port via `?serial=` (or a tunnelled `?serialws=` for remote targets); the
-page's built-in `ws://<host>:8724/stream` fallback only applies when it is opened by hand. The
-page fetches serialcap's `/interfaces` and
-builds one xterm.js terminal per interface. xterm.js is **vendored, not CDN**, so the dashboard
+**serves the page** but references serialcap **only by URL** — `paniolo console` passes a
+complete loopback WebSocket URL, serialcap's own token inside, as `?serialws=` (the tunnel's
+local port for a remote target; hdmicap's token rides as `?token=`); the page refuses a
+non-loopback URL, and its built-in `ws://<host>:8724/stream` fallback only applies when it is
+opened by hand. The page fetches serialcap's `/interfaces` and
+builds one xterm.js terminal per interface. No daemon learns another's token: each one's
+travels only in the URL the page uses to reach it. xterm.js is **vendored, not CDN**, so the dashboard
 works on an isolated lab network. The power on/off toggle and cycle button appear only when
 hdmicap was started with a target (so they are safe on shared dashboards); their availability
 probe (`GET /power`) performs no power action.
@@ -335,6 +341,10 @@ and the macOS-only bits (Vision OCR, BPF) are irrelevant there.
 - **Daemons hard-exit on SIGTERM** — both serve infinite responses (`/preview` MJPEG, `/stream`
   WebSocket), so each removes its discovery file, waits ~300 ms, then `exit(0)`; the OS releases
   the device.
+- **Daemon APIs are authenticated** — a fresh token per daemon start, published only in the
+  owner-only discovery file; loopback-only `Host`/`Origin`; no `Access-Control-Allow-Origin: *`.
+  A daemon started by an older paniolo has no token and is replaced by
+  `paniolo daemons restart --stale`.
 - **Interface configuration needs root** — NOPASSWD sudo is the practical setup for unattended
   agent use.
 - **Link modes (netboot / link / ffx / off) are mutually exclusive on the link** — netboot and

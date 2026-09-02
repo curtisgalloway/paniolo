@@ -19,7 +19,8 @@
 //! Ported from the Python `_serial.py`. serialcap's discovery file is
 //! `<runtime-base>/serialcap/<target>/daemon.json` (per-target, so multiple
 //! targets' daemons coexist on one host — see daemons.rs), holding
-//! `{pid, port, …}`; an interface is passed to the daemon as
+//! `{pid, port, token, …}`; every request carries the token (see
+//! `daemons::Endpoint`). An interface is passed to the daemon as
 //! `NAME=DEVICE@BAUD[:SENSE]`.
 
 use std::process::{Command, Stdio};
@@ -37,8 +38,14 @@ pub const DAEMON: &str = "serialcap";
 /// collides with stale `ssh -L` dashboard tunnels squatting the old 8724.
 pub const DEFAULT_PORT: u16 = 0;
 
+/// The target's running serialcap daemon — port and token — or None if it
+/// isn't running.
+pub fn daemon(target: &str) -> Option<daemons::Endpoint> {
+    daemons::daemon_endpoint(DAEMON, Some(target))
+}
+
 /// Base URL of the target's running serialcap daemon, or None if it isn't
-/// running.
+/// running. For printing; API calls go through [`daemon`].
 pub fn daemon_url(target: &str) -> Option<String> {
     daemons::daemon_url(DAEMON, Some(target))
 }
@@ -97,13 +104,19 @@ pub fn stop_daemon(target: &str) -> Result<i32> {
 /// POST raw bytes to the serial port the daemon owns; input coexists with
 /// capture. `pace_ms > 0` drips bytes one at a time (the substitute for flow
 /// control on slow polled consoles), so the timeout is scaled to match.
-pub fn send_input(base_url: &str, interface: &str, data: &[u8], pace_ms: u32) -> Result<()> {
-    let mut url = format!("{base_url}/input?interface={interface}");
+pub fn send_input(
+    daemon: &daemons::Endpoint,
+    interface: &str,
+    data: &[u8],
+    pace_ms: u32,
+) -> Result<()> {
+    let mut path = format!("/input?interface={interface}");
     if pace_ms > 0 {
-        url.push_str(&format!("&pace_ms={pace_ms}"));
+        path.push_str(&format!("&pace_ms={pace_ms}"));
     }
     let timeout_ms = std::cmp::max(15_000, data.len() as u64 * pace_ms as u64 + 10_000);
-    ureq::post(&url)
+    daemon
+        .post(&path)
         .timeout(Duration::from_millis(timeout_ms))
         .send_bytes(data)
         .map(|_| ())

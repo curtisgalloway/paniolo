@@ -130,7 +130,8 @@ behavior.
 - **The KVM daemon (`serve`/`stop`) is implemented and hardware-verified.**
   `ch9329 serve` owns the UART and re-exposes the protocol over a localhost
   WebSocket (`GET /hid`) plus a `POST /send` one-shot endpoint, publishing the
-  `/tmp/paniolo-<uid>/hid/<target>/daemon.json` discovery file paniolo's `console` reads
+  `/tmp/paniolo-<uid>/hid/<target>/daemon.json` discovery file (port, plus the
+  per-start token every request must carry) paniolo's `console` reads
   — so the web-console "Capture input" KVM works with the Openterface. While a
   daemon runs, one-shot `paniolo hid send` invocations route through it
   automatically, so the CLI and the browser never contend for the UART and

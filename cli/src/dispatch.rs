@@ -244,12 +244,16 @@ pub fn dispatch_stdout_to_file(
     Ok(code)
 }
 
-/// Read the TCP port from a daemon's discovery file on `host`, or None.
-/// The path is resolved by a remote shell so the host's own uid applies;
-/// must match `runtime_base()` in daemons.rs (and the daemon crates).
-/// `subdir` is `<name>` for a host-singleton daemon or `<name>/<target>` for a
-/// per-target one — build it with [`crate::daemons::runtime_rel`].
-pub fn remote_daemon_port(host: &crate::model::Host, subdir: &str) -> Option<u16> {
+/// Read a daemon's discovery record — port and token — from its `daemon.json`
+/// on `host`, or None. The path is resolved by a remote shell so the host's
+/// own uid applies; must match `runtime_base()` in daemons.rs (and the daemon
+/// crates). `subdir` is `<name>` for a host-singleton daemon or
+/// `<name>/<target>` for a per-target one — build it with
+/// [`crate::daemons::runtime_rel`]. The token crosses only the SSH session.
+pub fn remote_daemon_endpoint(
+    host: &crate::model::Host,
+    subdir: &str,
+) -> Option<crate::daemons::Endpoint> {
     let script = format!(
         "cat \"${{PANIOLO_RUNTIME_BASE:-/tmp}}/paniolo-$(id -u)/{subdir}/daemon.json\" 2>/dev/null"
     );
@@ -263,8 +267,7 @@ pub fn remote_daemon_port(host: &crate::model::Host, subdir: &str) -> Option<u16
     if out.status != 0 || out.stdout.trim().is_empty() {
         return None;
     }
-    let v: serde_json::Value = serde_json::from_str(out.stdout.trim()).ok()?;
-    v.get("port")?.as_u64().map(|p| p as u16)
+    crate::daemons::Endpoint::from_json(out.stdout.trim())
 }
 
 /// Resolve where a command should run and dispatch if remote.
