@@ -175,7 +175,19 @@ required at runtime.
 
 `paniolo netboot start` refuses an interface that carries the system default route (a primary
 NIC), since it reconfigures the interface to the static `host_ip` — the netboot link must be a
-dedicated secondary (USB-Ethernet) interface.
+dedicated secondary (USB-Ethernet) interface — and refuses a second target on an interface
+another target's live netbootd already serves (one netboot per interface). After spawning it
+watches the daemon for ~2 s and, if netbootd exits during startup, fails with the tail of the
+log rather than recording a dead daemon.
+
+`netbootd` only ever hears the netboot link: every listener (DHCP, TFTP, HTTP) is pinned to the
+interface (`IP_BOUND_IF` / `SO_BINDTODEVICE`) before it is bound, and a pin that fails is fatal
+(`--interface` is required). Startup is validate → bind and pin → drop root → serve: on Linux the
+daemon drops from `sudo`'s root to the invoking user (`SUDO_UID`/`SUDO_GID`) as soon as the
+listeners are bound, so nothing that parses packets or serves files runs privileged (its later
+`sudo ip …` shell-outs rely on passwordless sudo). The client lease is derived from `host_ip`
+(same /24, last octet `100`), and an HTTP bind failure only disables HTTP Boot — DHCP and TFTP
+keep serving.
 
 On macOS, `netbootd`'s raw-frame send path (the Sequoia workaround) gets a `/dev/bpf` descriptor
 from a setuid-root `netbootd-bpf-helper` over `SCM_RIGHTS`, so the daemon itself stays
@@ -298,7 +310,8 @@ Core power/serial/netboot works on both; the platform-specific spots are contain
 
 | Area | macOS | Linux |
 |---|---|---|
-| Netboot ports 67/69 | rootless (10.14+) | `sudo` (auto-prepended) |
+| Netboot ports 67/69 | rootless (10.14+) | `sudo` (auto-prepended); netbootd drops root to `SUDO_UID` once bound |
+| Listener pinning to the netboot interface | `IP_BOUND_IF` | `SO_BINDTODEVICE` (set while still root) |
 | Interface config | `networksetup` / `ifconfig` | `ip addr`/`ip link` (iproute2) |
 | ARP pinning | `arp -s` | `ip neigh replace … nud permanent` |
 | TFTP egress workaround | BPF raw frames (`/dev/bpf*`) for Sequoia routing | normal `sendto()` |

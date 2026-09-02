@@ -736,17 +736,56 @@ tokio tasks in one process. It is the **only** netboot engine for `paniolo
 netboot start` (originally ported from a pure-Python `_dhcp`/`_tftp` pair, since
 removed).
 
-The pure protocol logic is unit-tested (`dhcp.rs` / `tftp.rs` `#[cfg(test)]`
-modules): packet parse/build, RRQ option negotiation, path-traversal rejection,
-and full loopback DATA/ACK transfers (multi-block, OACK, retransmit-on-loss,
-error packets). A 65 K-round-trip block-wraparound test is marked `#[ignore]` —
-run it with `cargo test -- --ignored`.
+The pure protocol logic is unit-tested (`dhcp.rs` / `tftp.rs` / `http.rs`
+`#[cfg(test)]` modules): packet parse/build, the REQUEST verdict (ACK / NAK /
+ignore), client-IP derivation, RRQ option negotiation, path-traversal
+rejection, full loopback DATA/ACK transfers (multi-block, OACK,
+retransmit-on-loss, error packets, a junk-sending peer, a duplicate RRQ), and
+loopback HTTP (Content-Length bounding, HTTP/1.0 close, head timeout). A 65
+K-round-trip block-wraparound test is marked `#[ignore]` — run it with `cargo
+test -- --ignored`.
+
+Startup order is fixed: validate → bind and pin every listener → drop root
+(Linux) → serve. Each server exposes `bind_server(port, interface)` (sync,
+called from `main` before anything runs concurrently) and `serve(socket, …)`.
 
 Key differences from the Python servers:
 
 - **In-process MAC handoff.** The DHCP task publishes the client's hardware
   address to the TFTP task via `tokio::sync::watch` — no on-disk `client-mac`
   file.
+- **Every listener is pinned to the netboot interface** (`src/pin.rs`:
+  `IP_BOUND_IF` on macOS, `SO_BINDTODEVICE` on Linux) before it is bound, and
+  a pin that fails is fatal — so is a DHCP or TFTP bind failure. `--interface`
+  is required. The HTTP bind alone is non-fatal: a port clash logs a warning
+  and netbootd runs DHCP + TFTP without HTTP Boot. The UDP listeners carry no
+  `SO_REUSEADDR` (UDP has no TIME_WAIT, and on Linux it would let a duplicate
+  daemon silently share the port); the TCP listener keeps it for TIME_WAIT.
+- **Root is dropped on Linux** (`src/privdrop.rs`) right after the listeners
+  are bound: `setgroups(empty)` → `setgid` → `setuid` to `SUDO_UID`/`SUDO_GID`,
+  any failure fatal, then verified irreversible (`setuid(0)` must fail). The
+  decision is the pure, unit-tested `drop_target`; the syscalls need a root
+  process and are not unit-tested. The later `sudo ip neigh` / `sudo ip addr`
+  shell-outs run as the dropped user, hence passwordless sudo on Linux. macOS
+  is untouched (never privileged). All shell-outs made while serving go through
+  `tokio::process` — none block a runtime worker.
+- **One lease, derived from the host IP** (`dhcp::derive_client_ip`: host's
+  /24, last octet 100, or 101 when the host is .100; `--client-ip` overrides,
+  `validate_client_ip` refuses anything outside the /24). A REQUEST for another
+  address is NAKed (`request_verdict`), one addressed to another server
+  (option 54) ignored, and non-Ethernet / `hlen != 6` clients dropped.
+- **Hardened against the far end of the link.** TFTP streams blocks from the
+  file (`seek` + bounded read; nothing read whole), gives each retransmit
+  attempt a fixed `Instant` deadline (junk cannot re-arm it), replaces an
+  in-flight transfer on a repeated RRQ from the same TID (`abort` the old
+  task), and caps `blksize` at 1468 when replies go out as raw frames
+  (`cap_blksize`); `frame::build_udp_frame` refuses a payload the 16-bit
+  length fields cannot describe. HTTP: 10 s head/body-drain timeout, 64
+  concurrent connections (`Semaphore`), HTTP/1.0 defaults to close, and a body
+  is exactly the announced `Content-Length` (grown file → cut, shrunk file →
+  connection dropped). Peer-supplied names are passed through
+  `served::loggable` (printable ASCII, capped) before they reach the log.
+  SIGTERM shuts down cleanly like Ctrl-C.
 - **Privilege-separated `/dev/bpf` on macOS.** The macOS raw-frame send path
   (the Sequoia workaround) needs a BPF descriptor, which only root can open.
   Rather than run the daemon as root, a tiny **setuid-root** helper —
@@ -774,8 +813,17 @@ Key differences from the Python servers:
 - **Layout.** `src/lib.rs` exposes `frame` (frame builder, unit-tested),
   `handoff` (BPF open + fd passing + the helper's caller/interface policy,
   unit-tested) and, on macOS, `route` (the default-route lookup) so both the
-  `netbootd` and `netbootd-bpf-helper` binaries share them. On Linux netbootd
-  uses the kernel send path (no BPF), matching the Python behavior.
+  `netbootd` and `netbootd-bpf-helper` binaries share them. The daemon-only
+  modules are `dhcp`, `tftp`, `http`, `served` (shared path resolution + log
+  sanitizer), `pin` (interface pinning), `privdrop` (the Linux root drop),
+  `netcfg` (ARP pin + IP monitor shell-outs) and `bpf`. On Linux netbootd uses
+  the kernel send path (no BPF), matching the Python behavior.
+- **`paniolo netboot start` checks liveness.** After spawning, the CLI watches
+  the child for ~2 s (`try_wait` + the named-process probe) and only then
+  writes the state file; an early exit fails `start` with the last 20 log
+  lines instead. It also refuses to start a second target on an interface
+  another target's live netbootd already serves (`state::running_netboots`,
+  one netboot per interface).
 
 ## hidrig (USB HID injector)
 
@@ -1181,8 +1229,11 @@ Per-subsystem behavior:
   - *macOS:* 14+ allows DHCP (port 67) and TFTP (port 69) rootless; `sudo` is
     used only for interface config (`ifconfig`).
   - *Linux:* both ports require root, so `paniolo netboot start` auto-prepends
-    `sudo` when spawning `netbootd`, and `ip addr add` uses sudo too. With
-    passwordless sudoers this is transparent; otherwise sudo prompts.
+    `sudo` when spawning `netbootd`, and `ip addr add` uses sudo too. netbootd
+    drops back to the invoking user (`SUDO_UID`/`SUDO_GID`) as soon as its
+    listeners are bound, so its own later `sudo ip neigh` / `sudo ip addr`
+    calls run unprivileged too. With passwordless sudoers this is transparent;
+    otherwise sudo prompts (and, inside the daemon, fails).
   - *Windows:* neither port is privileged — Windows has no low-port
     restriction — so `netbootd` is spawned directly with no `sudo` prefix.
 - **Interface management** (`cli/src/netif.rs`, `netif::configure_interface()` /
