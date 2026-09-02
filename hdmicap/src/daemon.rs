@@ -130,7 +130,7 @@ pub fn run(device: DeviceSpec, port: u16) -> Result<()> {
         info!("hdmicap daemon listening on http://{bound}");
 
         let app = server::router(
-            AppState { frames },
+            AppState::new(frames),
             crate::auth::Auth::new(token, server::PUBLIC_ASSETS),
         );
 
@@ -138,13 +138,23 @@ pub fn run(device: DeviceSpec, port: u16) -> Result<()> {
         //    infinite response, so a plain graceful shutdown would block on it
         //    forever. Remove the discovery file, give short in-flight requests a
         //    brief grace period, then hard-exit (the OS releases the device).
+        //
+        //    The lock file itself is deliberately NOT unlinked here: `lock_file`
+        //    (above) holds an OS advisory lock (flock) on it, and this process
+        //    exits before ever reaching `drop(lock_file)`. Unlinking the path
+        //    while the lock is still held replaces the directory entry with a
+        //    fresh inode the moment the next daemon starts — that daemon's
+        //    `try_lock_exclusive` succeeds against the NEW inode even while this
+        //    process (and its lock on the OLD, now-unlinked inode) is still
+        //    alive, so two daemons could hold the device at once. Leaving the
+        //    file in place means the next daemon's `File::create` reopens the
+        //    SAME inode, and its lock attempt correctly waits on this process's
+        //    exit (which releases the OS-level lock).
         let disc = discovery_path()?;
-        let lock = lock_path()?;
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
                 shutdown_signal().await;
                 let _ = fs::remove_file(&disc);
-                let _ = fs::remove_file(&lock);
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 info!("daemon shut down");
                 std::process::exit(0);
