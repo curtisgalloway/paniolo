@@ -19,15 +19,17 @@
 //!
 //! `/stream` is a bidirectional WebSocket: the daemon sends serial output (binary
 //! frames) and accepts client keystrokes (binary or text) to write back to the
-//! port. The hdmicap preview page connects here cross-port, so responses carry a
-//! permissive CORS header.
+//! port. The hdmicap preview page connects here cross-port; the auth layer
+//! (`auth.rs`) admits only loopback origins that present the daemon's token and
+//! echoes that one origin in the CORS header — never `*`.
 
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Query, State,
+        DefaultBodyLimit, Query, State,
     },
-    http::{header, StatusCode},
+    http::StatusCode,
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -63,6 +65,20 @@ pub struct ButtonParam {
 /// power-button event, >=3 s a hard PMIC cut), so a minute is generous.
 const MAX_BUTTON_MS: u64 = 60_000;
 
+/// Ceiling on a `POST /input` body. A line of console input is bytes to a few
+/// KiB; anything larger is a mistake or a flood, and with pacing every byte
+/// costs wall-clock time on the port.
+const MAX_INPUT_BYTES: usize = 64 * 1024;
+
+/// Ceiling on one `/stream` WebSocket message (client keystrokes), for the
+/// same reason.
+const MAX_WS_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// Ceiling on per-byte pacing. 8 ms/byte is the known-good value for a polled
+/// 115200-baud console; at ten seconds per byte a full body would already hold
+/// the port for a week, so nothing real lies beyond it.
+const MAX_PACE_MS: u64 = 10_000;
+
 #[derive(Deserialize)]
 pub struct InputParam {
     interface: Option<String>,
@@ -72,18 +88,32 @@ pub struct InputParam {
     pace_ms: u64,
 }
 
-pub fn router(state: AppState) -> Router {
+/// The API router. Every route sits behind the auth layer: loopback Host and
+/// Origin, and the daemon token (see `auth.rs`).
+pub fn router(state: AppState, auth: crate::auth::Auth) -> Router {
     Router::new()
         .route("/stream", get(stream))
         .route("/status", get(status))
         .route("/interfaces", get(interfaces))
         .route("/devices", get(devices))
         .route("/button", post(button))
-        .route("/input", post(input))
+        .route(
+            "/input",
+            post(input).layer(DefaultBodyLimit::max(MAX_INPUT_BYTES)),
+        )
+        .layer(middleware::from_fn_with_state(auth, crate::auth::require))
         .with_state(state)
 }
 
-const CORS: (header::HeaderName, &str) = (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*");
+/// The per-byte pacing for `pace_ms`, or the refusal for one past the ceiling.
+fn pace_of(pace_ms: u64) -> Result<std::time::Duration, String> {
+    if pace_ms > MAX_PACE_MS {
+        return Err(format!(
+            "pace_ms={pace_ms} exceeds the {MAX_PACE_MS} ms ceiling\n"
+        ));
+    }
+    Ok(std::time::Duration::from_millis(pace_ms))
+}
 
 /// Resolve the requested interface, or the default (first) when none is named.
 fn resolve<'a>(serials: &'a Serials, name: &Option<String>) -> Option<&'a SerialHandle> {
@@ -108,17 +138,12 @@ fn status_json(ns: &NamedSerial) -> serde_json::Value {
 async fn status(State(s): State<AppState>, Query(q): Query<IfaceParam>) -> Response {
     match &q.interface {
         Some(name) => match s.serials.all().iter().find(|ns| &ns.name == name) {
-            Some(ns) => ([CORS], Json(status_json(ns))).into_response(),
-            None => (
-                StatusCode::NOT_FOUND,
-                [CORS],
-                format!("no interface '{name}'"),
-            )
-                .into_response(),
+            Some(ns) => (Json(status_json(ns))).into_response(),
+            None => (StatusCode::NOT_FOUND, format!("no interface '{name}'")).into_response(),
         },
         None => {
             let all: Vec<_> = s.serials.all().iter().map(status_json).collect();
-            ([CORS], Json(all)).into_response()
+            (Json(all)).into_response()
         }
     }
 }
@@ -126,19 +151,16 @@ async fn status(State(s): State<AppState>, Query(q): Query<IfaceParam>) -> Respo
 /// All interfaces this daemon owns (name, device, baud, connected).
 async fn interfaces(State(s): State<AppState>) -> Response {
     let all: Vec<_> = s.serials.all().iter().map(status_json).collect();
-    ([CORS], Json(all)).into_response()
+    (Json(all)).into_response()
 }
 
 async fn devices() -> Response {
     match crate::serial_io::list_ports() {
-        Ok(list) => (
-            [CORS],
-            Json(
-                list.into_iter()
-                    .map(|(path, desc)| serde_json::json!({"path": path, "misc": desc}))
-                    .collect::<Vec<_>>(),
-            ),
-        )
+        Ok(list) => (Json(
+            list.into_iter()
+                .map(|(path, desc)| serde_json::json!({"path": path, "misc": desc}))
+                .collect::<Vec<_>>(),
+        ),)
             .into_response(),
         Err(e) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -161,18 +183,12 @@ async fn button(State(s): State<AppState>, Query(q): Query<ButtonParam>) -> Resp
         Some(h) => h.clone(),
         None => {
             let what = q.interface.as_deref().unwrap_or("(default)");
-            return (
-                StatusCode::NOT_FOUND,
-                [CORS],
-                format!("no interface '{what}'"),
-            )
-                .into_response();
+            return (StatusCode::NOT_FOUND, format!("no interface '{what}'")).into_response();
         }
     };
     if q.ms > MAX_BUTTON_MS {
         return (
             StatusCode::BAD_REQUEST,
-            [CORS],
             format!(
                 "ms={} exceeds the {MAX_BUTTON_MS} ms ceiling — the port is out of the \
                  read/write loop for the whole press\n",
@@ -182,8 +198,8 @@ async fn button(State(s): State<AppState>, Query(q): Query<ButtonParam>) -> Resp
             .into_response();
     }
     match handle.dtr_press(q.ms).await {
-        Ok(()) => ([CORS], format!("button pressed for {} ms\n", q.ms)).into_response(),
-        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, [CORS], format!("{e:#}\n")).into_response(),
+        Ok(()) => (format!("button pressed for {} ms\n", q.ms)).into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}\n")).into_response(),
     }
 }
 
@@ -195,26 +211,26 @@ async fn button(State(s): State<AppState>, Query(q): Query<ButtonParam>) -> Resp
 /// With `pace_ms > 0` the bytes are dripped one at a time that many ms apart —
 /// the substitute for hardware flow control on a slow polled console. The call
 /// blocks until the whole body has been written, so a paced send of N bytes
-/// takes about `N * pace_ms` ms. Returns 200 on success, 404 for an unknown
-/// interface, 503 if the supervisor is not running.
+/// takes about `N * pace_ms` ms. The body is capped at [`MAX_INPUT_BYTES`] and
+/// the pacing at [`MAX_PACE_MS`]. Returns 200 on success, 400 for a pace past
+/// the ceiling, 404 for an unknown interface, 413 for an oversized body, 503
+/// if the supervisor is not running.
 async fn input(State(s): State<AppState>, Query(q): Query<InputParam>, body: Bytes) -> Response {
     let handle = match resolve(&s.serials, &q.interface) {
         Some(h) => h.clone(),
         None => {
             let what = q.interface.as_deref().unwrap_or("(default)");
-            return (
-                StatusCode::NOT_FOUND,
-                [CORS],
-                format!("no interface '{what}'"),
-            )
-                .into_response();
+            return (StatusCode::NOT_FOUND, format!("no interface '{what}'")).into_response();
         }
     };
     let n = body.len();
-    let pace = std::time::Duration::from_millis(q.pace_ms);
+    let pace = match pace_of(q.pace_ms) {
+        Ok(p) => p,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
     match handle.write_paced(body, pace).await {
-        Ok(()) => ([CORS], format!("wrote {n} bytes\n")).into_response(),
-        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, [CORS], format!("{e:#}\n")).into_response(),
+        Ok(()) => (format!("wrote {n} bytes\n")).into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}\n")).into_response(),
     }
 }
 
@@ -227,15 +243,11 @@ async fn stream(
         Some(h) => h.clone(),
         None => {
             let what = q.interface.as_deref().unwrap_or("(default)");
-            return (
-                StatusCode::NOT_FOUND,
-                [CORS],
-                format!("no interface '{what}'"),
-            )
-                .into_response();
+            return (StatusCode::NOT_FOUND, format!("no interface '{what}'")).into_response();
         }
     };
-    ws.on_upgrade(move |socket| handle_ws(socket, handle))
+    ws.max_message_size(MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_ws(socket, handle))
 }
 
 async fn handle_ws(socket: WebSocket, serial: SerialHandle) {
@@ -285,5 +297,23 @@ async fn handle_ws(socket: WebSocket, serial: SerialHandle) {
     tokio::select! {
         _ = &mut send_task => recv_task.abort(),
         _ = &mut recv_task => send_task.abort(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pacing multiplies the time a body holds the port; the ceiling keeps one
+    /// request from parking the interface for days.
+    #[test]
+    fn pace_has_a_ceiling() {
+        assert_eq!(pace_of(0).unwrap(), std::time::Duration::ZERO);
+        assert_eq!(
+            pace_of(MAX_PACE_MS).unwrap(),
+            std::time::Duration::from_millis(MAX_PACE_MS)
+        );
+        assert!(pace_of(MAX_PACE_MS + 1).is_err());
+        assert!(pace_of(u64::MAX).is_err());
     }
 }

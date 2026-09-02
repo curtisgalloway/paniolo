@@ -22,6 +22,7 @@
 //!   stop     ask the running daemon to exit
 //!   preview  print the URL to open in a browser
 
+mod auth;
 mod capture;
 mod capture_thread;
 mod daemon;
@@ -122,9 +123,38 @@ fn main() -> Result<()> {
     }
 }
 
-fn base_url() -> Result<String> {
-    let d = daemon::discover()?;
-    Ok(format!("http://127.0.0.1:{}", d.port))
+/// The running daemon as a client sees it: its base URL and the bearer token
+/// its API requires (absent for a daemon older than the token).
+struct Client {
+    base: String,
+    token: Option<String>,
+}
+
+impl Client {
+    fn discover() -> Result<Client> {
+        let d = daemon::discover()?;
+        Ok(Client {
+            base: format!("http://127.0.0.1:{}", d.port),
+            token: d.token,
+        })
+    }
+
+    /// A GET of `path` (which may carry a query) with the token attached.
+    fn get(&self, path: &str) -> ureq::Request {
+        let req = ureq::get(&format!("{}{path}", self.base));
+        match &self.token {
+            Some(t) => req.set("Authorization", &format!("Bearer {t}")),
+            None => req,
+        }
+    }
+
+    /// `path` as a URL a browser can open: the token rides as `?token=`.
+    fn browser_url(&self, path: &str) -> String {
+        match &self.token {
+            Some(t) => format!("{}{path}?token={t}", self.base),
+            None => format!("{}{path}", self.base),
+        }
+    }
 }
 
 fn cmd_devices(json: bool, all: bool) -> Result<()> {
@@ -153,16 +183,17 @@ fn cmd_devices(json: bool, all: bool) -> Result<()> {
 }
 
 fn cmd_shot(stable: bool, changed_since: Option<String>, timeout: u64, out: &str) -> Result<()> {
-    let url = base_url().context("is the daemon running? try `hdmicap daemon`")?;
-    let mut snap_url = format!("{url}/snapshot?timeout={timeout}");
+    let client = Client::discover().context("is the daemon running? try `hdmicap daemon`")?;
+    let mut snap_path = format!("/snapshot?timeout={timeout}");
     if stable {
-        snap_url.push_str("&wait=stable");
+        snap_path.push_str("&wait=stable");
     }
     if let Some(ref hash) = changed_since {
-        snap_url.push_str(&format!("&changed_since={hash}"));
+        snap_path.push_str(&format!("&changed_since={hash}"));
     }
 
-    let resp = ureq::get(&snap_url)
+    let resp = client
+        .get(&snap_path)
         .call()
         .context("GET /snapshot failed")?;
 
@@ -189,10 +220,11 @@ fn cmd_shot(stable: bool, changed_since: Option<String>, timeout: u64, out: &str
 }
 
 fn cmd_watch(timeout: u64) -> Result<()> {
-    let url = base_url().context("is the daemon running? try `hdmicap daemon`")?;
+    let client = Client::discover().context("is the daemon running? try `hdmicap daemon`")?;
 
     // Read the current hash so we can long-poll for a change.
-    let body = ureq::get(&format!("{url}/status"))
+    let body = client
+        .get("/status")
         .call()
         .context("GET /status failed")?
         .into_string()
@@ -204,11 +236,10 @@ fn cmd_watch(timeout: u64) -> Result<()> {
         .to_string();
 
     // Block until the frame changes or we time out.
-    let resp = ureq::get(&format!(
-        "{url}/snapshot?changed_since={hash}&timeout={timeout}"
-    ))
-    .call()
-    .context("GET /snapshot (changed_since) failed")?;
+    let resp = client
+        .get(&format!("/snapshot?changed_since={hash}&timeout={timeout}"))
+        .call()
+        .context("GET /snapshot (changed_since) failed")?;
 
     let new_hash = resp.header("x-frame-hash").unwrap_or("").to_string();
     let timed_out = resp.header("x-timeout") == Some("1");
@@ -220,8 +251,11 @@ fn cmd_watch(timeout: u64) -> Result<()> {
 }
 
 fn cmd_preview() -> Result<()> {
-    let url = base_url().context("is the daemon running? try `hdmicap daemon`")?;
-    println!("Open {url}/preview in a browser to watch the screen.");
+    let client = Client::discover().context("is the daemon running? try `hdmicap daemon`")?;
+    println!(
+        "Open {} in a browser to watch the screen.",
+        client.browser_url("/preview")
+    );
     Ok(())
 }
 
