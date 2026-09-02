@@ -76,9 +76,14 @@ follow-up. Run through this checklist before calling `gh pr create`:
    - `docs/dev/requirements.md` — the requirements tracker status (if scope/progress changed)
    - `README.md` — capabilities table, installation steps
    - `AGENTS.md` — module layout, command descriptions, architecture notes
-   - `evals/scenarios/*.toml` — the agent-eval scenarios assert CLI behavior;
-     `python3.12 evals/run.py --check` (Python ≥ 3.11) flags expectations the
-     surface change broke
+   - `evals/scenarios/*.toml` — the agent-eval scenarios assert CLI behavior.
+     `python3.12 evals/run.py --check` (Python ≥ 3.11) verifies only that every
+     *single-line* `reference` entry names a real subcommand path with flags
+     that subcommand accepts, and that the T1-safe allowlist
+     (`evals/graders/t1_config.SAFE`) names real groups/subcommands. It does
+     **not** check positional arguments, flag values, multi-line (prose)
+     references, or a scenario's `goal`/grader expectations — read the
+     scenarios that mention the changed command yourself.
    Include doc updates in the same PR, not a follow-up.
 
    Also check the diff for private infrastructure — real hostnames, private

@@ -96,9 +96,18 @@ def make_sandbox(scenario: dict, real: str) -> dict:
     if seed:
         shutil.copy(HERE / "fixtures" / seed, lab)
     else:
-        subprocess.run([real, "init", "--lab", str(lab)], capture_output=True)
+        proc = subprocess.run([real, "init", "--lab", str(lab)],
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            shutil.rmtree(sb, ignore_errors=True)
+            raise RuntimeError(
+                f"paniolo init failed (rc={proc.returncode}): "
+                f"{(proc.stderr or proc.stdout).strip()}")
 
     return {"dir": sb, "lab": lab, "argv_log": argv_log}
+
+
+CREDENTIALS_REL = Path(".claude") / ".credentials.json"
 
 
 def base_env(sb: dict, isolation: str) -> dict:
@@ -106,15 +115,43 @@ def base_env(sb: dict, isolation: str) -> dict:
     env["PATH"] = f"{sb['dir'] / 'bin'}:{env.get('PATH', '')}"
     env["PANIOLO_LAB"] = str(sb["lab"])
     env["PANIOLO_ARGV_LOG"] = str(sb["argv_log"])
+    # Scope paniolo's runtime dir (daemon pids/sockets) to the sandbox in every
+    # mode, so the agent's daemons — and the post-run `daemons stop --all`
+    # sweep — never see the operator's real /tmp/paniolo-<uid>.
+    runtime = sb["dir"] / "runtime"
+    runtime.mkdir(parents=True, exist_ok=True)
+    env["PANIOLO_RUNTIME_BASE"] = str(runtime)
     if isolation == "home":
         home = sb["dir"] / "home"
         env["HOME"] = str(home)
-        # carry credentials so the agent can still authenticate
-        cred = Path.home() / ".claude" / ".credentials.json"
+        # Carry credentials so the agent can still authenticate — as a symlink,
+        # not a copy: a token refresh by the agent then lands in the real file,
+        # and no credential copy is left behind in a kept sandbox. Removed by
+        # `remove_credential_link` when the run ends.
+        cred = Path.home() / CREDENTIALS_REL
         if cred.exists():
-            (home / ".claude").mkdir(parents=True, exist_ok=True)
-            shutil.copy(cred, home / ".claude" / ".credentials.json")
+            link = home / CREDENTIALS_REL
+            link.parent.mkdir(parents=True, exist_ok=True)
+            if link.is_symlink() or link.exists():
+                link.unlink()
+            link.symlink_to(cred)
     return env
+
+
+def remove_credential_link(sb: dict) -> None:
+    """Drop the sandbox's credential entry, whatever it has become. A symlink
+    is simply unlinked; a regular file means the agent replaced the link (e.g.
+    a write-to-temp-and-rename refresh) — remove that too, since a kept sandbox
+    must never hold a credential copy, and say that the refresh did not reach
+    the real file."""
+    path = sb["dir"] / "home" / CREDENTIALS_REL
+    if path.is_symlink():
+        path.unlink()
+    elif path.exists():
+        path.unlink()
+        print(f"warning: {path} was a file, not the credential symlink — removed; "
+              "a token refreshed during the run did not reach "
+              f"~/{CREDENTIALS_REL}", file=sys.stderr)
 
 
 def setup_condition(scenario: dict, sb: dict, condition: str) -> dict:
@@ -223,12 +260,15 @@ def command_surface(real: str, force: bool = False) -> str:
 
     `force=True` ignores any cache and re-walks the live CLI — used by `--check`
     so drift is always measured against the installed binary, never a stale dump.
+    The on-disk cache is also ignored when the paniolo binary is newer than it
+    (a rebuild since the last walk), so a judge never grades against the
+    previous build's surface.
     """
     global _SURFACE_CACHE
     if not force and _SURFACE_CACHE is not None:
         return _SURFACE_CACHE
     cache = HERE / ".paniolo_surface.txt"
-    if not force and cache.exists():
+    if not force and surface_cache_fresh(cache, real):
         _SURFACE_CACHE = cache.read_text()
         return _SURFACE_CACHE
     seen: set[tuple] = set()
@@ -263,6 +303,16 @@ def command_surface(real: str, force: bool = False) -> str:
     return _SURFACE_CACHE
 
 
+def surface_cache_fresh(cache: Path, real: str) -> bool:
+    """A cached --help dump is trustworthy only if it postdates the binary it
+    was walked from (`paniolo --version` is constant across builds, so mtime
+    is the signal)."""
+    try:
+        return cache.stat().st_mtime >= Path(real).stat().st_mtime
+    except OSError:
+        return False
+
+
 def grade(scenario: dict, sb: dict, exec_result: dict, condition: str,
           judge_cmd: str | None, surface: str | None = None) -> dict:
     gtype = scenario.get("grader", {}).get("type", "judge")
@@ -289,6 +339,15 @@ def run_one(scenario: dict, condition: str, mode: str, agent: str,
     real = real_paniolo()
     sb = make_sandbox(scenario, real)
     env = base_env(sb, isolation)
+    try:
+        return _run_one(scenario, sb, env, real, condition, mode, agent,
+                        judge_cmd, keep)
+    finally:
+        remove_credential_link(sb)
+
+
+def _run_one(scenario: dict, sb: dict, env: dict, real: str, condition: str,
+             mode: str, agent: str, judge_cmd: str | None, keep: bool) -> dict:
     cond = setup_condition(scenario, sb, condition)
     if mode == "reference":
         exec_result = run_reference(scenario, sb, env)
@@ -306,6 +365,8 @@ def run_one(scenario: dict, condition: str, mode: str, agent: str,
         exec_result = run_agent(scenario, sb, env, agent, cond["extra_args"], goal)
         # Safety sweep: a "list the commands" scenario shouldn't start daemons,
         # but an over-eager agent might. Don't leave a stray holding a port.
+        # `env` carries the sandbox PANIOLO_RUNTIME_BASE, so this only ever
+        # sees daemons the agent started — never the operator's.
         subprocess.run([real, "daemons", "stop", "--all"], env=env,
                        capture_output=True)
     if exec_result.get("timeout"):
@@ -398,7 +459,11 @@ def main() -> int:
     if args.all:
         chosen = list(scenarios.values())
     elif args.scenario:
-        chosen = [scenarios[s] for s in args.scenario if s in scenarios]
+        unknown = [s for s in args.scenario if s not in scenarios]
+        if unknown:
+            ap.error(f"unknown scenario id(s): {', '.join(unknown)} "
+                     "(see --list)")
+        chosen = [scenarios[s] for s in args.scenario]
     else:
         ap.error("pass --scenario ID, --all, or --list")
     if args.tier:
