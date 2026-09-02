@@ -26,17 +26,22 @@
 use std::fs::{self, File};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::server::{self, AppState};
 use crate::uart::HidHandle;
 
 /// Discovery subdir = the paniolo channel name, not the binary name.
 pub const DISCOVERY_NAME: &str = "hid";
+
+/// How long shutdown waits for the release of held keys and buttons before
+/// exiting anyway.
+const RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Serialize, Deserialize)]
 pub struct Discovery {
@@ -123,19 +128,25 @@ pub fn run(device: String, port: u16) -> Result<()> {
         .context("writing discovery file")?;
         info!("ch9329 hid daemon listening on http://{bound} (device {device})");
 
+        let shutdown_hid = hid.clone();
         let app = server::router(AppState { hid }, crate::auth::Auth::new(token, &[]));
 
         // The /hid WebSocket is long-lived, so plain graceful shutdown would
-        // block forever. Remove discovery + lock, brief grace, then hard-exit
-        // (the OS releases the UART).
+        // block forever. Release whatever is held, remove discovery + lock,
+        // brief grace, then hard-exit (the OS releases the UART).
         let disc_p = discovery_path()?;
         let lock_p = lock_path()?;
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
                 shutdown_signal().await;
+                // This daemon is the only thing that remembers what it
+                // pressed; leave the target with nothing held.
+                if let Err(e) = shutdown_hid.release_for_shutdown(RELEASE_TIMEOUT).await {
+                    warn!("shutdown: {e}");
+                }
                 let _ = fs::remove_file(&disc_p);
                 let _ = fs::remove_file(&lock_p);
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
                 info!("ch9329 hid daemon shut down");
                 std::process::exit(0);
             })

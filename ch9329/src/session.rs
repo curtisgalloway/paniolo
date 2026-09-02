@@ -63,6 +63,9 @@ const USB_SWITCH_TO_HOST: u8 = 0x00;
 const USB_SWITCH_TO_TARGET: u8 = 0x01;
 const USB_SWITCH_QUERY: u8 = 0x03;
 
+/// Key slots in the boot-protocol keyboard report.
+const KEY_SLOTS: usize = 6;
+
 /// Length of the CH9329 parameter-config block (`docs/ch9329-spec.md` §5).
 const PARA_CFG_LEN: usize = 50;
 /// Byte offset of the 4-byte big-endian baud field within the config block.
@@ -159,6 +162,22 @@ fn hold_for(keys: &[Key]) -> Duration {
     }
 }
 
+/// How many of the [`KEY_SLOTS`] key-report slots `chord` would need,
+/// counting keys already held (deduplicated) plus the chord's new usages
+/// (deduplicated against each other and against what is already held).
+/// Modifiers do not count — they have their own report byte.
+fn keys_needed(chord: &[Key], held: &[u8]) -> usize {
+    let mut new_keys: Vec<u8> = Vec::new();
+    for &k in chord {
+        if let Key::Usage(u) = k {
+            if !new_keys.contains(&u) && !held.contains(&u) {
+                new_keys.push(u);
+            }
+        }
+    }
+    held.len() + new_keys.len()
+}
+
 /// Refuse a rate the chip cannot store, before anything touches it.
 pub fn validate_baud(rate: u32) -> Result<()> {
     if !(BAUD_MIN..=BAUD_MAX).contains(&rate) {
@@ -192,6 +211,14 @@ fn probe_order(first: Option<u32>) -> Vec<u32> {
             .filter(|b| Some(*b) != first),
     );
     order
+}
+
+/// Whether an error message from [`Session::send`]/[`Session::read_reply`] is
+/// the specific "no reply within the timeout" case, as opposed to a NAK, a
+/// checksum mismatch, or a write failure. Only this case means "the chip does
+/// not implement this command" for [`Session::usb_cmd`]'s reply-timeout gloss.
+fn is_reply_timeout(msg: &str) -> bool {
+    msg.starts_with("timed out")
 }
 
 fn button_mask(name: &str) -> Result<u8> {
@@ -313,7 +340,14 @@ impl Session {
                 buttons: 0,
             };
             match s.get_info() {
-                Ok(_) => return Ok(s),
+                Ok(_) => {
+                    // The chip remembers its last HID report independent of
+                    // our process; start every session from a clean slate
+                    // rather than trusting that nothing was left held by
+                    // whatever last had this link open.
+                    s.push_all_clear()?;
+                    return Ok(s);
+                }
                 Err(e) => {
                     last_err = Some(e);
                     // Close the port before the settle window so the chip sees
@@ -397,6 +431,9 @@ impl Session {
         if sum != expected {
             bail!("reply checksum mismatch (got {sum:#04x}, want {expected:#04x})");
         }
+        if raddr != ADDR {
+            bail!("reply from address {raddr:#04x}, expected {ADDR:#04x}");
+        }
         if rcmd == cmd | 0xC0 {
             let status = payload.first().copied().unwrap_or(0xFF);
             bail!("CH9329 rejected cmd {cmd:#04x}: {}", status_name(status));
@@ -460,12 +497,30 @@ impl Session {
         let mut data = [0u8; USB_SWITCH_LEN];
         data[USB_SWITCH_LEN - 1] = selector;
         let p = self.send(CMD_USB_SWITCH, &data).map_err(|e| {
-            anyhow!(
-                "{e}\nA device with no switchable USB mux does not answer this \
-                 command at all — the protocol has no negative ack for an \
-                 unknown opcode — so a timeout here means unsupported rather \
-                 than broken."
-            )
+            let msg = e.to_string();
+            if is_reply_timeout(&msg) {
+                // A device with no switchable USB mux does not answer this
+                // command at all — the protocol has no negative ack for an
+                // unknown opcode — so a timeout here means unsupported rather
+                // than broken. Reworded (rather than just appending a note to
+                // the timeout message) so this expected, benign case does not
+                // read as transport loss to the daemon's reopen logic
+                // (`is_transport_error` in uart.rs), which would otherwise
+                // force a full reopen — and on a KVM-Go, a reopen briefly
+                // toggles DTR/RTS, which is an MCU reset — every time a
+                // mux-less device is asked for its (nonexistent) mux state.
+                anyhow!(
+                    "this device does not support USB mux switching (no \
+                     reply): the protocol has no negative ack for an unknown \
+                     opcode, so a timeout here means unsupported rather than \
+                     broken"
+                )
+            } else {
+                // A genuine NAK (bad parameter, checksum mismatch, wrong
+                // reply address, …) is a real transport/protocol problem —
+                // propagate it as-is, with no "unsupported" gloss.
+                e
+            }
         })?;
         match (p.len(), p.first().copied().and_then(MuxSide::from_status)) {
             (1, Some(side)) => Ok(side),
@@ -548,33 +603,67 @@ impl Session {
     fn push_keyboard(&mut self) -> Result<()> {
         let mut data = vec![self.mods, 0x00];
         let mut slots = self.keys.clone();
-        slots.resize(6, 0x00);
-        data.extend_from_slice(&slots[..6]);
+        slots.resize(KEY_SLOTS, 0x00);
+        data.extend_from_slice(&slots[..KEY_SLOTS]);
         self.send(CMD_KB_GENERAL, &data)?;
         Ok(())
     }
 
-    /// Tap a key: add it to the held set, push, hold briefly, then restore the
-    /// previously-held report. A modifier taps as a held bit (e.g. the GUI key).
-    pub fn tap(&mut self, key: Key) -> Result<()> {
-        self.apply_down(key);
+    /// Push an all-zero keyboard report and a zero-button relative mouse
+    /// report. Called once a fresh open's `GET_INFO` confirms the chip is
+    /// there: the chip remembers its last HID report independent of *our*
+    /// process — a daemon that crashed mid-tap and restarted would otherwise
+    /// leave the target with a key or button the new session's local state
+    /// (starting at all-zero in memory) has no idea is actually held.
+    fn push_all_clear(&mut self) -> Result<()> {
         self.push_keyboard()?;
-        sleep(hold_for(&[key]));
-        self.apply_up(key);
-        self.push_keyboard()
+        self.push_mouse_rel(self.buttons, 0, 0, 0)
     }
 
-    /// Chord: press every key together, hold, then release back to held state.
+    /// Tap a key: add it to the held set, push, hold briefly, then restore the
+    /// previously-held report. A modifier taps as a held bit (e.g. the GUI key).
+    ///
+    /// On any error after the press report was written, this makes a
+    /// best-effort attempt to restore the previously-held state before
+    /// returning — so a transport hiccup mid-tap does not leave `key` stuck
+    /// down on the target.
+    pub fn tap(&mut self, key: Key) -> Result<()> {
+        self.apply_down(key);
+        let pressed = self.push_keyboard();
+        if pressed.is_ok() {
+            sleep(hold_for(&[key]));
+        }
+        self.apply_up(key);
+        let released = self.push_keyboard();
+        self.finish_hold(pressed, released)
+    }
+
+    /// Chord: press every key together, hold, then release back to held
+    /// state. A report has [`KEY_SLOTS`] key slots; a chord needing more —
+    /// counting keys already held with `down` — is refused rather than
+    /// silently truncated. Modifiers have their own byte and never take a
+    /// slot. Errors after the press are handled like [`Session::tap`].
     pub fn combo(&mut self, chord: &[Key]) -> Result<()> {
+        let needed = keys_needed(chord, &self.keys);
+        if needed > KEY_SLOTS {
+            return Err(anyhow!(
+                "combo needs {needed} key slots but a report has {KEY_SLOTS} \
+                 ({} already held); modifiers do not count",
+                self.keys.len()
+            ));
+        }
         for &k in chord {
             self.apply_down(k);
         }
-        self.push_keyboard()?;
-        sleep(hold_for(chord));
+        let pressed = self.push_keyboard();
+        if pressed.is_ok() {
+            sleep(hold_for(chord));
+        }
         for &k in chord {
             self.apply_up(k);
         }
-        self.push_keyboard()
+        let released = self.push_keyboard();
+        self.finish_hold(pressed, released)
     }
 
     pub fn key_down(&mut self, key: Key) -> Result<()> {
@@ -593,11 +682,20 @@ impl Session {
         self.push_keyboard()
     }
 
+    /// Everything released: held keys, modifiers, and mouse buttons. Used at
+    /// daemon shutdown so the target is not left with something held after
+    /// the process that was holding it exits. Never touches the USB mux.
+    pub fn release_everything(&mut self) -> Result<()> {
+        self.release_all()?;
+        self.buttons = 0;
+        self.push_mouse_rel(0, 0, 0, 0)
+    }
+
     fn apply_down(&mut self, key: Key) {
         match key {
             Key::Modifier(bit) => self.mods |= bit,
             Key::Usage(u) => {
-                if !self.keys.contains(&u) && self.keys.len() < 6 {
+                if !self.keys.contains(&u) && self.keys.len() < KEY_SLOTS {
                     self.keys.push(u);
                 }
             }
@@ -611,14 +709,45 @@ impl Session {
         }
     }
 
-    /// Type literal text (US layout) on top of any held modifiers. Text longer
-    /// than [`MAX_TYPE_CHARS`] is refused rather than truncated.
+    /// Reconcile a press/release pair's results, used by [`Session::tap`] and
+    /// [`Session::combo`]: on full success, `Ok(())`. If the press was never
+    /// confirmed its error stands — the tap did not happen, whatever the
+    /// release write did. If the press landed but the release failed, make
+    /// one best-effort retry of the release before surfacing its error, so a
+    /// single lost reply does not leave the key or chord stuck down.
+    fn finish_hold(&mut self, pressed: Result<()>, released: Result<()>) -> Result<()> {
+        match (pressed, released) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(e), _) => Err(e),
+            (Ok(()), Err(e)) => {
+                let _ = self.push_keyboard();
+                Err(e)
+            }
+        }
+    }
+
+    /// Type literal text (US layout) on top of any held modifiers. Text
+    /// longer than [`MAX_TYPE_CHARS`] is refused rather than truncated.
+    ///
+    /// A character whose usage is already held (via `down`) is released
+    /// first: pressing it "again" would compose the exact report already in
+    /// effect and the target's HID stack would see no new edge, so the
+    /// keystroke would silently not register. On any error after a report has
+    /// been written, this makes a best-effort attempt to restore the
+    /// previously-held state before returning, like [`Session::tap`].
     pub fn type_text(&mut self, text: &str) -> Result<()> {
         check_type_len(text)?;
         let mut prev: u8 = 0;
         for c in text.chars() {
             let (usage, shift) = crate::keys::char_to_usage(c)?;
-            if usage == prev {
+            let already_held = self.keys.contains(&usage);
+            if already_held {
+                self.keys.retain(|&k| k != usage);
+                let cleared = self.push_keyboard();
+                self.keys.push(usage); // restore bookkeeping either way
+                cleared?;
+                sleep(TYPE_GAP);
+            } else if usage == prev {
                 // Same key twice needs the release between presses to register.
                 sleep(TYPE_GAP);
             }
@@ -629,14 +758,25 @@ impl Session {
                     0
                 };
             let mut data = vec![mods, 0x00, usage, 0, 0, 0, 0, 0];
-            // Keep any already-held keys alongside the typed one.
-            for (i, &k) in self.keys.iter().take(5).enumerate() {
+            // Keep any other already-held keys alongside the typed one (it is
+            // placed separately above, so it is excluded here even though
+            // `self.keys` still lists it).
+            for (i, &k) in self
+                .keys
+                .iter()
+                .filter(|&&k| k != usage)
+                .take(KEY_SLOTS - 1)
+                .enumerate()
+            {
                 data[3 + i] = k;
             }
-            self.send(CMD_KB_GENERAL, &data)?;
-            sleep(TYPE_GAP);
-            self.push_keyboard()?; // release the typed key, restore held state
+            let pressed = self.send(CMD_KB_GENERAL, &data).map(|_| ());
+            if pressed.is_ok() {
+                sleep(TYPE_GAP);
+            }
+            let released = self.push_keyboard(); // restore held state
             prev = usage;
+            self.finish_hold(pressed, released)?;
         }
         Ok(())
     }
@@ -770,8 +910,196 @@ fn set_low_read_latency(fd: std::os::unix::io::RawFd) {
     unsafe { libc::ioctl(fd, IOSSDATALAT, &latency) };
 }
 
+/// Test-only fake of the CH9329 UART, shared crate-wide (`proto.rs` and
+/// `uart.rs` also build a [`Session`] on it) so tests can execute real wire
+/// behaviour — what gets written, and how a scripted reply is parsed — without
+/// hardware. `Session` only ever calls [`Read`], [`Write`] and `clear()`
+/// through the `port: Box<dyn SerialPort>` field; every other `SerialPort`
+/// method here is a fixed stub the code under test never reaches.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::io;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration as StdDuration;
+
+    /// Every buffer passed to [`FakePort::write`], shared with the test so it
+    /// can inspect the wire log after the `Session` (and its `Box<dyn
+    /// SerialPort>`) has taken ownership of the `FakePort`. `SerialPort`
+    /// requires `Send`, so this is `Arc<Mutex<_>>` rather than `Rc<RefCell<_>>`.
+    #[derive(Clone, Default)]
+    pub(crate) struct WriteLog(Arc<Mutex<Vec<Vec<u8>>>>);
+
+    impl WriteLog {
+        pub(crate) fn snapshot(&self) -> Vec<Vec<u8>> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    pub(crate) struct FakePort {
+        inbox: VecDeque<u8>,
+        log: WriteLog,
+    }
+
+    impl FakePort {
+        pub(crate) fn new(log: WriteLog) -> Self {
+            FakePort {
+                inbox: VecDeque::new(),
+                log,
+            }
+        }
+
+        /// Queue raw reply bytes, consumed FIFO by `read()`. An empty inbox
+        /// means a read times out, like a CH9329 that never answers.
+        pub(crate) fn queue_reply(&mut self, bytes: &[u8]) {
+            self.inbox.extend(bytes.iter().copied());
+        }
+    }
+
+    impl io::Read for FakePort {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.inbox.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "fake: no reply queued",
+                ));
+            }
+            let n = buf.len().min(self.inbox.len());
+            for slot in buf.iter_mut().take(n) {
+                *slot = self.inbox.pop_front().unwrap();
+            }
+            Ok(n)
+        }
+    }
+
+    impl io::Write for FakePort {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.log.0.lock().unwrap().push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SerialPort for FakePort {
+        fn name(&self) -> Option<String> {
+            None
+        }
+        fn baud_rate(&self) -> serialport::Result<u32> {
+            Ok(115_200)
+        }
+        fn data_bits(&self) -> serialport::Result<serialport::DataBits> {
+            Ok(serialport::DataBits::Eight)
+        }
+        fn flow_control(&self) -> serialport::Result<serialport::FlowControl> {
+            Ok(serialport::FlowControl::None)
+        }
+        fn parity(&self) -> serialport::Result<serialport::Parity> {
+            Ok(serialport::Parity::None)
+        }
+        fn stop_bits(&self) -> serialport::Result<serialport::StopBits> {
+            Ok(serialport::StopBits::One)
+        }
+        fn timeout(&self) -> StdDuration {
+            StdDuration::from_millis(500)
+        }
+        fn set_baud_rate(&mut self, _: u32) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn set_data_bits(&mut self, _: serialport::DataBits) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn set_flow_control(&mut self, _: serialport::FlowControl) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn set_parity(&mut self, _: serialport::Parity) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn set_stop_bits(&mut self, _: serialport::StopBits) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn set_timeout(&mut self, _: StdDuration) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn write_request_to_send(&mut self, _: bool) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn write_data_terminal_ready(&mut self, _: bool) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn read_clear_to_send(&mut self) -> serialport::Result<bool> {
+            Ok(false)
+        }
+        fn read_data_set_ready(&mut self) -> serialport::Result<bool> {
+            Ok(false)
+        }
+        fn read_ring_indicator(&mut self) -> serialport::Result<bool> {
+            Ok(false)
+        }
+        fn read_carrier_detect(&mut self) -> serialport::Result<bool> {
+            Ok(false)
+        }
+        fn bytes_to_read(&self) -> serialport::Result<u32> {
+            Ok(self.inbox.len() as u32)
+        }
+        fn bytes_to_write(&self) -> serialport::Result<u32> {
+            Ok(0)
+        }
+        fn clear(&self, _: serialport::ClearBuffer) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn try_clone(&self) -> serialport::Result<Box<dyn SerialPort>> {
+            Err(serialport::Error::new(
+                serialport::ErrorKind::Unknown,
+                "FakePort cannot clone",
+            ))
+        }
+        fn set_break(&self) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn clear_break(&self) -> serialport::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Build a `Session` directly on a `FakePort`, bypassing `open()`'s real
+    /// serial-port construction and baud probing entirely.
+    pub(crate) fn session_on(port: FakePort) -> Session {
+        Session {
+            port: Box::new(port),
+            baud: 115_200,
+            mods: 0,
+            keys: Vec::new(),
+            buttons: 0,
+        }
+    }
+
+    /// Build a well-formed `[HEAD][ADDR][cmd][len][payload][sum]` reply frame
+    /// — an ACK (`cmd | 0x80`) when `payload` is what a success reply
+    /// carries, or any other `rcmd`/payload for a scripted edge case.
+    pub(crate) fn frame_bytes(raddr: u8, rcmd: u8, payload: &[u8]) -> Vec<u8> {
+        let len = payload.len() as u8;
+        let mut sum: u32 =
+            HEAD[0] as u32 + HEAD[1] as u32 + raddr as u32 + rcmd as u32 + len as u32;
+        sum += payload.iter().map(|&b| b as u32).sum::<u32>();
+        let mut out = vec![HEAD[0], HEAD[1], raddr, rcmd, len];
+        out.extend_from_slice(payload);
+        out.push(sum as u8);
+        out
+    }
+
+    /// A success ACK for `cmd`, with `payload` as its data (empty for a plain
+    /// status-`0x00` ack).
+    pub(crate) fn ack(cmd: u8, payload: &[u8]) -> Vec<u8> {
+        frame_bytes(ADDR, cmd | 0x80, payload)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::*;
     use super::*;
 
     #[test]
@@ -909,5 +1237,162 @@ mod tests {
         assert_eq!(scale_abs(16_384), 2048); // midpoint
         assert_eq!(scale_abs(-5), 0); // clamped
         assert_eq!(scale_abs(40_000), 4095); // clamped
+    }
+
+    #[test]
+    fn keys_needed_dedupes_against_held_and_within_the_chord() {
+        let held = [0x04u8, 0x05]; // A, B already held
+        let chord = [Key::Usage(0x06), Key::Usage(0x07), Key::Usage(0x08)];
+        assert_eq!(keys_needed(&chord, &held), 5); // 2 held + 3 new
+                                                   // A key already held doesn't add a slot again.
+        let chord = [Key::Usage(0x04), Key::Usage(0x09)];
+        assert_eq!(keys_needed(&chord, &held), 3);
+        // Duplicate usages within the chord itself count once.
+        let chord = [Key::Usage(0x09), Key::Usage(0x09)];
+        assert_eq!(keys_needed(&chord, &held), 3);
+        // Modifiers never take a slot.
+        let chord = [
+            Key::Modifier(crate::keys::MOD_LEFT_CONTROL),
+            Key::Usage(0x09),
+        ];
+        assert_eq!(keys_needed(&chord, &held), 3);
+        assert_eq!(keys_needed(&[], &[]), 0);
+    }
+
+    #[test]
+    fn combo_refuses_before_writing_anything_when_it_needs_too_many_slots() {
+        let log = WriteLog::default();
+        let port = FakePort::new(log.clone());
+        let mut s = session_on(port);
+        let seven: Vec<Key> = (0x04..0x0b).map(Key::Usage).collect(); // 7 distinct usages
+        let err = s.combo(&seven).unwrap_err().to_string();
+        assert!(err.contains('6'), "{err}");
+        assert!(log.snapshot().is_empty(), "refused before any write");
+    }
+
+    #[test]
+    fn reply_timeout_classification() {
+        assert!(is_reply_timeout(
+            "timed out waiting for CH9329 reply (check device/baud, target on)"
+        ));
+        assert!(!is_reply_timeout(
+            "CH9329 rejected cmd 0x17: bad parameter (0xe5)"
+        ));
+        assert!(!is_reply_timeout(
+            "reply checksum mismatch (got 0x01, want 0x02)"
+        ));
+    }
+
+    /// A reply carrying a different address than ours is a protocol problem,
+    /// not silently accepted.
+    #[test]
+    fn reply_from_the_wrong_address_is_rejected() {
+        let log = WriteLog::default();
+        let mut port = FakePort::new(log);
+        port.queue_reply(&frame_bytes(0x01, CMD_GET_INFO | 0x80, &[0x38, 0x01, 0x00]));
+        let mut s = session_on(port);
+        let err = s.get_info().unwrap_err().to_string();
+        assert!(err.contains("0x01"), "{err}");
+        assert!(err.contains("expected"), "{err}");
+    }
+
+    /// The regression this guards: a mux-less device's silence on
+    /// `CMD_USB_SWITCH` must read as "unsupported", not as the generic
+    /// transport-loss wording that would make the daemon's reopen logic
+    /// (`is_transport_error` in uart.rs) force a reopen — on a KVM-Go, a
+    /// reopen blips DTR/RTS, which is an MCU reset.
+    #[test]
+    fn usb_query_timeout_is_reworded_as_unsupported_not_transport_loss() {
+        let log = WriteLog::default();
+        let port = FakePort::new(log); // empty inbox: every read times out
+        let mut s = session_on(port);
+        let err = s.usb_query().unwrap_err().to_string();
+        assert!(err.contains("does not support USB mux switching"), "{err}");
+        assert!(!err.starts_with("timed out"), "{err}");
+    }
+
+    /// A genuine NAK on the same command is a real protocol error and keeps
+    /// its own message — no "unsupported" gloss grafted onto it.
+    #[test]
+    fn usb_query_nak_is_not_reworded_as_unsupported() {
+        let log = WriteLog::default();
+        let mut port = FakePort::new(log);
+        port.queue_reply(&frame_bytes(ADDR, CMD_USB_SWITCH | 0xC0, &[0xE5]));
+        let mut s = session_on(port);
+        let err = s.usb_query().unwrap_err().to_string();
+        assert!(err.contains("rejected"), "{err}");
+        assert!(!err.contains("unsupported"), "{err}");
+    }
+
+    #[test]
+    fn push_all_clear_writes_a_zero_keyboard_and_zero_mouse_report() {
+        let log = WriteLog::default();
+        let mut port = FakePort::new(log.clone());
+        port.queue_reply(&ack(CMD_KB_GENERAL, &[0x00]));
+        port.queue_reply(&ack(CMD_MS_REL, &[0x00]));
+        let mut s = session_on(port);
+        s.push_all_clear().unwrap();
+        let writes = log.snapshot();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0][3], CMD_KB_GENERAL);
+        assert_eq!(&writes[0][5..13], &[0u8; 8]);
+        assert_eq!(writes[1][3], CMD_MS_REL);
+        assert_eq!(&writes[1][5..10], &[0x01, 0, 0, 0, 0]);
+    }
+
+    /// A transport hiccup between the press and the release must not leave
+    /// the key stuck: `tap` makes a best-effort second attempt at the release
+    /// before surfacing the error.
+    #[test]
+    fn tap_error_after_the_press_still_attempts_a_release() {
+        let log = WriteLog::default();
+        let mut port = FakePort::new(log.clone());
+        port.queue_reply(&ack(CMD_KB_GENERAL, &[0x00])); // only the press gets a reply
+        let mut s = session_on(port);
+        let err = s.tap(Key::Usage(0x04)).unwrap_err().to_string();
+        assert!(err.contains("timed out"), "{err}");
+        let writes = log.snapshot();
+        // press, release attempt, and the best-effort retry of the release.
+        assert_eq!(writes.len(), 3);
+        assert!(writes.iter().all(|w| w[3] == CMD_KB_GENERAL));
+        assert_eq!(&writes[1][5..13], &[0u8; 8], "release carries no key");
+        assert_eq!(&writes[2][5..13], &[0u8; 8], "retry carries no key");
+        assert!(
+            s.keys.is_empty(),
+            "local state reflects the key as released"
+        );
+    }
+
+    /// A usage already held via `down` is released before it is pressed
+    /// again: otherwise the press report would be byte-identical to the one
+    /// already in effect and the target would see no new edge.
+    #[test]
+    fn typing_an_already_held_usage_releases_before_pressing_again() {
+        let log = WriteLog::default();
+        let mut port = FakePort::new(log.clone());
+        port.queue_reply(&ack(CMD_KB_GENERAL, &[0x00])); // release
+        port.queue_reply(&ack(CMD_KB_GENERAL, &[0x00])); // press
+        port.queue_reply(&ack(CMD_KB_GENERAL, &[0x00])); // restore
+        let mut s = session_on(port);
+        s.keys.push(0x04); // A already held via `down`
+        s.type_text("a").unwrap();
+        let writes = log.snapshot();
+        assert_eq!(writes.len(), 3);
+        assert!(
+            !writes[0][5..13].contains(&0x04),
+            "release drops the usage: {:?}",
+            writes[0]
+        );
+        assert_eq!(
+            writes[1][7], 0x04,
+            "press carries the usage: {:?}",
+            writes[1]
+        );
+        assert!(
+            writes[2][5..13].contains(&0x04),
+            "restore holds the usage again: {:?}",
+            writes[2]
+        );
+        assert_eq!(s.keys, vec![0x04]);
     }
 }

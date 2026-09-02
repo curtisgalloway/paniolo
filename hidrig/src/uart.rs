@@ -40,7 +40,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
-use crate::compose::{Composer, F_CTRL};
+use crate::compose::{Composer, Frame, F_CTRL};
 use crate::proto::open_port;
 
 const REQ_CAP: usize = 256;
@@ -60,12 +60,21 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// Console-frame selector byte for `0x03` (one DUT UART today).
 const CONSOLE_PORT: u8 = 0;
 /// Console frame type tag.
-const F_CONSOLE: u8 = 0x03;
+pub(crate) const F_CONSOLE: u8 = 0x03;
 
-/// One queued command awaiting its reply.
-struct Request {
-    line: String,
-    reply: oneshot::Sender<Result<String, String>>,
+/// One item on the owner's queue.
+enum Request {
+    /// A command line, answered on `reply` with the `OK` data or the
+    /// `ERR`/transport message.
+    Line {
+        line: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    /// Shutdown: release every held key, modifier and button, so the target is
+    /// not left with one down after the daemon — the only thing that remembers
+    /// what it pressed — exits. Answered on `done` once the frames are written
+    /// or there was no open link to write them to.
+    Release { done: oneshot::Sender<()> },
 }
 
 /// An in-flight control command awaiting its `0x02` reply.
@@ -125,7 +134,7 @@ impl HidHandle {
         let (tx, rx) = oneshot::channel();
         let round_trip = async {
             self.req_tx
-                .send(Request { line, reply: tx })
+                .send(Request::Line { line, reply: tx })
                 .await
                 .map_err(|_| "hid daemon stopped".to_string())?;
             rx.await
@@ -136,6 +145,27 @@ impl HidHandle {
             Err(_) => Err(format!(
                 "hid daemon did not answer within {} s",
                 limit.as_secs()
+            )),
+        }
+    }
+
+    /// Shutdown hook: release every held key, modifier and button. Bounded by
+    /// `limit`; the error is informational — the daemon exits either way.
+    pub async fn release_for_shutdown(&self, limit: Duration) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        let round_trip = async {
+            self.req_tx
+                .send(Request::Release { done: tx })
+                .await
+                .map_err(|_| "hid control link owner is gone".to_string())?;
+            rx.await
+                .map_err(|_| "hid control link owner dropped the release".to_string())
+        };
+        match tokio::time::timeout(limit, round_trip).await {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "hid control link did not release keys within {} ms",
+                limit.as_millis()
             )),
         }
     }
@@ -203,9 +233,15 @@ fn run(
         if pending.is_none() {
             loop {
                 match req_rx.try_recv() {
-                    Ok(req) => {
-                        match service_request(&mut composer, &mut p, req, &transcript, &mut pending)
-                        {
+                    Ok(Request::Line { line, reply }) => {
+                        match service_request(
+                            &mut composer,
+                            &mut p,
+                            line,
+                            reply,
+                            &transcript,
+                            &mut pending,
+                        ) {
                             ServiceOutcome::Continue => continue,
                             ServiceOutcome::AwaitReply => break,
                             ServiceOutcome::Transport(msg) => {
@@ -213,6 +249,16 @@ fn run(
                                 lost = true;
                                 break;
                             }
+                        }
+                    }
+                    Ok(Request::Release { done }) => {
+                        let frames = composer.release_everything();
+                        let result = write_frames(&mut p, &frames);
+                        let _ = done.send(());
+                        if let Err(msg) = result {
+                            warn!("hid control link write error (release), will reopen: {msg}");
+                            lost = true;
+                            break;
                         }
                     }
                     Err(TryRecvError::Empty) => break,
@@ -279,47 +325,51 @@ fn run(
     }
 }
 
-/// Compose `req.line`, write its frames, and either reply immediately
+/// Compose `line`, write its frames, and either reply immediately
 /// (fire-and-forget HID) or arm `pending` for its control reply.
 fn service_request(
     composer: &mut Composer,
     port: &mut Box<dyn serialport::SerialPort>,
-    req: Request,
+    line: String,
+    reply: oneshot::Sender<Result<String, String>>,
     transcript: &broadcast::Sender<Event>,
     pending: &mut Option<Pending>,
 ) -> ServiceOutcome {
-    let frames = match composer.dispatch(&req.line) {
+    let frames = match composer.dispatch(&line) {
         Ok(f) => f,
         Err(e) => {
             // A composition error (unknown command) is not a transport failure.
-            finish(transcript, &req.line, Err(e.to_string()), req.reply);
+            finish(transcript, &line, Err(e.to_string()), reply);
             return ServiceOutcome::Continue;
         }
     };
     let wants_reply = frames.iter().any(|f| f.first() == Some(&F_CTRL));
-    for f in &frames {
-        if let Err(e) = port.write_all(f) {
-            let msg = format!("write error: {e}");
-            finish(transcript, &req.line, Err(msg.clone()), req.reply);
-            return ServiceOutcome::Transport(msg);
-        }
-    }
-    if let Err(e) = port.flush() {
-        let msg = format!("write error: {e}");
-        finish(transcript, &req.line, Err(msg.clone()), req.reply);
+    if let Err(msg) = write_frames(port, &frames) {
+        finish(transcript, &line, Err(msg.clone()), reply);
         return ServiceOutcome::Transport(msg);
     }
     if wants_reply {
         *pending = Some(Pending {
-            line: req.line,
-            reply: req.reply,
+            line,
+            reply,
             deadline: Instant::now() + REPLY_TIMEOUT,
         });
         ServiceOutcome::AwaitReply
     } else {
-        finish(transcript, &req.line, Ok(String::new()), req.reply);
+        finish(transcript, &line, Ok(String::new()), reply);
         ServiceOutcome::Continue
     }
+}
+
+/// Write composed frames to the port and flush.
+fn write_frames(
+    port: &mut Box<dyn serialport::SerialPort>,
+    frames: &[Frame],
+) -> Result<(), String> {
+    for f in frames {
+        port.write_all(f).map_err(|e| format!("write error: {e}"))?;
+    }
+    port.flush().map_err(|e| format!("write error: {e}"))
 }
 
 /// Drain DUT-bound bytes from the PTY master and frame them to the port as
@@ -411,8 +461,9 @@ fn demux(
 /// Parse complete `[type][b1][len][payload]` frames from `buf`. Returns each
 /// frame's type byte and payload, and how many bytes were consumed; a leading
 /// unframed byte (type not `0x02`/`0x03`) is skipped to resync. The trailing
-/// partial frame, if any, is left in `buf`.
-fn split_frames(buf: &[u8]) -> (Vec<(u8, Vec<u8>)>, usize) {
+/// partial frame, if any, is left in `buf`. Shared with the one-shot reader in
+/// `proto.rs`, which must demultiplex the same stream.
+pub(crate) fn split_frames(buf: &[u8]) -> (Vec<(u8, Vec<u8>)>, usize) {
     let mut out = Vec::new();
     let mut i = 0;
     let n = buf.len();
@@ -444,7 +495,13 @@ fn drain_failing(
 ) -> bool {
     loop {
         match req_rx.try_recv() {
-            Ok(req) => finish(transcript, &req.line, Err(msg.to_string()), req.reply),
+            Ok(Request::Line { line, reply }) => {
+                finish(transcript, &line, Err(msg.to_string()), reply)
+            }
+            // Nothing is held on a link that is not open.
+            Ok(Request::Release { done }) => {
+                let _ = done.send(());
+            }
             Err(TryRecvError::Empty) => return true,
             Err(TryRecvError::Disconnected) => return false,
         }
@@ -502,6 +559,21 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("did not answer"), "{err}");
+    }
+
+    /// The shutdown release is answered even when the board is absent (the
+    /// port cannot open): "nothing held on a closed link", not a request left
+    /// queued behind the reopen loop until the daemon's grace runs out.
+    #[tokio::test]
+    async fn release_for_shutdown_is_answered_without_a_board() {
+        let hid = HidHandle::spawn("/nonexistent/hidrig-release-test".into(), None);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            hid.release_for_shutdown(Duration::from_secs(3)),
+        )
+        .await
+        .expect("bounded by its own limit");
+        assert_eq!(result, Ok(()));
     }
 
     #[test]

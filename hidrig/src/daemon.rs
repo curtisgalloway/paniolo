@@ -24,7 +24,8 @@
 
 use std::fs::{self, File};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use fs2::FileExt;
@@ -37,6 +38,10 @@ use crate::uart::HidHandle;
 /// Discovery subdir = the paniolo channel name, not the binary name.
 pub const DISCOVERY_NAME: &str = "hid";
 
+/// How long shutdown waits for the release of held keys and buttons before
+/// exiting anyway.
+const RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[derive(Serialize, Deserialize)]
 pub struct Discovery {
     pub pid: u32,
@@ -48,11 +53,18 @@ pub struct Discovery {
     pub token: Option<String>,
     /// The control UART this daemon owns (so a CLI one-shot can match its -d).
     pub device: String,
-    /// The DUT serial-console PTY (a stable symlink to the slave device) that
-    /// paniolo's `serial` channel points its `device =` at, when the console
-    /// bridge is up. Absent if PTY allocation failed.
+    /// The path paniolo's `serial` channel points its `device =` at when the
+    /// console bridge is up: the stable symlink `<runtime>/hid/console` when
+    /// it could be made, else the slave device itself. Absent if PTY
+    /// allocation failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub console: Option<String>,
+    /// The PTY slave device node behind `console` (`/dev/pts/7`, or
+    /// `/dev/ttys003` on macOS). This file is the source of truth for the
+    /// console's identity; the symlink is a convenience for a lab file that
+    /// wants a stable path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console_device: Option<String>,
 }
 
 /// The daemon's runtime dir. Paniolo passes the canonical location as
@@ -109,9 +121,17 @@ pub fn run(device: String, port: u16) -> Result<()> {
         // Bring up the DUT serial-console PTY and publish a stable symlink that
         // paniolo's `serial` channel points its `device =` at. Best-effort: if
         // PTY allocation fails the daemon still serves HID/control, just without
-        // a console. `console_link` is set only when we created a symlink, so
-        // shutdown removes ours and never the /dev/pts node itself.
-        let (console_master, console_path, console_link) = open_console_bridge(&runtime_dir()?);
+        // a console. `link` is set only when we created a symlink, so shutdown
+        // removes ours and never the /dev/pts node itself. The slave handle is
+        // bound here, in this block, so it stays open until the process exits
+        // (pty.rs explains why it must).
+        let ConsoleBridge {
+            master: console_master,
+            slave: _console_slave,
+            published: console_path,
+            device: console_device,
+            link: console_link,
+        } = open_console_bridge(&runtime_dir()?);
 
         let hid = HidHandle::spawn(device.clone(), console_master);
 
@@ -128,6 +148,7 @@ pub fn run(device: String, port: u16) -> Result<()> {
             token: Some(token.clone()),
             device: device.clone(),
             console: console_path,
+            console_device,
         };
         crate::auth::write_private_file(
             &discovery_path()?,
@@ -136,23 +157,28 @@ pub fn run(device: String, port: u16) -> Result<()> {
         .context("writing discovery file")?;
         info!("hid daemon listening on http://{bound} (device {device})");
 
+        let shutdown_hid = hid.clone();
         let app = server::router(AppState { hid }, crate::auth::Auth::new(token, &[]));
 
         // The /hid WebSocket is long-lived, so plain graceful shutdown would
-        // block forever. Remove discovery + lock, brief grace, then hard-exit
-        // (the OS releases the UART).
+        // block forever. Release whatever is held, remove discovery + lock,
+        // brief grace, then hard-exit (the OS releases the UART).
         let disc_p = discovery_path()?;
         let lock_p = lock_path()?;
-        let console_link_p = console_link;
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
                 shutdown_signal().await;
+                // This daemon is the only thing that remembers what it pressed;
+                // leave the target with nothing held.
+                if let Err(e) = shutdown_hid.release_for_shutdown(RELEASE_TIMEOUT).await {
+                    warn!("shutdown: {e}");
+                }
                 let _ = fs::remove_file(&disc_p);
                 let _ = fs::remove_file(&lock_p);
-                if let Some(link) = &console_link_p {
+                if let Some(link) = &console_link {
                     let _ = fs::remove_file(link);
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
                 info!("hid daemon shut down");
                 std::process::exit(0);
             })
@@ -165,23 +191,38 @@ pub fn run(device: String, port: u16) -> Result<()> {
     Ok(())
 }
 
+/// The DUT console bridge as brought up at start. Every field is `None` when
+/// no console could be made — the daemon then serves HID and control without
+/// one, which is the documented best-effort behaviour.
+#[derive(Default)]
+struct ConsoleBridge {
+    /// PTY master, handed to the control-link owner thread.
+    master: Option<File>,
+    /// The daemon's own raw-mode handle on the slave, held open for the
+    /// daemon's lifetime (see pty.rs).
+    slave: Option<File>,
+    /// What the discovery file's `console` names: the stable symlink, or the
+    /// device itself when the link could not be made.
+    published: Option<String>,
+    /// The slave device node (`console_device` in the discovery file).
+    device: Option<String>,
+    /// The symlink we created, removed at shutdown.
+    link: Option<PathBuf>,
+}
+
 /// Allocate the DUT console PTY and publish a stable symlink to its slave node.
-///
-/// Returns `(master, published path, symlink we own)`. Every element is `None`
-/// when no console could be brought up — the daemon then serves HID and control
-/// without a console, which is the documented best-effort behaviour.
 #[cfg(unix)]
-fn open_console_bridge(dir: &std::path::Path) -> (Option<File>, Option<String>, Option<PathBuf>) {
+fn open_console_bridge(dir: &Path) -> ConsoleBridge {
     let p = match crate::pty::open() {
         Ok(p) => p,
         Err(e) => {
             warn!("DUT console bridge unavailable: {e}");
-            return (None, None, None);
+            return ConsoleBridge::default();
         }
     };
     let link = dir.join("console");
-    let _ = fs::remove_file(&link);
-    let (path, owned_link) = match std::os::unix::fs::symlink(&p.slave_path, &link) {
+    remove_stale_console_link(&link);
+    let (published, owned_link) = match std::os::unix::fs::symlink(&p.slave_path, &link) {
         Ok(()) => (link.to_string_lossy().into_owned(), Some(link)),
         Err(e) => {
             warn!(
@@ -191,8 +232,45 @@ fn open_console_bridge(dir: &std::path::Path) -> (Option<File>, Option<String>, 
             (p.slave_path.clone(), None)
         }
     };
-    info!("DUT console bridge at {path}");
-    (Some(p.master), Some(path), owned_link)
+    info!(
+        "DUT console bridge at {published} (device {})",
+        p.slave_path
+    );
+    ConsoleBridge {
+        master: Some(p.master),
+        slave: Some(p.slave),
+        published: Some(published),
+        device: Some(p.slave_path),
+        link: owned_link,
+    }
+}
+
+/// A `console` link left behind by a previous daemon — pointing at a PTY that
+/// no longer exists, or at one that now belongs to some other process — is
+/// removed so ours can take the name. Anything there that is not a symlink is
+/// left alone; publication then falls back to the device path.
+#[cfg(unix)]
+fn remove_stale_console_link(link: &Path) {
+    match fs::symlink_metadata(link) {
+        Ok(md) if md.file_type().is_symlink() => {
+            match fs::read_link(link) {
+                Ok(target) => info!(
+                    "removing stale console link {} -> {}",
+                    link.display(),
+                    target.display()
+                ),
+                Err(_) => info!("removing stale console link {}", link.display()),
+            }
+            if let Err(e) = fs::remove_file(link) {
+                warn!("cannot remove stale console link {}: {e}", link.display());
+            }
+        }
+        Ok(_) => warn!(
+            "{} exists and is not a symlink; leaving it alone",
+            link.display()
+        ),
+        Err(_) => {}
+    }
 }
 
 /// Windows has no PTY layer to hand a slave device path to paniolo's `serial`
@@ -201,9 +279,9 @@ fn open_console_bridge(dir: &std::path::Path) -> (Option<File>, Option<String>, 
 /// is the whole point of the published `console` path.) HID and control are
 /// unaffected.
 #[cfg(windows)]
-fn open_console_bridge(_dir: &std::path::Path) -> (Option<File>, Option<String>, Option<PathBuf>) {
+fn open_console_bridge(_dir: &Path) -> ConsoleBridge {
     warn!("DUT console bridge unavailable: no PTY support on Windows");
-    (None, None, None)
+    ConsoleBridge::default()
 }
 
 async fn shutdown_signal() {
@@ -240,16 +318,48 @@ mod tests {
         let old: Discovery =
             serde_json::from_str(r#"{"pid":1,"port":2,"device":"/dev/x"}"#).unwrap();
         assert_eq!(old.token, None);
+        assert_eq!(old.console_device, None);
         let new = Discovery {
             pid: 1,
             port: 2,
             token: Some("ab".into()),
             device: "/dev/x".into(),
-            console: None,
+            console: Some("/run/hid/console".into()),
+            console_device: Some("/dev/pts/7".into()),
         };
         let text = serde_json::to_string(&new).unwrap();
         assert!(text.contains(r#""token":"ab""#), "{text}");
+        assert!(text.contains(r#""console_device":"/dev/pts/7""#), "{text}");
         let back: Discovery = serde_json::from_str(&text).unwrap();
         assert_eq!(back.token.as_deref(), Some("ab"));
+        assert_eq!(back.console.as_deref(), Some("/run/hid/console"));
+        assert_eq!(back.console_device.as_deref(), Some("/dev/pts/7"));
+    }
+
+    /// A `console` link left by a previous daemon (here: dangling) is replaced
+    /// by one to our own PTY, and the published path and device agree with it.
+    #[cfg(unix)]
+    #[test]
+    fn stale_console_link_is_replaced_on_start() {
+        let dir = std::env::temp_dir().join(format!("paniolo-hid-console-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("console");
+        std::os::unix::fs::symlink("/dev/pts/paniolo-does-not-exist", &link).unwrap();
+        assert!(fs::metadata(&link).is_err(), "the stale link dangles");
+
+        let bridge = open_console_bridge(&dir);
+        let device = bridge.device.clone().expect("a pty was allocated");
+        assert_eq!(bridge.published.as_deref(), link.to_str());
+        assert_eq!(bridge.link.as_deref(), Some(link.as_path()));
+        assert_eq!(fs::read_link(&link).unwrap(), PathBuf::from(&device));
+        assert!(
+            fs::metadata(&link).is_ok(),
+            "the link resolves to a live pty"
+        );
+        assert!(bridge.master.is_some() && bridge.slave.is_some());
+
+        drop(bridge);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

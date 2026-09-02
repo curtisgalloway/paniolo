@@ -160,6 +160,38 @@ if DEBUG:
 # complete length-prefixed frames, exactly as a UART link would (transport-
 # agnostic framing).
 _rxbuf = bytearray()
+# time.monotonic() when the first byte of the currently-pending (not yet
+# complete) frame arrived; None while _rxbuf holds no partial frame. A partial
+# I2C write (bus glitch, control board reset mid-relay) can leave a stale
+# frame here; without this, the next relayed frame's leading bytes would
+# silently complete it and get sent to send_report as whatever usages the
+# stale header happened to declare (docs/dev/hid-dual-board-design.md §5).
+_rxbuf_started = None
+PARTIAL_FRAME_TIMEOUT_S = 0.05
+
+
+def note_rxbuf_start():
+    """Record when the currently-pending partial frame started accumulating.
+    A no-op once already recorded, so a call that doesn't fully drain _rxbuf
+    never resets the clock on a frame that was already waiting."""
+    global _rxbuf_started
+    if _rxbuf:
+        if _rxbuf_started is None:
+            _rxbuf_started = time.monotonic()
+    else:
+        _rxbuf_started = None
+
+
+def discard_stale_rxbuf():
+    """Drop a partial frame that has waited too long. Called before every I2C
+    transaction is accumulated, so a stale tail from an interrupted write
+    never gets completed by a later, unrelated one."""
+    global _rxbuf, _rxbuf_started
+    if _rxbuf_started is not None and time.monotonic() - _rxbuf_started > PARTIAL_FRAME_TIMEOUT_S:
+        if DEBUG:
+            print("target: discarding stale partial frame (%d bytes)" % len(_rxbuf))
+        _rxbuf = bytearray()
+        _rxbuf_started = None
 
 
 def extract_frames():
@@ -187,10 +219,12 @@ def extract_frames():
             i += 1  # unframed/unknown byte (control frames TBD) — resync
     if i:
         _rxbuf = _rxbuf[i:]  # keep the unconsumed tail
+    note_rxbuf_start()
 
 
 while True:
     check_button()
+    discard_stale_rxbuf()
     req = i2c.request()  # block until the controller addresses us
     if not req:
         continue
