@@ -23,7 +23,10 @@
 #   bash scripts/ci-local.sh
 #
 # It mirrors every Linux crate job in ci.yml; scripts/ci-coverage-check.sh
-# enforces that the two stay in sync.
+# enforces that the two stay in sync. The lint jobs (shellcheck, zigplug,
+# evals-check, actions-pinned) are deliberately not mirrored: none needs a
+# Linux box, so run them on the host -- "Before opening a PR" in AGENTS.md
+# has the one-line command for each.
 #
 # It installs the toolchain if missing (rustup + uv + apt build deps) and copies
 # the working tree to a VM-local dir before building, so nothing is written to a
@@ -43,9 +46,9 @@ echo "### [setup] system deps"
 # install still fails -- without these libraries every serialport crate (cli,
 # serialcap, cambrionix, ch9329, hidrig) and hdmicap fail to build, which reads
 # as six code failures instead of one missing dependency.
-APT="-o DPkg::Lock::Timeout=300"
-if ! sudo apt-get $APT update -qq \
-  || ! sudo apt-get $APT install -y -qq pkg-config libudev-dev build-essential \
+APT=(-o DPkg::Lock::Timeout=300)
+if ! sudo apt-get "${APT[@]}" update -qq \
+  || ! sudo apt-get "${APT[@]}" install -y -qq pkg-config libudev-dev build-essential \
        libclang-dev clang cmake nasm libturbojpeg0-dev curl ca-certificates rsync >/dev/null
 then
   echo "FATAL: could not install the system build dependencies; aborting." >&2
@@ -53,16 +56,33 @@ then
   exit 2
 fi
 
+# Installers are downloaded to a file and run from there, never piped into
+# sh: the file is what actually ran, so its path and sha256 are logged and it
+# can be read or diffed against a known copy while the script is running.
+INSTALLERS="$(mktemp -d)"
+trap 'rm -rf "$INSTALLERS"' EXIT
+fetch_installer () {
+  local url="$1" out="$INSTALLERS/$2"
+  curl --proto '=https' --tlsv1.2 -fsSL -o "$out" "$url" || return 1
+  echo "###   fetched $url"
+  sha256sum "$out"
+}
+
 if ! command -v cargo >/dev/null 2>&1; then
   echo "### [setup] rustup (stable, minimal + clippy + rustfmt)"
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --profile minimal --component clippy --component rustfmt >/dev/null
+  fetch_installer https://sh.rustup.rs rustup-init.sh \
+    && sh "$INSTALLERS/rustup-init.sh" -y --profile minimal \
+         --component clippy --component rustfmt >/dev/null
 fi
+# rustup writes ~/.cargo/env at install time; it is not in the repo, so there
+# is nothing for the SC1091 source-follow to read.
+# shellcheck disable=SC1091
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 
 if ! command -v uv >/dev/null 2>&1; then
   echo "### [setup] uv"
-  curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
+  fetch_installer https://astral.sh/uv/install.sh uv-install.sh \
+    && sh "$INSTALLERS/uv-install.sh" >/dev/null 2>&1
 fi
 export PATH="$HOME/.local/bin:$PATH"
 
@@ -73,11 +93,30 @@ fi
 echo "### toolchain: $(cargo --version) | $(uv --version 2>/dev/null || echo 'uv missing')"
 
 echo "### [setup] copy working tree to local disk ($DST)"
+# rsync --delete erases whatever else is in $DST, so refuse unless it is
+# clearly ours: absent, empty, or carrying the marker this script leaves
+# behind after its first sync. A PANIOLO_CI_DIR typo that lands on a real
+# directory then fails loudly instead of emptying it.
+MARKER=".paniolo-ci-local"
+if [ -e "$DST" ]; then
+  if [ ! -d "$DST" ]; then
+    echo "FATAL: $DST exists and is not a directory; aborting." >&2
+    exit 2
+  fi
+  if [ -n "$(ls -A "$DST")" ] && [ ! -f "$DST/$MARKER" ]; then
+    echo "FATAL: $DST is not empty and has no $MARKER marker; refusing to" >&2
+    echo "       rsync --delete into it. Point PANIOLO_CI_DIR at an empty or" >&2
+    echo "       previously synced directory, or clear this one by hand." >&2
+    exit 2
+  fi
+fi
 mkdir -p "$DST"
 rsync -a --delete \
   --exclude 'target' --exclude '.venv' --exclude '*.egg-info' \
   --exclude '_site' --exclude 'site' --exclude '.git' \
+  --exclude "$MARKER" \
   "$SRC/" "$DST/"
+touch "$DST/$MARKER"
 
 declare -A RES
 

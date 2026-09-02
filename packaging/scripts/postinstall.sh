@@ -1,3 +1,5 @@
+#!/bin/sh
+set -e
 # Copyright 2026 Curtis Galloway
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

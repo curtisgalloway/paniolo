@@ -142,6 +142,15 @@ follow-up. Run through this checklist before calling `gh pr create`:
    hdmicap AVFoundation + visionocr — runs on the host.) Note `cli` is the
    primary control-plane crate; don't let its tests rot.
 
+   CI also runs four lint jobs that are not crate jobs and that
+   `scripts/ci-local.sh` does not mirror — none needs a Linux box, so run
+   them on the host: `shellcheck` over every tracked script
+   (`git ls-files -z '*.sh' | xargs -0 shellcheck`), `zigplug`
+   (`cd zigplug && uv sync --frozen && uv run pyink --check . && uv run
+   python -m compileall -q src`), `evals-check` (`python3.12 evals/run.py
+   --check`, from step 1), and `actions-pinned`
+   (`bash scripts/ci-actions-pinned.sh`, step 7).
+
 5. **Every crate has a CI job — no exceptions.** A crate is not finished until
    `.github/workflows/ci.yml` has a job for it (`working-directory: <crate>`,
    then fmt + clippy `-D warnings` + test, copied from an existing crate job)
@@ -176,7 +185,18 @@ follow-up. Run through this checklist before calling `gh pr create`:
    leaves the ambient binary sysroot in place. Revisit the pin when #19982
    closes.
 
-7. **Push, open the PR, and merge only when asked.** Get the branch ready by
+7. **Every workflow action is pinned to a commit SHA.** A `uses:` line under
+   `.github/workflows/` names a full 40-hex commit with the version it
+   resolves to in a trailing comment (`actions/checkout@<sha> # v6.1.0`),
+   never a movable tag. `scripts/ci-actions-pinned.sh` (the `actions-pinned`
+   job) fails the build otherwise, and `.github/dependabot.yml` bumps the SHA
+   and its comment together, weekly, in one grouped PR. To add or bump one by
+   hand, resolve the tag through the API rather than from memory:
+   `gh api repos/<owner>/<repo>/git/ref/tags/<tag>`, and when
+   `.object.type` is `tag` (annotated) dereference it via `git/tags/<sha>`
+   to reach the commit.
+
+8. **Push, open the PR, and merge only when asked.** Get the branch ready by
    committing locally, but treat `git push`, `gh pr create`, and merging as
    gated on the maintainer's explicit instruction — don't push or open a PR on
    your own initiative, and never merge. When told to, open with `gh pr create`;
@@ -1126,11 +1146,15 @@ and dies in the field three days later.
 
 ### Developing against Windows
 
-`brik.h.curtisg.xyz` (10.66.30.58) is the Windows bench host: SSH lands in
-PowerShell 7, `$HOME` is `C:\Users\curti` (not `curtisg`), and the repo is
-cloned at `C:\Users\curti\src\paniolo`. `scripts/sync-brik.sh <crate>…`
-pushes sources there (it excludes `target/`, which is gigabytes and stalls the
-transfer). The MSVC linker resolves without a Developer Prompt.
+The Windows bench host (`brik`; its address and checkout path are private
+infrastructure and live outside this repo) is reached over SSH, which lands
+in PowerShell 7. Note `$HOME` there is the Windows account's `C:\Users\…`,
+a different account name than on the Mac, and the repo is cloned under it.
+`BRIK_HOST=<ssh host> BRIK_DEST=<checkout, forward slashes>
+scripts/sync-brik.sh <crate>…` pushes sources there; both variables are
+required, with no defaults, and the script excludes `target/`, which is
+gigabytes and stalls the transfer. The MSVC linker resolves without a
+Developer Prompt.
 
 A local `cargo check --target x86_64-pc-windows-msvc` catches most `#[cfg]`
 mistakes without leaving macOS, but **only for crates with no C dependency** —

@@ -49,6 +49,21 @@ ls "$DEBS_DIR"/*.deb >/dev/null 2>&1 || {
   exit 1
 }
 
+# The fingerprint index.html shows is read from the key that signs, so the
+# page cannot drift from the key docs.yml actually imported.
+FPR="$(gpg --batch --with-colons --fingerprint "$KEY" \
+  | awk -F: '/^fpr:/ {print $10; exit}')"
+[ -n "$FPR" ] || {
+  echo "error: no fingerprint for signing key $KEY (not imported?)" >&2
+  exit 1
+}
+
+# apt refuses the repo once this passes, which bounds how long a stale or
+# replayed index can be served. 30 days; docs.yml rebuilds weekly on a
+# schedule as well as on every release, so a live repo never reaches it.
+# LC_ALL=C keeps the day/month names English (RFC 1123, what apt parses).
+VALID_UNTIL="$(LC_ALL=C date -u -d '+30 days' '+%a, %d %b %Y %H:%M:%S UTC')"
+
 POOL="pool/$COMPONENT/p/paniolo"
 mkdir -p "$OUT/$POOL"
 cp "$DEBS_DIR"/*.deb "$OUT/$POOL/"
@@ -72,6 +87,7 @@ apt-ftparchive \
   -o "APT::FTPArchive::Release::Codename=$SUITE" \
   -o "APT::FTPArchive::Release::Architectures=$ARCHES" \
   -o "APT::FTPArchive::Release::Components=$COMPONENT" \
+  -o "APT::FTPArchive::Release::Valid-Until=$VALID_UNTIL" \
   release "dists/$SUITE" > "dists/$SUITE/Release"
 
 gpg --batch --yes --local-user "$KEY" --armor --detach-sign \
@@ -98,7 +114,7 @@ Signed-By: /etc/apt/keyrings/paniolo.asc
 SRC
 sudo apt update &amp;&amp; sudo apt install paniolo
 </pre>
-<p>Signing key fingerprint: <code>93087CD8AF0D6D0717E8F8518D26C3AFB0A4FCBA</code></p>
+<p>Signing key fingerprint: <code>$FPR</code></p>
 </body></html>
 EOF
 

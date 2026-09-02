@@ -1,0 +1,31 @@
+# Copyright 2026 Curtis Galloway
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Keep the commit-SHA pins in .github/workflows current. Every `uses:` there
+# is pinned to a full commit rather than a movable tag (Review M7;
+# scripts/ci-actions-pinned.sh enforces it). Dependabot bumps the SHA and the
+# trailing `# vX.Y.Z` comment together, in one grouped PR a week, so pinning
+# does not mean freezing. Only GitHub Actions is covered here: Cargo
+# dependency bumps are reviewed by hand.
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"
