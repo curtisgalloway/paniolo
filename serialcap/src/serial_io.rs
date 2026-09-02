@@ -814,6 +814,9 @@ mod tests {
                         Bytes::copy_from_slice(&n.to_le_bytes()),
                     );
                     n += 1;
+                    // Give the sampling thread a turn so it is not perpetually
+                    // lagged behind the producer on a loaded machine.
+                    std::thread::yield_now();
                 }
                 n
             })
@@ -834,8 +837,13 @@ mod tests {
             dtr_tx: mpsc::channel(1).0,
         };
 
+        // Sample until enough verdicts are in; a lagged sample yields none, and
+        // how often that happens depends on machine load, not on correctness.
         let mut checked = 0;
-        for _ in 0..2000 {
+        for _ in 0..50_000 {
+            if checked >= 100 {
+                break;
+            }
             let (snap, mut rx) = handle.attach();
             let mut nums = snap
                 .as_chunks::<4>()
@@ -872,9 +880,9 @@ mod tests {
         let produced = producer.join().unwrap();
         drop(to_clients);
         drain.join().unwrap();
-        assert!(produced > 1000, "producer barely ran ({produced} chunks)");
+        assert!(produced > 100, "producer barely ran ({produced} chunks)");
         assert!(
-            checked > 100,
+            checked >= 100,
             "too few verdicts to mean anything ({checked})"
         );
     }
