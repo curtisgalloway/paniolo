@@ -175,7 +175,7 @@ Linux) and prints a ready-to-paste command for any discovered peer, e.g.:
 mode    ffx
 carrier up
 inet6   fe80::1/64
-peer    fe80::fc33:fca2:96e0:6dbe%enx00e04c08d9a0  (try: ffx target add fe80::fc33:fca2:96e0:6dbe%enx00e04c08d9a0)
+peer    fe80::fc33:fca2:96e0:6dbe%enx001122334455  (try: ffx target add fe80::fc33:fca2:96e0:6dbe%enx001122334455)
 ```
 
 This surfaces the target's link-local address without scraping the serial log.

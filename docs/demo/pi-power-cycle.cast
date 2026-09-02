@@ -241,7 +241,7 @@
 [0.034, "o", "-"]
 [0.040, "o", "1"]
 [0.039, "o", "\r\n"]
-[0.448, "o", "Power cycling 'lab-pi-1' via python3 /home/curtisg/src/usb-relay/host/usbrelay.py --port /dev/serial/by-id/usb-Raspberry_Pi_Pico_503558607AC7371F-if02 cycle 1\r\n"]
+[0.448, "o", "Power cycling 'lab-pi-1' via python3 ~/src/usb-relay/host/usbrelay.py --port /dev/serial/by-id/usb-Raspberry_Pi_Pico_AA00BB11CC22DD33-if02 cycle 1\r\n"]
 [0.046, "o", "OK cycle 1 5.0\r\n"]
 [0.015, "o", "Power cycle complete.\r\n"]
 [1.221, "o", "\u001b[1;36m$\u001b[0m "]

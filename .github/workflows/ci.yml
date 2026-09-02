@@ -326,7 +326,7 @@ jobs:
     #
     # What CI cannot cover: anything needing the bench hardware. hdmicap's
     # Media Foundation backend and the ch9329 HID path are verified by hand on
-    # `brik`, not here. See AGENTS.md under **Platform support** for what is
+    # the Windows bench host, not here. See AGENTS.md under **Platform support** for what is
     # and is not verified.
     name: windows (all crates, fmt, clippy, test)
     runs-on: windows-latest

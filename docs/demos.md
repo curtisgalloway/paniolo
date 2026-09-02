@@ -177,7 +177,7 @@ Power ON  (lab-pi-1)
 
 # Cycle it, and catch the machine dying:
 $ paniolo power-cycle lab-pi-1
-Power cycling 'lab-pi-1' via python3 /home/curtisg/src/usb-relay/host/usbrelay.py --port /dev/serial/by-id/usb-Raspberry_Pi_Pico_503558607AC7371F-if02 cycle 1
+Power cycling 'lab-pi-1' via python3 ~/src/usb-relay/host/usbrelay.py --port /dev/serial/by-id/usb-Raspberry_Pi_Pico_AA00BB11CC22DD33-if02 cycle 1
 OK cycle 1 5.0
 Power cycle complete.
 $ paniolo power-state lab-pi-1

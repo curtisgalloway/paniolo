@@ -2,7 +2,7 @@
 
 [targets.pico.netboot]
 interface = "en7"
-tftp_root = "/Users/curtisg/tftp/pico"
+tftp_root = "~/tftp/pico"
 
 [[targets.pico.serial]]
 name = "console"
@@ -13,8 +13,8 @@ baud = 115200
 device = "HDMI"
 
 [targets.pico.power]
-cycle_cmd = "shellyplug -d 10.66.27.141 cycle"
-state_cmd = "shellyplug -d 10.66.27.141 state"
+cycle_cmd = "shellyplug -d 192.0.2.41 cycle"
+state_cmd = "shellyplug -d 192.0.2.41 state"
 
 [targets.pico.hid]
 cmd = "hidrig -d /dev/cu.usbmodem1234"
