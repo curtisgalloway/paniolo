@@ -92,10 +92,35 @@ fn group_exists(group: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Add the user to dialout/video if needed (Linux). Returns true if anything
-/// changed (a re-login is needed for it to take effect).
-fn ensure_linux_groups() -> bool {
-    let user = std::env::var("USER").unwrap_or_default();
+/// The account name for `sudo usermod -aG <group> <user>`: `$USER`, required
+/// non-empty. Extracted from `ensure_linux_groups` so the failure mode — no
+/// sudo invocation with an empty or missing username — is testable without a
+/// real system group.
+fn linux_group_user(group: &str, reason: &str) -> Result<String> {
+    std::env::var("USER")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "$USER is not set, so paniolo cannot add this account to the \
+             '{group}' group ({reason}); set $USER and re-run `paniolo setup`, \
+             or run `sudo usermod -aG {group} <your-username>` yourself"
+            )
+        })
+}
+
+/// Add the user to dialout/video if needed (Linux). Returns `Ok(true)` if
+/// anything changed (a re-login is needed for it to take effect).
+///
+/// Errors if `$USER` is unset or empty at the point a group actually needs
+/// joining. The old code read `$USER` with `unwrap_or_default()` and ran
+/// `sudo usermod -aG <group> ""` on an unset one — a real sudo prompt for a
+/// command guaranteed to fail, instead of a clear error up front (Review low
+/// #11). An agent-invoked shell without a login environment is exactly the
+/// case that can hit this; on Windows/macOS `group_exists` is always false
+/// here, so `$USER` (which on Windows isn't even the right variable name) is
+/// never consulted.
+fn ensure_linux_groups() -> Result<bool> {
     let mut changed = false;
     for (group, reason) in [
         ("dialout", "serial port access (/dev/ttyUSB*, /dev/ttyACM*)"),
@@ -106,21 +131,22 @@ fn ensure_linux_groups() -> bool {
         }
         if user_in_group(group) {
             println!("  ✓ {group:12} already a member");
+            continue;
+        }
+        let user = linux_group_user(group, reason)?;
+        let ok = Command::new("sudo")
+            .args(["usermod", "-aG", group, &user])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            println!("  ✓ {group:12} added ({reason})");
+            changed = true;
         } else {
-            let ok = Command::new("sudo")
-                .args(["usermod", "-aG", group, &user])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if ok {
-                println!("  ✓ {group:12} added ({reason})");
-                changed = true;
-            } else {
-                eprintln!("  ✗ {group:12} could not add ({reason})");
-            }
+            eprintln!("  ✗ {group:12} could not add ({reason})");
         }
     }
-    changed
+    Ok(changed)
 }
 
 /// netbootd's macOS raw-frame send path needs a /dev/bpf descriptor, which
@@ -227,8 +253,8 @@ fn helper_safe_to_setuid(_helper: &Path) -> Result<()> {
 /// in: the full build needs `libGL.so.1`, absent on a headless Pi OS, and the
 /// failure is an ImportError at first OCR rather than at install time.
 #[cfg(target_os = "linux")]
-fn install_rapidocr_venv(libexec: &Path) {
-    if !lab_wants_gui_ocr() {
+fn install_rapidocr_venv(libexec: &Path, lab_flag: Option<&str>) {
+    if !lab_wants_gui_ocr(lab_flag) {
         println!(
             "  … rapidocr venv: skipped (no target sets video ocr_mode = \"gui\"; \
              it is ~317 MB — set the field and re-run to install)"
@@ -283,15 +309,22 @@ fn install_rapidocr_venv(libexec: &Path) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn install_rapidocr_venv(_libexec: &Path) {}
+fn install_rapidocr_venv(_libexec: &Path, _lab_flag: Option<&str>) {}
 
 /// Does the user's lab file ask for GUI-mode OCR anywhere?
 ///
 /// Read as text rather than parsed: this runs before any lab is loaded, and the
-/// only question is whether to spend 317 MB.
+/// only question is whether to spend 317 MB. `lab_flag` resolves the same way
+/// every other lab-reading command does (`--lab`, then `$PANIOLO_LAB`, then
+/// the default path) — this used to always read the default path outright,
+/// so `paniolo setup --lab other.toml` (or `$PANIOLO_LAB` pointed elsewhere)
+/// judged the venv against the wrong file (Review low #11).
 #[cfg(target_os = "linux")]
-fn lab_wants_gui_ocr() -> bool {
-    std::fs::read_to_string(crate::model::default_lab_path())
+fn lab_wants_gui_ocr(lab_flag: Option<&str>) -> bool {
+    let Some(path) = crate::model::resolve_lab_path(lab_flag) else {
+        return false;
+    };
+    std::fs::read_to_string(path)
         .map(|s| s.contains("ocr_mode") && s.contains("\"gui\""))
         .unwrap_or(false)
 }
@@ -384,7 +417,7 @@ pub fn run_packaged() -> Result<()> {
             // and then fails on the first channel it needs a helper for.
             PackagedStep::WindowsLayout => check_windows_layout(),
             PackagedStep::LinuxGroups => {
-                if ensure_linux_groups() {
+                if ensure_linux_groups()? {
                     println!(
                         "\nNote: group changes take effect after you log out and back in \
                          (or run `newgrp dialout` in the current shell)."
@@ -412,7 +445,9 @@ pub fn run_packaged() -> Result<()> {
 /// Run the local setup from a source checkout at `repo`. With `rust_only`,
 /// stop after the cargo installs (skip the OCR, setuid, zigplug, and
 /// stale-copy-cleanup steps) — the fast path for iterating on the Rust code.
-pub fn run(repo: &Path, rust_only: bool) -> Result<()> {
+/// `lab_flag` is `--lab`, if given; it decides which lab file `install_rapidocr_venv`
+/// checks for `ocr_mode = "gui"`.
+pub fn run(repo: &Path, rust_only: bool, lab_flag: Option<&str>) -> Result<()> {
     let bin_dir = cargo_bin();
     let libexec_root = crate::daemons::libexec_root()
         .ok_or_else(|| anyhow!("could not determine the home directory"))?;
@@ -430,7 +465,7 @@ pub fn run(repo: &Path, rust_only: bool) -> Result<()> {
                  \x20   sudo apt-get install build-essential pkg-config libudev-dev libclang-dev cmake nasm"
             );
             println!("\nChecking group membership…");
-            if ensure_linux_groups() {
+            if ensure_linux_groups()? {
                 println!(
                     "\nNote: group changes take effect after you log out and back in \
                      (or run `newgrp dialout` in the current shell)."
@@ -580,7 +615,7 @@ pub fn run(repo: &Path, rust_only: bool) -> Result<()> {
             std::fs::copy(&rsrc, &rdest)?;
             crate::platform::make_executable(&rdest)?;
             println!("  ✓ {:12} {}", "rapidocr", rdest.display());
-            install_rapidocr_venv(&libexec);
+            install_rapidocr_venv(&libexec, lab_flag);
         }
         if crate::daemons::find_binary("tesseract").is_none() {
             println!(
@@ -724,5 +759,58 @@ mod tests {
         assert!(!is_repo_root(Path::new("/")));
         let cli = Path::new(env!("CARGO_MANIFEST_DIR"));
         assert!(!is_repo_root(cli), "the cli crate dir is not the repo root");
+    }
+
+    /// The old code read `$USER` with `unwrap_or_default()` and would have
+    /// gone on to run `sudo usermod -aG dialout ""` on an unset one; this is
+    /// the error that now stops it before any command is run (Review low
+    /// #11). Not gated to Linux: the function itself is portable, only its
+    /// caller's context (an existing dialout/video group) is Linux-specific.
+    #[test]
+    fn linux_group_user_errors_on_unset_or_empty_user() {
+        // Safe: mutated and restored within one test; no other test in this
+        // crate reads or writes $USER.
+        let prev = std::env::var_os("USER");
+        unsafe { std::env::remove_var("USER") };
+        let e = linux_group_user("dialout", "serial port access").unwrap_err();
+        assert!(e.to_string().contains("$USER is not set"), "{e}");
+
+        unsafe { std::env::set_var("USER", "") };
+        let e = linux_group_user("dialout", "serial port access").unwrap_err();
+        assert!(e.to_string().contains("$USER is not set"), "{e}");
+
+        unsafe { std::env::set_var("USER", "alice") };
+        assert_eq!(
+            linux_group_user("dialout", "serial port access").unwrap(),
+            "alice"
+        );
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("USER", v) },
+            None => unsafe { std::env::remove_var("USER") },
+        }
+    }
+
+    /// `paniolo setup --lab other.toml` (or `$PANIOLO_LAB`) must judge the
+    /// rapidocr venv against *that* lab, not silently fall back to the
+    /// default path the way the old no-argument `lab_wants_gui_ocr()` always
+    /// did (Review low #11). Linux-only: the function itself is gated to the
+    /// platform the venv is for.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lab_wants_gui_ocr_honors_the_lab_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let gui = dir.path().join("gui-lab.toml");
+        std::fs::write(&gui, "[targets.t]\n[targets.t.video]\nocr_mode = \"gui\"\n").unwrap();
+        assert!(lab_wants_gui_ocr(Some(gui.to_str().unwrap())));
+
+        let plain = dir.path().join("plain-lab.toml");
+        std::fs::write(&plain, "[targets.t]\n").unwrap();
+        assert!(!lab_wants_gui_ocr(Some(plain.to_str().unwrap())));
+
+        // A --lab that doesn't resolve to a real file (typo'd path) is "no",
+        // not a panic or a silent read of an unrelated file.
+        let missing = dir.path().join("missing.toml");
+        assert!(!lab_wants_gui_ocr(Some(missing.to_str().unwrap())));
     }
 }

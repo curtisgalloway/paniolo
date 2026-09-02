@@ -578,12 +578,19 @@ hand-typed, set up one of these **next to whatever invokes paniolo**:
   `read -rs AMT_PASSWORD && export AMT_PASSWORD` keeps the value out of the
   command line and shell history.
 
-**Placement rule:** the variable must exist where the *hook runs* — the host
-that owns the target's power channel. Locally that is simply the environment
-of your `paniolo` command. For a target driven through a remote lab host,
-plain SSH does not carry your local environment across, so install the
-wrapper/reference file on the control host itself (or use the sshd
-`AcceptEnv` forwarding pattern shown under Generic power hooks).
+**Placement rule:** `AMT_PASSWORD` only ever needs to exist in the environment
+of the local `paniolo` command you actually run. That is the whole rule now —
+for a target driven through a remote control host, paniolo's own dispatch
+carries `AMT_PASSWORD` across automatically (over the remote command's
+**stdin**, never its argv, so `ps` on the control host never shows it); there
+is nothing to install on the control host, and plain SSH's usual "your local
+environment doesn't cross" limitation doesn't apply here. This is specific to
+`AMT_PASSWORD` (the fixed forwarding list, `ssh::FORWARDED_ENV`) — a *generic*
+hook secret like `HA_TOKEN` still needs one of the techniques under Generic
+power hooks (a wrapper on the control host, or sshd `AcceptEnv`). It also only
+covers non-interactive commands (`power-cycle`, `power on/off/state`); an
+interactive one (`serial connect`) forwards nothing by construction, since its
+stdin is your own terminal, not a channel to smuggle a secret ahead of.
 
 ### Commands
 
@@ -628,7 +635,10 @@ paniolo power set -t target-machine \
 
 Remember the hooks run in paniolo's environment: `paniolo power …` /
 `power-cycle` / `power-state` must themselves be invoked with `AMT_PASSWORD`
-set (the `op run … bash -c '…'` pattern above).
+set (the `op run … bash -c '…'` pattern above) — locally if the power channel
+is local, or on whatever machine you're typing the command on if it routes to
+a remote control host (see "Placement rule" above — dispatch carries it the
+rest of the way).
 
 ### Gotchas
 

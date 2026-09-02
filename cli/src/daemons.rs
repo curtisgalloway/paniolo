@@ -182,11 +182,19 @@ fn runtime_base() -> PathBuf {
     runtime_root().join(format!("paniolo-{uid}"))
 }
 
-/// Sanitize an instance key (a target name, user-chosen) into a single safe
-/// path component: keep alphanumerics, `-`, `_`, `.`; collapse anything else
-/// to `_`. Mirrors serialcap's interface-name sanitizer. An empty result
-/// falls back to `_`.
-fn sanitize_component(s: &str) -> String {
+/// Sanitize a user-chosen key (a target name, a hook program's basename, …)
+/// into a single safe path component: keep alphanumerics, `-`, `_`, `.`;
+/// collapse anything else to `_`. Mirrors serialcap's interface-name
+/// sanitizer. An empty result, or one that collapses to exactly `.` or `..`
+/// — both still legal under the character allowlist above, and both a path
+/// traversal rather than a real component — falls back to `_`.
+///
+/// Reused everywhere a name that ultimately reached the lab file (a target
+/// name that predates [`crate::model::validate_name`], a power hook's
+/// program) is turned into a filesystem path component: [`runtime_rel`],
+/// [`hook_helper_name`], the `paniolo helper <name>` host-singleton branch in
+/// main.rs, and `state::target_dir`.
+pub(crate) fn sanitize_component(s: &str) -> String {
     let out: String = s
         .chars()
         .map(|c| {
@@ -197,11 +205,34 @@ fn sanitize_component(s: &str) -> String {
             }
         })
         .collect();
-    if out.is_empty() {
+    if out.is_empty() || out == "." || out == ".." {
         "_".to_string()
     } else {
         out
     }
+}
+
+/// True if `tok` looks like a POSIX shell environment assignment
+/// (`VAR=value`) rather than a program name — the shape a hook or helper
+/// `cmd` can legitimately be prefixed with, e.g.
+/// `AMT_PASSWORD=... amt-tool cycle` (docs/power.md "Credentials").
+fn is_env_assignment(tok: &str) -> bool {
+    let Some((var, _)) = tok.split_once('=') else {
+        return false;
+    };
+    !var.is_empty()
+        && var.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && var.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// The first token of a shell command line that is not an environment
+/// assignment — the program a hook or helper `cmd` actually invokes, whether
+/// or not it is preceded by one or more `VAR=value` assignments. Used both to
+/// name the helper ([`hook_helper_name`]) and to probe it (`doctor.rs`); a
+/// probe or a state/runtime dir keyed on the assignment itself, as a plain
+/// `split_whitespace().next()` would do, is simply wrong.
+pub fn first_program_token(cmd: &str) -> Option<&str> {
+    cmd.split_whitespace().find(|tok| !is_env_assignment(tok))
 }
 
 /// The runtime subdir for a daemon, relative to the per-uid base: `<name>` for
@@ -324,16 +355,22 @@ pub fn helper_env(name: &str, instance: Option<&str>) -> Vec<(&'static str, Path
 }
 
 /// The helper name for an opaque hook command: the basename of its first
-/// shell token (`zigplug -d … on …` → `zigplug`, `/path/to/script.sh …` →
-/// `script.sh`). Hooks are opaque strings, so this is a convention, not an
-/// inspection — documented in docs/adding-power-helpers.md.
+/// non-assignment shell token (`zigplug -d … on …` → `zigplug`,
+/// `/path/to/script.sh …` → `script.sh`, `AMT_PASSWORD=... amt-tool cycle` →
+/// `amt-tool`, skipping the assignment). Hooks are opaque strings, so this is
+/// a convention, not an inspection — documented in docs/adding-power-helpers.md.
+///
+/// Sanitized before it comes back: the name becomes a path component
+/// (`daemons::helper_env` → [`runtime_rel`]), and a hook string is
+/// hand-written in the lab file, not validated the way a target/host/serial
+/// name is at `add`/`set` time.
 pub fn hook_helper_name(cmd: &str) -> Option<String> {
-    let first = cmd.split_whitespace().next()?;
+    let first = first_program_token(cmd)?;
     let name = first.rsplit('/').next()?;
     if name.is_empty() {
         None
     } else {
-        Some(name.to_string())
+        Some(sanitize_component(name))
     }
 }
 
@@ -621,6 +658,26 @@ fn strays_in_ps(
         .collect()
 }
 
+/// Percent-encode a query-parameter value: everything but RFC 3986's
+/// unreserved characters. Used for every value spliced into a daemon URL or
+/// API path that didn't come from this process's own fixed vocabulary —
+/// interface names (user-chosen, land in `?interface=`), a nested URL
+/// (`?serialws=ws://…/stream?token=…`, which has to survive as one value) —
+/// so a name containing `&`, `=`, `#`, or a space can't reshape the query
+/// string it's placed into.
+pub fn query_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// A running daemon's HTTP endpoint, as read from its discovery file: the
 /// loopback port and the bearer token every request must carry. `token` is
 /// `None` for a daemon started by a paniolo older than the token — it accepts
@@ -755,6 +812,70 @@ mod tests {
         );
         assert_eq!(hook_helper_name(""), None);
         assert_eq!(hook_helper_name("   "), None);
+    }
+
+    /// A hook may be prefixed with one or more `VAR=value` assignments (the
+    /// AMT credential convention, docs/power.md "Credentials"); the helper
+    /// name is the program after them, not the assignment itself.
+    #[test]
+    fn hook_helper_name_skips_leading_env_assignments() {
+        assert_eq!(
+            hook_helper_name("AMT_PASSWORD=hunter2 amt-tool cycle").as_deref(),
+            Some("amt-tool")
+        );
+        assert_eq!(
+            hook_helper_name("A=1 B=2 /opt/bin/relay.sh on").as_deref(),
+            Some("relay.sh")
+        );
+        // A value containing `=` doesn't confuse the split.
+        assert_eq!(
+            hook_helper_name("AMT_PASSWORD=a=b amt-tool cycle").as_deref(),
+            Some("amt-tool")
+        );
+        // All assignments, no program: nothing to name.
+        assert_eq!(hook_helper_name("AMT_PASSWORD=hunter2"), None);
+    }
+
+    /// The returned name always lands as a single path component under the
+    /// runtime/state base — a hook string is hand-written, not validated the
+    /// way `add`/`set` names are (Review lows #3, #10).
+    #[test]
+    fn hook_helper_name_sanitizes_the_result() {
+        // A basename is always taken first, so a directory traversal in the
+        // path collapses on its own...
+        assert_eq!(
+            hook_helper_name("../../etc/passwd --flag").as_deref(),
+            Some("passwd")
+        );
+        // ...but a bare `..` (no `/`) is the basename, and stays a traversal
+        // component unless sanitize_component catches it too.
+        assert_eq!(hook_helper_name("..").as_deref(), Some("_"));
+        assert_eq!(
+            hook_helper_name("weird!name* --flag").as_deref(),
+            Some("weird_name_")
+        );
+    }
+
+    #[test]
+    fn query_escape_keeps_unreserved_and_encodes_the_rest() {
+        assert_eq!(query_escape("abc-_.~09"), "abc-_.~09");
+        assert_eq!(
+            query_escape("ws://127.0.0.1:5/stream?token=a&b"),
+            "ws%3A%2F%2F127.0.0.1%3A5%2Fstream%3Ftoken%3Da%26b"
+        );
+        // Exactly the characters an interface name could carry that would
+        // otherwise reshape a `?interface=` query string.
+        assert_eq!(query_escape("a b&c=d"), "a%20b%26c%3Dd");
+    }
+
+    #[test]
+    fn sanitize_component_refuses_dot_and_dotdot() {
+        assert_eq!(sanitize_component("."), "_");
+        assert_eq!(sanitize_component(".."), "_");
+        assert_eq!(sanitize_component(""), "_");
+        // Three dots is a harmless literal filename, not a traversal.
+        assert_eq!(sanitize_component("..."), "...");
+        assert_eq!(sanitize_component("pi5"), "pi5");
     }
 
     #[test]

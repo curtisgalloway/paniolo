@@ -47,6 +47,9 @@ serde_json = "1"
 # --- direct DTR control fallback when serialcap isn't running ------------
 serialport = "4"
 
+# --- atomic file writes (lab file, state, shipped slices, capture output) -
+tempfile = "3"
+
 # --- process/identity primitives behind cli/src/platform.rs --------------
 # uid for the per-user runtime + ControlMaster dirs, and the daemon pid
 # probes. Each platform gets only what it can use: libc on Unix, the Win32
@@ -59,9 +62,6 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
 ] }
-
-[dev-dependencies]
-tempfile = "3"
 
 [profile.release]
 opt-level = 3

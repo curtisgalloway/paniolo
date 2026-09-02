@@ -34,6 +34,8 @@ use serde::Deserialize;
 pub const LOCAL: &str = "local";
 pub const DEFAULT_HOST_IP: &str = "192.168.99.1";
 pub const VALID_SENSE_SIGNALS: [&str; 4] = ["cts", "dsr", "dcd", "ri"];
+/// The `video.ocr_mode` values (see [`VideoChannel::ocr_mode`]).
+pub const VALID_OCR_MODES: [&str; 2] = ["text", "gui"];
 
 /// The lab file is malformed or a mutation would make it invalid.
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +44,39 @@ pub struct LabError(pub String);
 
 fn lab_err<T>(msg: impl Into<String>) -> Result<T, LabError> {
     Err(LabError(msg.into()))
+}
+
+/// What a target, host, or serial interface name may look like. Names become
+/// path components (`<runtime-base>/serialcap/<target>/`,
+/// `~/.local/share/paniolo/<target>/`), daemon query values
+/// (`?interface=<name>`), and positional arguments to a re-exec'd `paniolo`
+/// on a control host, so they are confined to what survives all three
+/// unquoted — and a leading `-` is refused because that positional would be
+/// read as an option.
+pub const NAME_RULE: &str =
+    "letters, digits, `.`, `_` and `-` only; not `.` or `..`; not starting with `-`";
+
+/// Whether `name` satisfies [`NAME_RULE`].
+pub fn is_valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Reject a `what` (target/host/serial interface) name that fails
+/// [`NAME_RULE`], saying which rule and what the name was for. Applied by the
+/// editor when a name is chosen (`add`, `rename`, `set`), not on load, so a
+/// hand-written lab with an odd name still reads.
+pub fn validate_name(what: &str, name: &str) -> Result<(), LabError> {
+    if is_valid_name(name) {
+        Ok(())
+    } else {
+        lab_err(format!("invalid {what} name '{name}': {NAME_RULE}"))
+    }
 }
 
 fn default_baud() -> i64 {
@@ -373,6 +408,7 @@ impl Lab {
         if let Some(v) = &t.video {
             let mut f = Vec::new();
             push_opt(&mut f, "device", &v.device);
+            push_opt(&mut f, "ocr_mode", &v.ocr_mode);
             channels.push(ResolvedChannel {
                 kind: ChannelKind::Video,
                 name: "video".into(),
@@ -444,10 +480,13 @@ fn push_opt(fields: &mut Vec<(&'static str, String)>, key: &'static str, v: &Opt
 /// Resolve the host a command should run on, given the channel it touches.
 ///
 /// Singleton kinds use that channel's host (else the target default). Serial
-/// with a name uses that interface's host; serial without a name uses the common
-/// host of all interfaces, erroring if they span hosts (the `serial watch` case,
-/// where the daemon owns every interface). A missing channel falls back to the
-/// target's default host so the body can report it.
+/// with a name uses that interface's host — a name the target does not have
+/// is an error here, before anything is dispatched, rather than a silent
+/// fall-through to the default host (where `console -i typo` used to open a
+/// dashboard on the wrong interface); serial without a name uses the common
+/// host of all interfaces, erroring if they span hosts (the `serial watch`
+/// case, where the daemon owns every interface). A missing channel *kind*
+/// falls back to the target's default host so the body can report it.
 pub fn channel_host(
     rt: &ResolvedTarget,
     kind: ChannelKind,
@@ -460,11 +499,22 @@ pub fn channel_host(
             .filter(|c| c.kind == ChannelKind::Serial)
             .collect();
         if let Some(n) = serial_name {
-            return Ok(serials
+            return serials
                 .iter()
                 .find(|c| c.name == n)
                 .map(|c| c.host.clone())
-                .unwrap_or_else(|| rt.default_host.clone()));
+                .ok_or_else(|| {
+                    let have: Vec<&str> = serials.iter().map(|c| c.name.as_str()).collect();
+                    LabError(format!(
+                        "target '{}' has no serial interface '{n}' (have: {})",
+                        rt.name,
+                        if have.is_empty() {
+                            "none".to_string()
+                        } else {
+                            have.join(", ")
+                        }
+                    ))
+                });
         }
         if serials.is_empty() {
             return Ok(rt.default_host.clone());
@@ -508,16 +558,60 @@ pub fn validate(lab: &Lab) -> Result<(), LabError> {
     let mut declared: BTreeSet<&str> = lab.hosts.keys().map(String::as_str).collect();
     declared.insert(LOCAL);
     for (name, h) in &lab.hosts {
+        if name.is_empty() {
+            return lab_err("a host has an empty name");
+        }
         if h.ssh.trim().is_empty() {
             return lab_err(format!("host '{name}': missing required 'ssh' field"));
         }
+        // `local` is the sentinel for this machine and resolves as local
+        // whatever its `ssh` says; a declared [hosts.local] with a real
+        // destination would silently run its channels here instead.
+        if name == LOCAL && h.ssh != LOCAL {
+            return lab_err(format!(
+                "host '{LOCAL}' means this machine and cannot have ssh = \"{}\"; \
+                 give the remote host another name",
+                h.ssh
+            ));
+        }
+        // These become ssh arguments; one starting with `-` would be read as
+        // an option (`-oProxyCommand=…`) rather than a destination or path.
+        for (field, value) in [
+            ("ssh", Some(h.ssh.as_str())),
+            ("identity", h.identity.as_deref()),
+            ("control_path", h.control_path.as_deref()),
+        ] {
+            if value.is_some_and(|v| v.starts_with('-')) {
+                return lab_err(format!(
+                    "host '{name}': {field} '{}' must not begin with '-'",
+                    value.unwrap_or_default()
+                ));
+            }
+        }
     }
     for (name, t) in &lab.targets {
+        if name.is_empty() {
+            return lab_err("a target has an empty name");
+        }
         let default_host = t.default_host();
         check_host_ref(default_host, &declared, &format!("target '{name}'"))?;
         if let Some(nb) = &t.netboot {
             let h = nb.host.as_deref().unwrap_or(default_host);
             check_host_ref(h, &declared, &format!("target '{name}' netboot"))?;
+            if let Some(ip) = &nb.host_ip {
+                if ip.parse::<std::net::Ipv4Addr>().is_err() {
+                    return lab_err(format!(
+                        "target '{name}' netboot: host_ip '{ip}' is not an IPv4 address"
+                    ));
+                }
+            }
+            if let Some(port) = &nb.http_port {
+                if !matches!(port.parse::<u16>(), Ok(p) if p != 0) {
+                    return lab_err(format!(
+                        "target '{name}' netboot: http_port '{port}' is not a port number (1-65535)"
+                    ));
+                }
+            }
         }
         if let Some(p) = &t.power {
             let h = p.host.as_deref().unwrap_or(default_host);
@@ -526,6 +620,14 @@ pub fn validate(lab: &Lab) -> Result<(), LabError> {
         if let Some(v) = &t.video {
             let h = v.host.as_deref().unwrap_or(default_host);
             check_host_ref(h, &declared, &format!("target '{name}' video"))?;
+            if let Some(mode) = &v.ocr_mode {
+                if !VALID_OCR_MODES.contains(&mode.as_str()) {
+                    return lab_err(format!(
+                        "target '{name}' video: invalid ocr_mode '{mode}' (valid: {})",
+                        VALID_OCR_MODES.join(", ")
+                    ));
+                }
+            }
         }
         if let Some(hid) = &t.hid {
             let h = hid.host.as_deref().unwrap_or(default_host);
@@ -568,6 +670,35 @@ pub fn validate(lab: &Lab) -> Result<(), LabError> {
                 &declared,
                 &format!("target '{name}' serial '{}'", s.name),
             )?;
+        }
+    }
+    Ok(())
+}
+
+/// [`validate`], plus the cross-references a *write* must not leave dangling:
+/// a `power.serial_interface` has to name one of the target's own serial
+/// interfaces. Applied by the editor before every save and not on load, so a
+/// lab that already carries a stale reference still loads (`doctor` reports
+/// it) — but no CLI edit may create one, or remove the interface it names.
+pub fn validate_for_save(lab: &Lab) -> Result<(), LabError> {
+    validate(lab)?;
+    for (name, t) in &lab.targets {
+        let Some(si) = t.power.as_ref().and_then(|p| p.serial_interface.as_deref()) else {
+            continue;
+        };
+        if !t.serial.iter().any(|s| s.name == si) {
+            let have: Vec<&str> = t.serial.iter().map(|s| s.name.as_str()).collect();
+            return lab_err(format!(
+                "target '{name}': power.serial_interface '{si}' names no serial interface \
+                 of this target (have: {}); point it at one with \
+                 `paniolo power set -t {name} --serial-interface <name>`, or remove the \
+                 power channel first",
+                if have.is_empty() {
+                    "none".to_string()
+                } else {
+                    have.join(", ")
+                }
+            ));
         }
     }
     Ok(())
@@ -797,5 +928,137 @@ mod tests {
     fn validate_rejects_missing_ssh() {
         // ssh is a required field, so this fails at deserialize time.
         assert!(parse("[hosts.bench1]\n").is_err());
+    }
+
+    /// `[hosts.local]` with a real destination would resolve as *this*
+    /// machine (the name is the sentinel) while claiming to be remote.
+    #[test]
+    fn validate_rejects_a_local_host_with_a_remote_ssh() {
+        let e = parse("[hosts.local]\nssh = \"u@bench1\"\n").unwrap_err();
+        assert!(e.0.contains("host 'local' means this machine"), "{}", e.0);
+        // The redundant-but-harmless spelling still parses.
+        assert!(parse("[hosts.local]\nssh = \"local\"\n").is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_empty_host_and_target_names() {
+        let e = parse("[hosts.\"\"]\nssh = \"u@b\"\n").unwrap_err();
+        assert!(e.0.contains("host has an empty name"), "{}", e.0);
+        let e = parse("[targets.\"\"]\n").unwrap_err();
+        assert!(e.0.contains("target has an empty name"), "{}", e.0);
+    }
+
+    /// `ssh`, `identity` and `control_path` all end up as ssh arguments; a
+    /// value starting with `-` would be parsed as an option there.
+    #[test]
+    fn validate_rejects_host_fields_that_look_like_options() {
+        for (field, toml) in [
+            ("ssh", "[hosts.b]\nssh = \"-oProxyCommand=x\"\n"),
+            ("identity", "[hosts.b]\nssh = \"u@b\"\nidentity = \"-x\"\n"),
+            (
+                "control_path",
+                "[hosts.b]\nssh = \"u@b\"\ncontrol_path = \"-x\"\n",
+            ),
+        ] {
+            let e = parse(toml).unwrap_err();
+            assert!(
+                e.0.contains(&format!("{field} '-")) && e.0.contains("must not begin with '-'"),
+                "{field}: {}",
+                e.0
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_bad_host_ip_and_http_port() {
+        let e = parse("[targets.t]\n[targets.t.netboot]\nhost_ip = \"192.168.99\"\n").unwrap_err();
+        assert!(
+            e.0.contains("host_ip '192.168.99' is not an IPv4"),
+            "{}",
+            e.0
+        );
+        let e = parse("[targets.t]\n[targets.t.netboot]\nhost_ip = \"fe80::1\"\n").unwrap_err();
+        assert!(e.0.contains("not an IPv4"), "{}", e.0);
+        for bad in ["http", "0", "65536", "-1"] {
+            let e = parse(&format!(
+                "[targets.t]\n[targets.t.netboot]\nhttp_port = \"{bad}\"\n"
+            ))
+            .unwrap_err();
+            assert!(e.0.contains("is not a port number"), "{bad}: {}", e.0);
+        }
+        assert!(parse(
+            "[targets.t]\n[targets.t.netboot]\nhost_ip = \"192.168.99.1\"\nhttp_port = \"8080\"\n"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_unknown_ocr_mode() {
+        let e = parse("[targets.t]\n[targets.t.video]\nocr_mode = \"fast\"\n").unwrap_err();
+        assert!(e.0.contains("invalid ocr_mode 'fast'"), "{}", e.0);
+        for ok in VALID_OCR_MODES {
+            assert!(parse(&format!(
+                "[targets.t]\n[targets.t.video]\nocr_mode = \"{ok}\"\n"
+            ))
+            .is_ok());
+        }
+    }
+
+    /// A dangling `power.serial_interface` still *loads* (so a lab edited by
+    /// hand can be repaired with the CLI) but must not be *saved*.
+    #[test]
+    fn validate_for_save_rejects_a_dangling_serial_interface() {
+        let dangling = parse(
+            "[targets.t]\n[targets.t.power]\nserial_interface = \"console\"\n\
+             [[targets.t.serial]]\nname = \"other\"\ndevice = \"/dev/a\"\n",
+        )
+        .unwrap();
+        let e = validate_for_save(&dangling).unwrap_err();
+        assert!(
+            e.0.contains("power.serial_interface 'console' names no serial interface"),
+            "{}",
+            e.0
+        );
+        assert!(e.0.contains("have: other"), "{}", e.0);
+        let fine = parse(
+            "[targets.t]\n[targets.t.power]\nserial_interface = \"console\"\n\
+             [[targets.t.serial]]\nname = \"console\"\ndevice = \"/dev/a\"\n",
+        )
+        .unwrap();
+        validate_for_save(&fine).unwrap();
+    }
+
+    /// Naming an interface the target does not have is an error at
+    /// resolution, not a fall-through to the default host.
+    #[test]
+    fn channel_host_rejects_an_unknown_serial_interface() {
+        let rt = multihost().resolved_target("fortune").unwrap();
+        assert_eq!(
+            channel_host(&rt, ChannelKind::Serial, Some("console")).unwrap(),
+            "bench1"
+        );
+        let e = channel_host(&rt, ChannelKind::Serial, Some("typo")).unwrap_err();
+        assert!(
+            e.0.contains("no serial interface 'typo' (have: console)"),
+            "{}",
+            e.0
+        );
+        // No serial at all, none asked for by name: still the default host,
+        // so the command body can say what is missing.
+        let lab = parse("[targets.bare]\n").unwrap();
+        let rt = lab.resolved_target("bare").unwrap();
+        assert_eq!(channel_host(&rt, ChannelKind::Serial, None).unwrap(), LOCAL);
+    }
+
+    #[test]
+    fn name_rule_accepts_plain_names_and_rejects_the_rest() {
+        for ok in ["pi5", "lab-nuc-1", "bench_2", "v1.2", "a"] {
+            assert!(is_valid_name(ok), "{ok}");
+        }
+        for bad in ["", ".", "..", "-x", "a b", "a/b", "a\tb", "é", "a:b", "x\0"] {
+            assert!(!is_valid_name(bad), "{bad:?}");
+        }
+        let e = validate_name("target", "a b").unwrap_err();
+        assert!(e.0.starts_with("invalid target name 'a b':"), "{}", e.0);
     }
 }

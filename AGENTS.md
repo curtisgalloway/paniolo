@@ -353,6 +353,26 @@ Python tree below:
   NEW` takes two bare positionals and no `-t` (it renames the target itself,
   carrying all channels and lab-file comments; config-only — running daemons
   keep their runtime dirs under the old name, so `stop` and re-`watch` them).
+- **Name rule**: target, host, and serial interface names are constrained to
+  `model::NAME_RULE` — letters, digits, `.`, `_`, `-`; never `.` or `..`;
+  never leading `-` (it would read as an option where the name becomes a
+  positional). Enforced by `model::validate_name` in the labfile editor at
+  `add`/`rename`/`set` time, not on load — a hand-written lab with an odd name
+  still reads, but the CLI never writes one. Names become path components
+  (`state::target_dir`, `daemons::runtime_rel`/`sanitize_component`), so
+  anything that reaches a filesystem path from a name that predates this rule
+  is sanitized again, defensively, at that point.
+- **`video set --ocr-mode {text|gui}`** selects the OCR engine on Linux (see
+  [dev/ocr.md](docs/dev/ocr.md#linux-needs-two-engines-the-other-platforms-need-one));
+  unset is the platform default everywhere. The field travels with the video
+  channel through remote dispatch, same as `--device`.
+- **Env forwarding to a control host**: a fixed allowlist (`ssh::FORWARDED_ENV`
+  — today just `AMT_PASSWORD`) is carried across a non-interactive dispatch
+  (`run`/`run_passthrough`/`run_stdout_to`) over the remote command's stdin, so
+  it never appears in the control host's `ps` output; `run_interactive` (`serial
+  connect`, `adb shell`) forwards nothing — its stdin is the user's own
+  terminal. See
+  [distributed-control.md](docs/distributed-control.md#env-forwarding-to-a-control-host).
 - **`paniolo daemons`** is the unified daemon inventory: every discovery-file
   daemon under `/tmp/paniolo-<uid>/` (the per-target capture daemons listed as
   `serialcap[<target>]`, `hdmicap[<target>]`, `hid[<target>]`; plus host-singleton
@@ -387,7 +407,9 @@ cli/src/
   labfile.rs    toml_edit comment-preserving lab editor (the write side)
   dispatch.rs   per-channel re-exec: slice building/shipping, maybe_dispatch,
                 run_subcommand, remote_daemon_endpoint (port + token over ssh)
-  ssh.rs        SSH transport: ControlMaster run/passthrough/interactive, forward (tunnels)
+  ssh.rs        SSH transport: ControlMaster run/passthrough/interactive, forward
+                (tunnels); FORWARDED_ENV + stdin_prelude carry an allowlisted var
+                (AMT_PASSWORD) to a non-interactive remote command over its stdin
   daemons.rs    shared daemon contract: find_binary (libexec → PATH →
                 legacy ~/.cargo/bin), hook_path, daemon.json discovery
                 (Endpoint = port + token; get/post attach the bearer header,
@@ -419,8 +441,14 @@ cli/src/
 `PANIOLO_STATE_DIR` (`~/.config/paniolo/helpers/<name>/`, durable) and
 `PANIOLO_RUNTIME_DIR` (`/tmp/paniolo-<uid>/<name>/`, discovery/locks/logs) —
 directories pre-created — on every helper invocation: hook commands (named by
-the hook's program basename, see `hook_helper_name`), `paniolo helper`
-passthrough, and daemon spawns. The per-target capture daemons
+the hook's program basename, see `hook_helper_name`; it skips leading
+`VAR=value` assignments — `AMT_PASSWORD=... amt-tool cycle` names `amt-tool`,
+not the assignment — and sanitizes the result the same way a target name does,
+since a hook string is hand-written and never runs through
+`model::validate_name`), `paniolo helper` passthrough (sanitized the same way
+on its host-singleton branch), and daemon spawns. `doctor.rs` probes a hook's
+program the same way (`daemons::first_program_token`), so a credential-prefixed
+hook isn't misreported as a missing binary. The per-target capture daemons
 (serialcap/hdmicap/hid) append a `/<target>` segment to their runtime dir
 (`/tmp/paniolo-<uid>/<name>/<target>/`) so multiple targets capture concurrently
 on one host; host-singleton helpers (zigplug/cambrionix/netbootd) use the base

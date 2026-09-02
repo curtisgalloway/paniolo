@@ -60,7 +60,8 @@ reasoning to revisit if this is ever reopened:
    so the missing ones raise no signal to fall back on.
 
 `ocr_mode` exists because the choice cannot be inferred at runtime — see the
-confidence table below.
+confidence table below. Set it with `paniolo video set -t <target> --ocr-mode
+gui` (or `text`, the default) — see [video.md](../video.md#ocr).
 
 **No preprocessing for rapidocr.** The benchmark swept upscaling, inversion and
 binarisation: every variant was slower than `raw` and none more accurate. Unlike

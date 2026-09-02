@@ -110,7 +110,10 @@ pub fn send_input(
     data: &[u8],
     pace_ms: u32,
 ) -> Result<()> {
-    let mut path = format!("/input?interface={interface}");
+    // `interface` is a name from the lab file — percent-encode it so one
+    // containing `&` or `=` can't reshape the query string it's spliced into
+    // (Review low #3).
+    let mut path = format!("/input?interface={}", daemons::query_escape(interface));
     if pace_ms > 0 {
         path.push_str(&format!("&pace_ms={pace_ms}"));
     }
@@ -249,6 +252,36 @@ mod tests {
         assert_eq!(
             interface_arg(&ch("console", Some("cts"))),
             "console=/dev/ttyUSB0@115200:cts"
+        );
+    }
+
+    /// The interface name reaches `/input` percent-encoded — checked against
+    /// a real loopback listener, not by inspecting the formatted string
+    /// (Review low #3): unescaped, `a b&c` would reshape the query string
+    /// into extra, wrong parameters.
+    #[test]
+    fn send_input_percent_encodes_the_interface() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = s.read(&mut buf).unwrap();
+            let _ =
+                s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+        let ep = daemons::Endpoint {
+            pid: 1,
+            port,
+            token: None,
+        };
+        send_input(&ep, "a b&c", b"hi", 0).unwrap();
+        let req = server.join().unwrap();
+        assert!(
+            req.starts_with("POST /input?interface=a%20b%26c HTTP/1.1"),
+            "{req}"
         );
     }
 

@@ -47,7 +47,7 @@ impl LabFile {
         let doc = text
             .parse::<DocumentMut>()
             .map_err(|e| LabError(e.to_string()))?;
-        validate_doc(&doc)?;
+        model::validate(&lab_of(&doc)?)?;
         Ok(Self {
             path: path.to_path_buf(),
             doc,
@@ -63,8 +63,14 @@ impl LabFile {
         }
     }
 
+    /// Validate (with the save-time cross-reference rules, see
+    /// [`model::validate_for_save`]) and write the document. The write is
+    /// atomic — a sibling temp file renamed into place — so a reader never
+    /// sees a half-written lab and a crash leaves the old one intact; and it
+    /// resolves the path first, so a lab that is a symlink into a git
+    /// checkout keeps being one (see [`crate::platform::write_atomic`]).
     pub fn save(&self) -> Result<(), LabError> {
-        validate_doc(&self.doc)?;
+        model::validate_for_save(&lab_of(&self.doc)?)?;
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| LabError(format!("{}: {e}", parent.display())))?;
@@ -78,7 +84,7 @@ impl LabFile {
                 out = format!("# {h}\n\n{out}");
             }
         }
-        std::fs::write(&self.path, out)
+        crate::platform::write_atomic(&self.path, out.as_bytes())
             .map_err(|e| LabError(format!("{}: {e}", self.path.display())))
     }
 
@@ -95,7 +101,8 @@ impl LabFile {
         control_path: Option<&str>,
         paniolo_cmd: Option<&str>,
     ) -> Result<(), LabError> {
-        let hosts = super_table(&mut self.doc, "hosts");
+        model::validate_name("host", name)?;
+        let hosts = super_table(&mut self.doc, "hosts")?;
         if hosts.contains_key(name) {
             return lab_err(format!("host '{name}' already exists"));
         }
@@ -121,6 +128,7 @@ impl LabFile {
         control_path: Option<&str>,
         paniolo_cmd: Option<&str>,
     ) -> Result<(), LabError> {
+        model::validate_name("host", name)?;
         let t = self
             .doc
             .get_mut("hosts")
@@ -178,7 +186,8 @@ impl LabFile {
         host: Option<&str>,
         description: Option<&str>,
     ) -> Result<(), LabError> {
-        let targets = super_table(&mut self.doc, "targets");
+        model::validate_name("target", name)?;
+        let targets = super_table(&mut self.doc, "targets")?;
         if targets.contains_key(name) {
             return lab_err(format!("target '{name}' already exists"));
         }
@@ -195,6 +204,7 @@ impl LabFile {
         host: Option<&str>,
         description: Option<&str>,
     ) -> Result<(), LabError> {
+        model::validate_name("target", name)?;
         let t = self.target_mut(name)?;
         set_opt(t, "host", host);
         if description.is_some() {
@@ -221,6 +231,7 @@ impl LabFile {
     /// Rename a target, carrying every channel table (and any hand-written
     /// comments inside them) to the new name.
     pub fn rename_target(&mut self, old: &str, new: &str) -> Result<(), LabError> {
+        model::validate_name("target", new)?;
         let targets = self
             .doc
             .get_mut("targets")
@@ -252,6 +263,7 @@ impl LabFile {
         power_button: bool,
         host: Option<&str>,
     ) -> Result<(), LabError> {
+        model::validate_name("serial interface", name)?;
         let t = self.target_mut(target)?;
         if !t.contains_key("serial") {
             t.insert("serial", Item::ArrayOfTables(ArrayOfTables::new()));
@@ -290,6 +302,7 @@ impl LabFile {
         power_button: Option<bool>,
         host: Option<&str>,
     ) -> Result<(), LabError> {
+        model::validate_name("serial interface", name)?;
         let t = self.target_mut(target)?;
         let aot = t
             .get_mut("serial")
@@ -430,9 +443,14 @@ impl LabFile {
         &mut self,
         target: &str,
         device: Option<&str>,
+        ocr_mode: Option<&str>,
         host: Option<&str>,
     ) -> Result<(), LabError> {
-        self.set_singleton(target, "video", &[("device", device), ("host", host)])
+        self.set_singleton(
+            target,
+            "video",
+            &[("device", device), ("ocr_mode", ocr_mode), ("host", host)],
+        )
     }
 
     pub fn remove_video(&mut self, target: &str) -> Result<(), LabError> {
@@ -484,23 +502,44 @@ impl LabFile {
     }
 
     fn target_mut(&mut self, name: &str) -> Result<&mut Table, LabError> {
-        self.doc
+        let missing = || LabError(format!("no target '{name}'"));
+        let targets = self
+            .doc
             .get_mut("targets")
-            .and_then(|i| i.as_table_mut())
-            .and_then(|t| t.get_mut(name))
-            .and_then(|i| i.as_table_mut())
-            .ok_or_else(|| LabError(format!("no target '{name}'")))
+            .ok_or_else(missing)?
+            .as_table_mut()
+            .ok_or_else(|| not_a_standard_table("targets"))?;
+        targets
+            .get_mut(name)
+            .ok_or_else(missing)?
+            .as_table_mut()
+            .ok_or_else(|| not_a_standard_table(&format!("targets.{name}")))
     }
 }
 
+/// The editor works on standard `[key]` tables only. A valid lab may spell
+/// the same thing as an inline table (`hosts = { b1 = { ssh = "…" } }`);
+/// `toml_edit` represents that as a value, not a `Table`, and rewriting it
+/// would destroy the author's layout — so it is reported, never panicked on
+/// (this used to be an `expect("super table")`).
+fn not_a_standard_table(key: &str) -> LabError {
+    let leaf = key.rsplit('.').next().unwrap_or(key);
+    LabError(format!(
+        "`{key}` is not a standard table — the CLI cannot edit the inline form \
+         (`{leaf} = {{ … }}`); rewrite it as a `[{key}]` table by hand"
+    ))
+}
+
 /// Get or create an implicit super-table so children render as `[key.child]`.
-fn super_table<'a>(doc: &'a mut DocumentMut, key: &str) -> &'a mut Table {
+fn super_table<'a>(doc: &'a mut DocumentMut, key: &str) -> Result<&'a mut Table, LabError> {
     if doc.get(key).is_none() {
         let mut t = Table::new();
         t.set_implicit(true);
         doc.insert(key, Item::Table(t));
     }
-    doc[key].as_table_mut().expect("super table")
+    doc[key]
+        .as_table_mut()
+        .ok_or_else(|| not_a_standard_table(key))
 }
 
 /// Set a key when the value is present; leave it untouched otherwise.
@@ -510,10 +549,10 @@ fn set_opt(t: &mut Table, key: &str, v: Option<&str>) {
     }
 }
 
-/// Validate by deserializing the live document and running the shared rulebook.
-fn validate_doc(doc: &DocumentMut) -> Result<(), LabError> {
-    let lab: Lab = toml::from_str(&doc.to_string()).map_err(|e| LabError(e.to_string()))?;
-    model::validate(&lab)
+/// The typed view of the live document, for running the shared rulebook
+/// ([`model::validate`] on load, [`model::validate_for_save`] on save).
+fn lab_of(doc: &DocumentMut) -> Result<Lab, LabError> {
+    toml::from_str(&doc.to_string()).map_err(|e| LabError(e.to_string()))
 }
 
 #[cfg(test)]
@@ -791,5 +830,191 @@ mod tests {
         lf.save().unwrap();
         let lab = model::load(&path).unwrap();
         assert!(lab.targets["t"].serial.is_empty());
+    }
+
+    #[test]
+    fn set_video_round_trips_ocr_mode_and_keeps_it_across_a_device_change() {
+        let (_d, path) = tmp();
+        let mut lf = LabFile::create(&path);
+        lf.add_target("t", None, None).unwrap();
+        lf.set_video("t", Some("/dev/video0"), Some("gui"), None)
+            .unwrap();
+        lf.save().unwrap();
+        let v = model::load(&path).unwrap().targets["t"]
+            .video
+            .clone()
+            .unwrap();
+        assert_eq!(v.device.as_deref(), Some("/dev/video0"));
+        assert_eq!(v.ocr_mode.as_deref(), Some("gui"));
+        // Changing only the device leaves the mode alone.
+        lf.set_video("t", Some("/dev/video1"), None, None).unwrap();
+        lf.save().unwrap();
+        let v = model::load(&path).unwrap().targets["t"]
+            .video
+            .clone()
+            .unwrap();
+        assert_eq!(v.device.as_deref(), Some("/dev/video1"));
+        assert_eq!(v.ocr_mode.as_deref(), Some("gui"));
+        // An unknown mode is refused at save, like any other bad field.
+        lf.set_video("t", None, Some("fast"), None).unwrap();
+        assert!(lf.save().unwrap_err().0.contains("invalid ocr_mode 'fast'"));
+    }
+
+    /// `save` replaces the file by rename rather than truncating and
+    /// rewriting it in place — that is what makes a concurrent reader (or a
+    /// crash mid-write) see either the old lab or the new one, never an
+    /// empty or partial file. On Unix the replacement is a new inode.
+    #[cfg(unix)]
+    #[test]
+    fn save_replaces_the_file_by_rename() {
+        use std::os::unix::fs::MetadataExt;
+        let (_d, path) = tmp();
+        let mut lf = LabFile::create(&path);
+        lf.add_target("t", None, None).unwrap();
+        lf.save().unwrap();
+        let before = std::fs::metadata(&path).unwrap().ino();
+        lf.add_target("u", None, None).unwrap();
+        lf.save().unwrap();
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().ino(),
+            before,
+            "the lab must be replaced whole, not rewritten in place"
+        );
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("[targets.u]"));
+        // No temp file left beside it.
+        let names: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["lab.toml"], "{names:?}");
+    }
+
+    /// The lab file is often a symlink into a git checkout. Saving must write
+    /// the checkout's file *through* the link and leave the link standing —
+    /// a rename onto the link itself would replace it with a plain file and
+    /// silently detach the lab from version control.
+    #[cfg(unix)]
+    #[test]
+    fn save_through_a_symlink_keeps_the_link_and_updates_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("checkout").join("lab.toml");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, "# in git\n[targets.old]\n").unwrap();
+        let link = dir.path().join("lab.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mut lf = LabFile::load(&link).unwrap();
+        lf.add_target("new", None, None).unwrap();
+        lf.save().unwrap();
+
+        let md = std::fs::symlink_metadata(&link).unwrap();
+        assert!(
+            md.file_type().is_symlink(),
+            "the link was replaced by a file"
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), real);
+        let text = std::fs::read_to_string(&real).unwrap();
+        assert!(text.contains("# in git"), "{text}");
+        assert!(text.contains("[targets.new]"), "{text}");
+    }
+
+    /// `hosts = { … }` is valid TOML the model reads fine, but `toml_edit`
+    /// holds it as a value, not a table. Editing it used to hit
+    /// `expect("super table")` and abort; now it is a lab error that says
+    /// what to rewrite.
+    #[test]
+    fn inline_hosts_table_is_an_error_not_a_panic() {
+        let (_d, path) = tmp();
+        std::fs::write(&path, "hosts = { b1 = { ssh = \"u@b1\" } }\n").unwrap();
+        let mut lf = LabFile::load(&path).unwrap();
+        let e = lf
+            .add_host("b2", "u@b2", None, None, None, None, None)
+            .unwrap_err();
+        assert!(e.0.contains("`hosts` is not a standard table"), "{}", e.0);
+        assert!(e.0.contains("[hosts]"), "{}", e.0);
+    }
+
+    #[test]
+    fn inline_target_table_is_an_error_not_a_panic() {
+        let (_d, path) = tmp();
+        std::fs::write(
+            &path,
+            "[targets]\nt = { description = \"inline\" }\n[targets.plain]\n",
+        )
+        .unwrap();
+        let mut lf = LabFile::load(&path).unwrap();
+        let e = lf
+            .set_video("t", Some("/dev/video0"), None, None)
+            .unwrap_err();
+        assert!(
+            e.0.contains("`targets.t` is not a standard table"),
+            "{}",
+            e.0
+        );
+        assert!(e.0.contains("[targets.t]"), "{}", e.0);
+        // A sibling written the standard way is still editable.
+        lf.set_video("plain", Some("/dev/video0"), None, None)
+            .unwrap();
+        // And a whole inline `targets` is reported at that level.
+        std::fs::write(&path, "targets = { t = { } }\n").unwrap();
+        let mut lf = LabFile::load(&path).unwrap();
+        let e = lf.update_target("t", None, Some("x")).unwrap_err();
+        assert!(e.0.contains("`targets` is not a standard table"), "{}", e.0);
+    }
+
+    /// Names are checked where they are chosen. A bad name never reaches the
+    /// document, so the file on disk stays loadable by every path.
+    #[test]
+    fn add_rename_and_set_reject_invalid_names() {
+        let (_d, path) = tmp();
+        let mut lf = LabFile::create(&path);
+        for bad in ["", ".", "..", "-x", "a b", "a/b"] {
+            let e = lf
+                .add_host(bad, "u@b", None, None, None, None, None)
+                .unwrap_err();
+            assert!(e.0.starts_with("invalid host name"), "{bad:?}: {}", e.0);
+            let e = lf.add_target(bad, None, None).unwrap_err();
+            assert!(e.0.starts_with("invalid target name"), "{bad:?}: {}", e.0);
+        }
+        lf.add_target("ok", None, None).unwrap();
+        let e = lf.rename_target("ok", "not ok").unwrap_err();
+        assert!(e.0.starts_with("invalid target name 'not ok'"), "{}", e.0);
+        let e = lf
+            .add_serial("ok", "con sole", "/dev/a", 115200, None, false, None)
+            .unwrap_err();
+        assert!(
+            e.0.starts_with("invalid serial interface name 'con sole'"),
+            "{}",
+            e.0
+        );
+        let e = lf.update_target("../x", None, Some("d")).unwrap_err();
+        assert!(e.0.starts_with("invalid target name"), "{}", e.0);
+        // Nothing bad landed in the document.
+        lf.save().unwrap();
+        let lab = model::load(&path).unwrap();
+        assert_eq!(lab.target_names(), vec!["ok"]);
+        assert!(lab.hosts.is_empty());
+    }
+
+    /// A `power.serial_interface` must name one of the target's interfaces
+    /// at save time — whether the reference was just set, or the interface
+    /// it names was just removed.
+    #[test]
+    fn save_refuses_a_dangling_power_serial_interface() {
+        let (_d, path) = tmp();
+        let mut lf = LabFile::create(&path);
+        lf.add_target("t", None, None).unwrap();
+        lf.set_power("t", None, None, None, None, Some("console"), None)
+            .unwrap();
+        let e = lf.save().unwrap_err();
+        assert!(e.0.contains("power.serial_interface 'console'"), "{}", e.0);
+        lf.add_serial("t", "console", "/dev/a", 115200, None, false, None)
+            .unwrap();
+        lf.save().unwrap();
+        lf.remove_serial("t", "console").unwrap();
+        let e = lf.save().unwrap_err();
+        assert!(e.0.contains("power.serial_interface 'console'"), "{}", e.0);
     }
 }

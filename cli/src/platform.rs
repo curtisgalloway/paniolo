@@ -180,6 +180,54 @@ pub fn make_executable(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Write `data` to `path` through a sibling temp file and a rename, so a
+/// reader never sees a truncated or half-written file and a crash mid-write
+/// leaves the old contents intact.
+///
+/// `path` is resolved first: the lab file is commonly a symlink into a git
+/// checkout, and a rename onto the *link* would replace it with a plain file
+/// and silently detach the lab from version control. The temp file is
+/// created beside the resolved target (rename needs one filesystem), and an
+/// existing file's permissions are carried over — the temp file starts
+/// owner-only, which is not what a lab in a shared checkout was.
+pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let resolved = match std::fs::canonicalize(path) {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let name = path.file_name().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{} has no file name", path.display()),
+                )
+            })?;
+            std::fs::canonicalize(parent)?.join(name)
+        }
+        Err(e) => return Err(e),
+    };
+    let dir = resolved.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} has no parent directory", resolved.display()),
+        )
+    })?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".")
+        .suffix(".tmp")
+        .tempfile_in(dir)?;
+    tmp.write_all(data)?;
+    tmp.as_file().sync_all()?;
+    if let Ok(md) = std::fs::metadata(&resolved) {
+        std::fs::set_permissions(tmp.path(), md.permissions())?;
+    }
+    tmp.persist(&resolved).map_err(|e| e.error)?;
+    Ok(())
+}
+
 // ── process lifecycle ───────────────────────────────────────────────────────
 
 /// A pid that could not name a real process.
@@ -562,5 +610,47 @@ mod tests {
         assert!(!is_private_dir(&link));
         let _ = std::fs::remove_file(&link);
         let _ = std::fs::remove_dir_all(&real);
+    }
+
+    /// `write_atomic` replaces the destination by rename rather than
+    /// truncating it in place — a concurrent reader (`state::load_netboot_state`,
+    /// a lab load) sees either the old content or the new content whole, never
+    /// a partial write, and a crash mid-write leaves the previous file intact.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_replaces_the_file_by_rename() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        write_atomic(&path, b"first").unwrap();
+        let before = std::fs::metadata(&path).unwrap().ino();
+        write_atomic(&path, b"second, and longer than the first payload").unwrap();
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().ino(),
+            before,
+            "the file must be replaced whole, not rewritten in place"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "second, and longer than the first payload"
+        );
+        // No temp file left beside it.
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["state.json"], "{names:?}");
+    }
+
+    /// A relative, nonexistent destination in the current directory is still
+    /// resolved and written — `write_atomic` must not assume `path` already
+    /// exists to find where to put the temp file.
+    #[test]
+    fn write_atomic_creates_a_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.json");
+        assert!(!path.exists());
+        write_atomic(&path, b"{}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
     }
 }

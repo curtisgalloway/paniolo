@@ -133,6 +133,24 @@ paniolo video read [target-machine]            # OCR the current frame, text to 
 paniolo video read --stable [--timeout <ms>]   # wait for a steady frame first
 ```
 
+**GUI screens on Linux** get more accurate OCR from a different engine than
+console/firmware screens do — see
+[dev/ocr.md](dev/ocr.md#linux-needs-two-engines-the-other-platforms-need-one)
+for the accuracy numbers and why. Ask for it per target:
+
+```bash
+paniolo video set -t target-machine --device "0x8300000534d2109" --ocr-mode gui
+paniolo video set -t target-machine --ocr-mode text   # back to the platform default
+```
+
+`--ocr-mode` is `text` (the platform default) or `gui`; leaving it unset is the
+same as `text`. It only changes anything on Linux — macOS and Windows already
+use their one native engine regardless. Setting it on a target whose video
+channel lives on a remote control host still works: the field travels with the
+channel when paniolo re-execs there, the same as `--device`. `paniolo setup`
+only builds the ~317 MB `rapidocr` venv when some target in the active lab has
+`--ocr-mode gui` set — see dev/ocr.md for why it's opt-in.
+
 `read` wraps the running daemon's `GET /ocr` endpoint (also reachable via the
 OCR button on the [web dashboard](dashboard.md), or directly with the token
 from the discovery file:
