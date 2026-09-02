@@ -1061,6 +1061,7 @@ mod tests {
 
     // ── pty consoles (a VM's serial port) ───────────────────────────────────
 
+    #[cfg(unix)]
     #[test]
     fn is_pty_recognizes_platform_pty_paths() {
         assert!(is_pty("/dev/ttys006"), "macOS pty slave");
@@ -1083,6 +1084,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn tmp_dir(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("serialcap-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
@@ -1279,6 +1281,7 @@ mod tests {
 
     /// Wait until the client-side stream has carried `needle`, returning
     /// everything received so far.
+    #[cfg(unix)]
     async fn recv_until(rx: &mut broadcast::Receiver<Bytes>, needle: &[u8]) -> Vec<u8> {
         let mut got = Vec::new();
         loop {
