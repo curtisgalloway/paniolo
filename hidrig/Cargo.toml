@@ -38,7 +38,6 @@ futures-util = "0.3"
 
 # --- daemon plumbing + client ----------------------------------------------
 fs2 = "0.4"
-dirs = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
