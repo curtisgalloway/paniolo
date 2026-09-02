@@ -85,8 +85,13 @@ paniolo netboot stop  [target-machine]
 `start` assigns the static `host_ip` to the interface, then launches paniolo's
 own **DHCP + TFTP + HTTP server** — the single `netbootd` binary (Rust), serving
 all three protocols from one background process. No external daemons (`dnsmasq`,
-`tftp-now`) are required at runtime. `stop` sends SIGTERM (which netbootd
-handles as a clean shutdown, same as Ctrl-C) and clears the state file.
+`tftp-now`) are required at runtime. `stop` sends SIGTERM (via `sudo kill`
+when the daemon is root's), waits up to 3 s, SIGKILLs a holdout and waits 2 s
+more, then clears the state file and restores the interface. It only signals
+a pid whose command line still names `netbootd` — a recorded pid the kernel
+has since recycled is just forgotten — and if the daemon survives even the
+SIGKILL, `stop` fails and keeps the state file rather than report a stop that
+did not happen.
 
 **`start` confirms the daemon came up.** netbootd validates its configuration
 and binds every listener *before* it serves anything, so a port already in use,

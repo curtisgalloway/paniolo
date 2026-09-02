@@ -83,14 +83,29 @@ pub fn is_pid_alive(pid: i32) -> bool {
     crate::platform::pid_alive(pid)
 }
 
-/// The full command line of `pid`, or empty on failure.
-fn pid_cmdline(pid: i32) -> String {
+/// The full command line of `pid`, or empty on failure. On Windows it is the
+/// image name only (`hdmicap.exe`, what `tasklist` reports), which is enough
+/// for every caller: they all match on a binary name.
+pub fn pid_cmdline(pid: i32) -> String {
     if cfg!(target_os = "macos") {
         std::process::Command::new("ps")
             .args(["-p", &pid.to_string(), "-o", "args="])
             .output()
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    } else if cfg!(windows) {
+        // `"hdmicap.exe","1234","Console","1","12,345 K"` — or an INFO line
+        // when nothing matches.
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                let text = String::from_utf8_lossy(&o.stdout);
+                let row = text.lines().find(|l| l.starts_with('"'))?;
+                Some(row.trim_start_matches('"').split('"').next()?.to_string())
+            })
             .unwrap_or_default()
     } else {
         std::fs::read(format!("/proc/{pid}/cmdline"))

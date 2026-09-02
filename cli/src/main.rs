@@ -200,8 +200,10 @@ enum DaemonsCmd {
     List,
     /// Stop daemons — named ones, or every one with --all.
     Stop {
-        /// Daemon names from `paniolo daemons` (e.g. serialcap, zigplug,
-        /// netbootd).
+        /// Daemons as `paniolo daemons` lists them: a bare name (serialcap,
+        /// zigplug, netbootd) stops every instance of that daemon; the
+        /// `NAME[TARGET]` form (`'serialcap[pi5]'` — quote it, `[]` is a
+        /// shell glob) stops one target's instance.
         names: Vec<String>,
         /// Stop every daemon, and TERM stray helper processes too.
         #[arg(long)]
@@ -213,8 +215,11 @@ enum DaemonsCmd {
     /// Restart capture daemons (serialcap, hdmicap) from their current
     /// binary — the clean fix after an upgrade leaves stale ones running.
     Restart {
-        /// Daemon names to restart (e.g. serialcap, hdmicap); empty with
-        /// --all restarts every restartable daemon.
+        /// Daemons to restart, as `paniolo daemons` lists them: a bare name
+        /// (serialcap, hdmicap) restarts every instance of that daemon; the
+        /// `NAME[TARGET]` form (`'hdmicap[pi5]'` — quote it, `[]` is a shell
+        /// glob) restarts one target's instance. Empty with --all restarts
+        /// every restartable daemon.
         names: Vec<String>,
         /// Restart every running serialcap/hdmicap daemon.
         #[arg(long)]
@@ -813,6 +818,104 @@ fn run(cli: Cli) -> Result<()> {
 /// Running netboot engines, found via their per-target state files.
 use state::running_netboots;
 
+/// A daemon named on the `daemons stop` / `daemons restart` command line, in
+/// either form `paniolo daemons` prints: bare `serialcap` (every instance of
+/// that daemon) or `serialcap[pi5]` (one target's instance). netbootd's
+/// instances are its targets, so `netbootd[pi5]` reads the same way.
+struct DaemonSpec {
+    name: String,
+    instance: Option<String>,
+}
+
+impl DaemonSpec {
+    fn parse(arg: &str) -> Self {
+        match arg.strip_suffix(']').and_then(|s| s.split_once('[')) {
+            Some((name, instance)) => DaemonSpec {
+                name: name.to_string(),
+                instance: Some(instance.to_string()),
+            },
+            None => DaemonSpec {
+                name: arg.to_string(),
+                instance: None,
+            },
+        }
+    }
+
+    /// Does this spec select the daemon `name` running as `instance`?
+    fn matches(&self, name: &str, instance: Option<&str>) -> bool {
+        self.name == name
+            && match self.instance.as_deref() {
+                Some(want) => Some(want) == instance,
+                None => true,
+            }
+    }
+}
+
+impl std::fmt::Display for DaemonSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.instance {
+            Some(inst) => write!(f, "{}[{inst}]", self.name),
+            None => f.write_str(&self.name),
+        }
+    }
+}
+
+/// `serialcap[pi5]` / `zigplug` — the name `paniolo daemons` prints for a
+/// discovered daemon, and the form [`DaemonSpec`] accepts back.
+fn daemon_label(d: &daemons::DaemonInfo) -> String {
+    match &d.instance {
+        Some(inst) => format!("{}[{inst}]", d.name),
+        None => d.name.clone(),
+    }
+}
+
+/// Command-line needles that identify a discovery daemon's process: the
+/// daemon's own binary name, except the `hid` channel, which any conforming
+/// injector may serve (the mapping `cmd_helper` applies, in reverse).
+fn daemon_process_needles(name: &str) -> Vec<String> {
+    match name {
+        HID_DAEMON => vec!["hidrig".to_string(), "ch9329".to_string()],
+        n => vec![n.to_string()],
+    }
+}
+
+/// True if `pid` is alive and its command line names one of `needles` —
+/// `state::is_named_child_alive` over several candidate names. A discovery
+/// file's pid is checked this way right before it is signalled, so a pid the
+/// kernel has since recycled for something else is skipped, not killed.
+fn pid_runs_one_of(pid: i32, needles: &[String]) -> bool {
+    if !state::is_pid_alive(pid) {
+        return false;
+    }
+    let cmdline = state::pid_cmdline(pid);
+    needles.iter().any(|n| cmdline.contains(n.as_str()))
+}
+
+/// Send `signal` to `pid`, printing the `TERM`/`KILL` line only once it has
+/// actually been delivered; a refusal (EPERM for a process that is not ours)
+/// is reported instead. Returns whether it landed.
+fn signal_or_report(label: &str, pid: i32, signal: platform::Signal) -> bool {
+    match platform::try_signal_pid(pid, signal) {
+        Ok(()) => {
+            let verb = match signal {
+                platform::Signal::Term => "TERM",
+                platform::Signal::Kill => "KILL",
+            };
+            println!("{verb} {label} (pid {pid})");
+            true
+        }
+        Err(e) => {
+            let why = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                "permission denied".to_string()
+            } else {
+                e.to_string()
+            };
+            eprintln!("could not signal {label} (pid {pid}): {why}");
+            false
+        }
+    }
+}
+
 /// One unified view of every paniolo background process on this host: the
 /// discovery-file daemons, netbootd (state files), and stray helper
 /// processes running out of the libexec dir.
@@ -830,10 +933,7 @@ fn cmd_daemons_list() -> Result<()> {
     let mut any_stale = false;
     for d in &discovered {
         let port = d.port.map_or("-".to_string(), |p| p.to_string());
-        let name = match &d.instance {
-            Some(inst) => format!("{}[{inst}]", d.name),
-            None => d.name.clone(),
-        };
+        let name = daemon_label(d);
         let stale = if d.stale == Some(true) {
             any_stale = true;
             "\t(stale: binary changed since start)"
@@ -864,27 +964,50 @@ fn cmd_daemons_list() -> Result<()> {
 
 /// Stop daemons by name or wholesale: netbootd via its proper teardown
 /// (interface cleanup), everything else via SIGTERM, with an optional
-/// SIGKILL escalation after a grace period.
+/// SIGKILL escalation after a grace period. A pid from a discovery file is
+/// signalled only while its command line still names the daemon (a recycled
+/// pid is skipped with a message), and a signal the OS refuses is reported
+/// and fails the command instead of being printed as if it had landed.
 fn cmd_daemons_stop(names: &[String], all: bool, force: bool) -> Result<()> {
     if !all && names.is_empty() {
         bail!("name one or more daemons (see `paniolo daemons`), or pass --all");
     }
-    let wanted = |n: &str| all || names.iter().any(|w| w == n);
+    let specs: Vec<DaemonSpec> = names.iter().map(|n| DaemonSpec::parse(n)).collect();
+    let wanted =
+        |name: &str, instance: Option<&str>| all || specs.iter().any(|s| s.matches(name, instance));
 
     // netbootd first — its stop also restores the interface.
-    for (target, _) in running_netboots() {
-        if wanted("netbootd") {
-            netboot::stop(&target)?;
+    let netboots = running_netboots();
+    for (target, _) in &netboots {
+        if wanted("netbootd", Some(target)) {
+            netboot::stop(target)?;
             println!("netbootd stopped (target {target}).");
         }
     }
 
-    let mut victims: Vec<(String, i32)> = daemons::list_discovered()
-        .into_iter()
-        .filter(|d| wanted(&d.name))
-        .map(|d| (d.name, d.pid))
+    let discovered = daemons::list_discovered();
+    for spec in &specs {
+        let running = if spec.name == "netbootd" {
+            netboots
+                .iter()
+                .any(|(t, _)| spec.matches("netbootd", Some(t)))
+        } else {
+            discovered
+                .iter()
+                .any(|d| spec.matches(&d.name, d.instance.as_deref()))
+        };
+        if !running {
+            eprintln!("warning: no running daemon named '{spec}'");
+        }
+    }
+
+    // (label, pid, command-line needles that prove the pid is still it)
+    let mut victims: Vec<(String, i32, Vec<String>)> = discovered
+        .iter()
+        .filter(|d| wanted(&d.name, d.instance.as_deref()))
+        .map(|d| (daemon_label(d), d.pid, daemon_process_needles(&d.name)))
         .collect();
-    let known: Vec<i32> = victims.iter().map(|(_, p)| p).copied().collect();
+    let known: Vec<i32> = victims.iter().map(|(_, pid, _)| *pid).collect();
     if all {
         for (pid, args) in daemons::list_stray_helpers(&known) {
             let short = args
@@ -892,12 +1015,14 @@ fn cmd_daemons_stop(names: &[String], all: bool, force: bool) -> Result<()> {
                 .take(4)
                 .collect::<Vec<_>>()
                 .join(" ");
-            victims.push((format!("stray: {short}"), pid));
-        }
-    }
-    for name in names {
-        if name != "netbootd" && !victims.iter().any(|(n, _)| n == name) {
-            eprintln!("warning: no running daemon named '{name}'");
+            // A stray was just seen running out of a helper dir; that program
+            // is what must still be on the pid when it is signalled.
+            let program = args
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            victims.push((format!("stray: {short}"), pid, vec![program]));
         }
     }
     if victims.is_empty() {
@@ -905,28 +1030,43 @@ fn cmd_daemons_stop(names: &[String], all: bool, force: bool) -> Result<()> {
         return Ok(());
     }
 
-    for (name, pid) in &victims {
-        daemons::signal_pid(*pid, platform::Signal::Term);
-        println!("TERM {name} (pid {pid})");
+    let mut failed = false;
+    let mut pending: Vec<(String, i32, Vec<String>)> = Vec::new();
+    for (label, pid, needles) in victims {
+        if !pid_runs_one_of(pid, &needles) {
+            eprintln!(
+                "skipping {label} (pid {pid}): no longer running {}",
+                needles.join("/")
+            );
+            continue;
+        }
+        if signal_or_report(&label, pid, platform::Signal::Term) {
+            pending.push((label, pid, needles));
+        } else {
+            failed = true;
+        }
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     while std::time::Instant::now() < deadline {
-        victims.retain(|(_, pid)| state::is_pid_alive(*pid));
-        if victims.is_empty() {
+        pending.retain(|(_, pid, _)| state::is_pid_alive(*pid));
+        if pending.is_empty() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(150));
     }
-    victims.retain(|(_, pid)| state::is_pid_alive(*pid));
-    for (name, pid) in &victims {
+    // Name-verified again: the grace period is long enough for a pid to be
+    // recycled, and a KILL must never reach the newcomer.
+    pending.retain(|(_, pid, needles)| pid_runs_one_of(*pid, needles));
+    for (label, pid, _) in &pending {
         if force {
-            daemons::signal_pid(*pid, platform::Signal::Kill);
-            println!("KILL {name} (pid {pid})");
+            if !signal_or_report(label, *pid, platform::Signal::Kill) {
+                failed = true;
+            }
         } else {
-            eprintln!("still alive: {name} (pid {pid}) — re-run with --force to SIGKILL");
+            eprintln!("still alive: {label} (pid {pid}) — re-run with --force to SIGKILL");
         }
     }
-    if !force && !victims.is_empty() {
+    if failed || (!force && !pending.is_empty()) {
         std::process::exit(1);
     }
     Ok(())
@@ -949,10 +1089,11 @@ fn cmd_daemons_restart(
     }
     let lab = load_for_read(lab_flag)?;
     let restartable = [serial::DAEMON, video::DAEMON];
-    for n in names {
-        if !restartable.contains(&n.as_str()) {
+    let specs: Vec<DaemonSpec> = names.iter().map(|n| DaemonSpec::parse(n)).collect();
+    for spec in &specs {
+        if !restartable.contains(&spec.name.as_str()) {
             eprintln!(
-                "warning: '{n}' is not a restartable capture daemon \
+                "warning: '{spec}' is not a restartable capture daemon \
                  (serialcap, hdmicap); skipping"
             );
         }
@@ -961,7 +1102,12 @@ fn cmd_daemons_restart(
     let selected: Vec<(String, String)> = daemons::list_discovered()
         .into_iter()
         .filter(|d| restartable.contains(&d.name.as_str()))
-        .filter(|d| all || stale_only || names.iter().any(|w| w == &d.name))
+        .filter(|d| {
+            all || stale_only
+                || specs
+                    .iter()
+                    .any(|s| s.matches(&d.name, d.instance.as_deref()))
+        })
         .filter(|d| !stale_only || d.stale == Some(true))
         .filter_map(|d| d.instance.map(|inst| (d.name, inst)))
         .collect();
@@ -991,12 +1137,57 @@ fn cmd_daemons_restart(
     Ok(())
 }
 
+/// Stop the `name` capture daemon for `target` and wait for its *process* to
+/// exit — not just for its discovery file to clear, which a daemon releases
+/// while still shutting down. Until the process is gone it owns the device (a
+/// V4L2 node or a serial port can't be opened twice), and while it is alive
+/// its discovery file can still satisfy `wait_for_daemon` on behalf of a
+/// replacement that actually failed to start. A process that overstays the
+/// 5 s grace is SIGKILLed — after re-checking, by name, that the pid is still
+/// the daemon — and one that survives even that is an error rather than a
+/// silent race. Every path that replaces a running capture daemon comes
+/// through here: `daemons restart`, and the stale-binary restart in
+/// `serial watch` / `video watch`.
+fn stop_capture_daemon_and_wait(name: &str, target: &str) -> Result<()> {
+    let old_pid = daemons::daemon_pid(name, Some(target));
+    // The daemon's own `stop` owns the clean shutdown; it failing (already
+    // gone, no discovery file) is not fatal — the pid wait is the real gate.
+    let _ = if name == serial::DAEMON {
+        serial::stop_daemon(target)
+    } else {
+        video::stop_daemon(target)
+    };
+    let Some(pid) = old_pid else {
+        return Ok(());
+    };
+    let still_it = || state::is_named_child_alive(pid, name);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while still_it() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if !still_it() {
+        return Ok(());
+    }
+    eprintln!("old {name} daemon (pid {pid}) ignored stop; killing it");
+    platform::try_signal_pid(pid, platform::Signal::Kill)
+        .map_err(|e| anyhow!("could not SIGKILL the old {name} daemon (pid {pid}): {e}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while still_it() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if still_it() {
+        bail!(
+            "old {name} daemon (pid {pid}) is still running after SIGKILL; not starting a \
+             replacement that would race it for the device"
+        );
+    }
+    Ok(())
+}
+
 /// Stop one capture daemon and start it again from the lab's channel config,
-/// returning the new daemon's URL. Waits for the *old process* to exit before
-/// starting — not just for its discovery file to clear, which a daemon releases
-/// while still shutting down — so the replacement never races it for an
-/// exclusive device (a V4L2 capture node can't be opened twice). A process that
-/// overstays the grace period is SIGKILLed to free the device.
+/// returning the new daemon's URL. The stop goes through
+/// [`stop_capture_daemon_and_wait`], so the replacement never races the old
+/// process for an exclusive device.
 fn restart_capture_daemon(lab: &Lab, name: &str, target: &str) -> Result<String> {
     // Resolve start parameters up front so a stop failure can't strand us.
     enum Start {
@@ -1022,26 +1213,7 @@ fn restart_capture_daemon(lab: &Lab, name: &str, target: &str) -> Result<String>
         bail!("'{name}' is not a restartable capture daemon");
     };
 
-    let old_pid = daemons::daemon_pid(name, Some(target));
-    match &start {
-        Start::Serial(_) => {
-            let _ = serial::stop_daemon(target);
-        }
-        Start::Video(..) => {
-            let _ = video::stop_daemon(target);
-        }
-    }
-    // Wait for the old process to actually exit (it owns the device until then).
-    if let Some(pid) = old_pid {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while state::is_pid_alive(pid) && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        if state::is_pid_alive(pid) {
-            daemons::signal_pid(pid, platform::Signal::Kill);
-            std::thread::sleep(std::time::Duration::from_millis(300));
-        }
-    }
+    stop_capture_daemon_and_wait(name, target)?;
 
     match start {
         Start::Serial(serials) => serial::start_daemon(&serials, 0, target)?,
@@ -2476,8 +2648,7 @@ fn cmd_serial_watch(lab_flag: Option<&str>, target: Option<&str>, port: u16) -> 
     if let Some(url) = serial::daemon_url(&target) {
         if daemons::binary_is_stale(serial::DAEMON, Some(&target)) == Some(true) {
             eprintln!("Serial daemon for '{target}' was built from an older binary; restarting…");
-            let _ = serial::stop_daemon(&target);
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            stop_capture_daemon_and_wait(serial::DAEMON, &target)?;
         } else {
             println!("Serial daemon for '{target}' already running at {url}");
             return Ok(());
@@ -2711,8 +2882,7 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
                         "Video daemon for '{target}' was built from an older binary; restarting…"
                     );
                 }
-                let _ = video::stop_daemon(&target);
-                std::thread::sleep(std::time::Duration::from_secs(1));
+                stop_capture_daemon_and_wait(video::DAEMON, &target)?;
             }
             eprintln!("Starting video daemon for '{target}' ('{device}')…");
             video::start_daemon(&device, port, &target, v.ocr_mode.as_deref())?;
@@ -3319,9 +3489,7 @@ fn ensure_hid_daemon_local(lab: &Lab, target: &str) -> Result<Option<u16>> {
         anyhow!("hid channel for '{target}' has no cmd (paniolo hid set -t {target} --cmd ...)")
     })?;
     eprintln!("Starting hid daemon for '{target}'…");
-    let log = std::fs::File::create(
-        daemons::ensure_runtime_dir(HID_DAEMON, Some(target))?.join("daemon.log"),
-    )?;
+    let log = daemons::create_log(HID_DAEMON, Some(target))?;
     let mut command = platform::shell_command(&exec_prefixed(&format!("{cmd} serve --port 0")));
     command
         .env("PATH", daemons::hook_path())
@@ -3748,5 +3916,55 @@ mod tests {
             resolve_dtr_interface(&lab, "dut", Some("console")).unwrap(),
             "console"
         );
+    }
+
+    /// `daemons stop` / `restart` accept a daemon as `paniolo daemons` prints
+    /// it: bare (every instance of that daemon) or `name[target]` (one).
+    #[test]
+    fn daemon_spec_parses_both_forms_and_matches_instances() {
+        let bare = DaemonSpec::parse("serialcap");
+        assert!(bare.matches("serialcap", Some("pi5")));
+        assert!(bare.matches("serialcap", Some("nuc")));
+        assert!(bare.matches("serialcap", None));
+        assert!(!bare.matches("hdmicap", Some("pi5")));
+        assert_eq!(bare.to_string(), "serialcap");
+
+        let one = DaemonSpec::parse("serialcap[pi5]");
+        assert_eq!(one.name, "serialcap");
+        assert_eq!(one.instance.as_deref(), Some("pi5"));
+        assert!(one.matches("serialcap", Some("pi5")));
+        assert!(!one.matches("serialcap", Some("nuc")));
+        assert!(!one.matches("serialcap", None));
+        assert!(!one.matches("hdmicap", Some("pi5")));
+        assert_eq!(one.to_string(), "serialcap[pi5]");
+
+        // An unterminated bracket is just a (strange) bare name.
+        let odd = DaemonSpec::parse("serialcap[pi5");
+        assert_eq!(odd.name, "serialcap[pi5");
+        assert!(odd.instance.is_none());
+    }
+
+    /// The `hid` discovery dir is served by whichever injector the lab names,
+    /// so its process is recognised by either helper's name; every other
+    /// daemon by its own.
+    #[test]
+    fn daemon_process_needles_cover_the_hid_injectors() {
+        assert_eq!(daemon_process_needles("serialcap"), vec!["serialcap"]);
+        assert_eq!(daemon_process_needles(HID_DAEMON), vec!["hidrig", "ch9329"]);
+    }
+
+    /// The gate in front of every `daemons stop` signal, run against a real
+    /// process: this one is alive and its command line names the test
+    /// binary — and does not name `netbootd`.
+    #[test]
+    fn pid_runs_one_of_checks_the_live_command_line() {
+        let me = std::process::id() as i32;
+        let exe = std::env::current_exe().unwrap();
+        let exe_name = exe.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(pid_runs_one_of(
+            me,
+            &["definitely-not-this".to_string(), exe_name]
+        ));
+        assert!(!pid_runs_one_of(me, &["netbootd".to_string()]));
     }
 }

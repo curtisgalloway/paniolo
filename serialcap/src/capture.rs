@@ -144,11 +144,7 @@ impl LineLog {
         let next_seq = recover_next_seq(&dir);
         let active_lines = count_lines(&active_path);
         let _ = fs::remove_file(dir.join(PENDING));
-        let writer = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&active_path)
-            .ok();
+        let writer = open_private_append(&active_path).ok();
         LineLog {
             dir,
             active_path,
@@ -226,11 +222,7 @@ impl LineLog {
             let _ = fs::rename(&from, &to);
         }
         let _ = fs::rename(&self.active_path, self.dir.join(format!("{ACTIVE}.1")));
-        self.writer = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.active_path)
-            .ok();
+        self.writer = open_private_append(&self.active_path).ok();
         self.active_lines = 0;
     }
 
@@ -251,11 +243,34 @@ impl LineLog {
         };
         if let Ok(s) = serde_json::to_string(&line) {
             let tmp = self.dir.join("pending.tmp");
-            if fs::write(&tmp, s.as_bytes()).is_ok() {
+            if write_private(&tmp, s.as_bytes()).is_ok() {
                 let _ = fs::rename(&tmp, &path);
             }
         }
     }
+}
+
+/// Open `path` for append, creating it 0600 on Unix. The capture holds
+/// whatever the target printed — boot logs, prompts, anything typed at them —
+/// so a fresh file must be unreadable by other users on its own, not only by
+/// virtue of the runtime base's 0700. As with any `open(2)`, the mode applies
+/// at creation; an existing file keeps what it has.
+fn open_private_append(path: &Path) -> std::io::Result<File> {
+    let mut o = OpenOptions::new();
+    o.create(true).append(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    o.open(path)
+}
+
+/// `fs::write`, but creating the file 0600 on Unix (see
+/// [`open_private_append`]).
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut o = OpenOptions::new();
+    o.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    o.open(path)?.write_all(bytes)
 }
 
 // ── reader (used by `serialcap log`) ─────────────────────────────────────────
@@ -545,6 +560,29 @@ mod tests {
         ));
         fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// Every file the writer creates — the active segment, the segment a
+    /// rotation opens, and the pending sidecar — must be readable by nobody
+    /// else. With a one-line segment size each ingested line rotates, so one
+    /// ingest exercises all three creation paths.
+    #[cfg(unix)]
+    #[test]
+    fn capture_files_are_created_private() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tmp();
+        // seg_lines = max(1 / MAX_SEGMENTS, 1) = 1: every committed line rotates.
+        let mut log = LineLog::open(dir.clone(), 1);
+        log.ingest(b"first\nsecond\npartial");
+        let mode = |name: &str| fs::metadata(dir.join(name)).unwrap().mode() & 0o777;
+        assert_eq!(mode(ACTIVE), 0o600, "active segment (opened by rotate)");
+        assert_eq!(
+            mode(&format!("{ACTIVE}.2")),
+            0o600,
+            "oldest segment (opened by LineLog::open)"
+        );
+        assert_eq!(mode(PENDING), 0o600, "pending sidecar");
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -142,9 +142,7 @@ pub fn start_daemon(device: &str, port: u16, target: &str, ocr_mode: Option<&str
     cmd.env("PANIOLO_TARGET", target);
     // Capture stderr (tracing output) so a startup failure is diagnosable;
     // daemons::start_failure() reads the tail on timeout.
-    let log = std::fs::File::create(
-        daemons::ensure_runtime_dir(DAEMON, Some(target))?.join("daemon.log"),
-    )?;
+    let log = daemons::create_log(DAEMON, Some(target))?;
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
     crate::platform::detach(&mut cmd);
     cmd.spawn()?;

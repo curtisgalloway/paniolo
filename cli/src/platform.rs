@@ -94,15 +94,20 @@ pub fn default_runtime_root() -> std::path::PathBuf {
 /// Create `base` as a private, user-owned directory, or validate it if it
 /// already exists.
 ///
-/// On Unix this is a 0700 create plus an ownership check, guarding against a
-/// squatter pre-creating the well-known `/tmp` path. On Windows the parent is
-/// inside the user's own profile, whose inherited ACL already denies other
-/// non-administrative users, so the check reduces to "exists and is a
-/// directory". (An administrator can write anywhere on either platform; that
-/// is out of scope for both.)
+/// On Unix this is a 0700 create plus an ownership *and mode* check, guarding
+/// against a squatter pre-creating the well-known `/tmp` path. An existing
+/// directory that is ours but group/world-accessible — left by a plain
+/// `create_dir_all` in an older paniolo, or made by hand — is tightened to
+/// 0700 and accepted: it is our own directory, so there is nothing to refuse
+/// and nothing to report. One that is a symlink, not a directory, or owned
+/// by someone else is an error. On Windows the parent is inside the user's
+/// own profile, whose inherited ACL already denies other non-administrative
+/// users, so the check reduces to "exists and is a directory". (An
+/// administrator can write anywhere on either platform; that is out of scope
+/// for both.)
 #[cfg(unix)]
 pub fn ensure_private_dir(base: &Path) -> Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     match std::fs::DirBuilder::new().mode(0o700).create(base) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -114,10 +119,36 @@ pub fn ensure_private_dir(base: &Path) -> Result<()> {
                     base.display()
                 ));
             }
+            if md.mode() & 0o077 != 0 {
+                std::fs::set_permissions(base, std::fs::Permissions::from_mode(0o700))?;
+            }
             Ok(())
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// True if `path` is a directory this user owns that nobody else can enter:
+/// a real directory (not a symlink), owned by [`current_uid`], with no
+/// group/other permission bits. The read-side twin of [`ensure_private_dir`]
+/// — a reader of the runtime base applies it before trusting a discovery
+/// file found beneath — and, unlike the writer, it never repairs, only
+/// refuses. On Windows the profile ACL stands in for the owner and mode
+/// checks, so it reduces to "a directory, not a link".
+#[cfg(unix)]
+pub fn is_private_dir(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(md) => md.is_dir() && md.uid() == current_uid() && md.mode() & 0o077 == 0,
+        Err(_) => false,
+    }
+}
+
+#[cfg(windows)]
+pub fn is_private_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|md| md.is_dir())
+        .unwrap_or(false)
 }
 
 #[cfg(windows)]
@@ -218,37 +249,54 @@ pub fn is_superuser() -> bool {
     false
 }
 
-/// Like [`signal_pid`], but reports whether the signal was delivered, so the
-/// caller can escalate (e.g. re-send under `sudo`) when it was not.
+/// Like [`signal_pid`], but reports whether the signal was delivered and why
+/// not, so the caller can escalate (re-send under `sudo` on `EPERM`) or tell
+/// the user rather than print a `TERM` line for a signal that never landed.
+/// The error is the OS's own (`PermissionDenied` for a process that is not
+/// ours, `NotFound`-class for one that already exited).
 #[cfg(unix)]
-pub fn try_signal_pid(pid: i32, signal: Signal) -> bool {
+pub fn try_signal_pid(pid: i32, signal: Signal) -> std::io::Result<()> {
     if !is_real_pid(pid) {
-        return false;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid pid {pid}"),
+        ));
     }
     let sig = match signal {
         Signal::Term => libc::SIGTERM,
         Signal::Kill => libc::SIGKILL,
     };
     // Safe: kill() on an arbitrary pid is defined; we only read the result.
-    unsafe { libc::kill(pid, sig) == 0 }
+    if unsafe { libc::kill(pid, sig) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 #[cfg(windows)]
-pub fn try_signal_pid(pid: i32, _signal: Signal) -> bool {
+pub fn try_signal_pid(pid: i32, _signal: Signal) -> std::io::Result<()> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
     if !is_real_pid(pid) {
-        return false;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid pid {pid}"),
+        ));
     }
     // Safe: a null handle is checked before use.
     unsafe {
         let h = OpenProcess(PROCESS_TERMINATE, 0, pid as u32);
         if h.is_null() {
-            return false;
+            return Err(std::io::Error::last_os_error());
         }
-        let ok = TerminateProcess(h, 1) != 0;
+        let result = if TerminateProcess(h, 1) != 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        };
         CloseHandle(h);
-        ok
+        result
     }
 }
 
@@ -396,10 +444,7 @@ mod tests {
         let pid = child.id() as i32;
         assert!(pid_alive(pid), "a just-spawned child must read as alive");
 
-        assert!(
-            try_signal_pid(pid, Signal::Kill),
-            "terminating our own child must succeed"
-        );
+        try_signal_pid(pid, Signal::Kill).expect("terminating our own child must succeed");
         let _ = child.wait();
 
         // Windows can take a moment to tear the process down, and a reaped
@@ -472,5 +517,50 @@ mod tests {
             "a squatted path must be refused, not silently used"
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// A base left group/world-accessible by an earlier creator (an older
+    /// paniolo's plain `create_dir_all`, or the user by hand) is ours to
+    /// tighten: after the call it must be 0700, so nothing beneath it — a
+    /// discovery file, a capture log — is reachable by other users.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_tightens_an_open_dir_we_own() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let tmp = std::env::temp_dir().join(format!("paniolo-test-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir(&tmp).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(std::fs::metadata(&tmp).unwrap().mode() & 0o777, 0o755);
+        assert!(!is_private_dir(&tmp), "a 0755 dir is not private");
+
+        ensure_private_dir(&tmp).expect("an open dir we own is tightened, not refused");
+        assert_eq!(std::fs::metadata(&tmp).unwrap().mode() & 0o777, 0o700);
+        assert!(is_private_dir(&tmp));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A symlink at the base — even one pointing at a private directory we
+    /// own — is refused by both the writer and the reader: a squatter's link
+    /// would redirect every discovery file and capture log to a place of
+    /// their choosing.
+    #[cfg(unix)]
+    #[test]
+    fn private_dir_checks_reject_a_symlink() {
+        let real = std::env::temp_dir().join(format!("paniolo-test-real-{}", std::process::id()));
+        let link = std::env::temp_dir().join(format!("paniolo-test-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&real);
+        let _ = std::fs::remove_file(&link);
+        ensure_private_dir(&real).unwrap();
+        assert!(is_private_dir(&real));
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert!(
+            ensure_private_dir(&link).is_err(),
+            "a symlinked base must be refused"
+        );
+        assert!(!is_private_dir(&link));
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&real);
     }
 }

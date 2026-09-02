@@ -143,7 +143,12 @@ additionally receive two environment variables on every invocation — `PANIOLO_
 (durable state, `~/.config/paniolo/helpers/<name>`) and `PANIOLO_RUNTIME_DIR`
 (`/tmp/paniolo-<uid>/<name>`; the capture daemons append a `/<target>` segment), both pre-created.
 The runtime base honors `$PANIOLO_RUNTIME_BASE` (default `/tmp`) (`cli/src/daemons.rs`; contract in
-[`adding-power-helpers.md`](adding-power-helpers.md)):
+[`adding-power-helpers.md`](adding-power-helpers.md)). It is a **private** directory: created 0700,
+and an existing one must be a real directory owned by the current user with no group/other bits (a
+too-open one we own is tightened; a symlink or another owner's is refused). The discovery-file
+readers apply the same check before trusting a `daemon.json` beneath it, the SSH ControlMaster
+socket dir (`cli/src/ssh.rs`) is created through the same check, and daemon stderr logs and
+serialcap's capture files are created 0600:
 
 | Purpose | Path |
 |---|---|

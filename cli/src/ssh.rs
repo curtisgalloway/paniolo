@@ -38,34 +38,47 @@ fn uid() -> u32 {
 
 /// Short directory holding paniolo's default ControlMaster sockets. Kept short
 /// because a Unix-domain socket path is length-limited and ssh appends a 40-char
-/// `%C` hash; `$XDG_RUNTIME_DIR` is short on Linux, else `/tmp`.
-fn control_dir() -> PathBuf {
-    let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-    let d = PathBuf::from(base).join(format!("paniolo-{}", uid()));
-    let _ = std::fs::create_dir_all(&d);
-    d
+/// `%C` hash; `$XDG_RUNTIME_DIR` is short on Linux, else the platform's
+/// runtime root (`/tmp` on Unix).
+///
+/// Created and validated as a private directory (0700, owned by us) through
+/// the same check as the daemon runtime base — on macOS it *is* the same
+/// `/tmp/paniolo-<uid>` path, and a plain `create_dir_all` here once left
+/// that base 0755 with every capture log beneath it world-readable. A path
+/// that cannot be made private is an error, never a silent fallback: a
+/// ControlMaster socket in a squatter's directory is an open SSH session in
+/// their hands.
+fn control_dir() -> std::io::Result<PathBuf> {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(crate::platform::default_runtime_root);
+    let d = base.join(format!("paniolo-{}", uid()));
+    crate::platform::ensure_private_dir(&d).map_err(std::io::Error::other)?;
+    Ok(d)
 }
 
-fn control_args(host: &Host) -> Vec<String> {
+fn control_args(host: &Host) -> std::io::Result<Vec<String>> {
     let cp = match &host.control_path {
         Some(p) => expand_tilde(p).to_string_lossy().into_owned(),
-        None => control_dir().join("cm-%C").to_string_lossy().into_owned(),
+        None => control_dir()?.join("cm-%C").to_string_lossy().into_owned(),
     };
-    vec![
+    Ok(vec![
         "-o".into(),
         "ControlMaster=auto".into(),
         "-o".into(),
         format!("ControlPath={cp}"),
         "-o".into(),
         format!("ControlPersist={CONTROL_PERSIST}"),
-    ]
+    ])
 }
 
 /// Base `ssh` argv (program + options) for a non-local host. `multiplex=false`
 /// gives a standalone connection — a port forward must own its channel: an
 /// `ssh -N -L` attached to a ControlMaster hands the forward to the master and
 /// exits, so the process no longer represents (or can tear down) the tunnel.
-fn base_args(host: &Host, interactive: bool, multiplex: bool) -> Vec<String> {
+/// Errors only when the default ControlMaster directory cannot be made
+/// private (see [`control_dir`]).
+fn base_args(host: &Host, interactive: bool, multiplex: bool) -> std::io::Result<Vec<String>> {
     debug_assert!(host.ssh != LOCAL, "ssh called for the local host");
     let mut a = vec!["ssh".to_string()];
     if !interactive {
@@ -82,7 +95,7 @@ fn base_args(host: &Host, interactive: bool, multiplex: bool) -> Vec<String> {
         a.push("IdentitiesOnly=yes".into());
     }
     if multiplex {
-        a.extend(control_args(host));
+        a.extend(control_args(host)?);
     } else {
         a.extend(
             ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
@@ -90,7 +103,7 @@ fn base_args(host: &Host, interactive: bool, multiplex: bool) -> Vec<String> {
                 .map(|s| s.to_string()),
         );
     }
-    a
+    Ok(a)
 }
 
 /// Quote a single token for a POSIX shell.
@@ -120,7 +133,7 @@ pub fn remote_command(argv: &[String], env: &[(String, String)]) -> String {
 ///
 /// Same identity, timeout and multiplexing — an sftp that reuses the session's
 /// ControlMaster costs no extra handshake.
-fn transfer_args(host: &Host) -> Vec<String> {
+fn transfer_args(host: &Host) -> std::io::Result<Vec<String>> {
     let mut a = vec![
         "-o".to_string(),
         "BatchMode=yes".to_string(),
@@ -133,8 +146,8 @@ fn transfer_args(host: &Host) -> Vec<String> {
         a.push("-o".into());
         a.push("IdentitiesOnly=yes".into());
     }
-    a.extend(control_args(host));
-    a
+    a.extend(control_args(host)?);
+    Ok(a)
 }
 
 /// Quote a path for an sftp batch line.
@@ -149,7 +162,7 @@ fn sftp_quote(s: &str) -> String {
 
 fn sftp_batch(host: &Host, script: &str) -> std::io::Result<()> {
     let mut cmd = Command::new("sftp");
-    cmd.args(transfer_args(host));
+    cmd.args(transfer_args(host)?);
     cmd.arg("-b").arg("-").arg(&host.ssh);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
@@ -215,7 +228,7 @@ pub fn run(
     env: &[(String, String)],
 ) -> std::io::Result<Output> {
     let mut cmd = Command::new("ssh");
-    cmd.args(&base_args(host, false, true)[1..]);
+    cmd.args(&base_args(host, false, true)?[1..]);
     cmd.arg(&host.ssh);
     cmd.arg(remote_command(argv, env));
     cmd.stdin(if stdin.is_some() {
@@ -249,7 +262,7 @@ pub fn run_passthrough(
     env: &[(String, String)],
 ) -> std::io::Result<i32> {
     let status = Command::new("ssh")
-        .args(&base_args(host, false, true)[1..])
+        .args(&base_args(host, false, true)?[1..])
         .arg(&host.ssh)
         .arg(remote_command(argv, env))
         .status()?;
@@ -267,7 +280,7 @@ pub fn run_stdout_to(
     sink: std::fs::File,
 ) -> std::io::Result<i32> {
     let status = Command::new("ssh")
-        .args(&base_args(host, false, true)[1..])
+        .args(&base_args(host, false, true)?[1..])
         .arg(&host.ssh)
         .arg(remote_command(argv, env))
         .stdout(Stdio::from(sink))
@@ -282,7 +295,7 @@ pub fn run_interactive(
     env: &[(String, String)],
 ) -> std::io::Result<i32> {
     let status = Command::new("ssh")
-        .args(&base_args(host, true, true)[1..])
+        .args(&base_args(host, true, true)?[1..])
         .arg("-t")
         .arg(&host.ssh)
         .arg(remote_command(argv, env))
@@ -317,7 +330,7 @@ pub fn forward(host: &Host, remote_port: u16) -> anyhow::Result<Forward> {
     let local_port = free_local_port()?;
     let spec = format!("{local_port}:127.0.0.1:{remote_port}");
     let mut child = Command::new("ssh")
-        .args(&base_args(host, false, false)[1..])
+        .args(&base_args(host, false, false)?[1..])
         .arg("-N")
         .arg("-L")
         .arg(&spec)
@@ -386,12 +399,29 @@ mod tests {
             identity: Some("~/.ssh/id".into()),
             ..Default::default()
         };
-        let a = base_args(&host, false, true).join(" ");
+        let a = base_args(&host, false, true).unwrap().join(" ");
         assert!(a.contains("BatchMode=yes"), "{a}");
         assert!(a.contains("ControlMaster=auto"), "{a}");
         assert!(a.contains("IdentitiesOnly=yes"), "{a}");
         // Interactive variant drops BatchMode (so a PTY/password can work).
-        assert!(!base_args(&host, true, true).join(" ").contains("BatchMode"));
+        assert!(!base_args(&host, true, true)
+            .unwrap()
+            .join(" ")
+            .contains("BatchMode"));
+    }
+
+    /// The default ControlMaster directory must come back private. On macOS
+    /// it is the same path as the daemon runtime base, and the plain
+    /// `create_dir_all` this replaced is what once left that base 0755 with
+    /// every capture log beneath it world-readable.
+    #[test]
+    fn control_dir_is_private() {
+        let d = control_dir().expect("control dir");
+        assert!(
+            crate::platform::is_private_dir(&d),
+            "{} must be a private directory owned by us",
+            d.display()
+        );
     }
 
     /// A Windows path is mostly backslashes, and the sftp batch parser treats a
@@ -423,7 +453,7 @@ mod tests {
             identity: Some("~/.ssh/id".into()),
             ..Default::default()
         };
-        let a = transfer_args(&host).join(" ");
+        let a = transfer_args(&host).unwrap().join(" ");
         assert!(a.contains("BatchMode=yes"), "{a}");
         assert!(a.contains("IdentitiesOnly=yes"), "{a}");
         assert!(a.contains("ControlMaster=auto"), "{a}");

@@ -72,9 +72,7 @@ pub fn start_daemon(ifaces: &[SerialChannel], port: u16, target: &str) -> Result
     }
     // Capture stderr (tracing output) so a startup failure is diagnosable;
     // daemons::start_failure() reads the tail on timeout.
-    let log = std::fs::File::create(
-        daemons::ensure_runtime_dir(DAEMON, Some(target))?.join("daemon.log"),
-    )?;
+    let log = daemons::create_log(DAEMON, Some(target))?;
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
     // Detach into its own process group so it survives this CLI exiting.
     crate::platform::detach(&mut cmd);
