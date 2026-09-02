@@ -20,6 +20,7 @@
 //!   devices  list serial devices
 //!   stop     ask the running daemon to exit (SIGTERM)
 
+mod auth;
 mod capture;
 mod daemon;
 // The file is kept byte-identical across the crates that copy it, so a crate

@@ -24,7 +24,6 @@
 //! owns *its* UART before routing through it.
 
 use std::fs::{self, File};
-use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -43,6 +42,11 @@ pub const DISCOVERY_NAME: &str = "hid";
 pub struct Discovery {
     pub pid: u32,
     pub port: u16,
+    /// The bearer token every request to this daemon must carry (see
+    /// auth.rs). Optional on read so a file written by an older daemon still
+    /// parses; always written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
     /// The control UART this daemon owns (so a CLI one-shot can match its -d).
     pub device: String,
 }
@@ -103,16 +107,23 @@ pub fn run(device: String, port: u16) -> Result<()> {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let bound = listener.local_addr()?;
 
+        // Every request must present this token (auth.rs); it reaches clients
+        // only through the owner-only discovery file.
+        let token = crate::auth::generate_token()?;
         let disc = Discovery {
             pid: std::process::id(),
             port: bound.port(),
+            token: Some(token.clone()),
             device: device.clone(),
         };
-        let mut f = File::create(discovery_path()?).context("writing discovery file")?;
-        f.write_all(serde_json::to_string(&disc)?.as_bytes())?;
+        crate::auth::write_private_file(
+            &discovery_path()?,
+            serde_json::to_string(&disc)?.as_bytes(),
+        )
+        .context("writing discovery file")?;
         info!("ch9329 hid daemon listening on http://{bound} (device {device})");
 
-        let app = server::router(AppState { hid });
+        let app = server::router(AppState { hid }, crate::auth::Auth::new(token, &[]));
 
         // The /hid WebSocket is long-lived, so plain graceful shutdown would
         // block forever. Remove discovery + lock, brief grace, then hard-exit
@@ -157,4 +168,29 @@ async fn shutdown_signal() {
         _ = term => {},
     }
     info!("shutdown signal received");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The discovery file now carries the token. One written by an older
+    /// daemon (no token) must still parse, so a one-shot can still route
+    /// through it and the CLI can tell the operator to restart it.
+    #[test]
+    fn discovery_token_is_optional_on_read_and_written_when_present() {
+        let old: Discovery =
+            serde_json::from_str(r#"{"pid":1,"port":2,"device":"/dev/x"}"#).unwrap();
+        assert_eq!(old.token, None);
+        let new = Discovery {
+            pid: 1,
+            port: 2,
+            token: Some("ab".into()),
+            device: "/dev/x".into(),
+        };
+        let text = serde_json::to_string(&new).unwrap();
+        assert!(text.contains(r#""token":"ab""#), "{text}");
+        let back: Discovery = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.token.as_deref(), Some("ab"));
+    }
 }

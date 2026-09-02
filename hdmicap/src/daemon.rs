@@ -15,7 +15,6 @@
 //! Daemon lifecycle: advisory lock, discovery file, runtime wiring, shutdown.
 
 use std::fs::{self, File};
-use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -32,6 +31,11 @@ use crate::server::{self, AppState};
 pub struct Discovery {
     pub pid: u32,
     pub port: u16,
+    /// The bearer token every request to this daemon must carry (see
+    /// auth.rs). Optional on read so a file written by an older daemon still
+    /// parses; always written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 /// The daemon's runtime dir. Paniolo passes the canonical location as
@@ -109,16 +113,26 @@ pub fn run(device: DeviceSpec, port: u16) -> Result<()> {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let bound = listener.local_addr()?;
 
-        // 4. Publish discovery info now that we have the real port.
+        // 4. Publish discovery info now that we have the real port. Every
+        //    request must present the token (auth.rs); it reaches clients only
+        //    through the owner-only discovery file.
+        let token = crate::auth::generate_token()?;
         let disc = Discovery {
             pid: std::process::id(),
             port: bound.port(),
+            token: Some(token.clone()),
         };
-        let mut f = File::create(discovery_path()?)?;
-        f.write_all(serde_json::to_string(&disc)?.as_bytes())?;
+        crate::auth::write_private_file(
+            &discovery_path()?,
+            serde_json::to_string(&disc)?.as_bytes(),
+        )
+        .context("writing discovery file")?;
         info!("hdmicap daemon listening on http://{bound}");
 
-        let app = server::router(AppState { frames });
+        let app = server::router(
+            AppState { frames },
+            crate::auth::Auth::new(token, server::PUBLIC_ASSETS),
+        );
 
         // 5. Serve until SIGTERM/SIGINT. The /preview MJPEG stream is an
         //    infinite response, so a plain graceful shutdown would block on it
@@ -203,5 +217,23 @@ mod tests {
             "the stale file must be reaped, not left to fail again"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The discovery file now carries the token. One written by an older
+    /// daemon (no token) must still parse, so the CLI can see it is running
+    /// and tell the operator to restart it.
+    #[test]
+    fn discovery_token_is_optional_on_read_and_written_when_present() {
+        let old: Discovery = serde_json::from_str(r#"{"pid":1,"port":2}"#).unwrap();
+        assert_eq!(old.token, None);
+        let new = Discovery {
+            pid: 1,
+            port: 2,
+            token: Some("ab".into()),
+        };
+        let text = serde_json::to_string(&new).unwrap();
+        assert!(text.contains(r#""token":"ab""#), "{text}");
+        let back: Discovery = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.token.as_deref(), Some("ab"));
     }
 }

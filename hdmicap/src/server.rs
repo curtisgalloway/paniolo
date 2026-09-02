@@ -14,6 +14,11 @@
 
 //! Localhost HTTP API. Handlers never touch the device — they only read the
 //! latest FrameState from their `watch::Receiver`. PNG encoding is lazy, here.
+//!
+//! Every route but the vendored xterm.js assets sits behind the auth layer
+//! (`auth.rs`): loopback Host and Origin, and the daemon token. The dashboard
+//! page reads the token from its own URL and appends it to every request it
+//! makes back here.
 
 use std::io::Cursor;
 use std::process::Stdio;
@@ -23,6 +28,7 @@ use axum::{
     body::Body,
     extract::{Query, State},
     http::{header, StatusCode},
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -41,7 +47,12 @@ pub struct AppState {
     pub frames: FrameRx,
 }
 
-pub fn router(state: AppState) -> Router {
+/// Paths served without the daemon token: the vendored xterm.js library files
+/// the dashboard page loads by bare `<script>`/`<link>` path. They are public
+/// code, not data, and a bare asset tag cannot carry a header.
+pub const PUBLIC_ASSETS: &[&str] = &["/xterm.js", "/xterm.css", "/xterm-addon-fit.js"];
+
+pub fn router(state: AppState, auth: crate::auth::Auth) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/status", get(status))
@@ -57,12 +68,19 @@ pub fn router(state: AppState) -> Router {
         .route("/xterm.js", get(xterm_js))
         .route("/xterm.css", get(xterm_css))
         .route("/xterm-addon-fit.js", get(xterm_fit_js))
+        .layer(middleware::from_fn_with_state(auth, crate::auth::require))
         .with_state(state)
 }
 
+/// The dashboard. It must never render inside another page's frame: its power
+/// buttons act on the target, and a framed page is how a click gets stolen.
 async fn index() -> impl IntoResponse {
     (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"),
+            (header::X_FRAME_OPTIONS, "DENY"),
+        ],
         include_str!("../assets/index.html"),
     )
 }
