@@ -18,10 +18,21 @@
 //! Ported from `_netboot.py`, rust engine only (the legacy pure-Python
 //! DHCP/TFTP engine stays behind in the Python tree). On macOS netbootd runs
 //! unprivileged (its raw-frame send path uses the setuid bpf-helper installed
-//! beside it); on Linux ports 67/69 need root so the spawn gets a sudo prefix.
+//! beside it); on Linux ports 67/69 need root so the spawn gets a sudo prefix
+//! (netbootd drops that root itself once its sockets are bound).
+//!
+//! `start` does not trust the spawn alone: netbootd validates its
+//! configuration and binds every listener before it serves, and any of that
+//! failing (a port in use, an interface it cannot pin, a bad client IP) is an
+//! early exit — so `start` watches the child for [`STARTUP_GRACE`] and, if it
+//! dies, reports the tail of its log instead of writing a state file for a
+//! daemon that is not there. It also keeps one netboot per interface: a
+//! second target starting on an interface another target's netbootd already
+//! serves would only fight it for the port.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 
@@ -29,9 +40,40 @@ use crate::daemons;
 use crate::netif;
 use crate::state::{self, NetbootState};
 
+/// How long `start` watches a freshly spawned netbootd for an early exit
+/// before declaring it up. Binding, pinning and the primary-NIC lookup take
+/// well under a second; the margin covers a loaded host.
+const STARTUP_GRACE: Duration = Duration::from_secs(2);
+/// Poll interval while watching the child during [`STARTUP_GRACE`].
+const STARTUP_POLL: Duration = Duration::from_millis(100);
+/// How much of the daemon's log a startup failure quotes.
+const LOG_TAIL_LINES: usize = 20;
+
 fn resolve_netbootd() -> Result<std::path::PathBuf> {
     daemons::find_binary("netbootd")
         .ok_or_else(|| anyhow!("netbootd not found — build and install it with `paniolo setup`"))
+}
+
+/// The other target (name and state) whose live netbootd already owns
+/// `interface`, if any. One netbootd per interface: the second would just
+/// fail to bind (or, worse, share) the DHCP/TFTP ports on the same link.
+fn interface_conflict<'a>(
+    target: &str,
+    interface: &str,
+    running: &'a [(String, NetbootState)],
+) -> Option<&'a (String, NetbootState)> {
+    running
+        .iter()
+        .find(|(other, st)| other != target && st.interface == interface)
+}
+
+/// The last `lines` lines of the file at `path` (all of it if shorter; empty
+/// if unreadable), for quoting a failed daemon's log in an error.
+fn log_tail(path: &Path, lines: usize) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let all: Vec<&str> = text.lines().collect();
+    let start = all.len().saturating_sub(lines);
+    all[start..].join("\n")
 }
 
 /// Optional UEFI boot parameters forwarded to `netbootd` as flags. All default
@@ -79,6 +121,14 @@ pub fn start(
              adapter for the netboot link."
         );
     }
+    if let Some((other, st)) = interface_conflict(target, interface, &state::running_netboots()) {
+        bail!(
+            "netboot for '{other}' is already running on {interface} (pid {}); one netboot \
+             per interface — stop it first (paniolo netboot stop {other}) or give \
+             '{target}' its own adapter",
+            st.dhcp_pid
+        );
+    }
 
     cleanup_stale(target);
     netif::configure_interface(interface, host_ip)?;
@@ -124,13 +174,38 @@ pub fn start(
     }
     cmd.stdin(Stdio::null()).stdout(log).stderr(log_err);
     crate::platform::detach(&mut cmd);
-    let child = cmd.spawn()?;
+    let mut child = cmd.spawn()?;
+    let pid = child.id() as i32;
+
+    // Watch for an early exit before recording the daemon as running. Two
+    // probes: `try_wait` reaps a child that has exited (a zombie still answers
+    // `kill -0`, so a liveness probe alone could miss a crash on macOS), and
+    // the named-process check catches the Linux case where the pid we hold is
+    // `sudo`'s while netbootd underneath it has already gone.
+    let deadline = Instant::now() + STARTUP_GRACE;
+    while Instant::now() < deadline {
+        std::thread::sleep(STARTUP_POLL);
+        let exited = match child.try_wait() {
+            Ok(Some(status)) => Some(format!("exited with {status}")),
+            Ok(None) if !state::is_named_child_alive(pid, "netbootd") => {
+                Some("is no longer running".to_string())
+            }
+            _ => None,
+        };
+        if let Some(how) = exited {
+            let tail = log_tail(&log_path, LOG_TAIL_LINES);
+            bail!(
+                "netbootd {how} during startup; last lines of {}:\n{tail}",
+                log_path.display()
+            );
+        }
+    }
 
     state::save_netboot_state(&NetbootState {
         target: target.to_string(),
         // Single process; both pid fields hold the netbootd PID (state-file compat).
-        dhcp_pid: child.id() as i32,
-        tftp_pid: child.id() as i32,
+        dhcp_pid: pid,
+        tftp_pid: pid,
         started_at: state::now_epoch(),
         interface: interface.to_string(),
         tftp_root: tftp_root.to_string(),
@@ -186,5 +261,68 @@ pub fn status(target: &str) -> Status {
         running: alive,
         state: Some(s),
         uptime_seconds: uptime,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn running(target: &str, interface: &str, pid: i32) -> (String, NetbootState) {
+        (
+            target.to_string(),
+            NetbootState {
+                target: target.to_string(),
+                dhcp_pid: pid,
+                tftp_pid: pid,
+                started_at: 0.0,
+                interface: interface.to_string(),
+                tftp_root: "/srv/tftp".to_string(),
+                engine: "rust".to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn another_target_on_the_same_interface_conflicts() {
+        let live = vec![running("pi5", "en7", 4242), running("nova", "en9", 4343)];
+        let hit = interface_conflict("nuc", "en7", &live).expect("en7 is taken");
+        assert_eq!(hit.0, "pi5");
+        assert_eq!(hit.1.dhcp_pid, 4242);
+    }
+
+    #[test]
+    fn a_free_interface_or_our_own_entry_does_not_conflict() {
+        let live = vec![running("pi5", "en7", 4242)];
+        assert!(
+            interface_conflict("nuc", "en8", &live).is_none(),
+            "other adapter"
+        );
+        // A stale-but-alive entry for the same target is `start`'s own business
+        // (cleanup_stale), not a conflict with another target.
+        assert!(interface_conflict("pi5", "en7", &live).is_none());
+        assert!(
+            interface_conflict("nuc", "en7", &[]).is_none(),
+            "nothing running"
+        );
+    }
+
+    #[test]
+    fn log_tail_quotes_the_last_lines_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("netboot.log");
+        let all: Vec<String> = (1..=30).map(|i| format!("line {i}")).collect();
+        std::fs::write(&path, all.join("\n") + "\n").unwrap();
+
+        let tail = log_tail(&path, 20);
+        let got: Vec<&str> = tail.lines().collect();
+        assert_eq!(got.len(), 20);
+        assert_eq!(got[0], "line 11");
+        assert_eq!(got[19], "line 30");
+
+        // Shorter than the window: everything, in order.
+        assert_eq!(log_tail(&path, 100).lines().count(), 30);
+        // Missing file: empty, not an error — the spawn failure is the story.
+        assert_eq!(log_tail(&dir.path().join("nope.log"), 20), "");
     }
 }
