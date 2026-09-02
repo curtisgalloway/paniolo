@@ -213,6 +213,44 @@ def pump_console_rx():
 
 
 _rxbuf = bytearray()
+# time.monotonic() when the first byte of the currently-pending (not yet
+# complete) frame arrived; None while _rxbuf holds no partial frame.
+_rxbuf_started = None
+
+# A daemon killed mid-frame and restarted writes a fresh RESYNC_PREAMBLE (258
+# zero bytes, hidrig/src/proto.rs) before anything else, which relies on this
+# board not still holding a stale partial frame from the previous session —
+# otherwise the preamble's zero bytes complete THAT frame instead of being
+# skipped, and the byte(s) after the preamble (the new session's first real
+# frame) get parsed as whatever comes next. Discarding a partial frame that
+# has waited this long is the other half of the resync story (docs/dev/
+# hid-dual-board-design.md §5).
+PARTIAL_FRAME_TIMEOUT_S = 0.05
+
+
+def note_rxbuf_start():
+    """Record when the currently-pending partial frame started accumulating.
+    A no-op once already recorded, so a later call that doesn't fully drain
+    _rxbuf never resets the clock on a frame that was already waiting."""
+    global _rxbuf_started
+    if _rxbuf:
+        if _rxbuf_started is None:
+            _rxbuf_started = time.monotonic()
+    else:
+        _rxbuf_started = None
+
+
+def discard_stale_rxbuf():
+    """Drop a partial frame that has waited too long. Called every main-loop
+    iteration (not just when new bytes arrive) so a host that stops sending
+    mid-frame doesn't leave the buffer waiting forever for bytes that would
+    otherwise wrongly complete it once some *later* session writes more."""
+    global _rxbuf, _rxbuf_started
+    if _rxbuf_started is not None and time.monotonic() - _rxbuf_started > PARTIAL_FRAME_TIMEOUT_S:
+        if DEBUG:
+            print("control: discarding stale partial frame (%d bytes)" % len(_rxbuf))
+        _rxbuf = bytearray()
+        _rxbuf_started = None
 
 
 def route_frames():
@@ -241,6 +279,7 @@ def route_frames():
             i += 1  # unframed/unknown byte — resync
     if i:
         _rxbuf = _rxbuf[i:]
+    note_rxbuf_start()
 
 
 if data is not None:
@@ -258,4 +297,5 @@ while True:
             _rxbuf.extend(data.read(n))
             route_frames()
             status(0, 0, 16)  # back to blue between bursts
+    discard_stale_rxbuf()
     pump_console_rx()
