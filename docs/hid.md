@@ -113,7 +113,16 @@ With a single target in the lab, `-t` may be omitted. Everything after
 set. Key names are `adafruit_hid` Keycode names: `A`–`Z`, `ENTER`, `TAB`,
 `ESCAPE`, `BACKSPACE`, `DELETE`, `UP_ARROW`, `DOWN_ARROW`, `LEFT_ARROW`,
 `RIGHT_ARROW`, `LEFT_CONTROL`, `LEFT_SHIFT`, `LEFT_ALT`, `LEFT_GUI`,
-`F1`–`F12`, etc.
+`F1`–`F12`, `PRINT_SCREEN`, `SCROLL_LOCK`, `PAUSE`, `NUM_LOCK`,
+`APPLICATION` (alias `MENU`), etc.
+
+`combo` presses at most 6 keys at once (a boot-protocol keyboard report's key
+slots; modifiers like `LEFT_CONTROL` don't count against it) — a chord asking
+for more, counting keys already held with `down`, fails with `ERR` rather
+than silently dropping the ones that don't fit. `type` text keeps trailing
+spaces (only the command's own line ending is stripped) and rejects a
+character outside the US layout with `ERR` instead of typing part of the
+string and silently skipping the rest.
 
 **Negative arguments:** `move` and `scroll` accept negative values directly
 (`paniolo hid send -t pi5 move 50 -30`); put `-t` before the helper
@@ -144,7 +153,10 @@ hidrig -d /dev/cu.usbmodemXXXX run boot-sequence.txt
 hidrig -d /dev/cu.usbmodemXXXX run - < boot-sequence.txt   # via stdin
 ```
 
-Sequencing and timing live on the host; the firmware stays dumb.
+Sequencing and timing live on the host; the firmware stays dumb. `delay`/`sleep`
+must be finite and between 0 and one hour — a negative, infinite, `nan`, or
+multi-hour value is rejected when the file is parsed rather than accepted and
+hung on later.
 
 ---
 

@@ -63,7 +63,11 @@ The full [HID serial protocol](../docs/dev/hid-serial-protocol.md) §3 surface:
 `type`, `key`, `combo`, `down`, `up`, `releaseall`, `move`, `moveabs`, `click`,
 `mdown`, `mup`, `scroll`, `ping`, `version`, and `run <file>` for command
 sequences. Key names are `adafruit_hid` Keycode names (`A`–`Z`, `ENTER`,
-`LEFT_CONTROL`, `FORWARD_SLASH`, `F1`…`F12`); `type` assumes a **US layout**.
+`LEFT_CONTROL`, `FORWARD_SLASH`, `F1`…`F12`, `PRINT_SCREEN`, `SCROLL_LOCK`,
+`PAUSE`, `NUM_LOCK`, `APPLICATION`); `type` assumes a **US layout** and rejects
+a character it can't type with `ERR` rather than dropping it silently.
+`combo` chords at most 6 keys at once (the boot-protocol report's key slots;
+modifiers don't count), refusing a larger chord with `ERR`.
 
 Extras beyond hidrig's surface:
 
@@ -78,8 +82,11 @@ Extras beyond hidrig's surface:
   position rather than a success code, so `host`/`target` compare it against
   what was asked and fail if it did not move; all three print the resulting
   side. A device without a mux does not answer at all — the protocol has no
-  negative ack for an unknown opcode — so unsupported hardware surfaces as a
-  timeout, and the error says so. Wired into paniolo as the `usb` channel
+  negative ack for an unknown opcode — so the underlying wait times out; the
+  daemon reports that plainly as "this device does not support USB mux
+  switching" rather than as a transport failure, so an `usb state` query
+  against ordinary hardware never trips the reopen logic (each reopen briefly
+  toggles DTR/RTS, which resets a KVM-Go's MCU). Wired into paniolo as the `usb` channel
   (`paniolo usb attach-host|attach-target|state`, docs/usb.md); protocol in
   notes/openterface-usb-mux-spec.md.
 - `ch9329 -d <dev> baud <rate>` — **persistently** set the chip's serial baud
@@ -145,6 +152,18 @@ behavior.
   per process (the CH9329 has no "read current report" command), so held state
   is per-invocation there; `combo` and `run` sequences still compose within one
   process.
+- **Recovery clears the chip's own report, not just the daemon's.** The chip
+  remembers its last HID report independent of the daemon process, so a fresh
+  `open()` — first start, or a reopen after a transport error — pushes an
+  all-zero keyboard and mouse report once `GET_INFO` confirms the chip is
+  there, rather than trusting a blank in-memory `Session` to mean nothing is
+  actually held on the target. A single lost reply is retried once in place
+  before the daemon gives up and reopens (each reopen briefly toggles DTR/RTS,
+  which resets a KVM-Go's MCU); `tap`/`combo`/`type` make a best-effort
+  attempt to release whatever they pressed if a later step in the same call
+  fails, so a mid-sequence transport hiccup does not leave a key down.
+  Graceful shutdown (`SIGTERM`/Ctrl-C) releases every held key, modifier and
+  mouse button before the daemon exits — it never touches the USB mux.
 - **Baud changing is implemented and hardware-verified** via the `baud`
   command (the `SET_PARA_CFG` flash-and-reset procedure, `notes/ch9329-spec.md`
   §5) — round-tripped 115200 → 9600 → 115200 on real hardware, the change

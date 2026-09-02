@@ -113,6 +113,10 @@ are separated by single spaces.
   boot-protocol relative mice); the device MUST split them into multiple
   reports transparently (or, for an absolute-pointer device, accumulate the
   relative delta into its tracked cursor).
+- `combo` presses at most **6 keys** at once (the boot-protocol keyboard
+  report's key-slot count; modifiers don't count against it — they have their
+  own report byte). A chord that needs more — counting keys already held via
+  `down` — MUST reply `ERR` rather than silently drop the keys it can't fit.
 - `moveabs <x> <y>` positions the pointer at logical coordinates in `0..32767`
   on each axis; the host OS maps that range across the full screen dimension,
   so a caller scales pixel coordinates against the screen size (see §6). It is
@@ -121,9 +125,13 @@ are separated by single spaces.
   callers fall back to relative `move`). Implementing `moveabs` requires an
   absolute-axis HID report descriptor on the device.
 - `type` text is the remainder of the line after `type ` — it may contain
-  spaces and `#`; no quoting or escaping exists. Characters outside the
-  device's keyboard layout (reference: US) may be typed approximately or
-  rejected with `ERR`.
+  spaces and `#`, and trailing spaces are part of the text (only the line's
+  own terminator is stripped, never trailing whitespace within it); no
+  quoting or escaping exists, and an embedded CR/LF is invalid (the command
+  line format has no way to carry one — see §2). A device MUST reply `ERR`
+  for a character outside its keyboard layout (reference: US) rather than
+  type it approximately or silently drop it — a partially-typed string is
+  worse than a refused one.
 - `baud <rate>` renegotiates the serial link's speed mid-session (optional,
   capability `baud`) — for a carrier where it makes sense (a UART; meaningless
   on a TCP/WebSocket carrier). The **device boots at its default rate** —
@@ -156,7 +164,8 @@ are separated by single spaces.
 - `F1`–`F12`.
 - `MINUS`, `EQUALS`, `LEFT_BRACKET`, `RIGHT_BRACKET`, `BACKSLASH`,
   `SEMICOLON`, `QUOTE`, `GRAVE_ACCENT`, `COMMA`, `PERIOD`,
-  `FORWARD_SLASH`, `CAPS_LOCK`, `PRINT_SCREEN`.
+  `FORWARD_SLASH`, `CAPS_LOCK`, `PRINT_SCREEN`, `SCROLL_LOCK`, `PAUSE`,
+  `NUM_LOCK` (alias `KEYPAD_NUMLOCK`), `APPLICATION` (alias `MENU`).
 
 An unknown name is an `ERR`. (The reference implementation accepts the full
 `adafruit_hid.Keycode` table; non-CircuitPython implementations map the

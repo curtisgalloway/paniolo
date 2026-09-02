@@ -179,6 +179,42 @@ Note the new **upstream** traffic: previously control→host carried only `0x02`
 now also carries a continuous `0x03` console stream, so the daemon's reader loop must
 demultiplex by type rather than assume every inbound frame is a reply.
 
+### Resync after a partial frame
+
+Both boards keep a length-prefixed parse buffer (`_rxbuf` in firmware, the daemon's
+`split_frames` on the host) that can be left mid-frame if whatever was writing to it stops
+partway through: a daemon killed between a frame's header and its payload, or a host process
+crashing mid-write to the control board. A parser that trusts a stale partial frame forever
+completes it with whatever bytes arrive next — from an unrelated later session — pressing or
+releasing usages that were never actually sent. Two mechanisms close this, one on each side:
+
+- **Host → control board: a resync preamble on every open.** Before writing anything else,
+  the host writes 258 zero bytes (3 header bytes + the longest possible payload, 255) to the
+  control board's data CDC endpoint (`hidrig::proto::open_port`/`RESYNC_PREAMBLE`, used by
+  both the daemon and the one-shot CLI path). `0x00` is not a frame type, so a parser already
+  in sync skips every byte of it as unframed noise; a parser left holding a stale partial
+  frame by the *previous* owner has that frame completed with an all-zero payload — a
+  keyboard report with nothing pressed, a pointer report with no buttons — rather than with
+  whichever real bytes happen to follow. This alone only protects the control board (the one
+  the host writes to directly), and only if the control board hasn't already given up on the
+  stale frame — see the next mechanism.
+- **Firmware: discard a partial frame after 50 ms.** Both `control/code.py` and
+  `target/code.py` track when the first byte of the currently-pending (not yet complete)
+  frame arrived (`_rxbuf_started`) and drop the buffer (`discard_stale_rxbuf`) if more than
+  `PARTIAL_FRAME_TIMEOUT_S` (50 ms) passes without it completing. This is what makes the
+  preamble effective in the first place — the preamble's zero bytes only resync a parser that
+  is *waiting* for them; a board that never discards a stale frame would instead have the
+  preamble complete that frame's payload with zeros and then resync cleanly afterward, which
+  is still safe, but only by luck of the frame's declared length being short enough for the
+  preamble to fully cover it. The 50 ms discard is what makes stale state bounded regardless
+  of that timing, and it is also the target board's *only* defense — the control→target I2C
+  link carries no preamble of its own (a `0x01` HID frame is written to `i2c.writeto` as a
+  single already-complete transaction; the risk there is a physically interrupted I2C write,
+  not a killed host process), so a partial frame that timing out is the sole guard against a
+  glitched write completing wrong. **Unverified on hardware** — the firmware change has not
+  been flashed and exercised on a bench; it needs a bring-up pass (kill the daemon mid-frame,
+  restart it, confirm the target does not register a spurious keystroke) before it is trusted.
+
 ### The descriptor is a shared constant
 
 Because the host composes reports, the host composer must match the target board's HID

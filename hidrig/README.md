@@ -193,6 +193,22 @@ publishes in its discovery file (`Authorization: Bearer <token>` or
 > (The retired single-board UART path used a 115200→460800 negotiation; that is
 > gone.)
 
+A one-shot control command (`power cycle`, `ping`) draws its `0x02` reply from
+the *same* CDC stream the DUT's `0x03` console output rides, so both the
+daemon and a direct one-shot demultiplex inbound bytes rather than assume the
+next bytes read are the reply — a `power cycle` issued while the DUT is
+mid-boot still gets its answer even though console frames are interleaved
+ahead of it. Every open of the control link (daemon start, reopen, or a direct
+one-shot) also writes a 258-byte all-zero resync preamble before anything
+else: it is invisible to a parser already in sync, and completes any partial
+frame a previous, differently-killed owner left pending with zeros instead of
+letting the next real bytes complete it wrong (design doc §5).
+
+Graceful shutdown (`SIGTERM`/Ctrl-C) releases every held key, modifier and
+mouse button before the daemon exits, bounded by a short timeout — so a killed
+daemon does not leave the target with a key down that nothing remembers to
+release.
+
 ### DUT power and serial console
 
 `hidrig power off|on|cycle [secs]` switches the DUT through the control board's
@@ -207,8 +223,14 @@ which a `power off`/`cycle` deliberately causes.
 When the `serve` daemon runs, it also bridges the DUT's serial console (control
 board UART0) and **re-exports it as a PTY**, so paniolo's existing `serial`
 channel attaches with no special handling. The daemon publishes a stable symlink
-and records it in its discovery file; point a `serial` channel's `device =` at
-that path (`/tmp/paniolo-<uid>/hid/console`):
+at `/tmp/paniolo-<uid>/hid/console` as a **convenience path** for a lab file to
+point a `serial` channel's `device =` at; the symlink can fail to create (e.g. a
+stale non-symlink left there), in which case `console` in the discovery file
+falls back to the underlying device directly. `daemon.json` is the source of
+truth either way: it records both `console` (whichever of the two is live) and
+`console_device` (always the real PTY slave path, e.g. `/dev/pts/7`), so
+anything reading discovery programmatically should prefer those fields over
+assuming the symlink path exists. Point the lab file at the symlink:
 
 ```toml
 [[targets.pi5.serial]]

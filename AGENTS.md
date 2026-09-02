@@ -566,22 +566,35 @@ hidrig/          USB HID injector: host CLI + daemon (Rust) + dual-board KB2040 
                    F_CTRL 0x02). Holds the held-key + virtual-cursor state so
                    relative `move` and `moveabs` share one absolute-pointer device
   src/proto.rs     control-link transport for the *direct one-shot* path: writes
-                   binary frames to the control board's data CDC endpoint (no baud
-                   negotiation — CDC; nominal 115200), reads `0x02` control-frame
-                   replies (ping/version/power); command-file sequence parser +
-                   clamp_abs
+                   a 258-byte all-zero resync preamble then binary frames to the
+                   control board's data CDC endpoint (no baud negotiation — CDC;
+                   nominal 115200); `read_control_reply` demultiplexes inbound
+                   bytes with uart.rs's `split_frames` rather than assuming the
+                   next bytes are the `0x02` reply — the board interleaves `0x03`
+                   console frames on the same stream whenever the DUT UART has
+                   bytes, so e.g. `power cycle` during a boot log still gets
+                   acked; command-file sequence parser (delay/sleep bounded to
+                   0..=3600s, `type` keeps trailing whitespace) + clamp_abs
   src/uart.rs      the control-link owner (daemon path): a dedicated *blocking-
                    serialport* thread (NOT tokio-serial — its async reads don't
                    get read-readiness on a macOS tty) running a full-duplex poll
-                   loop. It drains an mpsc command queue (CLI + web, serialized
-                   onto one wire), pumps PTY console input down as 0x03, then
-                   reads + demuxes inbound frames: 0x02 replies fulfil the in-
-                   flight control request (deadline-tracked), 0x03 payloads go to
-                   the console PTY master. HID is fire-and-forget; broadcast
-                   transcript; lazy open + reopen-on-transport-error
+                   loop. It drains an mpsc command queue (Line + a shutdown
+                   Release variant, CLI + web serialized onto one wire), pumps
+                   PTY console input down as 0x03, then reads + demuxes inbound
+                   frames: 0x02 replies fulfil the in-flight control request
+                   (deadline-tracked), 0x03 payloads go to the console PTY
+                   master. HID is fire-and-forget; broadcast transcript; lazy
+                   open (via proto::open_port, so it also writes the resync
+                   preamble) + reopen-on-transport-error; `split_frames` is
+                   `pub(crate)`, shared with proto.rs's one-shot reader
   src/pty.rs       allocates a PTY (libc posix_openpt) for the DUT serial-console
-                   bridge: the owner holds the master; paniolo's serial channel
-                   opens the slave via the stable symlink the daemon publishes
+                   bridge and opens its own raw-mode handle on the slave, held
+                   for the daemon's lifetime — otherwise the slave sits at
+                   cooked tty defaults (ECHO|ICANON) until some other reader
+                   attaches, and every byte written to the master in that window
+                   echoes back and gets framed to the DUT UART as if typed;
+                   paniolo's serial channel opens a *second*, separate handle on
+                   the slave via the stable symlink the daemon publishes
   src/server.rs    axum: GET /hid (WebSocket carrier, 4 KiB messages), POST /send
                    (4 KiB body), /status, /version. WS clients send command
                    lines; all results are broadcast as `evt ok|err …` frames so
@@ -590,20 +603,31 @@ hidrig/          USB HID injector: host CLI + daemon (Rust) + dual-board KB2040 
                    (byte-identical in serialcap/hdmicap/ch9329)
   src/daemon.rs    advisory lock, discovery file at /tmp/paniolo-<uid>/hid/<target>/
                    (the channel name, not "hidrig", so paniolo finds it without
-                   knowing the helper); brings up the console PTY + publishes its
-                   stable symlink (recorded as discovery `console`); tokio
-                   runtime, graceful shutdown (also removes the symlink)
+                   knowing the helper); brings up the console PTY (removing a
+                   stale `console` symlink from a previous daemon first) and
+                   publishes both the stable symlink (discovery `console`, a
+                   convenience — falls back to the raw device path if the
+                   symlink can't be made) and the real slave path (discovery
+                   `console_device`, always present, the source of truth); tokio
+                   runtime, graceful shutdown (releases held keys/buttons via
+                   uart.rs's Release request, then removes the symlink)
   firmware/dual/control/  control board (CircuitPython 9.x): USB-CDC <-> I2C1
                    controller; reads framed input from usb_cdc.data, relays 0x01
                    HID frames verbatim over I2C1 to the target, answers 0x02
                    control frames (ping/version/power -> dual-control/1; power
                    drives a DUT relay on D5) locally, and bridges 0x03 console
-                   frames to/from the DUT UART (TX=GP0/RX=GP1)
+                   frames to/from the DUT UART (TX=GP0/RX=GP1). Discards a
+                   partial frame after 50ms of no completion (`_rxbuf_started`/
+                   `discard_stale_rxbuf`) so a killed-and-restarted daemon's
+                   resync preamble has something to resync — UNVERIFIED on
+                   hardware
   firmware/dual/target/   target board (CircuitPython 9.x): I2C1 peripheral that
                    relays report bytes to usb_hid send_report — no adafruit_hid,
                    no parsing. boot.py holds the HID descriptor (keyboard + custom
                    absolute-pointer, 0..32767 axes) and the dev/HID-only NVM flag
-                   (BOOT button GP11 toggles; D2->GND at reset forces dev)
+                   (BOOT button GP11 toggles; D2->GND at reset forces dev). Same
+                   50ms stale-partial-frame discard as the control board, guarding
+                   against an interrupted I2C write — UNVERIFIED on hardware
   firmware/{boot,code,config}.py  retired single-board "smart" firmware (line
                    protocol + adafruit_hid); kept for the future dumb single-board
   host/hid_seize_reports.c  macOS IOKit tool: seizes the HID device exclusively
@@ -630,11 +654,28 @@ ch9329/          Rust crate: the *other* hid helper — a WCH CH9329 UART->USB-H
                    instead of forwarded to a microcontroller; `execute_line` is
                    the one backend for CLI subcommands and `run` files, so the
                    accepted command set matches hidrig exactly (sequence parser
-                   + moveabs clamp ported from hidrig/src/proto.rs)
-  src/session.rs   the link itself: framing/checksum, GET_INFO, held-key/pointer
-                   state, and `open()`'s baud probe (BAUD_CANDIDATES = 115200,
-                   57600 — the NanoKVM-USB default — then 9600; force one with
-                   -b). Holds two verified CH9329-on-Linux workarounds —
+                   — delay/sleep bounded to 0..=3600s, `type` keeps trailing
+                   whitespace, an embedded CR/LF is refused on this direct path
+                   too — + moveabs clamp ported from hidrig/src/proto.rs)
+  src/session.rs   the link itself: framing/checksum (rejects a reply from the
+                   wrong `raddr`), GET_INFO, held-key/pointer state, and
+                   `open()`'s baud probe (BAUD_CANDIDATES = 115200, 57600 — the
+                   NanoKVM-USB default — then 9600; force one with -b).
+                   `open()` pushes an all-zero keyboard + mouse report once
+                   GET_INFO confirms the chip, since the chip's own HID state
+                   outlives the daemon process; `tap`/`combo`/`type_text` best-
+                   effort release whatever they pressed if a later step fails,
+                   `combo` refuses (ERR) a chord needing more than the 6 key
+                   slots rather than truncating it, and typing a usage already
+                   held via `down` releases it first so the press is a real
+                   edge. `usb_cmd` (the mux-switch command) reworks a reply
+                   timeout into a "not supported" message that does NOT read as
+                   transport loss, so a mux-less device's `usb state` query
+                   never trips uart.rs's reopen. A `#[cfg(test)] pub(crate)
+                   test_support` module (FakePort, a full `SerialPort` stub over
+                   an in-memory byte queue + write log) lets proto.rs/uart.rs/
+                   session.rs tests execute real wire behaviour without
+                   hardware. Holds two verified CH9329-on-Linux workarounds —
                    clicks go through the *relative* report (libinput coalesces a
                    button transition in an absolute report at an unchanged
                    coordinate), and `moveabs` nudges one unit before the exact
@@ -642,16 +683,24 @@ ch9329/          Rust crate: the *other* hid helper — a WCH CH9329 UART->USB-H
                    coalesced away)
   src/uart.rs      the UART owner (daemon path): one dedicated thread holding a
                    long-lived Session, serializing CLI- and WebSocket-injected
-                   commands onto the one wire, one in flight — which is also
-                   what makes held state survive across separate invocations
+                   commands (plus a shutdown Release request) onto the one wire,
+                   one in flight — which is also what makes held state survive
+                   across separate invocations. A timed-out request gets one
+                   retry in place before it is classified as transport loss and
+                   the session is reopened (a reopen briefly toggles DTR/RTS,
+                   which resets a KVM-Go's MCU)
   src/keys.rs      key-name -> USB HID usage mapping (adafruit_hid Keycode names,
-                   US layout), shared with the hidrig vocabulary
+                   US layout, incl. PRINT_SCREEN/SCROLL_LOCK/PAUSE/NUM_LOCK/
+                   APPLICATION), shared with the hidrig vocabulary
   src/server.rs    axum: GET /hid (WebSocket, 4 KiB messages), POST /send (4 KiB
                    body), /status, /version
   src/auth.rs      token + loopback Host/Origin layer over the whole router
                    (byte-identical in serialcap/hdmicap/hidrig)
   src/daemon.rs    `serve`/`stop`: owns the UART, publishes the same
-                   /tmp/paniolo-<uid>/hid/ discovery file paniolo's console reads
+                   /tmp/paniolo-<uid>/hid/ discovery file paniolo's console
+                   reads; graceful shutdown releases held keys/buttons (via
+                   uart.rs's Release request) before exiting, and never touches
+                   the USB mux
   README.md        wiring, extras beyond hidrig's surface (`info` reports target
                    USB enumeration + lock LEDs; `baud` persists a rate to flash),
                    and the hardware-verified status notes
