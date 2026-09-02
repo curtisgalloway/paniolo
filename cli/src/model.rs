@@ -535,6 +535,10 @@ pub fn validate(lab: &Lab) -> Result<(), LabError> {
             let h = adb.host.as_deref().unwrap_or(default_host);
             check_host_ref(h, &declared, &format!("target '{name}' adb"))?;
         }
+        if let Some(usb) = &t.usb {
+            let h = usb.host.as_deref().unwrap_or(default_host);
+            check_host_ref(h, &declared, &format!("target '{name}' usb"))?;
+        }
         let mut seen: BTreeSet<&str> = BTreeSet::new();
         for s in &t.serial {
             if s.name.is_empty() || s.device.is_empty() {
@@ -768,6 +772,17 @@ mod tests {
     #[test]
     fn validate_rejects_unknown_host() {
         let e = parse("[targets.t]\nhost = \"ghost\"\n").unwrap_err();
+        assert!(e.0.contains("unknown host 'ghost'"), "{}", e.0);
+    }
+
+    #[test]
+    fn validate_rejects_unknown_usb_host() {
+        // Every channel's host reference is checked, the usb channel included:
+        // an unknown name here used to pass validation and then silently
+        // resolve to the local host at runtime.
+        let e =
+            parse("[targets.t.usb]\ncmd = \"ch9329 -d /dev/x\"\nhost = \"ghost\"\n").unwrap_err();
+        assert!(e.0.contains("target 't' usb"), "{}", e.0);
         assert!(e.0.contains("unknown host 'ghost'"), "{}", e.0);
     }
 

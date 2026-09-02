@@ -336,6 +336,30 @@ fn check_windows_layout() {
 #[cfg(not(windows))]
 fn check_windows_layout() {}
 
+/// One platform-specific step of a packaged (no-checkout) setup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackagedStep {
+    /// macOS: make the installed netbootd-bpf-helper setuid-root.
+    SetuidBpfHelper,
+    /// Windows: check the portable zip layout is intact.
+    WindowsLayout,
+    /// Linux: add the user to the device-access groups.
+    LinuxGroups,
+    /// Linux: hint at installing tesseract for OCR.
+    TesseractHint,
+}
+
+/// The packaged-setup steps for `os` (a `std::env::consts::OS` value). Kept
+/// as a pure function so each CI platform can assert its own steps: the
+/// Linux group step once sat under a Windows branch and nothing noticed.
+fn packaged_steps(os: &str) -> Vec<PackagedStep> {
+    match os {
+        "macos" => vec![PackagedStep::SetuidBpfHelper],
+        "windows" => vec![PackagedStep::WindowsLayout],
+        _ => vec![PackagedStep::LinuxGroups, PackagedStep::TesseractHint],
+    }
+}
+
 /// no source checkout, so no builds: setuid the installed bpf-helper on
 /// macOS (located via `find_binary`, which knows the per-user libexec, the
 /// Homebrew keg, and `/usr/libexec/paniolo/bin`), and check group
@@ -343,29 +367,38 @@ fn check_windows_layout() {}
 /// zigplug still needs a clone (`make install`).
 pub fn run_packaged() -> Result<()> {
     println!("No source checkout found — finishing setup for the installed paniolo.");
-    if cfg!(target_os = "macos") {
-        match crate::daemons::find_binary("netbootd-bpf-helper") {
-            Some(helper) => setuid_bpf_helper(&helper),
-            None => println!("  … netbootd-bpf-helper not found; skipping setuid install"),
-        }
-    } else if cfg!(windows) {
-        // Nothing to grant on Windows: there is no setuid bit, no dialout
-        // group, and the OCR helper has no Windows build. The one thing worth
-        // checking is that the portable layout is intact, since a zip extracted
-        // without its `libexec` directory yields a CLI that runs and then fails
-        // on the first channel it needs a helper for.
-        check_windows_layout();
-        if ensure_linux_groups() {
-            println!(
-                "\nNote: group changes take effect after you log out and back in \
-                 (or run `newgrp dialout` in the current shell)."
-            );
-        }
-        if crate::daemons::find_binary("tesseract").is_none() {
-            println!(
-                "  ! tesseract not found — install it for OCR:\n\
-                 \x20   sudo apt-get install tesseract-ocr"
-            );
+    for step in packaged_steps(std::env::consts::OS) {
+        match step {
+            PackagedStep::SetuidBpfHelper => {
+                match crate::daemons::find_binary("netbootd-bpf-helper") {
+                    Some(helper) => setuid_bpf_helper(&helper),
+                    None => {
+                        println!("  … netbootd-bpf-helper not found; skipping setuid install")
+                    }
+                }
+            }
+            // Nothing to grant on Windows: there is no setuid bit, no dialout
+            // group, and the OCR helper has no Windows build. The one thing
+            // worth checking is that the portable layout is intact, since a zip
+            // extracted without its `libexec` directory yields a CLI that runs
+            // and then fails on the first channel it needs a helper for.
+            PackagedStep::WindowsLayout => check_windows_layout(),
+            PackagedStep::LinuxGroups => {
+                if ensure_linux_groups() {
+                    println!(
+                        "\nNote: group changes take effect after you log out and back in \
+                         (or run `newgrp dialout` in the current shell)."
+                    );
+                }
+            }
+            PackagedStep::TesseractHint => {
+                if crate::daemons::find_binary("tesseract").is_none() {
+                    println!(
+                        "  ! tesseract not found — install it for OCR:\n\
+                         \x20   sudo apt-get install tesseract-ocr"
+                    );
+                }
+            }
         }
     }
     println!(
@@ -649,6 +682,19 @@ mod tests {
         let missing = dir.path().join("absent");
         let err = helper_safe_to_setuid(&missing).unwrap_err().to_string();
         assert!(err.contains("cannot stat"), "{err}");
+    }
+
+    #[test]
+    fn packaged_steps_grant_groups_on_linux_not_windows() {
+        // Regression: the Linux group/tesseract steps were nested under the
+        // Windows branch, so a .deb install never joined dialout/video.
+        let linux = packaged_steps("linux");
+        assert!(linux.contains(&PackagedStep::LinuxGroups));
+        assert!(linux.contains(&PackagedStep::TesseractHint));
+        assert!(!linux.contains(&PackagedStep::WindowsLayout));
+        assert!(!linux.contains(&PackagedStep::SetuidBpfHelper));
+        assert_eq!(packaged_steps("windows"), vec![PackagedStep::WindowsLayout]);
+        assert_eq!(packaged_steps("macos"), vec![PackagedStep::SetuidBpfHelper]);
     }
 
     /// The markers `is_repo_root` keys off must match the *real* tree.
