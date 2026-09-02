@@ -312,7 +312,9 @@ jobs:
         env:
           REF: ${{ github.ref_name }}
         run: |
-          $ver = $env:REF -replace '^v',''
+          # A branch ref on workflow_dispatch can contain '/', which is not a
+          # valid file name; keep only file-safe characters.
+          $ver = ($env:REF -replace '^v','') -replace '[^A-Za-z0-9._-]','-'
           Compress-Archive -Path dist/paniolo -DestinationPath "dist/paniolo-$ver-x86_64-pc-windows-msvc.zip"
           Get-FileHash "dist/paniolo-$ver-x86_64-pc-windows-msvc.zip" -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |
