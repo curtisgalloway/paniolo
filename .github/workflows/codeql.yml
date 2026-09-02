@@ -80,7 +80,7 @@ jobs:
           - language: rust
             build-mode: none
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       # See the header note. Both variables are required. The path is computed
       # rather than hardcoded, and the directory is asserted, so a rustup layout
@@ -95,11 +95,11 @@ jobs:
           echo "CODEQL_EXTRACTOR_RUST_OPTION_SYSROOT=$sysroot" >> "$GITHUB_ENV"
           echo "CODEQL_EXTRACTOR_RUST_OPTION_SYSROOT_SRC=$sysroot/lib/rustlib/src/rust/library" >> "$GITHUB_ENV"
 
-      - uses: github/codeql-action/init@v3
+      - uses: github/codeql-action/init@6f5948dfacef28e207b48d0905cf90c03365536d # v3.37.9
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
 
-      - uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/analyze@6f5948dfacef28e207b48d0905cf90c03365536d # v3.37.9
         with:
           category: "/language:${{ matrix.language }}"
