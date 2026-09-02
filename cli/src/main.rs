@@ -3321,11 +3321,12 @@ fn log_was_replaced(
 }
 
 /// A value identifying which underlying file `path` currently names — the
-/// inode on Unix, the file index on Windows — so a poll loop can tell "this
-/// path was truncated and reopened as a new file" from "this path's file just
-/// grew". `None` when the file is momentarily missing (mid-recreate) or on a
-/// platform with neither primitive; callers treat that as "keep the current
-/// handle".
+/// inode on Unix — so a poll loop can tell "this path now names a new file"
+/// from "this path's file just grew". `None` when the file is momentarily
+/// missing (mid-recreate), and always on Windows, where std's file index is
+/// still unstable; there [`log_was_replaced`] falls back to the shrunk-file
+/// signal alone, which is the one that fires for an in-place truncation on
+/// every platform anyway.
 fn file_identity(path: &std::path::Path) -> Option<u64> {
     let meta = std::fs::metadata(path).ok()?;
     #[cfg(unix)]
@@ -3333,12 +3334,7 @@ fn file_identity(path: &std::path::Path) -> Option<u64> {
         use std::os::unix::fs::MetadataExt;
         Some(meta.ino())
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        meta.file_index()
-    }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(unix))]
     {
         let _ = meta;
         None
