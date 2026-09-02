@@ -29,8 +29,8 @@ Subcommands:
   cycle <ieee>         Power-cycle: off → delay → on → confirm.
   remove <ieee>        Unpair a plug from the network.
   serve                Run the coordinator-owning daemon (--foreground).
-  stop                 Stop the running daemon.
-  status               Show daemon + network status.
+  stop                 Stop the running daemon (no -d needed).
+  status               Show daemon + network status (no -d needed).
   backup [-o FILE]     Save a network backup (key, counters) as JSON.
   restore [-i FILE]    Write a backup into the coordinator NVRAM.
 """
@@ -73,15 +73,21 @@ class _Options:
 
 _options = _Options()
 
+# Subcommands that only talk to the already-running daemon. It is found
+# through its host-singleton discovery file, so they need no --device.
+_DAEMON_ONLY = frozenset({"stop", "status"})
+
 
 @app.callback()
 def main(
+    ctx: typer.Context,
     device: Annotated[
         Optional[str],
         typer.Option(
             "--device",
             "-d",
-            help="Coordinator UART device path (e.g. /dev/cu.usbserial-8310).",
+            help="Coordinator UART device path (e.g. /dev/cu.usbserial-8310). "
+            "Not needed by `stop`/`status`.",
         ),
     ] = None,
     db: Annotated[
@@ -102,9 +108,9 @@ def main(
     ] = 0,
 ) -> None:
     """Store global options and configure logging."""
-    if device is None:
+    if device is None and ctx.invoked_subcommand not in _DAEMON_ONLY:
         raise typer.BadParameter("required option '--device' (-d) was not provided")
-    _options.device = device
+    _options.device = device or ""
     _options.db_path = db if db is not None else _app.default_db_path()
     _options.no_daemon = no_daemon
     level = {0: logging.WARNING, 1: logging.INFO}.get(verbose, logging.DEBUG)
@@ -129,9 +135,10 @@ def _proxy(
 ):
     """Route an operation through the daemon, spawning it if needed."""
     try:
-        url = _daemon.ensure(_options.device, _options.db_path)
         timeout = _daemon.OP_TIMEOUT_S + extra_wait + 10.0
-        return _daemon.call(url, method, path, body, timeout=timeout)
+        return _daemon.request(
+            _options.device, _options.db_path, method, path, body, timeout=timeout
+        )
     except _app.ZigplugError as exc:
         raise _fail(exc) from exc
 
@@ -288,53 +295,58 @@ def serve(
     existing = _daemon.read_discovery()
     if existing is not None:
         typer.echo(
-            f"daemon already running (pid {existing['pid']}, "
-            f"device {existing['device']})"
+            f"daemon already running (pid {existing.pid}, device {existing.device})"
         )
         return
     if foreground:
         code = _run(_daemon.serve(_options.device, _options.db_path))
         raise typer.Exit(code=code or 0)
     try:
-        url = _daemon.spawn(_options.device, _options.db_path)
+        daemon = _daemon.spawn(_options.device, _options.db_path)
     except _app.ZigplugError as exc:
         raise _fail(exc) from exc
-    typer.echo(f"daemon running at {url}")
+    typer.echo(f"daemon running at {daemon.url}")
 
 
 @app.command()
 def stop() -> None:
     """Stop the running daemon."""
-    info = _daemon.read_discovery()
-    if info is None:
+    daemon = _daemon.read_discovery()
+    if daemon is None:
         typer.echo("no daemon running")
         return
-    with contextlib.suppress(_app.ZigplugError):
-        _daemon.call(
-            f"http://127.0.0.1:{info['port']}", "POST", "/stop", None, timeout=5.0
-        )
+    try:
+        _daemon.call(daemon, "POST", "/stop", None, timeout=5.0)
+    except _daemon.DaemonGone as exc:
+        # Nothing to stop — and the recorded pid may belong to some other
+        # process by now, so it must not be signalled below.
+        typer.echo(str(exc), err=True)
+        return
+    except _app.ZigplugError:
+        pass
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
         if _daemon.read_discovery() is None:
-            typer.echo(f"daemon (pid {info['pid']}) stopped")
+            typer.echo(f"daemon (pid {daemon.pid}) stopped")
             return
         time.sleep(0.2)
     with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.kill(int(info["pid"]), signal.SIGTERM)
-    typer.echo(f"daemon (pid {info['pid']}) signalled")
+        os.kill(daemon.pid, signal.SIGTERM)
+    typer.echo(f"daemon (pid {daemon.pid}) signalled")
 
 
 @app.command()
 def status() -> None:
     """Show daemon and network status."""
-    info = _daemon.read_discovery()
-    if info is None:
+    daemon = _daemon.read_discovery()
+    if daemon is None:
         typer.echo("daemon\tnot running")
         return
-    health = _daemon.call(
-        f"http://127.0.0.1:{info['port']}", "GET", "/healthz", None, timeout=5.0
-    )
-    typer.echo(f"daemon\trunning (pid {info['pid']}, port {info['port']})")
+    try:
+        health = _daemon.call(daemon, "GET", "/healthz", None, timeout=5.0)
+    except _app.ZigplugError as exc:
+        raise _fail(exc) from exc
+    typer.echo(f"daemon\trunning (pid {daemon.pid}, port {daemon.port})")
     typer.echo(f"device\t{health['device']}")
     typer.echo(f"network\tchannel {health['channel']}, PAN {health['pan_id']}")
     typer.echo(f"uptime\t{health['uptime_s']}s")
