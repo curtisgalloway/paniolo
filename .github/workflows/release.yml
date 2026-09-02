@@ -64,11 +64,13 @@ jobs:
 
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - name: Install Rust
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      # The same SHA-pinned toolchain action ci.yml uses, in place of an
+      # ad-hoc `curl https://sh.rustup.rs | sh` here. The container has no
+      # rustup, and the action bootstraps one itself (it needs the curl and
+      # ca-certificates installed above); the download still happens, but
+      # its flags and its source now live in a pinned, Dependabot-tracked
+      # action that can be read at that commit, not in a pipe nobody diffs.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -119,11 +121,21 @@ jobs:
           # `ocr_mode = "gui"`, so a .deb stays a .deb.
           install -m 0755 ocr/rapidocr packaging/stage/libexec/
 
+      # The .deb is checked against the checksums.txt goreleaser publishes
+      # alongside it before apt installs it as root — a swapped download would
+      # otherwise run its maintainer scripts inside the build. --ignore-missing
+      # skips the other assets the file lists; sha256sum still fails when
+      # nothing it lists was found.
       - name: Install nfpm
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
-          curl -fsSL -o /tmp/nfpm.deb \
-            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_${{ matrix.arch }}.deb"
-          apt-get install -y /tmp/nfpm.deb
+          base="https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}"
+          mkdir -p /tmp/nfpm && cd /tmp/nfpm
+          curl -fsSL -O "$base/nfpm_${NFPM_VERSION}_${ARCH}.deb"
+          curl -fsSL -O "$base/checksums.txt"
+          sha256sum -c --ignore-missing checksums.txt
+          apt-get install -y "/tmp/nfpm/nfpm_${NFPM_VERSION}_${ARCH}.deb"
 
       - name: Build .deb
         env:
@@ -153,11 +165,19 @@ jobs:
         run: |
           apt-get install -y ./dist/paniolo_*.deb
           test -x /usr/bin/paniolo
+          # Run each helper, not just stat it: --help returns 0 only once the
+          # binary has loaded, so a missing shared library (libudev, a
+          # turbojpeg .so) fails the release here rather than on a user's box.
+          # linuxocr and rapidocr are Python; their argparse --help exercises
+          # the python3 dependency the .deb declares.
           for helper in $HELPERS; do
             test -x "/usr/libexec/paniolo/bin/$helper"
+            "/usr/libexec/paniolo/bin/$helper" --help >/dev/null
           done
           test -x /usr/libexec/paniolo/bin/linuxocr
+          /usr/libexec/paniolo/bin/linuxocr --help >/dev/null
           test -x /usr/libexec/paniolo/bin/rapidocr
+          /usr/libexec/paniolo/bin/rapidocr --help >/dev/null
           test -f /usr/share/paniolo/skills/paniolo/SKILL.md
           /usr/bin/paniolo --help
           # Run outside the checkout so `skill` resolves the packaged copy
@@ -283,11 +303,16 @@ jobs:
           }
           if ($failed) { exit 1 }
 
+      # The ref reaches pwsh through env rather than a `${{ }}` spliced into
+      # the script source, where a ref containing a quote would be code.
+      # github.ref_name is never empty (the tag on a tag push, the branch on
+      # workflow_dispatch), so the old `$ver = "dev"` fallback was unreachable.
       - name: Zip
         shell: pwsh
+        env:
+          REF: ${{ github.ref_name }}
         run: |
-          $ver = "${{ github.ref_name }}" -replace '^v',''
-          if (-not $ver) { $ver = "dev" }
+          $ver = $env:REF -replace '^v',''
           Compress-Archive -Path dist/paniolo -DestinationPath "dist/paniolo-$ver-x86_64-pc-windows-msvc.zip"
           Get-FileHash "dist/paniolo-$ver-x86_64-pc-windows-msvc.zip" -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |
@@ -363,12 +388,16 @@ jobs:
                  "Add a fine-grained PAT (Contents:write on curtisgalloway/homebrew-tap)."
             exit 0
           fi
+          # jq builds the body so the tag is JSON-escaped, not spliced into
+          # a string literal.
+          body="$(jq -n --arg tag "$TAG" \
+            '{event_type: "paniolo-release", client_payload: {tag: $tag}}')"
           curl -fsSL -X POST \
             -H "Authorization: Bearer ${TAP_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             https://api.github.com/repos/curtisgalloway/homebrew-tap/dispatches \
-            -d "{\"event_type\":\"paniolo-release\",\"client_payload\":{\"tag\":\"${TAG}\"}}"
+            -d "$body"
           echo "Dispatched paniolo-release (${TAG}) to homebrew-tap."
 
   refresh-apt-repo:
