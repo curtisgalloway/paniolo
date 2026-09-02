@@ -723,20 +723,32 @@ Key differences from the Python servers:
 - **Privilege-separated `/dev/bpf` on macOS.** The macOS raw-frame send path
   (the Sequoia workaround) needs a BPF descriptor, which only root can open.
   Rather than run the daemon as root, a tiny **setuid-root** helper —
-  `netbootd-bpf-helper` — opens `/dev/bpfN`, binds it (`BIOCSETIF`), sets
-  `BIOCSHDRCMPLT`, and passes the fd back over a `socketpair` via `SCM_RIGHTS`
-  (`src/handoff.rs`), then exits. netbootd itself runs **unprivileged** and only
-  `write(2)`s frames to the fd (`src/bpf.rs::BpfSender::from_handoff`). The
-  helper is the *only* component that runs as root; `paniolo setup` installs it
-  setuid (the one-time sudo). If the helper is missing/not-setuid, netbootd logs
-  it and falls back to the kernel `send_to` path (broken on macOS 15+).
+  `netbootd-bpf-helper` — opens `/dev/bpfN` **write-only**, binds it
+  (`BIOCSETIF`), sets `BIOCSHDRCMPLT`, installs a reject-all filter
+  (`BIOCSETF`, `ret #0`), and passes the fd back over a `socketpair` via
+  `SCM_RIGHTS` (`src/handoff.rs`), then exits. netbootd itself runs
+  **unprivileged** and only `write(2)`s frames to the fd
+  (`src/bpf.rs::BpfSender::from_handoff`); the fd cannot capture (`read(2)`
+  fails — no `FREAD` — and the filter accepts nothing) and is `FD_CLOEXEC` so
+  the daemon's `sudo arp`/`ifconfig` children never inherit it. The helper is
+  the *only* component that runs as root; `paniolo setup` installs it setuid
+  4755 (the one-time sudo), and it gates itself rather than relying on the
+  mode: it refuses any caller whose real uid is not the owner of the directory
+  it lives in (`handoff::caller_allowed` — the installing user, or root) and
+  refuses the default-route interface (`handoff::interface_refused`, looked
+  up by `route::default_route_interface` — `/sbin/route` by absolute path with
+  an empty environment). If the helper is missing, not setuid, or refuses,
+  netbootd logs its exit status and stderr and falls back to the kernel
+  `send_to` path (broken on macOS 15+). `setup` will not setuid a symlink or a
+  file the invoking user does not own.
 - **Primary-NIC guard.** `netcfg::is_primary_interface` mirrors the Python
   guard; `main()` refuses to start, and `monitor_interface` refuses to enforce,
   on the default-route interface.
-- **Layout.** `src/lib.rs` exposes `frame` (frame builder, unit-tested) and
-  `handoff` (BPF open + fd passing) so both the `netbootd` and
-  `netbootd-bpf-helper` binaries share them. On Linux netbootd uses the kernel
-  send path (no BPF), matching the Python behavior.
+- **Layout.** `src/lib.rs` exposes `frame` (frame builder, unit-tested),
+  `handoff` (BPF open + fd passing + the helper's caller/interface policy,
+  unit-tested) and, on macOS, `route` (the default-route lookup) so both the
+  `netbootd` and `netbootd-bpf-helper` binaries share them. On Linux netbootd
+  uses the kernel send path (no BPF), matching the Python behavior.
 
 ## hidrig (USB HID injector)
 

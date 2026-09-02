@@ -125,6 +125,26 @@ it is missing or not setuid, the rust engine logs a warning and falls back to
 the kernel send path (which is unreliable on macOS 15+). Run `paniolo setup`
 (one sudo) to install it.
 
+What the helper will and will not do, since it is setuid-root and any local
+user can execute it:
+
+- **Only the installing user may invoke it.** It refuses every caller whose
+  real uid is not the owner of the directory it was installed into (your
+  private libexec dir, or the Homebrew keg) — root excepted. Another user gets
+  `refused: caller uid N is not the installing user (uid M)` and no descriptor.
+- **It refuses the default-route interface.** Asking it to bind the primary
+  NIC (the one `route -n get default` names) yields `refused: <iface> carries
+  the default route`; the netboot link must be a dedicated secondary adapter.
+- **The descriptor is write-only, with a reject-all filter.** It is opened
+  `O_WRONLY`, so `read(2)` on it fails, and a `BIOCSETF` program that accepts
+  nothing is installed before it leaves the helper. The daemon can inject
+  frames on the netboot interface and nothing else — it cannot capture.
+
+`netbootd` reports the helper's exit status and message in its log when the
+handoff fails (`BPF handoff failed (netbootd-bpf-helper exited with exit
+status: 1: refused: …)`), so a refused or not-setuid helper is diagnosable
+from the log alone.
+
 ---
 
 ## Status and logs
