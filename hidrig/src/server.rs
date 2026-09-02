@@ -134,11 +134,13 @@ async fn handle_ws(socket: WebSocket, hid: HidHandle) {
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
             let line = match msg {
-                Message::Text(t) => t.trim().to_string(),
+                // Only a line terminator is stripped: a `type` line's trailing
+                // spaces are part of its text.
+                Message::Text(t) => t.trim_end_matches(['\r', '\n']).to_string(),
                 Message::Close(_) => break,
                 _ => continue,
             };
-            if line.is_empty() {
+            if line.trim().is_empty() {
                 continue;
             }
             let _ = hid.send(line).await; // result is broadcast as an `evt` frame

@@ -47,10 +47,19 @@ const POWER_CYCLE: u8 = 2;
 /// Absolute-pointer logical maximum (`moveabs` axis range is `0..=ABS_MAX`).
 pub const ABS_MAX: i32 = 32_767;
 
+/// Key slots in the keyboard report (the boot-protocol six).
+const KEY_SLOTS: usize = 6;
+
 /// Ceiling on the text of one `type` command. A command line is one line of
 /// input, so 4 KiB is generous; the cap keeps one request from queueing hours
 /// of keystrokes (two frames per character) ahead of every other client.
 pub const MAX_TYPE_CHARS: usize = 4096;
+
+/// Ceiling on one `scroll` call's total travel. The wheel field is one signed
+/// byte per report, so larger amounts are split across reports; without a
+/// ceiling `scroll 2000000000` would queue sixteen million frames ahead of
+/// every other client. Matches ch9329's per-call relative limit.
+pub const MAX_SCROLL_TOTAL: i32 = 32_767;
 
 /// A composed wire frame ready to send to the control board.
 pub type Frame = Vec<u8>;
@@ -162,11 +171,23 @@ fn named_key(n: &str) -> Option<u8> {
         ("LEFT_ARROW", 0x50),
         ("DOWN_ARROW", 0x51),
         ("UP_ARROW", 0x52),
+        // Lock, system and menu keys — the same names and usage ids as
+        // ch9329/src/keys.rs, so a sequence file runs on either helper.
+        ("PRINT_SCREEN", 0x46),
+        ("SCROLL_LOCK", 0x47),
+        ("PAUSE", 0x48),
+        ("NUM_LOCK", 0x53),
+        ("KEYPAD_NUMLOCK", 0x53),
+        ("APPLICATION", 0x65),
+        ("MENU", 0x65),
     ];
     words.iter().find(|(name, _)| *name == n).map(|(_, u)| *u)
 }
 
-/// US-keyboard layout: printable ASCII → (usage, needs-shift).
+/// US-keyboard layout: printable ASCII → (usage, needs-shift). A newline is
+/// deliberately not here: the command line is the frame, so `type` text can
+/// never carry one ([`Composer::dispatch`] refuses it) — `key ENTER` presses
+/// Enter.
 fn char_to_key(c: char) -> Option<(u8, bool)> {
     Some(match c {
         'a'..='z' => (0x04 + (c as u8 - b'a'), false),
@@ -174,7 +195,6 @@ fn char_to_key(c: char) -> Option<(u8, bool)> {
         '1'..='9' => (0x1e + (c as u8 - b'1'), false),
         '0' => (0x27, false),
         ' ' => (0x2c, false),
-        '\n' => (0x28, false),
         '\t' => (0x2b, false),
         '!' => (0x1e, true),
         '@' => (0x1f, true),
@@ -254,7 +274,13 @@ impl Composer {
     fn kbd(&self, extra_mods: u8, extra_keys: &[u8]) -> Frame {
         let mut report = [0u8; 8];
         report[0] = self.held_mods | extra_mods;
-        for (slot, &k) in self.held_keys.iter().chain(extra_keys).take(6).enumerate() {
+        for (slot, &k) in self
+            .held_keys
+            .iter()
+            .chain(extra_keys)
+            .take(KEY_SLOTS)
+            .enumerate()
+        {
             report[2 + slot] = k;
         }
         frame(F_HID, RID_KBD, &report)
@@ -276,7 +302,9 @@ impl Composer {
     }
 
     /// `type <text>`: tap each character (press then release). Text longer
-    /// than [`MAX_TYPE_CHARS`] is refused rather than truncated.
+    /// than [`MAX_TYPE_CHARS`] is refused rather than truncated, and text the
+    /// US layout cannot produce is refused rather than typed with holes —
+    /// nothing is composed for a refused string, so nothing partial is typed.
     pub fn type_text(&self, text: &str) -> Result<Vec<Frame>> {
         let n = text.chars().count();
         if n > MAX_TYPE_CHARS {
@@ -284,13 +312,14 @@ impl Composer {
                 "type text is {n} characters; the limit is {MAX_TYPE_CHARS}"
             ));
         }
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(2 * n);
         for c in text.chars() {
-            if let Some((usage, shift)) = char_to_key(c) {
-                let m = if shift { 0x02 } else { 0 };
-                out.push(self.kbd(m, &[usage]));
-                out.push(self.kbd(0, &[]));
-            }
+            let (usage, shift) = char_to_key(c).ok_or_else(|| {
+                anyhow!("cannot type character {c:?} (US layout only; use `key <NAME>` for a named key)")
+            })?;
+            let m = if shift { 0x02 } else { 0 };
+            out.push(self.kbd(m, &[usage]));
+            out.push(self.kbd(0, &[]));
         }
         Ok(out)
     }
@@ -304,14 +333,29 @@ impl Composer {
     }
 
     /// `combo <NAME>...`: press all the named keys together, then release.
+    /// A report has [`KEY_SLOTS`] key slots; a chord needing more (counting
+    /// keys already held with `down`) is refused rather than silently
+    /// truncated. Modifiers have their own byte and never take a slot.
     pub fn combo(&self, names: &[String]) -> Result<Vec<Frame>> {
         let mut mods = 0u8;
-        let mut keys = Vec::new();
+        let mut keys: Vec<u8> = Vec::new();
         for n in names {
             match key_kind(n)? {
                 KeyKind::Modifier(bit) => mods |= bit,
-                KeyKind::Key(u) => keys.push(u),
+                KeyKind::Key(u) => {
+                    if !keys.contains(&u) && !self.held_keys.contains(&u) {
+                        keys.push(u);
+                    }
+                }
             }
+        }
+        let needed = self.held_keys.len() + keys.len();
+        if needed > KEY_SLOTS {
+            return Err(anyhow!(
+                "combo needs {needed} key slots but a report has {KEY_SLOTS} \
+                 ({} already held); modifiers do not count",
+                self.held_keys.len()
+            ));
         }
         Ok(vec![self.kbd(mods, &keys), self.kbd(0, &[])])
     }
@@ -384,9 +428,28 @@ impl Composer {
         Ok(vec![self.mouse(0)])
     }
 
-    /// `scroll <amount>`: wheel notch(es) at the current position.
+    /// `scroll <amount>`: wheel notches at the current position. The wheel
+    /// field is one signed byte, so the amount is split across reports
+    /// (protocol §3); the per-call total is capped at [`MAX_SCROLL_TOTAL`].
     pub fn scroll(&self, amount: i32) -> Vec<Frame> {
-        vec![self.mouse(amount.clamp(-127, 127) as i8)]
+        let mut left = amount.clamp(-MAX_SCROLL_TOTAL, MAX_SCROLL_TOTAL);
+        let mut out = Vec::new();
+        while left != 0 {
+            let step = left.clamp(-127, 127);
+            out.push(self.mouse(step as i8));
+            left -= step;
+        }
+        out
+    }
+
+    /// Everything released: no keys, no modifiers, no buttons. The daemon
+    /// sends this at shutdown so the target is not left with a key or button
+    /// down after the process that was holding it exits.
+    pub fn release_everything(&mut self) -> Vec<Frame> {
+        self.held_mods = 0;
+        self.held_keys.clear();
+        self.buttons = 0;
+        vec![self.kbd(0, &[]), self.mouse(0)]
     }
 
     /// `ping`: a control frame (the control board answers).
@@ -420,46 +483,54 @@ impl Composer {
     /// Compose one v1 ASCII command line into the frames to send. The single
     /// composition entry point shared by the one-shot CLI and the daemon (it
     /// replaces the firmware's `handle_line`).
+    ///
+    /// The line is the frame: one trailing line terminator is stripped, and a
+    /// CR/LF anywhere else is refused rather than typed as Enter — the daemon's
+    /// queue refuses it too, so the direct path agrees. `type` text is the
+    /// remainder after the one separator, verbatim (trailing spaces included);
+    /// every other verb takes whitespace-separated tokens.
     pub fn dispatch(&mut self, line: &str) -> Result<Vec<Frame>> {
-        let (head, rest) = line
-            .trim()
-            .split_once(char::is_whitespace)
-            .unwrap_or((line.trim(), ""));
-        let rest = rest.trim();
-        let button = || if rest.is_empty() { "left" } else { rest };
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.contains(['\r', '\n']) {
+            return Err(anyhow!("command contains a newline: {line:?}"));
+        }
+        let line = line.trim_start();
+        let (head, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        let args = rest.trim();
+        let button = || if args.is_empty() { "left" } else { args };
         match head.to_ascii_lowercase().as_str() {
             "type" => self.type_text(rest),
-            "key" => self.key(rest),
+            "key" => self.key(args),
             "combo" => self.combo(
-                &rest
+                &args
                     .split_whitespace()
                     .map(str::to_string)
                     .collect::<Vec<_>>(),
             ),
-            "down" => self.down(rest),
-            "up" => self.up(rest),
+            "down" => self.down(args),
+            "up" => self.up(args),
             "releaseall" => Ok(self.releaseall()),
             "move" => {
-                let (dx, dy) = two_ints(rest)?;
+                let (dx, dy) = two_ints(args)?;
                 Ok(self.move_rel(dx, dy))
             }
             "moveabs" => {
-                let (x, y) = two_ints(rest)?;
+                let (x, y) = two_ints(args)?;
                 Ok(self.moveabs(x, y))
             }
             "click" => self.click(button()),
             "mdown" => self.mdown(button()),
             "mup" => self.mup(button()),
             "scroll" => {
-                let n = rest
+                let n = args
                     .parse()
-                    .map_err(|_| anyhow!("scroll needs an integer: {rest:?}"))?;
+                    .map_err(|_| anyhow!("scroll needs an integer: {args:?}"))?;
                 Ok(self.scroll(n))
             }
             "ping" => Ok(vec![self.ping()]),
             "version" => Ok(vec![self.version()]),
             "power" => {
-                let mut it = rest.split_whitespace();
+                let mut it = args.split_whitespace();
                 let action = it
                     .next()
                     .ok_or_else(|| anyhow!("power needs an action: off|on|cycle"))?;
@@ -569,6 +640,26 @@ mod tests {
         assert_eq!(c.version(), vec![0x02, 0x02, 0x00]);
     }
 
+    /// The shutdown release drops every held key, modifier and button in one
+    /// keyboard report and one pointer report, and leaves the composer clear.
+    #[test]
+    fn release_everything_clears_keys_and_buttons() {
+        let mut c = Composer::new();
+        c.down("LEFT_SHIFT").unwrap();
+        c.down("A").unwrap();
+        c.mdown("left").unwrap();
+        c.mdown("right").unwrap();
+        let frames = c.release_everything();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(&frames[0][..3], &[0x01, 0x01, 0x08]);
+        assert!(frames[0][3..].iter().all(|&b| b == 0), "{:?}", frames[0]);
+        assert_eq!(&frames[1][..3], &[0x01, 0x02, 0x06]);
+        assert_eq!(frames[1][3], 0, "buttons byte");
+        // And a later tap carries no leftover modifier or button.
+        assert_eq!(c.key("B").unwrap()[0][3], 0);
+        assert_eq!(c.click("left").unwrap()[1][3], 0);
+    }
+
     #[test]
     fn power_frames() {
         let mut c = Composer::new();
@@ -621,5 +712,94 @@ mod tests {
         let c = Composer::new();
         let f = &c.scroll(-3)[0];
         assert_eq!(f[8], 0xfd); // -3 as int8 two's complement
+    }
+
+    /// The wheel field is one signed byte per report, so a larger amount must
+    /// be split across reports (protocol §3), with a per-call ceiling so an
+    /// absurd amount cannot queue millions of frames.
+    #[test]
+    fn scroll_splits_into_int8_reports_and_caps_the_total() {
+        let c = Composer::new();
+        let wheels =
+            |frames: Vec<Frame>| -> Vec<i8> { frames.iter().map(|f| f[8] as i8).collect() };
+        assert_eq!(wheels(c.scroll(300)), vec![127, 127, 46]);
+        assert_eq!(wheels(c.scroll(-200)), vec![-127, -73]);
+        assert_eq!(wheels(c.scroll(5)), vec![5]);
+        assert!(c.scroll(0).is_empty());
+        let total: i64 = wheels(c.scroll(i32::MAX)).iter().map(|&w| w as i64).sum();
+        assert_eq!(total, MAX_SCROLL_TOTAL as i64);
+        let total: i64 = wheels(c.scroll(i32::MIN)).iter().map(|&w| w as i64).sum();
+        assert_eq!(total, -(MAX_SCROLL_TOTAL as i64));
+    }
+
+    /// The lock, system and menu keys ch9329 already names (its keys.rs) —
+    /// same usage ids here so a sequence file works on either helper.
+    #[test]
+    fn lock_and_system_keys_are_named() {
+        let c = Composer::new();
+        for (name, usage) in [
+            ("PRINT_SCREEN", 0x46u8),
+            ("SCROLL_LOCK", 0x47),
+            ("PAUSE", 0x48),
+            ("NUM_LOCK", 0x53),
+            ("KEYPAD_NUMLOCK", 0x53),
+            ("APPLICATION", 0x65),
+            ("MENU", 0x65),
+        ] {
+            let press = &c.key(name).unwrap()[0];
+            assert_eq!(press[5], usage, "{name}");
+        }
+    }
+
+    /// A keyboard report carries six key slots. A chord that needs more —
+    /// counting keys already held with `down` — is refused rather than
+    /// silently truncated; modifiers live in their own byte and never count.
+    #[test]
+    fn combo_refuses_more_than_six_keys() {
+        let mut c = Composer::new();
+        let six: Vec<String> = ["A", "B", "C", "D", "E", "F"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(c.combo(&six).is_ok());
+        let mut seven = six.clone();
+        seven.push("G".into());
+        assert!(c.combo(&seven).is_err());
+        let mut with_mods = six.clone();
+        with_mods.push("LEFT_CONTROL".into());
+        assert!(c.combo(&with_mods).is_ok());
+        c.down("H").unwrap();
+        assert!(c.combo(&six).is_err(), "a held key takes a slot too");
+    }
+
+    /// Text the US layout cannot produce is an `ERR`, not a silently shorter
+    /// string; nothing is composed for it, so nothing partial is typed.
+    #[test]
+    fn type_refuses_unmappable_characters() {
+        let c = Composer::new();
+        assert!(c.type_text("caf\u{e9}").is_err());
+        assert!(c.type_text("a\u{1f600}b").is_err());
+        assert!(c.type_text("plain ascii ok").is_ok());
+    }
+
+    /// `type` text is the remainder of the line after one separator,
+    /// verbatim: trailing spaces are typed, leading ones too. Only a line
+    /// terminator is stripped, and a CR/LF *inside* the text is refused (the
+    /// daemon path already refuses it; the direct path must agree).
+    #[test]
+    fn type_text_is_verbatim_after_the_separator() {
+        let mut c = Composer::new();
+        // "hi " is three characters: two frames each.
+        assert_eq!(c.dispatch("type hi ").unwrap().len(), 6);
+        assert_eq!(c.dispatch("type hi \n").unwrap().len(), 6);
+        assert_eq!(c.dispatch("type hi \r\n").unwrap().len(), 6);
+        assert_eq!(
+            c.dispatch("type  x").unwrap().len(),
+            4,
+            "leading space kept"
+        );
+        assert!(c.dispatch("type a\nb").is_err());
+        assert!(c.dispatch("type a\rb").is_err());
+        assert!(c.dispatch("key\nENTER").is_err());
     }
 }
