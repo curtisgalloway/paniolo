@@ -1021,7 +1021,10 @@ mod tests {
             ensure_runtime_dir("serialcap", Some("pi5")).unwrap();
             plant_discovery(&expected_base(root), "serialcap/pi5", 4321);
 
-            assert_eq!(daemon_endpoint("serialcap", Some("pi5")).map(|ep| ep.port), Some(4321));
+            assert_eq!(
+                daemon_endpoint("serialcap", Some("pi5")).map(|ep| ep.port),
+                Some(4321)
+            );
             assert_eq!(
                 daemon_pid("serialcap", Some("pi5")),
                 Some(std::process::id() as i32)
@@ -1048,7 +1051,10 @@ mod tests {
             plant_discovery(&real, "serialcap/pi5", 4321);
             std::os::unix::fs::symlink(&real, expected_base(root)).unwrap();
 
-            assert_eq!(daemon_endpoint("serialcap", Some("pi5")).map(|ep| ep.port), None);
+            assert_eq!(
+                daemon_endpoint("serialcap", Some("pi5")).map(|ep| ep.port),
+                None
+            );
             assert_eq!(daemon_pid("serialcap", Some("pi5")), None);
             assert!(list_discovered().is_empty());
         });
@@ -1068,7 +1074,10 @@ mod tests {
             std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
             plant_discovery(&base, "serialcap/pi5", 4321);
 
-            assert_eq!(daemon_endpoint("serialcap", Some("pi5")).map(|ep| ep.port), Some(4321));
+            assert_eq!(
+                daemon_endpoint("serialcap", Some("pi5")).map(|ep| ep.port),
+                Some(4321)
+            );
             assert_eq!(
                 std::fs::metadata(&base).unwrap().mode() & 0o777,
                 0o700,
