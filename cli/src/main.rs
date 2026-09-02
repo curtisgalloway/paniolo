@@ -3290,7 +3290,9 @@ fn cmd_netboot_logs(target: &str, tail: usize, follow: bool) -> Result<()> {
         // and read the new file's content immediately rather than waiting
         // out a sleep first.
         let current = file_identity(&path);
-        if current.is_some() && current != id {
+        let pos = f.stream_position()?;
+        let len = std::fs::metadata(&path).ok().map(|m| m.len());
+        if log_was_replaced(id, current, pos, len) {
             if let Ok(reopened) = std::fs::File::open(&path) {
                 f = reopened;
                 id = current;
@@ -3299,6 +3301,23 @@ fn cmd_netboot_logs(target: &str, tail: usize, follow: bool) -> Result<()> {
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
+}
+
+/// Whether the log a `--follow` loop is reading has been replaced under it.
+/// Two signals, either sufficient: the path now names a different file
+/// (`create_log` on some platforms, or an editor's rename-into-place), or the
+/// file at the path is shorter than the position we have read to (truncate-
+/// in-place reuses the inode, so identity alone would never notice). A
+/// momentarily missing file (mid-recreate) is neither: keep the handle.
+fn log_was_replaced(
+    opened_id: Option<u64>,
+    current_id: Option<u64>,
+    read_pos: u64,
+    current_len: Option<u64>,
+) -> bool {
+    let different_file = current_id.is_some() && current_id != opened_id;
+    let truncated = current_len.is_some_and(|len| len < read_pos);
+    different_file || truncated
 }
 
 /// A value identifying which underlying file `path` currently names — the
@@ -4159,36 +4178,52 @@ mod tests {
         assert_eq!(daemon_process_needles(HID_DAEMON), vec!["hidrig", "ch9329"]);
     }
 
-    /// `netboot logs --follow` uses this to notice a daemon restart
-    /// (`daemons::create_log` truncates the log by recreating the file) and
-    /// reopen instead of reading a stalled, now-unlinked handle forever
-    /// (Review low #9).
+    /// `netboot logs --follow` must notice a daemon restart and reopen
+    /// instead of reading a stalled handle forever (Review low #9). The
+    /// decision is a pure function of what the loop can observe; Linux
+    /// happily reuses an inode for a file recreated at the same path, so the
+    /// shrunk-file signal is the one that matters in practice.
     #[test]
-    fn file_identity_distinguishes_a_recreated_file_at_the_same_path() {
+    fn log_follow_reopens_on_truncation_or_a_new_file_only() {
+        // Same file, grown: keep reading.
+        assert!(!log_was_replaced(Some(7), Some(7), 100, Some(150)));
+        // Same file, same length: nothing happened.
+        assert!(!log_was_replaced(Some(7), Some(7), 100, Some(100)));
+        // Truncated in place (inode reused): reopen.
+        assert!(log_was_replaced(Some(7), Some(7), 100, Some(0)));
+        // Recreated as a different file: reopen even if it already grew past us.
+        assert!(log_was_replaced(Some(7), Some(8), 100, Some(500)));
+        // Momentarily missing (mid-recreate): keep the handle for now.
+        assert!(!log_was_replaced(Some(7), None, 100, None));
+        // No identity available on this platform at all: length still decides.
+        assert!(log_was_replaced(None, None, 100, Some(10)));
+    }
+
+    /// The same decision driven by a real file: read to the end, truncate the
+    /// file in place the way `daemons::create_log` does, and the loop's
+    /// observations say "reopen".
+    #[test]
+    fn log_follow_notices_an_in_place_truncation() {
+        use std::io::{Read, Seek, Write};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("log.txt");
-        std::fs::write(&path, "first").unwrap();
-        let a = file_identity(&path);
-        assert!(a.is_some(), "expected a file identity on this platform");
+        std::fs::write(&path, "first daemon's output\n").unwrap();
+        let mut f = std::fs::File::open(&path).unwrap();
+        let mut sink = Vec::new();
+        f.read_to_end(&mut sink).unwrap();
+        let id = file_identity(&path);
+        let pos = f.stream_position().unwrap();
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert!(!log_was_replaced(id, file_identity(&path), pos, Some(len)));
 
-        std::fs::remove_file(&path).unwrap();
-        std::fs::write(&path, "second").unwrap();
-        let b = file_identity(&path);
-        assert!(b.is_some());
-        assert_ne!(
-            a, b,
-            "a recreated file at the same path must get a new identity"
+        // create_log's truncate-on-open, then a shorter new log.
+        let mut fresh = std::fs::File::create(&path).unwrap();
+        fresh.write_all(b"new\n").unwrap();
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            log_was_replaced(id, file_identity(&path), pos, Some(len)),
+            "a truncated log must be reopened even when the inode is reused"
         );
-
-        // Growing (not recreating) the same file keeps its identity — a
-        // `--follow` loop must not reopen on every ordinary append.
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap();
-        f.write_all(b" more").unwrap();
-        assert_eq!(file_identity(&path), b);
     }
 
     /// `paniolo daemons` prints other processes' raw argv (the stray-helper
