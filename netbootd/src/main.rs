@@ -41,6 +41,7 @@ mod dhcp;
 mod http;
 mod netcfg;
 mod pin;
+mod privdrop;
 mod served;
 mod tftp;
 
@@ -175,6 +176,10 @@ async fn main() -> Result<()> {
     // unconditionally as a type, so the TFTP call sites stay compiled and checked
     // on every platform.
     let bpf = Arc::new(build_bpf_sender(&cli.interface));
+
+    // Everything that needed root is done: give it back (Linux; a no-op where
+    // the daemon was never privileged).
+    privdrop::drop_privileges()?;
 
     // Interface-IP enforcement (matches _dhcp.py's monitor thread).
     {
