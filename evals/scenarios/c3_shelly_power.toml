@@ -7,7 +7,7 @@ conditions = ["cold", "warm", "preloaded"]
 capabilities = ["power", "helper:shellyplug"]
 goal = """
 The target `pico` is plugged into a Shelly smart plug reachable at
-`10.66.27.141`. Configure paniolo so that `paniolo power-cycle pico` (and
+`192.0.2.41`. Configure paniolo so that `paniolo power-cycle pico` (and
 power on/off, and power-state) actually switch the plug.
 """
 traps = [
@@ -15,7 +15,7 @@ traps = [
   "the helper is `shellyplug`; wire it into --cycle-cmd/--on-cmd/--off-cmd/--state-cmd",
 ]
 reference = [
-  'paniolo power set -t pico --cycle-cmd "shellyplug -d 10.66.27.141 cycle" --on-cmd "shellyplug -d 10.66.27.141 on" --off-cmd "shellyplug -d 10.66.27.141 off" --state-cmd "shellyplug -d 10.66.27.141 state"',
+  'paniolo power set -t pico --cycle-cmd "shellyplug -d 192.0.2.41 cycle" --on-cmd "shellyplug -d 192.0.2.41 on" --off-cmd "shellyplug -d 192.0.2.41 off" --state-cmd "shellyplug -d 192.0.2.41 state"',
 ]
 seed = "pico_console.toml"
 
@@ -27,7 +27,7 @@ path = "targets.pico.power.cycle_cmd"
 contains = "shellyplug"
 [[grader.assert]]
 path = "targets.pico.power.cycle_cmd"
-contains = "10.66.27.141"
+contains = "192.0.2.41"
 [[grader.assert]]
 path = "targets.pico.power.cycle_cmd"
 contains = "cycle"
@@ -38,7 +38,7 @@ contains = "state"
 # all four hooks at the right plug, not only the one the title mentions.
 [[grader.assert]]
 path = "targets.pico.power.state_cmd"
-contains = "10.66.27.141"
+contains = "192.0.2.41"
 [[grader.assert]]
 path = "targets.pico.power.on_cmd"
 matches = 'shellyplug .* on$'

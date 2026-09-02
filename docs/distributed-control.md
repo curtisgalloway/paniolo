@@ -84,7 +84,7 @@ reproduces today's single-host behavior exactly.
 # mylab.toml — checked into a git repo; PANIOLO_LAB points here.
 
 [hosts.bench1]
-ssh = "curtisg@bench1.local"      # ssh destination — how OTHER machines reach it; the only required field
+ssh = "user@bench1.local"      # ssh destination — how OTHER machines reach it; the only required field
 # hostname = "bench1.local"       # this box's FQDN; set it so bench1 recognizes ITSELF when the
 #                                   shared lab file is run on bench1 (matched against `hostname -f`)
 # identity = "~/.ssh/id_lab"      # optional key; set it to avoid agent key-spray (below)
@@ -92,7 +92,7 @@ ssh = "curtisg@bench1.local"      # ssh destination — how OTHER machines reach
 # paniolo_cmd = "/Users/me/.local/bin/paniolo"  # if paniolo isn't on the host's ssh PATH
 
 [hosts.bench2]
-ssh = "curtisg@bench2.local"
+ssh = "user@bench2.local"
 # hostname = "bench2.local"
 
 # A normal single-host target. Everything inherits host = bench1.
@@ -100,17 +100,17 @@ ssh = "curtisg@bench2.local"
 host = "bench1"                   # default host for this target's resources
 
 [targets.fortune.netboot]
-interface = "enx00e04c08d9a0"
+interface = "enx001122334455"
 host_ip   = "192.168.99.1"
-tftp_root = "/home/curtisg/tftp/fortune"
+tftp_root = "~/tftp/fortune"
 
 [[targets.fortune.serial]]
 name   = "console"
-device = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG00W7NY-if00-port0"
+device = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AA00BB11-if00-port0"
 baud   = 115200
 
 [targets.fortune.power]
-cycle_cmd = "/home/curtisg/src/rpi5-bringup/scripts/power-cycle.sh"
+cycle_cmd = "~/scripts/power-cycle.sh"
 
 # --- the future case: one target spanning two control hosts ---
 [targets.fortune.video]

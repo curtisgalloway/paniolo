@@ -403,10 +403,10 @@ satisfies the `state_cmd` contract (`state <port>` prints `on` or `off`):
 
 ```
 paniolo power set -t pi5 \
-    --cycle-cmd "cambrionix -d /dev/cu.usbserial-DK0F9LZI cycle 4" \
-    --on-cmd    "cambrionix -d /dev/cu.usbserial-DK0F9LZI on 4" \
-    --off-cmd   "cambrionix -d /dev/cu.usbserial-DK0F9LZI off 4" \
-    --state-cmd "cambrionix -d /dev/cu.usbserial-DK0F9LZI state 4"
+    --cycle-cmd "cambrionix -d /dev/cu.usbserial-AA00BB11 cycle 4" \
+    --on-cmd    "cambrionix -d /dev/cu.usbserial-AA00BB11 on 4" \
+    --off-cmd   "cambrionix -d /dev/cu.usbserial-AA00BB11 off 4" \
+    --state-cmd "cambrionix -d /dev/cu.usbserial-AA00BB11 state 4"
 ```
 
 See `docs/power.md` for the full `cambrionix` command surface.
@@ -555,13 +555,13 @@ commands then run **transparently on that host over SSH** — you don't ssh by h
 ```toml
 # mylab.toml
 [hosts.bench1]
-ssh = "curtisg@bench1.local"     # ssh destination — how others reach it ("local" = this machine)
+ssh = "user@bench1.local"     # ssh destination — how others reach it ("local" = this machine)
 # description = "bench Mac mini"  # optional free-text label, shown in `config show` / `host show`
 # hostname = "bench1.local"      # this box's FQDN; set it so bench1 recognizes itself when ONE
 #                                  shared lab file is run from any machine (matched vs `hostname -f`)
 # identity = "~/.ssh/lab_key"    # set this if your ssh-agent offers many keys
 #                                  (avoids "Too many authentication failures")
-# paniolo_cmd = "/Users/curtisg/.local/bin/paniolo"  # if paniolo isn't on the
+# paniolo_cmd = "~/.local/bin/paniolo"  # if paniolo isn't on the
 #                                  host's non-interactive ssh PATH
 
 [targets.fortune]
@@ -569,15 +569,15 @@ host = "bench1"
 # description = "Pi 5 under test"  # optional free-text label (legacy key: `note`)
 
 [targets.fortune.netboot]
-interface = "enx00e04c08d9a0"
-tftp_root = "/home/curtisg/tftp/fortune"
+interface = "enx001122334455"
+tftp_root = "~/tftp/fortune"
 
 [[targets.fortune.serial]]
 name = "console"
-device = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG00W7NY-if00-port0"
+device = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AA00BB11-if00-port0"
 
 [targets.fortune.power]
-cycle_cmd = "/home/curtisg/scripts/power-cycle.sh"
+cycle_cmd = "~/scripts/power-cycle.sh"
 ```
 
 ```
@@ -604,7 +604,7 @@ Notes:
 ### Authoring a lab (discovery + provisioning)
 
 After declaring a host's connection info (`paniolo host add bench1 --ssh
-curtisg@bench1.local`, or hand-write `[hosts.bench1] ssh = …`), let
+user@bench1.local`, or hand-write `[hosts.bench1] ssh = …`), let
 paniolo discover its hardware and propose the target block:
 
 ```

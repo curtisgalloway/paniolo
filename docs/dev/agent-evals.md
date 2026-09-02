@@ -202,12 +202,12 @@ main console."
 *Grade:* two `[[serial]]` blocks, names `console` and `bmc`, baud 9600 on `bmc`.
 
 **C3 — Power-cycle through a Shelly plug.** *(invent-detector)*
-*Goal:* "`pico` is plugged into a Shelly smart plug at `10.66.27.141`. Make
+*Goal:* "`pico` is plugged into a Shelly smart plug at `192.0.2.41`. Make
 `paniolo power-cycle pico` actually cut and restore its power."
 *Reference:* discover the `shellyplug` helper (`paniolo helper`, the power
 docs) and wire it into the power hooks:
-`power set -t pico --cycle-cmd "shellyplug -d 10.66.27.141 cycle" --state-cmd
-"shellyplug -d 10.66.27.141 state"` (and on/off).
+`power set -t pico --cycle-cmd "shellyplug -d 192.0.2.41 cycle" --state-cmd
+"shellyplug -d 192.0.2.41 state"` (and on/off).
 *Trap:* there is **no** `paniolo shelly` command — smart plugs are helpers behind
 generic `power` hooks.
 *Grade:* `power.cycle_cmd` references `shellyplug` with the right host; no
@@ -228,9 +228,9 @@ main console and everything else."
 *Grade:* `bmc` gone, `console` and other channels intact.
 
 **C6 — Author a remote control host.**
-*Goal:* "There's a control Mac reachable at `curtisg@bench1.local`. Add it to the
+*Goal:* "There's a control Mac reachable at `user@bench1.local`. Add it to the
 lab and propose a target block for the Pi wired to it."
-*Reference:* `host add bench1 --ssh curtisg@bench1.local` (T1, mutates lab), then
+*Reference:* `host add bench1 --ssh user@bench1.local` (T1, mutates lab), then
 `configure <target> --host bench1` (T0 — note it **proposes/prints**, writes
 nothing).
 *Trap:* `configure` is a propose-only step; the human pastes the block. Don't

@@ -672,7 +672,7 @@ mod tests {
     #[test]
     fn is_pty_rejects_real_serial_devices() {
         for dev in [
-            "/dev/tty.usbserial-BG03U7X9", // macOS FTDI
+            "/dev/tty.usbserial-AA00BB11", // macOS FTDI
             "/dev/cu.usbmodem14201",       // macOS CDC-ACM
             "/dev/ttyS0",                  // Linux 16550
             "/dev/ttyUSB0",
@@ -695,7 +695,7 @@ mod tests {
         };
         assert_eq!(open_baud("/dev/ttys006", 115_200), want);
         // A real port always keeps its rate, on every platform.
-        assert_eq!(open_baud("/dev/tty.usbserial-BG03U7X9", 115_200), 115_200);
+        assert_eq!(open_baud("/dev/tty.usbserial-AA00BB11", 115_200), 115_200);
     }
 
     /// A pty pair, as a hypervisor hands one out: the returned fd is the end

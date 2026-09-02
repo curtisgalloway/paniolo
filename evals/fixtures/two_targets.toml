@@ -2,7 +2,7 @@
 
 [targets.pico.netboot]
 interface = "en7"
-tftp_root = "/Users/curtisg/tftp/pico"
+tftp_root = "~/tftp/pico"
 
 [[targets.pico.serial]]
 name = "console"
@@ -10,7 +10,7 @@ device = "/dev/cu.usbserial-AAA"
 baud = 115200
 
 [targets.pico.power]
-cycle_cmd = "shellyplug -d 10.66.27.141 cycle"
+cycle_cmd = "shellyplug -d 192.0.2.41 cycle"
 
 [targets.tablet]
 

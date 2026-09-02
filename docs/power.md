@@ -263,14 +263,14 @@ instead of hanging the hook.
 
 ```bash
 paniolo power set -t pi5 \
-    --cycle-cmd "cambrionix -d /dev/cu.usbserial-DK0F9LZI cycle 4" \
-    --on-cmd    "cambrionix -d /dev/cu.usbserial-DK0F9LZI on 4" \
-    --off-cmd   "cambrionix -d /dev/cu.usbserial-DK0F9LZI off 4" \
-    --state-cmd "cambrionix -d /dev/cu.usbserial-DK0F9LZI state 4"
+    --cycle-cmd "cambrionix -d /dev/cu.usbserial-AA00BB11 cycle 4" \
+    --on-cmd    "cambrionix -d /dev/cu.usbserial-AA00BB11 on 4" \
+    --off-cmd   "cambrionix -d /dev/cu.usbserial-AA00BB11 off 4" \
+    --state-cmd "cambrionix -d /dev/cu.usbserial-AA00BB11 state 4"
 ```
 
 This example wires a Raspberry Pi 5 powered from hub port 4, with the hub's
-control UART on `/dev/cu.usbserial-DK0F9LZI`. After this config,
+control UART on `/dev/cu.usbserial-AA00BB11`. After this config,
 `paniolo power on pi5`, `paniolo power off pi5`, `paniolo power-cycle pi5`,
 and `paniolo power-state pi5` all work without further setup.
 
@@ -303,8 +303,12 @@ The daemon opens the port once, serializes every operation on one session,
 and bounds each with a hard timeout — a sick radio yields a fast error, never
 a hung power hook. It follows the standard daemon contract
 (`/tmp/paniolo-<uid>/zigplug/daemon.json`, localhost HTTP, OS-assigned port)
-and shows up in `paniolo daemons`. Manual control: `zigplug serve` / `stop` /
-`status`; `--no-daemon` forces the legacy direct path (debugging only).
+and shows up in `paniolo daemons`. The discovery file also carries a per-run
+bearer token (file mode 0600) that every request must present, so nothing
+else on the host — another user, a web page — can drive the coordinator
+through the daemon. Manual control: `zigplug serve` / `stop` / `status`
+(`stop` and `status` need no `-d`); `--no-daemon` forces the legacy direct
+path (debugging only).
 
 ### Installation
 
@@ -362,7 +366,9 @@ zigplug -d <device> off <ieee>            # switch off, confirm by read-back
 zigplug -d <device> cycle <ieee> [--delay-ms 3000]
                                           # off → delay → on → confirm
 zigplug -d <device> remove <ieee>         # unpair (ZDO leave + forget)
-zigplug -d <device> serve|stop|status     # daemon lifecycle (serve is automatic)
+zigplug -d <device> serve                 # start the daemon by hand (automatic otherwise)
+zigplug stop                              # stop the daemon (no -d: one daemon per host)
+zigplug status                            # daemon + network status (no -d)
 zigplug -d <device> backup [-o FILE]      # network backup (key, counters) as JSON
 zigplug -d <device> restore [-i FILE]     # write a backup into coordinator NVRAM
 ```

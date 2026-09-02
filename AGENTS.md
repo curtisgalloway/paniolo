@@ -473,14 +473,17 @@ zigplug/         Python (uv) helper: Zigbee smart plug control via a CC2652 (ZNP
                  coordinator dongle, using zigpy-znp. CLI wired into paniolo
                  via generic power hooks, like cambrionix — but operations
                  proxy through a persistent daemon (`_daemon.py`, aiohttp on
-                 localhost, standard daemon.json discovery) that owns the
-                 coordinator session: one-shots reset the CC2652 on every
-                 serial open (auto-BSL lines) and collide on the stateful ZNP
-                 session, so the daemon serializes ops with hard timeouts.
+                 localhost, standard daemon.json discovery; the file also
+                 carries a per-run bearer token, mode 0600, that every request
+                 must present) that owns the coordinator session: one-shots
+                 reset the CC2652 on every serial open (auto-BSL lines) and
+                 collide on the stateful ZNP session, so the daemon serializes
+                 ops with hard timeouts.
                  Auto-spawned on first use; hook strings stay one-shot-shaped.
                  Commands: `form` (one-time network setup), `permit` (pairing
                  window), `list`, `on/off/state/cycle <ieee>`, `remove <ieee>`,
-                 `serve/stop/status` (daemon), `backup`/`restore` (coordinator
+                 `serve/stop/status` (daemon; `stop`/`status` need no `-d`),
+                 `backup`/`restore` (coordinator
                  NVRAM recovery from zigpy's auto-backups — no re-pairing);
                  `state <ieee>` prints exactly `on` or `off` (state_cmd
                  contract). Device DB at
@@ -704,8 +707,12 @@ on-device, no network, no model download. `paniolo setup` compiles it (`swiftc`)
 into the libexec dir (`~/.local/libexec/paniolo/bin`).
 
 Tuning that matters for small console text:
-- `recognitionLevel = .fast` is the default, not `.accurate`. `.accurate` is
-  tuned for natural document text and returns *nothing* on thin console fonts.
+- `recognitionLevel = .accurate` is the default; `--fast` selects `.fast`. The
+  old `.fast` default rested on the belief that `.accurate` (tuned for natural
+  document text) misses thin console fonts; measured on the captures in
+  `evals/ocr/dataset` it is better or equal on every frame, while `.fast`
+  garbles BIOS menus and reads MAC zeros as the letter O (see the comment at
+  `recognitionLevel` in the source).
 - The tool 2×-upscales and black-pads the frame before recognition (fixes colon
   misreads and first-character clipping at the frame edge).
 - `minimumTextHeight` is lowered (it's a fraction of image height; the default
@@ -975,7 +982,7 @@ unit tests on all three. The `windows` CI job runs the same fmt/clippy/test
 triple as the Linux jobs, because a Unix-only CI cannot tell you whether the
 Windows `#[cfg]` arm still compiles.
 
-**Hardware-verified on Windows** (bench host `brik`, 2026-08-28, against a
+**Hardware-verified on Windows** (the Windows bench host, 2026-08-28, against a
 Shelly Plug and an Openterface KVM-GO):
 
 - **power** — `shellyplug` on/off/cycle, each confirmed by read-back.
@@ -1034,7 +1041,7 @@ it, and clean the slice up. Only the middle one was ever shell-safe.
   a `--lab` argument. Both platforms start an SSH session in the user's home,
   which is also SFTP's default directory, so a relative name resolves on both.
 
-Verified end to end against `brik`: `paniolo hid send -t <target> info` returned
+Verified end to end against the Windows bench host: `paniolo hid send -t <target> info` returned
 real CH9329 state, `hid send … move` drove the KVM, `video show` read the
 channel, and the slice was cleaned up. Unix dispatch to `waldo` is unchanged.
 
@@ -1146,8 +1153,8 @@ and dies in the field three days later.
 
 ### Developing against Windows
 
-The Windows bench host (`brik`; its address and checkout path are private
-infrastructure and live outside this repo) is reached over SSH, which lands
+The Windows bench host (`lab-host-1` in examples; its real name, address and
+checkout path are private infrastructure and live outside this repo) is reached over SSH, which lands
 in PowerShell 7. Note `$HOME` there is the Windows account's `C:\Users\…`,
 a different account name than on the Mac, and the repo is cloned under it.
 `BRIK_HOST=<ssh host> BRIK_DEST=<checkout, forward slashes>
@@ -1355,8 +1362,8 @@ the problem.
   produce confusions (`1`↔`l`↔`I`, `2`↔`Z`, colon spacing in IPv6). Accuracy
   improves markedly on larger boot-screen text. Do not change the target's console
   font to work around this — the font is relied upon by other agents (see OCR section).
-  On macOS, `VNRecognizeTextRequest` `.accurate` returns nothing on thin console
-  fonts; visionocr uses `.fast`.
+  On macOS, visionocr uses `VNRecognizeTextRequest` `.accurate`, measured better
+  than or equal to `.fast` on every captured frame, console text included.
 - **macOS Local Network privacy gate.** On macOS (Sequoia+), a freshly built,
   non-Apple-signed helper that reaches a LAN host (e.g. `shellyplug`) fails with
   `No route to host` (EHOSTUNREACH) until the launching app is granted Local

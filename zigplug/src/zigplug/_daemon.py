@@ -23,9 +23,12 @@ The daemon opens the coordinator once and serves operations over localhost
 HTTP, serialized on a single lock with hard per-operation timeouts. It
 follows paniolo's daemon contract (see cli/src/daemons.rs): it binds an
 OS-assigned port on 127.0.0.1 and publishes
-`/tmp/paniolo-<uid>/zigplug/daemon.json` containing `{pid, port, device}`.
-The one-shot CLI auto-spawns it and proxies through it transparently, so
-paniolo power hooks (`zigplug -d <dev> on <ieee>`) don't change.
+`/tmp/paniolo-<uid>/zigplug/daemon.json` containing `{pid, port, device,
+token}`. The token is a per-run secret that every request must present as a
+bearer token; the file is written mode 0600 inside the 0700 runtime dir, so
+only the daemon's owner can read it. The one-shot CLI auto-spawns the daemon
+and proxies through it transparently, so paniolo power hooks
+(`zigplug -d <dev> on <ieee>`) don't change.
 """
 
 # Single quotes nested in double-quoted f-strings are required on Python 3.11;
@@ -37,11 +40,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import fcntl
+import hmac
 import json
 import logging
 import os
+import secrets
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -106,6 +113,11 @@ def log_path() -> Path:
 
 
 def _pid_alive(pid: int) -> bool:
+    # `os.kill(0, 0)` addresses the caller's own process group and a negative
+    # pid a group (or, for -1, every process the caller may signal); both
+    # succeed without any daemon existing, so only a real pid counts.
+    if pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
     except (ProcessLookupError, PermissionError):
@@ -113,49 +125,150 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def read_discovery() -> dict | None:
-    """The running daemon's `{pid, port, device}`, or None."""
+@dataclasses.dataclass(frozen=True)
+class Daemon:
+    """A daemon as published in its discovery file."""
+
+    pid: int
+    port: int
+    device: str
+    token: str
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+
+def _load_discovery() -> Daemon | None:
+    """Parse the discovery file without checking liveness; None if unusable.
+
+    A missing, truncated, or field-incomplete file reads as "no daemon", so
+    the next invocation simply overwrites it.
+    """
     try:
         info = json.loads(discovery_path().read_text())
     except (OSError, ValueError):
         return None
-    if not _pid_alive(int(info.get("pid", -1))):
+    if not isinstance(info, dict):
         return None
-    return info
+    pid, port, device, token = (
+        info.get(key) for key in ("pid", "port", "device", "token")
+    )
+    if not (
+        isinstance(pid, int)
+        and isinstance(port, int)
+        and 0 < port < 65536
+        and isinstance(device, str)
+        and isinstance(token, str)
+        and token
+    ):
+        return None
+    return Daemon(pid=pid, port=port, device=device, token=token)
 
 
-def daemon_url(device: str) -> str | None:
-    """Base URL of a running daemon serving `device`, or None.
+def read_discovery() -> Daemon | None:
+    """The running daemon's discovery record, or None."""
+    daemon = _load_discovery()
+    if daemon is None or not _pid_alive(daemon.pid):
+        return None
+    return daemon
+
+
+def write_discovery(path: Path, daemon: Daemon) -> None:
+    """Publish `daemon` at `path`: mode 0600, and atomically.
+
+    The record carries the bearer token, so it must never be readable by
+    another user (the runtime dir is already 0700; the file mode is belt and
+    braces), and a one-shot must never see a half-written file — write a
+    sibling and rename it over the destination.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            os.fchmod(fh.fileno(), 0o600)  # O_CREAT's mode only applies when new
+            json.dump(dataclasses.asdict(daemon), fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+    os.replace(tmp, path)
+
+
+def forget(daemon: Daemon) -> None:
+    """Drop the discovery file if it still describes `daemon`.
+
+    Guarded so a one-shot that lost a race — another one already respawned
+    and republished — does not delete the fresh daemon's record.
+    """
+    if _load_discovery() == daemon:
+        with contextlib.suppress(OSError):
+            discovery_path().unlink()
+
+
+def find_daemon(device: str) -> Daemon | None:
+    """The running daemon serving `device`, or None.
 
     A daemon serving a *different* device is an error, not a miss — one
     coordinator per daemon, and silently bypassing it would reintroduce
     the port collision this daemon exists to prevent.
     """
-    info = read_discovery()
-    if info is None:
+    daemon = read_discovery()
+    if daemon is None:
         return None
-    if info.get("device") != device:
+    if daemon.device != device:
         raise _app.ZigplugError(
-            f"zigplug daemon (pid {info['pid']}) is serving {info['device']!r}, "
-            f"not {device!r} — stop it first (`zigplug -d {info['device']} stop`)"
+            f"zigplug daemon (pid {daemon.pid}) is serving {daemon.device!r}, "
+            f"not {device!r} — stop it first (`zigplug stop`)"
         )
-    return f"http://127.0.0.1:{info['port']}"
+    return daemon
 
 
 # ── client side: proxy calls + auto-spawn ────────────────────────────────────
 
 
-def call(base_url: str, method: str, path: str, body: dict | None, timeout: float):
-    """One JSON request to the daemon; raises ZigplugError on error replies."""
+class DaemonGone(_app.ZigplugError):
+    """The discovery file named a daemon that is no longer listening.
+
+    Raised by `call` after it has dropped the stale file; `request` recovers
+    by spawning afresh, once.
+    """
+
+
+# urllib honours $http_proxy (and, on macOS, the system proxy settings) even
+# for 127.0.0.1 unless $no_proxy says otherwise, which would route every power
+# hook through the proxy — or fail it while the proxy is down. An empty
+# ProxyHandler turns the lookup off.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _connection_refused(exc: BaseException) -> bool:
+    reason = getattr(exc, "reason", exc)  # URLError wraps the socket error
+    return isinstance(reason, ConnectionRefusedError)
+
+
+def call(daemon: Daemon, method: str, path: str, body: dict | None, timeout: float):
+    """One JSON request to `daemon`; raises ZigplugError on error replies.
+
+    Nothing listening on the daemon's port means it crashed without cleaning
+    up (and a reused pid keeps `read_discovery` fooled indefinitely): the
+    stale discovery file is dropped and DaemonGone raised so the caller can
+    respawn.
+    """
     data = None if body is None else json.dumps(body).encode()
     req = urllib.request.Request(
-        f"{base_url}{path}",
+        f"{daemon.url}{path}",
         data=data,
         method=method,
-        headers={"content-type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {daemon.token}",
+        },
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _OPENER.open(req, timeout=timeout) as resp:
             return json.loads(resp.read() or b"{}")
     except urllib.error.HTTPError as exc:
         try:
@@ -164,14 +277,21 @@ def call(base_url: str, method: str, path: str, body: dict | None, timeout: floa
             message = str(exc)
         raise _app.ZigplugError(message) from exc
     except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+        if _connection_refused(exc):
+            forget(daemon)
+            raise DaemonGone(
+                f"zigplug daemon (pid {daemon.pid}) is not listening on port "
+                f"{daemon.port} — it died without cleaning up; dropped its stale "
+                "discovery file"
+            ) from exc
         raise _app.ZigplugError(
             f"zigplug daemon unreachable ({exc}) — it may have died; "
             "the next invocation will restart it"
         ) from exc
 
 
-def spawn(device: str, db_path: Path) -> str:
-    """Start a detached daemon for `device` and wait for it; returns its URL.
+def spawn(device: str, db_path: Path) -> Daemon:
+    """Start a detached daemon for `device` and wait for it; returns its record.
 
     Serialized on a lock file so two concurrent one-shots can't both spawn
     (the loser of the race finds the winner's daemon via discovery).
@@ -179,9 +299,9 @@ def spawn(device: str, db_path: Path) -> str:
     lock_file = (runtime_dir() / "spawn.lock").open("w")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
-        url = daemon_url(device)  # someone else may have won the race
-        if url is not None:
-            return url
+        daemon = find_daemon(device)  # someone else may have won the race
+        if daemon is not None:
+            return daemon
         log = log_path().open("w")
         with contextlib.redirect_stdout(sys.stderr):
             print(f"starting zigplug daemon for {device}…")
@@ -204,11 +324,11 @@ def spawn(device: str, db_path: Path) -> str:
         )
         deadline = time.monotonic() + SPAWN_TIMEOUT_S
         while time.monotonic() < deadline:
-            url = daemon_url(device)
-            if url is not None:
+            daemon = find_daemon(device)
+            if daemon is not None:
                 try:
-                    call(url, "GET", "/healthz", None, timeout=2.0)
-                    return url
+                    call(daemon, "GET", "/healthz", None, timeout=2.0)
+                    return daemon
                 except _app.ZigplugError:
                     pass
             time.sleep(0.25)
@@ -224,12 +344,71 @@ def spawn(device: str, db_path: Path) -> str:
         lock_file.close()
 
 
-def ensure(device: str, db_path: Path) -> str:
-    """URL of a daemon serving `device`, spawning one if needed."""
-    return daemon_url(device) or spawn(device, db_path)
+def ensure(device: str, db_path: Path) -> Daemon:
+    """The daemon serving `device`, spawning one if needed."""
+    return find_daemon(device) or spawn(device, db_path)
+
+
+def request(
+    device: str,
+    db_path: Path,
+    method: str,
+    path: str,
+    body: dict | None,
+    timeout: float,
+) -> dict:
+    """Route one operation through the daemon serving `device`.
+
+    Spawns the daemon if needed, and recovers once from a stale discovery
+    file: `call` drops the file when nothing answers on the recorded port,
+    so the second `ensure` spawns afresh. Once only — a daemon that dies on
+    every start must surface as an error, not loop.
+    """
+    try:
+        return call(ensure(device, db_path), method, path, body, timeout)
+    except DaemonGone:
+        return call(ensure(device, db_path), method, path, body, timeout)
 
 
 # ── server side ──────────────────────────────────────────────────────────────
+
+
+def auth_middleware(token: str, port: int):
+    """aiohttp middleware admitting only a local client that holds `token`.
+
+    Listening on loopback keeps other hosts out, but not other users of this
+    host or a web page its owner happens to have open. So every request must
+    present `Authorization: Bearer <token>` (401 otherwise), name this
+    daemon's own loopback socket in `Host` (403 — a DNS-rebound page does
+    not), carry no `Origin` at all (403 — no browser ever talks to this
+    daemon, so a cross-origin request is an attack), and a POST must declare
+    `Content-Type: application/json` (415) before any handler parses it.
+    """
+    # Local import: the server is the only consumer (see serve()).
+    from aiohttp import web  # pylint: disable=import-outside-toplevel
+
+    allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+    expected = token.encode()
+
+    def reject(status: int, message: str) -> web.Response:
+        return web.json_response({"error": message}, status=status)
+
+    @web.middleware
+    async def middleware(request: web.Request, handler):
+        if "Origin" in request.headers:
+            return reject(403, "cross-origin requests are refused")
+        if request.host not in allowed_hosts:
+            return reject(403, f"unexpected Host {request.host!r}")
+        scheme, _, presented = request.headers.get("Authorization", "").partition(" ")
+        if scheme != "Bearer" or not hmac.compare_digest(
+            presented.strip().encode(), expected
+        ):
+            return reject(401, "missing or invalid bearer token")
+        if request.method == "POST" and request.content_type != "application/json":
+            return reject(415, "POST bodies must be Content-Type: application/json")
+        return await handler(request)
+
+    return middleware
 
 
 async def serve(device: str, db_path: Path) -> int:
@@ -383,7 +562,14 @@ async def serve(device: str, db_path: Path) -> int:
         stop_event.set()
         return {"stopping": True}
 
-    web_app = web.Application()
+    # Bind first so the request gate knows this daemon's own port before the
+    # application exists; SockSite then serves on the bound socket.
+    token = secrets.token_urlsafe(32)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))  # OS-assigned port
+    port = sock.getsockname()[1]
+
+    web_app = web.Application(middlewares=[auth_middleware(token, port)])
     web_app.router.add_get("/healthz", handler(h_healthz))
     web_app.router.add_get("/state", handler(h_state))
     web_app.router.add_post("/on", handler(h_on))
@@ -397,13 +583,12 @@ async def serve(device: str, db_path: Path) -> int:
 
     runner = web.AppRunner(web_app)
     await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", 0)
+    site = web.SockSite(runner, sock)
     await site.start()
-    port = runner.addresses[0][1]  # the OS-assigned port
 
     discovery = discovery_path()
-    discovery.write_text(
-        json.dumps({"pid": os.getpid(), "port": port, "device": device})
+    write_discovery(
+        discovery, Daemon(pid=os.getpid(), port=port, device=device, token=token)
     )
     LOGGER.info("zigplug daemon up: %s port %d", device, port)
 
