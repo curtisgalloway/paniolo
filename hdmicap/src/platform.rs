@@ -71,13 +71,18 @@ pub fn runtime_root() -> PathBuf {
 /// Create `base` as a private, user-owned directory, or validate an existing
 /// one.
 ///
-/// Unix does a 0700 create plus an ownership check, guarding the well-known
-/// `/tmp` path against a squatter. On Windows the path sits inside the user's
-/// own profile, whose inherited ACL already excludes other non-administrative
-/// users, so the check reduces to "exists and is a directory".
+/// Unix does a 0700 create plus an ownership *and mode* check, guarding the
+/// well-known `/tmp` path against a squatter. An existing directory that is
+/// ours but group/world-accessible (left by an older paniolo's plain
+/// `create_dir_all`, or made by hand) is tightened to 0700 and accepted — it
+/// is our own directory, so there is nothing to refuse or report; a symlink,
+/// a non-directory, or another owner is an error. On Windows the path sits
+/// inside the user's own profile, whose inherited ACL already excludes other
+/// non-administrative users, so the check reduces to "exists and is a
+/// directory".
 #[cfg(unix)]
 pub fn ensure_private_dir(base: &Path) -> Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     match std::fs::DirBuilder::new().mode(0o700).create(base) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -88,6 +93,9 @@ pub fn ensure_private_dir(base: &Path) -> Result<()> {
                     "{} exists but is not a directory owned by uid {uid}",
                     base.display()
                 ));
+            }
+            if md.mode() & 0o077 != 0 {
+                std::fs::set_permissions(base, std::fs::Permissions::from_mode(0o700))?;
             }
             Ok(())
         }
@@ -230,5 +238,45 @@ mod tests {
         assert!(tmp.is_dir());
         ensure_private_dir(&tmp).expect("second call revalidates");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A base left group/world-accessible by an earlier creator (an older
+    /// paniolo's plain `create_dir_all`, or the user by hand) is ours to
+    /// tighten: after the call it must be 0700, so the discovery file and
+    /// logs beneath it are not reachable by other users.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_tightens_an_open_dir_we_own() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let tmp = std::env::temp_dir().join(format!("paniolo-hp-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir(&tmp).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(std::fs::metadata(&tmp).unwrap().mode() & 0o777, 0o755);
+
+        ensure_private_dir(&tmp).expect("an open dir we own is tightened, not refused");
+        assert_eq!(std::fs::metadata(&tmp).unwrap().mode() & 0o777, 0o700);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A symlink at the base — even one pointing at a private directory we
+    /// own — is refused: a squatter's link would redirect the discovery file
+    /// and logs to a place of their choosing.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_rejects_a_symlink() {
+        let real = std::env::temp_dir().join(format!("paniolo-hp-real-{}", std::process::id()));
+        let link = std::env::temp_dir().join(format!("paniolo-hp-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&real);
+        let _ = std::fs::remove_file(&link);
+        ensure_private_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert!(
+            ensure_private_dir(&link).is_err(),
+            "a symlinked base must be refused"
+        );
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&real);
     }
 }

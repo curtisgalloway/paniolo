@@ -646,6 +646,7 @@ misbehaves):
 ```
 paniolo daemons                          # list: name, pid, port, detail + strays
 paniolo daemons stop zigplug serialcap   # stop specific daemons (SIGTERM)
+paniolo daemons stop 'serialcap[pi5]'    # one target's instance, as listed (quote: [] globs)
 paniolo daemons stop --all               # stop every daemon + TERM strays
 paniolo daemons stop --all --force       # …and SIGKILL whatever survives 3 s
 paniolo daemons restart --stale          # restart capture daemons on an old binary

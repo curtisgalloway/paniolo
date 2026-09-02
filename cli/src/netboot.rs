@@ -214,28 +214,110 @@ pub fn start(
     Ok(())
 }
 
-/// Stop the netboot session for `target` and restore its interface.
-pub fn stop(target: &str) -> Result<()> {
-    let s = state::load_netboot_state(target)
-        .ok_or_else(|| anyhow!("no netboot state for '{target}'"))?;
-    for pid in [s.dhcp_pid, s.tftp_pid] {
-        if state::is_pid_alive(pid)
-            && !crate::platform::try_signal_pid(pid, crate::platform::Signal::Term)
-        {
-            // Likely EPERM (started under sudo on Linux) — escalate.
-            #[cfg(unix)]
-            let _ = Command::new("sudo")
-                .args(["kill", "-TERM", &pid.to_string()])
-                .status();
-        }
+/// Whether `stop` may signal a pid it read from the state file. Only a pid
+/// that is both alive *and* still running netbootd is ours to touch: a dead
+/// one needs nothing, and a live one whose command line no longer mentions
+/// netbootd has been recycled by the kernel for some unrelated process since
+/// the file was written — signalling it (let alone `sudo kill`ing it) would
+/// hit a stranger. Pure, so the rule is unit-testable without a process.
+fn should_signal(alive: bool, cmdline_mentions_netbootd: bool) -> bool {
+    alive && cmdline_mentions_netbootd
+}
+
+/// [`should_signal`] evaluated against the live process table, right now.
+fn is_verified_netbootd(pid: i32) -> bool {
+    should_signal(
+        state::is_pid_alive(pid),
+        state::pid_cmdline(pid).contains("netbootd"),
+    )
+}
+
+/// Deliver `signal` to a verified netbootd, escalating through `sudo kill`
+/// when the direct send is refused: on Linux the daemon runs as root, so an
+/// unprivileged CLI gets `EPERM` from `kill(2)`.
+fn signal_netbootd(pid: i32, signal: crate::platform::Signal) {
+    if crate::platform::try_signal_pid(pid, signal).is_err() {
+        escalate_via_sudo(pid, signal);
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+}
+
+#[cfg(unix)]
+fn escalate_via_sudo(pid: i32, signal: crate::platform::Signal) {
+    let flag = match signal {
+        crate::platform::Signal::Term => "-TERM",
+        crate::platform::Signal::Kill => "-KILL",
+    };
+    let _ = Command::new("sudo")
+        .args(["kill", flag, &pid.to_string()])
+        .status();
+}
+
+/// No `sudo` and no root-owned daemon on Windows: a refused signal stays refused.
+#[cfg(not(unix))]
+fn escalate_via_sudo(_pid: i32, _signal: crate::platform::Signal) {}
+
+/// Block until every pid in `pids` has exited, or `timeout` passes.
+fn wait_for_exit(pids: &[i32], timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        if !state::is_pid_alive(s.dhcp_pid) && !state::is_pid_alive(s.tftp_pid) {
-            break;
+        if pids.iter().all(|&pid| !state::is_pid_alive(pid)) {
+            return;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+}
+
+/// Stop the netboot session for `target` and restore its interface.
+///
+/// Every signal is gated on the pid still being a live netbootd (see
+/// [`should_signal`]); a recorded pid that is dead or recycled is simply
+/// forgotten — state file removed, interface restored — without being
+/// signalled. A netbootd that ignores SIGTERM through the 3 s grace is
+/// SIGKILLed (again name-verified, again escalating through `sudo` on
+/// `EPERM`); one that survives even that is an error, and the state file is
+/// kept so nothing reports a stop that did not happen.
+pub fn stop(target: &str) -> Result<()> {
+    let s = state::load_netboot_state(target)
+        .ok_or_else(|| anyhow!("no netboot state for '{target}'"))?;
+    // Both fields hold the one netbootd pid for the rust engine; signal each
+    // distinct pid once.
+    let mut recorded = vec![s.dhcp_pid];
+    if s.tftp_pid != s.dhcp_pid {
+        recorded.push(s.tftp_pid);
+    }
+    let live: Vec<i32> = recorded
+        .into_iter()
+        .filter(|&pid| is_verified_netbootd(pid))
+        .collect();
+    for &pid in &live {
+        signal_netbootd(pid, crate::platform::Signal::Term);
+    }
+    wait_for_exit(&live, std::time::Duration::from_secs(3));
+
+    // Re-verify before escalating: the grace period is long enough for a
+    // pid to have been recycled.
+    let stubborn: Vec<i32> = live
+        .into_iter()
+        .filter(|&pid| is_verified_netbootd(pid))
+        .collect();
+    for &pid in &stubborn {
+        signal_netbootd(pid, crate::platform::Signal::Kill);
+    }
+    wait_for_exit(&stubborn, std::time::Duration::from_secs(2));
+    let survivors: Vec<String> = stubborn
+        .into_iter()
+        .filter(|&pid| is_verified_netbootd(pid))
+        .map(|pid| pid.to_string())
+        .collect();
+    if !survivors.is_empty() {
+        bail!(
+            "netbootd (pid {}) is still running after SIGKILL; leaving its state \
+             file and interface {} in place",
+            survivors.join(", "),
+            s.interface
+        );
+    }
+
     state::remove_netboot_state(target);
     netif::restore_interface(&s.interface);
     Ok(())
@@ -324,5 +406,20 @@ mod tests {
         assert_eq!(log_tail(&path, 100).lines().count(), 30);
         // Missing file: empty, not an error — the spawn failure is the story.
         assert_eq!(log_tail(&dir.path().join("nope.log"), 20), "");
+    }
+
+    /// The one rule behind every signal `stop` sends: a pid from the state
+    /// file is touched only while it is alive *and* still a netbootd. A live
+    /// pid running something else has been recycled and must be left alone —
+    /// that path used to get a SIGTERM and then a `sudo kill`.
+    #[test]
+    fn stop_signals_only_a_live_netbootd() {
+        assert!(should_signal(true, true));
+        assert!(
+            !should_signal(true, false),
+            "a recycled pid running another program must not be signalled"
+        );
+        assert!(!should_signal(false, true), "a dead pid needs nothing");
+        assert!(!should_signal(false, false));
     }
 }

@@ -232,6 +232,55 @@ pub fn log_path(name: &str, instance: Option<&str>) -> PathBuf {
         .join("daemon.log")
 }
 
+/// Create (truncating) the daemon's stderr log at [`log_path`], private to
+/// this user, with the runtime dir ensured first. The log is the daemon's
+/// tracing output — device paths, remote hostnames, whatever a hook printed —
+/// so on Unix it is created 0600 rather than umask-default, the same as
+/// serialcap's capture files.
+pub fn create_log(name: &str, instance: Option<&str>) -> Result<std::fs::File> {
+    let dir = ensure_runtime_dir(name, instance)?;
+    let mut o = std::fs::OpenOptions::new();
+    o.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    Ok(o.open(dir.join("daemon.log"))?)
+}
+
+/// The runtime base, only if it can be trusted: it exists, is a real
+/// directory (not a symlink), is owned by this user, and is closed to
+/// everyone else — the same conditions [`ensure_runtime_dir`] establishes
+/// when it creates the base. `Ok(None)` when it does not exist yet (nothing
+/// has ever started on this host); `Err` names the problem. Every reader of
+/// discovery files goes through this, so a `daemon.json` planted under a
+/// squatted or world-accessible base can never hand the CLI a port to
+/// connect to or a pid to signal. A base that is ours but was left too open
+/// is tightened to 0700 here, as the writer does; only a symlink or another
+/// owner is refused outright.
+fn trusted_runtime_base() -> std::result::Result<Option<PathBuf>, String> {
+    let base = runtime_base();
+    if std::fs::symlink_metadata(&base).is_err() {
+        return Ok(None);
+    }
+    if crate::platform::is_private_dir(&base) {
+        return Ok(Some(base));
+    }
+    // Our own directory left too open — created by an older paniolo, or by
+    // the ssh ControlMaster path before it went through the private-dir
+    // check. Tighten it exactly as the write path does rather than pretend
+    // nothing is running; only a symlink or another owner is refused.
+    if crate::platform::ensure_private_dir(&base).is_ok() && crate::platform::is_private_dir(&base)
+    {
+        Ok(Some(base))
+    } else {
+        Err(format!(
+            "{} is not a private directory owned by this user (a symlink, another \
+             owner, or group/world-accessible); ignoring the discovery files under \
+             it — `chmod 700` it if it is yours",
+            base.display()
+        ))
+    }
+}
+
 // ── helper state/runtime-dir API ────────────────────────────────────────────
 //
 // Helpers must not invent their own paths (a helper writing unnamespaced
@@ -450,7 +499,17 @@ fn read_discovery(
 /// hdmicap, hid).
 pub fn list_discovered() -> Vec<DaemonInfo> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(runtime_base()) else {
+    let base = match trusted_runtime_base() {
+        Ok(Some(base)) => base,
+        Ok(None) => return out,
+        Err(why) => {
+            // The human-facing inventory is the one place this is said aloud;
+            // the per-daemon readers just answer "not running".
+            eprintln!("warning: {why}");
+            return out;
+        }
+    };
+    let Ok(entries) = std::fs::read_dir(&base) else {
         return out;
     };
     for entry in entries.flatten() {
@@ -480,44 +539,91 @@ pub fn list_discovered() -> Vec<DaemonInfo> {
     out
 }
 
-/// Processes executing out of the libexec dir that are NOT in `exclude_pids` —
-/// stray helper invocations (e.g. wedged one-shots holding a serial port).
+/// Processes launched from a paniolo helper dir that are neither in
+/// `exclude_pids` nor descended from one of them — stray helper invocations
+/// (e.g. a wedged one-shot holding a serial port).
+///
+/// "Launched from" means the process's program path (argv[0]) sits directly
+/// in one of [`helper_dirs`]; the rest of the command line is not consulted,
+/// so the `cargo install --root …/libexec/paniolo …` that `make install`
+/// runs, an editor, or an `ls` that merely *mentions* the dir is not a stray
+/// and is not TERMed by `daemons stop --all`. Descendants of an excluded pid
+/// are excluded too, because a recorded pid is not always the helper itself:
+/// on Linux netbootd runs under `sudo`, so the recorded pid is sudo's and the
+/// real netbootd is its child, and hdmicap spawns its OCR helper the same way.
 pub fn list_stray_helpers(exclude_pids: &[i32]) -> Vec<(i32, String)> {
-    let needles: Vec<String> = helper_dirs()
-        .iter()
-        .map(|d| d.to_string_lossy().into_owned())
-        .collect();
     let Ok(out) = std::process::Command::new("ps")
-        .args(["-axo", "pid=,args="])
+        .args(["-axo", "pid=,ppid=,args="])
         .output()
     else {
         return Vec::new();
     };
-    let me = std::process::id() as i32;
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim_start();
-            let (pid_s, args) = line.split_once(' ')?;
-            let pid: i32 = pid_s.parse().ok()?;
-            let from_libexec = needles.iter().any(|n| args.contains(n.as_str()));
-            if !from_libexec || pid == me || exclude_pids.contains(&pid) {
-                return None;
-            }
-            Some((pid, args.trim().to_string()))
-        })
-        .collect()
+    strays_in_ps(
+        &String::from_utf8_lossy(&out.stdout),
+        &helper_dirs(),
+        std::process::id() as i32,
+        exclude_pids,
+    )
 }
 
-/// Send `signal` to `pid` (best-effort).
-pub fn signal_pid(pid: i32, signal: crate::platform::Signal) {
-    crate::platform::signal_pid(pid, signal);
+/// One row of `ps -axo pid=,ppid=,args=`: `(pid, ppid, command line)`. The
+/// numeric columns are right-aligned, so each is taken up to the next run of
+/// blanks rather than a single space.
+fn parse_ps_row(line: &str) -> Option<(i32, i32, &str)> {
+    let rest = line.trim_start();
+    let (pid, rest) = rest.split_once(' ')?;
+    let rest = rest.trim_start();
+    let (ppid, rest) = rest.split_once(' ')?;
+    Some((pid.parse().ok()?, ppid.parse().ok()?, rest.trim()))
+}
+
+/// True when argv[0] of `args` is a file directly inside one of `helper_dirs`.
+fn launched_from(args: &str, helper_dirs: &[PathBuf]) -> bool {
+    let Some(program) = args.split_whitespace().next() else {
+        return false;
+    };
+    Path::new(program)
+        .parent()
+        .is_some_and(|dir| helper_dirs.iter().any(|d| d.as_path() == dir))
+}
+
+/// The classification behind [`list_stray_helpers`], over the text of a
+/// `ps` listing: pure, so it is unit-testable with sample rows.
+fn strays_in_ps(
+    ps: &str,
+    helper_dirs: &[PathBuf],
+    me: i32,
+    exclude_pids: &[i32],
+) -> Vec<(i32, String)> {
+    let rows: Vec<(i32, i32, &str)> = ps.lines().filter_map(parse_ps_row).collect();
+    // Close the excluded set over parent → child, so a helper's own children
+    // (sudo's netbootd, hdmicap's OCR helper) go with it.
+    let mut excluded: std::collections::HashSet<i32> = exclude_pids.iter().copied().collect();
+    loop {
+        let before = excluded.len();
+        for (pid, ppid, _) in &rows {
+            if excluded.contains(ppid) {
+                excluded.insert(*pid);
+            }
+        }
+        if excluded.len() == before {
+            break;
+        }
+    }
+    rows.into_iter()
+        .filter(|(pid, _, args)| {
+            *pid != me && !excluded.contains(pid) && launched_from(args, helper_dirs)
+        })
+        .map(|(pid, _, args)| (pid, args.to_string()))
+        .collect()
 }
 
 /// Listen port of the named running daemon instance, or None if it isn't
 /// running. `instance` selects a per-target daemon (`None` = host-singleton).
 pub fn daemon_port(name: &str, instance: Option<&str>) -> Option<u16> {
-    let path = runtime_base()
+    let path = trusted_runtime_base()
+        .ok()
+        .flatten()?
         .join(runtime_rel(name, instance))
         .join("daemon.json");
     let text = std::fs::read_to_string(path).ok()?;
@@ -532,7 +638,9 @@ pub fn daemon_port(name: &str, instance: Option<&str>) -> Option<u16> {
 
 /// PID of the named running daemon instance, or None if it isn't running.
 pub fn daemon_pid(name: &str, instance: Option<&str>) -> Option<i32> {
-    let path = runtime_base()
+    let path = trusted_runtime_base()
+        .ok()
+        .flatten()?
         .join(runtime_rel(name, instance))
         .join("daemon.json");
     let text = std::fs::read_to_string(path).ok()?;
@@ -687,12 +795,180 @@ mod tests {
         // With no override, the root is the platform default: the hardcoded
         // /tmp on Unix, the per-user temp dir on Windows. The override is read
         // live, so only assert the shape (the env var is process-global in
-        // tests).
+        // tests; the lock keeps `with_runtime_root` from flipping it mid-way).
+        let _guard = RUNTIME_BASE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if std::env::var_os("PANIOLO_RUNTIME_BASE").is_none() {
             assert_eq!(runtime_root(), crate::platform::default_runtime_root());
             if cfg!(unix) {
                 assert_eq!(runtime_root(), PathBuf::from("/tmp"));
             }
         }
+    }
+
+    /// `PANIOLO_RUNTIME_BASE` is process-global and the test threads run
+    /// concurrently, so every test that points it somewhere holds this.
+    static RUNTIME_BASE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `f` with `PANIOLO_RUNTIME_BASE` pointed at a fresh scratch root
+    /// (so `runtime_base()` is `<root>/paniolo-<uid>`), restoring the
+    /// previous value afterwards.
+    fn with_runtime_root<R>(f: impl FnOnce(&Path) -> R) -> R {
+        let _guard = RUNTIME_BASE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("PANIOLO_RUNTIME_BASE");
+        // Safe: serialized by the lock above; restored below.
+        unsafe { std::env::set_var("PANIOLO_RUNTIME_BASE", root.path()) };
+        let r = f(root.path());
+        match prev {
+            Some(p) => unsafe { std::env::set_var("PANIOLO_RUNTIME_BASE", p) },
+            None => unsafe { std::env::remove_var("PANIOLO_RUNTIME_BASE") },
+        }
+        r
+    }
+
+    fn expected_base(root: &Path) -> PathBuf {
+        root.join(format!("paniolo-{}", crate::platform::current_uid()))
+    }
+
+    /// A discovery file naming *this* process, so the liveness check passes
+    /// and only the base check decides whether the readers trust it.
+    fn plant_discovery(base: &Path, rel: &str, port: u16) {
+        let dir = base.join(rel);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("daemon.json"),
+            format!(r#"{{"pid":{},"port":{port}}}"#, std::process::id()),
+        )
+        .unwrap();
+    }
+
+    /// The readers see a daemon when the base is the private directory the
+    /// writer creates — the everyday path, which must keep working with the
+    /// trust check in front of it.
+    #[test]
+    fn readers_trust_a_private_base_we_own() {
+        with_runtime_root(|root| {
+            ensure_runtime_dir("serialcap", Some("pi5")).unwrap();
+            plant_discovery(&expected_base(root), "serialcap/pi5", 4321);
+
+            assert_eq!(daemon_port("serialcap", Some("pi5")), Some(4321));
+            assert_eq!(
+                daemon_pid("serialcap", Some("pi5")),
+                Some(std::process::id() as i32)
+            );
+            let listed = list_discovered();
+            assert_eq!(listed.len(), 1, "one live daemon");
+            assert_eq!(listed[0].name, "serialcap");
+            assert_eq!(listed[0].instance.as_deref(), Some("pi5"));
+            assert_eq!(listed[0].port, Some(4321));
+        });
+    }
+
+    /// A symlink where the base should be — a squatter's, pointing wherever
+    /// they like — makes every reader answer "not running", even though the
+    /// discovery file behind it names a live pid.
+    #[cfg(unix)]
+    #[test]
+    fn readers_ignore_a_symlinked_base() {
+        use std::os::unix::fs::PermissionsExt;
+        with_runtime_root(|root| {
+            let real = root.join("elsewhere");
+            std::fs::create_dir(&real).unwrap();
+            std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+            plant_discovery(&real, "serialcap/pi5", 4321);
+            std::os::unix::fs::symlink(&real, expected_base(root)).unwrap();
+
+            assert_eq!(daemon_port("serialcap", Some("pi5")), None);
+            assert_eq!(daemon_pid("serialcap", Some("pi5")), None);
+            assert!(list_discovered().is_empty());
+        });
+    }
+
+    /// A base we own but left group/world-accessible is refused by the
+    /// readers: a base we own that was left too open (an older paniolo, or
+    /// the ssh ControlMaster path) is tightened to 0700 and then trusted, so
+    /// an upgrade never makes a running daemon look stopped.
+    #[cfg(unix)]
+    #[test]
+    fn readers_tighten_an_open_base_we_own() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        with_runtime_root(|root| {
+            let base = expected_base(root);
+            std::fs::create_dir(&base).unwrap();
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+            plant_discovery(&base, "serialcap/pi5", 4321);
+
+            assert_eq!(daemon_port("serialcap", Some("pi5")), Some(4321));
+            assert_eq!(
+                std::fs::metadata(&base).unwrap().mode() & 0o777,
+                0o700,
+                "reader tightened the base"
+            );
+            assert!(daemon_pid("serialcap", Some("pi5")).is_some());
+        });
+    }
+
+    /// The daemon's stderr log is created readable by nobody else.
+    #[cfg(unix)]
+    #[test]
+    fn daemon_log_is_created_private() {
+        use std::os::unix::fs::MetadataExt;
+        with_runtime_root(|_| {
+            let log = create_log("serialcap", Some("pi5")).unwrap();
+            assert_eq!(log.metadata().unwrap().mode() & 0o777, 0o600);
+            assert!(log_path("serialcap", Some("pi5")).is_file());
+        });
+    }
+
+    /// Only argv[0] decides whether a process is a stray helper. Rows whose
+    /// *arguments* mention the helper dir — the `cargo install --root` that
+    /// `make install` runs, an `ls`, an editor — used to match, and
+    /// `daemons stop --all` then TERMed them.
+    #[test]
+    fn strays_match_the_program_path_not_the_arguments() {
+        let dirs = vec![PathBuf::from("/opt/paniolo/libexec/bin")];
+        let ps = "\
+  100     1 /opt/paniolo/libexec/bin/zigplug -d /dev/ttyUSB0 on 1
+  101     1 cargo install --path zigplug --root /opt/paniolo/libexec
+  102     1 ls -l /opt/paniolo/libexec/bin
+  103     1 vim /opt/paniolo/libexec/bin/notes.txt
+  104     1 /opt/paniolo/libexec/binx/other
+  105     1 /opt/paniolo/libexec/bin/sub/deeper
+";
+        let pids: Vec<i32> = strays_in_ps(ps, &dirs, 999, &[])
+            .into_iter()
+            .map(|(pid, _)| pid)
+            .collect();
+        assert_eq!(pids, vec![100]);
+    }
+
+    /// Our own pid, the known daemons, and anything descended from a known
+    /// daemon are not strays: on Linux the recorded netboot pid is `sudo`'s
+    /// and the real netbootd is its child; hdmicap's OCR helper is likewise
+    /// a child of a known daemon. The wedged one-shot is what remains.
+    #[test]
+    fn strays_exclude_us_known_pids_and_their_descendants() {
+        let dirs = vec![PathBuf::from("/usr/libexec/paniolo/bin")];
+        let ps = "\
+  200     1 sudo env NO_COLOR=1 /usr/libexec/paniolo/bin/netbootd --host-ip 192.168.99.1
+  201   200 /usr/libexec/paniolo/bin/netbootd --host-ip 192.168.99.1
+  202   201 /usr/libexec/paniolo/bin/bpf-helper
+  300     1 /usr/libexec/paniolo/bin/hdmicap daemon --device /dev/video0
+  301   300 /usr/libexec/paniolo/bin/linuxocr
+  400     1 /usr/libexec/paniolo/bin/zigplug -d /dev/ttyUSB1 on 1
+  500     1 /usr/libexec/paniolo/bin/serialcap stop
+";
+        let strays = strays_in_ps(ps, &dirs, 500, &[200, 300]);
+        assert_eq!(
+            strays,
+            vec![(
+                400,
+                "/usr/libexec/paniolo/bin/zigplug -d /dev/ttyUSB1 on 1".to_string()
+            )]
+        );
     }
 }

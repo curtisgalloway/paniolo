@@ -344,7 +344,17 @@ Python tree below:
   zigplug), netbootd via its state files, plus *stray* helper processes running out of
   the libexec dir (wedged one-shots). `paniolo daemons stop [NAME…|--all]
   [--force]` TERMs them (netbootd via its proper interface-restoring stop),
-  escalating to KILL with `--force` after a 3 s grace period.
+  escalating to KILL with `--force` after a 3 s grace period. A `NAME` is
+  either form the list prints: bare `serialcap` (every instance) or
+  `'serialcap[pi5]'` (one target's; quote it, `[]` is a shell glob). Before
+  any signal the pid's command line is re-checked for the daemon's binary
+  name, so a pid the kernel has recycled is skipped with a message, and a
+  signal the OS refuses (EPERM) is reported and fails the command rather than
+  being printed as `TERM`. A stray is a process whose *program path* (argv[0])
+  is in a helper dir — not one whose arguments merely mention it (the `cargo
+  install --root …/libexec/paniolo` that `make install` runs) — and children
+  of a known daemon (sudo's netbootd on Linux, hdmicap's OCR helper) are
+  never strays.
   A daemon keeps running its binary from when it started; an upgrade or rebuild
   replaces that binary on disk but not the running process. The CLI stamps each
   capture daemon's binary identity at spawn (`binmeta.json`) and flags a daemon
@@ -912,6 +922,17 @@ clap treats a token starting with `-` as a potential option flag; the `dx`/
 whose trailing args allow hyphen values — keep `-t` before them).
 
 ## Runtime paths
+
+The runtime base `/tmp/paniolo-<uid>/` is private: created 0700 and, when it
+already exists, required to be a real directory owned by the current user
+with no group/other bits — a too-open base we own is tightened, a symlink or
+another owner's directory is refused (`platform::ensure_private_dir`, one copy
+per daemon crate). The discovery-file *readers* (`daemon_port`, `daemon_pid`,
+`list_discovered`) apply the same check before trusting anything beneath it,
+so a planted `daemon.json` can never supply a port or a pid; `paniolo daemons`
+warns when the base fails the check. The ControlMaster socket dir
+(`cli/src/ssh.rs`, the same path on macOS) goes through the same check.
+Daemon stderr logs and serialcap's capture files are created 0600.
 
 | Purpose | Path |
 |---|---|
