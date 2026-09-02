@@ -248,8 +248,11 @@ When the dashboard page loads, serialcap replays up to 64 KB of scrollback
 immediately on WebSocket connect, so the terminal isn't blank mid-session.
 Keystrokes typed in the terminal are forwarded to the serial port in real time.
 
-serialcap's HTTP responses carry a permissive CORS header so the cross-port
-fetch from the hdmicap page is allowed without any proxy.
+The page authenticates to serialcap with serialcap's own token: `paniolo
+console` reads it from the daemon's discovery file and embeds it in the
+`?serialws=` URL it hands the page. serialcap echoes only that loopback origin
+in its CORS header (never `*`), so the cross-port connection needs no proxy
+and no other page can make it.
 
 When serialcap owns multiple interfaces, the dashboard shows one terminal
 pane per interface side by side. Use `paniolo console -i <name>` to open in
@@ -285,7 +288,7 @@ See [power.md](power.md) for wiring diagrams, the generic power hooks
 
 | Purpose | Path |
 |---|---|
-| serialcap discovery | `/tmp/paniolo-<uid>/serialcap/<target>/daemon.json` (`{pid, port, interfaces:[...]}`) |
+| serialcap discovery | `/tmp/paniolo-<uid>/serialcap/<target>/daemon.json` (`{pid, port, token, interfaces:[...]}`; owner-only, it holds the token) |
 | serialcap advisory lock | `/tmp/paniolo-<uid>/serialcap/<target>/daemon.lock` |
 | serialcap stderr log | `/tmp/paniolo-<uid>/serialcap/<target>/daemon.log` (truncated on each start; shown on start timeout) |
 | Capture log (per interface) | `/tmp/paniolo-<uid>/serialcap/<target>/capture/<name>/serial.jsonl(.1..)` |
@@ -299,7 +302,25 @@ base honors `$PANIOLO_RUNTIME_BASE` (default `/tmp`).
 ## HTTP API (serialcap daemon)
 
 All per-interface endpoints take `?interface=NAME`, defaulting to the first
-configured interface. Responses carry a permissive CORS header.
+configured interface.
+
+**Every request needs the daemon's token.** The daemon generates a fresh one
+each start and publishes it as `token` in its discovery file (below), which is
+readable by the operator's uid only. Send it as `Authorization: Bearer <token>`
+or as a `?token=<token>` query parameter (the form the dashboard's WebSocket
+uses). The daemon also requires a loopback `Host` and, when a browser sends
+one, a loopback `Origin` — so a web page open in your browser cannot reach it
+even though it listens on 127.0.0.1. Without the token a request gets 401;
+with a foreign Host or Origin, 403. Doing it by hand:
+
+```bash
+d=/tmp/paniolo-$(id -u)/serialcap/target-machine/daemon.json
+curl -s -H "Authorization: Bearer $(jq -r .token "$d")" \
+    "http://127.0.0.1:$(jq -r .port "$d")/status"
+```
+
+A daemon started by a paniolo older than the token has none and accepts
+unauthenticated requests; `paniolo daemons restart --stale` replaces it.
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -312,5 +333,8 @@ configured interface. Responses carry a permissive CORS header.
 
 `POST /input` writes through the port the daemon already owns, so input coexists
 with live capture. A paced write (`pace_ms > 0`) blocks until the whole body is
-sent (~`len × pace_ms` ms). Returns 200 on success, 404 for an unknown interface,
-503 if the supervisor isn't running.
+sent (~`len × pace_ms` ms). The body is capped at 64 KiB and `pace_ms` at
+10 000, so one request cannot park the port for days. Returns 200 on success,
+400 for a pace past the ceiling, 404 for an unknown interface, 413 for an
+oversized body, 503 if the supervisor isn't running. `/stream` messages from
+the client are capped at 64 KiB likewise.

@@ -112,12 +112,17 @@ pub fn execute_line(s: &mut Session, line: &str) -> Result<String> {
             let rate: u32 = one_arg(rest, "baud")?
                 .parse()
                 .map_err(|_| anyhow!("baud rate must be an integer: {rest:?}"))?;
-            s.set_baud(rate)?;
-            return Ok(format!(
+            let note = s.set_baud(rate)?;
+            let mut reply = format!(
                 "link persisted to {rate} baud (CH9329 flash; auto-detect probes \
                  115200, 57600, then 9600 — for other rates reconnect with -b \
                  {rate})"
-            ));
+            );
+            if let Some(n) = note {
+                reply.push_str("; ");
+                reply.push_str(&n);
+            }
+            return Ok(reply);
         }
         "usb" => {
             // Openterface USB-mux control, another CH9329-family extension

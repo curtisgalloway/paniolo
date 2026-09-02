@@ -17,7 +17,10 @@
 //! Every daemon follows the same contract: it is an installed binary (the
 //! paniolo libexec dir, PATH, or legacy `~/.cargo/bin` — see [`find_binary`]),
 //! binds localhost (port 0 = OS-assigned), and writes a discovery file
-//! `{pid, port, …}` under `<runtime>/<name>[/<target>]/daemon.json`. The
+//! `{pid, port, token, …}` under `<runtime>/<name>[/<target>]/daemon.json`.
+//! `token` is the bearer secret every request to that daemon must carry (see
+//! [`Endpoint`]); the file is owner-only, so only the operator's own processes
+//! can read it. The
 //! optional `<target>` segment lets per-target capture daemons (serialcap,
 //! hdmicap, hid) coexist on one host; host-singleton daemons (zigplug,
 //! cambrionix, netbootd) omit it (see [`runtime_rel`]). `<runtime>` is
@@ -204,7 +207,7 @@ fn sanitize_component(s: &str) -> String {
 /// The runtime subdir for a daemon, relative to the per-uid base: `<name>` for
 /// a single-instance daemon, or `<name>/<sanitized-instance>` for a per-target
 /// (multi-instance) daemon. Both the local path helpers and the remote
-/// discovery lookup (`dispatch::remote_daemon_port`) build paths through this,
+/// discovery lookup (`dispatch::remote_daemon_endpoint`) build paths through this,
 /// so a daemon's writer and reader always agree on the location.
 pub fn runtime_rel(name: &str, instance: Option<&str>) -> String {
     match instance {
@@ -493,7 +496,7 @@ fn read_discovery(
 }
 
 /// Every daemon currently publishing a live discovery file. Stale files
-/// (dead pid) are skipped, mirroring [`daemon_port`]'s liveness rule. Handles
+/// (dead pid) are skipped, mirroring [`daemon_endpoint`]'s liveness rule. Handles
 /// both layouts: `<name>/daemon.json` (host-singleton: zigplug, cambrionix,
 /// netbootd) and `<name>/<target>/daemon.json` (per-target: serialcap,
 /// hdmicap, hid).
@@ -618,40 +621,106 @@ fn strays_in_ps(
         .collect()
 }
 
-/// Listen port of the named running daemon instance, or None if it isn't
-/// running. `instance` selects a per-target daemon (`None` = host-singleton).
-pub fn daemon_port(name: &str, instance: Option<&str>) -> Option<u16> {
-    let path = trusted_runtime_base()
-        .ok()
-        .flatten()?
-        .join(runtime_rel(name, instance))
-        .join("daemon.json");
-    let text = std::fs::read_to_string(path).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let pid = v.get("pid")?.as_i64()? as i32;
-    let port = v.get("port")?.as_u64()?;
-    if !pid_alive(pid) {
-        return None;
+/// A running daemon's HTTP endpoint, as read from its discovery file: the
+/// loopback port and the bearer token every request must carry. `token` is
+/// `None` for a daemon started by a paniolo older than the token — it accepts
+/// unauthenticated requests, and `paniolo daemons restart --stale` replaces
+/// it with one that does not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Endpoint {
+    pub pid: i32,
+    pub port: u16,
+    pub token: Option<String>,
+}
+
+impl Endpoint {
+    /// Parse a `daemon.json` body (read locally, or fetched over SSH by
+    /// `dispatch::remote_daemon_endpoint`). `None` without a pid and a port.
+    /// Liveness is the caller's concern.
+    pub fn from_json(text: &str) -> Option<Endpoint> {
+        let v: serde_json::Value = serde_json::from_str(text).ok()?;
+        let pid = i32::try_from(v.get("pid")?.as_i64()?).ok()?;
+        let port = u16::try_from(v.get("port")?.as_u64()?).ok()?;
+        let token = v
+            .get("token")
+            .and_then(|t| t.as_str())
+            .filter(|t| !t.is_empty())
+            .map(str::to_string);
+        Some(Endpoint { pid, port, token })
     }
-    u16::try_from(port).ok()
+
+    /// `http://127.0.0.1:<port>` — the base for API calls.
+    pub fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// A GET of `path` (which may carry a query) with the token attached as
+    /// `Authorization: Bearer`.
+    pub fn get(&self, path: &str) -> ureq::Request {
+        self.authorize(ureq::get(&format!("{}{path}", self.base_url())))
+    }
+
+    /// A POST to `path`, likewise.
+    pub fn post(&self, path: &str) -> ureq::Request {
+        self.authorize(ureq::post(&format!("{}{path}", self.base_url())))
+    }
+
+    fn authorize(&self, req: ureq::Request) -> ureq::Request {
+        match &self.token {
+            Some(t) => req.set("Authorization", &format!("Bearer {t}")),
+            None => req,
+        }
+    }
+
+    /// `scheme://127.0.0.1:<port><path>` with the token as a `token=` query
+    /// parameter — the form a browser needs, since a page load, an `<img>`
+    /// or a WebSocket upgrade cannot set a header. `path` may already carry
+    /// a query.
+    fn url_with_token(&self, scheme: &str, path: &str) -> String {
+        let mut url = format!("{scheme}://127.0.0.1:{}{path}", self.port);
+        if let Some(t) = &self.token {
+            url.push(if path.contains('?') { '&' } else { '?' });
+            url.push_str("token=");
+            url.push_str(t);
+        }
+        url
+    }
+
+    /// The URL a human opens in a browser (the dashboard is `GET /`).
+    pub fn http_url(&self, path: &str) -> String {
+        self.url_with_token("http", path)
+    }
+
+    /// The URL the dashboard page connects to (`/stream`, `/hid`).
+    pub fn ws_url(&self, path: &str) -> String {
+        self.url_with_token("ws", path)
+    }
+}
+
+/// `<dir>/daemon.json` as a live [`Endpoint`], or None if the file is absent,
+/// unparseable, or names a dead pid.
+fn endpoint_at(dir: &Path) -> Option<Endpoint> {
+    let text = std::fs::read_to_string(dir.join("daemon.json")).ok()?;
+    let ep = Endpoint::from_json(&text)?;
+    pid_alive(ep.pid).then_some(ep)
+}
+
+/// The named running daemon instance's endpoint (port + token), or None if
+/// it isn't running. `instance` selects a per-target daemon (`None` =
+/// host-singleton).
+pub fn daemon_endpoint(name: &str, instance: Option<&str>) -> Option<Endpoint> {
+    let base = trusted_runtime_base().ok().flatten()?;
+    endpoint_at(&base.join(runtime_rel(name, instance)))
 }
 
 /// PID of the named running daemon instance, or None if it isn't running.
 pub fn daemon_pid(name: &str, instance: Option<&str>) -> Option<i32> {
-    let path = trusted_runtime_base()
-        .ok()
-        .flatten()?
-        .join(runtime_rel(name, instance))
-        .join("daemon.json");
-    let text = std::fs::read_to_string(path).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let pid = v.get("pid")?.as_i64()? as i32;
-    pid_alive(pid).then_some(pid)
+    daemon_endpoint(name, instance).map(|ep| ep.pid)
 }
 
 /// Base URL of the named running daemon instance, or None if it isn't running.
 pub fn daemon_url(name: &str, instance: Option<&str>) -> Option<String> {
-    daemon_port(name, instance).map(|port| format!("http://127.0.0.1:{port}"))
+    daemon_endpoint(name, instance).map(|ep| ep.base_url())
 }
 
 /// Block until the named daemon instance answers discovery, or time out.
@@ -791,6 +860,103 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_parses_the_token_and_tolerates_its_absence() {
+        let ep = Endpoint::from_json(r#"{"pid":42,"port":8724,"token":"abc"}"#).unwrap();
+        assert_eq!(
+            ep,
+            Endpoint {
+                pid: 42,
+                port: 8724,
+                token: Some("abc".into())
+            }
+        );
+        // A daemon older than the token: still discoverable, no credential.
+        let old = Endpoint::from_json(r#"{"pid":42,"port":8724}"#).unwrap();
+        assert_eq!(old.token, None);
+        assert!(Endpoint::from_json(r#"{"pid":42}"#).is_none());
+        assert!(Endpoint::from_json("not json").is_none());
+    }
+
+    #[test]
+    fn endpoint_urls_carry_the_token_only_where_a_browser_needs_it() {
+        let ep = Endpoint {
+            pid: 1,
+            port: 5555,
+            token: Some("t0k".into()),
+        };
+        assert_eq!(ep.base_url(), "http://127.0.0.1:5555");
+        assert_eq!(ep.http_url("/"), "http://127.0.0.1:5555/?token=t0k");
+        assert_eq!(
+            ep.ws_url("/stream?interface=console"),
+            "ws://127.0.0.1:5555/stream?interface=console&token=t0k"
+        );
+        let old = Endpoint {
+            token: None,
+            ..ep.clone()
+        };
+        assert_eq!(old.ws_url("/hid"), "ws://127.0.0.1:5555/hid");
+    }
+
+    /// The liveness rule, executed against a real file: the current process's
+    /// pid is alive, pid 0 never is.
+    #[test]
+    fn endpoint_at_applies_the_liveness_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+        std::fs::write(
+            dir.path().join("daemon.json"),
+            format!(r#"{{"pid":{me},"port":7,"token":"x"}}"#),
+        )
+        .unwrap();
+        let ep = endpoint_at(dir.path()).unwrap();
+        assert_eq!((ep.port, ep.token.as_deref()), (7, Some("x")));
+        std::fs::write(
+            dir.path().join("daemon.json"),
+            r#"{"pid":0,"port":7,"token":"x"}"#,
+        )
+        .unwrap();
+        assert!(endpoint_at(dir.path()).is_none());
+    }
+
+    /// The request builders put the bearer header on the wire — checked
+    /// against a real loopback listener, not by inspecting a string.
+    #[test]
+    fn endpoint_requests_carry_the_bearer_header() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = s.read(&mut buf).unwrap();
+            let _ =
+                s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+        let ep = Endpoint {
+            pid: 1,
+            port,
+            token: Some("t0k".into()),
+        };
+        let resp = ep
+            .get("/status?interface=console")
+            .timeout(Duration::from_secs(5))
+            .call()
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let req = server.join().unwrap();
+        assert!(
+            req.starts_with("GET /status?interface=console HTTP/1.1"),
+            "{req}"
+        );
+        assert!(
+            req.lines()
+                .any(|l| l.eq_ignore_ascii_case("authorization: Bearer t0k")),
+            "no bearer header in:\n{req}"
+        );
+    }
+
+    #[test]
     fn runtime_root_honors_env_default_tmp() {
         // With no override, the root is the platform default: the hardcoded
         // /tmp on Unix, the per-user temp dir on Windows. The override is read
@@ -855,7 +1021,10 @@ mod tests {
             ensure_runtime_dir("serialcap", Some("pi5")).unwrap();
             plant_discovery(&expected_base(root), "serialcap/pi5", 4321);
 
-            assert_eq!(daemon_port("serialcap", Some("pi5")), Some(4321));
+            assert_eq!(
+                daemon_endpoint("serialcap", Some("pi5")).map(|ep| ep.port),
+                Some(4321)
+            );
             assert_eq!(
                 daemon_pid("serialcap", Some("pi5")),
                 Some(std::process::id() as i32)
@@ -882,7 +1051,10 @@ mod tests {
             plant_discovery(&real, "serialcap/pi5", 4321);
             std::os::unix::fs::symlink(&real, expected_base(root)).unwrap();
 
-            assert_eq!(daemon_port("serialcap", Some("pi5")), None);
+            assert_eq!(
+                daemon_endpoint("serialcap", Some("pi5")).map(|ep| ep.port),
+                None
+            );
             assert_eq!(daemon_pid("serialcap", Some("pi5")), None);
             assert!(list_discovered().is_empty());
         });
@@ -902,7 +1074,10 @@ mod tests {
             std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
             plant_discovery(&base, "serialcap/pi5", 4321);
 
-            assert_eq!(daemon_port("serialcap", Some("pi5")), Some(4321));
+            assert_eq!(
+                daemon_endpoint("serialcap", Some("pi5")).map(|ep| ep.port),
+                Some(4321)
+            );
             assert_eq!(
                 std::fs::metadata(&base).unwrap().mode() & 0o777,
                 0o700,

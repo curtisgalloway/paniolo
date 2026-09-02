@@ -32,24 +32,34 @@ pub const DAEMON: &str = "hdmicap";
 /// fixed defaults collide with stale dashboard tunnels).
 pub const DEFAULT_PORT: u16 = 0;
 
-pub fn daemon_url(target: &str) -> Option<String> {
-    daemons::daemon_url(DAEMON, Some(target))
+/// The target's running hdmicap daemon — port and token — or None if it
+/// isn't running.
+pub fn daemon(target: &str) -> Option<daemons::Endpoint> {
+    daemons::daemon_endpoint(DAEMON, Some(target))
+}
+
+/// The dashboard URL for a human to open: the daemon's `GET /` with the token
+/// a browser needs carried as `?token=`. None if the daemon isn't running.
+pub fn preview_url(target: &str) -> Option<String> {
+    daemon(target).map(|d| d.http_url("/"))
 }
 
 /// OCR the target daemon's current frame via `GET /ocr` (optionally waiting for
 /// a stable signal first), returning the raw v1 envelope (see docs/dev/ocr.md).
 pub fn ocr(target: &str, stable: bool, timeout_ms: u64) -> Result<String> {
-    let url = daemon_url(target)
+    let daemon = daemon(target)
         .ok_or_else(|| anyhow!("no video daemon running — start one with `paniolo video watch`"))?;
     if stable {
         // The snapshot blocks until the signal settles (or times out); the
         // body is discarded — only the wait matters.
-        let _ = ureq::get(&format!("{url}/snapshot?wait=stable&timeout={timeout_ms}"))
+        let _ = daemon
+            .get(&format!("/snapshot?wait=stable&timeout={timeout_ms}"))
             .timeout(std::time::Duration::from_millis(timeout_ms + 5_000))
             .call()
             .map_err(|e| anyhow!("waiting for a stable frame failed: {e}"))?;
     }
-    match ureq::get(&format!("{url}/ocr"))
+    match daemon
+        .get("/ocr")
         .timeout(std::time::Duration::from_secs(30))
         .call()
     {

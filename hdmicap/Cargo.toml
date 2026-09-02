@@ -41,6 +41,9 @@ ureq = "2"
 async-stream = "0.3"
 bytes = "1"
 
+# --- daemon auth: OS entropy for the per-start bearer token (src/auth.rs) ---
+getrandom = "0.2"
+
 # Linux capture: the v4l crate directly, so we can call stream.set_timeout()
 # and avoid an indefinite VIDIOC_DQBUF block, plus keep the raw MJPEG tee.
 # nokhwa is used for device enumeration only. turbojpeg provides fast MJPEG
@@ -75,6 +78,10 @@ windows = { version = "0.62", features = [
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
 ] }
+
+[dev-dependencies]
+# tower::ServiceExt::oneshot drives the auth layer in src/auth.rs's tests.
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 opt-level = 3

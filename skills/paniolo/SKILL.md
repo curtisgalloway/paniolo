@@ -217,8 +217,9 @@ paniolo video show [target]           # device + daemon status
 paniolo video stop [target]           # stop the daemon (on the target's host)
 ```
 
-- The **dashboard** (the video daemon's URL — ports are OS-assigned, printed by
-  `video watch`/`console`) shows live video on top, a
+- The **dashboard** (the video daemon's URL — ports are OS-assigned, and the
+  URL `video watch`/`video preview`/`console` print carries the daemon's
+  `?token=`; open exactly that URL) shows live video on top, a
   serial terminal below, an **OCR button** that reads the current screen, and —
   when the target has a `hid` channel — a **⌨ Capture input** button that turns
   the page into a KVM (see HID injection below).
@@ -679,9 +680,11 @@ instance. netbootd is excluded — cycle it via `paniolo netboot start/stop`.
   (e.g. a Homebrew keg from the tap can shadow it). The helper binaries are
   *not* on PATH — they live in `~/.local/libexec/paniolo/bin`
   (`paniolo helper <name> …` to run one by hand).
-- `paniolo console` auto-starts both daemons if they aren't running. Local
-  `console` passes the serialcap daemon's OS-assigned port as `?serial=PORT`
-  so the dashboard's serial pane connects correctly.
+- `paniolo console` auto-starts both daemons if they aren't running and opens
+  a URL carrying every daemon's token (`?token=`, `?serialws=…token=…`,
+  `?hidws=…`); the daemons answer nothing without it, so use the URL paniolo
+  prints rather than a bare `http://127.0.0.1:<port>/`. A daemon left over
+  from an older paniolo has no token — `paniolo daemons restart --stale`.
 - Netboot requires passwordless `sudo` (`ip` on Linux, `ifconfig` on macOS).
 - netboot and ffx are mutually exclusive on the link — use `paniolo netif mode`
   to switch; entering ffx mode stops netboot so a power-cycle boots from SD.

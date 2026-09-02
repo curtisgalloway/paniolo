@@ -183,7 +183,10 @@ While a daemon for a device is running, every `hidrig -d <device> …` one-shot
 routes through it automatically (over `POST /send`), so the CLI and the web
 console never contend for the port. `paniolo console` starts this daemon on
 demand and the dashboard streams keyboard + absolute-mouse events to it — see
-[`../docs/hid.md`](../docs/hid.md).
+[`../docs/hid.md`](../docs/hid.md). Every request needs the token the daemon
+publishes in its discovery file (`Authorization: Bearer <token>` or
+`?token=<token>`, from a loopback `Host`/`Origin` only); one-shots and
+`paniolo console` supply it themselves.
 
 > The control board is a **USB-CDC** device, so there is **no baud
 > negotiation** — USB sets the real rate and the nominal "baud" is ignored.

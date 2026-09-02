@@ -57,6 +57,9 @@ the dashboard speak only this vocabulary, so any injector behind the generic
   transcript frames — `evt ok <line> :: <reply>` / `evt err <line> :: <reply>` —
   so an issuer reads its own result off the shared stream (the daemon's
   `POST /send` one-shot endpoint returns the raw `OK`/`ERR` reply directly).
+  The carrier is authenticated: the upgrade (or `/send`) must present the
+  token from the daemon's discovery file — `?token=` on the WebSocket URL,
+  `Authorization: Bearer` on `/send` — from a loopback `Host`/`Origin`.
   Many clients may connect at once — the daemon serializes their commands onto
   the single device link, one in flight, which is exactly how CLI-injected and
   browser-injected events intermix. This is a carrier binding, not a different

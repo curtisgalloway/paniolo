@@ -114,7 +114,7 @@
 </head>
 <body>
   <div id="video">
-    <img id="feed" src="/preview" alt="HDMI capture feed" draggable="false">
+    <img id="feed" alt="HDMI capture feed" draggable="false">
     <div id="kvmhint">⌨ Use “Capture input” to control the target</div>
     <div id="videobtns">
       <button id="ocrbtn">⌕ OCR</button>
@@ -150,6 +150,28 @@
   <script src="/xterm.js"></script>
   <script src="/xterm-addon-fit.js"></script>
   <script>
+    // ── auth ──
+    // The daemon issues a per-start token (auth.rs); paniolo puts it in this
+    // page's URL, and every request back to the daemon carries it as ?token=
+    // (a page load, an <img> or a WebSocket cannot set a header).
+    const params = new URLSearchParams(location.search);
+    const TOKEN = params.get('token') || '';
+    function withToken(path) {
+      if (!TOKEN) return path;
+      return path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN);
+    }
+    // The serial and hid daemons' URLs arrive as page parameters. Only
+    // loopback WebSocket URLs are honoured: anything else would let a crafted
+    // link send this page's keystrokes — and the tokens inside those URLs —
+    // somewhere else. Returns the parsed URL, or null to refuse.
+    const LOOPBACK = ['127.0.0.1', 'localhost', '[::1]'];
+    function loopbackWs(u) {
+      try {
+        const p = new URL(u);
+        return (p.protocol === 'ws:' || p.protocol === 'wss:') && LOOPBACK.includes(p.hostname) ? p : null;
+      } catch (e) { return null; }
+    }
+
     // ── layout toggle ──
     const layoutBtn = document.getElementById('layoutbtn');
     const LAYOUT_KEY = 'paniolo-serial-layout';
@@ -171,10 +193,18 @@
     // ── video: poll signal/resolution from this (hdmicap) daemon ──
     const vimg = document.getElementById('feed');
     const vst  = document.getElementById('vstatus');
+    vimg.src = withToken('/preview');
     function pollVideo() {
-      fetch('/status').then(r => r.json()).then(d => {
-        vst.textContent = d.signal + ' · ' + d.width + '×' + d.height;
-        vst.style.color = d.signal === 'stable' ? '#0f0' : '#fa0';
+      fetch(withToken('/status')).then(r => {
+        if (r.status === 401) {
+          vst.textContent = 'unauthorized — open the URL paniolo printed; it carries the token';
+          vst.style.color = '#f44';
+          return;
+        }
+        return r.json().then(d => {
+          vst.textContent = d.signal + ' · ' + d.width + '×' + d.height;
+          vst.style.color = d.signal === 'stable' ? '#0f0' : '#fa0';
+        });
       }).catch(() => { vst.textContent = 'daemon unreachable'; vst.style.color = '#f44'; });
     }
     pollVideo();
@@ -190,7 +220,7 @@
       ocrPanel.classList.add('show');
       ocrTitle.textContent = 'OCR — reading…';
       ocrText.textContent = '';
-      fetch('/ocr')
+      fetch(withToken('/ocr'))
         .then(r => r.text().then(t => ({ ok: r.ok, t })))
         .then(({ ok, t }) => {
           ocrTitle.textContent = ok ? 'OCR' : 'OCR — error';
@@ -223,7 +253,7 @@
     }
     function refreshPower() {
       if (pwrBusy) return; // don't poll cambrionix while an action holds the port
-      fetch('/power').then(r => {
+      fetch(withToken('/power')).then(r => {
         if (r.status === 501) { // no target configured — hide power controls
           pwrToggle.style.display = 'none';
           pwrCycleBtn.style.display = 'none';
@@ -252,7 +282,7 @@
     function doPower(endpoint) {
       pwrBusy = true;
       pwrToggle.disabled = pwrCycleBtn.disabled = true;
-      fetch(endpoint, { method: 'POST' })
+      fetch(withToken(endpoint), { method: 'POST' })
         .then(r => { if (!r.ok) r.text().then(t => console.error(endpoint, t)); })
         .catch(e => console.error(e))
         .finally(() => {
@@ -268,14 +298,18 @@
     pwrCycleBtn.onclick = () => askPower('Power cycle the target?', 'Power cycle', () => doPower('/power-cycle'));
 
     // ── serial: xterm.js panes fed by serialcap WebSocket (cross-port) ──
-    // ?serial=PORT or ?serialws=URL override the default serialcap location.
+    // ?serialws=URL is what `paniolo console` passes: serialcap's /stream with
+    // that daemon's own ?token= inside. ?serial=PORT is the hand-opened form;
+    // it carries no token, so only a daemon without one accepts it. Either
+    // way the URL must be loopback, or the terminal is refused.
     // ?interface=NAME locks to a single interface (single-pane mode).
     // Without ?interface, all daemon interfaces get their own pane side-by-side.
-    const params = new URLSearchParams(location.search);
     const serialPort = params.get('serial') || '8724';
     const baseWsUrl = params.get('serialws') ||
                       ('ws://' + location.hostname + ':' + serialPort + '/stream');
-    const httpBase = baseWsUrl.replace(/^ws/, 'http').replace(/\/stream.*$/, '');
+    const serialWs = loopbackWs(baseWsUrl); // null: refused, no connection is made
+    const httpBase = serialWs ? serialWs.protocol.replace(/^ws/, 'http') + '//' + serialWs.host : null;
+    const serialToken = serialWs ? serialWs.searchParams.get('token') : null;
     const singleInterface = params.get('interface') || null;
 
     const sst = document.getElementById('sstatus');
@@ -359,17 +393,25 @@
       setTimeout(fitAll, 50);
     }
 
-    if (singleInterface) {
+    if (!serialWs) {
+      sst.textContent = 'refusing serial URL (not loopback): ' + baseWsUrl;
+      sst.style.color = '#f44';
+    } else if (singleInterface) {
       buildPanes([singleInterface]);
     } else {
-      fetch(httpBase + '/interfaces')
+      // A GET with no custom headers: the token rides in the query, so this
+      // cross-port fetch needs no CORS preflight.
+      const q = serialToken ? '?token=' + encodeURIComponent(serialToken) : '';
+      fetch(httpBase + '/interfaces' + q)
         .then(r => r.json())
         .then(list => buildPanes(Array.isArray(list) ? list.map(i => i.name) : [null]))
         .catch(() => buildPanes([null]));
     }
 
     // ── KVM: keyboard + absolute mouse to the target via the hid daemon ──
-    // ?hidws=URL (remote/tunnel) or ?hid=PORT (local) enable the HID leg. The
+    // ?hidws=URL (what `paniolo console` passes: the daemon's /hid with its
+    // own ?token= inside) or ?hid=PORT (hand-opened, no token) enable the HID
+    // leg; a non-loopback URL is refused. The
     // "Capture input" header button toggles capture; while engaged, all
     // keyboard + mouse events are sent to the target and suppressed locally
     // (click the button again to release). The mouse is absolute and the local
@@ -382,9 +424,16 @@
           : null);
       if (!hidWsUrl) return; // no HID channel on this console
 
+      const kst = document.getElementById('kvmstatus');
+      if (!loopbackWs(hidWsUrl)) {
+        kst.textContent = 'refusing hid URL (not loopback): ' + hidWsUrl;
+        kst.style.color = '#f44';
+        kst.style.display = '';
+        return; // no connection, no capture button
+      }
+
       const ABS_MAX = 32767;
       const btn = document.getElementById('kvmbtn');
-      const kst = document.getElementById('kvmstatus');
       const videoEl = document.getElementById('video');
       const feed = document.getElementById('feed');
       btn.style.display = 'inline-block'; // reveal the header toggle (CSS hides it by default)

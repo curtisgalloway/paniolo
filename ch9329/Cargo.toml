@@ -44,6 +44,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = "2"
 
+# --- daemon auth: OS entropy for the per-start bearer token (src/auth.rs) ---
+getrandom = "0.2"
+
 # --- process/identity primitives behind src/platform.rs -----------------
 # Each platform gets only what it can use: libc on Unix, the Win32 process
 # APIs on Windows.
@@ -55,6 +58,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
 ] }
+
+[dev-dependencies]
+# tower::ServiceExt::oneshot drives the auth layer in src/auth.rs's tests.
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 opt-level = 3

@@ -27,6 +27,7 @@
 //! with CLI injections; when a daemon is running for the same device, one-shots
 //! route through it automatically.
 
+mod auth;
 mod daemon;
 mod keys;
 // The file is kept byte-identical across the crates that copy it, so a crate
@@ -236,8 +237,10 @@ fn require_device(cli: &Cli) -> Result<&str> {
 /// One command line, executed either through a running daemon or directly on
 /// the UART, depending on what owns the device.
 enum Sender {
-    /// A hid daemon owns this device; route commands through its HTTP API.
-    Daemon { base: String },
+    /// A hid daemon owns this device; route commands through its HTTP API,
+    /// presenting the token from its discovery file (absent for a daemon
+    /// older than the token, which accepts anything).
+    Daemon { base: String, token: Option<String> },
     /// No daemon for this device; we hold the UART ourselves.
     Direct { session: Session },
 }
@@ -251,6 +254,7 @@ impl Sender {
             if d.device == device {
                 return Ok(Sender::Daemon {
                     base: format!("http://127.0.0.1:{}", d.port),
+                    token: d.token,
                 });
             }
         }
@@ -263,18 +267,19 @@ impl Sender {
     /// bare `OK`, the capability/info string for `version`/`info`).
     fn run_line(&mut self, line: &str) -> Result<String> {
         match self {
-            Sender::Daemon { base } => post_send(base, line),
+            Sender::Daemon { base, token } => post_send(base, token.as_deref(), line),
             Sender::Direct { session } => execute_line(session, line),
         }
     }
 }
 
 /// POST one command line to a running daemon's `/send`; return the reply body.
-fn post_send(base: &str, line: &str) -> Result<String> {
-    match ureq::post(&format!("{base}/send"))
-        .timeout(Duration::from_secs(15))
-        .send_string(line)
-    {
+fn post_send(base: &str, token: Option<&str>, line: &str) -> Result<String> {
+    let mut req = ureq::post(&format!("{base}/send")).timeout(Duration::from_secs(15));
+    if let Some(t) = token {
+        req = req.set("Authorization", &format!("Bearer {t}"));
+    }
+    match req.send_string(line) {
         Ok(resp) => Ok(resp.into_string().unwrap_or_default().trim().to_string()),
         // A 503 carries the board's ERR / transport message in the body.
         Err(ureq::Error::Status(_, resp)) => {

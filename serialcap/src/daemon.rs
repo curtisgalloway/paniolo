@@ -16,7 +16,6 @@
 //! Mirrors hdmicap's daemon so the two read the same way.
 
 use std::fs::{self, File};
-use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -39,6 +38,11 @@ pub struct DiscoveryInterface {
 pub struct Discovery {
     pub pid: u32,
     pub port: u16,
+    /// The bearer token every request to this daemon must carry (see
+    /// auth.rs). Optional on read so a file written by an older daemon still
+    /// parses; always written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
     pub interfaces: Vec<DiscoveryInterface>,
 }
 
@@ -119,9 +123,13 @@ pub fn run(interfaces: Vec<InterfaceSpec>, port: u16, buffer_lines: u64) -> Resu
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let bound = listener.local_addr()?;
 
+        // Every request must present this token (auth.rs); it reaches clients
+        // only through the owner-only discovery file.
+        let token = crate::auth::generate_token()?;
         let disc = Discovery {
             pid: std::process::id(),
             port: bound.port(),
+            token: Some(token.clone()),
             interfaces: interfaces
                 .iter()
                 .map(|i| DiscoveryInterface {
@@ -131,14 +139,17 @@ pub fn run(interfaces: Vec<InterfaceSpec>, port: u16, buffer_lines: u64) -> Resu
                 })
                 .collect(),
         };
-        let mut f = File::create(discovery_path()?)?;
-        f.write_all(serde_json::to_string(&disc)?.as_bytes())?;
+        crate::auth::write_private_file(
+            &discovery_path()?,
+            serde_json::to_string(&disc)?.as_bytes(),
+        )
+        .context("writing discovery file")?;
         info!(
             "serialcap daemon listening on http://{bound} ({} interface(s))",
             interfaces.len()
         );
 
-        let app = server::router(AppState { serials });
+        let app = server::router(AppState { serials }, crate::auth::Auth::new(token, &[]));
 
         // The /stream WebSocket is long-lived, so a plain graceful shutdown
         // would block on it forever. Remove the discovery file, give short
@@ -223,5 +234,24 @@ mod tests {
             "the stale file must be reaped, not left to fail again"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The discovery file now carries the token. One written by an older
+    /// daemon (no token) must still parse, so the CLI can see it is running
+    /// and tell the operator to restart it.
+    #[test]
+    fn discovery_token_is_optional_on_read_and_written_when_present() {
+        let old: Discovery = serde_json::from_str(r#"{"pid":1,"port":2,"interfaces":[]}"#).unwrap();
+        assert_eq!(old.token, None);
+        let new = Discovery {
+            pid: 1,
+            port: 2,
+            token: Some("ab".into()),
+            interfaces: Vec::new(),
+        };
+        let text = serde_json::to_string(&new).unwrap();
+        assert!(text.contains(r#""token":"ab""#), "{text}");
+        let back: Discovery = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.token.as_deref(), Some("ab"));
     }
 }

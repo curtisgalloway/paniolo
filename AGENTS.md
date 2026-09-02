@@ -313,6 +313,21 @@ Python tree below:
   Composites (`console`) require co-located channels.
 - **Daemons bind OS-assigned ports** (port 0) and are found via their
   `daemon.json` discovery files — fixed defaults collided with stale tunnels.
+- **Daemon APIs are authenticated.** Each daemon (serialcap, hdmicap, hidrig,
+  ch9329) generates a 32-byte token at start and publishes it as `token` in
+  its discovery file, written owner-only (0600, temp file + rename). Every
+  request must carry it — `Authorization: Bearer <token>` (the CLI, via
+  `daemons::Endpoint`; helper one-shots routed through a daemon) or
+  `?token=<token>` (the dashboard's page load, `<img>` and WebSockets, which
+  cannot set headers) — and must name a loopback `Host` and, when a browser
+  sends one, a loopback `Origin`; `Access-Control-Allow-Origin` echoes that
+  one origin, never `*`. The layer is each daemon's `src/auth.rs`,
+  byte-identical across the four like `platform.rs`; only hdmicap's vendored
+  `/xterm*` assets are exempt. A daemon started by an older paniolo has no
+  token (the CLI then sends none) — `paniolo daemons restart --stale`
+  replaces it. Printed browser URLs (`video watch`/`preview`/`show`,
+  `console`) carry `?token=`; `dispatch::remote_daemon_endpoint` reads the
+  token over SSH so a tunnelled `console` carries it too.
 - **Netboot is rust-engine only** (netbootd); the pure-Python DHCP/TFTP engine
   exists only in the legacy tree.
 - **Helpers live off PATH** in the private libexec dir
@@ -371,10 +386,12 @@ cli/src/
   model.rs      typed lab (serde), validate(), resolved per-channel view, channel_host
   labfile.rs    toml_edit comment-preserving lab editor (the write side)
   dispatch.rs   per-channel re-exec: slice building/shipping, maybe_dispatch,
-                run_subcommand, remote_daemon_port
+                run_subcommand, remote_daemon_endpoint (port + token over ssh)
   ssh.rs        SSH transport: ControlMaster run/passthrough/interactive, forward (tunnels)
   daemons.rs    shared daemon contract: find_binary (libexec → PATH →
-                legacy ~/.cargo/bin), hook_path, daemon.json discovery, wait
+                legacy ~/.cargo/bin), hook_path, daemon.json discovery
+                (Endpoint = port + token; get/post attach the bearer header,
+                http_url/ws_url carry it as ?token= for a browser), wait
   serial.rs     serialcap orchestration + tio exec + /input + device listing
   video.rs      hdmicap orchestration (daemon start/stop, client passthrough)
   adb.rs        adb transport (argv build, shell exec, run/input passthrough,
@@ -432,9 +449,13 @@ hdmicap/         Rust crate: warm-stream HDMI capture daemon
     frame.rs     FrameState, Signal enum, one-pass strided classification
                  (aHash + no-signal from 4k luma samples, resolution-independent)
     pixel.rs     PixelData (Rgb/Nv12/Empty) + NV12/YUYV -> RGB converters
-    server.rs    axum HTTP API: GET / (dashboard), /status, /snapshot, /preview,
-                 /ocr, /devices, POST /power-cycle, and /xterm.* static assets
-    daemon.rs    advisory lock, discovery file, tokio runtime, graceful shutdown
+    server.rs    axum HTTP API: GET / (dashboard; CSP frame-ancestors 'none'),
+                 /status, /snapshot, /preview, /ocr, /devices, POST /power-cycle,
+                 and /xterm.* static assets (the only token-exempt routes)
+    auth.rs      token + loopback Host/Origin layer over the whole router
+                 (byte-identical in serialcap/hidrig/ch9329)
+    daemon.rs    advisory lock, discovery file (pid, port, token; owner-only),
+                 tokio runtime, graceful shutdown
   assets/        index.html (combined dashboard) + vendored xterm.js/css/fit addon
 
 cambrionix/      Rust crate: standalone helper binary for Cambrionix USB hub control
@@ -517,13 +538,17 @@ serialcap/       Rust crate: serial console daemon (parallels hdmicap)
                  mirrors the current unterminated line to a pending sidecar. Also
                  the `log` reader (interface select; tail / range / since,
                  ANSI-stripped by default) + UTC formatting
-    server.rs    axum: GET /stream (bidirectional WebSocket), /status, /interfaces,
-                 /devices; POST /button (DTR pulse), /input (write bytes to port,
-                 ?pace_ms=N drips one byte per N ms for a slow polled console).
+    server.rs    axum: GET /stream (bidirectional WebSocket, 64 KiB messages),
+                 /status, /interfaces, /devices; POST /button (DTR pulse),
+                 /input (write bytes to port, 64 KiB body cap; ?pace_ms=N drips
+                 one byte per N ms for a slow polled console, capped at 10 000).
                  Per-interface endpoints take ?interface=NAME, defaulting to the
                  first configured interface
-    daemon.rs    advisory lock, discovery file, tokio runtime, graceful shutdown;
-                 spawns one supervisor per interface
+    auth.rs      token + loopback Host/Origin layer over the whole router
+                 (byte-identical in hdmicap/hidrig/ch9329)
+    daemon.rs    advisory lock, discovery file (pid, port, token; owner-only),
+                 tokio runtime, graceful shutdown; spawns one supervisor per
+                 interface
 
 ocr/             OCR helpers (compiled/installed binaries are gitignored):
                    visionocr.swift  Apple Vision OCR (macOS); built by paniolo setup via swiftc
@@ -557,10 +582,12 @@ hidrig/          USB HID injector: host CLI + daemon (Rust) + dual-board KB2040 
   src/pty.rs       allocates a PTY (libc posix_openpt) for the DUT serial-console
                    bridge: the owner holds the master; paniolo's serial channel
                    opens the slave via the stable symlink the daemon publishes
-  src/server.rs    axum: GET /hid (WebSocket carrier), POST /send, /status,
-                   /version. WS clients send command lines; all results are
-                   broadcast as `evt ok|err …` frames so observers see the
-                   intermixed stream
+  src/server.rs    axum: GET /hid (WebSocket carrier, 4 KiB messages), POST /send
+                   (4 KiB body), /status, /version. WS clients send command
+                   lines; all results are broadcast as `evt ok|err …` frames so
+                   observers see the intermixed stream
+  src/auth.rs      token + loopback Host/Origin layer over the whole router
+                   (byte-identical in serialcap/hdmicap/ch9329)
   src/daemon.rs    advisory lock, discovery file at /tmp/paniolo-<uid>/hid/<target>/
                    (the channel name, not "hidrig", so paniolo finds it without
                    knowing the helper); brings up the console PTY + publishes its
@@ -619,7 +646,10 @@ ch9329/          Rust crate: the *other* hid helper — a WCH CH9329 UART->USB-H
                    what makes held state survive across separate invocations
   src/keys.rs      key-name -> USB HID usage mapping (adafruit_hid Keycode names,
                    US layout), shared with the hidrig vocabulary
-  src/server.rs    axum: GET /hid (WebSocket), POST /send, /status, /version
+  src/server.rs    axum: GET /hid (WebSocket, 4 KiB messages), POST /send (4 KiB
+                   body), /status, /version
+  src/auth.rs      token + loopback Host/Origin layer over the whole router
+                   (byte-identical in serialcap/hdmicap/hidrig)
   src/daemon.rs    `serve`/`stop`: owns the UART, publishes the same
                    /tmp/paniolo-<uid>/hid/ discovery file paniolo's console reads
   README.md        wiring, extras beyond hidrig's surface (`info` reports target
@@ -663,9 +693,11 @@ hdmicap's `GET /` serves a two-pane page: the MJPEG video on top, an xterm.js
 terminal below. The terminal opens a WebSocket to **serialcap** (a separate
 daemon/port), so the two subsystems stay decoupled — hdmicap only references
 serialcap by URL. Defaults to `ws://<host>:8724/stream`; override with
-`?serial=<port>` or `?serialws=<url>`. Local `paniolo console` passes the
-serialcap daemon's OS-assigned port as `?serial=PORT`; the remote/tunnel path
-passes `?serialws=` (unchanged). serialcap sends serial bytes as binary
+`?serialws=<url>` (or `?serial=<port>`, which cannot carry a token). `paniolo
+console` passes `?serialws=` — serialcap's `/stream` with serialcap's own
+`?token=` inside, percent-encoded — on both the local and the remote/tunnel
+path, plus hdmicap's token as `?token=`; the page refuses a non-loopback URL.
+serialcap sends serial bytes as binary
 frames and accepts keystrokes back over the same socket. xterm.js is vendored
 (not CDN) so the dashboard works on an isolated lab network. This is the first
 concrete instance of the "Option B" inter-subsystem coordination described above.
@@ -940,15 +972,15 @@ Daemon stderr logs and serialcap's capture files are created 0600.
 | Helper durable state | `~/.config/paniolo/helpers/<name>/` (`PANIOLO_STATE_DIR`) |
 | Netboot daemon state | `~/.local/share/paniolo/<name>/netboot.json` |
 | Combined netboot log | `~/.local/share/paniolo/<name>/netboot.log` |
-| hdmicap discovery file | `/tmp/paniolo-<uid>/hdmicap/<target>/daemon.json` (`{pid, port}`) |
+| hdmicap discovery file | `/tmp/paniolo-<uid>/hdmicap/<target>/daemon.json` (`{pid, port, token}`; owner-only) |
 | hdmicap advisory lock | `/tmp/paniolo-<uid>/hdmicap/<target>/daemon.lock` |
 | hdmicap stderr log | `/tmp/paniolo-<uid>/hdmicap/<target>/daemon.log` (truncated on each CLI-spawned start) |
-| serialcap discovery file | `/tmp/paniolo-<uid>/serialcap/<target>/daemon.json` (`{pid, port, interfaces:[{name, device, baud}]}`) |
+| serialcap discovery file | `/tmp/paniolo-<uid>/serialcap/<target>/daemon.json` (`{pid, port, token, interfaces:[{name, device, baud}]}`; owner-only) |
 | serialcap advisory lock | `/tmp/paniolo-<uid>/serialcap/<target>/daemon.lock` |
 | serialcap stderr log | `/tmp/paniolo-<uid>/serialcap/<target>/daemon.log` (truncated on each CLI-spawned start) |
 | serialcap capture log | `/tmp/paniolo-<uid>/serialcap/<target>/capture/<name>/serial.jsonl(.1..)` (rotated JSONL, per interface) |
 | serialcap pending line | `/tmp/paniolo-<uid>/serialcap/<target>/capture/<name>/pending.json` (current unterminated line) |
-| hid daemon discovery file | `/tmp/paniolo-<uid>/hid/<target>/daemon.json` (channel name, any injector) |
+| hid daemon discovery file | `/tmp/paniolo-<uid>/hid/<target>/daemon.json` (`{pid, port, token, device, …}`; channel name, any injector) |
 
 The per-target capture daemons (hdmicap/serialcap/hid) add the `<target>`
 segment so multiple targets capture concurrently on one host; host-singleton

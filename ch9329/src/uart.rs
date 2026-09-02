@@ -30,6 +30,7 @@
 //! recovers across adapter replug and target power cycles without a restart.
 
 use std::thread;
+use std::time::Duration;
 
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{info, warn};
@@ -39,6 +40,10 @@ use crate::session::Session;
 
 const REQ_CAP: usize = 256;
 const TRANSCRIPT_CAP: usize = 256;
+/// Ceiling on one client's wait for its reply. The owner thread services one
+/// request at a time, so a request it never answers would otherwise hang
+/// every later client queued behind it (and their WebSocket loops with them).
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One queued command awaiting its reply.
 struct Request {
@@ -81,18 +86,33 @@ impl HidHandle {
     }
 
     /// Submit one command line and await the reply (the `OK` data, or the
-    /// `ERR`/transport message). The line must not contain a newline.
+    /// `ERR`/transport message). The line must not contain a newline. The
+    /// wait is bounded by [`SEND_TIMEOUT`].
     pub async fn send(&self, line: String) -> Result<String, String> {
+        self.send_within(line, SEND_TIMEOUT).await
+    }
+
+    /// [`send`](Self::send) with an explicit bound on the wait.
+    async fn send_within(&self, line: String, limit: Duration) -> Result<String, String> {
         if line.contains('\n') || line.contains('\r') {
             return Err(format!("command contains a newline: {line:?}"));
         }
         let (tx, rx) = oneshot::channel();
-        self.req_tx
-            .send(Request { line, reply: tx })
-            .await
-            .map_err(|_| "hid daemon stopped".to_string())?;
-        rx.await
-            .map_err(|_| "hid daemon dropped the request".to_string())?
+        let round_trip = async {
+            self.req_tx
+                .send(Request { line, reply: tx })
+                .await
+                .map_err(|_| "hid daemon stopped".to_string())?;
+            rx.await
+                .map_err(|_| "hid daemon dropped the request".to_string())?
+        };
+        match tokio::time::timeout(limit, round_trip).await {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "hid daemon did not answer within {} s",
+                limit.as_secs()
+            )),
+        }
     }
 
     /// Subscribe to the command transcript (for WebSocket observers).
@@ -116,11 +136,16 @@ fn is_transport_error(msg: &str) -> bool {
 /// one persistent [`Session`], broadcast the outcome.
 fn run(device: String, mut req_rx: mpsc::Receiver<Request>, transcript: broadcast::Sender<Event>) {
     let mut session: Option<Session> = None;
+    // The rate the last session ran at. After a transport error (adapter
+    // replug, target power cycle) the chip is almost always still there, so a
+    // reopen probes it first instead of paying the default candidates' failed
+    // probes — and a `baud` command that moved the chip is remembered too.
+    let mut last_baud: Option<u32> = None;
     info!("ch9329 UART owner started for {device}");
 
     while let Some(req) = req_rx.blocking_recv() {
         if session.is_none() {
-            match Session::open(&device, None) {
+            match Session::open_preferring(&device, last_baud) {
                 Ok(s) => {
                     info!("ch9329 UART open at {} baud for {device}", s.baud());
                     session = Some(s);
@@ -134,7 +159,11 @@ fn run(device: String, mut req_rx: mpsc::Receiver<Request>, transcript: broadcas
             }
         }
 
-        let result = execute_line(session.as_mut().unwrap(), &req.line).map_err(|e| e.to_string());
+        let s = session.as_mut().unwrap();
+        let result = execute_line(s, &req.line).map_err(|e| e.to_string());
+        // Recorded after every command: a `baud` command moves the chip, and
+        // the next reopen must probe where it went.
+        last_baud = Some(s.baud());
         if let Err(ref msg) = result {
             if is_transport_error(msg) {
                 warn!("ch9329 UART transport error, will reopen: {msg}");
@@ -170,6 +199,24 @@ fn broadcast_event(tx: &broadcast::Sender<Event>, line: &str, result: &Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request the owner never answers must come back as an error, not park
+    /// the caller — and every client behind it — forever.
+    #[tokio::test]
+    async fn send_gives_up_when_the_owner_never_answers() {
+        let (req_tx, _req_rx) = mpsc::channel(REQ_CAP);
+        let (transcript, _) = broadcast::channel(TRANSCRIPT_CAP);
+        let hid = HidHandle {
+            req_tx,
+            transcript,
+            device: "none".into(),
+        };
+        let err = hid
+            .send_within("ping".into(), Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(err.contains("did not answer"), "{err}");
+    }
 
     #[test]
     fn transport_error_classification() {
