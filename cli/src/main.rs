@@ -703,6 +703,11 @@ enum VideoCmd {
         /// Capture device: an hdmicap device name substring, index, or /dev path.
         #[arg(long, short)]
         device: String,
+        /// OCR engine selection: "gui" picks the GUI-tuned engine (only
+        /// meaningful on Linux; see docs/video.md "OCR"), "text" is the
+        /// platform default. Leave unset for the default on every platform.
+        #[arg(long, value_parser = model::VALID_OCR_MODES)]
+        ocr_mode: Option<String>,
         #[arg(long)]
         host: Option<String>,
     },
@@ -766,7 +771,12 @@ enum VideoCmd {
 fn main() {
     let cli = Cli::parse();
     if let Err(e) = run(cli) {
-        eprintln!("{e}");
+        // `{e:#}` — anyhow's alternate Display — prints the full `.context()`
+        // chain ("error: outer: middle: root cause") instead of just the
+        // outermost message; a bare `{e}` drops every cause a command added
+        // on the way up, which is often the only clue to what actually failed
+        // (Review low #7).
+        eprintln!("{e:#}");
         std::process::exit(1);
     }
 }
@@ -869,6 +879,25 @@ fn daemon_label(d: &daemons::DaemonInfo) -> String {
     }
 }
 
+/// Escape ASCII/C1 control characters (`\x00`–`\x1F`, `\x7F`–`\x9F`) as
+/// `\xHH`; everything else — including non-ASCII UTF-8 — passes through
+/// unchanged. For text that is *not* paniolo's own: another process's raw
+/// argv (`paniolo daemons`' stray-helper listing), which may contain
+/// terminal escape sequences (cursor moves, screen clears, OSC payloads) a
+/// hostile or merely weird process chose to put there. Printing it verbatim
+/// would let that process draw into this terminal (Review low #12).
+fn escape_control_chars(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() {
+            out.push_str(&format!("\\x{:02x}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Command-line needles that identify a discovery daemon's process: the
 /// daemon's own binary name, except the `hid` channel, which any conforming
 /// injector may serve (the mapping `cmd_helper` applies, in reverse).
@@ -955,7 +984,12 @@ fn cmd_daemons_list() -> Result<()> {
     if !strays.is_empty() {
         println!("\nStray helper processes (not daemons — wedged one-shots?):");
         for (pid, args) in &strays {
-            println!("  pid {pid}\t{args}");
+            // `args` is another process's raw command line — not paniolo's
+            // own text — so it may carry ANSI/terminal escape sequences a
+            // hostile or merely weird process chose to put in argv. Escaping
+            // control characters keeps `paniolo daemons` from replaying them
+            // into this terminal (Review low #12).
+            println!("  pid {pid}\t{}", escape_control_chars(args));
         }
         println!("Stop everything with `paniolo daemons stop --all [--force]`.");
     }
@@ -1271,15 +1305,19 @@ fn cmd_helper(name: Option<&str>, args: &[String]) -> Result<()> {
     // whose discovery name is the channel (any conforming helper may serve
     // it): hidrig publishes under "hid".
     let env_name = match name {
-        "hidrig" | "ch9329" => HID_DAEMON,
-        n => n,
+        "hidrig" | "ch9329" => HID_DAEMON.to_string(),
+        // Sanitized like every other name that becomes a path component
+        // (Review low #10): `name` is a typed CLI argument, and with no
+        // `instance` this host-singleton branch is the one place nothing
+        // downstream sanitizes it for us.
+        n => daemons::sanitize_component(n),
     };
     // Manual escape hatch: no target context, so use the non-instanced dir.
     // (Per-target capture daemons are normally launched via their own
     // subcommands, which supply the target.)
     let status = std::process::Command::new(binary)
         .args(args)
-        .envs(daemons::helper_env(env_name, None))
+        .envs(daemons::helper_env(&env_name, None))
         .status()?;
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
@@ -1457,13 +1495,13 @@ fn cmd_setup(lab_flag: Option<&str>, host: Option<&str>, rust_only: bool) -> Res
             if rust_only {
                 argv.push("--rust-only".to_string());
             }
-            let code = ssh::run_interactive(&resolved, &argv, &[])?;
+            let code = ssh::run_interactive(&resolved, &argv)?;
             std::process::exit(code);
         }
         eprintln!("'{name}' is the local machine; setting up here.");
     }
     match setup::find_repo_root() {
-        Some(repo) => setup::run(&repo, rust_only),
+        Some(repo) => setup::run(&repo, rust_only, lab_flag),
         None if rust_only => Err(anyhow!(
             "paniolo source checkout not found. `paniolo setup --rust-only` rebuilds \
              the Rust crates from source, so it must run from inside a clone \
@@ -2154,37 +2192,21 @@ struct DashboardLinks<'a> {
     hid_ws: Option<&'a str>,
 }
 
-/// Percent-encode a query-parameter value: everything but RFC 3986's
-/// unreserved characters. A nested URL (`?serialws=ws://…/stream?token=…`)
-/// has to survive as one value; the page decodes it with `URLSearchParams`.
-fn query_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
 /// The dashboard URL: the video daemon's `GET /`, its token as `?token=` (the
 /// page reads it back and puts it on every request it makes), plus the links.
 fn dashboard_url(video: &daemons::Endpoint, links: &DashboardLinks) -> String {
     let mut params: Vec<String> = Vec::new();
     if let Some(t) = &video.token {
-        params.push(format!("token={}", query_escape(t)));
+        params.push(format!("token={}", daemons::query_escape(t)));
     }
     if let Some(ws) = links.serial_ws {
-        params.push(format!("serialws={}", query_escape(ws)));
+        params.push(format!("serialws={}", daemons::query_escape(ws)));
     }
     if let Some(i) = links.interface {
-        params.push(format!("interface={}", query_escape(i)));
+        params.push(format!("interface={}", daemons::query_escape(i)));
     }
     if let Some(ws) = links.hid_ws {
-        params.push(format!("hidws={}", query_escape(ws)));
+        params.push(format!("hidws={}", daemons::query_escape(ws)));
     }
     let base = video.base_url();
     if params.is_empty() {
@@ -2881,10 +2903,11 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
         VideoCmd::Set {
             target,
             device,
+            ocr_mode,
             host,
         } => {
             edit_lab(lab_flag, |lf| {
-                lf.set_video(&target, Some(&device), host.as_deref())
+                lf.set_video(&target, Some(&device), ocr_mode.as_deref(), host.as_deref())
             })?;
             println!("video channel set for '{target}'.");
             Ok(())
@@ -3246,16 +3269,60 @@ fn cmd_netboot_logs(target: &str, tail: usize, follow: bool) -> Result<()> {
     use std::io::{Read, Seek};
     let mut f = std::fs::File::open(&path)?;
     f.seek(std::io::SeekFrom::End(0))?;
-    let mut buf = String::new();
+    let mut id = file_identity(&path);
+    let mut buf = Vec::new();
     loop {
         buf.clear();
-        f.read_to_string(&mut buf)?;
+        // Bytes, not `read_to_string`: netbootd's stderr can carry a stray
+        // non-UTF-8 byte (a client's MAC or hostname echoed back, say), and
+        // `read_to_string` would abort the whole `--follow` loop with an
+        // error on the first one instead of just showing it oddly.
+        f.read_to_end(&mut buf)?;
         if !buf.is_empty() {
-            print!("{buf}");
+            print!("{}", String::from_utf8_lossy(&buf));
             use std::io::Write;
             std::io::stdout().flush()?;
         }
+        // `daemons::create_log` recreates this file on every daemon start
+        // (truncate-on-open); the already-open handle above keeps reading
+        // the old, now-unlinked inode, which never gets new bytes again — a
+        // restart mid-`--follow` would otherwise go silent forever. Reopen
+        // and read the new file's content immediately rather than waiting
+        // out a sleep first.
+        let current = file_identity(&path);
+        if current.is_some() && current != id {
+            if let Ok(reopened) = std::fs::File::open(&path) {
+                f = reopened;
+                id = current;
+                continue;
+            }
+        }
         std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// A value identifying which underlying file `path` currently names — the
+/// inode on Unix, the file index on Windows — so a poll loop can tell "this
+/// path was truncated and reopened as a new file" from "this path's file just
+/// grew". `None` when the file is momentarily missing (mid-recreate) or on a
+/// platform with neither primitive; callers treat that as "keep the current
+/// handle".
+fn file_identity(path: &std::path::Path) -> Option<u64> {
+    let meta = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(meta.ino())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        meta.file_index()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = meta;
+        None
     }
 }
 
@@ -3714,6 +3781,39 @@ fn adb_cmd(lab_flag: Option<&str>, cmd: AdbCmd) -> Result<()> {
             )?);
         }
         AdbCmd::Screencap { target, out } => {
+            // Remote channel + a real --out path: `--out` must mean the
+            // invoking machine's filesystem, so run the remote screencap with
+            // `--out -` and stream the PNG into the local file instead of
+            // re-execing verbatim (which would write it on the control
+            // host) — mirrors `video shot` above.
+            if out != "-" {
+                let lab = load_for_read(lab_flag)?;
+                let target_name = resolve_single_target(&lab, target.as_deref())?;
+                let rt = lab
+                    .resolved_target(&target_name)
+                    .ok_or_else(|| anyhow!("target '{target_name}' not found in lab"))?;
+                let host_name = model::channel_host(&rt, model::ChannelKind::Adb, None)?;
+                if !lab.host(&host_name).is_local(&host_name) {
+                    let sub = vec![
+                        "adb".to_string(),
+                        "screencap".to_string(),
+                        target_name.clone(),
+                        "--out".to_string(),
+                        "-".to_string(),
+                    ];
+                    let code = dispatch::dispatch_stdout_to_file(
+                        &lab,
+                        &target_name,
+                        &host_name,
+                        &sub,
+                        &out,
+                    )?;
+                    if code == 0 {
+                        eprintln!("saved to {out}");
+                    }
+                    std::process::exit(code);
+                }
+            }
             let a = adb_runtime(lab_flag, target.as_deref(), dispatch::Mode::Reexec)?;
             adb::screencap(a.adb.as_deref(), a.serial.as_deref(), &out)
         }
@@ -3847,13 +3947,26 @@ fn print_resolved_target(rt: &ResolvedTarget) {
 mod tests {
     use super::*;
 
+    /// `main()`'s top-level `eprintln!("{e:#}")` (anyhow's *alternate* Display)
+    /// prints the whole `.context()` chain; the old plain `{e}` printed only
+    /// the outermost message and silently dropped every cause a command added
+    /// on the way up (Review low #7). `main()` itself can't be unit-tested
+    /// (it calls `std::process::exit`), so this pins the exact formatting
+    /// distinction it now relies on.
     #[test]
-    fn query_escape_keeps_unreserved_and_encodes_the_rest() {
-        assert_eq!(query_escape("abc-_.~09"), "abc-_.~09");
-        assert_eq!(
-            query_escape("ws://127.0.0.1:5/stream?token=a&b"),
-            "ws%3A%2F%2F127.0.0.1%3A5%2Fstream%3Ftoken%3Da%26b"
-        );
+    fn error_alternate_display_includes_the_full_context_chain() {
+        use anyhow::Context;
+        let err = Err::<(), _>(anyhow!("root cause"))
+            .context("middle step")
+            .context("outer command")
+            .unwrap_err();
+        let short = format!("{err}");
+        let full = format!("{err:#}");
+        assert_eq!(short, "outer command", "plain Display is outermost only");
+        for part in ["outer command", "middle step", "root cause"] {
+            assert!(full.contains(part), "{part:?} missing from {full:?}");
+        }
+        assert_ne!(full, short, "{{e:#}} must show more than {{e}}");
     }
 
     /// The dashboard URL carries the video daemon's token for the page itself
@@ -4044,6 +4157,56 @@ mod tests {
     fn daemon_process_needles_cover_the_hid_injectors() {
         assert_eq!(daemon_process_needles("serialcap"), vec!["serialcap"]);
         assert_eq!(daemon_process_needles(HID_DAEMON), vec!["hidrig", "ch9329"]);
+    }
+
+    /// `netboot logs --follow` uses this to notice a daemon restart
+    /// (`daemons::create_log` truncates the log by recreating the file) and
+    /// reopen instead of reading a stalled, now-unlinked handle forever
+    /// (Review low #9).
+    #[test]
+    fn file_identity_distinguishes_a_recreated_file_at_the_same_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.txt");
+        std::fs::write(&path, "first").unwrap();
+        let a = file_identity(&path);
+        assert!(a.is_some(), "expected a file identity on this platform");
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, "second").unwrap();
+        let b = file_identity(&path);
+        assert!(b.is_some());
+        assert_ne!(
+            a, b,
+            "a recreated file at the same path must get a new identity"
+        );
+
+        // Growing (not recreating) the same file keeps its identity — a
+        // `--follow` loop must not reopen on every ordinary append.
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(b" more").unwrap();
+        assert_eq!(file_identity(&path), b);
+    }
+
+    /// `paniolo daemons` prints other processes' raw argv (the stray-helper
+    /// listing); a control character in it — an ESC-led terminal escape
+    /// sequence, in particular — must not reach the terminal unescaped
+    /// (Review low #12).
+    #[test]
+    fn escape_control_chars_neutralizes_terminal_escapes_and_leaves_text_alone() {
+        assert_eq!(
+            escape_control_chars("\x1b[2J\x07bell\r\n"),
+            "\\x1b[2J\\x07bell\\x0d\\x0a"
+        );
+        assert_eq!(
+            escape_control_chars("zigplug -d /dev/x on 1"),
+            "zigplug -d /dev/x on 1"
+        );
+        // Non-ASCII text is untouched — only control characters are escaped.
+        assert_eq!(escape_control_chars("café"), "café");
     }
 
     /// The gate in front of every `daemons stop` signal, run against a real

@@ -44,8 +44,14 @@ pub fn state_dir() -> PathBuf {
         .join(".local/share/paniolo")
 }
 
+/// `target` becomes a single path component under `state_dir()`. It reaches
+/// here from the lab file, which may predate name validation
+/// (`model::validate_name` only runs at `add`/`rename`/`set` time — see its
+/// doc comment) or have been hand-edited, so it is sanitized the same way
+/// every other lab-derived path component is (`daemons::sanitize_component`)
+/// rather than trusted to already be safe.
 fn target_dir(target: &str) -> PathBuf {
-    state_dir().join(target)
+    state_dir().join(crate::daemons::sanitize_component(target))
 }
 
 pub fn netboot_state_path(target: &str) -> PathBuf {
@@ -65,7 +71,11 @@ pub fn ensure_target_dir(target: &str) -> std::io::Result<PathBuf> {
 pub fn save_netboot_state(state: &NetbootState) -> anyhow::Result<()> {
     ensure_target_dir(&state.target)?;
     let json = serde_json::to_string_pretty(state)?;
-    std::fs::write(netboot_state_path(&state.target), json)?;
+    // Atomic (sibling temp file + rename): a reader of this file — `doctor`,
+    // another `paniolo netboot` invocation — must never see a truncated or
+    // half-written state file, and a crash mid-write must leave the previous
+    // state intact rather than corrupt.
+    crate::platform::write_atomic(&netboot_state_path(&state.target), json.as_bytes())?;
     Ok(())
 }
 
@@ -162,4 +172,45 @@ pub fn now_epoch() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A target name reaching `target_dir` may predate `model::validate_name`
+    /// (it only runs at `add`/`rename`/`set` time) or come from a hand-edited
+    /// lab file. Whatever it is, it must land as one path component directly
+    /// under `state_dir()` — never able to escape it or address a sibling
+    /// directory (Review low #3). This doesn't touch the real filesystem:
+    /// `target_dir` only builds a path.
+    #[test]
+    fn target_dir_is_always_a_direct_child_of_state_dir() {
+        for bad in [
+            "../../etc",
+            "/etc/passwd",
+            "a/b",
+            "..",
+            ".",
+            "",
+            "  ",
+            "a b",
+        ] {
+            let d = target_dir(bad);
+            assert_eq!(
+                d.parent(),
+                Some(state_dir().as_path()),
+                "{bad:?} -> {}",
+                d.display()
+            );
+        }
+    }
+
+    /// A plain, already-safe name passes through unchanged, so existing
+    /// per-target state paths (`~/.local/share/paniolo/<target>/…`) don't
+    /// move under this change.
+    #[test]
+    fn target_dir_leaves_a_plain_name_unchanged() {
+        assert_eq!(target_dir("pi5"), state_dir().join("pi5"));
+    }
 }

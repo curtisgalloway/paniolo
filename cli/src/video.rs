@@ -44,6 +44,16 @@ pub fn preview_url(target: &str) -> Option<String> {
     daemon(target).map(|d| d.http_url("/"))
 }
 
+/// The local request timeout (ms) for a stable-frame wait of `timeout_ms`:
+/// the daemon's own `wait=stable&timeout=` plus 5s of slack, so the local
+/// timeout never fires first. `saturating_add` rather than `+`: `timeout_ms`
+/// is a caller-supplied `--timeout`, and a huge value must clamp to
+/// `u64::MAX` rather than wrap into a too-short local timeout, or panic
+/// outright in a debug build (Review low #8).
+fn stable_wait_timeout_ms(timeout_ms: u64) -> u64 {
+    timeout_ms.saturating_add(5_000)
+}
+
 /// OCR the target daemon's current frame via `GET /ocr` (optionally waiting for
 /// a stable signal first), returning the raw v1 envelope (see docs/dev/ocr.md).
 pub fn ocr(target: &str, stable: bool, timeout_ms: u64) -> Result<String> {
@@ -54,7 +64,9 @@ pub fn ocr(target: &str, stable: bool, timeout_ms: u64) -> Result<String> {
         // body is discarded — only the wait matters.
         let _ = daemon
             .get(&format!("/snapshot?wait=stable&timeout={timeout_ms}"))
-            .timeout(std::time::Duration::from_millis(timeout_ms + 5_000))
+            .timeout(std::time::Duration::from_millis(stable_wait_timeout_ms(
+                timeout_ms,
+            )))
             .call()
             .map_err(|e| anyhow!("waiting for a stable frame failed: {e}"))?;
     }
@@ -185,6 +197,15 @@ pub fn passthrough(args: &[String], instance: Option<&str>) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The old `timeout_ms + 5_000` panics on overflow in a debug build (and
+    /// wraps to a too-short timeout in release) for a `--timeout` near
+    /// `u64::MAX`; the saturating version clamps instead (Review low #8).
+    #[test]
+    fn stable_wait_timeout_saturates_instead_of_overflowing() {
+        assert_eq!(stable_wait_timeout_ms(2_000), 7_000);
+        assert_eq!(stable_wait_timeout_ms(u64::MAX), u64::MAX);
+    }
 
     /// `ocr_mode = "gui"` must reach `rapidocr` on Linux and must NOT change
     /// anything anywhere else — Apple Vision and Windows.Media.Ocr win both

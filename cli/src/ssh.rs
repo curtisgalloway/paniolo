@@ -118,15 +118,167 @@ pub fn shell_quote(s: &str) -> String {
     }
 }
 
-/// Quote argv (and optional `KEY=val` env assignments) into one remote command,
-/// preserving argument boundaries through the remote shell.
-pub fn remote_command(argv: &[String], env: &[(String, String)]) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    for (k, v) in env {
-        parts.push(format!("{k}={}", shell_quote(v)));
+/// Environment variables paniolo carries to a remote control host when it
+/// dispatches a command there: the secrets a helper reads from its
+/// environment rather than from the lab file (docs/power.md "Credentials").
+/// This one constant is the whole policy — nothing else in the local
+/// environment crosses, so a control host never sees a variable the lab did
+/// not ask for. The values travel on the remote command's **stdin** (see
+/// [`remote_command`]), never on its command line, where `ps` on the control
+/// host would show them to every local user.
+pub const FORWARDED_ENV: &[&str] = &["AMT_PASSWORD"];
+
+/// The [`FORWARDED_ENV`] variables set in this process, in list order — the
+/// `env` argument to [`run`], [`run_passthrough`] and [`run_stdout_to`].
+/// Unset variables are simply absent. A value containing a newline is an
+/// error: the remote reads one line per variable, so it could only arrive
+/// truncated, with the remainder fed to the command as input.
+pub fn forwarded_env() -> std::io::Result<Vec<(String, String)>> {
+    collect_forwarded(FORWARDED_ENV, |name| std::env::var_os(name))
+}
+
+/// [`forwarded_env`] over an arbitrary name list and lookup, so the rules can
+/// be tested without mutating this process's environment.
+fn collect_forwarded(
+    names: &[&str],
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> std::io::Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for name in names {
+        let Some(raw) = lookup(name) else {
+            continue;
+        };
+        let invalid = |why: &str| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{name} {why}, so it cannot be forwarded to a control host"),
+            )
+        };
+        let value = raw
+            .into_string()
+            .map_err(|_| invalid("is not valid UTF-8"))?;
+        if value.contains('\n') {
+            return Err(invalid("contains a newline"));
+        }
+        out.push((name.to_string(), value));
     }
+    Ok(out)
+}
+
+/// True for a POSIX shell variable name (`[A-Za-z_][A-Za-z0-9_]*`) — the only
+/// shape the prelude will splice into a `read`.
+fn is_env_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The remote command that reads `vars` from its stdin — one line each, in
+/// the given order — exports them, and then execs `argv` with the rest of
+/// stdin still attached:
+///
+/// ```text
+/// sh -c 'IFS= read -r AMT_PASSWORD && export AMT_PASSWORD && exec "$@"' sh paniolo …
+/// ```
+///
+/// `IFS=` and `-r` keep the value byte-for-byte (leading blanks, backslashes);
+/// the `&&` chain means a pipe closed before every line arrived runs nothing.
+/// The values themselves are not in this string — the caller writes them to
+/// the child's stdin ([`launch`]).
+pub fn stdin_prelude(argv: &[String], vars: &[&str]) -> String {
+    let mut script = String::new();
+    for v in vars {
+        assert!(is_env_name(v), "not a shell variable name: {v:?}");
+        script.push_str(&format!("IFS= read -r {v} && export {v} && "));
+    }
+    script.push_str("exec \"$@\"");
+    let mut parts = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        shell_quote(&script),
+        "sh".to_string(),
+    ];
     parts.extend(argv.iter().map(|a| shell_quote(a)));
     parts.join(" ")
+}
+
+/// Quote argv into one remote command, preserving argument boundaries through
+/// the remote shell. With a non-empty `env` the command is wrapped in the
+/// [`stdin_prelude`] for those variables' *names*; their values never appear
+/// here (see [`FORWARDED_ENV`] for why), the caller writes them to stdin.
+pub fn remote_command(argv: &[String], env: &[(String, String)]) -> String {
+    if env.is_empty() {
+        return argv
+            .iter()
+            .map(|a| shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+    let names: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+    stdin_prelude(argv, &names)
+}
+
+/// What the remote command's stdin carries once the forwarded values (if
+/// any) have been written.
+enum StdinSource<'a> {
+    /// Nothing more; a captured command that takes no input.
+    Null,
+    /// A fixed payload, then EOF.
+    Data(&'a str),
+    /// This process's own stdin, copied through until it reaches EOF — a
+    /// passthrough command (`serial send` reading a heredoc, say) keeps
+    /// working with the prelude in front of it.
+    Inherit,
+}
+
+/// Spawn `cmd` — an `ssh … -- <destination>` argv, or a local `sh -c` in the
+/// tests — with the quoted remote command appended as its last argument,
+/// `env` delivered through the child's stdin, and `stdin` following it.
+///
+/// Every non-interactive run function comes through here, so the one code
+/// path that writes secrets is exercised end to end by the tests against a
+/// shell instead of an ssh session. With no `env` and no payload the child's
+/// stdin is inherited or null exactly as before; only a forwarded value or a
+/// payload makes it a pipe. A pipe the child closed early (an ssh that could
+/// not connect) is not an error here — the exit status the caller collects
+/// says what happened.
+fn launch(
+    mut cmd: Command,
+    argv: &[String],
+    env: &[(String, String)],
+    stdin: StdinSource<'_>,
+) -> std::io::Result<std::process::Child> {
+    cmd.arg(remote_command(argv, env));
+    let piped = !env.is_empty() || matches!(stdin, StdinSource::Data(_));
+    cmd.stdin(match (piped, &stdin) {
+        (true, _) => Stdio::piped(),
+        (false, StdinSource::Inherit) => Stdio::inherit(),
+        (false, _) => Stdio::null(),
+    });
+    let mut child = cmd.spawn()?;
+    if let Some(mut pipe) = child.stdin.take() {
+        let tolerate_closed = |r: std::io::Result<()>| match r {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            other => other,
+        };
+        for (_, value) in env {
+            tolerate_closed(pipe.write_all(value.as_bytes()))?;
+            tolerate_closed(pipe.write_all(b"\n"))?;
+        }
+        match stdin {
+            StdinSource::Null => {}
+            StdinSource::Data(d) => tolerate_closed(pipe.write_all(d.as_bytes()))?,
+            StdinSource::Inherit => {
+                // Copy until local EOF; the pipe closes when the thread drops
+                // it, and a write into a child that has already exited
+                // returns EPIPE, which ends the copy.
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut std::io::stdin().lock(), &mut pipe);
+                });
+            }
+        }
+    }
+    Ok(child)
 }
 
 /// SSH options shared with [`base_args`], for `sftp` rather than `ssh`.
@@ -163,7 +315,7 @@ fn sftp_quote(s: &str) -> String {
 fn sftp_batch(host: &Host, script: &str) -> std::io::Result<()> {
     let mut cmd = Command::new("sftp");
     cmd.args(transfer_args(host)?);
-    cmd.arg("-b").arg("-").arg(&host.ssh);
+    cmd.arg("-b").arg("-").arg("--").arg(&host.ssh);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -220,33 +372,35 @@ pub struct Output {
     pub stderr: String,
 }
 
-/// Run `argv` on `host` and capture its output (never errors on non-zero exit).
+/// The `ssh` command for `host` up to and including the destination, ready
+/// for the remote command to be appended. `--` ends option parsing so a
+/// destination beginning with `-` can never be read as an ssh flag.
+fn ssh_command(host: &Host, interactive: bool) -> std::io::Result<Command> {
+    let mut cmd = Command::new("ssh");
+    cmd.args(&base_args(host, interactive, true)?[1..]);
+    if interactive {
+        cmd.arg("-t");
+    }
+    cmd.arg("--").arg(&host.ssh);
+    Ok(cmd)
+}
+
+/// Run `argv` on `host` and capture its output (never errors on non-zero
+/// exit). `env` is forwarded over the remote's stdin ahead of `stdin`.
 pub fn run(
     host: &Host,
     argv: &[String],
     stdin: Option<&str>,
     env: &[(String, String)],
 ) -> std::io::Result<Output> {
-    let mut cmd = Command::new("ssh");
-    cmd.args(&base_args(host, false, true)?[1..]);
-    cmd.arg(&host.ssh);
-    cmd.arg(remote_command(argv, env));
-    cmd.stdin(if stdin.is_some() {
-        Stdio::piped()
-    } else {
-        Stdio::null()
-    });
+    let mut cmd = ssh_command(host, false)?;
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    let mut child = cmd.spawn()?;
-    if let Some(data) = stdin {
-        child
-            .stdin
-            .take()
-            .expect("piped stdin")
-            .write_all(data.as_bytes())?;
-    }
-    let out = child.wait_with_output()?;
+    let source = match stdin {
+        Some(data) => StdinSource::Data(data),
+        None => StdinSource::Null,
+    };
+    let out = launch(cmd, argv, env, source)?.wait_with_output()?;
     Ok(Output {
         status: out.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -254,51 +408,47 @@ pub fn run(
     })
 }
 
-/// Run `argv` on `host` with the local terminal's stdio passed through (no PTY).
-/// This is the transparent re-exec path. Returns the exit code.
+/// Run `argv` on `host` with the local terminal's stdio passed through (no
+/// PTY). This is the transparent re-exec path. Returns the exit code. `env`
+/// is forwarded over the remote's stdin; the local stdin is copied through
+/// behind it.
 pub fn run_passthrough(
     host: &Host,
     argv: &[String],
     env: &[(String, String)],
 ) -> std::io::Result<i32> {
-    let status = Command::new("ssh")
-        .args(&base_args(host, false, true)?[1..])
-        .arg(&host.ssh)
-        .arg(remote_command(argv, env))
-        .status()?;
+    let cmd = ssh_command(host, false)?;
+    let status = launch(cmd, argv, env, StdinSource::Inherit)?.wait()?;
     Ok(status.code().unwrap_or(-1))
 }
 
 /// Run `argv` on `host` with stdout redirected into `sink` (stderr and stdin
-/// pass through). For remote commands that stream a binary payload on stdout
-/// (e.g. `video shot --out -`), where capturing into a lossy String would
-/// corrupt it.
+/// pass through, `env` forwarded as in [`run_passthrough`]). For remote
+/// commands that stream a binary payload on stdout (e.g. `video shot --out
+/// -`), where capturing into a lossy String would corrupt it.
 pub fn run_stdout_to(
     host: &Host,
     argv: &[String],
     env: &[(String, String)],
     sink: std::fs::File,
 ) -> std::io::Result<i32> {
-    let status = Command::new("ssh")
-        .args(&base_args(host, false, true)?[1..])
-        .arg(&host.ssh)
-        .arg(remote_command(argv, env))
-        .stdout(Stdio::from(sink))
-        .status()?;
+    let mut cmd = ssh_command(host, false)?;
+    cmd.stdout(Stdio::from(sink));
+    let status = launch(cmd, argv, env, StdinSource::Inherit)?.wait()?;
     Ok(status.code().unwrap_or(-1))
 }
 
 /// Run `argv` on `host` over an `ssh -t` PTY (for interactive tools like tio).
-pub fn run_interactive(
-    host: &Host,
-    argv: &[String],
-    env: &[(String, String)],
-) -> std::io::Result<i32> {
-    let status = Command::new("ssh")
-        .args(&base_args(host, true, true)?[1..])
-        .arg("-t")
-        .arg(&host.ssh)
-        .arg(remote_command(argv, env))
+///
+/// Nothing is forwarded from the environment here, by construction: the
+/// remote's stdin *is* the terminal the user is typing into, so there is no
+/// channel to put a secret on ahead of the command that the user's
+/// keystrokes would not also share. The interactive commands (`serial
+/// connect`, `adb shell`, `setup --host`) need none of the
+/// [`FORWARDED_ENV`] variables.
+pub fn run_interactive(host: &Host, argv: &[String]) -> std::io::Result<i32> {
+    let status = ssh_command(host, true)?
+        .arg(remote_command(argv, &[]))
         .status()?;
     Ok(status.code().unwrap_or(-1))
 }
@@ -334,6 +484,7 @@ pub fn forward(host: &Host, remote_port: u16) -> anyhow::Result<Forward> {
         .arg("-N")
         .arg("-L")
         .arg(&spec)
+        .arg("--")
         .arg(&host.ssh)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -378,18 +529,170 @@ mod tests {
         assert_eq!(shell_quote(""), "''");
     }
 
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
-    fn remote_command_prepends_env() {
-        let argv = vec![
-            "paniolo".to_string(),
-            "netboot".to_string(),
-            "start".to_string(),
-        ];
-        let env = vec![("PANIOLO_LAB".to_string(), "/tmp/s lice".to_string())];
+    fn remote_command_without_env_is_the_quoted_argv() {
         assert_eq!(
-            remote_command(&argv, &env),
-            "PANIOLO_LAB='/tmp/s lice' paniolo netboot start"
+            remote_command(&argv(&["paniolo", "serial", "send", "a b"]), &[]),
+            "paniolo serial send 'a b'"
         );
+    }
+
+    /// A forwarded variable's *name* goes into the prelude; its value must
+    /// not be anywhere in the command line, which `ps` on the control host
+    /// shows to every local user. That was the whole reason the old
+    /// `KEY=val` prefix could not be used for secrets (Review M14).
+    #[test]
+    fn remote_command_with_env_wraps_in_the_stdin_prelude_without_the_value() {
+        let env = vec![("AMT_PASSWORD".to_string(), "hunter2".to_string())];
+        let cmd = remote_command(&argv(&["paniolo", "power-state", "nuc"]), &env);
+        assert_eq!(
+            cmd,
+            "sh -c 'IFS= read -r AMT_PASSWORD && export AMT_PASSWORD && exec \"$@\"' \
+             sh paniolo power-state nuc"
+        );
+        assert!(!cmd.contains("hunter2"), "{cmd}");
+    }
+
+    /// Several variables are read in list order, one `read` each, so the
+    /// writer and the remote agree on which line is which.
+    #[test]
+    fn stdin_prelude_reads_variables_in_order() {
+        let p = stdin_prelude(&argv(&["x"]), &["FIRST", "SECOND"]);
+        assert_eq!(
+            p,
+            "sh -c 'IFS= read -r FIRST && export FIRST && IFS= read -r SECOND && \
+             export SECOND && exec \"$@\"' sh x"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "not a shell variable name")]
+    fn stdin_prelude_refuses_a_name_that_is_not_a_variable() {
+        stdin_prelude(&argv(&["x"]), &["A-B"]);
+    }
+
+    /// Only the listed variables cross, in list order; an unset one is
+    /// simply absent, and a value the remote's line-oriented `read` could
+    /// not take back intact is refused rather than truncated.
+    #[test]
+    fn collect_forwarded_takes_set_names_in_order_and_rejects_newlines() {
+        let lookup = |name: &str| -> Option<std::ffi::OsString> {
+            match name {
+                "B" => Some("second".into()),
+                "A" => Some("first".into()),
+                "NL" => Some("two\nlines".into()),
+                _ => None,
+            }
+        };
+        let got = collect_forwarded(&["A", "UNSET", "B"], lookup).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                ("A".to_string(), "first".to_string()),
+                ("B".to_string(), "second".to_string())
+            ]
+        );
+        let err = collect_forwarded(&["NL"], lookup).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("NL contains a newline"), "{err}");
+        assert!(collect_forwarded(&["UNSET"], lookup).unwrap().is_empty());
+    }
+
+    /// The transport path itself, run through a local `sh` in place of
+    /// `ssh`: the child sees each forwarded variable, in order, and the
+    /// payload that follows arrives on its stdin untouched. The same
+    /// [`launch`] backs `run`, `run_passthrough` and `run_stdout_to`.
+    #[cfg(unix)]
+    #[test]
+    fn launch_delivers_env_over_stdin_ahead_of_the_payload() {
+        let mut sh = Command::new("sh");
+        sh.arg("-c");
+        sh.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let inner = "printf '%s|%s|' \"$PANIOLO_TEST_A\" \"$PANIOLO_TEST_B\"; cat";
+        let remote = argv(&["sh", "-c", inner]);
+        let env = vec![
+            ("PANIOLO_TEST_A".to_string(), "  first secret".to_string()),
+            ("PANIOLO_TEST_B".to_string(), r"it's \2#".to_string()),
+        ];
+        let out = launch(sh, &remote, &env, StdinSource::Data("the rest\n"))
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "  first secret|it's \\2#|the rest\n"
+        );
+    }
+
+    /// With nothing to forward the child gets exactly the payload (the
+    /// pre-prelude `run` contract), and no prelude wraps the command.
+    #[cfg(unix)]
+    #[test]
+    fn launch_without_env_passes_the_payload_straight_through() {
+        let mut sh = Command::new("sh");
+        sh.arg("-c");
+        sh.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let out = launch(sh, &argv(&["cat"]), &[], StdinSource::Data("plain"))
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "plain");
+    }
+
+    /// A child that exits without draining its stdin (an ssh that failed to
+    /// connect, here a command that never reads) must surface as its exit
+    /// status, not as a broken-pipe error from the writer. The payload is
+    /// larger than a pipe buffer so the write cannot complete before the
+    /// child is gone.
+    #[cfg(unix)]
+    #[test]
+    fn launch_reports_an_early_exit_as_status_not_epipe() {
+        let mut sh = Command::new("sh");
+        sh.arg("-c");
+        sh.stdout(Stdio::null()).stderr(Stdio::null());
+        let payload = "x".repeat(1 << 20);
+        let out = launch(sh, &argv(&["exit", "7"]), &[], StdinSource::Data(&payload))
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(7));
+    }
+
+    /// Every ssh/sftp invocation puts `--` between the options and the
+    /// destination, so a destination that starts with `-` reaches ssh as a
+    /// host, not as a flag it would act on.
+    #[test]
+    fn ssh_command_terminates_options_before_the_destination() {
+        let host = Host {
+            ssh: "-oProxyCommand=evil".into(),
+            ..Default::default()
+        };
+        let cmd = ssh_command(&host, false).unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let dashdash = args.iter().position(|a| a == "--").expect("a `--`");
+        assert_eq!(args[dashdash + 1], "-oProxyCommand=evil");
+        assert_eq!(args.len(), dashdash + 2, "destination is last: {args:?}");
+        let interactive = ssh_command(&host, true).unwrap();
+        let args: Vec<String> = interactive
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let t = args.iter().position(|a| a == "-t").expect("-t");
+        let dashdash = args.iter().position(|a| a == "--").unwrap();
+        assert!(t < dashdash, "{args:?}");
     }
 
     #[test]

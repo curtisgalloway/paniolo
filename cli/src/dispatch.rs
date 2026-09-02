@@ -89,7 +89,7 @@ pub fn build_slice(lab: &Lab, target: &str, host: &str) -> Result<String, LabErr
     }
     if let Some(v) = &t.video {
         if on(&v.host) {
-            lf.set_video(target, v.device.as_deref(), None)?;
+            lf.set_video(target, v.device.as_deref(), v.ocr_mode.as_deref(), None)?;
         }
     }
     if let Some(h) = &t.hid {
@@ -134,8 +134,16 @@ pub fn strip_lab_option(args: &[String]) -> Vec<String> {
 
 /// The subcommand argv to re-exec on the remote: this process's args minus the
 /// program name and the global `--lab` option.
+///
+/// `args_os` rather than `args`: a non-UTF-8 argument (a device path or file
+/// name from the shell's locale, say) must not panic the whole dispatch —
+/// [`std::env::args`] does exactly that on invalid Unicode. Losing fidelity
+/// on the rare non-UTF-8 byte is an acceptable trade for not crashing.
 pub fn subcommand_args() -> Vec<String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
     strip_lab_option(&args)
 }
 
@@ -158,11 +166,14 @@ pub fn ship_slice(host: &crate::model::Host, slice_toml: &str) -> std::io::Resul
         .unwrap_or(0);
     let remote = format!(".paniolo-lab-{}-{stamp}.toml", std::process::id());
 
-    let mut local = std::env::temp_dir();
-    local.push(&remote);
-    std::fs::write(&local, slice_toml)?;
-    let sent = ssh::sftp_put(host, &local, &remote);
-    let _ = std::fs::remove_file(&local);
+    // The local copy only has to survive long enough for the SFTP put below;
+    // `tempfile` picks a private, collision-free name in the system temp dir
+    // and removes it on drop, so a failed put (or this process being killed)
+    // never leaves a stray lab slice behind the way a hand-rolled name could.
+    let mut local = tempfile::NamedTempFile::new()?;
+    use std::io::Write;
+    local.write_all(slice_toml.as_bytes())?;
+    let sent = ssh::sftp_put(host, local.path(), &remote);
     sent.map_err(|e| {
         std::io::Error::other(format!("failed to ship lab slice to {}: {e}", host.ssh))
     })?;
@@ -186,8 +197,11 @@ pub fn dispatch(
     argv.extend(sub_argv.iter().cloned());
 
     let code = match mode {
-        Mode::Interactive => ssh::run_interactive(&host, &argv, &[]),
-        Mode::Reexec => ssh::run_passthrough(&host, &argv, &[]),
+        // No environment crosses here: the remote's stdin *is* the terminal
+        // the user is typing into (see `ssh::run_interactive`'s doc comment
+        // for why that rules out a forwarding channel).
+        Mode::Interactive => ssh::run_interactive(&host, &argv),
+        Mode::Reexec => ssh::run_passthrough(&host, &argv, &ssh::forwarded_env()?),
     }?;
 
     // Best-effort cleanup of the shipped slice.
@@ -209,16 +223,53 @@ pub fn run_subcommand(
     let remote_path = ship_slice(&host, &slice)?;
     let mut argv = vec![host.paniolo(), "--lab".to_string(), remote_path.clone()];
     argv.extend(subargs.iter().map(|s| s.to_string()));
-    let out = ssh::run(&host, &argv, None, &[]);
+    let out = ssh::run(&host, &argv, None, &ssh::forwarded_env()?);
     let _ = ssh::sftp_rm(&host, &remote_path);
     Ok(out?)
 }
 
+/// Run `write_body` with a writable sink prepared for `out_path` — a sibling
+/// temp file in the same directory, never `out_path` itself — and persist
+/// that sink onto `out_path` only when `write_body` returns exit code 0.
+///
+/// Shared by every "stream a remote binary payload into a local file" path
+/// (`video shot`, `adb screencap` — see [`dispatch_stdout_to_file`]) so the
+/// atomicity guarantee lives in one place, testable without SSH: a failed or
+/// partial capture leaves whatever was already at `out_path` untouched
+/// instead of destroying it (the old code truncated `out_path` up front,
+/// before the transfer even started), and a reader of `out_path` never sees
+/// a partially-written file mid-transfer. On a non-zero exit the temp file
+/// is simply dropped, which removes it.
+fn capture_to_file(
+    out_path: &str,
+    write_body: impl FnOnce(std::fs::File) -> anyhow::Result<i32>,
+) -> anyhow::Result<i32> {
+    let dir = Path::new(out_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let tmp = tempfile::Builder::new()
+        .prefix(".paniolo-capture-")
+        .suffix(".tmp")
+        .tempfile_in(dir)
+        .map_err(|e| anyhow::anyhow!("creating a temp file next to {out_path}: {e}"))?;
+    let sink = tmp
+        .as_file()
+        .try_clone()
+        .map_err(|e| anyhow::anyhow!("preparing {out_path}: {e}"))?;
+    let code = write_body(sink)?;
+    if code == 0 {
+        tmp.persist(out_path)
+            .map_err(|e| anyhow::anyhow!("saving {out_path}: {}", e.error))?;
+    }
+    Ok(code)
+}
+
 /// Like [`dispatch`], but the remote command's stdout streams into the local
 /// file at `out_path` instead of the terminal — for remote commands producing
-/// a binary payload (`video shot`), where `--out <path>` must mean the
-/// invoking machine's filesystem, not the control host's. The file is removed
-/// on a non-zero exit so a failed capture doesn't leave a stub behind.
+/// a binary payload (`video shot`, `adb screencap`), where `--out <path>` must
+/// mean the invoking machine's filesystem, not the control host's. See
+/// [`capture_to_file`] for the write-then-rename guarantee.
 pub fn dispatch_stdout_to_file(
     lab: &Lab,
     target: &str,
@@ -233,15 +284,13 @@ pub fn dispatch_stdout_to_file(
     let mut argv = vec![host.paniolo(), "--lab".to_string(), remote_path.clone()];
     argv.extend(sub_argv.iter().cloned());
 
-    let sink =
-        std::fs::File::create(out_path).map_err(|e| anyhow::anyhow!("creating {out_path}: {e}"))?;
-    let code = ssh::run_stdout_to(&host, &argv, &[], sink)?;
+    let env = ssh::forwarded_env()?;
+    let code = capture_to_file(out_path, |sink| {
+        Ok(ssh::run_stdout_to(&host, &argv, &env, sink)?)
+    });
 
     let _ = ssh::sftp_rm(&host, &remote_path);
-    if code != 0 {
-        let _ = std::fs::remove_file(out_path);
-    }
-    Ok(code)
+    code
 }
 
 /// Read a daemon's discovery record — port and token — from its `daemon.json`
@@ -298,6 +347,61 @@ mod tests {
     use super::*;
     use crate::model;
 
+    /// A zero exit persists the sink's bytes onto `out_path`, replacing
+    /// whatever was already there. Proves the rename actually happens — not
+    /// just that the function returns without error.
+    #[test]
+    fn capture_to_file_persists_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("shot.png");
+        std::fs::write(&out, b"stale png").unwrap();
+
+        let code = capture_to_file(out.to_str().unwrap(), |mut sink| {
+            use std::io::Write;
+            sink.write_all(b"fresh png bytes")?;
+            Ok(0)
+        })
+        .unwrap();
+
+        assert_eq!(code, 0);
+        assert_eq!(std::fs::read(&out).unwrap(), b"fresh png bytes");
+        // No leftover temp file beside it.
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["shot.png"], "{names:?}");
+    }
+
+    /// A non-zero exit must not touch `out_path` at all — the old code
+    /// (`File::create(out_path)` before the transfer even started) truncated
+    /// it regardless of the outcome, destroying whatever was there on a
+    /// failed capture. This is the case that regresses without the
+    /// sibling-temp-file rewrite (Review "adb screencap on a remote channel").
+    #[test]
+    fn capture_to_file_leaves_the_original_untouched_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("shot.png");
+        std::fs::write(&out, b"the only good copy").unwrap();
+
+        let code = capture_to_file(out.to_str().unwrap(), |mut sink| {
+            use std::io::Write;
+            // The remote wrote a partial payload before failing.
+            sink.write_all(b"partial garbage")?;
+            Ok(1)
+        })
+        .unwrap();
+
+        assert_eq!(code, 1);
+        assert_eq!(std::fs::read(&out).unwrap(), b"the only good copy");
+        // The temp file was cleaned up too, not left beside it.
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["shot.png"], "{names:?}");
+    }
+
     fn lab() -> Lab {
         model::parse(
             r#"
@@ -314,6 +418,7 @@ mod tests {
             device = "/dev/ttyUSB0"
             [targets.fortune.video]
             device = "/dev/video0"
+            ocr_mode = "gui"
             host = "bench2"
             [targets.fortune.usb]
             cmd = "ch9329 -d /dev/ttyUSB1"
@@ -354,6 +459,20 @@ mod tests {
         assert!(t.usb.is_none());
         assert!(t.netboot.is_none());
         assert!(t.serial.is_empty());
+    }
+
+    /// `video.ocr_mode` used to be dropped by `build_slice` (it called
+    /// `set_video` with a hardcoded `None`), so a remote target's GUI OCR
+    /// mode silently reverted to the default engine after re-exec (Review
+    /// M14a).
+    #[test]
+    fn slice_carries_the_videos_ocr_mode() {
+        let s = build_slice(&lab(), "fortune", "bench2").unwrap();
+        let reparsed = model::parse(&s).unwrap();
+        let v = reparsed.targets["fortune"].video.as_ref().unwrap();
+        assert_eq!(v.device.as_deref(), Some("/dev/video0"));
+        assert_eq!(v.ocr_mode.as_deref(), Some("gui"));
+        assert!(v.host.is_none());
     }
 
     #[test]

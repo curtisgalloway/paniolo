@@ -21,6 +21,7 @@
 
 use std::process::Command;
 
+use crate::daemons;
 use crate::model::{ChannelKind, Lab, ResolvedChannel, ResolvedTarget};
 use crate::ssh;
 
@@ -294,13 +295,15 @@ fn check_channel(lab: &Lab, ch: &ResolvedChannel, rt: &ResolvedTarget) -> (Statu
             }
             // Probe all four hook fields; report the first missing program.
             // Bare names resolve like the hooks themselves do: libexec first,
-            // then PATH (see daemons::hook_path()).
+            // then PATH (see daemons::hook_path()). A hook may be prefixed
+            // with `VAR=value` credential assignments (docs/power.md
+            // "Credentials"); the program to probe is the token after them.
             let hook_keys = ["cycle_cmd", "on_cmd", "off_cmd", "state_cmd"];
             let mut configured: Vec<&str> = Vec::new();
             for key in hook_keys {
                 if let Some(cmd) = field(ch, key) {
                     configured.push(key);
-                    let prog = cmd.split_whitespace().next().unwrap_or("");
+                    let prog = daemons::first_program_token(cmd).unwrap_or("");
                     let rc = probe(lab, &ch.host, &hook_probe(prog));
                     if rc != Some(0) {
                         return interpret(rc, prog);
@@ -316,9 +319,10 @@ fn check_channel(lab: &Lab, ch: &ResolvedChannel, rt: &ResolvedTarget) -> (Statu
         ChannelKind::Hid | ChannelKind::Usb => match field(ch, "cmd") {
             None => (Status::Incomplete, "no cmd set".to_string()),
             // Like the power hooks: absolute-path helpers are probed for
-            // existence; bare names are probed under libexec-then-PATH.
+            // existence; bare names are probed under libexec-then-PATH; a
+            // leading `VAR=value` is skipped the same way.
             Some(cmd) => {
-                let prog = cmd.split_whitespace().next().unwrap_or("");
+                let prog = daemons::first_program_token(cmd).unwrap_or("");
                 interpret(probe(lab, &ch.host, &hook_probe(prog)), prog)
             }
         },
@@ -452,6 +456,21 @@ mod tests {
     fn hook_probe_picks_path_vs_name_lookup() {
         assert!(matches!(hook_probe("/opt/bin/zigplug"), Probe::Exists(_)));
         assert!(matches!(hook_probe("zigplug"), Probe::OnHookPath(_)));
+    }
+
+    /// `check_channel`'s power and hid/usb arms both build their probe from
+    /// `daemons::first_program_token(cmd)`, exactly as here — a hook written
+    /// `AMT_PASSWORD=... amt-tool cycle` (docs/power.md "Credentials") must
+    /// probe `amt-tool`, not the literal string `AMT_PASSWORD=...` (which the
+    /// old `cmd.split_whitespace().next()` treated as the program, and
+    /// `hook_probe` would then send down the `OnHookPath` branch as a bare
+    /// name doctor could never find).
+    #[test]
+    fn hook_probe_skips_a_leading_env_assignment() {
+        let cmd = "AMT_PASSWORD=hunter2 /opt/bin/amt-tool cycle";
+        let prog = daemons::first_program_token(cmd).unwrap_or("");
+        assert_eq!(prog, "/opt/bin/amt-tool");
+        assert!(matches!(hook_probe(prog), Probe::Exists(p) if p == "/opt/bin/amt-tool"));
     }
 
     #[test]
