@@ -102,6 +102,11 @@ pub fn build_slice(lab: &Lab, target: &str, host: &str) -> Result<String, LabErr
             lf.set_adb(target, a.serial.as_deref(), a.adb.as_deref(), None)?;
         }
     }
+    if let Some(u) = &t.usb {
+        if on(&u.host) {
+            lf.set_usb(target, u.cmd.as_deref(), None)?;
+        }
+    }
     Ok(lf.doc.to_string())
 }
 
@@ -307,6 +312,11 @@ mod tests {
             [targets.fortune.video]
             device = "/dev/video0"
             host = "bench2"
+            [targets.fortune.usb]
+            cmd = "ch9329 -d /dev/ttyUSB1"
+            [targets.fortune.hid]
+            cmd = "ch9329 -d /dev/ttyUSB1"
+            host = "bench2"
             "#,
         )
         .unwrap()
@@ -317,13 +327,30 @@ mod tests {
         let s = build_slice(&lab(), "fortune", "bench1").unwrap();
         let reparsed = model::parse(&s).unwrap();
         let t = &reparsed.targets["fortune"];
-        // bench1 has netboot + the console serial; video (bench2) is excluded.
+        // bench1 has netboot + the console serial + usb (inherited default
+        // host); video and hid (bench2) are excluded.
         assert!(t.netboot.is_some());
         assert_eq!(t.serial.len(), 1);
         assert!(t.video.is_none());
+        assert!(t.hid.is_none());
+        let usb = t.usb.as_ref().expect("usb channel shipped in the slice");
+        assert_eq!(usb.cmd.as_deref(), Some("ch9329 -d /dev/ttyUSB1"));
         // Host fields are stripped so the remote resolves them as local.
         assert!(t.host.is_none());
         assert!(t.serial[0].host.is_none());
+        assert!(usb.host.is_none());
+    }
+
+    #[test]
+    fn slice_for_the_other_host_carries_only_its_channels() {
+        let s = build_slice(&lab(), "fortune", "bench2").unwrap();
+        let reparsed = model::parse(&s).unwrap();
+        let t = &reparsed.targets["fortune"];
+        assert!(t.video.is_some());
+        assert!(t.hid.is_some());
+        assert!(t.usb.is_none());
+        assert!(t.netboot.is_none());
+        assert!(t.serial.is_empty());
     }
 
     #[test]
