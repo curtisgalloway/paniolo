@@ -78,6 +78,23 @@ const LOGICAL_MAX: i64 = 32_767;
 /// (see `docs/ch9329-spec.md` §2).
 const BAUD_CANDIDATES: [u32; 3] = [115_200, 57_600, 9_600];
 
+/// The datasheet's supported serial rates for `SET_PARA_CFG`
+/// (`docs/ch9329-spec.md` §5). A rate outside this range would be written to
+/// flash and leave a chip nothing can talk to.
+const BAUD_MIN: u32 = 1_200;
+const BAUD_MAX: u32 = 115_200;
+
+/// Ceiling on the text of one `type` command. Each character is a UART round
+/// trip plus [`TYPE_GAP`], so an unbounded string holds the wire — and every
+/// other client — for as long as the caller likes.
+pub const MAX_TYPE_CHARS: usize = 4096;
+
+/// Ceiling on one `move`/`scroll` call's total travel, per axis. The logical
+/// space is 0..=32767, so this already crosses the whole screen; each 127-unit
+/// report is a round trip plus a 4 ms gap, so an unbounded total would hold
+/// the wire for minutes.
+const MAX_REL_TOTAL: i32 = 32_767;
+
 /// Quiet period between baud probes — defensive, and host-dependent.
 ///
 /// On some hosts a reopen immediately after a failed probe times out, and only
@@ -140,6 +157,41 @@ fn hold_for(keys: &[Key]) -> Duration {
     } else {
         HOLD
     }
+}
+
+/// Refuse a rate the chip cannot store, before anything touches it.
+pub fn validate_baud(rate: u32) -> Result<()> {
+    if !(BAUD_MIN..=BAUD_MAX).contains(&rate) {
+        bail!("baud {rate} is outside the CH9329's {BAUD_MIN}..={BAUD_MAX} range");
+    }
+    Ok(())
+}
+
+/// Bound a relative `move`/`scroll` total to [`MAX_REL_TOTAL`] per call.
+fn clamp_rel_total(v: i32) -> i32 {
+    v.clamp(-MAX_REL_TOTAL, MAX_REL_TOTAL)
+}
+
+/// Refuse `type` text longer than [`MAX_TYPE_CHARS`] rather than truncate it.
+fn check_type_len(text: &str) -> Result<()> {
+    let n = text.chars().count();
+    if n > MAX_TYPE_CHARS {
+        bail!("type text is {n} characters; the limit is {MAX_TYPE_CHARS}");
+    }
+    Ok(())
+}
+
+/// The probe order for a reopen: `first` (the rate the previous session ran
+/// at), then the defaults it is not already among.
+fn probe_order(first: Option<u32>) -> Vec<u32> {
+    let mut order: Vec<u32> = first.into_iter().collect();
+    order.extend(
+        BAUD_CANDIDATES
+            .iter()
+            .copied()
+            .filter(|b| Some(*b) != first),
+    );
+    order
 }
 
 fn button_mask(name: &str) -> Result<u8> {
@@ -214,6 +266,19 @@ impl Session {
             Some(b) => vec![b],
             None => BAUD_CANDIDATES.to_vec(),
         };
+        Self::open_candidates(device, &candidates)
+    }
+
+    /// [`open`](Self::open) with no forced rate, but probing `first` — the
+    /// rate a previous session ran at — before the defaults. After an adapter
+    /// replug or a target power cycle the chip is almost always still at it,
+    /// so the daemon's reopen skips the failed probes (and their settle
+    /// delays) that autodetect from scratch would pay.
+    pub fn open_preferring(device: &str, first: Option<u32>) -> Result<Session> {
+        Self::open_candidates(device, &probe_order(first))
+    }
+
+    fn open_candidates(device: &str, candidates: &[u32]) -> Result<Session> {
         let mut last_err: Option<anyhow::Error> = None;
         let last_index = candidates.len() - 1;
         for (i, &rate) in candidates.iter().enumerate() {
@@ -416,8 +481,18 @@ impl Session {
     /// (activate), then reopen the host port at the new rate and confirm with
     /// `GET_INFO`. The reset clears the chip's HID state, so held keys/buttons
     /// are dropped. The datasheet supported range is 1200..=115200 (the
-    /// Openterface default is already 115200; a factory chip is 9600).
-    pub fn set_baud(&mut self, rate: u32) -> Result<()> {
+    /// Openterface default is already 115200; a factory chip is 9600); a rate
+    /// outside it is refused before the chip is touched.
+    ///
+    /// Once `SET_PARA_CFG` has succeeded the new rate is in flash, so the
+    /// `RESET` acknowledgement is best-effort: the chip may reboot before the
+    /// ack leaves the UART, and a lost ack says nothing about the stored rate.
+    /// Returns `Ok(None)` when the chip then answers at the new rate,
+    /// `Ok(Some(note))` when it does but the ack was lost, and an error only
+    /// when the chip does not answer afterwards (the message says the rate is
+    /// persisted and how to reconnect).
+    pub fn set_baud(&mut self, rate: u32) -> Result<Option<String>> {
+        validate_baud(rate)?;
         let mut cfg = self.send(CMD_GET_PARA_CFG, &[])?;
         if cfg.len() != PARA_CFG_LEN {
             bail!(
@@ -428,7 +503,10 @@ impl Session {
         // Rewrite only the baud field; preserve working mode, USB IDs, etc.
         cfg[PARA_CFG_BAUD..PARA_CFG_BAUD + 4].copy_from_slice(&rate.to_be_bytes());
         self.send(CMD_SET_PARA_CFG, &cfg)?; // persist to flash (expect 0x89/0x00)
-        self.send(CMD_RESET, &[])?; // activate (expect 0x8F/0x00)
+                                            // From here the rate is in flash: record it so a reopen (the daemon's
+                                            // transport-error path) probes the right rate first.
+        self.baud = rate;
+        let reset_ack = self.send(CMD_RESET, &[]); // activate (expect 0x8F/0x00), best-effort
 
         // The chip reboots at the new rate with its HID state cleared.
         self.mods = 0;
@@ -446,8 +524,9 @@ impl Session {
         for _ in 0..3 {
             match self.get_info() {
                 Ok(_) => {
-                    self.baud = rate;
-                    return Ok(());
+                    return Ok(reset_ack.err().map(|e| {
+                        format!("the reset ack was lost ({e}) but the chip answers at {rate} baud")
+                    }));
                 }
                 Err(e) => {
                     last = Some(e);
@@ -532,8 +611,10 @@ impl Session {
         }
     }
 
-    /// Type literal text (US layout) on top of any held modifiers.
+    /// Type literal text (US layout) on top of any held modifiers. Text longer
+    /// than [`MAX_TYPE_CHARS`] is refused rather than truncated.
     pub fn type_text(&mut self, text: &str) -> Result<()> {
+        check_type_len(text)?;
         let mut prev: u8 = 0;
         for c in text.chars() {
             let (usage, shift) = crate::keys::char_to_usage(c)?;
@@ -623,8 +704,10 @@ impl Session {
         Ok(())
     }
 
-    /// Relative move, split into per-report int8 deltas.
-    pub fn move_rel(&mut self, mut dx: i32, mut dy: i32) -> Result<()> {
+    /// Relative move, split into per-report int8 deltas. Each axis's total is
+    /// clamped to [`MAX_REL_TOTAL`] per call.
+    pub fn move_rel(&mut self, dx: i32, dy: i32) -> Result<()> {
+        let (mut dx, mut dy) = (clamp_rel_total(dx), clamp_rel_total(dy));
         loop {
             let sx = dx.clamp(-127, 127);
             let sy = dy.clamp(-127, 127);
@@ -642,8 +725,10 @@ impl Session {
         Ok(())
     }
 
-    /// Scroll the wheel; positive is up. Split into per-report int8 steps.
-    pub fn scroll(&mut self, mut amount: i32) -> Result<()> {
+    /// Scroll the wheel; positive is up. Split into per-report int8 steps; the
+    /// total is clamped to [`MAX_REL_TOTAL`] per call.
+    pub fn scroll(&mut self, amount: i32) -> Result<()> {
+        let mut amount = clamp_rel_total(amount);
         while amount != 0 {
             let step = amount.clamp(-127, 127);
             self.push_mouse_rel(self.buttons, 0, 0, step as i8)?;
@@ -778,6 +863,43 @@ mod tests {
         );
         assert_eq!(MuxSide::Host.as_str(), "host");
         assert_eq!(MuxSide::Target.as_str(), "target");
+    }
+
+    #[test]
+    fn baud_validation_matches_the_datasheet_range() {
+        assert!(validate_baud(1_200).is_ok());
+        assert!(validate_baud(9_600).is_ok());
+        assert!(validate_baud(115_200).is_ok());
+        assert!(validate_baud(0).is_err());
+        assert!(validate_baud(1_199).is_err());
+        assert!(validate_baud(115_201).is_err());
+        assert!(validate_baud(230_400).is_err());
+    }
+
+    #[test]
+    fn preferred_rate_is_probed_first_without_duplicates() {
+        assert_eq!(probe_order(None), BAUD_CANDIDATES.to_vec());
+        assert_eq!(probe_order(Some(9_600)), vec![9_600, 115_200, 57_600]);
+        assert_eq!(
+            probe_order(Some(38_400)),
+            vec![38_400, 115_200, 57_600, 9_600]
+        );
+    }
+
+    #[test]
+    fn relative_totals_are_clamped_per_call() {
+        assert_eq!(clamp_rel_total(100), 100);
+        assert_eq!(clamp_rel_total(-100), -100);
+        assert_eq!(clamp_rel_total(i32::MAX), MAX_REL_TOTAL);
+        assert_eq!(clamp_rel_total(i32::MIN), -MAX_REL_TOTAL);
+    }
+
+    #[test]
+    fn type_text_has_a_ceiling() {
+        assert!(check_type_len(&"a".repeat(MAX_TYPE_CHARS)).is_ok());
+        assert!(check_type_len(&"a".repeat(MAX_TYPE_CHARS + 1)).is_err());
+        // Characters, not bytes: multi-byte text is measured the same way.
+        assert!(check_type_len(&"é".repeat(MAX_TYPE_CHARS)).is_ok());
     }
 
     #[test]

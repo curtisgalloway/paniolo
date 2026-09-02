@@ -47,6 +47,11 @@ const POWER_CYCLE: u8 = 2;
 /// Absolute-pointer logical maximum (`moveabs` axis range is `0..=ABS_MAX`).
 pub const ABS_MAX: i32 = 32_767;
 
+/// Ceiling on the text of one `type` command. A command line is one line of
+/// input, so 4 KiB is generous; the cap keeps one request from queueing hours
+/// of keystrokes (two frames per character) ahead of every other client.
+pub const MAX_TYPE_CHARS: usize = 4096;
+
 /// A composed wire frame ready to send to the control board.
 pub type Frame = Vec<u8>;
 
@@ -270,8 +275,15 @@ impl Composer {
         frame(F_HID, RID_MOUSE, &payload)
     }
 
-    /// `type <text>`: tap each character (press then release).
-    pub fn type_text(&self, text: &str) -> Vec<Frame> {
+    /// `type <text>`: tap each character (press then release). Text longer
+    /// than [`MAX_TYPE_CHARS`] is refused rather than truncated.
+    pub fn type_text(&self, text: &str) -> Result<Vec<Frame>> {
+        let n = text.chars().count();
+        if n > MAX_TYPE_CHARS {
+            return Err(anyhow!(
+                "type text is {n} characters; the limit is {MAX_TYPE_CHARS}"
+            ));
+        }
         let mut out = Vec::new();
         for c in text.chars() {
             if let Some((usage, shift)) = char_to_key(c) {
@@ -280,7 +292,7 @@ impl Composer {
                 out.push(self.kbd(0, &[]));
             }
         }
-        out
+        Ok(out)
     }
 
     /// `key <NAME>`: tap one key on top of whatever is held.
@@ -341,9 +353,12 @@ impl Composer {
     }
 
     /// `move <dx> <dy>`: accumulate a relative move into the virtual cursor.
+    /// The sum saturates: a delta near `i32::MAX` clamps to the edge instead
+    /// of overflowing (a panic in a debug build, a wrap to the far corner in
+    /// release).
     pub fn move_rel(&mut self, dx: i32, dy: i32) -> Vec<Frame> {
-        self.mx = clamp_abs(self.mx + dx);
-        self.my = clamp_abs(self.my + dy);
+        self.mx = clamp_abs(self.mx.saturating_add(dx));
+        self.my = clamp_abs(self.my.saturating_add(dy));
         vec![self.mouse(0)]
     }
 
@@ -413,7 +428,7 @@ impl Composer {
         let rest = rest.trim();
         let button = || if rest.is_empty() { "left" } else { rest };
         match head.to_ascii_lowercase().as_str() {
-            "type" => Ok(self.type_text(rest)),
+            "type" => self.type_text(rest),
             "key" => self.key(rest),
             "combo" => self.combo(
                 &rest
@@ -498,7 +513,7 @@ mod tests {
     #[test]
     fn type_uppercase_uses_shift() {
         let c = Composer::new();
-        let frames = c.type_text("A");
+        let frames = c.type_text("A").unwrap();
         // press: shift modifier + 'a' usage 0x04; release: all zero.
         assert_eq!(
             frames[0],
@@ -510,7 +525,7 @@ mod tests {
     #[test]
     fn type_lowercase_no_shift() {
         let c = Composer::new();
-        let press = &c.type_text("a")[0];
+        let press = &c.type_text("a").unwrap()[0];
         assert_eq!(press, &vec![0x01, 0x01, 0x08, 0x00, 0, 0x04, 0, 0, 0, 0, 0]);
     }
 
@@ -577,6 +592,28 @@ mod tests {
             vec![vec![0x02, 0x03, 0x01, 0x02]]
         );
         assert!(c.dispatch("power sideways").is_err());
+    }
+
+    #[test]
+    fn type_text_has_a_ceiling() {
+        let mut c = Composer::new();
+        let ok = "a".repeat(MAX_TYPE_CHARS);
+        assert_eq!(c.type_text(&ok).unwrap().len(), 2 * MAX_TYPE_CHARS);
+        let over = "a".repeat(MAX_TYPE_CHARS + 1);
+        assert!(c.type_text(&over).is_err());
+        assert!(c.dispatch(&format!("type {over}")).is_err());
+    }
+
+    #[test]
+    fn move_rel_saturates_instead_of_overflowing() {
+        let mut c = Composer::new();
+        // From the centre, i32::MAX overflows a plain add; it must clamp to
+        // the far edge (x = 0x7fff) and the near edge (y = 0).
+        let f = c.move_rel(i32::MAX, i32::MIN).pop().unwrap();
+        assert_eq!(&f[3..], &[0x00, 0xff, 0x7f, 0x00, 0x00, 0x00]);
+        // And the cursor keeps working from the clamped position.
+        let f = c.move_rel(-1, 1).pop().unwrap();
+        assert_eq!(&f[3..], &[0x00, 0xfe, 0x7f, 0x01, 0x00, 0x00]);
     }
 
     #[test]
