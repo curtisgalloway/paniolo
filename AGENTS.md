@@ -1130,10 +1130,17 @@ Per-subsystem behavior:
     restriction — so `netbootd` is spawned directly with no `sudo` prefix.
 - **Interface management** (`cli/src/netif.rs`, `netif::configure_interface()` /
   `restore_interface()`).
-  - *macOS:* `networksetup` + `ifconfig`.
-  - *Linux:* iproute2 — `ip addr add` / `ip link set up`, flushed with
-    `ip addr flush dev <iface>`.
+  - *macOS:* `networksetup -setmanual <service> <ip> <mask> <router>` (router
+    = the host IP; the four-argument form is required) + `ifconfig`, which is
+    what makes the address live — a `networksetup` failure is a warning.
+  - *Linux:* iproute2 — `ip addr replace` first, then `ip addr del` of any
+    other IPv4 address (parsed from `ip -4 -o addr show dev <iface>`), then
+    `ip link set up`; a failed assignment never leaves the link addressless.
+    `restore_interface` still flushes with `ip addr flush dev <iface>`.
   - *Windows:* not implemented.
+  - Every mode change (`mode_*`, `down_hard`) and `netboot::start` refuse the
+    interface carrying the system default route (`is_primary_interface`; the
+    pure decision is `is_default_route_interface`, unit-tested).
 - **ARP pinning** (netbootd).
   - *macOS:* `arp -s`.
   - *Linux:* `ip neigh replace ... nud permanent`.
@@ -1238,8 +1245,10 @@ the problem.
   bring it back up; WoL stays off until re-enabled or the adapter is replugged.
   (macOS WoL is a system-wide `pmset womp` pref, so `down-hard` relies on
   admin-down there.) Heads-up: `del_host_ip` releases the macOS static IP via
-  `networksetup -setdhcp` (an `ifconfig` delete won't unset a `-setmanual` IP),
-  so `mode off` from `link` mode actually clears the address on macOS.
+  `networksetup -setdhcp` (an `ifconfig` delete won't unset a `-setmanual` IP)
+  *and then* `ifconfig <iface> inet <ip> -alias` (so an alias left by
+  `ifconfig` can't outlive the service reset), so `mode off` from `link` mode
+  actually clears the address on macOS.
 - **Interface configuration requires root.** `netif::configure_interface()`
   needs NOPASSWD sudo (`ifconfig`/`networksetup` on macOS, `ip` on Linux).
 - **SSH PATH.** Non-interactive SSH shells often lack `/opt/homebrew/bin`;
