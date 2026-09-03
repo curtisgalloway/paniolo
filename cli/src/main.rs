@@ -35,6 +35,8 @@ mod setup;
 mod skills;
 mod ssh;
 mod state;
+#[cfg(test)]
+mod stubhttp;
 mod video;
 
 use std::path::PathBuf;

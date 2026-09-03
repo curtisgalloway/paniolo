@@ -103,17 +103,12 @@ mod tests {
     /// `?interface=a b&c&ms=10` into two extra, wrong query parameters.
     #[test]
     fn dtr_press_daemon_percent_encodes_the_interface() {
-        use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let n = s.read(&mut buf).unwrap();
-            let _ =
-                s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-            String::from_utf8_lossy(&buf[..n]).into_owned()
-        });
+        let server = crate::stubhttp::serve_one(
+            listener,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
         let ep = Endpoint {
             pid: 1,
             port,
@@ -129,25 +124,13 @@ mod tests {
 
     #[test]
     fn read_power_state_percent_encodes_the_interface() {
-        use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let n = s.read(&mut buf).unwrap();
-            let body = b"{\"power_on\":true}";
-            let _ = s.write_all(
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                )
-                .as_bytes(),
-            );
-            let _ = s.write_all(body);
-            String::from_utf8_lossy(&buf[..n]).into_owned()
-        });
+        let server = crate::stubhttp::serve_one(
+            listener,
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+              Content-Length: 17\r\nConnection: close\r\n\r\n{\"power_on\":true}",
+        );
         let ep = Endpoint {
             pid: 1,
             port,
