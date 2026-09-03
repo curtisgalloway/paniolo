@@ -261,17 +261,12 @@ mod tests {
     /// into extra, wrong parameters.
     #[test]
     fn send_input_percent_encodes_the_interface() {
-        use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let n = s.read(&mut buf).unwrap();
-            let _ =
-                s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-            String::from_utf8_lossy(&buf[..n]).into_owned()
-        });
+        let server = crate::stubhttp::serve_one(
+            listener,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
         let ep = daemons::Endpoint {
             pid: 1,
             port,
