@@ -61,8 +61,10 @@ FPR="$(gpg --batch --with-colons --fingerprint "$KEY" \
 # apt refuses the repo once this passes, which bounds how long a stale or
 # replayed index can be served. 30 days; docs.yml rebuilds weekly on a
 # schedule as well as on every release, so a live repo never reaches it.
-# LC_ALL=C keeps the day/month names English (RFC 1123, what apt parses).
-VALID_UNTIL="$(LC_ALL=C date -u -d '+30 days' '+%a, %d %b %Y %H:%M:%S UTC')"
+# apt-ftparchive derives the Valid-Until field from ValidTime (seconds after
+# Date); it silently ignores a Valid-Until value given directly (verified
+# against apt 2.8: the field was missing from the published Release).
+VALID_SECONDS=$((30 * 24 * 3600))
 
 POOL="pool/$COMPONENT/p/paniolo"
 mkdir -p "$OUT/$POOL"
@@ -87,7 +89,7 @@ apt-ftparchive \
   -o "APT::FTPArchive::Release::Codename=$SUITE" \
   -o "APT::FTPArchive::Release::Architectures=$ARCHES" \
   -o "APT::FTPArchive::Release::Components=$COMPONENT" \
-  -o "APT::FTPArchive::Release::Valid-Until=$VALID_UNTIL" \
+  -o "APT::FTPArchive::Release::ValidTime=$VALID_SECONDS" \
   release "dists/$SUITE" > "dists/$SUITE/Release"
 
 gpg --batch --yes --local-user "$KEY" --armor --detach-sign \
