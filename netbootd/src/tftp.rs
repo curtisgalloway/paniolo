@@ -767,32 +767,52 @@ mod tests {
         assert_eq!(reply_pin_outcome(None), ReplyPin::Pinned);
     }
 
+    fn assert_falls_back(e: &io::Error) {
+        match reply_pin_outcome(Some(e)) {
+            ReplyPin::Fallback(reason) => {
+                assert!(
+                    reason.contains("5.7"),
+                    "reason should name the kernel requirement: {reason}"
+                );
+            }
+            other => panic!("expected Fallback for {e}, got {other:?}"),
+        }
+    }
+
     #[test]
     fn reply_pin_outcome_permission_denied_falls_back() {
+        assert_falls_back(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "setsockopt SO_BINDTODEVICE",
+        ));
+    }
+
+    /// The two errnos an old kernel returns for the unprivileged pin both
+    /// classify as `PermissionDenied`. Unix-only: the raw values mean
+    /// something else on Windows, where this arm never runs anyway.
+    #[cfg(unix)]
+    #[test]
+    fn reply_pin_outcome_maps_eperm_and_eacces_to_fallback() {
         for errno in [libc::EPERM, libc::EACCES] {
             let e = io::Error::from_raw_os_error(errno);
             assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
-            match reply_pin_outcome(Some(&e)) {
-                ReplyPin::Fallback(reason) => {
-                    assert!(
-                        reason.contains("5.7"),
-                        "reason should name the kernel requirement: {reason}"
-                    );
-                }
-                other => panic!("expected Fallback for errno {errno}, got {other:?}"),
-            }
+            assert_falls_back(&e);
         }
     }
 
     #[test]
     fn reply_pin_outcome_other_errors_are_fatal() {
-        // ENODEV (no such interface) and a generic InvalidInput are both
-        // "the interface itself is wrong" — not a permission story.
-        let enodev = io::Error::from_raw_os_error(libc::ENODEV);
-        assert_eq!(reply_pin_outcome(Some(&enodev)), ReplyPin::Fatal);
-
+        // A wrong interface (no such device, bad name) is not a permission
+        // story: the transfer must not silently continue unpinned.
+        #[cfg(unix)]
+        {
+            let enodev = io::Error::from_raw_os_error(libc::ENODEV);
+            assert_eq!(reply_pin_outcome(Some(&enodev)), ReplyPin::Fatal);
+        }
         let other = io::Error::new(io::ErrorKind::InvalidInput, "bad interface name");
         assert_eq!(reply_pin_outcome(Some(&other)), ReplyPin::Fatal);
+        let not_found = io::Error::new(io::ErrorKind::NotFound, "no such interface");
+        assert_eq!(reply_pin_outcome(Some(&not_found)), ReplyPin::Fatal);
     }
 
     // Path resolution (the shared `resolve`) is tested in the `served` module.
