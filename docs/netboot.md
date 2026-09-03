@@ -153,6 +153,31 @@ unpinned, and `netbootd`'s `--interface` flag is therefore required, not
 optional. The sockets still bind the wildcard address so they keep working
 through the link flaps where the interface IP is momentarily gone.
 
+**TFTP reply sockets are pinned too, on both platforms.** Each TFTP transfer
+answers from its own per-transfer socket (a fresh ephemeral port), not the
+port-69 listen socket, so it needs its own pin. On macOS that is
+`IP_BOUND_IF`, same as the listen sockets. On Linux it is the same
+`SO_BINDTODEVICE`, even though the reply socket is created after netbootd has
+already dropped root (see [netbootd gives root back](#starting-and-stopping)
+above): `SO_BINDTODEVICE` has not needed `CAP_NET_RAW` since Linux 5.7, which
+covers every kernel paniolo targets (Pi OS Trixie 6.x, Debian 12 6.1). On an
+older kernel the pin fails with `EPERM`/`EACCES`; netbootd logs one `warn!`
+naming the interface and falls back to the pre-fix behavior — bind the reply
+socket to the interface IP alone and let the kernel route — rather than
+failing the transfer. Either way the reply socket also binds to `host_ip`,
+not the wildcard, so its source address is the one the client dialled.
+
+Without this pin, two netboot links sharing the same `/24` (paniolo's default
+`192.168.99.1` on both) send every OACK and DATA block out of whichever
+interface currently owns the kernel route for that subnet, not the one the
+RRQ arrived on — the client retransmits its RRQ forever and the log repeats
+`no ACK for OACK` (issue #109). **To verify:** bring up two netboot-capable
+links both at `192.168.99.1/24` — put one target in [`netif mode
+link`](netif.md#testing-the-link-up-and-down) so it holds the IP without
+running a daemon on it — then `paniolo netboot start` a target on the *other*
+link and PXE-boot it. Before this fix the daemon log repeats `no ACK for
+OACK`; after, it logs `completed <file>`.
+
 **Just the link, no daemon.** `start`/`stop` bring the link up *and* run (or
 stop) the DHCP/TFTP server together. To bring the **bare link** up or down on its
 own — assign or release the host IP without serving anything, e.g. to test that
