@@ -23,8 +23,14 @@
 //!     never seen; a pin that fails is fatal.
 //!   * **Egress pinning** — each reply socket is tied to the netboot interface.
 //!     On macOS that's `IP_BOUND_IF` (survives the brief link-flap windows where
-//!     the interface IP is momentarily absent); elsewhere we bind the reply
-//!     socket to the interface IP, the Python "first fix".
+//!     the interface IP is momentarily absent). On Linux it is `SO_BINDTODEVICE`,
+//!     the same pin the listen sockets use, applied even though the reply
+//!     socket is created after the privilege drop (`SO_BINDTODEVICE` has not
+//!     needed `CAP_NET_RAW` since kernel 5.7); a kernel older than that gets a
+//!     logged `warn!` and falls back to the Python "first fix" of binding the
+//!     reply socket to the interface IP alone. Both platforms also bind to the
+//!     interface IP so the reply's source address is the one the client
+//!     dialled ([`reply_pin_outcome`] is the pure fallback/fatal decision).
 //!   * **Send path** — on macOS, once the DHCP handler has learned the client's
 //!     MAC, every reply is injected as a raw Ethernet frame via [`BpfSender`]
 //!     (we *always* prefer it when available: on Sequoia `send_to` reports
@@ -42,6 +48,7 @@
 //!     a DATA block always fits one Ethernet frame ([`cap_blksize`]).
 
 use std::collections::HashMap;
+use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -164,8 +171,52 @@ fn error_packet(code: u16, msg: &str) -> Vec<u8> {
     p
 }
 
+/// What to do with the result of pinning a Linux TFTP reply socket to the
+/// netboot interface (`pin_socket_to_interface`'s `Err`, if any).
+///
+/// The reply socket is created per transfer, inside `tftp::serve`, which
+/// only starts after `privdrop::drop_privileges` has already given up root
+/// (see `main.rs`'s startup order). `SO_BINDTODEVICE` has not needed
+/// `CAP_NET_RAW` since Linux 5.7 — every kernel paniolo targets (Pi OS
+/// Trixie is 6.x, Debian 12 is 6.1) — so the pin still succeeds after the
+/// drop there. A kernel older than that answers `EPERM`/`EACCES`, which is
+/// the one case worth falling back on rather than failing the transfer: it
+/// is an expected, identifiable "too old to pin post-drop" condition, not a
+/// sign the interface itself is wrong. Any other error (a bad interface
+/// name, `ENODEV`, …) means the interface is wrong and stays fatal, as it
+/// already is on macOS.
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(all(target_os = "macos", not(test)), allow(dead_code))]
+enum ReplyPin {
+    /// The pin succeeded.
+    Pinned,
+    /// A permission error: assume a pre-5.7 kernel running after the
+    /// privilege drop, and carry on with the pre-fix behavior (bind by IP,
+    /// let the kernel route) instead of failing the transfer.
+    Fallback(String),
+    /// Any other pin failure: the interface itself is wrong. Fatal, as on
+    /// macOS.
+    Fatal,
+}
+
+/// Pure decision for [`ReplyPin`] from the `Err` (if any) of a
+/// `pin_socket_to_interface` call. `None` means the pin succeeded.
+#[cfg_attr(all(target_os = "macos", not(test)), allow(dead_code))]
+fn reply_pin_outcome(err: Option<&io::Error>) -> ReplyPin {
+    match err {
+        None => ReplyPin::Pinned,
+        Some(e) if e.kind() == io::ErrorKind::PermissionDenied => ReplyPin::Fallback(format!(
+            "{e} (needs Linux 5.7+ for SO_BINDTODEVICE without CAP_NET_RAW after the \
+             privilege drop)"
+        )),
+        Some(_) => ReplyPin::Fatal,
+    }
+}
+
 /// Create a reply socket pinned to the netboot interface (`None` — the
-/// loopback tests — leaves it unpinned).
+/// loopback tests — leaves it unpinned). On Linux, an old kernel that
+/// cannot pin post-privilege-drop falls back to binding by IP alone instead
+/// of failing the transfer; see [`reply_pin_outcome`].
 fn bind_reply_socket(host_ip: Ipv4Addr, interface: Option<&str>) -> Result<UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
 
@@ -187,10 +238,31 @@ fn bind_reply_socket(host_ip: Ipv4Addr, interface: Option<&str>) -> Result<UdpSo
     }
     #[cfg(not(target_os = "macos"))]
     {
-        // Bound to the interface IP rather than pinned with SO_BINDTODEVICE:
-        // on Linux this runs after the privilege drop, and kernels before 5.7
-        // need CAP_NET_RAW for the pin. The source address selects the link.
-        let _ = interface;
+        // Pin first, with the same SO_BINDTODEVICE the listen sockets use
+        // (see the doc comment on ReplyPin for why this still works after
+        // the privilege drop, and what happens when it can't). Then bind to
+        // the interface IP regardless of whether the pin took: the pin
+        // alone fixes egress, not the *source address* the client's TID is
+        // keyed to, so both together are the belt-and-braces combination —
+        // the pin keeps the reply on the right wire even when another
+        // netboot link's route would otherwise win (the two-links-same-/24
+        // case in issue #109), and the IP bind keeps the source address the
+        // one the client dialled.
+        if let Some(iface) = interface {
+            let pin_result = pin_socket_to_interface(&sock, iface);
+            match reply_pin_outcome(pin_result.as_ref().err()) {
+                ReplyPin::Pinned => {}
+                ReplyPin::Fallback(reason) => {
+                    warn!(
+                        "pin TFTP reply socket to {iface}: {reason}; falling back to \
+                         unpinned (source address alone selects the link)"
+                    );
+                }
+                ReplyPin::Fatal => {
+                    pin_result.with_context(|| format!("pin TFTP reply socket to {iface}"))?;
+                }
+            }
+        }
         let addr: SocketAddr = SocketAddr::new(host_ip.into(), 0);
         sock.bind(&addr.into())
             .with_context(|| format!("bind reply socket to {host_ip}:0"))?;
@@ -688,6 +760,59 @@ mod tests {
         assert!(!x.raw_frames());
         x.client_mac = Some([1, 2, 3, 4, 5, 6]);
         assert!(!x.raw_frames(), "no sender: MAC alone is not enough");
+    }
+
+    #[test]
+    fn reply_pin_outcome_success_is_pinned() {
+        assert_eq!(reply_pin_outcome(None), ReplyPin::Pinned);
+    }
+
+    fn assert_falls_back(e: &io::Error) {
+        match reply_pin_outcome(Some(e)) {
+            ReplyPin::Fallback(reason) => {
+                assert!(
+                    reason.contains("5.7"),
+                    "reason should name the kernel requirement: {reason}"
+                );
+            }
+            other => panic!("expected Fallback for {e}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reply_pin_outcome_permission_denied_falls_back() {
+        assert_falls_back(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "setsockopt SO_BINDTODEVICE",
+        ));
+    }
+
+    /// The two errnos an old kernel returns for the unprivileged pin both
+    /// classify as `PermissionDenied`. Unix-only: the raw values mean
+    /// something else on Windows, where this arm never runs anyway.
+    #[cfg(unix)]
+    #[test]
+    fn reply_pin_outcome_maps_eperm_and_eacces_to_fallback() {
+        for errno in [libc::EPERM, libc::EACCES] {
+            let e = io::Error::from_raw_os_error(errno);
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+            assert_falls_back(&e);
+        }
+    }
+
+    #[test]
+    fn reply_pin_outcome_other_errors_are_fatal() {
+        // A wrong interface (no such device, bad name) is not a permission
+        // story: the transfer must not silently continue unpinned.
+        #[cfg(unix)]
+        {
+            let enodev = io::Error::from_raw_os_error(libc::ENODEV);
+            assert_eq!(reply_pin_outcome(Some(&enodev)), ReplyPin::Fatal);
+        }
+        let other = io::Error::new(io::ErrorKind::InvalidInput, "bad interface name");
+        assert_eq!(reply_pin_outcome(Some(&other)), ReplyPin::Fatal);
+        let not_found = io::Error::new(io::ErrorKind::NotFound, "no such interface");
+        assert_eq!(reply_pin_outcome(Some(&not_found)), ReplyPin::Fatal);
     }
 
     // Path resolution (the shared `resolve`) is tested in the `served` module.
