@@ -80,6 +80,21 @@ published.
 
 ## Installation
 
+On macOS, the easiest install is the Homebrew tap — it installs a prebuilt
+**universal** binary (one download, both Apple Silicon and Intel), so there's
+no Rust or Swift toolchain and no compile step:
+
+```bash
+brew tap curtisgalloway/tap
+brew install paniolo
+```
+
+New releases then arrive with `brew upgrade`. Run `paniolo setup` once after
+installing — it setuid-installs `netbootd-bpf-helper` (one sudo, for the
+netboot raw-frame send path) and installs the optional zigplug helper.
+`brew install --HEAD paniolo` instead builds from source — the same path as
+`make install` below, useful when tracking `main` between releases.
+
 On Linux (Debian 12+ / Raspberry Pi OS, amd64/arm64), the easiest install is
 the signed apt repository served from the docs site — new releases then
 arrive with a normal `apt upgrade`:

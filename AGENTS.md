@@ -205,9 +205,9 @@ follow-up. Run through this checklist before calling `gh pr create`:
 ## Cutting a release
 
 Releases are **tag-driven**: pushing an annotated `v*` tag to `origin` triggers
-`.github/workflows/release.yml`, which builds the Linux packages, publishes a
-GitHub Release, bumps the Homebrew tap, and refreshes the signed apt
-repository served from the GitHub Pages docs site. There is no version to edit in
+`.github/workflows/release.yml`, which builds the Linux, Windows, and macOS
+packages, publishes a GitHub Release, bumps the Homebrew tap, and refreshes
+the signed apt repository served from the GitHub Pages docs site. There is no version to edit in
 source — the **tag is the single source of truth**. Every crate's
 `Cargo.toml` stays at `version = "0.1.0"`; the workflow derives the package
 version from the tag name (`${GITHUB_REF_NAME#v}`), so don't bump the manifests.
@@ -241,21 +241,44 @@ Steps:
    git push origin vX.Y.Z
    ```
 
-   The push fans out to four jobs: `package` builds amd64 + arm64 `.deb`s and
-   tarballs inside a `debian:bookworm` container (glibc 2.36, so the packages run
-   on Debian 12+ and current Raspberry Pi OS) and smoke-tests the `.deb`;
-   `release` attaches them to a new GitHub Release with auto-generated notes;
-   `bump-tap` fires a `repository_dispatch` at `curtisgalloway/homebrew-tap` so it
+   The push fans out to a package job per platform, then the jobs that
+   publish them:
+   - `package` (matrix: amd64, arm64) builds `.deb`s and tarballs inside a
+     `debian:bookworm` container (glibc 2.36, so the packages run on
+     Debian 12+ and current Raspberry Pi OS) and smoke-tests the `.deb`.
+   - `package-windows` builds a portable `x86_64-pc-windows-msvc` zip,
+     Authenticode-signed when `vars.AZURE_SIGNING_ACCOUNT` is set (gated
+     behind the `release` environment's reviewer approval; absent, it ships
+     unsigned).
+   - `package-macos` builds one **universal** (arm64 + x86_64) tarball in the
+     Homebrew keg layout (`bin/paniolo`, `libexec/bin/<helper>`,
+     `share/paniolo/skills/`), ad-hoc signed by default — which is all
+     Homebrew needs, since it sets no quarantine attribute on what it
+     installs — or Developer-ID-signed and notarized when six secrets
+     (`MACOS_SIGNING_CERT_P12`, `MACOS_SIGNING_CERT_PASSWORD`,
+     `MACOS_SIGNING_IDENTITY`, `MACOS_NOTARY_APPLE_ID`,
+     `MACOS_NOTARY_PASSWORD`, `MACOS_NOTARY_TEAM_ID`) are all set. That path
+     is untested as of this writing — no signing cert is configured on the
+     repo yet.
+
+   Every asset from all three — every `.deb`, `.tar.gz`, and `.zip` — ships
+   with a `.sha256` sidecar (`sha256sum`/`shasum -a 256` format: `<hex>
+   <two spaces><filename>`), so a consumer can verify or re-pin a download
+   without fetching it first; the Homebrew tap's binary-only formula is the
+   first one that needs this. `release` attaches everything (`dist/*` from
+   every job) to a new GitHub Release with auto-generated notes; `bump-tap`
+   fires a `repository_dispatch` at `curtisgalloway/homebrew-tap` so it
    re-pins its formula to the new tag (needs the `HOMEBREW_TAP_DISPATCH_TOKEN`
    secret — absent, it warns and skips rather than failing); and
    `refresh-apt-repo` re-dispatches `.github/workflows/docs.yml` after the
    Release is published, so the Pages site's `/apt/` pool picks up the new
-   `.deb`s. The docs workflow rebuilds the apt pool statelessly from the
-   newest `APT_POOL_RELEASES` (currently 5) GitHub Releases and signs it with
-   the `APT_SIGNING_KEY` secret (`packaging/scripts/build-apt-repo.sh`); on
-   the canonical repo a missing key **fails** the docs build rather than
-   deploying a site without `/apt/`, since a Pages deploy replaces the whole
-   site.
+   `.deb`s (never the `.deb.sha256` sidecars — `gh release download --pattern
+   '*.deb'` only matches names actually ending `.deb`). The docs workflow
+   rebuilds the apt pool statelessly from the newest `APT_POOL_RELEASES`
+   (currently 5) GitHub Releases and signs it with the `APT_SIGNING_KEY`
+   secret (`packaging/scripts/build-apt-repo.sh`); on the canonical repo a
+   missing key **fails** the docs build rather than deploying a site without
+   `/apt/`, since a Pages deploy replaces the whole site.
 
 5. **Watch it land.** `gh run list --workflow=release.yml --limit 1`, then
    `gh release view vX.Y.Z` once green to confirm the artifacts and notes.

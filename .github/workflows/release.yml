@@ -12,15 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Build Linux packages (.deb + tarball) for amd64 and arm64 and attach them
-# to a GitHub Release when a v* tag is pushed, then fire a repository_dispatch
-# at the Homebrew tap so it re-pins its formula to the new tag, and re-run the
-# docs workflow so the Pages apt repository picks up the new .debs.
+# Build packages for every platform — Linux (.deb + tarball, amd64 and
+# arm64), Windows (portable zip), macOS (a single universal arm64+x86_64
+# tarball) — and attach them all to a GitHub Release when a v* tag is pushed,
+# then fire a repository_dispatch at the Homebrew tap so it re-pins its
+# formula to the new tag, and re-run the docs workflow so the Pages apt
+# repository picks up the new .debs. Every asset ships with a `.sha256`
+# sidecar, so a consumer (the tap's formula, in particular) can verify or
+# re-pin a download without fetching it first.
 # workflow_dispatch builds the packages as artifacts only (no Release, no tap
 # bump), for testing the pipeline.
 #
-# Builds run inside a debian:bookworm container so binaries link against
-# glibc 2.36 — the packages then run on Debian 12+, 13, and current
+# Linux builds run inside a debian:bookworm container so binaries link
+# against glibc 2.36 — the packages then run on Debian 12+, 13, and current
 # Raspberry Pi OS. Building bare on the ubuntu-24.04 runners (glibc 2.39)
 # would silently exclude bookworm machines.
 
@@ -158,6 +162,19 @@ jobs:
           cp -r skills "dist/$tardir/skills"
           tar -C dist -czf "dist/$tardir.tar.gz" "$tardir"
           rm -r "dist/$tardir"
+
+      # A sidecar per asset (matching the Windows zip's own .sha256), so the
+      # Homebrew tap's binary-only formula can verify and re-pin a download
+      # without fetching it first. Run from dist/ so the recorded filename
+      # has no directory prefix, matching the Windows sidecar's format.
+      - name: Write checksum sidecars
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          cd dist
+          sha256sum "paniolo_${VERSION}_${ARCH}.deb" > "paniolo_${VERSION}_${ARCH}.deb.sha256"
+          sha256sum "paniolo-${VERSION}-linux-${ARCH}.tar.gz" > "paniolo-${VERSION}-linux-${ARCH}.tar.gz.sha256"
 
       # We're already root inside the bookworm container: install the deb for
       # real and check the layout + helper discovery end to end.
