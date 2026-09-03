@@ -359,7 +359,8 @@ jobs:
       MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
       MACOS_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
       MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
-      MACOS_KEYCHAIN_PATH: ${{ runner.temp }}/paniolo-signing.keychain-db
+      # The keychain lives under $RUNNER_TEMP; the `runner` context is not
+      # available at job level, so the steps derive the path themselves.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -522,20 +523,20 @@ jobs:
           set -euo pipefail
           keychain_password="$(openssl rand -base64 24)"
           echo "::add-mask::$keychain_password"
-          security create-keychain -p "$keychain_password" "$MACOS_KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$MACOS_KEYCHAIN_PATH"
-          security unlock-keychain -p "$keychain_password" "$MACOS_KEYCHAIN_PATH"
+          security create-keychain -p "$keychain_password" "$RUNNER_TEMP/paniolo-signing.keychain-db"
+          security set-keychain-settings -lut 21600 "$RUNNER_TEMP/paniolo-signing.keychain-db"
+          security unlock-keychain -p "$keychain_password" "$RUNNER_TEMP/paniolo-signing.keychain-db"
           printf '%s' "$MACOS_SIGNING_CERT_P12" | base64 --decode -o "$RUNNER_TEMP/paniolo-signing.p12"
           security import "$RUNNER_TEMP/paniolo-signing.p12" -P "$MACOS_SIGNING_CERT_PASSWORD" \
-            -A -t cert -f pkcs12 -k "$MACOS_KEYCHAIN_PATH"
+            -A -t cert -f pkcs12 -k "$RUNNER_TEMP/paniolo-signing.keychain-db"
           rm -f "$RUNNER_TEMP/paniolo-signing.p12"
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$MACOS_KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$RUNNER_TEMP/paniolo-signing.keychain-db"
           # Prepend rather than replace, so the runner's default keychains
           # (and whatever else already trusts them) stay on the search list.
           existing="$(security list-keychains -d user | tr -d '"')"
           # Intentionally unquoted: $existing is a list of keychain paths,
           # one per line, that must word-split into separate arguments.
-          security list-keychains -d user -s "$MACOS_KEYCHAIN_PATH" $existing
+          security list-keychains -d user -s "$RUNNER_TEMP/paniolo-signing.keychain-db" $existing
 
       - name: Developer ID sign + notarize
         if: env.MACOS_SIGNING_CERT_P12 != ''
@@ -569,7 +570,7 @@ jobs:
 
       - name: Delete signing keychain
         if: always() && env.MACOS_SIGNING_CERT_P12 != ''
-        run: security delete-keychain "$MACOS_KEYCHAIN_PATH" || true
+        run: security delete-keychain "$RUNNER_TEMP/paniolo-signing.keychain-db" || true
 
       - name: Notice (no macOS signing secrets)
         if: env.MACOS_SIGNING_CERT_P12 == ''
