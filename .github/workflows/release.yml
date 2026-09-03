@@ -12,15 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Build Linux packages (.deb + tarball) for amd64 and arm64 and attach them
-# to a GitHub Release when a v* tag is pushed, then fire a repository_dispatch
-# at the Homebrew tap so it re-pins its formula to the new tag, and re-run the
-# docs workflow so the Pages apt repository picks up the new .debs.
+# Build packages for every platform — Linux (.deb + tarball, amd64 and
+# arm64), Windows (portable zip), macOS (a single universal arm64+x86_64
+# tarball) — and attach them all to a GitHub Release when a v* tag is pushed,
+# then fire a repository_dispatch at the Homebrew tap so it re-pins its
+# formula to the new tag, and re-run the docs workflow so the Pages apt
+# repository picks up the new .debs. Every asset ships with a `.sha256`
+# sidecar, so a consumer (the tap's formula, in particular) can verify or
+# re-pin a download without fetching it first.
 # workflow_dispatch builds the packages as artifacts only (no Release, no tap
 # bump), for testing the pipeline.
 #
-# Builds run inside a debian:bookworm container so binaries link against
-# glibc 2.36 — the packages then run on Debian 12+, 13, and current
+# Linux builds run inside a debian:bookworm container so binaries link
+# against glibc 2.36 — the packages then run on Debian 12+, 13, and current
 # Raspberry Pi OS. Building bare on the ubuntu-24.04 runners (glibc 2.39)
 # would silently exclude bookworm machines.
 
@@ -158,6 +162,19 @@ jobs:
           cp -r skills "dist/$tardir/skills"
           tar -C dist -czf "dist/$tardir.tar.gz" "$tardir"
           rm -r "dist/$tardir"
+
+      # A sidecar per asset (matching the Windows zip's own .sha256), so the
+      # Homebrew tap's binary-only formula can verify and re-pin a download
+      # without fetching it first. Run from dist/ so the recorded filename
+      # has no directory prefix, matching the Windows sidecar's format.
+      - name: Write checksum sidecars
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          cd dist
+          sha256sum "paniolo_${VERSION}_${ARCH}.deb" > "paniolo_${VERSION}_${ARCH}.deb.sha256"
+          sha256sum "paniolo-${VERSION}-linux-${ARCH}.tar.gz" > "paniolo-${VERSION}-linux-${ARCH}.tar.gz.sha256"
 
       # We're already root inside the bookworm container: install the deb for
       # real and check the layout + helper discovery end to end.
@@ -326,10 +343,316 @@ jobs:
           path: dist/*.zip*
           if-no-files-found: error
 
+  package-macos:
+    name: package (macos universal)
+    runs-on: macos-14
+    # The six secrets that gate Developer ID signing + notarization below are
+    # read into env here (a step `if:` can't see `secrets` directly — same
+    # reason the winget job routes WINGET_TOKEN through env). All six are
+    # optional: absent, the job still ships an ad-hoc-signed universal
+    # binary, which is what Homebrew needs (see the comment above "Import
+    # signing certificate").
+    env:
+      MACOS_SIGNING_CERT_P12: ${{ secrets.MACOS_SIGNING_CERT_P12 }}
+      MACOS_SIGNING_CERT_PASSWORD: ${{ secrets.MACOS_SIGNING_CERT_PASSWORD }}
+      MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+      MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+      MACOS_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+      MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+      # The keychain lives under $RUNNER_TEMP; the `runner` context is not
+      # available at job level, so the steps derive the path themselves.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: macos-universal
+          workspaces: |
+            cli
+            hdmicap
+            serialcap
+            netbootd
+            cambrionix
+            hidrig
+            ch9329
+            shellyplug
+            amt
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            raw="${GITHUB_REF_NAME#v}"
+          else
+            raw="0.0.0~dev.$(printf '%.7s' "$GITHUB_SHA")"
+          fi
+          # Same character filter the Windows zip step applies to its
+          # ref-derived version. $raw is already filename-safe here (a tag
+          # name has no '/'; a hex commit prefix is only [0-9a-f]) — this
+          # just keeps both jobs' sanitization rules identical rather than
+          # assuming that stays true. It does turn the dev case's '~' into
+          # '-' (unlike the Linux tarball name, which keeps the tilde); that
+          # string never reaches dpkg on this path, so it's cosmetic only.
+          safe="$(printf '%s' "$raw" | sed -E 's/[^A-Za-z0-9._-]/-/g')"
+          echo "version=$safe" >> "$GITHUB_OUTPUT"
+
+      # cli plus every crate in $HELPERS, once per Apple Silicon and Intel
+      # target. hdmicap's build.rs compiles src/capture_avf.m with the `cc`
+      # crate, which reads the target triple's arch and passes the matching
+      # `-arch` to the system clang — verified locally on both targets, no
+      # extra Homebrew package needed for either slice (turbojpeg/nasm are a
+      # Linux-only dependency, gated to `target_os = "linux"` in
+      # hdmicap/Cargo.toml; nothing else in $HELPERS carries a build.rs or a
+      # macOS-specific native dependency, including netbootd's pnet_datalink
+      # and its /dev/bpf FFI, which is plain libc, no bindgen).
+      #
+      # netbootd's Cargo.toml declares two [[bin]] targets — netbootd and
+      # netbootd-bpf-helper, the setuid-root privilege-separation helper for
+      # the macOS raw-frame send path (netbootd/src/bpf.rs, cli/src/setup.rs)
+      # — and a bare `cargo build --release` builds both from one
+      # manifest-path invocation, so no separate loop entry is needed for it.
+      - name: Build release binaries (both targets)
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+        run: |
+          set -euo pipefail
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            for crate in cli $HELPERS; do
+              echo "==> cargo build --release --target $target ($crate)"
+              cargo build --release --target "$target" --manifest-path "$crate/Cargo.toml"
+            done
+          done
+
+      # visionocr is not a workspace crate (see ocr/visionocr.swift); built
+      # explicitly with swiftc, the same way the Windows job builds winocr
+      # explicitly rather than from $HELPERS. macos12.0 is the lowest
+      # deployment target tried, per the task; it compiled clean for both
+      # slices in local rehearsal with no rejected API, so it was kept
+      # rather than raised.
+      - name: Build visionocr (both slices)
+        run: |
+          set -euo pipefail
+          mkdir -p dist-stage
+          swiftc -O -target arm64-apple-macos12.0 -o dist-stage/visionocr-arm64 ocr/visionocr.swift
+          swiftc -O -target x86_64-apple-macos12.0 -o dist-stage/visionocr-x86_64 ocr/visionocr.swift
+
+      # The keg layout `helper_dirs()`/`skills_dirs()` expect from a
+      # relocated install (cli/src/daemons.rs, cli/src/skills.rs): the CLI's
+      # own resolved path's grandparent is the prefix, so `bin/paniolo` pairs
+      # with `libexec/bin/*` and `share/paniolo/skills/*` beside it — NOT the
+      # flat layout the Linux tarball uses.
+      - name: Stage the keg layout
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          root="dist/paniolo-${VERSION}-macos-universal"
+          mkdir -p "$root/bin" "$root/libexec/bin" "$root/share/paniolo/skills"
+
+          lipo -create -output "$root/bin/paniolo" \
+            "cli/target/aarch64-apple-darwin/release/paniolo" \
+            "cli/target/x86_64-apple-darwin/release/paniolo"
+          for helper in $HELPERS; do
+            lipo -create -output "$root/libexec/bin/$helper" \
+              "$helper/target/aarch64-apple-darwin/release/$helper" \
+              "$helper/target/x86_64-apple-darwin/release/$helper"
+          done
+          lipo -create -output "$root/libexec/bin/visionocr" \
+            dist-stage/visionocr-arm64 dist-stage/visionocr-x86_64
+          # netbootd's second [[bin]] target — see the "Build release
+          # binaries" comment above. `paniolo setup`'s run_packaged() looks
+          # this up by name via find_binary("netbootd-bpf-helper"), which
+          # searches this same libexec/bin dir.
+          lipo -create -output "$root/libexec/bin/netbootd-bpf-helper" \
+            "netbootd/target/aarch64-apple-darwin/release/netbootd-bpf-helper" \
+            "netbootd/target/x86_64-apple-darwin/release/netbootd-bpf-helper"
+
+          for skill in skills/*/SKILL.md; do
+            name="$(basename "$(dirname "$skill")")"
+            mkdir -p "$root/share/paniolo/skills/$name"
+            cp "$skill" "$root/share/paniolo/skills/$name/SKILL.md"
+          done
+          cp LICENSE README.md "$root/"
+
+      # Ad-hoc signing (a valid signature with no identity behind it) is what
+      # Homebrew needs: it never sets a quarantine attribute on files it
+      # installs, so there is nothing for Gatekeeper to check and no identity
+      # is required — only that every slice carries *a* signature, since an
+      # unsigned arm64 Mach-O refuses to launch under AMFI. This step is
+      # unconditional, so the smoke test below always runs against a signed
+      # tree even when the Developer ID secrets further down are absent.
+      # Real Developer ID signing (if present) overwrites these signatures
+      # in place, before the tarball is built.
+      - name: Ad-hoc sign universal binaries
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          root="dist/paniolo-${VERSION}-macos-universal"
+          for f in "$root/bin/paniolo" "$root/libexec/bin/"*; do
+            codesign --force -s - "$f"
+            codesign --verify --strict "$f"
+            lipo -info "$f"
+          done
+
+      # ---- Optional Developer ID signing + notarization ----
+      # Six secrets, all optional — absent, the two steps below are skipped
+      # entirely and the ad-hoc signature from the previous step ships:
+      #   MACOS_SIGNING_CERT_P12      base64-encoded Developer ID Application
+      #                                .p12 (certificate + private key)
+      #   MACOS_SIGNING_CERT_PASSWORD password protecting that .p12
+      #   MACOS_SIGNING_IDENTITY      the codesign identity string, e.g.
+      #                                "Developer ID Application: NAME (TEAMID)"
+      #   MACOS_NOTARY_APPLE_ID       Apple ID used for notarization
+      #   MACOS_NOTARY_PASSWORD       an app-specific password for that Apple
+      #                                ID — never the account password
+      #   MACOS_NOTARY_TEAM_ID        the notarization team ID
+      # Gated the same way as package-windows's Azure steps: an `if:` on each
+      # step rather than skipping the whole job, so the ad-hoc-signed path
+      # above still runs and uploads on every push. This path is untested —
+      # there is no signing cert configured on this repo yet, so only the
+      # `if: env.MACOS_SIGNING_CERT_P12 != ''` branch staying false has
+      # actually executed.
+      - name: Import signing certificate
+        if: env.MACOS_SIGNING_CERT_P12 != ''
+        run: |
+          set -euo pipefail
+          keychain_password="$(openssl rand -base64 24)"
+          echo "::add-mask::$keychain_password"
+          security create-keychain -p "$keychain_password" "$RUNNER_TEMP/paniolo-signing.keychain-db"
+          security set-keychain-settings -lut 21600 "$RUNNER_TEMP/paniolo-signing.keychain-db"
+          security unlock-keychain -p "$keychain_password" "$RUNNER_TEMP/paniolo-signing.keychain-db"
+          printf '%s' "$MACOS_SIGNING_CERT_P12" | base64 --decode -o "$RUNNER_TEMP/paniolo-signing.p12"
+          security import "$RUNNER_TEMP/paniolo-signing.p12" -P "$MACOS_SIGNING_CERT_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$RUNNER_TEMP/paniolo-signing.keychain-db"
+          rm -f "$RUNNER_TEMP/paniolo-signing.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$RUNNER_TEMP/paniolo-signing.keychain-db"
+          # Prepend rather than replace, so the runner's default keychains
+          # (and whatever else already trusts them) stay on the search list.
+          existing="$(security list-keychains -d user | tr -d '"')"
+          # Intentionally unquoted: $existing is a list of keychain paths,
+          # one per line, that must word-split into separate arguments.
+          security list-keychains -d user -s "$RUNNER_TEMP/paniolo-signing.keychain-db" $existing
+
+      - name: Developer ID sign + notarize
+        if: env.MACOS_SIGNING_CERT_P12 != ''
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          root="dist/paniolo-${VERSION}-macos-universal"
+          for f in "$root/bin/paniolo" "$root/libexec/bin/"*; do
+            codesign --force --options runtime --timestamp -s "$MACOS_SIGNING_IDENTITY" "$f"
+            codesign --verify --strict "$f"
+          done
+
+          # Bare CLI binaries (not an .app/.pkg/.dmg) cannot be stapled —
+          # notarytool's ticket only attaches to a bundle — so submit-and-wait
+          # for Accepted is the whole check; there is nothing to staple
+          # afterward.
+          notarize_zip="$RUNNER_TEMP/paniolo-notarize.zip"
+          ditto -c -k --keepParent "$root" "$notarize_zip"
+          result_json="$RUNNER_TEMP/notarize-result.json"
+          xcrun notarytool submit "$notarize_zip" \
+            --apple-id "$MACOS_NOTARY_APPLE_ID" \
+            --password "$MACOS_NOTARY_PASSWORD" \
+            --team-id "$MACOS_NOTARY_TEAM_ID" \
+            --wait --output-format json | tee "$result_json"
+          status="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$result_json")"
+          if [ "$status" != "Accepted" ]; then
+            echo "::error::notarization not accepted: $status"
+            exit 1
+          fi
+
+      - name: Delete signing keychain
+        if: always() && env.MACOS_SIGNING_CERT_P12 != ''
+        run: security delete-keychain "$RUNNER_TEMP/paniolo-signing.keychain-db" || true
+
+      - name: Notice (no macOS signing secrets)
+        if: env.MACOS_SIGNING_CERT_P12 == ''
+        run: |
+          echo "MACOS_SIGNING_CERT_P12 not set — shipping ad-hoc-signed" \
+               "universal binaries. That is what Homebrew needs; it sets no" \
+               "quarantine attribute on files it installs, so there is" \
+               "nothing for Gatekeeper to check."
+
+      # Built once, after whichever signing path above ran, so there is only
+      # ever one tarball and one smoke test — the one that actually ships
+      # carries whatever signature is in place at this point (Developer ID,
+      # if the secrets above were set; ad-hoc otherwise).
+      - name: Build tarball
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist
+          tar -czf "paniolo-${VERSION}-macos-universal.tar.gz" "paniolo-${VERSION}-macos-universal"
+          shasum -a 256 "paniolo-${VERSION}-macos-universal.tar.gz" > "paniolo-${VERSION}-macos-universal.tar.gz.sha256"
+
+      - name: Smoke-test the tarball
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          extract="$RUNNER_TEMP/smoke"
+          mkdir -p "$extract"
+          tar -C "$extract" -xzf "dist/paniolo-${VERSION}-macos-universal.tar.gz"
+          root="$extract/paniolo-${VERSION}-macos-universal"
+
+          # Every shipped Mach-O must carry both slices — a build that
+          # silently dropped one target should fail here, not on a user's
+          # Intel Mac (or an Apple Silicon one running it under Rosetta).
+          for f in "$root/bin/paniolo" "$root/libexec/bin/"*; do
+            archs="$(lipo -info "$f")"
+            echo "$archs"
+            case "$archs" in
+              *x86_64*arm64*|*arm64*x86_64*) : ;;
+              *) echo "::error::$f is not a universal (arm64 + x86_64) binary"; exit 1 ;;
+            esac
+          done
+
+          "$root/bin/paniolo" --help >/dev/null
+          # Run outside the checkout so `skill` resolves the packaged copy
+          # under the extracted share/ dir, not the repo's own skills/ dir
+          # (cli/src/skills.rs skills_dirs() checks a repo checkout first).
+          ( cd /tmp && "$root/bin/paniolo" skill )
+          for helper in $HELPERS; do
+            "$root/libexec/bin/$helper" --help >/dev/null
+          done
+          # netbootd-bpf-helper takes no --help; called with no arguments it
+          # prints a usage line and exits 2 (netbootd/src/bin/netbootd-bpf-helper.rs) —
+          # confirms the binary actually runs without needing the root
+          # privilege its real invocation requires.
+          if "$root/libexec/bin/netbootd-bpf-helper" 2>&1; then
+            echo "::error::netbootd-bpf-helper exited 0 with no arguments (expected a usage error)"
+            exit 1
+          fi
+
+          # visionocr has no --help; it reads an image and prints the v1 OCR
+          # JSON envelope (ocr/visionocr.swift). Decode a tiny (8x8, 72-byte)
+          # synthetic PNG and confirm the binary actually decodes it through
+          # Vision/CoreGraphics/ImageIO and emits that envelope — not just
+          # that the process starts.
+          tiny_png="$RUNNER_TEMP/tiny.png"
+          printf '%s' "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAD0lEQVR4nGP4jwMwDC0JALoev0Ewkwr8AAAAAElFTkSuQmCC" \
+            | base64 --decode -o "$tiny_png"
+          "$root/libexec/bin/visionocr" --json "$tiny_png" \
+            | python3 -c 'import json, sys; d = json.load(sys.stdin); assert d["engine"] == "visionocr", d'
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: packages-macos-universal
+          path: dist/*
+          if-no-files-found: error
+
   release:
     name: attach to GitHub Release
     if: github.ref_type == 'tag'
-    needs: [package, package-windows]
+    needs: [package, package-windows, package-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
