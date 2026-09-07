@@ -58,6 +58,7 @@ pub struct Status {
     pub device: String,
     pub baud: u32,
     pub connected: bool,
+    generation: u64,
     /// Current power state as read from the configured modem-control sense line.
     /// `None` when no sense signal is configured for this interface.
     pub power_on: Option<bool>,
@@ -137,7 +138,7 @@ pub struct SerialHandle {
     /// Serial bytes flowing out to every connected client.
     to_clients: broadcast::Sender<Bytes>,
     /// Client keystrokes flowing back to the port.
-    pub write_tx: mpsc::Sender<Bytes>,
+    write_tx: mpsc::Sender<WriteRequest>,
     ring: Arc<Mutex<VecDeque<u8>>>,
     status: Arc<Mutex<Status>>,
     /// Button-press requests: caller sends (duration_ms, responder); the
@@ -181,31 +182,30 @@ impl SerialHandle {
             .map_err(|_| anyhow::anyhow!("supervisor dropped response"))
     }
 
-    /// Write `data` to the port through the supervisor's normal write path.
-    ///
-    /// When `pace` is non-zero, the bytes are dripped one at a time with `pace`
-    /// between each, throttling input for a slow polled console that has no
-    /// hardware flow control (each byte is consumed before the next arrives, so
-    /// the receiver's RX FIFO can't overflow). When `pace` is zero the whole
-    /// buffer is sent in one message (full line-rate, same as interactive input).
-    ///
-    /// The supervisor's select loop is unchanged: it just sees one or many write
-    /// messages. The interactive WebSocket path shares `write_tx` but never paces,
-    /// so live typing stays immediate.
+    /// Wait until every byte has been accepted by the serial driver. Pacing
+    /// is enforced by the supervisor after actual writes, not queue insertion.
+    /// Requests belong to one connection and are never replayed on reconnect.
     pub async fn write_paced(&self, data: Bytes, pace: Duration) -> anyhow::Result<()> {
-        let dead = |_| anyhow::anyhow!("supervisor not running");
-        if pace.is_zero() {
-            self.write_tx.send(data).await.map_err(dead)?;
+        let status = self.status();
+        if !status.connected {
+            return Err(anyhow::anyhow!("serial interface disconnected"));
+        }
+        if data.is_empty() {
             return Ok(());
         }
-        for i in 0..data.len() {
-            self.write_tx
-                .send(data.slice(i..i + 1))
-                .await
-                .map_err(dead)?;
-            tokio::time::sleep(pace).await;
-        }
-        Ok(())
+        let (reply, done) = oneshot::channel();
+        self.write_tx
+            .send(WriteRequest {
+                data,
+                pace,
+                generation: status.generation,
+                reply: Some(reply),
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("supervisor not running"))?;
+        done.await
+            .map_err(|_| anyhow::anyhow!("serial write interrupted"))?
+            .map_err(anyhow::Error::msg)
     }
 }
 
@@ -225,6 +225,7 @@ pub fn spawn_interface(
         device: spec.device.clone(),
         baud: spec.baud,
         connected: false,
+        generation: 0,
         power_on: None,
     }));
 
@@ -370,63 +371,133 @@ fn read_power_sense(port: &mut impl SerialPort, signal: &str) -> Option<bool> {
     }
 }
 
-/// Bytes waiting to go out to the port, handed over at most [`WRITE_CHUNK`]
-/// at a time.
-///
-/// The supervisor used to `write_all` each input message to completion before
-/// it polled the port again: a 64 KiB paste at 115200 baud is ~6 s of line
-/// time during which nothing was read — the kernel's tty buffer overflowed and
-/// bytes vanished from the stream, the scrollback and the capture, and a
-/// `/button` press queued behind it. Queueing input here and writing one
-/// bounded slice per pass of the loop keeps the read arm live throughout.
+/// One caller's write, bound to the connection it was submitted against.
+struct WriteRequest {
+    data: Bytes,
+    pace: Duration,
+    generation: u64,
+    reply: Option<oneshot::Sender<Result<(), String>>>,
+}
+
+impl WriteRequest {
+    fn fail(mut self, message: &str) {
+        if let Some(reply) = self.reply.take() {
+            let _ = reply.send(Err(message.into()));
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.reply.as_ref().is_some_and(|reply| reply.is_closed())
+    }
+}
+
+/// A bounded FIFO whose acknowledgements follow successful driver writes.
+/// Paced messages expose one byte at a time, with the next deadline measured
+/// from the last successful write. Reads and DTR remain live while it drains.
 #[derive(Default)]
 struct Outbox {
-    queue: VecDeque<Bytes>,
-    /// Bytes of `queue.front()` already written.
+    queue: VecDeque<WriteRequest>,
     cursor: usize,
-    /// Bytes not yet written, across the whole queue.
     pending: usize,
+    next_byte: Option<tokio::time::Instant>,
 }
 
 impl Outbox {
-    fn push(&mut self, data: Bytes) {
-        if data.is_empty() {
+    fn enqueue(&mut self, mut request: WriteRequest) {
+        if request.data.is_empty() {
+            if let Some(reply) = request.reply.take() {
+                let _ = reply.send(Ok(()));
+            }
             return;
         }
-        self.pending += data.len();
-        self.queue.push_back(data);
+        self.pending += request.data.len();
+        self.queue.push_back(request);
+    }
+
+    #[cfg(test)]
+    fn push(&mut self, data: Bytes) {
+        self.enqueue(WriteRequest {
+            data,
+            pace: Duration::ZERO,
+            generation: 0,
+            reply: None,
+        });
     }
 
     fn is_empty(&self) -> bool {
         self.pending == 0
     }
-
-    /// Bytes still to be written.
     fn pending(&self) -> usize {
         self.pending
     }
 
-    /// The next slice to write: up to [`WRITE_CHUNK`] bytes, empty when
-    /// nothing is waiting.
+    fn ready(&self) -> bool {
+        !self.is_empty()
+            && self
+                .next_byte
+                .is_none_or(|t| tokio::time::Instant::now() >= t)
+    }
+
+    fn wait(&self) -> Duration {
+        let poll = Duration::from_millis(50);
+        if self.ready() {
+            return poll;
+        }
+        self.next_byte.map_or(poll, |t| {
+            t.saturating_duration_since(tokio::time::Instant::now())
+                .min(poll)
+        })
+    }
+
     fn front(&self) -> &[u8] {
         match self.queue.front() {
-            Some(head) => &head[self.cursor..(self.cursor + WRITE_CHUNK).min(head.len())],
+            Some(head) => {
+                let chunk = if head.pace.is_zero() { WRITE_CHUNK } else { 1 };
+                &head.data[self.cursor..(self.cursor + chunk).min(head.data.len())]
+            }
             None => &[],
         }
     }
 
-    /// Account for `n` bytes of `front()` having been written. A short write
-    /// leaves the cursor mid-message; the rest goes out next pass.
     fn consume(&mut self, n: usize) {
         let Some(head) = self.queue.front() else {
             return;
         };
-        let n = n.min(head.len() - self.cursor);
+        let n = n.min(head.data.len() - self.cursor);
+        if n == 0 {
+            return;
+        }
         self.cursor += n;
         self.pending -= n;
-        if self.cursor >= head.len() {
-            self.queue.pop_front();
+        self.next_byte = if head.pace.is_zero() {
+            None
+        } else {
+            Some(tokio::time::Instant::now() + head.pace)
+        };
+        if self.cursor == head.data.len() {
+            let mut done = self.queue.pop_front().unwrap();
             self.cursor = 0;
+            if let Some(reply) = done.reply.take() {
+                let _ = reply.send(Ok(()));
+            }
+        }
+    }
+
+    fn discard_cancelled(&mut self) {
+        while self.queue.front().is_some_and(WriteRequest::cancelled) {
+            let request = self.queue.pop_front().unwrap();
+            self.pending -= request.data.len() - self.cursor;
+            self.cursor = 0;
+        }
+    }
+}
+
+impl Drop for Outbox {
+    fn drop(&mut self) {
+        for request in self.queue.drain(..) {
+            request.fail(
+                "serial connection lost before write completed; input may have been partially sent",
+            );
         }
     }
 }
@@ -485,7 +556,7 @@ enum InnerExit {
 async fn supervisor(
     spec: InterfaceSpec,
     to_clients: broadcast::Sender<Bytes>,
-    mut write_rx: mpsc::Receiver<Bytes>,
+    mut write_rx: mpsc::Receiver<WriteRequest>,
     mut dtr_rx: mpsc::Receiver<(u64, oneshot::Sender<()>)>,
     ring: Arc<Mutex<VecDeque<u8>>>,
     status: Arc<Mutex<Status>>,
@@ -531,6 +602,7 @@ async fn supervisor(
                 }
                 {
                     let mut st = status.lock().unwrap();
+                    st.generation = st.generation.wrapping_add(1);
                     st.connected = true;
                     if let Some(sig) = &power_sense_signal {
                         st.power_on = read_power_sense(&mut p, sig);
@@ -555,11 +627,19 @@ async fn supervisor(
                     None => {}
                 }
                 status.lock().unwrap().connected = false;
-                tokio::time::sleep(REOPEN_DELAY).await;
+                let retry = tokio::time::sleep(REOPEN_DELAY);
+                tokio::pin!(retry);
+                loop {
+                    tokio::select! {
+                        _ = &mut retry => break,
+                        Some(request) = write_rx.recv() => request.fail("serial interface disconnected"),
+                    }
+                }
                 continue;
             }
         };
 
+        let generation = status.lock().unwrap().generation;
         let (mut rd, mut wr) = tokio::io::split(port);
         let mut buf = [0u8; 65536];
         let mut outbox = Outbox::default();
@@ -568,6 +648,7 @@ async fn supervisor(
         // only a disconnect does.
         loop {
             let exit = loop {
+                outbox.discard_cancelled();
                 tokio::select! {
                     read = rd.read(&mut buf) => match read {
                         Ok(0) if pty => {
@@ -593,7 +674,7 @@ async fn supervisor(
                     },
                     // One bounded slice per pass, so the read arm above keeps
                     // its turn while a large paste drains (see `Outbox`).
-                    written = wr.write(outbox.front()), if !outbox.is_empty() => match written {
+                    written = wr.write(outbox.front()), if outbox.ready() => match written {
                         Ok(0) => tokio::time::sleep(Duration::from_millis(1)).await,
                         Ok(n) => outbox.consume(n),
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -604,8 +685,15 @@ async fn supervisor(
                     // Past the high-water mark the queue is left in the
                     // channel, where senders wait on it.
                     Some(data) = write_rx.recv(), if outbox.pending() < OUTBOX_HIGH_WATER => {
-                        outbox.push(data);
+                        if data.generation != generation {
+                            data.fail("serial connection changed before write");
+                        } else {
+                            outbox.enqueue(data);
+                        }
                     },
+                    // Wake for paced writes and to discard input whose caller
+                    // disconnected while a serial write was backpressured.
+                    _ = tokio::time::sleep(outbox.wait()), if !outbox.is_empty() => {},
                     Some((duration_ms, resp_tx)) = dtr_rx.recv() => {
                         break InnerExit::DtrPress { duration_ms, resp_tx };
                     }
@@ -832,6 +920,7 @@ mod tests {
                 device: "test".into(),
                 baud: 0,
                 connected: true,
+                generation: 1,
                 power_on: None,
             })),
             dtr_tx: mpsc::channel(1).0,
@@ -1005,7 +1094,7 @@ mod tests {
 
     // ── write_paced: the `serial send` pacing fan-out ───────────────────────
 
-    fn test_handle() -> (SerialHandle, mpsc::Receiver<Bytes>) {
+    fn test_handle() -> (SerialHandle, mpsc::Receiver<WriteRequest>) {
         let (to_clients, _) = broadcast::channel(16);
         let (write_tx, write_rx) = mpsc::channel(WRITE_CAP);
         let (dtr_tx, _dtr_rx) = mpsc::channel(1);
@@ -1013,6 +1102,7 @@ mod tests {
             device: "test".into(),
             baud: 115_200,
             connected: false,
+            generation: 0,
             power_on: None,
         }));
         let handle = SerialHandle {
@@ -1029,42 +1119,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_paced_zero_sends_whole_buffer_as_one_message() {
-        let (h, mut rx) = test_handle();
-        h.write_paced(Bytes::from_static(b"hello"), Duration::ZERO)
+    async fn disconnected_write_is_rejected_without_queueing() {
+        let (handle, mut rx) = test_handle();
+        assert!(handle
+            .write_paced(Bytes::from_static(b"reboot\n"), Duration::ZERO)
             .await
-            .unwrap();
-        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"hello"));
-        assert!(rx.try_recv().is_err(), "exactly one message at line rate");
-    }
-
-    #[tokio::test]
-    async fn write_paced_nonzero_drips_one_byte_per_message_in_order() {
-        let (h, mut rx) = test_handle();
-        h.write_paced(Bytes::from_static(b"abc"), Duration::from_millis(1))
-            .await
-            .unwrap();
-        let mut got = Vec::new();
-        while let Ok(b) = rx.try_recv() {
-            got.push(b);
-        }
-        assert_eq!(
-            got,
-            vec![
-                Bytes::from_static(b"a"),
-                Bytes::from_static(b"b"),
-                Bytes::from_static(b"c"),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn write_paced_empty_buffer_sends_nothing_when_paced() {
-        let (h, mut rx) = test_handle();
-        h.write_paced(Bytes::new(), Duration::from_millis(1))
-            .await
-            .unwrap();
+            .is_err());
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn write_waits_for_driver_completion() {
+        let (handle, mut rx) = test_handle();
+        handle.status.lock().unwrap().connected = true;
+        let mut task = tokio::spawn(async move {
+            handle
+                .write_paced(Bytes::from_static(b"abc"), Duration::ZERO)
+                .await
+        });
+        let request = rx.recv().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut task)
+                .await
+                .is_err(),
+            "queueing must not acknowledge delivery"
+        );
+        let mut outbox = Outbox::default();
+        outbox.enqueue(request);
+        outbox.consume(1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut task)
+                .await
+                .is_err(),
+            "a short write is not completion"
+        );
+        outbox.consume(2);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnect_fails_outstanding_write() {
+        let (handle, mut rx) = test_handle();
+        handle.status.lock().unwrap().connected = true;
+        let task = tokio::spawn(async move {
+            handle
+                .write_paced(Bytes::from_static(b"abc"), Duration::ZERO)
+                .await
+        });
+        let mut outbox = Outbox::default();
+        outbox.enqueue(rx.recv().await.unwrap());
+        outbox.consume(1);
+        drop(outbox);
+        assert!(task
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("partially sent"));
+    }
+
+    #[tokio::test]
+    async fn pacing_starts_after_each_successful_write() {
+        let mut outbox = Outbox::default();
+        outbox.enqueue(WriteRequest {
+            data: Bytes::from_static(b"abc"),
+            pace: Duration::from_millis(30),
+            generation: 0,
+            reply: None,
+        });
+        assert_eq!(outbox.front(), b"a");
+        // Simulate a driver stall longer than the requested pace.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        outbox.consume(1);
+        assert!(!outbox.ready(), "elapsed queue time must not allow a burst");
+        assert_eq!(outbox.front(), b"b");
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        assert!(outbox.ready());
+    }
+
+    #[tokio::test]
+    async fn cancelled_write_discards_unsent_bytes() {
+        let (reply, done) = oneshot::channel();
+        let mut outbox = Outbox::default();
+        outbox.enqueue(WriteRequest {
+            data: Bytes::from_static(b"abc"),
+            pace: Duration::ZERO,
+            generation: 0,
+            reply: Some(reply),
+        });
+        outbox.consume(1);
+        drop(done);
+        outbox.discard_cancelled();
+        assert!(outbox.is_empty());
     }
 
     // ── pty consoles (a VM's serial port) ───────────────────────────────────
@@ -1323,18 +1469,24 @@ mod tests {
         let (_, mut rx) = handle.attach();
         recv_until(&mut rx, b"serial connected").await;
 
-        handle
-            .write_tx
-            .send(Bytes::from(vec![b'x'; 64 * 1024]))
-            .await
-            .unwrap();
+        let writer = handle.clone();
+        let writing = tokio::spawn(async move {
+            writer
+                .write_paced(Bytes::from(vec![b'x'; 64 * 1024]), Duration::ZERO)
+                .await
+        });
         // Give the supervisor time to start the write and wedge on the full
         // pty buffer before the target speaks.
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         std::io::Write::write_all(&mut far, b"target says hi\r\n").unwrap();
         recv_until(&mut rx, b"target says hi").await;
-
+        assert!(
+            !writing.is_finished(),
+            "blocked writes must not report success"
+        );
+        writing.abort();
+        let _ = writing.await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1362,5 +1514,58 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_rejects_input_from_an_old_connection() {
+        let (handle, _far, dir) = spawn_on_pty("old-generation");
+        let (_, mut stream) = handle.attach();
+        recv_until(&mut stream, b"serial connected").await;
+        let (reply, done) = oneshot::channel();
+        handle
+            .write_tx
+            .send(WriteRequest {
+                data: Bytes::from_static(b"reboot\n"),
+                pace: Duration::ZERO,
+                generation: handle.status().generation.wrapping_sub(1),
+                reply: Some(reply),
+            })
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), done)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.unwrap_err().contains("connection changed"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn actual_disconnect_fails_a_backpressured_send() {
+        let (handle, far, dir) = spawn_on_pty("write-disconnect");
+        let (_, mut stream) = handle.attach();
+        recv_until(&mut stream, b"serial connected").await;
+        let writer = handle.clone();
+        let writing = tokio::spawn(async move {
+            writer
+                .write_paced(Bytes::from(vec![b'x'; 64 * 1024]), Duration::ZERO)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!writing.is_finished());
+        drop(far);
+        assert!(tokio::time::timeout(Duration::from_secs(3), writing)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        assert!(!handle.status().connected);
+        assert!(handle
+            .write_paced(Bytes::from_static(b"reboot\n"), Duration::ZERO)
+            .await
+            .is_err());
+        std::fs::remove_dir_all(dir).ok();
     }
 }

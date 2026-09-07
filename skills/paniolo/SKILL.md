@@ -287,6 +287,12 @@ one interface, `-i`/`--interface` can be omitted everywhere. Don't run `connect`
 and `watch` (or an external `screen`/`tio`) on the **same device** at once —
 start one, or `stop`/close the other first.
 
+### Updating an older serialcap daemon
+
+If `serial stop` reports that authenticated shutdown is unavailable, use
+`paniolo daemons stop serialcap` and start serial capture again. New
+`serialcap stop` uses the daemon token and never signals a discovery-file PID.
+
 **A VM's console is a serial interface.** A pty path (`/dev/ttysNNN` on macOS,
 `/dev/pts/N` on Linux — `utmctl attach <vm>` prints it, qemu's `-serial pty`
 reports it at startup) can be added like any device, which is how you watch a
@@ -327,6 +333,13 @@ only past completed lines, or use `--no-pending`, because partial text can grow
 without changing its sequence number.
 
 ### Sending input
+
+Serial sends require a connected interface and finish only when the driver
+accepts every byte. Queued writes are not replayed after a disconnect. A failed
+send may have partially reached the target: read the console before retrying.
+Paced sends share a FIFO with dashboard typing; pacing follows actual driver
+writes, and capture continues while a send waits.
+
 
 `paniolo serial send` injects one line through the **running daemon** (start
 `watch` first), so input coexists with capture — what you send and what the
