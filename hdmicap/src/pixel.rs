@@ -97,6 +97,58 @@ pub fn nv12_to_rgb_half(y: &[u8], cbcr: &[u8], w: u32, h: u32) -> RgbImage {
     rgb
 }
 
+/// Compact a possibly-padded NV12 buffer into tightly packed Y and CbCr
+/// planes.
+///
+/// Media Foundation (and other platform capture APIs) may deliver a frame
+/// whose rows are padded to a stride wider than the visible `width` — a
+/// hardware/driver alignment requirement, not something the capture code
+/// controls. [`nv12_to_rgb`] and [`nv12_to_rgb_half`] both index their planes
+/// using `width` as the row pitch, so a padded buffer has to be compacted
+/// first: copying naive `width*height` bytes out of a strided buffer pulls in
+/// padding bytes on every row after the first and, worse, starts the chroma
+/// plane at `width*height` instead of its real offset `stride*height`, which
+/// silently reads chroma from inside what is actually still luma (or
+/// padding).
+///
+/// `buf` is the raw sample: `height` rows of Y at `stride` pitch, followed
+/// immediately by `ceil(height/2)` rows of interleaved CbCr, also at `stride`
+/// pitch. Only the first `width` bytes of each row are visible pixels; the
+/// rest is padding. Returns `None` when `buf` is too short to hold that
+/// layout.
+///
+/// When `stride == width` this still copies (rather than special-casing a
+/// zero-copy return) so the fast path exercises the same code as the padded
+/// one and callers always get owned, tightly packed planes.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn compact_nv12(
+    buf: &[u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let chroma_rows = height.div_ceil(2);
+    let needed = stride.checked_mul(height + chroma_rows)?;
+    if buf.len() < needed {
+        return None;
+    }
+
+    let mut y = Vec::with_capacity(width * height);
+    for row in 0..height {
+        let start = row * stride;
+        y.extend_from_slice(&buf[start..start + width]);
+    }
+
+    let chroma_base = stride * height;
+    let mut cbcr = Vec::with_capacity(width * chroma_rows);
+    for row in 0..chroma_rows {
+        let start = chroma_base + row * stride;
+        cbcr.extend_from_slice(&buf[start..start + width]);
+    }
+
+    Some((y, cbcr))
+}
+
 /// Packed YUYV (Y0 Cb Y1 Cr) -> RGB, full-range coefficients. Kept for the
 /// Linux YUYV fallback path and macOS 'yuvs'-only devices.
 pub fn yuyv_to_rgb(buf: &[u8], w: u32, h: u32) -> RgbImage {
@@ -165,5 +217,95 @@ mod tests {
         assert!(p[0] > 100 && p[0] < 160, "{p:?}");
         assert_eq!(p[0], p[1]);
         assert_eq!(p[1], p[2]);
+    }
+
+    /// Build a synthetic NV12 buffer with a row stride wider than the
+    /// visible width. Every padding byte (both the tail of each Y row and
+    /// the tail of each CbCr row) is the sentinel `0xEE`, so any padding
+    /// that leaks into a compacted plane is detectable. The byte at the old
+    /// (wrong) packed chroma offset `width*height` is also the sentinel,
+    /// while the real chroma offset `stride*height` holds recognizable
+    /// data — a `compact_nv12` that used `width*height` for the chroma
+    /// offset (the bug this test exists to catch) would read sentinel bytes
+    /// there instead of real chroma.
+    fn padded_nv12(width: usize, height: usize, stride: usize) -> Vec<u8> {
+        assert!(stride >= width);
+        let chroma_rows = height.div_ceil(2);
+        let mut buf = vec![0xEEu8; stride * (height + chroma_rows)];
+        for row in 0..height {
+            for col in 0..width {
+                // Recognizable, position-dependent value distinct from 0xEE.
+                buf[row * stride + col] = ((row * width + col) % 200) as u8;
+            }
+        }
+        let chroma_base = stride * height;
+        for row in 0..chroma_rows {
+            for col in 0..width {
+                buf[chroma_base + row * stride + col] = (0x40 + (row * width + col) % 100) as u8;
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn compact_nv12_strips_row_padding_and_finds_chroma_at_stride_offset() {
+        let (width, height, stride) = (6, 4, 8);
+        let buf = padded_nv12(width, height, stride);
+
+        let (y, cbcr) = compact_nv12(&buf, stride, width, height).expect("buffer is long enough");
+
+        assert_eq!(y.len(), width * height);
+        assert!(
+            !y.contains(&0xEE),
+            "Y plane must not contain padding bytes: {y:?}"
+        );
+        for row in 0..height {
+            for col in 0..width {
+                assert_eq!(
+                    y[row * width + col],
+                    ((row * width + col) % 200) as u8,
+                    "Y mismatch at row {row} col {col}"
+                );
+            }
+        }
+
+        let chroma_rows = height.div_ceil(2);
+        assert_eq!(cbcr.len(), width * chroma_rows);
+        assert!(
+            !cbcr.contains(&0xEE),
+            "CbCr plane must not contain padding, or data read from the wrong (packed) offset: {cbcr:?}"
+        );
+        for row in 0..chroma_rows {
+            for col in 0..width {
+                assert_eq!(
+                    cbcr[row * width + col],
+                    (0x40 + (row * width + col) % 100) as u8,
+                    "CbCr mismatch at row {row} col {col}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compact_nv12_packed_stride_equals_width() {
+        let (width, height) = (6, 4);
+        let stride = width;
+        let buf = padded_nv12(width, height, stride);
+
+        let (y, cbcr) = compact_nv12(&buf, stride, width, height).expect("packed buffer is valid");
+
+        assert_eq!(y.len(), width * height);
+        assert_eq!(cbcr.len(), width * height.div_ceil(2));
+        assert_eq!(y, buf[..width * height]);
+        assert_eq!(cbcr, buf[width * height..]);
+    }
+
+    #[test]
+    fn compact_nv12_too_short_is_none() {
+        let (width, height, stride) = (6, 4, 8);
+        let full = padded_nv12(width, height, stride);
+        // One byte short of the full Y+CbCr layout.
+        let truncated = &full[..full.len() - 1];
+        assert!(compact_nv12(truncated, stride, width, height).is_none());
     }
 }
