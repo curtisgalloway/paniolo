@@ -108,6 +108,10 @@ fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "hdmicap=info".into()),
         )
+        // Log to stderr: the paniolo CLI redirects a daemon's stderr into its
+        // daemon.log and discards stdout, so logging to stdout left every managed
+        // daemon's log file empty.
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();

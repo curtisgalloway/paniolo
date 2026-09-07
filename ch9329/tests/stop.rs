@@ -51,10 +51,11 @@ fn authenticated_stop_exits_and_removes_discovery() {
             "0",
         ])
         .env("PANIOLO_RUNTIME_DIR", &dir)
-        // The daemon logs which path stopped it; captured to prove below that
-        // the stop arrived over HTTP rather than as a signal.
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // The daemon logs which path stopped it on stderr (where the paniolo CLI
+        // collects daemon.log); captured to prove below that the stop arrived over
+        // HTTP rather than as a signal.
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let mut daemon = Daemon { child, dir };
@@ -92,7 +93,7 @@ fn authenticated_stop_exits_and_removes_discovery() {
     }
     assert!(!discovery.exists(), "discovery file survived the stop");
     let mut log = String::new();
-    std::io::Read::read_to_string(daemon.child.stdout.as_mut().unwrap(), &mut log).unwrap();
+    std::io::Read::read_to_string(daemon.child.stderr.as_mut().unwrap(), &mut log).unwrap();
     assert!(
         log.contains("stop requested over HTTP"),
         "the daemon was not stopped through POST /stop:\n{log}"
