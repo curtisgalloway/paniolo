@@ -717,7 +717,11 @@ hidrig/          USB HID injector: host CLI + daemon (Rust) + dual-board KB2040 
                    symlink can't be made) and the real slave path (discovery
                    `console_device`, always present, the source of truth); tokio
                    runtime, graceful shutdown (releases held keys/buttons via
-                   uart.rs's Release request, then removes the symlink)
+                   uart.rs's Release request, then removes daemon.json and the
+                   console symlink). Shutdown removes daemon.json only — NOT
+                   the lock file, which stays open (flock'd) until this
+                   process exits; see the identical note on hdmicap's
+                   daemon.rs above
   firmware/dual/control/  control board (CircuitPython 9.x): USB-CDC <-> I2C1
                    controller; reads framed input from usb_cdc.data, relays 0x01
                    HID frames verbatim over I2C1 to the target, answers 0x02
@@ -807,7 +811,9 @@ ch9329/          Rust crate: the *other* hid helper — a WCH CH9329 UART->USB-H
                    /tmp/paniolo-<uid>/hid/ discovery file paniolo's console
                    reads; graceful shutdown releases held keys/buttons (via
                    uart.rs's Release request) before exiting, and never touches
-                   the USB mux
+                   the USB mux. Shutdown removes daemon.json only — NOT the
+                   lock file, which stays open (flock'd) until this process
+                   exits; see the identical note on hdmicap's daemon.rs above
   README.md        wiring, extras beyond hidrig's surface (`info` reports target
                    USB enumeration + lock LEDs; `baud` persists a rate to flash),
                    and the hardware-verified status notes
@@ -1137,6 +1143,7 @@ Daemon stderr logs and serialcap's capture files are created 0600.
 | serialcap capture log | `/tmp/paniolo-<uid>/serialcap/<target>/capture/<name>/serial.jsonl(.1..)` (rotated JSONL, per interface) |
 | serialcap pending line | `/tmp/paniolo-<uid>/serialcap/<target>/capture/<name>/pending.json` (current unterminated line) |
 | hid daemon discovery file | `/tmp/paniolo-<uid>/hid/<target>/daemon.json` (`{pid, port, token, device, …}`; channel name, any injector) |
+| hid daemon advisory lock | `/tmp/paniolo-<uid>/hid/<target>/daemon.lock` |
 
 The per-target capture daemons (hdmicap/serialcap/hid) add the `<target>`
 segment so multiple targets capture concurrently on one host; host-singleton
