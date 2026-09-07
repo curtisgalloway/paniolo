@@ -510,9 +510,7 @@ hdmicap/         Rust crate: warm-stream HDMI capture daemon
     pixel.rs     PixelData (Rgb/Nv12/Empty) + NV12/YUYV -> RGB converters
     server.rs    axum HTTP API: GET / (dashboard; CSP frame-ancestors 'none'),
                  /status, /snapshot, /preview, /ocr, /devices, POST /power-cycle,
-                 POST /stop (authenticated shutdown; `hdmicap stop` never
-                 signals the discovery-file PID), and /xterm.* static assets
-                 (the only token-exempt routes).
+                 and /xterm.* static assets (the only token-exempt routes).
                  /snapshot matches the inner Result of `rx.changed()`, not just
                  the outer timeout — otherwise a dropped capture-thread Sender
                  makes it spin at 100% CPU until the deadline instead of
@@ -705,9 +703,11 @@ hidrig/          USB HID injector: host CLI + daemon (Rust) + dual-board KB2040 
                    paniolo's serial channel opens a *second*, separate handle on
                    the slave via the stable symlink the daemon publishes
   src/server.rs    axum: GET /hid (WebSocket carrier, 4 KiB messages), POST /send
-                   (4 KiB body), /status, /version. WS clients send command
-                   lines; all results are broadcast as `evt ok|err …` frames so
-                   observers see the intermixed stream
+                   (4 KiB body), POST /stop (authenticated shutdown; `hidrig
+                   stop` never signals the discovery-file PID), /status,
+                   /version. WS clients send command lines; all results are
+                   broadcast as `evt ok|err …` frames so observers see the
+                   intermixed stream
   src/auth.rs      token + loopback Host/Origin layer over the whole router
                    (byte-identical in serialcap/hdmicap/ch9329)
   src/daemon.rs    advisory lock, discovery file at /tmp/paniolo-<uid>/hid/<target>/
@@ -718,8 +718,9 @@ hidrig/          USB HID injector: host CLI + daemon (Rust) + dual-board KB2040 
                    convenience — falls back to the raw device path if the
                    symlink can't be made) and the real slave path (discovery
                    `console_device`, always present, the source of truth); tokio
-                   runtime, graceful shutdown (releases held keys/buttons via
-                   uart.rs's Release request, then removes the symlink)
+                   runtime, graceful shutdown — on SIGTERM/SIGINT or a `POST
+                   /stop`-woken `Notify` alike — releases held keys/buttons via
+                   uart.rs's Release request, then removes the symlink
   firmware/dual/control/  control board (CircuitPython 9.x): USB-CDC <-> I2C1
                    controller; reads framed input from usb_cdc.data, relays 0x01
                    HID frames verbatim over I2C1 to the target, answers 0x02
@@ -802,14 +803,16 @@ ch9329/          Rust crate: the *other* hid helper — a WCH CH9329 UART->USB-H
                    US layout, incl. PRINT_SCREEN/SCROLL_LOCK/PAUSE/NUM_LOCK/
                    APPLICATION), shared with the hidrig vocabulary
   src/server.rs    axum: GET /hid (WebSocket, 4 KiB messages), POST /send (4 KiB
-                   body), /status, /version
+                   body), POST /stop (authenticated shutdown; `ch9329 stop`
+                   never signals the discovery-file PID), /status, /version
   src/auth.rs      token + loopback Host/Origin layer over the whole router
                    (byte-identical in serialcap/hdmicap/hidrig)
   src/daemon.rs    `serve`/`stop`: owns the UART, publishes the same
                    /tmp/paniolo-<uid>/hid/ discovery file paniolo's console
-                   reads; graceful shutdown releases held keys/buttons (via
-                   uart.rs's Release request) before exiting, and never touches
-                   the USB mux
+                   reads; graceful shutdown — on SIGTERM/SIGINT or a `POST
+                   /stop`-woken `Notify` alike — releases held keys/buttons
+                   (via uart.rs's Release request) before exiting, and never
+                   touches the USB mux
   README.md        wiring, extras beyond hidrig's surface (`info` reports target
                    USB enumeration + lock LEDs; `baud` persists a rate to flash),
                    and the hardware-verified status notes
@@ -1161,18 +1164,6 @@ base honors `$PANIOLO_RUNTIME_BASE` (default `/tmp`).
   clean before pushing.
   Run `make fmt` to format every crate. The `zigplug` Python helper is formatted
   with `pyink` at line-length 88 (`zigplug/pyproject.toml`).
-- **Never signal a PID read from a discovery file.** A helper's `stop`
-  subcommand shuts its daemon down through the daemon's token-protected
-  `POST /stop` and never falls back to `kill(pid)`: `daemon.json` outlives a
-  crash (and, on Windows, every stop), and a recycled PID names an unrelated
-  process that a liveness probe cannot distinguish from the daemon. The only
-  place that may signal a recorded PID is `paniolo daemons stop`, which
-  compares the process's command line to the expected daemon immediately
-  before signaling. New daemons get the `/stop` route, the `Notify`-driven
-  shutdown, and the three tests (token gate, live-unrelated-PID, lifecycle log
-  line) from the existing helpers — see the lifecycle notes under
-  [Known limitations / gotchas](#known-limitations--gotchas) and the
-  `cli-conventions` skill's "Stopping a daemon found through a discovery file".
 - **`paniolo setup` builds the native components from the source tree** when
   run from a clone — `make install` (which invokes the *installed* CLI)
   resolves the checkout by walking up from the cwd (`setup::find_repo_root`).
@@ -1615,20 +1606,18 @@ the problem.
   concurrently on one host (multiple hdmicap = multiple capture devices). The
   host-singleton daemons (zigplug/cambrionix/netbootd) stay **one per host** at
   `<base>/paniolo-<uid>/<daemon>/` with no `<target>` segment.
-- **Helper `stop` commands authenticate shutdown.** `serialcap stop` and
-  `hdmicap stop` call their daemon's token-protected `POST /stop` instead of
-  signaling a discovery-file PID, which may have been recycled. Older daemons
-  without the endpoint require `paniolo daemons stop <name>` (which checks the
-  process identity before signaling) before restarting.
+- **Helper `stop` commands authenticate shutdown.** `serialcap stop`,
+  `hdmicap stop`, `ch9329 stop`, and `hidrig stop` call their daemon's
+  token-protected `POST /stop` instead of signaling a discovery-file PID,
+  which may have been recycled; zigplug's `stop` does the same over its own
+  HTTP API. Older daemons without the endpoint require `paniolo daemons stop
+  <name>` (which checks the process identity before signaling) before
+  restarting.
 - **Daemon shutdown hard-exits.** Both hdmicap (`/preview` MJPEG) and serialcap
   (`/stream` WebSocket) serve infinite responses, so a plain axum graceful
   shutdown would block on them forever. On SIGTERM each daemon removes its
   discovery file, gives a 300 ms grace, then `std::process::exit(0)`. The OS
   releases the capture device / serial port on exit.
-- **Serialcap input completion.** `/input` and WebSocket writes share a FIFO;
-  success follows driver acceptance of all bytes. The supervisor paces actual
-  writes and rejects old connection generations after reconnect. A failed send
-  may have partially reached the target; unsent bytes are not replayed.
 - **Serial ports are exclusive.** Only one of `tio`/`screen`/serialcap can hold
   a port at a time. `paniolo serial watch` and `paniolo serial connect` conflict
   on the same device — use one or the other.
