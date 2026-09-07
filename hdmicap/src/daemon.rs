@@ -129,15 +129,21 @@ pub fn run(device: DeviceSpec, port: u16) -> Result<()> {
         .context("writing discovery file")?;
         info!("hdmicap daemon listening on http://{bound}");
 
+        // `POST /stop` wakes this; `hdmicap stop` never signals the PID in
+        // the discovery file, which a crash can leave pointing at whatever
+        // process the kernel next gave that number to.
+        let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
         let app = server::router(
             AppState::new(frames),
             crate::auth::Auth::new(token, server::PUBLIC_ASSETS),
-        );
+        )
+        .layer(axum::Extension(shutdown.clone()));
 
-        // 5. Serve until SIGTERM/SIGINT. The /preview MJPEG stream is an
-        //    infinite response, so a plain graceful shutdown would block on it
-        //    forever. Remove the discovery file, give short in-flight requests a
-        //    brief grace period, then hard-exit (the OS releases the device).
+        // 5. Serve until SIGTERM/SIGINT or an authenticated `POST /stop`. The
+        //    /preview MJPEG stream is an infinite response, so a plain graceful
+        //    shutdown would block on it forever. Remove the discovery file, give
+        //    short in-flight requests a brief grace period, then hard-exit (the
+        //    OS releases the device).
         //
         //    The lock file itself is deliberately NOT unlinked here: `lock_file`
         //    (above) holds an OS advisory lock (flock) on it, and this process
@@ -153,7 +159,10 @@ pub fn run(device: DeviceSpec, port: u16) -> Result<()> {
         let disc = discovery_path()?;
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
-                shutdown_signal().await;
+                tokio::select! {
+                    _ = shutdown_signal() => {},
+                    _ = shutdown.notified() => info!("stop requested over HTTP"),
+                }
                 let _ = fs::remove_file(&disc);
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 info!("daemon shut down");

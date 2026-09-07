@@ -287,11 +287,12 @@ one interface, `-i`/`--interface` can be omitted everywhere. Don't run `connect`
 and `watch` (or an external `screen`/`tio`) on the **same device** at once —
 start one, or `stop`/close the other first.
 
-### Updating an older serialcap daemon
+### Updating an older serialcap or hdmicap daemon
 
-If `serial stop` reports that authenticated shutdown is unavailable, use
-`paniolo daemons stop serialcap` and start serial capture again. New
-`serialcap stop` uses the daemon token and never signals a discovery-file PID.
+If `serial stop` or `video stop` reports that authenticated shutdown is
+unavailable, use `paniolo daemons stop serialcap` (or `hdmicap`) and start the
+capture again. New `serialcap stop` and `hdmicap stop` use the daemon token
+and never signal a discovery-file PID.
 
 **A VM's console is a serial interface.** A pty path (`/dev/ttysNNN` on macOS,
 `/dev/pts/N` on Linux — `utmctl attach <vm>` prints it, qemu's `-serial pty`

@@ -510,7 +510,9 @@ hdmicap/         Rust crate: warm-stream HDMI capture daemon
     pixel.rs     PixelData (Rgb/Nv12/Empty) + NV12/YUYV -> RGB converters
     server.rs    axum HTTP API: GET / (dashboard; CSP frame-ancestors 'none'),
                  /status, /snapshot, /preview, /ocr, /devices, POST /power-cycle,
-                 and /xterm.* static assets (the only token-exempt routes).
+                 POST /stop (authenticated shutdown; `hdmicap stop` never
+                 signals the discovery-file PID), and /xterm.* static assets
+                 (the only token-exempt routes).
                  /snapshot matches the inner Result of `rx.changed()`, not just
                  the outer timeout — otherwise a dropped capture-thread Sender
                  makes it spin at 100% CPU until the deadline instead of
@@ -1601,9 +1603,11 @@ the problem.
   concurrently on one host (multiple hdmicap = multiple capture devices). The
   host-singleton daemons (zigplug/cambrionix/netbootd) stay **one per host** at
   `<base>/paniolo-<uid>/<daemon>/` with no `<target>` segment.
-- **serialcap stop authenticates shutdown.** It calls token-protected `POST /stop`
-  instead of signaling a discovery-file PID, which may have been recycled.
-  Older daemons require `paniolo daemons stop serialcap` before restarting.
+- **Helper `stop` commands authenticate shutdown.** `serialcap stop` and
+  `hdmicap stop` call their daemon's token-protected `POST /stop` instead of
+  signaling a discovery-file PID, which may have been recycled. Older daemons
+  without the endpoint require `paniolo daemons stop <name>` (which checks the
+  process identity before signaling) before restarting.
 - **Daemon shutdown hard-exits.** Both hdmicap (`/preview` MJPEG) and serialcap
   (`/stream` WebSocket) serve infinite responses, so a plain axum graceful
   shutdown would block on them forever. On SIGTERM each daemon removes its
