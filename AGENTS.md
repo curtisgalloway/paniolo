@@ -507,7 +507,10 @@ hdmicap/         Rust crate: warm-stream HDMI capture daemon
                  thread see it), that IS the wedged case and it still exits
     frame.rs     FrameState, Signal enum, one-pass strided classification
                  (aHash + no-signal from 4k luma samples, resolution-independent)
-    pixel.rs     PixelData (Rgb/Nv12/Empty) + NV12/YUYV -> RGB converters
+    pixel.rs     PixelData (Rgb/Nv12/Empty) + NV12/YUYV -> RGB converters;
+                 compact_nv12() re-packs a strided (row-padded) NV12 buffer
+                 into tight Y/CbCr planes — needed by the Windows backend,
+                 whose samples may pad rows past the visible width
     server.rs    axum HTTP API: GET / (dashboard; CSP frame-ancestors 'none'),
                  /status, /snapshot, /preview, /ocr, /devices, POST /power-cycle,
                  and /xterm.* static assets (the only token-exempt routes).
@@ -1516,7 +1519,13 @@ Per-subsystem behavior:
     device's *native* media types and selects one explicitly — the Windows form
     of the AVFoundation lesson below, and the reason an Openterface captures at
     its real 3840x2160 instead of a rescaled 1080p. MJPEG-only devices are not
-    yet supported.
+    yet supported. Media Foundation samples can pad each row to a stride wider
+    than the frame's visible width, so `frame()` gets the real per-sample pitch
+    from `IMF2DBuffer::Lock2D` when the buffer supports it, falling back to the
+    selected media type's `MF_MT_DEFAULT_STRIDE` (read once in `open()`) and
+    finally to `width`; `pixel::compact_nv12` then strips the padding into
+    tight Y/CbCr planes before anything downstream indexes by `width`. A
+    negative pitch (bottom-up) is treated as an explicit unsupported case.
 
 ## Removed: `usbhub` (per-port USB hub power)
 
