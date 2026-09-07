@@ -36,17 +36,19 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use windows::core::Interface;
 use windows::Win32::Media::MediaFoundation::{
-    IMFActivate, IMFMediaSource, IMFMediaType, IMFSourceReader, MFCreateAttributes,
-    MFCreateSourceReaderFromMediaSource, MFEnumDeviceSources, MFMediaType_Video, MFShutdown,
-    MFStartup, MFVideoFormat_NV12, MFSTARTUP_FULL, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
-    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
-    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE,
-    MF_MT_SUBTYPE, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+    IMF2DBuffer, IMFActivate, IMFMediaBuffer, IMFMediaSource, IMFMediaType, IMFSourceReader,
+    MFCreateAttributes, MFCreateSourceReaderFromMediaSource, MFEnumDeviceSources,
+    MFMediaType_Video, MFShutdown, MFStartup, MFVideoFormat_NV12, MFSTARTUP_FULL,
+    MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
+    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, MF_MT_DEFAULT_STRIDE,
+    MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
 };
 
 use super::{CaptureBackend, CapturedFrame, DeviceInfo, DeviceSpec};
-use crate::pixel::PixelData;
+use crate::pixel::{self, PixelData};
 
 /// Start Media Foundation once per process.
 ///
@@ -159,6 +161,13 @@ pub struct MfBackend {
     reader: IMFSourceReader,
     width: u32,
     height: u32,
+    /// Row stride (bytes) reported by the selected media type's
+    /// `MF_MT_DEFAULT_STRIDE` attribute, read once at open time. Used only
+    /// as a fallback in [`MfBackend::frame`] when a sample's buffer does not
+    /// support `IMF2DBuffer::Lock2D` (which reports the true per-sample
+    /// pitch); `None` means the attribute was absent, in which case `frame`
+    /// falls back further, to `width`.
+    default_stride: Option<u32>,
 }
 
 impl MfBackend {
@@ -190,6 +199,11 @@ impl MfBackend {
                 .with_context(|| format!("creating source reader for '{name}'"))?;
             let (media_type, width, height) = select_native_nv12(&reader)
                 .with_context(|| format!("no usable NV12 format on '{name}'"))?;
+            // Read once, from the media type we are about to select — the
+            // fallback stride for samples whose buffer doesn't support
+            // IMF2DBuffer::Lock2D (see MfBackend::frame). Absent on many
+            // drivers, in which case `frame` falls back further, to `width`.
+            let default_stride = media_type.GetUINT32(&MF_MT_DEFAULT_STRIDE).ok();
             reader
                 .SetCurrentMediaType(
                     MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
@@ -201,6 +215,7 @@ impl MfBackend {
                 reader,
                 width,
                 height,
+                default_stride,
             })
         }
     }
@@ -247,11 +262,100 @@ unsafe fn select_native_nv12(reader: &IMFSourceReader) -> Result<(IMFMediaType, 
     })
 }
 
+/// Lock `buffer` through the `IMF2DBuffer` interface and compact it,
+/// treating the reported pitch as the row stride.
+///
+/// Returns `None` (rather than an error) when `buffer` doesn't implement
+/// `IMF2DBuffer`, or its `Lock2D` fails — both mean "this buffer doesn't
+/// support the 2D path," which is a normal fallback trigger, not a capture
+/// failure. Once `Lock2D` itself succeeds, every problem after that
+/// (negative pitch, a null scanline, a too-short buffer) is reported as a
+/// real error rather than falling back, since a working 2D lock is the
+/// authoritative source for the stride.
+///
+/// Safe to call from the `unsafe` block in [`MfBackend::frame`]: dereferences
+/// the scanline pointer only for the byte range Media Foundation guarantees
+/// backs the sample at the pitch it just reported, and always calls
+/// `Unlock2D` before returning when `Lock2D` succeeded.
+unsafe fn lock_and_compact_2d(
+    buffer: &IMFMediaBuffer,
+    w: usize,
+    h: usize,
+) -> Option<Result<(Vec<u8>, Vec<u8>)>> {
+    let buf2d = buffer.cast::<IMF2DBuffer>().ok()?;
+    let mut scanline0: *mut u8 = std::ptr::null_mut();
+    let mut pitch: i32 = 0;
+    buf2d.Lock2D(&mut scanline0, &mut pitch).ok()?;
+
+    let chroma_rows = h.div_ceil(2);
+    let result = if pitch < 0 {
+        // Bottom-up NV12 would need the scanline pointer walked backwards
+        // and is not a layout any capture device we target produces;
+        // treat it as an explicit unsupported case rather than guessing.
+        Err(anyhow!(
+            "bottom-up NV12 frame (negative stride {pitch}) is not supported"
+        ))
+    } else if scanline0.is_null() {
+        Err(anyhow!("Lock2D returned a null scanline pointer"))
+    } else {
+        let stride = pitch as usize;
+        let needed = stride * (h + chroma_rows);
+        let all = std::slice::from_raw_parts(scanline0, needed);
+        pixel::compact_nv12(all, stride, w, h).ok_or_else(|| {
+            anyhow!(
+                "short NV12 frame (2D, stride {stride}) for {w}x{h} \
+                 (expected {needed} bytes)"
+            )
+        })
+    };
+    let _ = buf2d.Unlock2D();
+    Some(result)
+}
+
+/// Lock `buffer` through the plain `IMFMediaBuffer::Lock` (1D) interface and
+/// compact it, using `stride` as the row pitch.
+///
+/// This is the fallback used when [`lock_and_compact_2d`] reports that the
+/// buffer has no 2D interface: `stride` is the caller's best remaining
+/// guess — `MF_MT_DEFAULT_STRIDE` from the selected media type, or `width`
+/// when even that attribute was absent.
+unsafe fn lock_and_compact_1d(
+    buffer: &IMFMediaBuffer,
+    stride: usize,
+    w: usize,
+    h: usize,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut ptr: *mut u8 = std::ptr::null_mut();
+    let mut len: u32 = 0;
+    buffer
+        .Lock(&mut ptr, None, Some(&mut len))
+        .context("locking the frame buffer")?;
+
+    let chroma_rows = h.div_ceil(2);
+    let needed = stride * (h + chroma_rows);
+    let got = len as usize;
+    let result = if ptr.is_null() || got < needed {
+        Err(anyhow!(
+            "short NV12 frame: {got} bytes for {w}x{h} at stride {stride} (expected {needed})"
+        ))
+    } else {
+        let all = std::slice::from_raw_parts(ptr, needed);
+        pixel::compact_nv12(all, stride, w, h).ok_or_else(|| {
+            anyhow!(
+                "short NV12 frame: {got} bytes for {w}x{h} at stride {stride} (expected {needed})"
+            )
+        })
+    };
+    let _ = buffer.Unlock();
+    result
+}
+
 impl CaptureBackend for MfBackend {
     fn frame(&mut self) -> Result<CapturedFrame> {
         let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
-        // Safe: the reader is owned by self; the buffer is unlocked before the
-        // sample is dropped, and the copy happens while the lock is held.
+        // Safe: the reader is owned by self; every buffer we lock (2D or 1D)
+        // is unlocked before the sample is dropped, and the copy happens
+        // while the lock is held.
         unsafe {
             // A device can legitimately return an empty sample (a stream tick,
             // or a format change in flight), so retry rather than fail the
@@ -278,29 +382,28 @@ impl CaptureBackend for MfBackend {
                     .ConvertToContiguousBuffer()
                     .context("ConvertToContiguousBuffer")?;
 
-                let mut ptr: *mut u8 = std::ptr::null_mut();
-                let mut len: u32 = 0;
-                buffer
-                    .Lock(&mut ptr, None, Some(&mut len))
-                    .context("locking the frame buffer")?;
                 let (w, h) = (self.width as usize, self.height as usize);
-                let y_len = w * h;
-                let want = y_len + w * h.div_ceil(2);
-                let got = len as usize;
-                let result = if ptr.is_null() || got < want {
-                    Err(anyhow!(
-                        "short NV12 frame: {got} bytes for {w}x{h} (expected {want})"
-                    ))
-                } else {
-                    let all = std::slice::from_raw_parts(ptr, want);
-                    Ok((Arc::from(&all[..y_len]), Arc::from(&all[y_len..])))
+                // Media Foundation buffers can be padded to a row stride
+                // wider than the visible width (a driver/hardware alignment
+                // requirement). Prefer the per-sample stride from
+                // IMF2DBuffer::Lock2D when the buffer supports it; only fall
+                // back to the stride recorded from the media type (or,
+                // failing that, `width`) when it doesn't.
+                let result = match lock_and_compact_2d(&buffer, w, h) {
+                    Some(result) => result,
+                    None => {
+                        let stride = self.default_stride.map(|s| s as usize).unwrap_or(w);
+                        lock_and_compact_1d(&buffer, stride, w, h)
+                    }
                 };
-                let _ = buffer.Unlock();
 
-                let (y, cbcr): (Arc<[u8]>, Arc<[u8]>) = result?;
+                let (y, cbcr) = result?;
                 return Ok(CapturedFrame {
                     jpeg: None,
-                    pixels: PixelData::Nv12 { y, cbcr },
+                    pixels: PixelData::Nv12 {
+                        y: Arc::from(y),
+                        cbcr: Arc::from(cbcr),
+                    },
                     width: self.width,
                     height: self.height,
                 });
