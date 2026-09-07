@@ -199,7 +199,7 @@ fn pause_secs(value: &str, per_second: f64, what: &str, rest: &str) -> Result<f6
         .parse()
         .map_err(|_| anyhow!("invalid {what} value: {rest:?}"))?;
     let secs = v / per_second;
-    if !secs.is_finite() || secs < 0.0 || secs > MAX_PAUSE_SECS {
+    if !secs.is_finite() || !(0.0..=MAX_PAUSE_SECS).contains(&secs) {
         return Err(anyhow!(
             "{what} must be between 0 and {MAX_PAUSE_SECS} seconds: {rest:?}"
         ));
