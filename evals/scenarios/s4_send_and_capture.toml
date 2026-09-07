@@ -18,7 +18,7 @@ traps = [
 ]
 reference = [
   'paniolo serial watch dut',
-  'paniolo serial log dut --tail 1            # note the seq before sending',
+  'paniolo serial log dut --no-pending --tail 1            # note the seq before sending',
   'paniolo serial send dut "cat /proc/version"',
   'paniolo serial log dut --since <seq>        # read back the echoed command + output',
 ]
