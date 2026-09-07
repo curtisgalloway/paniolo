@@ -346,15 +346,34 @@ goes back to DISCOVER; a REQUEST addressed to another server (option 54) is
 ignored; and only Ethernet clients with a 6-byte hardware address are answered
 at all.
 
+**Single client.** The lease above is the *address* contract; netbootd also
+enforces an *identity* one, by hardware address. The first DISCOVER or REQUEST
+it sees locks in that MAC as the active client for as long as the process runs.
+A DISCOVER or REQUEST from a **different** MAC — a second device plugged into
+the same netboot link — gets no reply at all: no OFFER, ACK, or NAK, just a
+rate-limited warning in the log (`netboot logs`). Retransmissions from the
+already-active MAC are unaffected. There is no lease timer and no way to
+release the lock short of restarting the daemon — `netboot start`/`stop`
+already restarts `netbootd` per boot session, so switching which device
+netboots on a link means stopping and starting netboot again, exactly as
+switching TFTP roots or boot files already required.
+
 **TFTP.** The TFTP server is **read-only** (RFC 1350) and negotiates
-`blksize`/`tsize` options. Files are streamed from disk one block at a time
-(never read whole), each retransmit attempt has a fixed one-second deadline so a
-peer sending anything but the awaited ACK cannot keep a transfer alive past six
-attempts, and a repeated RRQ from the same client port replaces the transfer in
-flight rather than starting a parallel one. When replies go out as raw frames
-(the macOS BPF path) the negotiated `blksize` is capped at 1468 bytes so every
-DATA block fits one Ethernet frame. A symlink inside the TFTP root that points
-outside it is refused like any other escape (TFTP `file not found`, HTTP 404):
+`blksize`/`tsize` options. It only answers requests from the one IP DHCP
+leases on this link — a request from any other source address is ignored,
+the same as a second DHCP client's MAC above — and holds at most
+`MAX_TRANSFERS` (4) transfers open at once; a request that arrives when every
+slot is taken is dropped rather than queued, and a slot frees again once its
+transfer completes, errors, or exhausts its retransmit attempts. Files are
+streamed from disk one block at a time (never read whole), each retransmit
+attempt has a fixed one-second deadline so a peer sending anything but the
+awaited ACK cannot keep a transfer alive past six attempts, and a repeated RRQ
+from the same client port replaces the transfer in flight rather than starting
+a parallel one (still counting as one of the `MAX_TRANSFERS` slots). When
+replies go out as raw frames (the macOS BPF path) the negotiated `blksize` is
+capped at 1468 bytes so every DATA block fits one Ethernet frame. A symlink
+inside the TFTP root that points outside it is refused like any other escape
+(TFTP `file not found`, HTTP 404):
 only regular files whose real path is under the root are served.
 
 **HTTP.** The HTTP server sends exactly the `Content-Length` it announced even

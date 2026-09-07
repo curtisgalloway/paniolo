@@ -966,7 +966,14 @@ rejection, full loopback DATA/ACK transfers (multi-block, OACK,
 retransmit-on-loss, error packets, a junk-sending peer, a duplicate RRQ), and
 loopback HTTP (Content-Length bounding, HTTP/1.0 close, head timeout). A 65
 K-round-trip block-wraparound test is marked `#[ignore]` — run it with `cargo
-test -- --ignored`.
+test -- --ignored`. `dhcp::serve` itself is deliberately *not* driven
+end-to-end in tests (it shells out to `sudo arp`/`ip neigh` on every accepted
+request, which a test must never trigger for real); `accept_client`, the pure
+decision function it calls, is what carries the single-client test coverage
+instead. `tftp::run` *is* driven end-to-end over loopback (no such shell-out
+exists there) for the peer-IP gate and the `MAX_TRANSFERS` semaphore bound,
+including a stalled-transfer-then-freed-slot case (`tftp.rs`'s "Peer gating"
+and "Transfer-slot bound" test groups).
 
 Startup order is fixed: validate → bind and pin every listener → drop root
 (Linux) → serve. Each server exposes `bind_server(port, interface)` (sync,
@@ -1004,6 +1011,30 @@ Key differences from the Python servers:
   `validate_client_ip` refuses anything outside the /24). A REQUEST for another
   address is NAKed (`request_verdict`), one addressed to another server
   (option 54) ignored, and non-Ethernet / `hlen != 6` clients dropped.
+- **One client, enforced by MAC** (`dhcp::accept_client`). The lease above is
+  the address contract; this is the identity one: the first DISCOVER/REQUEST
+  `dhcp::serve` sees locks in that hardware address as the active client for
+  the process's lifetime, and a later request from a *different* MAC is
+  ignored outright — no OFFER/ACK/NAK, just a `warn!` rate-limited via
+  `served::warn_rate_limited` — so a second device on the link cannot steal
+  the lease, the ARP pin, or the MAC handed to TFTP's raw-frame sender. A
+  retransmission from the active MAC is unaffected (`accept_client` is
+  idempotent for it). There is no lease timer and no in-process reset —
+  `paniolo netboot start`/`stop` restarts the process per boot session, so a
+  new client means restarting netbootd.
+- **TFTP is gated to the leased client and bounded in concurrency**
+  (`tftp::run`). Every RRQ/WRQ whose source IP is not the one DHCP leases on
+  this link (`client_ip`, threaded from `main` into `tftp::serve`) is dropped
+  silently. Concurrent transfers are capped by a `MAX_TRANSFERS`-permit
+  (currently 4) `tokio::sync::Semaphore`: a permit is acquired with
+  `try_acquire_owned` before a transfer task is spawned and moved *into* that
+  task, so it releases whenever the task stops running — normal completion,
+  a read/send error, or `abort()` when a repeated RRQ from the same TID
+  replaces it — with no separate bookkeeping needed. An RRQ that finds every
+  slot taken is dropped rather than queued (TFTP has no "try again shortly"),
+  so a flood of unique-source RRQs cannot grow tasks, sockets, or open files
+  without bound; a rate-limited `warn!` covers a sustained flood of either
+  rejection.
 - **Hardened against the far end of the link.** TFTP streams blocks from the
   file (`seek` + bounded read; nothing read whole), gives each retransmit
   attempt a fixed `Instant` deadline (junk cannot re-arm it), replaces an

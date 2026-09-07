@@ -213,6 +213,7 @@ async fn main() -> Result<()> {
     let tftp = tokio::spawn(tftp::serve(
         tftp_sock,
         cli.host_ip,
+        client_ip,
         cli.tftp_root.clone(),
         cli.interface.clone(),
         bpf,

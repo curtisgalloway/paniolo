@@ -25,6 +25,20 @@
 //! interface (see `pin`), and a pin that fails is fatal — an unpinned DHCP
 //! server on the wildcard address would answer DISCOVERs on the host's
 //! primary NIC too.
+//!
+//! One *client*, too, enforced by hardware address rather than by address
+//! alone: the lease above says which IP is handed out, [`accept_client`]
+//! says who it is handed to. The first DISCOVER or REQUEST `serve` sees
+//! locks in that MAC as the active client for the life of the process; a
+//! later request from a different MAC is not the machine on the other end of
+//! this dedicated link, so it gets no OFFER, ACK, or NAK at all — just a
+//! rate-limited `warn!` — rather than being allowed to steal the lease, the
+//! ARP pin, or the MAC handed to TFTP's raw-frame sender. A retransmission
+//! from the already-active MAC is unaffected (`accept_client` is idempotent
+//! for it). There is no lease timer to expire the lock: `paniolo netboot
+//! start`/`stop` restarts this process per boot session, so swapping the
+//! netboot target means restarting netbootd, clearing the lock along with
+//! everything else this process held in memory.
 
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
@@ -37,6 +51,7 @@ use tracing::{info, warn};
 
 use crate::netcfg;
 use crate::pin::pin_socket_to_interface;
+use crate::served::warn_rate_limited;
 
 const BOOTREQUEST: u8 = 1;
 const BOOTREPLY: u8 = 2;
@@ -85,6 +100,11 @@ const SUBNET_MASK: [u8; 4] = [255, 255, 255, 0];
 /// Last octet of the derived client IP (`_dhcp.py` leased `.100` on the
 /// default `192.168.99.0/24`); `.101` when the host itself is `.100`.
 const DEFAULT_CLIENT_OCTET: u8 = 100;
+
+/// How often a "second client ignored" warning may repeat. A device that
+/// keeps hammering DISCOVER on a link it does not hold the lease for should
+/// leave one line every few seconds, not one per packet.
+const REJECTED_CLIENT_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The IP leased to the netboot client, derived from the host IP: the same
 /// /24 with the last octet replaced by [`DEFAULT_CLIENT_OCTET`] — or one more
@@ -480,12 +500,33 @@ fn build_nak(req: &Request, server_ip: Ipv4Addr) -> Vec<u8> {
     pkt
 }
 
-fn mac_string(chaddr: &[u8; 16]) -> String {
-    chaddr[..6]
+/// Format the first six bytes of `mac` (a `chaddr` or a bare hardware
+/// address) as colon-separated hex.
+fn mac_string(mac: &[u8]) -> String {
+    mac[..6]
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<Vec<_>>()
         .join(":")
+}
+
+/// The single-client gate: decide whether `mac` is the client this process
+/// answers, updating `active` the first time it is called.
+///
+/// `active` starts `None` (no client seen yet). The first call locks `mac`
+/// in as `Some(mac)` and returns `true`. Every later call with the *same*
+/// `mac` (a retransmission) is idempotent — `active` is left unchanged and
+/// it still returns `true`. A call with a *different* `mac` — a second
+/// device on the link — returns `false` and leaves `active` alone: that MAC
+/// never becomes the client, no matter how many times it asks.
+fn accept_client(active: &mut Option<[u8; 6]>, mac: [u8; 6]) -> bool {
+    match active {
+        Some(a) => *a == mac,
+        None => {
+            *active = Some(mac);
+            true
+        }
+    }
 }
 
 /// Bind the broadcast-capable DHCP listen socket on `0.0.0.0:port`, pinned to
@@ -550,6 +591,13 @@ pub async fn serve(
         sock.local_addr()?
     );
 
+    // The single client this process will ever answer, locked in by
+    // `accept_client` on the first accepted DISCOVER/REQUEST — see the
+    // module doc comment. There is no in-process reset; a new client means
+    // restarting netbootd.
+    let mut active_mac: Option<[u8; 6]> = None;
+    let mut last_rejected_warn: Option<Instant> = None;
+
     let mut buf = vec![0u8; 4096];
     // Rate-limit the "ignoring HTTPClient, no HTTP endpoint" warning: a
     // firmware that gets no offer typically retries every few seconds, and
@@ -566,7 +614,24 @@ pub async fn serve(
         let Some(req) = parse_request(&buf[..n]) else {
             continue;
         };
-        let mac = mac_string(&req.chaddr);
+        let mut mac_bytes = [0u8; 6];
+        mac_bytes.copy_from_slice(&req.chaddr[..6]);
+        let mac = mac_string(&mac_bytes);
+
+        if !accept_client(&mut active_mac, mac_bytes) {
+            // active_mac is always Some here: accept_client only returns
+            // false once a client is already locked in.
+            let active = active_mac.map(|m| mac_string(&m)).unwrap_or_default();
+            warn_rate_limited(
+                &mut last_rejected_warn,
+                REJECTED_CLIENT_WARN_INTERVAL,
+                &format!(
+                    "ignoring DHCP request from {mac}: the netboot lease is held by {active} \
+                     for this session; restart netbootd to switch clients"
+                ),
+            );
+            continue;
+        }
 
         let (reply_type, label) = match req.msg_type {
             DHCP_DISCOVER => (DHCP_OFFER, "DHCPDISCOVER"),
@@ -630,8 +695,6 @@ pub async fn serve(
         };
 
         // Publish the client MAC to the TFTP task (for the macOS BPF send path).
-        let mut mac_bytes = [0u8; 6];
-        mac_bytes.copy_from_slice(&req.chaddr[..6]);
         let _ = mac_tx.send_replace(Some(mac_bytes));
 
         // Pin the client's MAC so the host kernel can deliver to the silent
@@ -915,6 +978,44 @@ mod tests {
             ],
             "a NAK carries only message type + server id"
         );
+    }
+
+    // ── Single-client gate ───────────────────────────────────────────────────
+
+    const MAC_A: [u8; 6] = [0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa];
+    const MAC_B: [u8; 6] = [0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb];
+
+    #[test]
+    fn accept_client_locks_in_the_first_mac_seen() {
+        let mut active = None;
+        assert!(accept_client(&mut active, MAC_A));
+        assert_eq!(active, Some(MAC_A));
+    }
+
+    #[test]
+    fn accept_client_is_idempotent_for_a_retransmission_from_the_active_mac() {
+        let mut active = Some(MAC_A);
+        // Any number of repeats from the already-active MAC keep succeeding
+        // and never disturb `active` — this is what keeps a retransmitted
+        // DISCOVER/REQUEST from the real client working.
+        for _ in 0..3 {
+            assert!(accept_client(&mut active, MAC_A));
+            assert_eq!(active, Some(MAC_A));
+        }
+    }
+
+    #[test]
+    fn accept_client_rejects_a_second_distinct_mac() {
+        let mut active = Some(MAC_A);
+        assert!(
+            !accept_client(&mut active, MAC_B),
+            "a different MAC must not be accepted"
+        );
+        // Rejecting it must not steal or clear the lock.
+        assert_eq!(active, Some(MAC_A));
+        // ...and the real client can still be served afterward.
+        assert!(accept_client(&mut active, MAC_A));
+        assert_eq!(active, Some(MAC_A));
     }
 
     // ── Client IP derivation ─────────────────────────────────────────────────
