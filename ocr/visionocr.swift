@@ -17,12 +17,18 @@
 // stdin) and prints recognized text in reading order, one observation per line.
 //
 //   visionocr [--fast] [--json] [PATH | -]
+//   visionocr --self-test
 //
-//   --fast   use the fast recognition level (lower latency, worse on every
-//            frame measured — see the note at recognitionLevel below)
-//   --json   emit the v1 OCR envelope (see docs/ocr.md): engine identity,
-//            source dimensions, joined text, and per-line text + confidence +
-//            [x, y, w, h] bbox in SOURCE pixels, origin top-left
+//   --fast        use the fast recognition level (lower latency, worse on
+//                 every frame measured — see the note at recognitionLevel
+//                 below)
+//   --json        emit the v1 OCR envelope (see docs/ocr.md): engine identity,
+//                 source dimensions, joined text, and per-line text +
+//                 confidence + [x, y, w, h] bbox in SOURCE pixels, origin
+//                 top-left
+//   --self-test   run the bbox clipping math (clipBoxToSource) against a set
+//                 of edge-crossing cases and exit 0/1; no image or Vision
+//                 needed
 
 import CoreGraphics
 import Foundation
@@ -55,17 +61,113 @@ func upscaleAndPad(_ img: CGImage, scale: CGFloat, pad: Int) -> CGImage? {
     return ctx.makeImage()
 }
 
+// Map a processed-space box (top-left pixel origin, both corners) into
+// source coordinates and clip it to the source image. `toSource` below
+// converts a Vision-normalized, bottom-left-origin box into these
+// coordinates first; this function is the pure math and is exercised
+// directly by `--self-test`.
+//
+// Both corners are mapped independently through the inverse of the
+// preprocessing (undo the padding, then the upscale) and rounded, then
+// intersected with [0, srcW] x [0, srcH] so the returned box never extends
+// past the source frame — a recognition rectangle that crosses an edge
+// shrinks on that side instead of reporting a size measured in the padding.
+// A box that lands entirely outside the source (only possible for garbage
+// input) clips to zero size rather than negative.
+func clipBoxToSource(
+    px0: CGFloat, py0: CGFloat, px1: CGFloat, py1: CGFloat,
+    pad: CGFloat, scale: CGFloat, srcW: CGFloat, srcH: CGFloat
+) -> [Int] {
+    let sx0 = ((px0 - pad) / scale).rounded()
+    let sy0 = ((py0 - pad) / scale).rounded()
+    let sx1 = ((px1 - pad) / scale).rounded()
+    let sy1 = ((py1 - pad) / scale).rounded()
+
+    let x0 = min(max(0, sx0), srcW)
+    let y0 = min(max(0, sy0), srcH)
+    let x1 = max(min(sx1, srcW), x0)
+    let y1 = max(min(sy1, srcH), y0)
+
+    return [Int(x0), Int(y0), Int(x1 - x0), Int(y1 - y0)]
+}
+
+private struct BBoxCase {
+    let name: String
+    let px0: CGFloat
+    let py0: CGFloat
+    let px1: CGFloat
+    let py1: CGFloat
+    let pad: CGFloat
+    let scale: CGFloat
+    let srcW: CGFloat
+    let srcH: CGFloat
+    let expected: [Int]
+}
+
+// Exercises clipBoxToSource against the edge-crossing cases from issue #149,
+// without needing Vision or an actual image. Numbers mirror ocr/tests'
+// Python cases against the same synthetic source frame (100 x 80) and
+// preprocessing (scale=2, pad=10).
+private func runSelfTest() -> Bool {
+    let cases: [BBoxCase] = [
+        BBoxCase(
+            name: "fully inside", px0: 40, py0: 40, px1: 60, py1: 50,
+            pad: 10, scale: 2, srcW: 100, srcH: 80, expected: [15, 15, 10, 5]),
+        BBoxCase(
+            name: "left edge crossing", px0: 0, py0: 40, px1: 30, py1: 60,
+            pad: 10, scale: 2, srcW: 100, srcH: 80, expected: [0, 15, 10, 10]),
+        BBoxCase(
+            name: "top edge crossing", px0: 40, py0: 0, px1: 60, py1: 30,
+            pad: 10, scale: 2, srcW: 100, srcH: 80, expected: [15, 0, 10, 10]),
+        BBoxCase(
+            name: "right edge crossing", px0: 190, py0: 40, px1: 230, py1: 60,
+            pad: 10, scale: 2, srcW: 100, srcH: 80, expected: [90, 15, 10, 10]),
+        BBoxCase(
+            name: "bottom edge crossing", px0: 40, py0: 150, px1: 60, py1: 190,
+            pad: 10, scale: 2, srcW: 100, srcH: 80, expected: [15, 70, 10, 10]),
+        BBoxCase(
+            name: "fully outside bottom-right", px0: 300, py0: 300, px1: 340, py1: 340,
+            pad: 10, scale: 2, srcW: 100, srcH: 80, expected: [100, 80, 0, 0]),
+        BBoxCase(
+            name: "fully outside top-left", px0: -40, py0: -40, px1: -10, py1: -10,
+            pad: 10, scale: 2, srcW: 100, srcH: 80, expected: [0, 0, 0, 0]),
+    ]
+
+    var ok = true
+    for c in cases {
+        let got = clipBoxToSource(
+            px0: c.px0, py0: c.py0, px1: c.px1, py1: c.py1,
+            pad: c.pad, scale: c.scale, srcW: c.srcW, srcH: c.srcH)
+        if got != c.expected {
+            FileHandle.standardError.write(
+                "visionocr --self-test: FAIL \(c.name): got \(got), want \(c.expected)\n"
+                    .data(using: .utf8)!)
+            ok = false
+        }
+    }
+    if ok {
+        print("visionocr --self-test: all \(cases.count) cases passed")
+    }
+    return ok
+}
+
 var accurate = true
 var json = false
+var selfTest = false
 var path: String? = nil
 for arg in CommandLine.arguments.dropFirst() {
     switch arg {
     case "--accurate": accurate = true
     case "--fast": accurate = false
     case "--json": json = true
+    case "--self-test": selfTest = true
     case "-": path = nil
     default: path = arg
     }
+}
+
+if selfTest {
+    exit(runSelfTest() ? 0 : 1)
 }
 
 let data: Data
@@ -147,24 +249,14 @@ if json {
     let srcH = CGFloat(decoded.height)
 
     func toSource(_ b: CGRect) -> [Int] {
-        let px = b.origin.x * procW
+        let px0 = b.origin.x * procW
         // Flip to a top-left origin while still in processed pixels.
-        let py = (1.0 - b.origin.y - b.size.height) * procH
-        let pw = b.size.width * procW
-        let ph = b.size.height * procH
-        let x = (px - appliedPad) / appliedScale
-        let y = (py - appliedPad) / appliedScale
-        let w = pw / appliedScale
-        let h = ph / appliedScale
-        // Padding means a glyph at the frame edge can map slightly outside it.
-        let cx = min(max(x, 0), srcW)
-        let cy = min(max(y, 0), srcH)
-        return [
-            Int(cx.rounded()),
-            Int(cy.rounded()),
-            Int(min(w, srcW - cx).rounded()),
-            Int(min(h, srcH - cy).rounded()),
-        ]
+        let py0 = (1.0 - b.origin.y - b.size.height) * procH
+        let px1 = (b.origin.x + b.size.width) * procW
+        let py1 = (1.0 - b.origin.y) * procH
+        return clipBoxToSource(
+            px0: px0, py0: py0, px1: px1, py1: py1,
+            pad: appliedPad, scale: appliedScale, srcW: srcW, srcH: srcH)
     }
 
     var lines: [[String: Any]] = []

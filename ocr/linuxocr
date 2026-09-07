@@ -78,6 +78,50 @@ def _tesseract(tmp: str, tsv: bool) -> str:
     return result.stdout
 
 
+def _clip_to_source(
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    scale: int,
+    pad: int,
+    src_w: int,
+    src_h: int,
+) -> "tuple[int, int, int, int]":
+    """Map a processed-space box to source coordinates and clip it there.
+
+    ``(x0, y0)``-``(x1, y1)`` is a box in the preprocessed (upscaled + padded)
+    image. Both corners are mapped independently through the inverse of that
+    preprocessing (undo the padding, then the upscale) and rounded, then the
+    result is intersected with ``[0, src_w] x [0, src_h]`` so the reported box
+    never extends past the source frame — a box whose recognition rectangle
+    crosses an edge shrinks on that side instead of reporting a size measured
+    in the padding. A box that lands entirely outside the source (possible
+    only for garbage input) clips to zero size rather than negative.
+
+    ``src_w``/``src_h`` may be ``0`` (the PNG header could not be parsed) — the
+    near edge is still clamped to 0 in that case, but the far edge is left
+    unclipped, since the true source extent isn't known.
+
+    Returns ``(x, y, w, h)`` with ``w, h >= 0``.
+    """
+
+    def to_source(v: float) -> int:
+        return round((v - pad) / scale)
+
+    sx0, sy0 = to_source(x0), to_source(y0)
+    sx1, sy1 = to_source(x1), to_source(y1)
+
+    x = min(max(0, sx0), src_w) if src_w else max(0, sx0)
+    y = min(max(0, sy0), src_h) if src_h else max(0, sy0)
+    x1c = min(sx1, src_w) if src_w else sx1
+    y1c = min(sy1, src_h) if src_h else sy1
+    x1c = max(x1c, x)
+    y1c = max(y1c, y)
+
+    return x, y, x1c - x, y1c - y
+
+
 def _lines_from_tsv(tsv: str, scale: int, pad: int, src_w: int, src_h: int) -> list:
     """Group tesseract's per-word TSV rows into lines, in source coordinates.
 
@@ -128,20 +172,12 @@ def _lines_from_tsv(tsv: str, scale: int, pad: int, src_w: int, src_h: int) -> l
         g["x1"] = max(g["x1"], left + wid)
         g["y1"] = max(g["y1"], top + hgt)
 
-    def to_source(v: int) -> int:
-        return max(0, round((v - pad) / scale))
-
     out = []
     for key in order:
         g = grouped[key]
-        x = to_source(g["x0"])
-        y = to_source(g["y0"])
-        w = max(0, round((g["x1"] - g["x0"]) / scale))
-        h = max(0, round((g["y1"] - g["y0"]) / scale))
-        if src_w:
-            w = min(w, src_w - x)
-        if src_h:
-            h = min(h, src_h - y)
+        x, y, w, h = _clip_to_source(
+            g["x0"], g["y0"], g["x1"], g["y1"], scale, pad, src_w, src_h
+        )
         line = {"text": " ".join(g["words"]), "bbox": [x, y, w, h]}
         if g["confs"]:
             line["confidence"] = round(sum(g["confs"]) / len(g["confs"]), 4)

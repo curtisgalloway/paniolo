@@ -123,7 +123,10 @@ running the helper by hand.
   than inferred from confidence: on two of three platforms there is nothing to
   infer from.
 - `lines[].bbox` — `[x, y, w, h]` in **pixels, origin top-left, in source-image
-  coordinates**.
+  coordinates**. Always the intersection of the recognized box with the source
+  frame: a line whose recognition rectangle crosses an edge is reported at the
+  size it actually occupies inside `[0, width) x [0, height)`, not the size it
+  had before clipping.
 
 ### The bbox rule is the sharp edge
 
@@ -148,6 +151,16 @@ where the answer was `104`.
 
 Apple Vision additionally reports **normalized, bottom-left-origin** boxes, so
 `visionocr` flips the y axis as well as undoing its own scale and padding.
+
+A follow-up defect (#149) got the origin right but not the extent: both
+helpers clamped a mapped corner to 0 at the left/top edge without also
+shrinking the width/height that had been measured in the padding, so a line
+flush with the frame's left edge came back a few pixels too wide instead of
+clipped. The fix maps *both* corners of a box into source coordinates,
+intersects the result with `[0, width] x [0, height]`, and derives width and
+height from the clipped corners — so a crossing on any edge shrinks the
+reported box, and a box landing entirely outside the source (only possible for
+garbage input) clips to zero size rather than a negative one.
 
 ## What paniolo does with it
 
