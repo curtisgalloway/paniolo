@@ -41,11 +41,8 @@ Subcommands:
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
-import os
-import signal
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -310,7 +307,15 @@ def serve(
 
 @app.command()
 def stop() -> None:
-    """Stop the running daemon."""
+    """Stop the running daemon.
+
+    Shuts it down through its token-protected `POST /stop`. Never falls back
+    to signaling the recorded pid: a discovery file outlives the daemon
+    whenever it did not exit cleanly, and once the kernel reuses that pid the
+    record names an unrelated process. If the authenticated request does not
+    make the daemon exit, use `paniolo daemons stop zigplug`, which checks
+    the process identity before it signals anything.
+    """
     daemon = _daemon.read_discovery()
     if daemon is None:
         typer.echo("no daemon running")
@@ -330,9 +335,13 @@ def stop() -> None:
             typer.echo(f"daemon (pid {daemon.pid}) stopped")
             return
         time.sleep(0.2)
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.kill(daemon.pid, signal.SIGTERM)
-    typer.echo(f"daemon (pid {daemon.pid}) signalled")
+    raise _fail(
+        _app.ZigplugError(
+            f"daemon (pid {daemon.pid}) did not stop within 5s of an "
+            "authenticated /stop request; use `paniolo daemons stop "
+            "zigplug`, which checks process identity before signaling"
+        )
+    )
 
 
 @app.command()

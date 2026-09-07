@@ -32,7 +32,7 @@ use axum::{
     middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use bytes::Bytes;
 use image::{ImageBuffer, Rgb};
@@ -91,6 +91,7 @@ pub const PUBLIC_ASSETS: &[&str] = &["/xterm.js", "/xterm.css", "/xterm-addon-fi
 pub fn router(state: AppState, auth: crate::auth::Auth) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/stop", post(stop))
         .route("/status", get(status))
         .route("/snapshot", get(snapshot))
         .route("/preview", get(preview))
@@ -106,6 +107,16 @@ pub fn router(state: AppState, auth: crate::auth::Auth) -> Router {
         .route("/xterm-addon-fit.js", get(xterm_fit_js))
         .layer(middleware::from_fn_with_state(auth, crate::auth::require))
         .with_state(state)
+}
+
+/// Authenticated shutdown. `hdmicap stop` calls this instead of signaling the
+/// PID in the discovery file: a record left behind by a crash can name a PID
+/// the kernel has since handed to an unrelated process, and the token proves
+/// the request reached the daemon that wrote the record. The daemon's serve
+/// loop owns the `Notify` (see `daemon::run`).
+async fn stop(Extension(shutdown): Extension<Arc<tokio::sync::Notify>>) -> &'static str {
+    shutdown.notify_one();
+    "daemon stopping\n"
 }
 
 /// The dashboard. It must never render inside another page's frame: its power
@@ -857,6 +868,55 @@ mod tests {
         assert_eq!(v["lines"].as_array().map(|a| a.len()), Some(0));
         // The binary is named so the cause is visible in the response itself.
         assert!(v["engine_detail"].as_str().unwrap().contains("linuxocr"));
+    }
+
+    /// `/stop` sits behind the same bearer-token layer as every other route,
+    /// and only a valid token may wake the daemon's shutdown `Notify`.
+    #[tokio::test]
+    async fn shutdown_requires_the_daemon_token() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let (_tx, rx) = watch::channel(Arc::new(FrameState::no_device()));
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let app = router(
+            AppState::new(rx),
+            crate::auth::Auth::new("test-token".into(), PUBLIC_ASSETS),
+        )
+        .layer(Extension(shutdown.clone()));
+        for token in [None, Some("wrong"), Some("test-token")] {
+            let mut req = HttpRequest::builder()
+                .method("POST")
+                .uri("/stop")
+                .header(header::HOST, "127.0.0.1:1");
+            if let Some(token) = token {
+                req = req.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let resp = app
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let valid = token == Some("test-token");
+            assert_eq!(
+                resp.status(),
+                if valid {
+                    StatusCode::OK
+                } else {
+                    StatusCode::UNAUTHORIZED
+                },
+                "token {token:?}"
+            );
+            assert_eq!(
+                tokio::time::timeout(Duration::from_millis(10), shutdown.notified())
+                    .await
+                    .is_ok(),
+                valid,
+                "token {token:?} must {}wake the shutdown",
+                if valid { "" } else { "not " }
+            );
+        }
     }
 
     // ── Review M20: /snapshot must not spin when the capture thread is gone ──
