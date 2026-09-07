@@ -1161,6 +1161,18 @@ base honors `$PANIOLO_RUNTIME_BASE` (default `/tmp`).
   clean before pushing.
   Run `make fmt` to format every crate. The `zigplug` Python helper is formatted
   with `pyink` at line-length 88 (`zigplug/pyproject.toml`).
+- **Never signal a PID read from a discovery file.** A helper's `stop`
+  subcommand shuts its daemon down through the daemon's token-protected
+  `POST /stop` and never falls back to `kill(pid)`: `daemon.json` outlives a
+  crash (and, on Windows, every stop), and a recycled PID names an unrelated
+  process that a liveness probe cannot distinguish from the daemon. The only
+  place that may signal a recorded PID is `paniolo daemons stop`, which
+  compares the process's command line to the expected daemon immediately
+  before signaling. New daemons get the `/stop` route, the `Notify`-driven
+  shutdown, and the three tests (token gate, live-unrelated-PID, lifecycle log
+  line) from the existing helpers — see the lifecycle notes under
+  [Known limitations / gotchas](#known-limitations--gotchas) and the
+  `cli-conventions` skill's "Stopping a daemon found through a discovery file".
 - **`paniolo setup` builds the native components from the source tree** when
   run from a clone — `make install` (which invokes the *installed* CLI)
   resolves the checkout by walking up from the cwd (`setup::find_repo_root`).
