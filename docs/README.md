@@ -1,5 +1,7 @@
 # Paniolo documentation
 
+![A robot paniolo on horseback surveys a herd of single-board computers grazing on the range](paniolo-and-herd.jpg)
+
 Paniolo is an **agent-controlled target-machine wrangler** for low-level software development —
 it gives an AI agent (or you) the controls to netboot a target, watch its output, send it input,
 and power-cycle it without a person at the bench each iteration. See the root
