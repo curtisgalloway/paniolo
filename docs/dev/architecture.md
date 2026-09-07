@@ -202,8 +202,10 @@ keep serving.
 DISCOVER/REQUEST it sees for the life of the process and silently ignores a different MAC (a
 second device on the link never gets an OFFER/ACK, and can't steal the lease, the ARP pin, or
 the MAC handed to TFTP's raw-frame sender); TFTP separately accepts RRQs only from that leased
-IP. There is no in-process reset for either gate — a new client means restarting `netbootd`
-(i.e. `paniolo netboot stop` then `start`).
+IP and caps concurrent transfers at a small fixed `MAX_TRANSFERS` via a semaphore, so a flood of
+RRQs from unique source ports cannot grow tasks/sockets/files without bound. There is no
+in-process reset for either gate — a new client means restarting `netbootd` (i.e. `paniolo
+netboot stop` then `start`).
 
 On macOS, `netbootd`'s raw-frame send path (the Sequoia workaround) gets a `/dev/bpf` descriptor
 from a setuid-root `netbootd-bpf-helper` over `SCM_RIGHTS`, so the daemon itself stays

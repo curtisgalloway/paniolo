@@ -156,7 +156,9 @@ DHCP reply at all — check `netboot logs` for the rate-limited warning if a
 board that should be netbooting stays dark). There is no way to switch which
 device it answers short of `paniolo netboot stop` then `start` again — that
 restart is the "release the lock" operation. TFTP separately only answers the
-one leased IP.
+one leased IP and caps itself at a handful of concurrent transfers, which is
+invisible in normal use (a boot flow never needs more than that) but means a
+misbehaving client flooding RRQs gets dropped rather than served.
 
 ## Link mode — netboot · link · ffx · off
 

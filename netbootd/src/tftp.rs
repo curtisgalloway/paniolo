@@ -47,10 +47,18 @@
 //!   * when replies go out as raw frames the negotiated `blksize` is capped so
 //!     a DATA block always fits one Ethernet frame ([`cap_blksize`]).
 //!
-//! One more gate on every inbound request, ahead of all of the above: **peer
-//! identity** — a request whose source address is not the one IP DHCP ever
-//! leases on this link is not from the netboot client, so it is ignored
-//! outright (no reply of any kind).
+//! Two more gates on every inbound request, ahead of all of the above:
+//!   * **peer identity** — a request whose source address is not the one IP
+//!     DHCP ever leases on this link is not from the netboot client, so it is
+//!     ignored outright (no reply of any kind);
+//!   * **transfer slots** — concurrent transfers are bounded by a
+//!     `MAX_TRANSFERS`-permit [`tokio::sync::Semaphore`], acquired before a
+//!     task is spawned and held *inside* that task so it is released however
+//!     the transfer ends (completion, error, or `abort()` on replacement). A
+//!     request that finds every slot taken is dropped rather than queued —
+//!     TFTP has no way to tell a client "try again shortly" — so a flood of
+//!     unique-source RRQs cannot grow tasks, sockets, or open files without
+//!     bound.
 
 use std::collections::HashMap;
 use std::io;
@@ -64,7 +72,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio::net::UdpSocket;
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout_at, Instant};
 use tracing::{info, warn};
@@ -93,9 +101,20 @@ const MAX_RETRIES: usize = 6;
 /// bigger block could neither be fragmented nor transmitted.
 const MAX_RAW_FRAME_BLKSIZE: usize = 1468;
 
-/// How often a "peer not leased" warning may repeat, so a sustained flood of
-/// rejected RRQs produces one log line every few seconds instead of one per
-/// packet.
+/// How many transfers `run` will hold open at once. The Pi 5 EEPROM's
+/// request sequence (`docs/netboot.md`) is sequential — `start.elf` (404),
+/// `config.txt`, the `.dtb`, then the kernel — and UEFI PXE/HTTP Boot is
+/// similar, so no supported boot flow needs more than a couple of transfers
+/// overlapping at once. This bounds the worst case (a flood of RRQs from
+/// unique source ports), not the happy path, so it is set a little above
+/// that: enough headroom for a boot flow's files plus one in-flight retry
+/// during a replacement, without leaving the cap so high that a flood could
+/// still pile up a meaningful number of held files and sockets.
+const MAX_TRANSFERS: usize = 4;
+
+/// How often a "peer not leased" or "no transfer slots" warning may repeat,
+/// so a sustained flood of rejected RRQs produces one log line every few
+/// seconds instead of one per packet.
 const REJECTED_PEER_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The `blksize` to serve with. A client may ask for up to 65 464 bytes (RFC
@@ -574,10 +593,12 @@ pub async fn serve(
 /// replaces that transfer — a client that restarted its request gets one
 /// sender, not one per attempt.
 ///
-/// Every request is gated once more before that: its source IP must be
-/// `client_ip` — the one address DHCP ever leases on this link. A request
-/// that fails the check is dropped silently (bar a rate-limited `warn!`):
-/// TFTP has no NAK to send back.
+/// Every request is gated twice before that: its source IP must be
+/// `client_ip` — the one address DHCP ever leases on this link — and a
+/// `MAX_TRANSFERS`-permit semaphore must have a slot free. Either failing
+/// drops the request silently (bar a rate-limited `warn!`): TFTP has no NAK,
+/// and queuing a rejected request would just build a backlog instead of
+/// bounding one.
 #[allow(clippy::too_many_arguments)]
 async fn run(
     sock: UdpSocket,
@@ -591,10 +612,12 @@ async fn run(
 ) -> Result<()> {
     let mut buf = vec![0u8; 4096];
     let mut inflight: HashMap<SocketAddr, JoinHandle<()>> = HashMap::new();
+    let transfers = Arc::new(Semaphore::new(MAX_TRANSFERS));
     // `served::warn_rate_limited` works in `std::time::Instant` (shared with
     // dhcp.rs, which has no async runtime clock to prefer); everything else
     // in this file uses tokio's `Instant` for `timeout_at` deadlines.
     let mut last_peer_warn: Option<std::time::Instant> = None;
+    let mut last_slots_warn: Option<std::time::Instant> = None;
     loop {
         let (n, peer) = match sock.recv_from(&mut buf).await {
             Ok(v) => v,
@@ -625,6 +648,21 @@ async fn run(
         match opcode {
             OP_RRQ => {
                 inflight.retain(|_, h| !h.is_finished());
+                // Acquire the slot before touching any existing transfer for
+                // this peer: if the daemon is already at MAX_TRANSFERS, a
+                // replacement RRQ is refused exactly like a new one rather
+                // than tearing down the old transfer for nothing.
+                let Ok(permit) = transfers.clone().try_acquire_owned() else {
+                    warn_rate_limited(
+                        &mut last_slots_warn,
+                        REJECTED_PEER_WARN_INTERVAL,
+                        &format!(
+                            "TFTP RRQ from {peer} dropped: all {MAX_TRANSFERS} transfer slots \
+                             are in use"
+                        ),
+                    );
+                    continue;
+                };
                 if let Some(old) = inflight.remove(&peer) {
                     info!("RRQ from {peer} while a transfer to it is in flight; replacing it");
                     old.abort();
@@ -632,10 +670,14 @@ async fn run(
                 let data = buf[..n].to_vec();
                 let root = root.clone();
                 let interface = interface.clone();
-                let task =
-                    tokio::spawn(
-                        async move { handle_rrq(root, data, peer, interface, xfer).await },
-                    );
+                // The permit lives inside the task, not the dispatcher: it is
+                // dropped — and the slot freed — whenever this future stops
+                // running, on any exit path (`handle_rrq` returning, or
+                // `abort()` above cancelling a future replacement).
+                let task = tokio::spawn(async move {
+                    let _permit = permit;
+                    handle_rrq(root, data, peer, interface, xfer).await;
+                });
                 inflight.insert(peer, task);
             }
             OP_WRQ => {
@@ -1357,6 +1399,88 @@ mod tests {
             got, contents,
             "the leased peer must still be served normally"
         );
+
+        dispatcher.abort();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // ── Transfer-slot bound ──────────────────────────────────────────────────
+
+    /// `MAX_TRANSFERS` clients that never ACK anything fill every slot; one
+    /// more, from a fresh source port, gets nothing while the daemon is full.
+    /// Once the stalled transfers exhaust `MAX_RETRIES` and give up, their
+    /// slots free and the same request succeeds.
+    #[tokio::test]
+    async fn transfers_are_bounded_and_a_slot_frees_after_the_retry_deadline() {
+        let root = tmp();
+        fs::write(root.join("stall.img"), vec![0x42u8; 4096]).unwrap();
+        let small = b"tiny".to_vec();
+        fs::write(root.join("small.img"), &small).unwrap();
+
+        let listen = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listen.local_addr().unwrap();
+        let (_tx, rx) = watch::channel::<Option<[u8; 6]>>(None);
+        let ack_timeout = Duration::from_millis(80);
+        let dispatcher = tokio::spawn(run(
+            listen,
+            root.clone(),
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
+            None,
+            Arc::new(BpfSender::unavailable()),
+            rx,
+            ack_timeout,
+        ));
+
+        // Fill every slot with a client that never ACKs.
+        let mut stalled = Vec::new();
+        for _ in 0..MAX_TRANSFERS {
+            let (sock, _) = client_socket().await;
+            sock.send_to(&rrq("stall.img", "octet", &[]), server_addr)
+                .await
+                .unwrap();
+            stalled.push(sock);
+        }
+        // Confirm each was actually spawned (holds a permit) before probing
+        // the bound: every one must see its first DATA block.
+        let started_by = Instant::now() + Duration::from_secs(2);
+        let mut buf = vec![0u8; 2048];
+        for sock in &stalled {
+            let (_n, _) = timeout_at(started_by, sock.recv_from(&mut buf))
+                .await
+                .expect("a slotted transfer must send its first DATA block")
+                .unwrap();
+            assert_eq!(u16::from_be_bytes([buf[0], buf[1]]), OP_DATA);
+        }
+
+        // One more, from a fresh source port: every slot is taken, so this
+        // must get nothing rather than being queued.
+        let (extra, _) = client_socket().await;
+        extra
+            .send_to(&rrq("small.img", "octet", &[]), server_addr)
+            .await
+            .unwrap();
+        let mut extra_buf = vec![0u8; 2048];
+        let denied = timeout_at(
+            Instant::now() + ack_timeout * 2,
+            extra.recv_from(&mut extra_buf),
+        )
+        .await;
+        assert!(
+            denied.is_err(),
+            "an RRQ past MAX_TRANSFERS must be dropped, not queued, while every slot is in use"
+        );
+
+        // Past MAX_RETRIES * ack_timeout the stalled transfers give up; each
+        // held permit drops with its task, freeing the slot.
+        tokio::time::sleep(ack_timeout * (MAX_RETRIES as u32) + Duration::from_millis(200)).await;
+
+        extra
+            .send_to(&rrq("small.img", "octet", &[]), server_addr)
+            .await
+            .unwrap();
+        let (got, _blocks) = recv_transfer(&extra, DEFAULT_BLKSIZE).await;
+        assert_eq!(got, small, "a freed slot serves the next request");
 
         dispatcher.abort();
         fs::remove_dir_all(&root).ok();
