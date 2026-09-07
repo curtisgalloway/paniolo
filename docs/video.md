@@ -130,6 +130,25 @@ that `/snapshot` and `/ocr` share a small concurrency limit for, so a burst
 of clicks queues briefly rather than piling up unbounded work — see *OCR*
 below.
 
+`GET /preview` (the MJPEG stream behind `paniolo video preview`/the
+[dashboard](dashboard.md)) shares that same concurrency limit for its own
+JPEG-encode fallback (macOS/Windows NV12; Linux serves the device's raw MJPEG
+bytes directly and never hits this path), and coalesces: every open preview
+connection watching the same frame reuses one encode rather than each running
+its own, so a handful of browser tabs left open can't starve `/snapshot` or
+`/ocr` of the same CPU work.
+
+`/preview` also refuses to keep showing a frame once it goes stale. Every
+multipart part carries an `X-Signal` header naming the effective signal that
+produced it; when that signal is anything but `stable`/`mode_switching` —
+most commonly `stale` (capture stopped delivering, the same staleness
+`/snapshot` and `/ocr` refuse), but also `no_signal`/`no_device` — the stream
+stops sending that frame's bytes and instead sends a placeholder image (a
+dark gray field with a red diagonal X) once per transition, at the last known
+resolution. This is what keeps a browser tab left open on `/preview`
+honest: without it, the `<img>` would freeze on the last real frame forever,
+which looks exactly like a live, unchanging screen.
+
 ---
 
 ## OCR
@@ -176,8 +195,10 @@ Gigaboot screen with 1.35% of its pixels lit reported `no_signal` for minutes.
 And a *stalled* capture kept reporting `stable`: the capture loop publishes only
 on success, so the last frame stayed in place with its old label, and a machine
 whose mains had been cut went on reporting `stable` on its pre-cut desktop. A
-frame older than `STALE_AFTER` now reports `stale`, and `/snapshot`, `/ocr` and
-`--stable` all refuse it.
+frame older than `STALE_AFTER` now reports `stale`, and `/snapshot`, `/ocr`,
+`--stable`, and `/preview` (which swaps in the placeholder image described
+above rather than refusing outright — a stream can't return an error mid-part)
+all refuse to treat it as live.
 
 The lesson for anything collecting frames: **treat `signal` as a hint, save
 every frame, and de-duplicate by hash afterwards** rather than filtering on the

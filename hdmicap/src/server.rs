@@ -22,7 +22,7 @@
 
 use std::io::Cursor;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -44,18 +44,33 @@ use crate::frame::{FrameState, Signal, StatusDto};
 use crate::pixel::{nv12_to_rgb, nv12_to_rgb_half, PixelData};
 
 /// Concurrent permits for the genuinely expensive work a dashboard click can
-/// trigger: PNG encode/decode and the OCR subprocess (Review M21). Small on
-/// purpose — enough that one slow request doesn't serialize behind another
-/// unrelated one, not so large that a burst of clicks piles up unbounded CPU
-/// work or unbounded `visionocr` helper processes.
+/// trigger: PNG encode/decode and the OCR subprocess (Review M21). Also
+/// bounds /preview's own JPEG-encode fallback (Issue #142) — every open
+/// preview connection used to spawn its own unbounded `spawn_blocking`
+/// encode, so a handful of browser tabs could starve /snapshot and /ocr's
+/// share of this same semaphore. Small on purpose — enough that one slow
+/// request doesn't serialize behind another unrelated one, not so large
+/// that a burst of clicks piles up unbounded CPU work or unbounded
+/// `visionocr` helper processes.
 const EXPENSIVE_PERMITS: usize = 2;
+
+/// The most recently fallback-encoded /preview JPEG, keyed by the source
+/// frame's `captured_at` (Issue #142): `None` until the first fallback
+/// encode, then `Some((that frame's captured_at, its encoded bytes))`.
+type PreviewCache = Arc<Mutex<Option<(Instant, Arc<[u8]>)>>>;
 
 #[derive(Clone)]
 pub struct AppState {
     pub frames: FrameRx,
-    /// Bounds concurrent PNG encode/decode and OCR subprocess work — see
-    /// [`EXPENSIVE_PERMITS`].
+    /// Bounds concurrent PNG encode/decode, OCR subprocess work, and
+    /// /preview's fallback JPEG encode — see [`EXPENSIVE_PERMITS`].
     pub expensive: Arc<Semaphore>,
+    /// Every preview client observing the same frame checks this after
+    /// taking an `expensive` permit — a cache hit reuses the bytes instead
+    /// of re-encoding, so N clients watching one frame cost one encode, not
+    /// N. Plain `std::sync::Mutex` is fine: it is only ever held for a
+    /// synchronous lookup or store, never across an `.await`.
+    preview_cache: PreviewCache,
 }
 
 impl AppState {
@@ -63,6 +78,7 @@ impl AppState {
         AppState {
             frames,
             expensive: Arc::new(Semaphore::new(EXPENSIVE_PERMITS)),
+            preview_cache: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -337,58 +353,186 @@ async fn png_response(f: &Arc<FrameState>, timed_out: bool, expensive: &Semaphor
         .into_response()
 }
 
+/// Dimensions for the "not a screen" placeholder (Issue #143) when this
+/// connection has never yet seen a live frame — e.g. `/preview` opened before
+/// any device is detected.
+const PLACEHOLDER_DEFAULT_DIMS: (u32, u32) = (640, 360);
+
+/// Half the stroke width, in pixels, of the placeholder's diagonal X.
+const PLACEHOLDER_HALF_STROKE: f64 = 6.0;
+
+/// A clearly-not-a-screen placeholder JPEG: a dark gray field with a thick
+/// red diagonal X. `/preview` sends this in place of a live frame whenever
+/// `FrameState::effective_signal()` says the last frame no longer describes
+/// the screen (Issue #143) — a frozen `<img>` on an open MJPEG stream reads
+/// as "still live" to a human watching it, so the picture itself has to
+/// visibly change, not just an HTTP header nobody but a script reads.
+///
+/// `dims` is the last live frame's resolution, so the placeholder keeps that
+/// aspect ratio instead of jumping to the default; `None` (never seen a live
+/// frame on this connection) falls back to [`PLACEHOLDER_DEFAULT_DIMS`].
+fn placeholder_jpeg(dims: Option<(u32, u32)>) -> Option<Vec<u8>> {
+    let (w, h) = dims
+        .filter(|&(w, h)| w > 0 && h > 0)
+        .unwrap_or(PLACEHOLDER_DEFAULT_DIMS);
+    let mut img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_pixel(w, h, Rgb([40, 40, 40]));
+
+    // Perpendicular (Euclidean) distance from (x, y) to each corner-to-corner
+    // diagonal of the w*h box; painting every pixel within half a stroke
+    // width of either draws a thick X regardless of aspect ratio.
+    let (wf, hf) = (f64::from(w), f64::from(h));
+    let norm = wf.hypot(hf).max(1.0);
+    for y in 0..h {
+        for x in 0..w {
+            let (xf, yf) = (f64::from(x), f64::from(y));
+            let d1 = (xf * hf - yf * wf).abs() / norm;
+            let d2 = (xf * hf + yf * wf - wf * hf).abs() / norm;
+            if d1 <= PLACEHOLDER_HALF_STROKE || d2 <= PLACEHOLDER_HALF_STROKE {
+                img.put_pixel(x, y, Rgb([200, 20, 20]));
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let encoder = jpeg_encoder::Encoder::new(&mut out, 80);
+    encoder
+        .encode(
+            img.as_raw(),
+            w as u16,
+            h as u16,
+            jpeg_encoder::ColorType::Rgb,
+        )
+        .ok()?;
+    Some(out)
+}
+
+/// Build one multipart/x-mixed-replace part: boundary, headers — including
+/// `X-Signal` (Issue #143; browsers ignore unknown part headers, but a test
+/// or a future client can read it) — then the JPEG bytes.
+fn multipart_chunk(jpeg_bytes: &[u8], signal: Signal) -> Bytes {
+    let part_header = format!(
+        "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nX-Signal: {}\r\n\r\n",
+        jpeg_bytes.len(),
+        signal_name(signal),
+    );
+    let mut chunk = Vec::with_capacity(part_header.len() + jpeg_bytes.len() + 2);
+    chunk.extend_from_slice(part_header.as_bytes());
+    chunk.extend_from_slice(jpeg_bytes);
+    chunk.extend_from_slice(b"\r\n");
+    Bytes::from(chunk)
+}
+
+/// What this /preview connection last put on the wire — so a signal that
+/// hasn't changed (the common case: a real frame across several 67ms ticks,
+/// or a placeholder while nothing has recovered) is neither re-encoded nor
+/// re-sent every tick.
+enum Served {
+    Frame(Instant),
+    Placeholder(Signal),
+}
+
 /// multipart/x-mixed-replace MJPEG stream for the human browser preview.
 /// Reads the same warm buffer as /snapshot — zero device contention.
 /// When raw JPEG bytes are available (Linux MJPEG path), they are served
 /// directly with zero server-side decode or re-encode. Otherwise we re-encode
-/// from the decoded RGB buffer at quality 80.
+/// from the decoded RGB buffer at quality 80 — bounded by the same
+/// `AppState.expensive` semaphore /snapshot and /ocr share, and coalesced
+/// across every client watching the same frame via `AppState.preview_cache`
+/// (Issue #142): N clients on one frame cost one encode, not N.
+///
+/// Once `FrameState::effective_signal()` says the last frame is no longer
+/// live (`Stale`, `NoSignal`, or `NoDevice`), the stream stops serving that
+/// frame's bytes and instead sends [`placeholder_jpeg`] once per transition,
+/// so a browser tab left open visibly shows "not the screen" instead of
+/// quietly freezing on the last real frame (Issue #143). Every part carries
+/// an `X-Signal` header naming the effective signal that produced it.
 async fn preview(State(s): State<AppState>) -> Response {
     let mut frames = s.frames.clone();
+    let expensive = s.expensive.clone();
+    let preview_cache = s.preview_cache.clone();
 
     let stream = async_stream::stream! {
         let mut interval = tokio::time::interval(Duration::from_millis(67));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // Don't re-encode (or re-send) a frame the client already has; at
-        // camera rates below the tick rate this halves the encode work.
-        let mut last_served: Option<Instant> = None;
+        let mut last_served: Option<Served> = None;
+        // The last live frame's dimensions, so a placeholder shown after a
+        // real frame keeps that frame's aspect ratio rather than jumping to
+        // the startup default.
+        let mut last_dims: Option<(u32, u32)> = None;
 
         loop {
             interval.tick().await;
             let f = frames.borrow_and_update().clone();
+            let eff = f.effective_signal();
+            let live = matches!(eff, Signal::Stable | Signal::ModeSwitching)
+                && f.width > 0
+                && f.height > 0;
 
-            if f.signal == Signal::NoDevice || f.width == 0 {
-                continue;
-            }
-            if last_served == Some(f.captured_at) {
-                continue;
-            }
-
-            // Fast path: raw JPEG bytes from the device — no decode/re-encode.
-            let jpeg_bytes: Vec<u8> = if let Some(ref raw) = f.jpeg {
-                raw.to_vec()
-            } else {
-                // Fallback: encode from native pixels (macOS NV12 / YUYV).
-                // Review M21: real CPU work, so it runs off the async runtime
-                // rather than blocking this stream's tokio worker (and every
-                // other request sharing it) for the encode.
-                let owned = f.clone();
-                match tokio::task::spawn_blocking(move || encode_preview_jpeg(&owned)).await {
-                    Ok(Some(b)) => b,
-                    _ => continue,
+            if live {
+                last_dims = Some((f.width, f.height));
+                if matches!(last_served, Some(Served::Frame(at)) if at == f.captured_at) {
+                    continue;
                 }
-            };
-            last_served = Some(f.captured_at);
 
-            let part_header = format!(
-                "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
-                jpeg_bytes.len()
-            );
-            let mut chunk = Vec::with_capacity(part_header.len() + jpeg_bytes.len() + 2);
-            chunk.extend_from_slice(part_header.as_bytes());
-            chunk.extend_from_slice(&jpeg_bytes);
-            chunk.extend_from_slice(b"\r\n");
-
-            yield Ok::<Bytes, std::io::Error>(Bytes::from(chunk));
+                // Fast path: raw JPEG bytes from the device — no decode/re-encode.
+                let jpeg_bytes: Vec<u8> = if let Some(ref raw) = f.jpeg {
+                    raw.to_vec()
+                } else {
+                    // Fallback: encode from native pixels (macOS NV12 / YUYV).
+                    // Review M21 / Issue #142: real CPU work, so it runs off
+                    // the async runtime, bounded by `expensive`, and
+                    // coalesced across every client on this frame via
+                    // `preview_cache`. `_permit` (leading underscore: a real
+                    // binding kept alive by RAII, not `let _ = ...`, which
+                    // would drop it immediately) is released at the end of
+                    // this `else` block — before its value is even assigned
+                    // to `jpeg_bytes`, well before the chunk below is
+                    // yielded.
+                    let _permit = match expensive.acquire().await {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    let cached = {
+                        let guard = preview_cache.lock().ok();
+                        guard.and_then(|g| match &*g {
+                            Some((at, bytes)) if *at == f.captured_at => Some(Arc::clone(bytes)),
+                            _ => None,
+                        })
+                    };
+                    let bytes = match cached {
+                        Some(b) => b,
+                        None => {
+                            let owned = f.clone();
+                            let encoded =
+                                tokio::task::spawn_blocking(move || encode_preview_jpeg(&owned))
+                                    .await;
+                            let encoded: Arc<[u8]> = match encoded {
+                                Ok(Some(b)) => Arc::from(b),
+                                _ => continue,
+                            };
+                            if let Ok(mut c) = preview_cache.lock() {
+                                *c = Some((f.captured_at, Arc::clone(&encoded)));
+                            }
+                            encoded
+                        }
+                    };
+                    bytes.to_vec()
+                };
+                last_served = Some(Served::Frame(f.captured_at));
+                yield Ok::<Bytes, std::io::Error>(multipart_chunk(&jpeg_bytes, eff));
+            } else {
+                if matches!(last_served, Some(Served::Placeholder(sig)) if sig == eff) {
+                    continue;
+                }
+                let dims = last_dims;
+                let jpeg_bytes =
+                    match tokio::task::spawn_blocking(move || placeholder_jpeg(dims)).await {
+                        Ok(Some(b)) => b,
+                        _ => continue,
+                    };
+                last_served = Some(Served::Placeholder(eff));
+                yield Ok::<Bytes, std::io::Error>(multipart_chunk(&jpeg_bytes, eff));
+            }
         }
     };
 
@@ -705,6 +849,10 @@ use watch as _watch;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame::STALE_AFTER;
+    use axum::http::Request as HttpRequest;
+    use futures_util::StreamExt;
+    use tower::ServiceExt;
 
     /// A pre-v1 helper's plain text must still reach the caller as an
     /// envelope. Failing instead would look to an agent like a broken capture
@@ -874,5 +1022,235 @@ mod tests {
             .unwrap_or_else(|_| panic!("should not time out"));
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
+    }
+
+    // ── /preview test helpers ─────────────────────────────────────────────
+
+    /// A frame carrying real NV12 pixels, so the fallback encode path
+    /// (`encode_preview_jpeg`) actually runs rather than short-circuiting on
+    /// `PixelData::Empty`/`jpeg`.
+    fn nv12_frame(w: u32, h: u32, signal: Signal, captured_at: Instant) -> FrameState {
+        let y = vec![126u8; (w * h) as usize];
+        let cbcr = vec![128u8; (w * (h / 2)) as usize];
+        FrameState {
+            jpeg: None,
+            pixels: PixelData::Nv12 {
+                y: Arc::from(y),
+                cbcr: Arc::from(cbcr),
+            },
+            width: w,
+            height: h,
+            hash: 1,
+            signal,
+            resolution_epoch: 1,
+            captured_at,
+        }
+    }
+
+    fn preview_request() -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .uri("/preview")
+            .header(header::HOST, "127.0.0.1:1")
+            .header(header::AUTHORIZATION, "Bearer tok")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn preview_auth() -> crate::auth::Auth {
+        crate::auth::Auth::new("tok".into(), PUBLIC_ASSETS)
+    }
+
+    /// Pull one chunk (one multipart part: headers + JPEG bytes + trailing
+    /// CRLF) off a /preview response body stream, failing the test if none
+    /// arrives within 2s.
+    async fn next_chunk<S>(stream: &mut S) -> Bytes
+    where
+        S: futures_util::Stream<Item = Result<Bytes, axum::Error>> + Unpin,
+    {
+        tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("no chunk within 2s")
+            .expect("stream ended")
+            .expect("chunk error")
+    }
+
+    /// Slice out just the JPEG bytes of one chunk: between the blank line
+    /// that ends the part headers and the trailing "\r\n" this server always
+    /// appends after each part's body.
+    fn chunk_jpeg_payload(chunk: &[u8]) -> &[u8] {
+        let sep = chunk
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("no header/body separator in chunk")
+            + 4;
+        &chunk[sep..chunk.len() - 2]
+    }
+
+    /// Pull one header's value out of a chunk's part headers (before the
+    /// blank line). Not a real HTTP parser — good enough for a test.
+    fn header_value(chunk: &[u8], name: &str) -> Option<String> {
+        let text = String::from_utf8_lossy(chunk);
+        let needle = format!("{name}: ");
+        let start = text.find(&needle)? + needle.len();
+        let end = text[start..].find("\r\n")?;
+        Some(text[start..start + end].to_string())
+    }
+
+    // ── Issue #142: /preview's fallback encode is bounded + coalesced ───────
+
+    /// Before the fix, every open /preview connection ran its own unbounded
+    /// `spawn_blocking` encode with no relationship to `AppState.expensive` —
+    /// so a burst of preview clients could pile up encode work indefinitely
+    /// while /snapshot and /ocr starved for a share of the same CPU. This
+    /// test holds every `expensive` permit (standing in for busy
+    /// /snapshot or /ocr requests) and checks that /preview's fallback
+    /// encode does not even start; only after releasing the permits does a
+    /// chunk arrive. On the old code (no `expensive.acquire()` anywhere in
+    /// the fallback path) the first assertion fails outright: a chunk
+    /// arrives immediately no matter who else holds permits.
+    #[tokio::test]
+    async fn preview_fallback_encode_is_bounded_by_the_expensive_semaphore() {
+        let frame = Arc::new(nv12_frame(16, 8, Signal::Stable, Instant::now()));
+        let (_tx, rx) = watch::channel(frame);
+        let state = AppState::new(rx);
+
+        // Clone the Arc first: a permit borrowed straight off `state.expensive`
+        // would tie its lifetime to a borrow of `state`, and `state` needs to
+        // move into `router` below while the permit is still held.
+        let expensive = state.expensive.clone();
+        let held = expensive
+            .acquire_many(EXPENSIVE_PERMITS as u32)
+            .await
+            .expect("acquire every expensive permit");
+
+        let app = router(state, preview_auth());
+        let resp = app.oneshot(preview_request()).await.unwrap();
+        let mut stream = resp.into_body().into_data_stream();
+
+        let starved = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
+        assert!(
+            starved.is_err(),
+            "a preview chunk arrived while every expensive permit was held"
+        );
+
+        drop(held);
+
+        let chunk = next_chunk(&mut stream).await;
+        assert!(chunk.starts_with(b"--frame\r\n"));
+    }
+
+    /// Two /preview connections watching the same (unchanged) frame must
+    /// share one encode (Issue #142) rather than each running their own.
+    /// Proven here not just by reading the cache after the first
+    /// connection's chunk arrives, but by *replacing* the cached bytes with
+    /// a sentinel a real encode could never produce, then checking that a
+    /// second, independent connection serves that sentinel back. On the old
+    /// code (no cache at all) this fails: the second connection re-encodes
+    /// the real frame and never sees the sentinel.
+    #[tokio::test]
+    async fn preview_shares_one_encode_across_clients_on_the_same_frame() {
+        const SENTINEL: &[u8] = b"SENTINEL-NOT-A-REAL-JPEG-0142";
+
+        let frame = Arc::new(nv12_frame(16, 8, Signal::Stable, Instant::now()));
+        let (_tx, rx) = watch::channel(frame);
+        let state = AppState::new(rx);
+
+        let app1 = router(state.clone(), preview_auth());
+        let resp1 = app1.oneshot(preview_request()).await.unwrap();
+        let mut stream1 = resp1.into_body().into_data_stream();
+        let _chunk1 = next_chunk(&mut stream1).await;
+
+        {
+            let mut cache = state.preview_cache.lock().unwrap();
+            let (captured_at, _) = cache.take().expect("first client populated the cache");
+            *cache = Some((captured_at, Arc::from(SENTINEL)));
+        }
+
+        let app2 = router(state, preview_auth());
+        let resp2 = app2.oneshot(preview_request()).await.unwrap();
+        let mut stream2 = resp2.into_body().into_data_stream();
+        let chunk2 = next_chunk(&mut stream2).await;
+
+        assert_eq!(
+            chunk_jpeg_payload(&chunk2),
+            SENTINEL,
+            "second client did not reuse the cached bytes for the same frame"
+        );
+    }
+
+    // ── Issue #143: /preview must not serve a frame that has gone stale ─────
+
+    /// A frame older than `STALE_AFTER` must not be served as-is: the first
+    /// part /preview sends for it must carry `X-Signal: stale` and must NOT
+    /// be the real encode of that (stale) frame. On the old code — which
+    /// only checked `f.signal == NoDevice || f.width == 0`, never
+    /// `effective_signal()` — this fails: the real, stale-frame encode goes
+    /// out with no `X-Signal` header at all.
+    #[tokio::test]
+    async fn preview_serves_a_placeholder_for_a_stale_frame() {
+        let stale_at = Instant::now() - (STALE_AFTER + Duration::from_millis(1));
+        let frame = Arc::new(nv12_frame(16, 8, Signal::Stable, stale_at));
+        let real_encode = encode_preview_jpeg(&frame).expect("reference encode");
+        let (_tx, rx) = watch::channel(frame);
+        let state = AppState::new(rx);
+
+        let app = router(state, preview_auth());
+        let resp = app.oneshot(preview_request()).await.unwrap();
+        let mut stream = resp.into_body().into_data_stream();
+        let chunk = next_chunk(&mut stream).await;
+
+        assert_eq!(header_value(&chunk, "X-Signal").as_deref(), Some("stale"));
+        assert_ne!(
+            chunk_jpeg_payload(&chunk),
+            real_encode.as_slice(),
+            "served the real (stale) frame instead of a placeholder"
+        );
+    }
+
+    /// The mirror image of the previous test: a fresh `Stable` frame must
+    /// still be served for real, byte-for-byte what `encode_preview_jpeg`
+    /// produces, carrying `X-Signal: stable`. Guards against an
+    /// over-eager staleness check swallowing live frames too.
+    #[tokio::test]
+    async fn preview_serves_the_real_encode_for_a_fresh_stable_frame() {
+        let frame = Arc::new(nv12_frame(16, 8, Signal::Stable, Instant::now()));
+        let real_encode = encode_preview_jpeg(&frame).expect("reference encode");
+        let (_tx, rx) = watch::channel(frame);
+        let state = AppState::new(rx);
+
+        let app = router(state, preview_auth());
+        let resp = app.oneshot(preview_request()).await.unwrap();
+        let mut stream = resp.into_body().into_data_stream();
+        let chunk = next_chunk(&mut stream).await;
+
+        assert_eq!(header_value(&chunk, "X-Signal").as_deref(), Some("stable"));
+        assert_eq!(chunk_jpeg_payload(&chunk), real_encode.as_slice());
+    }
+
+    /// A stale placeholder must be sent once per transition, not every 67ms
+    /// tick: after the first placeholder part, no further chunk should
+    /// arrive while the signal stays `Stale`. This particular frame's fixed
+    /// `captured_at` means the *old* code's `last_served == Some(captured_at)`
+    /// dedup would also have suppressed a repeat, for the wrong reason —
+    /// this test guards the new `Served::Placeholder` dedup against a
+    /// regression where every tick re-encodes and re-sends the placeholder,
+    /// rather than discriminating old vs. new code on its own.
+    #[tokio::test]
+    async fn preview_does_not_repeat_the_stale_placeholder_every_tick() {
+        let stale_at = Instant::now() - (STALE_AFTER + Duration::from_millis(1));
+        let frame = Arc::new(nv12_frame(16, 8, Signal::Stable, stale_at));
+        let (_tx, rx) = watch::channel(frame);
+        let state = AppState::new(rx);
+
+        let app = router(state, preview_auth());
+        let resp = app.oneshot(preview_request()).await.unwrap();
+        let mut stream = resp.into_body().into_data_stream();
+        let _first = next_chunk(&mut stream).await;
+
+        let second = tokio::time::timeout(Duration::from_millis(300), stream.next()).await;
+        assert!(
+            second.is_err(),
+            "the stale placeholder was resent on a later tick"
+        );
     }
 }
