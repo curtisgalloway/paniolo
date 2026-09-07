@@ -106,12 +106,32 @@ pub fn discover() -> Option<Discovery> {
     Some(d)
 }
 
+/// Try to acquire the daemon's advisory lock at `path`, creating the lock
+/// file if it doesn't already exist. Fails if another process already holds
+/// an exclusive `flock` on it — including one holding it on the same path's
+/// *previous* inode (see the long comment at the `run()` call site for why
+/// the lock path is never unlinked on shutdown).
+fn acquire_lock(path: &Path) -> Result<File> {
+    let file = File::create(path)?;
+    file.try_lock_exclusive()
+        .map_err(|_| anyhow!("another hid daemon is already running"))?;
+    Ok(file)
+}
+
+/// Shutdown cleanup run from the graceful-shutdown future, with the process
+/// about to hard-exit. Removes the discovery file and the console symlink
+/// (when we own one) — `daemon.lock` is deliberately left in place; see the
+/// comment at the call site.
+fn shutdown_cleanup(discovery_path: &Path, console_link: Option<&Path>) {
+    let _ = fs::remove_file(discovery_path);
+    if let Some(link) = console_link {
+        let _ = fs::remove_file(link);
+    }
+}
+
 /// Blocking entry point for `hidrig serve`.
 pub fn run(device: String, port: u16) -> Result<()> {
-    let lock_file = File::create(lock_path()?)?;
-    lock_file
-        .try_lock_exclusive()
-        .map_err(|_| anyhow!("another hid daemon is already running"))?;
+    let lock_file = acquire_lock(&lock_path()?)?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -166,10 +186,22 @@ pub fn run(device: String, port: u16) -> Result<()> {
             .layer(axum::Extension(shutdown.clone()));
 
         // The /hid WebSocket is long-lived, so plain graceful shutdown would
-        // block forever. Release whatever is held, remove discovery + lock,
-        // brief grace, then hard-exit (the OS releases the UART).
+        // block forever. Release whatever is held, remove the discovery
+        // file and console symlink, brief grace, then hard-exit (the OS
+        // releases the UART).
+        //
+        // The lock file itself is deliberately NOT unlinked here: `lock_file`
+        // (above) holds an OS advisory lock (flock) on it, and this process
+        // exits before ever reaching `drop(lock_file)`. Unlinking the path
+        // while the lock is still held replaces the directory entry with a
+        // fresh inode the moment the next daemon starts — that daemon's
+        // `try_lock_exclusive` succeeds against the NEW inode even while this
+        // process (and its lock on the OLD, now-unlinked inode) is still
+        // alive, so two daemons could hold the UART at once. Leaving the
+        // file in place means the next daemon's `File::create` reopens the
+        // SAME inode, and its lock attempt correctly waits on this process's
+        // exit (which releases the OS-level lock).
         let disc_p = discovery_path()?;
-        let lock_p = lock_path()?;
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
                 tokio::select! {
@@ -181,11 +213,7 @@ pub fn run(device: String, port: u16) -> Result<()> {
                 if let Err(e) = shutdown_hid.release_for_shutdown(RELEASE_TIMEOUT).await {
                     warn!("shutdown: {e}");
                 }
-                let _ = fs::remove_file(&disc_p);
-                let _ = fs::remove_file(&lock_p);
-                if let Some(link) = &console_link {
-                    let _ = fs::remove_file(link);
-                }
+                shutdown_cleanup(&disc_p, console_link.as_deref());
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 info!("hid daemon shut down");
                 std::process::exit(0);
@@ -342,6 +370,65 @@ mod tests {
         assert_eq!(back.token.as_deref(), Some("ab"));
         assert_eq!(back.console.as_deref(), Some("/run/hid/console"));
         assert_eq!(back.console_device.as_deref(), Some("/dev/pts/7"));
+    }
+
+    /// Reproduces the shutdown race from issue #148 without hardware. The
+    /// running daemon holds an exclusive `flock` on `daemon.lock`; shutdown
+    /// must not unlink that path, or a second daemon's `File::create` +
+    /// `try_lock_exclusive` opens a fresh inode there and locks IT
+    /// successfully while the first daemon (still holding the lock on the
+    /// old, now-unlinked inode) is still alive — two UART owners at once.
+    ///
+    /// On the pre-fix code, `shutdown_cleanup` also unlinked the lock path,
+    /// so `lock_path.exists()` would be false right after the call (the
+    /// directory entry is gone) and the `second` acquire below would
+    /// wrongly succeed — this test fails against that behavior. Against the
+    /// fix, the path still names the same, still-locked inode, so `second`
+    /// fails until `first` is dropped.
+    #[test]
+    fn shutdown_cleanup_leaves_the_lock_file_locked() {
+        let dir =
+            std::env::temp_dir().join(format!("paniolo-hidrig-lock-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let lock_path = dir.join("daemon.lock");
+        let disc_path = dir.join("daemon.json");
+
+        // Simulates the running daemon: it holds the lock and has published
+        // a discovery file.
+        let first = acquire_lock(&lock_path).expect("first daemon acquires the lock");
+        fs::write(&disc_path, b"{}").unwrap();
+
+        // Run the exact cleanup the graceful-shutdown future calls, with
+        // `first` still open — the real shutdown never reaches
+        // `drop(lock_file)` either, since it hard-exits right after this.
+        shutdown_cleanup(&disc_path, None);
+
+        assert!(!disc_path.exists(), "discovery file is removed on shutdown");
+        assert!(
+            lock_path.exists(),
+            "daemon.lock must stay on disk -- shutdown must not unlink it"
+        );
+
+        // A second daemon starting now must fail to acquire the lock: it
+        // opens the SAME inode `first` still holds.
+        let second = acquire_lock(&lock_path);
+        assert!(
+            second.is_err(),
+            "a second daemon must not lock the path while the first is still running"
+        );
+
+        drop(first);
+
+        // Once the first daemon actually exits (releasing its OS-level
+        // flock), the next daemon can start normally against the same path.
+        let third = acquire_lock(&lock_path);
+        assert!(
+            third.is_ok(),
+            "the next daemon can lock the path once the previous one is gone"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A `console` link left by a previous daemon (here: dangling) is replaced
