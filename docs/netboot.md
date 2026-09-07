@@ -66,7 +66,7 @@ netboot channel fields:
 | `--host-ip` | `192.168.99.1` | Static IP assigned to the interface; also the TFTP/HTTP server address and the router the client is told about. The client's lease is derived from it (same /24, last octet `100` — `192.168.99.100` by default) — see [Lease](#dhcp--tftp-behavior-notes) |
 | `--tftp-root` | (none) | Directory whose contents are served over TFTP **and** HTTP |
 | `--boot-file` | `kernel_2712.img` | Boot program (filename under the root, e.g. `grubaa64.efi`); served as a TFTP filename to PXE and wrapped in an `http://` URL for HTTP Boot |
-| `--http-port` | `80` | HTTP server port; also embedded in the HTTP Boot URL (omitted from the URL when 80) |
+| `--http-port` | `80` | HTTP server port; also embedded in the HTTP Boot URL (omitted from the URL when 80). `0` binds an OS-assigned ephemeral port — the URL always carries the port actually bound, never a literal `0` |
 | `--content-type` | `application/octet-stream` | `Content-Type` for HTTP responses (UEFI treats octet-stream as an EFI application) |
 | `--host` | target default | Lab host the channel lives on |
 
@@ -130,9 +130,12 @@ netbootd stays root and says so in its log. On macOS netbootd never had root
 **HTTP is optional; DHCP and TFTP are not.** If the HTTP port cannot be bound
 (something else owns port 80, say), netbootd logs a warning naming the port and
 keeps serving DHCP + TFTP — the Pi and UEFI PXE paths still work. HTTP Boot is
-then unavailable: an `HTTPClient` DHCP request still gets its `http://` offer,
-but the fetch fails. Free the port or set `--http-port` to an unused one. A DHCP
-or TFTP socket that cannot be bound or pinned is fatal.
+then unavailable: an `HTTPClient` DHCP request gets no offer at all (a
+rate-limited warning in the log), rather than an `http://` URL pointing at a
+server that isn't there — EDK2's `HttpBootDxe` would only reject a non-HTTP
+reply anyway, since it requires the `HTTPClient` class echo before it accepts
+an offer. Free the port or set `--http-port` to an unused one. A DHCP or TFTP
+socket that cannot be bound or pinned is fatal.
 
 **Interface safety:** `start` **refuses** an interface that carries your system
 default route (a primary NIC). netboot reconfigures the interface to the static

@@ -981,7 +981,14 @@ Key differences from the Python servers:
   `IP_BOUND_IF` on macOS, `SO_BINDTODEVICE` on Linux) before it is bound, and
   a pin that fails is fatal — so is a DHCP or TFTP bind failure. `--interface`
   is required. The HTTP bind alone is non-fatal: a port clash logs a warning
-  and netbootd runs DHCP + TFTP without HTTP Boot. The UDP listeners carry no
+  and netbootd runs DHCP + TFTP without HTTP Boot. `main.rs` reads the *actual*
+  bound port back from the listener (`local_addr()`) and hands DHCP an
+  `Option<u16>` — `Some(real_port)`, correct even for `--http-port 0`'s
+  OS-assigned ephemeral port, or `None` when there is no listener at all.
+  `dhcp::serve`'s `choose_boot` never builds an `http://` URL without a real
+  bound port: an `HTTPClient` DHCPDISCOVER/REQUEST with no HTTP endpoint is
+  ignored (rate-limited warning) rather than answered with a URL pointing at
+  nothing (#144). The UDP listeners carry no
   `SO_REUSEADDR` (UDP has no TIME_WAIT, and on Linux it would let a duplicate
   daemon silently share the port); the TCP listener keeps it for TIME_WAIT.
 - **Root is dropped on Linux** (`src/privdrop.rs`) right after the listeners
