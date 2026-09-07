@@ -1,11 +1,15 @@
 # paniolo
 
+<img src="docs/paniolo-on-horse.png" align="left" width="240" alt="A robot paniolo in a cowboy hat, on horseback, holding the reins">
+
 Agent-controlled target machine wrangler for low-level software development.
 
 "Paniolo" is the Hawaiian word for cowboy. The idea: an AI agent sits at the
 reins while you're writing bootloaders, firmware, or OS bring-up code — paniolo
 gives it the controls to netboot the target, watch its output, send it input,
 and power-cycle it without human intervention at each iteration.
+
+<br clear="left">
 
 ## See it work
 
