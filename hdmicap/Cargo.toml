@@ -82,6 +82,14 @@ windows = { version = "0.62", features = [
 [dev-dependencies]
 # tower::ServiceExt::oneshot drives the auth layer in src/auth.rs's tests.
 tower = { version = "0.5", features = ["util"] }
+# StreamExt::next(), to pull individual multipart/x-mixed-replace chunks out
+# of /preview's response body in server.rs's tests. Not a new dependency in
+# practice: axum-core already depends on futures-util directly, with this
+# same feature set (it's what implements Body/BodyDataStream's Stream impl),
+# so this only exposes the crate already in the build graph under our own
+# name for test code to use, without pulling in anything axum-core doesn't
+# already request.
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 
 [profile.release]
 opt-level = 3

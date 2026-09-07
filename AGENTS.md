@@ -517,9 +517,20 @@ hdmicap/         Rust crate: warm-stream HDMI capture daemon
                  answering 503 "capture thread gone" right away. PNG
                  encode/decode (incl. Linux turbojpeg) and the preview JPEG
                  fallback run on spawn_blocking, not inline on a tokio worker;
-                 PNG encoding and the OCR subprocess share AppState.expensive
-                 (a 2-permit Semaphore) so repeated dashboard clicks queue
-                 rather than piling up CPU work or visionocr children. The OCR
+                 PNG encoding, the OCR subprocess, and /preview's fallback
+                 encode all share AppState.expensive (a 2-permit Semaphore) so
+                 repeated dashboard clicks (or a handful of open preview tabs)
+                 queue rather than piling up CPU work or visionocr children.
+                 /preview also coalesces: AppState.preview_cache (a std Mutex,
+                 never held across an await) keeps the last fallback-encoded
+                 JPEG keyed by the frame's captured_at, so every client
+                 watching one frame costs one encode, not N. And /preview
+                 checks FrameState::effective_signal(), not just
+                 signal == NoDevice — once the warm frame goes Stale (or
+                 NoSignal/NoDevice), the stream stops sending that frame's
+                 bytes and instead sends a placeholder JPEG (dark field, red
+                 X) once per transition, with every part carrying an
+                 X-Signal header naming the effective signal. The OCR
                  child sets kill_on_drop(true) and is awaited under a 30 s
                  timeout (wait_with_timeout) — 504 on timeout, process killed
     auth.rs      token + loopback Host/Origin layer over the whole router
