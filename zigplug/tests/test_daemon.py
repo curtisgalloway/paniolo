@@ -36,9 +36,10 @@ import unittest
 from pathlib import Path
 
 import pytest
+import typer
 from aiohttp import test_utils, web
 
-from zigplug import _app, _daemon
+from zigplug import _app, _cli, _daemon
 
 TOKEN = "test-token-not-a-secret"
 
@@ -264,6 +265,54 @@ def test_request_does_not_loop_when_the_respawn_is_dead_too(runtime_dir, monkeyp
             "/dev/ttyZ", Path("unused.db"), "GET", "/healthz", None, timeout=5.0
         )
     assert spawns == ["/dev/ttyZ"]
+
+
+# ── CLI: `zigplug stop` never falls back to signaling the recorded pid ─────
+
+
+def test_stop_never_signals_a_stale_pid_when_the_daemon_wont_die(
+    runtime_dir, stub_daemon, monkeypatch
+):
+    """Something is listening on the recorded port and answers `/stop`, but
+    it rejects the token (a stand-in for the real bug: the kernel reused the
+    pid/port and whatever is there now is not our daemon) and never removes
+    the discovery file. Before the fix, `stop` waited 5s and then fell back
+    to `os.kill(daemon.pid, SIGTERM)`. The recorded pid here is this test
+    process's own pid, so the old behavior would kill the test runner. The
+    fix must report failure and exit non-zero, and must never call
+    `os.kill` at all.
+    """
+    mismatched = dataclasses.replace(stub_daemon, token="not-the-real-token")
+    _daemon.write_discovery(_daemon.discovery_path(), mismatched)
+
+    # Speed the 5s poll loop up to nothing: fake time.monotonic()/time.sleep()
+    # under the same names `_cli.py` calls (`import time`), so the test does
+    # not need to wait out the real deadline.
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_cli.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        _cli.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+    )
+
+    # `_daemon.read_discovery()` legitimately probes liveness with
+    # `os.kill(pid, 0)` (signal 0 raises nothing on a live pid and is not a
+    # termination); only a real signal (SIGTERM below) is what must never
+    # happen.
+    killed: list[tuple] = []
+
+    def fake_kill(pid, sig=0):
+        if sig != 0:
+            killed.append((pid, sig))
+
+    monkeypatch.setattr(os, "kill", fake_kill)
+
+    with pytest.raises(typer.Exit) as excinfo:
+        _cli.stop()
+    assert excinfo.value.exit_code != 0
+    assert not killed, f"stop() must never signal the recorded pid, got {killed}"
+    # The daemon never actually exited (its discovery file never changed),
+    # and `stop` must not have deleted it out from under a real daemon.
+    assert _daemon.read_discovery() == mismatched
 
 
 # ── server: the auth middleware on a real aiohttp test server ────────────────
