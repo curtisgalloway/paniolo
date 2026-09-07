@@ -417,6 +417,12 @@ because DTR-to-J2 wiring is rare. On a target that hasn't opted in, `serial dtr`
 So: unless DTR wiring is explicitly declared, reboot via the console `reboot` or
 `power-cycle` — do **not** assume `serial reset` power-cycles the board.
 
+### DTR failures
+
+A serial DTR command fails if either assertion or release fails. The daemon
+attempts release and reconnects the failed port. Inspect the target before
+retrying: an error does not prove that no physical power-button press occurred.
+
 ### Cambrionix hub (example)
 
 The `cambrionix` helper binary drives a Cambrionix USB hub's control UART and

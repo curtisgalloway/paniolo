@@ -177,7 +177,7 @@ async fn devices() -> Response {
 /// Short presses (≤500 ms) deliver a power-button event to the OS (graceful
 /// reboot/halt, target-OS-defined).  Long presses (≥3000 ms) trigger a PMIC
 /// hard power-off.  The call blocks until the press completes.
-/// Returns 200 on success, 503 if the supervisor is not running.
+/// Returns 200 on success, 503 if the supervisor is unavailable or a DTR ioctl fails.
 async fn button(State(s): State<AppState>, Query(q): Query<ButtonParam>) -> Response {
     let handle = match resolve(&s.serials, &q.interface) {
         Some(h) => h.clone(),

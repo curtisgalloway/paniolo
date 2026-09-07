@@ -661,3 +661,8 @@ rest of the way).
   it works regardless of the AC-recovery BIOS setting.
 - **`status` is the debugging view**: it prints the AMT firmware identity
   (from the HTTP `Server:` header) and the raw CIM PowerState name/number.
+
+When serialcap handles DTR, a failed assertion or release fails the command
+instead of reporting a successful press. Release is attempted even after an
+assertion error. The daemon reconnects the failed handle with DTR deasserted;
+check the target before retrying because the physical press may have occurred.

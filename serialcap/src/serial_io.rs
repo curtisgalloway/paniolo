@@ -143,7 +143,7 @@ pub struct SerialHandle {
     status: Arc<Mutex<Status>>,
     /// Button-press requests: caller sends (duration_ms, responder); the
     /// supervisor asserts DTR for that many milliseconds then replies.
-    dtr_tx: mpsc::Sender<(u64, oneshot::Sender<()>)>,
+    dtr_tx: mpsc::Sender<(u64, oneshot::Sender<Result<(), String>>)>,
 }
 
 impl SerialHandle {
@@ -179,7 +179,8 @@ impl SerialHandle {
             .map_err(|_| anyhow::anyhow!("supervisor not running"))?;
         resp_rx
             .await
-            .map_err(|_| anyhow::anyhow!("supervisor dropped response"))
+            .map_err(|_| anyhow::anyhow!("supervisor dropped response"))?
+            .map_err(anyhow::Error::msg)
     }
 
     /// Wait until every byte has been accepted by the serial driver. Pacing
@@ -219,7 +220,7 @@ pub fn spawn_interface(
 ) -> SerialHandle {
     let (to_clients, _) = broadcast::channel(BROADCAST_CAP);
     let (write_tx, write_rx) = mpsc::channel(WRITE_CAP);
-    let (dtr_tx, dtr_rx) = mpsc::channel::<(u64, oneshot::Sender<()>)>(1);
+    let (dtr_tx, dtr_rx) = mpsc::channel::<(u64, oneshot::Sender<Result<(), String>>)>(1);
     let ring = Arc::new(Mutex::new(VecDeque::with_capacity(RING_BYTES)));
     let status = Arc::new(Mutex::new(Status {
         device: spec.device.clone(),
@@ -549,7 +550,7 @@ enum InnerExit {
     Disconnect,
     DtrPress {
         duration_ms: u64,
-        resp_tx: oneshot::Sender<()>,
+        resp_tx: oneshot::Sender<Result<(), String>>,
     },
 }
 
@@ -557,7 +558,7 @@ async fn supervisor(
     spec: InterfaceSpec,
     to_clients: broadcast::Sender<Bytes>,
     mut write_rx: mpsc::Receiver<WriteRequest>,
-    mut dtr_rx: mpsc::Receiver<(u64, oneshot::Sender<()>)>,
+    mut dtr_rx: mpsc::Receiver<(u64, oneshot::Sender<Result<(), String>>)>,
     ring: Arc<Mutex<VecDeque<u8>>>,
     status: Arc<Mutex<Status>>,
     line_tx: stdmpsc::Sender<Bytes>,
@@ -708,15 +709,31 @@ async fn supervisor(
                     // Rejoin the split halves to regain the SerialPort trait methods.
                     let mut port = rd.unsplit(wr);
                     emit_marker(&ring, &to_clients, &line_tx, "button press", 35); // magenta
-                    port.write_data_terminal_ready(true).ok();
-                    tokio::time::sleep(Duration::from_millis(duration_ms)).await;
-                    port.write_data_terminal_ready(false).ok();
+                    let result = pulse_dtr(
+                        |level| port.write_data_terminal_ready(level),
+                        Duration::from_millis(duration_ms),
+                    )
+                    .await;
                     // Read power state immediately after releasing the button — the
                     // 3.3 V rail may have dropped (long press → power-off).
                     if let Some(sig) = &power_sense_signal {
                         status.lock().unwrap().power_on = read_power_sense(&mut port, sig);
                     }
-                    resp_tx.send(()).ok();
+                    let failed = result.is_err();
+                    resp_tx.send(result).ok();
+                    if failed {
+                        // A failed release may leave DTR asserted. Close the
+                        // failed handle and reconnect with DTR deasserted.
+                        {
+                            let mut st = status.lock().unwrap();
+                            st.connected = false;
+                            st.power_on = None;
+                        }
+                        emit_marker(&ring, &to_clients, &line_tx, "disconnected", 31);
+                        drop(port);
+                        tokio::time::sleep(REOPEN_DELAY).await;
+                        break;
+                    }
                     // Keep the port open. Closing and reopening it here let the
                     // OS drop and re-raise DTR on the way back in — a second,
                     // driver-timed button press after every deliberate one.
@@ -734,6 +751,27 @@ async fn supervisor(
                 }
             }
         }
+    }
+}
+
+/// Always attempt release, including when assertion itself failed. Keep both
+/// errors if neither operation succeeded so a failed release is never hidden.
+async fn pulse_dtr(
+    mut set: impl FnMut(bool) -> serialport::Result<()>,
+    duration: Duration,
+) -> Result<(), String> {
+    let asserted = set(true);
+    if asserted.is_ok() {
+        tokio::time::sleep(duration).await;
+    }
+    let released = set(false);
+    match (asserted, released) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), Ok(())) => Err(format!("asserting DTR failed: {e}")),
+        (Ok(()), Err(e)) => Err(format!("releasing DTR failed: {e}")),
+        (Err(a), Err(r)) => Err(format!(
+            "asserting DTR failed: {a}; releasing DTR failed: {r}"
+        )),
     }
 }
 
@@ -1054,6 +1092,49 @@ mod tests {
         );
         assert_eq!(f.recovered(), None, "a clean open has nothing to report");
         assert_eq!(f.failed(t0), Some(1), "the cycle restarts after recovery");
+    }
+
+    #[tokio::test]
+    async fn dtr_errors_are_reported_and_release_is_always_attempted() {
+        for failures in [[false, false], [true, false], [false, true], [true, true]] {
+            let mut calls = Vec::new();
+            let result = pulse_dtr(
+                |level| {
+                    let fail = failures[calls.len()];
+                    calls.push(level);
+                    if fail {
+                        Err(serialport::Error::new(
+                            serialport::ErrorKind::Unknown,
+                            "injected failure",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+                Duration::ZERO,
+            )
+            .await;
+            assert_eq!(calls, [true, false]);
+            assert_eq!(result.is_err(), failures.iter().any(|f| *f));
+            if let Err(message) = result {
+                assert_eq!(message.contains("asserting"), failures[0]);
+                assert_eq!(message.contains("releasing"), failures[1]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dtr_handle_propagates_the_supervisors_error() {
+        let (mut handle, _rx) = test_handle();
+        let (tx, mut rx) = mpsc::channel(1);
+        handle.dtr_tx = tx;
+        let worker = tokio::spawn(async move {
+            let (_, reply) = rx.recv().await.unwrap();
+            reply.send(Err("releasing DTR failed".into())).unwrap();
+        });
+        let error = handle.dtr_press(1).await.unwrap_err();
+        assert!(error.to_string().contains("releasing DTR failed"));
+        worker.await.unwrap();
     }
 
     // ── describe: port-type formatting ──────────────────────────────────────
@@ -1502,12 +1583,19 @@ mod tests {
         let (_, mut rx) = handle.attach();
         recv_until(&mut rx, b"serial connected").await;
 
-        handle.dtr_press(20).await.unwrap();
+        let press = handle.dtr_press(20).await;
+        if press.is_err() {
+            // PTYs need not implement modem-control ioctls. A failed ioctl
+            // must now be reported and the failed handle reopened.
+            recv_until(&mut rx, b"reconnected").await;
+        }
 
         std::io::Write::write_all(&mut far, b"after the press\r\n").unwrap();
         let got = recv_until(&mut rx, b"after the press").await;
         let text = String::from_utf8_lossy(&got);
-        assert!(text.contains("serial button press"), "{text}");
+        if press.is_ok() {
+            assert!(text.contains("serial button press"), "{text}");
+        }
         assert!(
             !text.contains("reconnected") && !text.contains("disconnected"),
             "the press reopened the port: {text}"

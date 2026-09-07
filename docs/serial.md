@@ -327,6 +327,11 @@ See [power.md](power.md) for wiring diagrams, the generic power hooks
 
 ---
 
+A failed DTR assertion or release returns an error to the caller. The daemon
+always attempts release, then closes and reopens a failed serial handle with
+DTR deasserted. An error can follow a partial or completed physical press;
+check the target before retrying a power operation.
+
 ## Runtime paths
 
 | Purpose | Path |
@@ -371,7 +376,7 @@ unauthenticated requests; `paniolo daemons restart --stale` replaces it.
 | GET | `/status` | One interface (`?interface=`) or all; `{name, device, baud, connected, power_on}` |
 | GET | `/interfaces` | All interfaces and their status |
 | GET | `/devices` | Serial devices on the host |
-| POST | `/button` | Pulse DTR for `?ms=N` (J2 power button); see [power.md](power.md) |
+| POST | `/button` | Pulse DTR for `?ms=N`; 503 if assertion or release fails; see [power.md](power.md) |
 | POST | `/input` | Write the request body to the port; `?pace_ms=N` drips one byte per N ms |
 
 `POST /input` writes through the port the daemon already owns, so input coexists
