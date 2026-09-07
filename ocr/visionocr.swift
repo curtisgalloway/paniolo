@@ -40,6 +40,49 @@ func die(_ msg: String) -> Never {
     exit(1)
 }
 
+// Resource limits shared with ocr/linuxocr, ocr/rapidocr and
+// ocr/winocr/src/main.rs -- maxEncodedBytes, maxDimension and maxPixels must
+// be identical across all four helpers (see docs/dev/ocr.md's "Resource
+// limits" section). This helper upscales 2x during preprocessing (see
+// upscaleAndPad below), so maxDimension/maxPixels are sized against that
+// *working* (post-2x, before padding) size: exactly 2x a 4K capture
+// (3840x2160) in each dimension, so any 4K frame passes with margin. The
+// small fixed padding upscaleAndPad adds on top is not part of the limit --
+// it is a constant 32 px, negligible against an 8192px/33-megapixel budget.
+let maxEncodedBytes = 64 * 1024 * 1024  // 64 MiB of encoded input
+let maxDimension = 8192  // px, per side, of the post-upscale (pre-pad) working image
+let maxPixels = 33_177_600  // 7680x4320 total px of the post-upscale (pre-pad) image
+
+// Reject dimensions before they drive an allocation. Pure so `--self-test`
+// can exercise it without an image or Vision; returns a one-line message
+// when `w`x`h` exceeds either shared limit, nil otherwise.
+func checkDimensions(_ w: Int, _ h: Int) -> String? {
+    if w > maxDimension || h > maxDimension {
+        return "image is \(w)x\(h); exceeds the \(maxDimension)px-per-side limit"
+    }
+    if w * h > maxPixels {
+        return "image is \(w)x\(h) (\(w * h) px); exceeds the \(maxPixels)px limit"
+    }
+    return nil
+}
+
+// Reads chunks from `next(want)` -- each call asks for no more than what's
+// left before `maxBytes` + 1 -- until input ends or the limit is passed.
+// Pure aside from the `next` closure, so `--self-test` can drive it with an
+// in-memory chunk source instead of a real FileHandle; the actual callers
+// below wrap `FileHandle.read(upToCount:)`. Returns whatever was read,
+// which may be up to one byte more than `maxBytes` -- the caller decides
+// whether that's an error (it always is, here).
+func readBounded(maxBytes: Int, next: (_ want: Int) -> Data?) -> Data {
+    var data = Data()
+    while data.count <= maxBytes {
+        let want = maxBytes + 1 - data.count
+        guard let chunk = next(want), !chunk.isEmpty else { break }
+        data.append(chunk)
+    }
+    return data
+}
+
 // Upscale and black-pad an image. Small thin console text recognizes far better
 // when enlarged, and padding stops glyphs flush to the frame edge from being
 // clipped (which drops the first/last character of a line).
@@ -134,21 +177,95 @@ private func runSelfTest() -> Bool {
     ]
 
     var ok = true
+    var count = 0
+    func fail(_ name: String, _ got: Any, _ want: Any) {
+        FileHandle.standardError.write(
+            "visionocr --self-test: FAIL \(name): got \(got), want \(want)\n"
+                .data(using: .utf8)!)
+        ok = false
+    }
+
     for c in cases {
+        count += 1
         let got = clipBoxToSource(
             px0: c.px0, py0: c.py0, px1: c.px1, py1: c.py1,
             pad: c.pad, scale: c.scale, srcW: c.srcW, srcH: c.srcH)
         if got != c.expected {
-            FileHandle.standardError.write(
-                "visionocr --self-test: FAIL \(c.name): got \(got), want \(c.expected)\n"
-                    .data(using: .utf8)!)
-            ok = false
+            fail(c.name, got, c.expected)
         }
     }
+
+    // checkDimensions -- issue #150/#151's shared resource limits.
+    count += 1
+    if let err = checkDimensions(100, 100) {
+        fail("checkDimensions accepts 100x100", err, "nil")
+    }
+    count += 1
+    if checkDimensions(maxDimension + 1, 100) == nil {
+        fail("checkDimensions rejects over per-side limit", "nil", "an error")
+    }
+    count += 1
+    // 6000x6000 is under maxDimension (8192) on each side but over maxPixels
+    // (33,177,600) in total: 36,000,000 > 33,177,600.
+    if checkDimensions(6000, 6000) == nil {
+        fail("checkDimensions rejects over pixel-count limit", "nil", "an error")
+    }
+    count += 1
+    let atLimitHeight = maxPixels / maxDimension
+    if let err = checkDimensions(maxDimension, atLimitHeight) {
+        fail("checkDimensions accepts exactly the limits", err, "nil")
+    }
+
+    // readBounded, driven from an in-memory chunk source rather than a real
+    // FileHandle -- one 200-byte chunk, then EOF.
+    count += 1
+    let exact = Data(repeating: 7, count: 10)
+    var servedExact = false
+    let gotExact = readBounded(maxBytes: 10) { _ in
+        if servedExact { return nil }
+        servedExact = true
+        return exact
+    }
+    if gotExact != exact {
+        fail("readBounded returns data at exactly the cap", gotExact.count, exact.count)
+    }
+    count += 1
+    let over = Data(repeating: 7, count: 11)
+    var servedOver = false
+    let gotOver = readBounded(maxBytes: 10) { _ in
+        if servedOver { return nil }
+        servedOver = true
+        return over
+    }
+    if gotOver.count <= 10 {
+        fail("readBounded surfaces one byte over the cap", gotOver.count, 11)
+    }
+    count += 1
+    // Multiple small chunks, well under the cap: nothing should be dropped.
+    var chunks = [Data([1, 2]), Data([3, 4, 5]), Data([6])]
+    let gotChunked = readBounded(maxBytes: 100) {
+        _ in chunks.isEmpty ? nil : chunks.removeFirst()
+    }
+    if gotChunked != Data([1, 2, 3, 4, 5, 6]) {
+        fail("readBounded reassembles multiple chunks", Array(gotChunked), [1, 2, 3, 4, 5, 6])
+    }
+
     if ok {
-        print("visionocr --self-test: all \(cases.count) cases passed")
+        print("visionocr --self-test: all \(count) cases passed")
     }
     return ok
+}
+
+// Checks a source size and the working (post-upscale, pre-pad) size
+// upscaleAndPad is about to allocate for it against the shared limits, and
+// dies with checkDimensions's message if either is over. The small fixed
+// padding upscaleAndPad adds on top is not part of the check -- see
+// maxDimension/maxPixels's comment.
+func enforceDimensionLimits(sourceW: Int, sourceH: Int, scale: CGFloat) {
+    if let err = checkDimensions(sourceW, sourceH) { die(err) }
+    let workingW = Int((Double(sourceW) * Double(scale)).rounded())
+    let workingH = Int((Double(sourceH) * Double(scale)).rounded())
+    if let err = checkDimensions(workingW, workingH) { die(err) }
 }
 
 var accurate = true
@@ -170,21 +287,47 @@ if selfTest {
     exit(runSelfTest() ? 0 : 1)
 }
 
-let data: Data
+let handle: FileHandle
 if let p = path {
-    guard let d = FileManager.default.contents(atPath: p) else { die("cannot read \(p)") }
-    data = d
+    guard let h = FileHandle(forReadingAtPath: p) else { die("cannot read \(p)") }
+    handle = h
 } else {
-    data = FileHandle.standardInput.readDataToEndOfFile()
+    handle = FileHandle.standardInput
+}
+let data = readBounded(maxBytes: maxEncodedBytes) { want in
+    try? handle.read(upToCount: want)
+}
+if data.count > maxEncodedBytes {
+    die("input is over \(maxEncodedBytes) bytes (encoded-input limit)")
 }
 if data.isEmpty { die("no image data") }
 
-guard let src = CGImageSourceCreateWithData(data as CFData, nil),
-    let decoded = CGImageSourceCreateImageAtIndex(src, 0, nil)
-else { die("could not decode image") }
+guard let src = CGImageSourceCreateWithData(data as CFData, nil) else {
+    die("could not decode image")
+}
 
 let preScale: CGFloat = 2.0
 let prePad = 16
+
+// Inspect dimensions from the image header -- ImageIO reports these without
+// decoding pixels -- before CGImageSourceCreateImageAtIndex below ever
+// rasterizes the image, checking both the source size and the working
+// (post-upscale) size upscaleAndPad is about to allocate.
+if let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+    let headerW = props[kCGImagePropertyPixelWidth] as? Int,
+    let headerH = props[kCGImagePropertyPixelHeight] as? Int
+{
+    enforceDimensionLimits(sourceW: headerW, sourceH: headerH, scale: preScale)
+}
+
+guard let decoded = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+    die("could not decode image")
+}
+// Backstop for inputs the header-based check above could not read a size
+// from (should not happen for a format ImageIO recognizes, but the decode
+// has already run by here regardless of whether that check ran).
+enforceDimensionLimits(sourceW: decoded.width, sourceH: decoded.height, scale: preScale)
+
 let upscaled = upscaleAndPad(decoded, scale: preScale, pad: prePad)
 let image = upscaled ?? decoded
 // When upscaleAndPad falls back, no transform was applied and the boxes are

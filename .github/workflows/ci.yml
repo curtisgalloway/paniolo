@@ -384,7 +384,13 @@ jobs:
       # The OCR helper is not a workspace crate (it lives under ocr/ with its
       # Swift and Python siblings), so ci-coverage-check.sh does not see it and
       # it needs covering explicitly. Windows-only by nature.
-      - name: winocr (fmt, clippy, build)
+      #
+      # `cargo test` here is the only place check_dimensions/read_bounded
+      # (issue #150's shared resource limits) get exercised as compiled code
+      # with `mod win` (cfg(windows)) actually active -- see the "ocr helpers"
+      # and "macos" jobs for the equivalent pytest/`--self-test` coverage of
+      # linuxocr/rapidocr and visionocr.
+      - name: winocr (fmt, clippy, build, test)
         shell: pwsh
         working-directory: ocr/winocr
         run: |
@@ -393,6 +399,8 @@ jobs:
           cargo clippy --all-targets -- -D warnings
           if ($LASTEXITCODE -ne 0) { exit 1 }
           cargo build
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cargo test
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
   macos:
