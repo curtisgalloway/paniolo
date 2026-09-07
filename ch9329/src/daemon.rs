@@ -128,8 +128,13 @@ pub fn run(device: String, port: u16) -> Result<()> {
         .context("writing discovery file")?;
         info!("ch9329 hid daemon listening on http://{bound} (device {device})");
 
+        // `POST /stop` wakes this; `ch9329 stop` never signals the PID in the
+        // discovery file, which a crash can leave pointing at whatever
+        // process the kernel next gave that number to.
+        let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
         let shutdown_hid = hid.clone();
-        let app = server::router(AppState { hid }, crate::auth::Auth::new(token, &[]));
+        let app = server::router(AppState { hid }, crate::auth::Auth::new(token, &[]))
+            .layer(axum::Extension(shutdown.clone()));
 
         // The /hid WebSocket is long-lived, so plain graceful shutdown would
         // block forever. Release whatever is held, remove discovery + lock,
@@ -138,7 +143,10 @@ pub fn run(device: String, port: u16) -> Result<()> {
         let lock_p = lock_path()?;
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
-                shutdown_signal().await;
+                tokio::select! {
+                    _ = shutdown_signal() => {},
+                    _ = shutdown.notified() => info!("stop requested over HTTP"),
+                }
                 // This daemon is the only thing that remembers what it
                 // pressed; leave the target with nothing held.
                 if let Err(e) = shutdown_hid.release_for_shutdown(RELEASE_TIMEOUT).await {

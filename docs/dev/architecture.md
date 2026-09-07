@@ -336,9 +336,11 @@ and the macOS-only bits (Vision OCR, BPF) are irrelevant there.
 
 ## 9. Lifecycle & exclusivity notes
 
-Serialcap also accepts authenticated `POST /stop`. Its helper stop command uses
-this endpoint instead of signaling the PID in discovery, avoiding PID reuse.
-The request and OS signals enter the same discovery cleanup and exit path.
+Serialcap, hdmicap, ch9329, and hidrig all accept authenticated `POST /stop`;
+zigplug's daemon accepts the same over its own HTTP API. Each helper's stop
+command uses this endpoint instead of signaling the PID in discovery, avoiding
+PID reuse. The request and OS signals enter the same discovery cleanup and
+exit path.
 
 - **Serial ports are exclusive** — only one of `serialcap` / `tio` / `screen` can hold a port.
   `serial watch` and `serial connect` conflict on the same device.
