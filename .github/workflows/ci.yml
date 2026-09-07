@@ -90,6 +90,21 @@ jobs:
             echo "zigplug/tests does not exist yet; nothing to run."
           fi
 
+  ocr-helpers:
+    # The Python OCR helper (ocr/linuxocr) and its bbox-mapping tests in
+    # ocr/tests. Not a Cargo crate, so ci-coverage-check.sh doesn't see it --
+    # see the macos job's visionocr self-test step and the windows job's
+    # winocr comment for this helper directory's other explicit coverage.
+    # No lockfile here (unlike zigplug): the helper has no third-party
+    # runtime dependencies of its own, so the test deps are supplied inline.
+    name: ocr helpers (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - name: Test
+        run: uv run --with pytest --with pillow pytest -q ocr/tests
+
   evals-check:
     # evals/scenarios/*.toml assert the CLI surface; run.py --check re-walks
     # the live `paniolo --help` tree and fails when a scenario references a
@@ -406,3 +421,5 @@ jobs:
         run: cargo test
       - name: Compile visionocr (Apple Vision OCR helper)
         run: swiftc -O -o "$RUNNER_TEMP/visionocr" ocr/visionocr.swift
+      - name: visionocr bbox self-test
+        run: '"$RUNNER_TEMP/visionocr" --self-test'
