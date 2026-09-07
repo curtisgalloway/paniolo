@@ -161,6 +161,10 @@ pub struct MfBackend {
     reader: IMFSourceReader,
     width: u32,
     height: u32,
+    /// Set once the first frame has logged which stride path it took and
+    /// what pitch it saw, so a bench run can confirm the padding handling
+    /// without a debugger and the log is not flooded per frame.
+    stride_logged: bool,
     /// Row stride (bytes) reported by the selected media type's
     /// `MF_MT_DEFAULT_STRIDE` attribute, read once at open time. Used only
     /// as a fallback in [`MfBackend::frame`] when a sample's buffer does not
@@ -216,6 +220,7 @@ impl MfBackend {
                 width,
                 height,
                 default_stride,
+                stride_logged: false,
             })
         }
     }
@@ -281,13 +286,17 @@ unsafe fn lock_and_compact_2d(
     buffer: &IMFMediaBuffer,
     w: usize,
     h: usize,
-) -> Option<Result<(Vec<u8>, Vec<u8>)>> {
+) -> Option<Result<(Vec<u8>, Vec<u8>, usize)>> {
     let buf2d = buffer.cast::<IMF2DBuffer>().ok()?;
     let mut scanline0: *mut u8 = std::ptr::null_mut();
     let mut pitch: i32 = 0;
     buf2d.Lock2D(&mut scanline0, &mut pitch).ok()?;
 
     let chroma_rows = h.div_ceil(2);
+    // The buffer was made contiguous above, so its current length bounds
+    // what the scanline pointer may be read through; never trust the pitch
+    // alone to size the slice.
+    let got = buffer.GetCurrentLength().map(|n| n as usize).unwrap_or(0);
     let result = if pitch < 0 {
         // Bottom-up NV12 would need the scanline pointer walked backwards
         // and is not a layout any capture device we target produces;
@@ -297,16 +306,24 @@ unsafe fn lock_and_compact_2d(
         ))
     } else if scanline0.is_null() {
         Err(anyhow!("Lock2D returned a null scanline pointer"))
+    } else if got < (pitch as usize) * (h + chroma_rows) {
+        Err(anyhow!(
+            "short NV12 frame (2D): {got} bytes for {w}x{h} at stride {pitch} \
+             (expected {})",
+            (pitch as usize) * (h + chroma_rows)
+        ))
     } else {
         let stride = pitch as usize;
         let needed = stride * (h + chroma_rows);
         let all = std::slice::from_raw_parts(scanline0, needed);
-        pixel::compact_nv12(all, stride, w, h).ok_or_else(|| {
-            anyhow!(
-                "short NV12 frame (2D, stride {stride}) for {w}x{h} \
-                 (expected {needed} bytes)"
-            )
-        })
+        pixel::compact_nv12(all, stride, w, h)
+            .map(|(y, cbcr)| (y, cbcr, stride))
+            .ok_or_else(|| {
+                anyhow!(
+                    "short NV12 frame (2D, stride {stride}) for {w}x{h} \
+                     (expected {needed} bytes)"
+                )
+            })
     };
     let _ = buf2d.Unlock2D();
     Some(result)
@@ -324,7 +341,7 @@ unsafe fn lock_and_compact_1d(
     stride: usize,
     w: usize,
     h: usize,
-) -> Result<(Vec<u8>, Vec<u8>)> {
+) -> Result<(Vec<u8>, Vec<u8>, usize)> {
     let mut ptr: *mut u8 = std::ptr::null_mut();
     let mut len: u32 = 0;
     buffer
@@ -340,11 +357,13 @@ unsafe fn lock_and_compact_1d(
         ))
     } else {
         let all = std::slice::from_raw_parts(ptr, needed);
-        pixel::compact_nv12(all, stride, w, h).ok_or_else(|| {
-            anyhow!(
-                "short NV12 frame: {got} bytes for {w}x{h} at stride {stride} (expected {needed})"
-            )
-        })
+        pixel::compact_nv12(all, stride, w, h)
+            .map(|(y, cbcr)| (y, cbcr, stride))
+            .ok_or_else(|| {
+                anyhow!(
+                    "short NV12 frame: {got} bytes for {w}x{h} at stride {stride} (expected {needed})"
+                )
+            })
     };
     let _ = buffer.Unlock();
     result
@@ -389,15 +408,31 @@ impl CaptureBackend for MfBackend {
                 // IMF2DBuffer::Lock2D when the buffer supports it; only fall
                 // back to the stride recorded from the media type (or,
                 // failing that, `width`) when it doesn't.
-                let result = match lock_and_compact_2d(&buffer, w, h) {
-                    Some(result) => result,
+                let (result, path) = match lock_and_compact_2d(&buffer, w, h) {
+                    Some(result) => (result, "IMF2DBuffer::Lock2D"),
                     None => {
                         let stride = self.default_stride.map(|s| s as usize).unwrap_or(w);
-                        lock_and_compact_1d(&buffer, stride, w, h)
+                        let path = if self.default_stride.is_some() {
+                            "MF_MT_DEFAULT_STRIDE"
+                        } else {
+                            "width (no stride reported)"
+                        };
+                        (lock_and_compact_1d(&buffer, stride, w, h), path)
                     }
                 };
 
-                let (y, cbcr) = result?;
+                let (y, cbcr, stride) = result?;
+                if !self.stride_logged {
+                    tracing::info!(
+                        "NV12 {w}x{h}: row stride {stride} bytes via {path}{}",
+                        if stride == w {
+                            ""
+                        } else {
+                            " (rows are padded)"
+                        }
+                    );
+                    self.stride_logged = true;
+                }
                 return Ok(CapturedFrame {
                     jpeg: None,
                     pixels: PixelData::Nv12 {
