@@ -22,8 +22,13 @@
 //! points outside it canonicalizes to the outside path and is refused), and
 //! (because `canonicalize` fails on a missing path) probes for files that do
 //! not exist.
+//!
+//! Also shared: [`warn_rate_limited`], so DHCP's second-client gate and
+//! TFTP's peer/transfer-slot gates all cap a sustained flood to one log line
+//! per interval rather than one per packet.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Longest peer-supplied string [`loggable`] lets into the log.
 const MAX_LOG_CHARS: usize = 128;
@@ -60,6 +65,23 @@ pub fn loggable(s: &str) -> String {
         });
     }
     out
+}
+
+/// Log `msg` via `warn!`, but only if at least `interval` has passed since
+/// the last warning tracked in `last` (updated in place). A sustained
+/// flood — a second DHCP client hammering DISCOVER, or a burst of TFTP RRQs
+/// from an unleased peer or past the transfer-slot bound — would otherwise
+/// turn one ongoing condition into an unbounded number of log lines.
+pub fn warn_rate_limited(last: &mut Option<Instant>, interval: Duration, msg: &str) {
+    let now = Instant::now();
+    let should_warn = match *last {
+        Some(t) => now.duration_since(t) >= interval,
+        None => true,
+    };
+    if should_warn {
+        tracing::warn!("{msg}");
+        *last = Some(now);
+    }
 }
 
 #[cfg(test)]
@@ -177,5 +199,41 @@ mod tests {
         // Exactly at the cap: nothing is cut and no ellipsis is added.
         let exact = "b".repeat(MAX_LOG_CHARS);
         assert_eq!(loggable(&exact), exact);
+    }
+
+    #[test]
+    fn warn_rate_limited_first_call_always_warns_and_records() {
+        let mut last = None;
+        warn_rate_limited(&mut last, Duration::from_secs(60), "first");
+        assert!(last.is_some(), "the first call must record a timestamp");
+    }
+
+    #[test]
+    fn warn_rate_limited_suppresses_within_the_interval() {
+        let mut last = None;
+        warn_rate_limited(&mut last, Duration::from_secs(60), "first");
+        let recorded = last;
+        warn_rate_limited(&mut last, Duration::from_secs(60), "second, too soon");
+        assert_eq!(
+            last, recorded,
+            "a call inside the interval must not move the timestamp"
+        );
+    }
+
+    #[test]
+    fn warn_rate_limited_warns_again_after_the_interval() {
+        let mut last = None;
+        warn_rate_limited(&mut last, Duration::from_millis(10), "first");
+        std::thread::sleep(Duration::from_millis(30));
+        let before = last;
+        warn_rate_limited(
+            &mut last,
+            Duration::from_millis(10),
+            "second, interval elapsed",
+        );
+        assert_ne!(
+            last, before,
+            "a call past the interval must move the timestamp forward"
+        );
     }
 }

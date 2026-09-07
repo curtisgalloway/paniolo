@@ -46,10 +46,15 @@
 //!     replaces that transfer instead of adding a parallel sender;
 //!   * when replies go out as raw frames the negotiated `blksize` is capped so
 //!     a DATA block always fits one Ethernet frame ([`cap_blksize`]).
+//!
+//! One more gate on every inbound request, ahead of all of the above: **peer
+//! identity** — a request whose source address is not the one IP DHCP ever
+//! leases on this link is not from the netboot client, so it is ignored
+//! outright (no reply of any kind).
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -66,7 +71,7 @@ use tracing::{info, warn};
 
 use crate::bpf::BpfSender;
 use crate::pin::pin_socket_to_interface;
-use crate::served::{loggable, resolve};
+use crate::served::{loggable, resolve, warn_rate_limited};
 
 const OP_RRQ: u16 = 1;
 const OP_WRQ: u16 = 2;
@@ -87,6 +92,11 @@ const MAX_RETRIES: usize = 6;
 /// sender builds a single frame per packet with DF set (`frame.rs`), so a
 /// bigger block could neither be fragmented nor transmitted.
 const MAX_RAW_FRAME_BLKSIZE: usize = 1468;
+
+/// How often a "peer not leased" warning may repeat, so a sustained flood of
+/// rejected RRQs produces one log line every few seconds instead of one per
+/// packet.
+const REJECTED_PEER_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The `blksize` to serve with. A client may ask for up to 65 464 bytes (RFC
 /// 2348); that is fine through the kernel, which fragments, but a DATA block
@@ -530,6 +540,7 @@ pub fn bind_server(port: u16, interface: &str) -> Result<UdpSocket> {
 pub async fn serve(
     sock: UdpSocket,
     host_ip: Ipv4Addr,
+    client_ip: Ipv4Addr,
     root: PathBuf,
     interface: String,
     bpf: Arc<BpfSender>,
@@ -539,7 +550,7 @@ pub async fn serve(
         .canonicalize()
         .with_context(|| format!("TFTP root {} does not exist", root.display()))?;
     info!(
-        %host_ip,
+        %host_ip, %client_ip,
         root = %root.display(),
         bpf = bpf.available(),
         "TFTP listening on {} via {interface}",
@@ -549,6 +560,7 @@ pub async fn serve(
         sock,
         root,
         host_ip,
+        client_ip,
         Some(interface),
         bpf,
         mac_rx,
@@ -561,10 +573,17 @@ pub async fn serve(
 /// source address) so a repeated RRQ from a TID with a transfer in flight
 /// replaces that transfer — a client that restarted its request gets one
 /// sender, not one per attempt.
+///
+/// Every request is gated once more before that: its source IP must be
+/// `client_ip` — the one address DHCP ever leases on this link. A request
+/// that fails the check is dropped silently (bar a rate-limited `warn!`):
+/// TFTP has no NAK to send back.
+#[allow(clippy::too_many_arguments)]
 async fn run(
     sock: UdpSocket,
     root: PathBuf,
     host_ip: Ipv4Addr,
+    client_ip: Ipv4Addr,
     interface: Option<String>,
     bpf: Arc<BpfSender>,
     mac_rx: watch::Receiver<Option<[u8; 6]>>,
@@ -572,6 +591,10 @@ async fn run(
 ) -> Result<()> {
     let mut buf = vec![0u8; 4096];
     let mut inflight: HashMap<SocketAddr, JoinHandle<()>> = HashMap::new();
+    // `served::warn_rate_limited` works in `std::time::Instant` (shared with
+    // dhcp.rs, which has no async runtime clock to prefer); everything else
+    // in this file uses tokio's `Instant` for `timeout_at` deadlines.
+    let mut last_peer_warn: Option<std::time::Instant> = None;
     loop {
         let (n, peer) = match sock.recv_from(&mut buf).await {
             Ok(v) => v,
@@ -581,6 +604,14 @@ async fn run(
             }
         };
         if n < 2 {
+            continue;
+        }
+        if peer.ip() != IpAddr::V4(client_ip) {
+            warn_rate_limited(
+                &mut last_peer_warn,
+                REJECTED_PEER_WARN_INTERVAL,
+                &format!("TFTP request from {peer}, not the leased client {client_ip}; ignoring"),
+            );
             continue;
         }
         let opcode = u16::from_be_bytes([buf[0], buf[1]]);
@@ -1199,6 +1230,7 @@ mod tests {
             listen,
             root.clone(),
             Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
             None,
             Arc::new(BpfSender::unavailable()),
             rx,
@@ -1241,6 +1273,91 @@ mod tests {
                 );
             }
         }
+        dispatcher.abort();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // ── Peer gating ──────────────────────────────────────────────────────────
+    //
+    // TFTP has no concept of source-address identity of its own — these tests
+    // drive the real dispatcher (`run`) with different *configured*
+    // `client_ip` values against the same real 127.0.0.1 test client, which
+    // exercises the actual `peer.ip() != client_ip` check without needing a
+    // second loopback address (binding one, e.g. 127.0.0.2, needs an OS-level
+    // alias that is not present by default on macOS).
+
+    #[tokio::test]
+    async fn rrq_from_a_non_leased_peer_is_ignored() {
+        let root = tmp();
+        fs::write(root.join("k.img"), b"hello").unwrap();
+
+        let listen = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listen.local_addr().unwrap();
+        let (_tx, rx) = watch::channel::<Option<[u8; 6]>>(None);
+        // A client IP the real test client (127.0.0.1) can never match.
+        let unleased_client_ip = Ipv4Addr::new(203, 0, 113, 9);
+        let dispatcher = tokio::spawn(run(
+            listen,
+            root.clone(),
+            Ipv4Addr::LOCALHOST,
+            unleased_client_ip,
+            None,
+            Arc::new(BpfSender::unavailable()),
+            rx,
+            ACK_TIMEOUT,
+        ));
+
+        let (sock, _) = client_socket().await;
+        sock.send_to(&rrq("k.img", "octet", &[]), server_addr)
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 2048];
+        let got = timeout_at(
+            Instant::now() + Duration::from_millis(300),
+            sock.recv_from(&mut buf),
+        )
+        .await;
+        assert!(
+            got.is_err(),
+            "an RRQ from a peer other than the leased client must get no reply (OACK/DATA/ERROR) \
+             at all"
+        );
+
+        dispatcher.abort();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn rrq_from_the_leased_peer_is_served() {
+        let root = tmp();
+        let contents = b"hello netboot".to_vec();
+        fs::write(root.join("k.img"), &contents).unwrap();
+
+        let listen = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listen.local_addr().unwrap();
+        let (_tx, rx) = watch::channel::<Option<[u8; 6]>>(None);
+        let dispatcher = tokio::spawn(run(
+            listen,
+            root.clone(),
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
+            None,
+            Arc::new(BpfSender::unavailable()),
+            rx,
+            ACK_TIMEOUT,
+        ));
+
+        let (sock, _) = client_socket().await;
+        sock.send_to(&rrq("k.img", "octet", &[]), server_addr)
+            .await
+            .unwrap();
+        let (got, _blocks) = recv_transfer(&sock, DEFAULT_BLKSIZE).await;
+        assert_eq!(
+            got, contents,
+            "the leased peer must still be served normally"
+        );
+
         dispatcher.abort();
         fs::remove_dir_all(&root).ok();
     }
