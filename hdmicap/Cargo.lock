@@ -657,6 +657,7 @@ dependencies = [
  "cc",
  "clap",
  "fs2",
+ "futures-util",
  "getrandom 0.2.17",
  "image",
  "jpeg-encoder",

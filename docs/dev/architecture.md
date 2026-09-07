@@ -198,6 +198,15 @@ listeners are bound, so nothing that parses packets or serves files runs privile
 (same /24, last octet `100`), and an HTTP bind failure only disables HTTP Boot — DHCP and TFTP
 keep serving.
 
+`netbootd` also enforces one *client*, not just one lease: DHCP locks onto the MAC of the first
+DISCOVER/REQUEST it sees for the life of the process and silently ignores a different MAC (a
+second device on the link never gets an OFFER/ACK, and can't steal the lease, the ARP pin, or
+the MAC handed to TFTP's raw-frame sender); TFTP separately accepts RRQs only from that leased
+IP and caps concurrent transfers at a small fixed `MAX_TRANSFERS` via a semaphore, so a flood of
+RRQs from unique source ports cannot grow tasks/sockets/files without bound. There is no
+in-process reset for either gate — a new client means restarting `netbootd` (i.e. `paniolo
+netboot stop` then `start`).
+
 On macOS, `netbootd`'s raw-frame send path (the Sequoia workaround) gets a `/dev/bpf` descriptor
 from a setuid-root `netbootd-bpf-helper` over `SCM_RIGHTS`, so the daemon itself stays
 unprivileged — the helper is the only root component, installed by `paniolo setup`. The
@@ -232,12 +241,6 @@ into the port. `paniolo serial log` reads the on-disk JSONL **directly** (no dae
 so it works whether or not the daemon is running. A separate, dependency-light **interactive**
 path (`paniolo serial connect`) execs `tio` for a foreground terminal — it holds the port
 exclusively and so conflicts with the daemon.
-
-Serialcap input requests carry a connection generation and a completion reply.
-The supervisor writes bounded slices while continuing to read serial output,
-spaces paced bytes after successful driver writes, and acknowledges only a
-completed request. Disconnects fail pending requests; a new connection rejects
-requests from older generations so input is never replayed across reconnects.
 
 ### Power control ([`power.md`](../power.md))
 Two mechanisms, both driven through serial/config: **DTR via FTDI** (the serial adapter's DTR
@@ -342,9 +345,11 @@ and the macOS-only bits (Vision OCR, BPF) are irrelevant there.
 
 ## 9. Lifecycle & exclusivity notes
 
-Serialcap also accepts authenticated `POST /stop`. Its helper stop command uses
-this endpoint instead of signaling the PID in discovery, avoiding PID reuse.
-The request and OS signals enter the same discovery cleanup and exit path.
+Serialcap, hdmicap, ch9329, and hidrig all accept authenticated `POST /stop`;
+zigplug's daemon accepts the same over its own HTTP API. Each helper's stop
+command uses this endpoint instead of signaling the PID in discovery, avoiding
+PID reuse. The request and OS signals enter the same discovery cleanup and
+exit path.
 
 - **Serial ports are exclusive** — only one of `serialcap` / `tio` / `screen` can hold a port.
   `serial watch` and `serial connect` conflict on the same device.

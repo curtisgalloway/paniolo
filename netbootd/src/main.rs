@@ -92,9 +92,13 @@ struct Cli {
 
     /// HTTP server port, also embedded in the UEFI HTTP Boot URL advertised in
     /// DHCP option 67. Defaults to 80 (omitted from the URL); choose an
-    /// unprivileged high port to avoid needing root for the bind. If the port
-    /// cannot be bound netbootd logs a warning and runs without HTTP Boot
-    /// (DHCP + TFTP only).
+    /// unprivileged high port to avoid needing root for the bind. `0` asks
+    /// the OS for an ephemeral port — DHCP advertises whatever port the bind
+    /// actually returns, read back from the listener, never the literal `0`
+    /// that was requested. If the port cannot be bound, netbootd logs a
+    /// warning and runs without HTTP Boot: DHCP + TFTP (and PXE) keep
+    /// working, but an `HTTPClient` DHCP request gets no offer at all,
+    /// rather than one pointing at a server that isn't there.
     #[arg(long, default_value_t = 80)]
     http_port: u16,
 
@@ -161,14 +165,20 @@ async fn main() -> Result<()> {
         Err(e) => {
             warn!(
                 "HTTP listener on port {} unavailable ({e:#}); continuing with DHCP + TFTP \
-                 only. HTTP Boot will not work — an HTTPClient DHCP request is still \
-                 answered with an http:// URL, but the fetch will fail. Free the port or \
-                 set --http-port to an unused one.",
+                 only. HTTP Boot is unavailable: an HTTPClient DHCP request gets no offer \
+                 at all (rate-limited warning in the DHCP log), rather than one pointing at \
+                 a server that isn't there. Free the port or set --http-port to an unused \
+                 one.",
                 cli.http_port
             );
             None
         }
     };
+    // DHCP must advertise the port actually bound, not the one requested:
+    // `--http-port 0` asks the OS for an ephemeral port, and only the
+    // listener knows what it got back. `None` (no listener at all) is what
+    // tells `dhcp::serve` to stop building `http://` URLs entirely (#144).
+    let bound_http_port = http_endpoint(http_listener.as_ref());
 
     // Raw-frame sender: on macOS the bound /dev/bpf descriptor is obtained from
     // the setuid-root helper via SCM_RIGHTS (netbootd itself stays unprivileged).
@@ -197,12 +207,13 @@ async fn main() -> Result<()> {
         client_ip,
         cli.boot_file.clone(),
         cli.interface.clone(),
-        cli.http_port,
+        bound_http_port,
         mac_tx,
     ));
     let tftp = tokio::spawn(tftp::serve(
         tftp_sock,
         cli.host_ip,
+        client_ip,
         cli.tftp_root.clone(),
         cli.interface.clone(),
         bpf,
@@ -313,4 +324,51 @@ fn mac_of(iface: &str) -> Option<[u8; 6]> {
         .find(|i| i.name == iface)
         .and_then(|i| i.mac)
         .map(|m| [m.0, m.1, m.2, m.3, m.4, m.5])
+}
+
+/// The port DHCP should advertise for HTTP, read back from the listener that
+/// was actually bound rather than trusted from the command line.
+///
+/// `None` means no HTTP listener exists at all (the bind failed), which is
+/// what tells `dhcp::serve` to stop building `http://` URLs for `HTTPClient`
+/// requests entirely. `Some(port)` is the real, OS-confirmed port — for
+/// `--http-port 0` this is the ephemeral port the OS actually assigned, never
+/// the literal `0` that was requested (issue #144).
+fn http_endpoint(listener: Option<&tokio::net::TcpListener>) -> Option<u16> {
+    let listener = listener?;
+    match listener.local_addr() {
+        Ok(addr) => Some(addr.port()),
+        Err(e) => {
+            warn!("HTTP listener has no local address ({e:#}); treating HTTP as unavailable");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_endpoint_is_none_without_a_listener() {
+        assert_eq!(http_endpoint(None), None);
+    }
+
+    /// The bind-to-port-0 plumbing this whole fix depends on: an ephemeral
+    /// bind hands back a real port from the OS, and `http_endpoint` must
+    /// report that real port — never `0`, and never something read from the
+    /// original (unbound) request.
+    #[tokio::test]
+    async fn http_endpoint_reads_back_the_os_assigned_ephemeral_port() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let bound_port = listener
+            .local_addr()
+            .expect("bound listener has a local address")
+            .port();
+        assert_ne!(bound_port, 0, "the OS must have assigned a real port");
+
+        assert_eq!(http_endpoint(Some(&listener)), Some(bound_port));
+    }
 }

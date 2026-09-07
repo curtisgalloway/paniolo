@@ -170,45 +170,6 @@ pub fn pid_alive(pid: i32) -> bool {
     }
 }
 
-/// Ask the process to stop: SIGTERM on Unix, `TerminateProcess` on Windows.
-///
-/// Windows has no signals, so the daemon is killed outright and never runs its
-/// graceful-shutdown path (discovery-file removal, the brief grace). A stale
-/// discovery file may be left for the next [`pid_alive`] probe to reap.
-#[cfg(unix)]
-pub fn terminate_pid(pid: i32) -> Result<()> {
-    if !is_real_pid(pid) {
-        return Err(anyhow!("invalid pid {pid}"));
-    }
-    // Safe: kill() on an arbitrary pid is defined; we only read the result.
-    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-pub fn terminate_pid(pid: i32) -> Result<()> {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
-    if !is_real_pid(pid) {
-        return Err(anyhow!("invalid pid {pid}"));
-    }
-    // Safe: a null handle is checked before use.
-    unsafe {
-        let h = OpenProcess(PROCESS_TERMINATE, 0, pid as u32);
-        if h.is_null() {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        let ok = TerminateProcess(h, 1) != 0;
-        CloseHandle(h);
-        if !ok {
-            return Err(std::io::Error::last_os_error().into());
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,8 +182,6 @@ mod tests {
     fn non_positive_pids_are_never_real() {
         assert!(!pid_alive(0));
         assert!(!pid_alive(-1));
-        assert!(terminate_pid(0).is_err());
-        assert!(terminate_pid(-1).is_err());
     }
 
     #[test]

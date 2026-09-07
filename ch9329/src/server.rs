@@ -24,6 +24,8 @@
 //! auth layer (`auth.rs`) admits only loopback origins that present the
 //! daemon's token and echoes that one origin in the CORS header — never `*`.
 
+use std::sync::Arc;
+
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -32,7 +34,7 @@ use axum::{
     middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::broadcast::error::RecvError;
@@ -61,10 +63,21 @@ pub fn router(state: AppState, auth: crate::auth::Auth) -> Router {
             "/send",
             post(send).layer(DefaultBodyLimit::max(MAX_SEND_BYTES)),
         )
+        .route("/stop", post(stop))
         .route("/status", get(status))
         .route("/version", get(version))
         .layer(middleware::from_fn_with_state(auth, crate::auth::require))
         .with_state(state)
+}
+
+/// Authenticated shutdown. `ch9329 stop` calls this instead of signaling the
+/// PID in the discovery file: a record left behind by a crash can name a PID
+/// the kernel has since handed to an unrelated process, and the token proves
+/// the request reached the daemon that wrote the record. The daemon's serve
+/// loop owns the `Notify` (see `daemon::run`).
+async fn stop(Extension(shutdown): Extension<Arc<tokio::sync::Notify>>) -> &'static str {
+    shutdown.notify_one();
+    "hid daemon stopping\n"
 }
 
 /// `GET /status` — daemon liveness + the device it owns.
@@ -150,5 +163,58 @@ async fn handle_ws(socket: WebSocket, hid: HidHandle) {
     tokio::select! {
         _ = &mut feed_task => recv_task.abort(),
         _ = &mut recv_task => feed_task.abort(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{header, Request as HttpRequest, StatusCode};
+    use tower::ServiceExt;
+
+    /// `/stop` sits behind the same bearer-token layer as every other route,
+    /// and only a valid token may wake the daemon's shutdown `Notify`.
+    #[tokio::test]
+    async fn shutdown_requires_the_daemon_token() {
+        let hid = HidHandle::spawn("test-device".into());
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let app = router(
+            AppState { hid },
+            crate::auth::Auth::new("test-token".into(), &[]),
+        )
+        .layer(Extension(shutdown.clone()));
+        for token in [None, Some("wrong"), Some("test-token")] {
+            let mut req = HttpRequest::builder()
+                .method("POST")
+                .uri("/stop")
+                .header(header::HOST, "127.0.0.1:1");
+            if let Some(token) = token {
+                req = req.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let resp = app
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let valid = token == Some("test-token");
+            assert_eq!(
+                resp.status(),
+                if valid {
+                    StatusCode::OK
+                } else {
+                    StatusCode::UNAUTHORIZED
+                },
+                "token {token:?}"
+            );
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_millis(10), shutdown.notified())
+                    .await
+                    .is_ok(),
+                valid,
+                "token {token:?} must {}wake the shutdown",
+                if valid { "" } else { "not " }
+            );
+        }
     }
 }

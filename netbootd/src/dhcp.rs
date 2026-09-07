@@ -25,8 +25,23 @@
 //! interface (see `pin`), and a pin that fails is fatal — an unpinned DHCP
 //! server on the wildcard address would answer DISCOVERs on the host's
 //! primary NIC too.
+//!
+//! One *client*, too, enforced by hardware address rather than by address
+//! alone: the lease above says which IP is handed out, [`accept_client`]
+//! says who it is handed to. The first DISCOVER or REQUEST `serve` sees
+//! locks in that MAC as the active client for the life of the process; a
+//! later request from a different MAC is not the machine on the other end of
+//! this dedicated link, so it gets no OFFER, ACK, or NAK at all — just a
+//! rate-limited `warn!` — rather than being allowed to steal the lease, the
+//! ARP pin, or the MAC handed to TFTP's raw-frame sender. A retransmission
+//! from the already-active MAC is unaffected (`accept_client` is idempotent
+//! for it). There is no lease timer to expire the lock: `paniolo netboot
+//! start`/`stop` restarts this process per boot session, so swapping the
+//! netboot target means restarting netbootd, clearing the lock along with
+//! everything else this process held in memory.
 
 use std::net::Ipv4Addr;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -36,6 +51,7 @@ use tracing::{info, warn};
 
 use crate::netcfg;
 use crate::pin::pin_socket_to_interface;
+use crate::served::warn_rate_limited;
 
 const BOOTREQUEST: u8 = 1;
 const BOOTREPLY: u8 = 2;
@@ -84,6 +100,11 @@ const SUBNET_MASK: [u8; 4] = [255, 255, 255, 0];
 /// Last octet of the derived client IP (`_dhcp.py` leased `.100` on the
 /// default `192.168.99.0/24`); `.101` when the host itself is `.100`.
 const DEFAULT_CLIENT_OCTET: u8 = 100;
+
+/// How often a "second client ignored" warning may repeat. A device that
+/// keeps hammering DISCOVER on a link it does not hold the lease for should
+/// leave one line every few seconds, not one per packet.
+const REJECTED_CLIENT_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The IP leased to the netboot client, derived from the host IP: the same
 /// /24 with the last octet replaced by [`DEFAULT_CLIENT_OCTET`] — or one more
@@ -352,6 +373,51 @@ fn http_boot_url(host_ip: Ipv4Addr, port: u16, boot_file: &str) -> String {
     }
 }
 
+/// How `serve()` should answer one client, decided from its vendor class and
+/// whether an HTTP endpoint is actually bound. Kept as a pure, unit-testable
+/// step separate from the packet I/O.
+enum BootChoice {
+    /// Legacy Pi / generic TFTP.
+    Tftp,
+    /// UEFI PXE.
+    Pxe,
+    /// UEFI HTTP Boot, carrying the full `http://…` URL to advertise.
+    Http(String),
+    /// An `HTTPClient` asked for HTTP Boot, but no HTTP endpoint is
+    /// available (the listener failed to bind, or was never started). Two
+    /// bad answers were considered and rejected (issue #144): building an
+    /// `http://` URL anyway offers a server that isn't there, so the fetch
+    /// always fails after DHCP has already succeeded; answering with a plain
+    /// TFTP/PXE reply doesn't help either, because EDK2's `HttpBootDxe`
+    /// requires the reply's option 60 to echo `HTTPClient` before it accepts
+    /// the offer at all — a non-HTTP reply is just rejected as invalid.
+    /// Ignoring the request is the only answer that doesn't mislead the
+    /// client; PXE and plain-TFTP clients on the same link never reach this
+    /// arm, so they keep working exactly as before.
+    Ignore,
+}
+
+/// Decide how to answer `req`, given the boot file and the HTTP endpoint
+/// actually bound (`None` when HTTP is unavailable, `Some(port)` — the real,
+/// OS-confirmed port, never the literal `0` a caller may have requested).
+fn choose_boot(
+    req: &Request,
+    host_ip: Ipv4Addr,
+    http_endpoint: Option<u16>,
+    boot_file: &str,
+) -> BootChoice {
+    if req.is_http_client() {
+        return match http_endpoint {
+            Some(port) => BootChoice::Http(http_boot_url(host_ip, port, boot_file)),
+            None => BootChoice::Ignore,
+        };
+    }
+    if req.is_pxe_client() {
+        return BootChoice::Pxe;
+    }
+    BootChoice::Tftp
+}
+
 /// The fixed BOOTP header of a reply to `req`: everything up to the options,
 /// with the given `yiaddr` / `siaddr` and the client's `chaddr` echoed. The
 /// broadcast flag is always set — our client has no address to unicast to.
@@ -434,12 +500,33 @@ fn build_nak(req: &Request, server_ip: Ipv4Addr) -> Vec<u8> {
     pkt
 }
 
-fn mac_string(chaddr: &[u8; 16]) -> String {
-    chaddr[..6]
+/// Format the first six bytes of `mac` (a `chaddr` or a bare hardware
+/// address) as colon-separated hex.
+fn mac_string(mac: &[u8]) -> String {
+    mac[..6]
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<Vec<_>>()
         .join(":")
+}
+
+/// The single-client gate: decide whether `mac` is the client this process
+/// answers, updating `active` the first time it is called.
+///
+/// `active` starts `None` (no client seen yet). The first call locks `mac`
+/// in as `Some(mac)` and returns `true`. Every later call with the *same*
+/// `mac` (a retransmission) is idempotent — `active` is left unchanged and
+/// it still returns `true`. A call with a *different* `mac` — a second
+/// device on the link — returns `false` and leaves `active` alone: that MAC
+/// never becomes the client, no matter how many times it asks.
+fn accept_client(active: &mut Option<[u8; 6]>, mac: [u8; 6]) -> bool {
+    match active {
+        Some(a) => *a == mac,
+        None => {
+            *active = Some(mac);
+            true
+        }
+    }
 }
 
 /// Bind the broadcast-capable DHCP listen socket on `0.0.0.0:port`, pinned to
@@ -471,19 +558,31 @@ pub fn bind_server(port: u16, interface: &str) -> Result<UdpSocket> {
     Ok(UdpSocket::from_std(sock.into())?)
 }
 
+/// Minimum gap between "ignoring HTTPClient, no HTTP endpoint" log warnings
+/// for the same daemon, so a firmware that retries every few seconds doesn't
+/// spam the log with one line per retry.
+const HTTP_UNAVAILABLE_WARN_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Run the DHCP server on an already-bound listen socket until the task is
 /// cancelled.
 ///
 /// `mac_tx` publishes the client's hardware address (from `chaddr`) to the TFTP
 /// task in-process, so the BPF send path can address frames to the Pi's real
 /// DHCP MAC without the on-disk `client-mac` file the Python version needs.
+///
+/// `http_endpoint` is the port actually bound for HTTP, read back from the
+/// listener by the caller — `None` when no HTTP listener exists at all (bind
+/// failed). This must never be a caller-requested port that was not verified
+/// to be live: see [`choose_boot`], which is what keeps an `HTTPClient`
+/// request from ever being answered with an `http://` URL pointing at
+/// nothing, or at port `0` (issue #144).
 pub async fn serve(
     sock: UdpSocket,
     host_ip: Ipv4Addr,
     client_ip: Ipv4Addr,
     boot_file: String,
     interface: String,
-    http_port: u16,
+    http_endpoint: Option<u16>,
     mac_tx: watch::Sender<Option<[u8; 6]>>,
 ) -> Result<()> {
     info!(
@@ -492,7 +591,18 @@ pub async fn serve(
         sock.local_addr()?
     );
 
+    // The single client this process will ever answer, locked in by
+    // `accept_client` on the first accepted DISCOVER/REQUEST — see the
+    // module doc comment. There is no in-process reset; a new client means
+    // restarting netbootd.
+    let mut active_mac: Option<[u8; 6]> = None;
+    let mut last_rejected_warn: Option<Instant> = None;
+
     let mut buf = vec![0u8; 4096];
+    // Rate-limit the "ignoring HTTPClient, no HTTP endpoint" warning: a
+    // firmware that gets no offer typically retries every few seconds, and
+    // without this the log would fill with one warning per retry.
+    let mut http_unavailable_warned_at: Option<Instant> = None;
     loop {
         let (n, _peer) = match sock.recv_from(&mut buf).await {
             Ok(v) => v,
@@ -504,7 +614,24 @@ pub async fn serve(
         let Some(req) = parse_request(&buf[..n]) else {
             continue;
         };
-        let mac = mac_string(&req.chaddr);
+        let mut mac_bytes = [0u8; 6];
+        mac_bytes.copy_from_slice(&req.chaddr[..6]);
+        let mac = mac_string(&mac_bytes);
+
+        if !accept_client(&mut active_mac, mac_bytes) {
+            // active_mac is always Some here: accept_client only returns
+            // false once a client is already locked in.
+            let active = active_mac.map(|m| mac_string(&m)).unwrap_or_default();
+            warn_rate_limited(
+                &mut last_rejected_warn,
+                REJECTED_CLIENT_WARN_INTERVAL,
+                &format!(
+                    "ignoring DHCP request from {mac}: the netboot lease is held by {active} \
+                     for this session; restart netbootd to switch clients"
+                ),
+            );
+            continue;
+        }
 
         let (reply_type, label) = match req.msg_type {
             DHCP_DISCOVER => (DHCP_OFFER, "DHCPDISCOVER"),
@@ -538,30 +665,42 @@ pub async fn serve(
             continue;
         }
 
+        // Decide what to answer before any side effect (MAC publish, ARP
+        // pin) that only matters if we are actually going to reply. Branches
+        // on the client's vendor class (option 60):
+        //   * HTTPClient → self-contained http:// URL in option 67 + the required
+        //     HTTPClient echo, served over HTTP — or, with no HTTP endpoint
+        //     bound, ignored (see `BootChoice::Ignore`);
+        //   * PXEClient  → the legacy TFTP reply plus a PXEClient option-60 echo;
+        //   * neither (the silent Pi, generic TFTP) → the legacy reply unchanged.
+        let boot = choose_boot(&req, host_ip, http_endpoint, &boot_file);
+        let (advert, style) = match &boot {
+            BootChoice::Http(url) => (BootAdvert::http(url), "http-boot"),
+            BootChoice::Pxe => (BootAdvert::pxe(&boot_file), "pxe"),
+            BootChoice::Tftp => (BootAdvert::tftp(&boot_file), "tftp"),
+            BootChoice::Ignore => {
+                let now = Instant::now();
+                let should_warn = http_unavailable_warned_at
+                    .is_none_or(|t| now.duration_since(t) >= HTTP_UNAVAILABLE_WARN_INTERVAL);
+                if should_warn {
+                    warn!(
+                        "{label} from {mac} is HTTPClient but no HTTP listener is bound; \
+                         ignoring rather than offering an http:// URL that points at \
+                         nothing. Free --http-port or use PXE/TFTP instead."
+                    );
+                    http_unavailable_warned_at = Some(now);
+                }
+                continue;
+            }
+        };
+
         // Publish the client MAC to the TFTP task (for the macOS BPF send path).
-        let mut mac_bytes = [0u8; 6];
-        mac_bytes.copy_from_slice(&req.chaddr[..6]);
         let _ = mac_tx.send_replace(Some(mac_bytes));
 
         // Pin the client's MAC so the host kernel can deliver to the silent
         // Pi bootloader (it never answers ARP). On macOS 15+ the kernel path is
         // unreliable for TFTP regardless — that's what the BPF send path covers.
         netcfg::set_arp(client_ip, &mac, &interface).await;
-
-        // Branch on the client's vendor class (option 60):
-        //   * HTTPClient → self-contained http:// URL in option 67 + the required
-        //     HTTPClient echo, served over HTTP;
-        //   * PXEClient  → the legacy TFTP reply plus a PXEClient option-60 echo;
-        //   * neither (the silent Pi, generic TFTP) → the legacy reply unchanged.
-        let url;
-        let (advert, style) = if req.is_http_client() {
-            url = http_boot_url(host_ip, http_port, &boot_file);
-            (BootAdvert::http(&url), "http-boot")
-        } else if req.is_pxe_client() {
-            (BootAdvert::pxe(&boot_file), "pxe")
-        } else {
-            (BootAdvert::tftp(&boot_file), "tftp")
-        };
 
         let reply = build_reply(&req, reply_type, host_ip, client_ip, &advert);
         // RFC 2131: with the broadcast flag set and giaddr=0 (our single-client
@@ -841,6 +980,44 @@ mod tests {
         );
     }
 
+    // ── Single-client gate ───────────────────────────────────────────────────
+
+    const MAC_A: [u8; 6] = [0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa];
+    const MAC_B: [u8; 6] = [0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb];
+
+    #[test]
+    fn accept_client_locks_in_the_first_mac_seen() {
+        let mut active = None;
+        assert!(accept_client(&mut active, MAC_A));
+        assert_eq!(active, Some(MAC_A));
+    }
+
+    #[test]
+    fn accept_client_is_idempotent_for_a_retransmission_from_the_active_mac() {
+        let mut active = Some(MAC_A);
+        // Any number of repeats from the already-active MAC keep succeeding
+        // and never disturb `active` — this is what keeps a retransmitted
+        // DISCOVER/REQUEST from the real client working.
+        for _ in 0..3 {
+            assert!(accept_client(&mut active, MAC_A));
+            assert_eq!(active, Some(MAC_A));
+        }
+    }
+
+    #[test]
+    fn accept_client_rejects_a_second_distinct_mac() {
+        let mut active = Some(MAC_A);
+        assert!(
+            !accept_client(&mut active, MAC_B),
+            "a different MAC must not be accepted"
+        );
+        // Rejecting it must not steal or clear the lock.
+        assert_eq!(active, Some(MAC_A));
+        // ...and the real client can still be served afterward.
+        assert!(accept_client(&mut active, MAC_A));
+        assert_eq!(active, Some(MAC_A));
+    }
+
     // ── Client IP derivation ─────────────────────────────────────────────────
 
     #[test]
@@ -1108,6 +1285,76 @@ mod tests {
             "http://192.168.99.1:8080/boot.efi",
             "non-default port kept"
         );
+    }
+
+    // ── HTTP endpoint plumbing (issue #144) ─────────────────────────────────
+
+    /// With no HTTP endpoint bound, an `HTTPClient` request must not be
+    /// answered with an `http://` URL — that would offer a server that isn't
+    /// there. On the pre-fix code, `choose_boot` did not exist and the branch
+    /// in `serve()` built `http_boot_url(host_ip, http_port, &boot_file)`
+    /// unconditionally, so this is exactly the case that regresses without
+    /// the fix.
+    #[test]
+    fn choose_boot_ignores_http_client_with_no_http_endpoint() {
+        let pkt = request_packet(BOOTREQUEST, Some(DHCP_DISCOVER), &http_client_opts());
+        let req = parse_request(&pkt).expect("HTTPClient DISCOVER parses");
+        let server = Ipv4Addr::new(192, 168, 99, 1);
+
+        let boot = choose_boot(&req, server, None, "grubaa64.efi");
+
+        assert!(
+            matches!(boot, BootChoice::Ignore),
+            "no HTTP listener means no http:// URL to offer"
+        );
+    }
+
+    /// A bound HTTP endpoint on a nonstandard port must be the port that
+    /// actually appears in option 67 — not the default 80, and not whatever
+    /// port was originally requested on the command line (which, for
+    /// `--http-port 0`, is never the port that ends up bound).
+    #[test]
+    fn choose_boot_advertises_the_actual_bound_port_in_option_67() {
+        let pkt = request_packet(BOOTREQUEST, Some(DHCP_DISCOVER), &http_client_opts());
+        let req = parse_request(&pkt).expect("HTTPClient DISCOVER parses");
+        let server = Ipv4Addr::new(192, 168, 99, 1);
+
+        let boot = choose_boot(&req, server, Some(8123), "grubaa64.efi");
+        let BootChoice::Http(url) = &boot else {
+            panic!("expected BootChoice::Http, got a different choice");
+        };
+        assert_eq!(url, "http://192.168.99.1:8123/grubaa64.efi");
+
+        let advert = BootAdvert::http(url);
+        let reply = build_reply(&req, DHCP_OFFER, server, CLIENT, &advert);
+        let opts = reply_options(&reply);
+        let get = |tag: u8| opts.iter().find(|(t, _)| *t == tag).map(|(_, v)| v.clone());
+
+        assert_eq!(
+            get(OPT_BOOTFILE),
+            Some(b"http://192.168.99.1:8123/grubaa64.efi".to_vec()),
+            "option 67 must carry the real bound port, not 80 or 0"
+        );
+        assert_eq!(get(OPT_VENDOR_CLASS), Some(b"HTTPClient".to_vec()));
+    }
+
+    /// A PXE client is unaffected by HTTP availability at all: `choose_boot`
+    /// takes the PXE branch regardless of `http_endpoint`, so PXE/TFTP keep
+    /// working when HTTP is intentionally unavailable.
+    #[test]
+    fn choose_boot_pxe_client_ignores_http_endpoint_state() {
+        let pkt = request_packet(BOOTREQUEST, Some(DHCP_DISCOVER), &pxe_client_opts());
+        let req = parse_request(&pkt).expect("PXEClient DISCOVER parses");
+        let server = Ipv4Addr::new(192, 168, 99, 1);
+
+        assert!(matches!(
+            choose_boot(&req, server, None, "ipxe.efi"),
+            BootChoice::Pxe
+        ));
+        assert!(matches!(
+            choose_boot(&req, server, Some(8080), "ipxe.efi"),
+            BootChoice::Pxe
+        ));
     }
 
     // ── PXE path ─────────────────────────────────────────────────────────────

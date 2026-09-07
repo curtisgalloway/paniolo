@@ -19,7 +19,7 @@
 //!   devices  list capture devices
 //!   shot     fetch one PNG from a running daemon (--stable, --out)
 //!   watch    block until the screen changes, then print the new hash
-//!   stop     ask the running daemon to exit
+//!   stop     ask the running daemon to exit (authenticated HTTP, never a PID signal)
 //!   preview  print the URL to open in a browser
 
 mod auth;
@@ -95,7 +95,10 @@ enum Cmd {
     },
     /// Print the preview URL (open in a browser).
     Preview,
-    /// Tell the running daemon to shut down.
+    /// Ask the running daemon to shut down using its authentication token.
+    ///
+    /// Older daemons without the shutdown endpoint must be stopped with
+    /// `paniolo daemons stop hdmicap` before starting the updated daemon.
     Stop,
 }
 
@@ -261,7 +264,80 @@ fn cmd_preview() -> Result<()> {
 
 fn cmd_stop() -> Result<()> {
     let d = daemon::discover().context("is the daemon running?")?;
-    crate::platform::terminate_pid(d.pid as i32).context("failed to send SIGTERM to daemon")?;
+    request_stop(&d)?;
     println!("daemon (pid {}) stopping", d.pid);
     Ok(())
+}
+
+/// Shut the daemon down through its token-protected `POST /stop`.
+///
+/// Never falls back to signaling `d.pid`. A discovery file outlives the daemon
+/// whenever it did not exit cleanly, and once the kernel reuses that PID the
+/// record names an unrelated process; only the token proves the request
+/// reached the daemon that wrote the file. A daemon too old to have the
+/// endpoint answers 404 and must be stopped by the paniolo CLI, which checks
+/// the process identity before it signals anything.
+fn request_stop(d: &daemon::Discovery) -> Result<()> {
+    let token = d.token.as_deref().filter(|t| !t.is_empty()).context(
+        "daemon has no token; use `paniolo daemons stop hdmicap` to stop the older daemon",
+    )?;
+    ureq::post(&format!("http://127.0.0.1:{}/stop", d.port))
+        .set("Authorization", &format!("Bearer {token}"))
+        .timeout(std::time::Duration::from_secs(5))
+        .send_bytes(&[])
+        .context(
+            "authenticated shutdown failed; for an older daemon use `paniolo daemons stop hdmicap`",
+        )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+
+    /// A stale record naming a live PID (here: our own) must be answered by
+    /// the daemon behind the token or fail — never by a signal to that PID.
+    /// The fake daemon rejects the token so the request fails; the process
+    /// running this test is still alive afterwards, which is the point.
+    #[test]
+    fn stale_record_never_signals_its_live_pid() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let worker = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("POST /stop "), "{request}");
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer old-token"),
+                "{request}"
+            );
+            socket
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let mut record = daemon::Discovery {
+            pid: std::process::id(),
+            port,
+            token: Some("old-token".into()),
+        };
+        assert!(request_stop(&record).is_err());
+        worker.join().unwrap();
+        // No token at all (a pre-token daemon): refuse rather than signal.
+        record.token = None;
+        assert!(request_stop(&record).is_err());
+    }
 }

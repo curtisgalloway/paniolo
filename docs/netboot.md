@@ -66,7 +66,7 @@ netboot channel fields:
 | `--host-ip` | `192.168.99.1` | Static IP assigned to the interface; also the TFTP/HTTP server address and the router the client is told about. The client's lease is derived from it (same /24, last octet `100` — `192.168.99.100` by default) — see [Lease](#dhcp--tftp-behavior-notes) |
 | `--tftp-root` | (none) | Directory whose contents are served over TFTP **and** HTTP |
 | `--boot-file` | `kernel_2712.img` | Boot program (filename under the root, e.g. `grubaa64.efi`); served as a TFTP filename to PXE and wrapped in an `http://` URL for HTTP Boot |
-| `--http-port` | `80` | HTTP server port; also embedded in the HTTP Boot URL (omitted from the URL when 80) |
+| `--http-port` | `80` | HTTP server port; also embedded in the HTTP Boot URL (omitted from the URL when 80). `0` binds an OS-assigned ephemeral port — the URL always carries the port actually bound, never a literal `0` |
 | `--content-type` | `application/octet-stream` | `Content-Type` for HTTP responses (UEFI treats octet-stream as an EFI application) |
 | `--host` | target default | Lab host the channel lives on |
 
@@ -130,9 +130,12 @@ netbootd stays root and says so in its log. On macOS netbootd never had root
 **HTTP is optional; DHCP and TFTP are not.** If the HTTP port cannot be bound
 (something else owns port 80, say), netbootd logs a warning naming the port and
 keeps serving DHCP + TFTP — the Pi and UEFI PXE paths still work. HTTP Boot is
-then unavailable: an `HTTPClient` DHCP request still gets its `http://` offer,
-but the fetch fails. Free the port or set `--http-port` to an unused one. A DHCP
-or TFTP socket that cannot be bound or pinned is fatal.
+then unavailable: an `HTTPClient` DHCP request gets no offer at all (a
+rate-limited warning in the log), rather than an `http://` URL pointing at a
+server that isn't there — EDK2's `HttpBootDxe` would only reject a non-HTTP
+reply anyway, since it requires the `HTTPClient` class echo before it accepts
+an offer. Free the port or set `--http-port` to an unused one. A DHCP or TFTP
+socket that cannot be bound or pinned is fatal.
 
 **Interface safety:** `start` **refuses** an interface that carries your system
 default route (a primary NIC). netboot reconfigures the interface to the static
@@ -343,15 +346,34 @@ goes back to DISCOVER; a REQUEST addressed to another server (option 54) is
 ignored; and only Ethernet clients with a 6-byte hardware address are answered
 at all.
 
+**Single client.** The lease above is the *address* contract; netbootd also
+enforces an *identity* one, by hardware address. The first DISCOVER or REQUEST
+it sees locks in that MAC as the active client for as long as the process runs.
+A DISCOVER or REQUEST from a **different** MAC — a second device plugged into
+the same netboot link — gets no reply at all: no OFFER, ACK, or NAK, just a
+rate-limited warning in the log (`netboot logs`). Retransmissions from the
+already-active MAC are unaffected. There is no lease timer and no way to
+release the lock short of restarting the daemon — `netboot start`/`stop`
+already restarts `netbootd` per boot session, so switching which device
+netboots on a link means stopping and starting netboot again, exactly as
+switching TFTP roots or boot files already required.
+
 **TFTP.** The TFTP server is **read-only** (RFC 1350) and negotiates
-`blksize`/`tsize` options. Files are streamed from disk one block at a time
-(never read whole), each retransmit attempt has a fixed one-second deadline so a
-peer sending anything but the awaited ACK cannot keep a transfer alive past six
-attempts, and a repeated RRQ from the same client port replaces the transfer in
-flight rather than starting a parallel one. When replies go out as raw frames
-(the macOS BPF path) the negotiated `blksize` is capped at 1468 bytes so every
-DATA block fits one Ethernet frame. A symlink inside the TFTP root that points
-outside it is refused like any other escape (TFTP `file not found`, HTTP 404):
+`blksize`/`tsize` options. It only answers requests from the one IP DHCP
+leases on this link — a request from any other source address is ignored,
+the same as a second DHCP client's MAC above — and holds at most
+`MAX_TRANSFERS` (4) transfers open at once; a request that arrives when every
+slot is taken is dropped rather than queued, and a slot frees again once its
+transfer completes, errors, or exhausts its retransmit attempts. Files are
+streamed from disk one block at a time (never read whole), each retransmit
+attempt has a fixed one-second deadline so a peer sending anything but the
+awaited ACK cannot keep a transfer alive past six attempts, and a repeated RRQ
+from the same client port replaces the transfer in flight rather than starting
+a parallel one (still counting as one of the `MAX_TRANSFERS` slots). When
+replies go out as raw frames (the macOS BPF path) the negotiated `blksize` is
+capped at 1468 bytes so every DATA block fits one Ethernet frame. A symlink
+inside the TFTP root that points outside it is refused like any other escape
+(TFTP `file not found`, HTTP 404):
 only regular files whose real path is under the root are served.
 
 **HTTP.** The HTTP server sends exactly the `Content-Length` it announced even
