@@ -331,6 +331,13 @@ marks the current unterminated line (e.g. a `login:` prompt with no newline yet)
 
 ### Sending input
 
+Serial sends require a connected interface and finish only when the driver
+accepts every byte. Queued writes are not replayed after a disconnect. A failed
+send may have partially reached the target: read the console before retrying.
+Paced sends share a FIFO with dashboard typing; pacing follows actual driver
+writes, and capture continues while a send waits.
+
+
 `paniolo serial send` injects one line through the **running daemon** (start
 `watch` first), so input coexists with capture — what you send and what the
 target echoes both land in the log:
