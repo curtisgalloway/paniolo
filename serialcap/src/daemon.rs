@@ -149,7 +149,9 @@ pub fn run(interfaces: Vec<InterfaceSpec>, port: u16, buffer_lines: u64) -> Resu
             interfaces.len()
         );
 
-        let app = server::router(AppState { serials }, crate::auth::Auth::new(token, &[]));
+        let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+        let app = server::router(AppState { serials }, crate::auth::Auth::new(token, &[]))
+            .layer(axum::Extension(shutdown.clone()));
 
         // The /stream WebSocket is long-lived, so a plain graceful shutdown
         // would block on it forever. Remove the discovery file, give short
@@ -170,7 +172,10 @@ pub fn run(interfaces: Vec<InterfaceSpec>, port: u16, buffer_lines: u64) -> Resu
         let disc = discovery_path()?;
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
-                shutdown_signal().await;
+                tokio::select! {
+                    _ = shutdown_signal() => {},
+                    _ = shutdown.notified() => {},
+                }
                 let _ = fs::remove_file(&disc);
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 info!("daemon shut down");

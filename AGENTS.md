@@ -1601,6 +1601,9 @@ the problem.
   concurrently on one host (multiple hdmicap = multiple capture devices). The
   host-singleton daemons (zigplug/cambrionix/netbootd) stay **one per host** at
   `<base>/paniolo-<uid>/<daemon>/` with no `<target>` segment.
+- **serialcap stop authenticates shutdown.** It calls token-protected `POST /stop`
+  instead of signaling a discovery-file PID, which may have been recycled.
+  Older daemons require `paniolo daemons stop serialcap` before restarting.
 - **Daemon shutdown hard-exits.** Both hdmicap (`/preview` MJPEG) and serialcap
   (`/stream` WebSocket) serve infinite responses, so a plain axum graceful
   shutdown would block on them forever. On SIGTERM each daemon removes its
