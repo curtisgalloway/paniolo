@@ -231,6 +231,52 @@ the strings bring-up cares about. On a PXE screen's MAC address:
 So match on such strings loosely, or corroborate them, rather than trusting an
 exact compare.
 
+## Resource limits
+
+Every helper is handed whatever bytes and resolution the target's video
+channel produces, which is not bounded by anything paniolo controls. Each
+enforces the same three limits, checked before the expensive work (a full
+image decode, or the 2x upscale `linuxocr`/`visionocr` do for small console
+fonts) happens, so a hostile or merely oversized input fails fast instead of
+driving an oversized allocation:
+
+- **64 MiB of encoded input.** Each helper reads stdin/the file argument in
+  bounded chunks (up to the limit plus one byte, so "exactly at the limit" and
+  "over it" are both detectable without ever buffering much past the cap) and
+  errors as soon as it sees more than that arrives.
+- **8192 px on a side, 33,177,600 px total** (7680x4320). Checked against the
+  image header *before* a full decode: `linuxocr`/`rapidocr` parse the PNG
+  IHDR by hand, `visionocr` reads ImageIO's properties
+  (`CGImageSourceCopyPropertiesAtIndex`), and `winocr` reads
+  `BitmapDecoder.PixelWidth`/`PixelHeight` before calling
+  `GetSoftwareBitmapAsync()` — all of which report a header-declared size
+  without rasterizing pixels. Each helper also checks again right after its
+  own decode, unconditionally, before doing anything with the result — a
+  backstop for whatever the header parse missed (a format the PNG-specific
+  check doesn't recognize, or Pillow/OpenCV succeeding where it didn't). The
+  decode has already happened by then, but the expensive step for
+  `linuxocr`/`visionocr` — the 2x upscale — has not.
+
+  33,177,600 is exactly 2x a 4K capture (3840x2160) in each dimension, so any
+  4K frame passes — with margin on the per-side number, none on the
+  pixel-count one, since a 4K frame doubled is precisely at that limit.
+  `linuxocr` and `visionocr` check this pixel/dimension pair twice: once
+  against the source size, once against the *working* size their own 2x
+  upscale is about to allocate (before the small fixed padding on top, which
+  isn't part of the limit — a constant ~20-32 px, negligible against this
+  budget). `rapidocr` and `winocr` do no upscaling, so it applies directly to
+  the source. `winocr` additionally intersects the shared per-side limit with
+  `OcrEngine::MaxImageDimension()`, using whichever is stricter.
+
+The three numbers must stay **identical** across `ocr/linuxocr`,
+`ocr/rapidocr`, `ocr/visionocr.swift` and `ocr/winocr/src/main.rs` — each
+defines them once as named constants, with a comment pointing at the other
+three so a future change to one doesn't silently drift from the rest.
+
+**Errors are one line, on stderr, non-zero exit** — the same path each helper
+already uses for "cannot read", "could not decode image", and so on, not a
+new failure mode a caller has to learn to recognize.
+
 ## Adding an engine
 
 1. Read a PNG from stdin or a path; support `--json`.

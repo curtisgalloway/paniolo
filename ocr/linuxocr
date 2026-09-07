@@ -38,17 +38,90 @@ import subprocess
 import sys
 import tempfile
 
+# Resource limits shared with ocr/rapidocr, ocr/visionocr.swift and
+# ocr/winocr/src/main.rs -- MAX_ENCODED_BYTES, MAX_DIMENSION and MAX_PIXELS
+# must be identical across all four helpers (see docs/dev/ocr.md's "Resource
+# limits" section). This helper upscales 2x during preprocessing, so
+# MAX_DIMENSION/MAX_PIXELS are sized against that *working* (post-2x, before
+# padding) size: exactly 2x a 4K capture (3840x2160) in each dimension, so
+# any 4K frame passes with margin. The small fixed padding _preprocess adds
+# on top is not part of the limit -- it is a constant ~20 px, negligible
+# against an 8192px/33-megapixel budget.
+MAX_ENCODED_BYTES = 64 * 1024 * 1024  # 64 MiB of encoded (PNG) input
+MAX_DIMENSION = 8192  # px, per side, of the post-upscale (pre-pad) working image
+MAX_PIXELS = 33_177_600  # 7680x4320 total px of the post-upscale (pre-pad) image
+
+# _preprocess's own upscale/pad factors, pulled out so the dimension check
+# below can predict the buffer _preprocess is about to allocate before it
+# allocates it.
+_UPSCALE = 2
+_PAD = 10
+
+
+def die(msg: str) -> "None":
+    sys.stderr.write(f"linuxocr: {msg}\n")
+    sys.exit(1)
+
+
+def _read_bounded(stream, max_bytes: int) -> bytes:
+    """Read at most ``max_bytes`` + 1 bytes from ``stream``, in chunks, and
+    error if the input turns out to be longer than ``max_bytes``.
+
+    Reading one byte past the cap (rather than stopping exactly at it) is
+    what lets this tell "exactly at the limit" from "over the limit" apart
+    without ever buffering more than a byte more than the limit allows.
+    """
+    chunks = []
+    total = 0
+    while total <= max_bytes:
+        chunk = stream.read(min(1 << 20, max_bytes + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    data = b"".join(chunks)
+    if len(data) > max_bytes:
+        die(f"input is over {max_bytes} bytes (encoded-input limit)")
+    return data
+
+
+def _check_dimensions(w: int, h: int) -> None:
+    """Reject dimensions before they drive an allocation.
+
+    Called both on the source image's dimensions (from the PNG header, before
+    Pillow ever opens it) and on the working size _preprocess is about to
+    allocate (2x upscale + padding) -- same two limits either way. A
+    ``w``/``h`` of 0 means the caller could not determine a size yet (e.g.
+    `_png_size` failed to parse a header) and there is nothing to check.
+    """
+    if w <= 0 or h <= 0:
+        return
+    if w > MAX_DIMENSION or h > MAX_DIMENSION:
+        die(f"image is {w}x{h}; exceeds the {MAX_DIMENSION}px-per-side limit")
+    if w * h > MAX_PIXELS:
+        die(f"image is {w}x{h} ({w * h} px); exceeds the {MAX_PIXELS}px limit")
+
 
 def _preprocess(png: bytes) -> bytes:
     """2x upscale + black pad. Falls back to identity if Pillow is absent."""
     try:
         from PIL import Image  # type: ignore
 
-        img = Image.open(io.BytesIO(png)).convert("RGB")
+        img = Image.open(io.BytesIO(png))
         w, h = img.size
-        img = img.resize((w * 2, h * 2), Image.LANCZOS)
-        padded = Image.new("RGB", (w * 2 + 20, h * 2 + 20), (0, 0, 0))
-        padded.paste(img, (10, 10))
+        # Belt-and-suspenders: main() already checked the header-derived
+        # size before calling this, but only when `_png_size` could parse
+        # one. Pillow's Image.open reads just the header too, so checking
+        # again here (before .convert()/.resize() force a full decode)
+        # catches whatever the header parse above missed, at no extra cost.
+        _check_dimensions(w, h)
+        _check_dimensions(w * _UPSCALE, h * _UPSCALE)
+        img = img.convert("RGB")
+        img = img.resize((w * _UPSCALE, h * _UPSCALE), Image.LANCZOS)
+        padded = Image.new(
+            "RGB", (w * _UPSCALE + _PAD * 2, h * _UPSCALE + _PAD * 2), (0, 0, 0)
+        )
+        padded.paste(img, (_PAD, _PAD))
         buf = io.BytesIO()
         padded.save(buf, "PNG")
         return buf.getvalue()
@@ -198,12 +271,17 @@ def main() -> None:
     args = ap.parse_args()
 
     if args.input == "-":
-        png = sys.stdin.buffer.read()
+        png = _read_bounded(sys.stdin.buffer, MAX_ENCODED_BYTES)
     else:
         with open(args.input, "rb") as f:
-            png = f.read()
+            png = _read_bounded(f, MAX_ENCODED_BYTES)
 
     src_w, src_h = _png_size(png)
+    if src_w and src_h:
+        # Inspect the header before _preprocess ever opens the image, so an
+        # oversized claim is rejected before Pillow decodes anything.
+        _check_dimensions(src_w, src_h)
+        _check_dimensions(src_w * _UPSCALE, src_h * _UPSCALE)
     processed = _preprocess(png)
     # _preprocess is identity when Pillow is missing, and then no mapping back
     # is needed. Detect that rather than assuming, so the bboxes stay correct

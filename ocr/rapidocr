@@ -81,6 +81,61 @@ def die(msg: str) -> "None":
     raise SystemExit(1)
 
 
+# Resource limits shared with ocr/linuxocr, ocr/visionocr.swift and
+# ocr/winocr/src/main.rs -- MAX_ENCODED_BYTES, MAX_DIMENSION and MAX_PIXELS
+# must be identical across all four helpers (see docs/dev/ocr.md's "Resource
+# limits" section). This helper does no upscaling (see the module docstring),
+# so these apply directly to the source image.
+MAX_ENCODED_BYTES = 64 * 1024 * 1024  # 64 MiB of encoded (PNG) input
+MAX_DIMENSION = 8192  # px, per side
+MAX_PIXELS = 33_177_600  # 7680x4320 total px -- 2x a 4K capture, with margin
+
+
+def _png_size(png: bytes) -> "tuple[int, int]":
+    """Width and height from the PNG IHDR, without decoding.
+
+    Mirrors ocr/linuxocr's copy of the same check -- kept as a separate copy
+    rather than a shared import because these are standalone scripts, not a
+    package.
+    """
+    if len(png) < 24 or png[:8] != b"\x89PNG\r\n\x1a\n":
+        return (0, 0)
+    return (int.from_bytes(png[16:20], "big"), int.from_bytes(png[20:24], "big"))
+
+
+def _check_dimensions(w: int, h: int) -> None:
+    """Reject dimensions before they drive a decode.
+
+    A ``w``/``h`` of 0 means the caller could not determine a size yet (e.g.
+    `_png_size` failed to parse a header) and there is nothing to check.
+    """
+    if w <= 0 or h <= 0:
+        return
+    if w > MAX_DIMENSION or h > MAX_DIMENSION:
+        die(f"image is {w}x{h}; exceeds the {MAX_DIMENSION}px-per-side limit")
+    if w * h > MAX_PIXELS:
+        die(f"image is {w}x{h} ({w * h} px); exceeds the {MAX_PIXELS}px limit")
+
+
+def _read_bounded(stream, max_bytes: int) -> bytes:
+    """Read at most ``max_bytes`` + 1 bytes from ``stream``, in chunks, and
+    error if the input turns out to be longer than ``max_bytes``. See
+    ocr/linuxocr's copy of this function for why one byte past the cap.
+    """
+    chunks = []
+    total = 0
+    while total <= max_bytes:
+        chunk = stream.read(min(1 << 20, max_bytes + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    data = b"".join(chunks)
+    if len(data) > max_bytes:
+        die(f"input is over {max_bytes} bytes (encoded-input limit)")
+    return data
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="OCR a PNG using PP-OCRv6 via RapidOCR (Linux GUI-mode helper)."
@@ -103,14 +158,28 @@ def main() -> None:
             "pip install 'rapidocr>=3,<4' onnxruntime opencv-python-headless"
         )
 
-    png = sys.stdin.buffer.read() if args.input == "-" else Path(args.input).read_bytes()
+    if args.input == "-":
+        png = _read_bounded(sys.stdin.buffer, MAX_ENCODED_BYTES)
+    else:
+        with open(args.input, "rb") as f:
+            png = _read_bounded(f, MAX_ENCODED_BYTES)
     if not png:
         die("no image data")
+
+    # Inspect the header before cv2.imdecode ever rasterizes the image, so an
+    # oversized claim is rejected before OpenCV decodes anything.
+    src_w, src_h = _png_size(png)
+    if src_w and src_h:
+        _check_dimensions(src_w, src_h)
 
     img = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         die("could not decode image")
     height, width = img.shape[:2]
+    # Backstop for inputs _png_size couldn't parse a header from (non-PNG, or
+    # malformed) -- the decode already happened, but the OCR engine below has
+    # not run yet.
+    _check_dimensions(width, height)
 
     # Four threads matches a Pi's core count. The key is nested under the
     # engine, not Global — RapidOCR validates keys strictly and raises on an
