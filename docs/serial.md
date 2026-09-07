@@ -370,8 +370,14 @@ curl -s -H "Authorization: Bearer $(jq -r .token "$d")" \
 A daemon started by a paniolo older than the token has none and accepts
 unauthenticated requests; `paniolo daemons restart --stale` replaces it.
 
+`serialcap stop` uses authenticated `POST /stop`, so a stale discovery file
+cannot cause it to terminate an unrelated process after PID reuse. It refuses
+to fall back to a PID signal. To replace an older daemon without this endpoint,
+use `paniolo daemons stop serialcap`, then start capture again.
+
 | Method | Path | Purpose |
 |---|---|---|
+| POST | `/stop` | Authenticated daemon shutdown; never signals a discovery-file PID |
 | GET | `/stream` | Bidirectional WebSocket: serial output (binary) + client keystrokes |
 | GET | `/status` | One interface (`?interface=`) or all; `{name, device, baud, connected, power_on}` |
 | GET | `/interfaces` | All interfaces and their status |
