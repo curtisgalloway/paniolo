@@ -180,6 +180,11 @@ Each captured line carries a monotonic sequence number (`seq`, stable across
 log rotation) and a UTC timestamp (`ts_ms`). The `--since` flag polls for lines
 with `seq` greater than the last seen value — safe to re-run from scripts.
 
+Completed records take precedence over a stale pending-line sidecar, including
+when applying `--tail` and sequence filters. A pending line may change without
+changing its sequence: advance a polling cursor only past completed records,
+or use `--no-pending` when polling with `--since`.
+
 Each interface writes to its own capture directory so logs never conflate:
 `/tmp/paniolo-<uid>/serialcap/<target>/capture/<name>/serial.jsonl`.
 

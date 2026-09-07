@@ -397,7 +397,12 @@ pub fn read_lines(dir: &Path, q: &Query) -> Vec<Line> {
 
     if q.include_pending {
         if let Some(p) = read_pending(dir) {
-            all.push(p);
+            // The sidecar is debounced independently of completed appends.
+            // It can still describe a line that has already been committed.
+            // Only a sequence newer than all completed records is pending.
+            if all.iter().all(|line| line.seq < p.seq) {
+                all.push(p);
+            }
         }
     }
 
@@ -1017,5 +1022,52 @@ mod tests {
         // 2021-01-01T00:00:00Z = 1609459200 s.
         assert_eq!(format_utc(1_609_459_200_000), "2021-01-01T00:00:00.000Z");
         assert_eq!(format_utc(1_609_459_200_123), "2021-01-01T00:00:00.123Z");
+    }
+
+    #[test]
+    fn completed_records_win_over_a_stale_pending_sidecar() {
+        let dir = tmp();
+        let mut log = LineLog::open(dir.clone(), 100);
+        log.ingest(b"login:");
+        let stale = fs::read(dir.join(PENDING)).unwrap();
+        log.ingest(b" ready\nnext\n");
+        // Model the sidecar snapshot a reader can see during debounce,
+        // without depending on how fast the test machine runs.
+        fs::write(dir.join(PENDING), stale).unwrap();
+        let query = Query {
+            include_pending: true,
+            ..Default::default()
+        };
+        let lines = read_lines(&dir, &query);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].text, "login: ready");
+        assert!(lines.iter().all(|l| !l.partial));
+        let tail = read_lines(
+            &dir,
+            &Query {
+                tail: Some(1),
+                include_pending: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].text, "next");
+        let since = read_lines(
+            &dir,
+            &Query {
+                since: Some(0),
+                include_pending: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(since.len(), 1);
+        assert_eq!(since[0].seq, 1);
+        log.ingest(b"new prompt");
+        log.flush_sidecar();
+        let lines = read_lines(&dir, &query);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[2].partial);
+        assert_eq!(lines[2].seq, 2);
+        fs::remove_dir_all(dir).unwrap();
     }
 }
