@@ -233,6 +233,12 @@ so it works whether or not the daemon is running. A separate, dependency-light *
 path (`paniolo serial connect`) execs `tio` for a foreground terminal — it holds the port
 exclusively and so conflicts with the daemon.
 
+Serialcap input requests carry a connection generation and a completion reply.
+The supervisor writes bounded slices while continuing to read serial output,
+spaces paced bytes after successful driver writes, and acknowledges only a
+completed request. Disconnects fail pending requests; a new connection rejects
+requests from older generations so input is never replayed across reconnects.
+
 ### Power control ([`power.md`](../power.md))
 Two mechanisms, both driven through serial/config: **DTR via FTDI** (the serial adapter's DTR
 line wired to the board's J2 power-button header — `serial dtr`/`serial reset`, ≤500 ms soft /

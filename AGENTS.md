@@ -1606,6 +1606,10 @@ the problem.
   shutdown would block on them forever. On SIGTERM each daemon removes its
   discovery file, gives a 300 ms grace, then `std::process::exit(0)`. The OS
   releases the capture device / serial port on exit.
+- **Serialcap input completion.** `/input` and WebSocket writes share a FIFO;
+  success follows driver acceptance of all bytes. The supervisor paces actual
+  writes and rejects old connection generations after reconnect. A failed send
+  may have partially reached the target; unsent bytes are not replayed.
 - **Serial ports are exclusive.** Only one of `tio`/`screen`/serialcap can hold
   a port at a time. `paniolo serial watch` and `paniolo serial connect` conflict
   on the same device — use one or the other.

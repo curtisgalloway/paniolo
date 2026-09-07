@@ -211,10 +211,11 @@ async fn button(State(s): State<AppState>, Query(q): Query<ButtonParam>) -> Resp
 /// With `pace_ms > 0` the bytes are dripped one at a time that many ms apart —
 /// the substitute for hardware flow control on a slow polled console. The call
 /// blocks until the whole body has been written, so a paced send of N bytes
-/// takes about `N * pace_ms` ms. The body is capped at [`MAX_INPUT_BYTES`] and
+/// takes at least `(N - 1) * pace_ms` ms. Completion means driver acceptance,
+/// not target execution. Disconnects fail pending writes without replay. The body is capped at [`MAX_INPUT_BYTES`] and
 /// the pacing at [`MAX_PACE_MS`]. Returns 200 on success, 400 for a pace past
 /// the ceiling, 404 for an unknown interface, 413 for an oversized body, 503
-/// if the supervisor is not running.
+/// if the interface is disconnected or a driver write fails.
 async fn input(State(s): State<AppState>, Query(q): Query<InputParam>, body: Bytes) -> Response {
     let handle = match resolve(&s.serials, &q.interface) {
         Some(h) => h.clone(),
@@ -288,21 +289,27 @@ async fn handle_ws(socket: WebSocket, serial: SerialHandle) {
     });
 
     // client -> serial
-    let write_tx = serial.write_tx.clone();
+    let input = serial.clone();
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
             match msg {
-                // `send` rather than `try_send`: a full queue backpressures
-                // the client's WebSocket read instead of silently dropping
-                // keystrokes (the queue only fills when the port itself is
-                // the bottleneck, e.g. a paced `/input` send in progress).
+                // Wait for the supervisor's driver acknowledgement. A write
+                // failure closes this connection; never silently replay input.
                 Message::Binary(b) => {
-                    if write_tx.send(Bytes::from(b)).await.is_err() {
+                    if input
+                        .write_paced(Bytes::from(b), std::time::Duration::ZERO)
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
                 Message::Text(t) => {
-                    if write_tx.send(Bytes::from(t.into_bytes())).await.is_err() {
+                    if input
+                        .write_paced(Bytes::from(t.into_bytes()), std::time::Duration::ZERO)
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -333,5 +340,44 @@ mod tests {
         );
         assert!(pace_of(MAX_PACE_MS + 1).is_err());
         assert!(pace_of(u64::MAX).is_err());
+    }
+
+    #[tokio::test]
+    async fn input_returns_503_for_a_disconnected_interface() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        let dir = std::env::temp_dir().join(format!(
+            "serialcap-http-disconnected-{}",
+            std::process::id()
+        ));
+        let app = router(
+            AppState {
+                serials: Serials::spawn_all(
+                    &[crate::serial_io::InterfaceSpec {
+                        name: "console".into(),
+                        device: dir.join("missing-device").to_string_lossy().into_owned(),
+                        baud: 115200,
+                        power_sense_signal: None,
+                    }],
+                    &dir,
+                    100,
+                ),
+            },
+            crate::auth::Auth::new("test-token".into(), &[]),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/input")
+                    .header("Host", "127.0.0.1")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::from("reboot\n"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        std::fs::remove_dir_all(dir).ok();
     }
 }

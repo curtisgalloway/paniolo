@@ -191,7 +191,11 @@ Each interface writes to its own capture directory so logs never conflate:
 scripted input coexists with capture — no `serial stop`, no exclusive re-open,
 and output keeps flowing to `serial log` and the dashboard. (Contrast
 `serial connect`, which holds the port exclusively and can't run alongside the
-daemon.) The daemon must be running (`paniolo serial watch`).
+daemon.) The daemon must be running (`paniolo serial watch`) and the interface connected.
+Success means the serial driver accepted all bytes; it does not confirm that
+the target executed the command. A disconnect fails pending writes, and unsent
+bytes are not replayed on reconnection. Errors can follow partial delivery, so
+inspect the console before retrying.
 
 With two positionals the first is the target (`serial send <target> <text>`);
 with one, it's the text and the sole target is implied. `-t` also works.
@@ -222,8 +226,10 @@ polled console.
 paniolo serial send -i console --pace-ms 8 "iochk --live-dangerously /block/000"
 ```
 
-A paced send of N bytes takes about `N * pace_ms` ms and blocks until the whole
-line is written. With `--pace-ms 0` (the default) the line is sent at full rate,
+A paced send of N bytes takes at least `(N - 1) * pace_ms` ms and blocks until
+the serial driver accepts the whole line. Pacing is applied after successful
+driver writes, so a stalled writer cannot accumulate a burst of queued bytes.
+Requests execute in FIFO order, including dashboard input. With `--pace-ms 0` (the default) the line is sent at full rate,
 which is fine for an interrupt-driven console or one with flow control wired.
 
 > **Why not RTS/CTS or XON/XOFF instead?** Hardware RTS/CTS *is* the proper fix,
@@ -369,9 +375,12 @@ unauthenticated requests; `paniolo daemons restart --stale` replaces it.
 | POST | `/input` | Write the request body to the port; `?pace_ms=N` drips one byte per N ms |
 
 `POST /input` writes through the port the daemon already owns, so input coexists
-with live capture. A paced write (`pace_ms > 0`) blocks until the whole body is
-sent (~`len × pace_ms` ms). The body is capped at 64 KiB and `pace_ms` at
-10 000, so one request cannot park the port for days. Returns 200 on success,
-400 for a pace past the ceiling, 404 for an unknown interface, 413 for an
-oversized body, 503 if the supervisor isn't running. `/stream` messages from
-the client are capped at 64 KiB likewise.
+with live capture. Both paced and unpaced requests wait until the driver accepts
+all bytes. Paced writes wait at least `pace_ms` between driver writes; reads
+and DTR requests remain serviced. The body is capped at 64 KiB and `pace_ms`
+at 10 000. Returns 200 on completion, 400 for a pace past the ceiling, 404 for
+an unknown interface, 413 for an oversized body, and 503 for a disconnected
+interface or interrupted write. A failed write may have partially reached the
+target; remaining bytes are discarded rather than replayed after reconnection.
+`/stream` messages from the client are capped at 64 KiB likewise and share the
+same FIFO writer. A WebSocket write failure closes that connection.
