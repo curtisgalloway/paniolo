@@ -287,11 +287,15 @@ one interface, `-i`/`--interface` can be omitted everywhere. Don't run `connect`
 and `watch` (or an external `screen`/`tio`) on the **same device** at once —
 start one, or `stop`/close the other first.
 
-### Updating an older serialcap daemon
+### Updating an older serialcap, hdmicap, ch9329, hidrig, or zigplug daemon
 
-If `serial stop` reports that authenticated shutdown is unavailable, use
-`paniolo daemons stop serialcap` and start serial capture again. New
-`serialcap stop` uses the daemon token and never signals a discovery-file PID.
+If `serial stop`, `video stop`, or `hid stop` reports that authenticated
+shutdown is unavailable, use `paniolo daemons stop <name>` (`serialcap`,
+`hdmicap`, or `hid`) and start capture again. A standalone `zigplug stop`
+that cannot make the daemon exit reports the same thing — use `paniolo
+daemons stop zigplug`. New `serialcap stop`, `hdmicap stop`, `ch9329 stop`,
+`hidrig stop`, and `zigplug stop` all use the daemon token and never signal a
+discovery-file PID.
 
 **A VM's console is a serial interface.** A pty path (`/dev/ttysNNN` on macOS,
 `/dev/pts/N` on Linux — `utmctl attach <vm>` prints it, qemu's `-serial pty`
@@ -328,18 +332,8 @@ it errors and lists the names); with more than one target, name it
 later with `--since <seq>` to get only what's new, or `--from/--to` to re-read an
 exact span. Output is ANSI-stripped by default; a `*` after the sequence number
 marks the current unterminated line (e.g. a `login:` prompt with no newline yet).
-Completed records supersede stale partial snapshots. Advance a `--since` cursor
-only past completed lines, or use `--no-pending`, because partial text can grow
-without changing its sequence number.
 
 ### Sending input
-
-Serial sends require a connected interface and finish only when the driver
-accepts every byte. Queued writes are not replayed after a disconnect. A failed
-send may have partially reached the target: read the console before retrying.
-Paced sends share a FIFO with dashboard typing; pacing follows actual driver
-writes, and capture continues while a send waits.
-
 
 `paniolo serial send` injects one line through the **running daemon** (start
 `watch` first), so input coexists with capture — what you send and what the
@@ -425,12 +419,6 @@ because DTR-to-J2 wiring is rare. On a target that hasn't opted in, `serial dtr`
 / `serial reset` **error** with a hint (they never toggle a lone console blindly).
 So: unless DTR wiring is explicitly declared, reboot via the console `reboot` or
 `power-cycle` — do **not** assume `serial reset` power-cycles the board.
-
-### DTR failures
-
-A serial DTR command fails if either assertion or release fails. The daemon
-attempts release and reconnects the failed port. Inspect the target before
-retrying: an error does not prove that no physical power-button press occurred.
 
 ### Cambrionix hub (example)
 

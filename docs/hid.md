@@ -207,6 +207,13 @@ URL it hands the dashboard — so a web page in your browser cannot inject
 keystrokes into the target. A daemon from an older paniolo has no token;
 `paniolo daemons restart --stale` replaces it.
 
+`hid stop` (and the standalone `ch9329 stop` / `hidrig stop`) shuts the daemon
+down through its authenticated `POST /stop`, never by signaling the PID in
+the discovery file: a record left behind by a crash can name a PID the
+kernel has since given to an unrelated process. A daemon too old to have the
+endpoint must be stopped with `paniolo daemons stop hid`, which checks the
+process identity first.
+
 **Limits.** One `type` command takes at most 4096 characters, a `move` or
 `scroll` moves at most 32 767 units per axis per call (`ch9329`), a `/send`
 body or WebSocket message is at most 4 KiB, and a command the injector never
