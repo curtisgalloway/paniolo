@@ -267,6 +267,10 @@ unsafe fn select_native_nv12(reader: &IMFSourceReader) -> Result<(IMFMediaType, 
     })
 }
 
+/// Tightly packed Y and CbCr planes plus the row stride they were compacted
+/// from, as both lock paths below return them.
+type CompactedPlanes = (Vec<u8>, Vec<u8>, usize);
+
 /// Lock `buffer` through the `IMF2DBuffer` interface and compact it,
 /// treating the reported pitch as the row stride.
 ///
@@ -286,7 +290,7 @@ unsafe fn lock_and_compact_2d(
     buffer: &IMFMediaBuffer,
     w: usize,
     h: usize,
-) -> Option<Result<(Vec<u8>, Vec<u8>, usize)>> {
+) -> Option<Result<CompactedPlanes>> {
     let buf2d = buffer.cast::<IMF2DBuffer>().ok()?;
     let mut scanline0: *mut u8 = std::ptr::null_mut();
     let mut pitch: i32 = 0;
@@ -341,7 +345,7 @@ unsafe fn lock_and_compact_1d(
     stride: usize,
     w: usize,
     h: usize,
-) -> Result<(Vec<u8>, Vec<u8>, usize)> {
+) -> Result<CompactedPlanes> {
     let mut ptr: *mut u8 = std::ptr::null_mut();
     let mut len: u32 = 0;
     buffer
