@@ -328,6 +328,9 @@ it errors and lists the names); with more than one target, name it
 later with `--since <seq>` to get only what's new, or `--from/--to` to re-read an
 exact span. Output is ANSI-stripped by default; a `*` after the sequence number
 marks the current unterminated line (e.g. a `login:` prompt with no newline yet).
+Completed records supersede stale partial snapshots. Advance a `--since` cursor
+only past completed lines, or use `--no-pending`, because partial text can grow
+without changing its sequence number.
 
 ### Sending input
 

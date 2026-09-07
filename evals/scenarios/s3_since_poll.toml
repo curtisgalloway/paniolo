@@ -11,13 +11,13 @@ lines that appear after the ones you've already seen — without re-dumping the
 whole log each time you check. How do you do that with paniolo?
 """
 traps = [
-  "each captured line has a stable, monotonic `seq`; note the highest, then poll `--since <seq>`",
+  "each captured line has a stable, monotonic `seq`; note the highest completed sequence, then poll `--since <seq>`",
   "a `*` after the seq marks the current unterminated line (e.g. a `login:` prompt with no newline yet)",
   "`seq` stays valid across buffer eviction, so an old `--since`/range query keeps working",
 ]
 reference = [
   'paniolo serial watch dut',
-  'paniolo serial log dut --tail 1        # note the highest seq, e.g. #1840',
+  'paniolo serial log dut --no-pending --tail 1        # note the highest seq, e.g. #1840',
   'paniolo serial log dut --since 1840     # only lines newer than #1840 (repeat to poll)',
 ]
 seed = "dut_console.toml"
