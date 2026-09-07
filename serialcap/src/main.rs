@@ -18,7 +18,7 @@
 //!   daemon   own a serial port and serve it over a localhost WebSocket
 //!   log      print captured serial output (timestamped, by line range)
 //!   devices  list serial devices
-//!   stop     ask the running daemon to exit (SIGTERM)
+//!   stop     ask the running daemon to exit (authenticated HTTP)
 
 mod auth;
 mod capture;
@@ -137,7 +137,10 @@ enum Cmd {
     },
     /// List available serial devices and exit (no daemon needed).
     Devices,
-    /// Tell the running daemon to shut down.
+    /// Ask the running daemon to shut down using its authentication token.
+    ///
+    /// Older daemons without the shutdown endpoint must be stopped with
+    /// `paniolo daemons stop serialcap` before starting the updated daemon.
     Stop,
 }
 
@@ -189,7 +192,65 @@ fn cmd_devices() -> Result<()> {
 
 fn cmd_stop() -> Result<()> {
     let d = daemon::discover().context("is the daemon running?")?;
-    crate::platform::terminate_pid(d.pid as i32).context("failed to send SIGTERM to daemon")?;
+    request_stop(&d)?;
     println!("daemon (pid {}) stopping", d.pid);
     Ok(())
+}
+
+/// Never fall back to signaling the PID: it may have been recycled.
+fn request_stop(d: &daemon::Discovery) -> Result<()> {
+    let token = d.token.as_deref().filter(|t| !t.is_empty()).context(
+        "daemon has no token; use `paniolo daemons stop serialcap` to stop the older daemon",
+    )?;
+    ureq::post(&format!("http://127.0.0.1:{}/stop", d.port))
+        .set("Authorization", &format!("Bearer {token}"))
+        .timeout(std::time::Duration::from_secs(5))
+        .send_bytes(&[])
+        .context("authenticated shutdown failed; for an older daemon use `paniolo daemons stop serialcap`")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+
+    #[test]
+    fn stale_record_never_signals_its_live_pid() {
+        // Our own PID is alive, but a failed request must never signal it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let worker = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("POST /stop "));
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer old-token"));
+            socket
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let mut record = daemon::Discovery {
+            pid: std::process::id(),
+            port,
+            token: Some("old-token".into()),
+            interfaces: vec![],
+        };
+        assert!(request_stop(&record).is_err());
+        worker.join().unwrap();
+        record.token = None;
+        assert!(request_stop(&record).is_err());
+    }
 }

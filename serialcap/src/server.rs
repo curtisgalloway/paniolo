@@ -26,7 +26,7 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        DefaultBodyLimit, Query, State,
+        DefaultBodyLimit, Extension, Query, State,
     },
     http::StatusCode,
     middleware,
@@ -92,6 +92,7 @@ pub struct InputParam {
 /// Origin, and the daemon token (see `auth.rs`).
 pub fn router(state: AppState, auth: crate::auth::Auth) -> Router {
     Router::new()
+        .route("/stop", post(stop))
         .route("/stream", get(stream))
         .route("/status", get(status))
         .route("/interfaces", get(interfaces))
@@ -103,6 +104,11 @@ pub fn router(state: AppState, auth: crate::auth::Auth) -> Router {
         )
         .layer(middleware::from_fn_with_state(auth, crate::auth::require))
         .with_state(state)
+}
+
+async fn stop(Extension(shutdown): Extension<std::sync::Arc<tokio::sync::Notify>>) -> &'static str {
+    shutdown.notify_one();
+    "daemon stopping\n"
 }
 
 /// The per-byte pacing for `pace_ms`, or the refusal for one past the ceiling.
@@ -321,6 +327,49 @@ async fn handle_ws(socket: WebSocket, serial: SerialHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_requires_the_daemon_token() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+        let app = router(
+            AppState {
+                serials: Serials::spawn_all(&[], std::path::Path::new("."), 100),
+            },
+            crate::auth::Auth::new("test-token".into(), &[]),
+        )
+        .layer(Extension(shutdown.clone()));
+        for token in [None, Some("wrong"), Some("test-token")] {
+            let mut req = Request::builder()
+                .method("POST")
+                .uri("/stop")
+                .header("Host", "127.0.0.1");
+            if let Some(token) = token {
+                req = req.header("Authorization", format!("Bearer {token}"));
+            }
+            let response = app
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let valid = token == Some("test-token");
+            assert_eq!(
+                response.status(),
+                if valid {
+                    StatusCode::OK
+                } else {
+                    StatusCode::UNAUTHORIZED
+                }
+            );
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_millis(10), shutdown.notified())
+                    .await
+                    .is_ok(),
+                valid
+            );
+        }
+    }
 
     /// Pacing multiplies the time a body holds the port; the ceiling keeps one
     /// request from parking the interface for days.

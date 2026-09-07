@@ -336,6 +336,10 @@ and the macOS-only bits (Vision OCR, BPF) are irrelevant there.
 
 ## 9. Lifecycle & exclusivity notes
 
+Serialcap also accepts authenticated `POST /stop`. Its helper stop command uses
+this endpoint instead of signaling the PID in discovery, avoiding PID reuse.
+The request and OS signals enter the same discovery cleanup and exit path.
+
 - **Serial ports are exclusive** — only one of `serialcap` / `tio` / `screen` can hold a port.
   `serial watch` and `serial connect` conflict on the same device.
 - **Daemons hard-exit on SIGTERM** — both serve infinite responses (`/preview` MJPEG, `/stream`
