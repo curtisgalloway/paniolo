@@ -72,6 +72,12 @@ loopback `Host` and `Origin`, so a web page open in your browser cannot reach
 it. A daemon started by a paniolo older than the token has none;
 `paniolo daemons restart --stale` replaces it.
 
+`video stop` (and `hdmicap stop`) shuts the daemon down through its
+authenticated `POST /stop`, never by signaling the PID in the discovery file:
+a record left behind by a crash can name a PID the kernel has since given to
+an unrelated process. A daemon too old to have the endpoint must be stopped
+with `paniolo daemons stop hdmicap`, which checks the process identity first.
+
 After an upgrade or rebuild, a daemon still running the old binary is flagged
 **stale** by `paniolo video show` and `paniolo daemons`; `watch` auto-restarts a
 stale daemon (no `--restart` needed), or restart it explicitly with
