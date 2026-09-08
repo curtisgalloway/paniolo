@@ -716,10 +716,13 @@ hidrig/          USB HID injector: host CLI + daemon (Rust) + dual-board KB2040 
                    PTY console input down as 0x03, then reads + demuxes inbound
                    frames: 0x02 replies fulfil the in-flight control request
                    (deadline-tracked), 0x03 payloads go to the console PTY
-                   master. HID is fire-and-forget; broadcast transcript; lazy
-                   open (via proto::open_port, so it also writes the resync
-                   preamble) + reopen-on-transport-error; `split_frames` is
-                   `pub(crate)`, shared with proto.rs's one-shot reader
+                   master. HID is fire-and-forget; a request whose client already
+                   gave up (its reply channel is closed) is dropped without
+                   composing or writing, so a timed-out command is not injected
+                   late; broadcast transcript; lazy open (via proto::open_port, so
+                   it also writes the resync preamble) + reopen-on-transport-error;
+                   `split_frames` is `pub(crate)`, shared with proto.rs's one-shot
+                   reader
   src/pty.rs       allocates a PTY (libc posix_openpt) for the DUT serial-console
                    bridge and opens its own raw-mode handle on the slave, held
                    for the daemon's lifetime — otherwise the slave sits at
@@ -728,12 +731,13 @@ hidrig/          USB HID injector: host CLI + daemon (Rust) + dual-board KB2040 
                    echoes back and gets framed to the DUT UART as if typed;
                    paniolo's serial channel opens a *second*, separate handle on
                    the slave via the stable symlink the daemon publishes
-  src/server.rs    axum: GET /hid (WebSocket carrier, 4 KiB messages), POST /send
-                   (4 KiB body), POST /stop (authenticated shutdown; `hidrig
-                   stop` never signals the discovery-file PID), /status,
-                   /version. WS clients send command lines; all results are
-                   broadcast as `evt ok|err …` frames so observers see the
-                   intermixed stream
+  src/server.rs    axum: GET /hid + POST /send (WebSocket message / body sized to
+                   one full `type` line — MAX_TYPE_CHARS + the `type ` verb — so
+                   the documented 4096-char `type` cap is actually reachable),
+                   POST /stop (authenticated shutdown; `hidrig stop` never signals
+                   the discovery-file PID), /status, /version. WS clients send
+                   command lines; all results are broadcast as `evt ok|err …`
+                   frames so observers see the intermixed stream
   src/auth.rs      token + loopback Host/Origin layer over the whole router
                    (byte-identical in serialcap/hdmicap/ch9329)
   src/daemon.rs    advisory lock, discovery file at /tmp/paniolo-<uid>/hid/<target>/
@@ -825,16 +829,28 @@ ch9329/          Rust crate: the *other* hid helper — a WCH CH9329 UART->USB-H
                    long-lived Session, serializing CLI- and WebSocket-injected
                    commands (plus a shutdown Release request) onto the one wire,
                    one in flight — which is also what makes held state survive
-                   across separate invocations. A timed-out request gets one
-                   retry in place before it is classified as transport loss and
-                   the session is reopened (a reopen briefly toggles DTR/RTS,
-                   which resets a KVM-Go's MCU)
+                   across separate invocations. Only an idempotent query
+                   (ping/info/version) is retried once on a lost reply; an input
+                   command (key/type/move/click/...) is NOT — re-running the whole
+                   line would inject a duplicate keystroke or click, so a lost ACK
+                   surfaces as the timeout for the caller to decide about (a
+                   persistent timeout still reopens the session; a reopen briefly
+                   toggles DTR/RTS, which resets a KVM-Go's MCU). A request whose
+                   client already gave up (its reply channel is closed) is dropped
+                   without executing, so a timed-out command is not injected late;
+                   a shutdown Release reopens the link if a transport error had
+                   dropped it before clearing, since the chip holds its last
+                   report independent of this process
   src/keys.rs      key-name -> USB HID usage mapping (adafruit_hid Keycode names,
                    US layout, incl. PRINT_SCREEN/SCROLL_LOCK/PAUSE/NUM_LOCK/
                    APPLICATION), shared with the hidrig vocabulary
-  src/server.rs    axum: GET /hid (WebSocket, 4 KiB messages), POST /send (4 KiB
-                   body), POST /stop (authenticated shutdown; `ch9329 stop`
-                   never signals the discovery-file PID), /status, /version
+  src/server.rs    axum: GET /hid + POST /send (WebSocket message / body sized to
+                   one full `type` line — MAX_TYPE_CHARS + the `type ` verb — so
+                   the documented 4096-char `type` cap is actually reachable and
+                   not ~5 characters short; an empty /send body is a no-op, not a
+                   forwarded blank command), POST /stop (authenticated shutdown;
+                   `ch9329 stop` never signals the discovery-file PID), /status,
+                   /version
   src/auth.rs      token + loopback Host/Origin layer over the whole router
                    (byte-identical in serialcap/hdmicap/hidrig)
   src/daemon.rs    `serve`/`stop`: owns the UART, publishes the same

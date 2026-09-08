@@ -335,6 +335,15 @@ fn service_request(
     transcript: &broadcast::Sender<Event>,
     pending: &mut Option<Pending>,
 ) -> ServiceOutcome {
+    // Skip a request whose client already gave up (its reply channel is
+    // closed): `send_within` drops the receiver on `SEND_TIMEOUT`, but the
+    // request stays queued, so without this the owner would compose and write
+    // its frames — injecting on the target a command the caller was already
+    // told timed out (issue #174).
+    if reply.is_closed() {
+        debug!("hid control link dropping a request whose client gave up: {line:?}");
+        return ServiceOutcome::Continue;
+    }
     let frames = match composer.dispatch(&line) {
         Ok(f) => f,
         Err(e) => {
@@ -603,5 +612,148 @@ mod tests {
         let (frames, consumed) = split_frames(&buf);
         assert_eq!(frames, vec![(F_CONSOLE, b"x".to_vec())]);
         assert_eq!(consumed, 5);
+    }
+
+    // -- #174: a request whose client gave up is not composed or written -----
+
+    use std::sync::{Arc, Mutex};
+
+    /// A `serialport::SerialPort` that records every write and never has bytes
+    /// to read, so a test can assert which frames (if any) `service_request`
+    /// wrote to the wire.
+    struct LogPort(Arc<Mutex<Vec<Vec<u8>>>>);
+
+    impl std::io::Read for LogPort {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "fake: nothing to read",
+            ))
+        }
+    }
+    impl std::io::Write for LogPort {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl serialport::SerialPort for LogPort {
+        fn name(&self) -> Option<String> {
+            None
+        }
+        fn baud_rate(&self) -> serialport::Result<u32> {
+            Ok(115_200)
+        }
+        fn data_bits(&self) -> serialport::Result<serialport::DataBits> {
+            Ok(serialport::DataBits::Eight)
+        }
+        fn flow_control(&self) -> serialport::Result<serialport::FlowControl> {
+            Ok(serialport::FlowControl::None)
+        }
+        fn parity(&self) -> serialport::Result<serialport::Parity> {
+            Ok(serialport::Parity::None)
+        }
+        fn stop_bits(&self) -> serialport::Result<serialport::StopBits> {
+            Ok(serialport::StopBits::One)
+        }
+        fn timeout(&self) -> Duration {
+            Duration::from_millis(5)
+        }
+        fn set_baud_rate(&mut self, _: u32) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn set_data_bits(&mut self, _: serialport::DataBits) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn set_flow_control(&mut self, _: serialport::FlowControl) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn set_parity(&mut self, _: serialport::Parity) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn set_stop_bits(&mut self, _: serialport::StopBits) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn set_timeout(&mut self, _: Duration) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn write_request_to_send(&mut self, _: bool) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn write_data_terminal_ready(&mut self, _: bool) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn read_clear_to_send(&mut self) -> serialport::Result<bool> {
+            Ok(false)
+        }
+        fn read_data_set_ready(&mut self) -> serialport::Result<bool> {
+            Ok(false)
+        }
+        fn read_ring_indicator(&mut self) -> serialport::Result<bool> {
+            Ok(false)
+        }
+        fn read_carrier_detect(&mut self) -> serialport::Result<bool> {
+            Ok(false)
+        }
+        fn bytes_to_read(&self) -> serialport::Result<u32> {
+            Ok(0)
+        }
+        fn bytes_to_write(&self) -> serialport::Result<u32> {
+            Ok(0)
+        }
+        fn clear(&self, _: serialport::ClearBuffer) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn try_clone(&self) -> serialport::Result<Box<dyn serialport::SerialPort>> {
+            Err(serialport::Error::new(
+                serialport::ErrorKind::Unknown,
+                "LogPort cannot clone",
+            ))
+        }
+        fn set_break(&self) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn clear_break(&self) -> serialport::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// #174: a dequeued command whose client already gave up (its reply
+    /// receiver dropped) must not be composed or written to the board. The old
+    /// code wrote its HID frames, injecting on the target after the caller was
+    /// told it timed out.
+    #[test]
+    fn a_request_whose_client_gave_up_is_not_written() {
+        let log = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let mut port: Box<dyn serialport::SerialPort> = Box::new(LogPort(log.clone()));
+        let mut composer = Composer::new();
+        let (transcript, _rx) = broadcast::channel(16);
+        let mut pending: Option<Pending> = None;
+
+        let (reply_tx, reply_rx) = oneshot::channel::<Result<String, String>>();
+        drop(reply_rx); // the client gave up waiting
+
+        let outcome = service_request(
+            &mut composer,
+            &mut port,
+            "key ENTER".into(),
+            reply_tx,
+            &transcript,
+            &mut pending,
+        );
+
+        assert!(matches!(outcome, ServiceOutcome::Continue));
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "a request the client abandoned must not reach the target: {:?}",
+            log.lock().unwrap()
+        );
+        assert!(
+            pending.is_none(),
+            "no reply is awaited for a skipped request"
+        );
     }
 }
