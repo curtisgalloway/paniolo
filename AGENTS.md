@@ -517,7 +517,11 @@ hdmicap/         Rust crate: warm-stream HDMI capture daemon
                  /snapshot matches the inner Result of `rx.changed()`, not just
                  the outer timeout — otherwise a dropped capture-thread Sender
                  makes it spin at 100% CPU until the deadline instead of
-                 answering 503 "capture thread gone" right away. PNG
+                 answering 503 "capture thread gone" right away. Readiness is
+                 snapshot_ready(): wait=stable and changed_since given together
+                 require BOTH (stable AND a differing hash) — not stability
+                 alone, which used to hand back the very frame the caller said
+                 they already had. PNG
                  encode/decode (incl. Linux turbojpeg) and the preview JPEG
                  fallback run on spawn_blocking, not inline on a tokio worker;
                  PNG encoding, the OCR subprocess, and /preview's fallback
@@ -533,9 +537,17 @@ hdmicap/         Rust crate: warm-stream HDMI capture daemon
                  NoSignal/NoDevice), the stream stops sending that frame's
                  bytes and instead sends a placeholder JPEG (dark field, red
                  X) once per transition, with every part carrying an
-                 X-Signal header naming the effective signal. The OCR
-                 child sets kill_on_drop(true) and is awaited under a 30 s
-                 timeout (wait_with_timeout) — 504 on timeout, process killed
+                 X-Signal header naming the effective signal. A live frame
+                 whose fallback encode FAILS (malformed RGB buffer) is recorded
+                 as Served::Failed(captured_at) and skipped (should_attempt_live)
+                 until a new frame arrives — attempted once + one warn!, not
+                 re-encoded every 67 ms tick draining the semaphore. Subprocess
+                 hooks all set kill_on_drop(true) and run under wait_with_timeout
+                 — 504 on timeout, process killed: the OCR child under
+                 OCR_TIMEOUT (30 s), and every power hook (/power on/off/cycle
+                 via run_paniolo_action, /power-state) under POWER_TIMEOUT (60 s,
+                 generous for a real power-cycle). /devices runs the synchronous
+                 capture::enumerate() on spawn_blocking, off the tokio worker
     auth.rs      token + loopback Host/Origin layer over the whole router
                  (byte-identical in serialcap/hidrig/ch9329)
     daemon.rs    advisory lock, discovery file (pid, port, token; owner-only),
