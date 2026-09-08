@@ -219,8 +219,24 @@ Steps:
    the HEAD commit you're about to tag (`gh run list --branch main --limit 5`) —
    the release builds that exact commit, so a red main means a broken release.
 
-2. **Pick the version.** Patch-bump from the latest tag
-   (`git tag --sort=-creatordate | head`); the project has stayed on `0.1.z`.
+2. **Pick the version.** Read the latest tag (`git tag --sort=-creatordate |
+   head`), then choose by what the release contains, not by habit:
+
+   - **Minor** (`0.X.0`) for anything substantive: a new command, channel or
+     helper; a change to a daemon's wire protocol or its lifecycle; a
+     behavioral change a user or an agent could notice; and larger bug fixes,
+     including any fix that changes what a target machine actually sees.
+     Anything that makes an already-running daemon incompatible with a newer
+     CLI belongs here without question.
+   - **Patch** (`0.x.Y`) only for small bug fixes and documentation.
+
+   The project spent `0.1.1` through `0.1.19` patch-bumping everything, which
+   put two compatibility breaks — token-authenticated daemons in `0.1.17`, and
+   `0.1.19`'s authenticated shutdown, which needs `paniolo daemons stop <name>`
+   before a newer CLI can replace an older daemon — behind a version number
+   that signalled nothing. When a release is on the line between the two, take
+   the minor: the cost of a spare minor bump is nothing, and the cost of a
+   silent break is somebody's bench at midnight.
 
 3. **Create an annotated tag** whose subject mirrors the prior ones —
    `vX.Y.Z: <lowercase one-line summary of the headline change>` — with an
