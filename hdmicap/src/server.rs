@@ -176,6 +176,25 @@ struct SnapReq {
 
 const DEFAULT_TIMEOUT_MS: u64 = 2000;
 
+/// Whether a frame satisfies the /snapshot wait conditions.
+///
+/// The subtle case is when the caller passes *both* `wait=stable` and
+/// `changed_since` (Issue #170): they want the next frame that is stable AND
+/// differs from the hash they already have, so both must hold. The earlier
+/// code answered on stability alone in that case, handing back the very frame
+/// the caller said they already had (`changed_since` silently ignored). Each
+/// single condition is still applied on its own; with neither, any frame is
+/// ready.
+fn snapshot_ready(f: &FrameState, want_stable: bool, changed_since: Option<u64>) -> bool {
+    let stable = f.effective_signal() == Signal::Stable;
+    match (want_stable, changed_since) {
+        (true, Some(h)) => stable && f.hash != h,
+        (true, None) => stable,
+        (false, Some(h)) => f.hash != h,
+        (false, None) => true,
+    }
+}
+
 async fn snapshot(State(s): State<AppState>, Query(q): Query<SnapReq>) -> Response {
     let mut rx = s.frames.clone();
     let timeout_ms = q.timeout.unwrap_or(DEFAULT_TIMEOUT_MS);
@@ -189,11 +208,7 @@ async fn snapshot(State(s): State<AppState>, Query(q): Query<SnapReq>) -> Respon
     loop {
         let ready = {
             let f = rx.borrow_and_update();
-            match (want_stable, changed_since) {
-                (true, _) => f.effective_signal() == Signal::Stable,
-                (_, Some(h)) => f.hash != h,
-                _ => true,
-            }
+            snapshot_ready(&f, want_stable, changed_since)
         };
 
         if ready {
@@ -427,8 +442,34 @@ fn multipart_chunk(jpeg_bytes: &[u8], signal: Signal) -> Bytes {
 /// or a placeholder while nothing has recovered) is neither re-encoded nor
 /// re-sent every tick.
 enum Served {
+    /// The last live frame served, keyed by its `captured_at`.
     Frame(Instant),
+    /// A live frame whose fallback JPEG encode failed, keyed by its
+    /// `captured_at` (Issue #169). `encode_preview_jpeg` returns `None` only
+    /// for a malformed `PixelData::Rgb` buffer (length != w*h*3), and a
+    /// `spawn_blocking` join error means the encode task panicked; either way
+    /// this exact frame cannot be encoded. Recording the attempt stops the
+    /// stream from re-acquiring an `expensive` permit and re-spawning the same
+    /// doomed encode on every 67ms tick. A new frame (different `captured_at`)
+    /// resumes normal service.
+    Failed(Instant),
+    /// The last placeholder served, keyed by the effective signal that caused
+    /// it.
     Placeholder(Signal),
+}
+
+/// Whether `preview` should attempt to encode and serve a live frame given
+/// what it last put on the wire. A frame already served (`Frame`) or already
+/// tried and found un-encodable (`Failed`) — same `captured_at` — is skipped,
+/// so an un-encodable frame is attempted once, not re-attempted on every 67ms
+/// tick (Issue #169). Any frame with a new `captured_at` is always attempted,
+/// whatever the previous outcome, so service resumes as soon as an encodable
+/// frame arrives.
+fn should_attempt_live(last_served: &Option<Served>, captured_at: Instant) -> bool {
+    !matches!(
+        last_served,
+        Some(Served::Frame(at) | Served::Failed(at)) if *at == captured_at
+    )
 }
 
 /// multipart/x-mixed-replace MJPEG stream for the human browser preview.
@@ -470,7 +511,7 @@ async fn preview(State(s): State<AppState>) -> Response {
 
             if live {
                 last_dims = Some((f.width, f.height));
-                if matches!(last_served, Some(Served::Frame(at)) if at == f.captured_at) {
+                if !should_attempt_live(&last_served, f.captured_at) {
                     continue;
                 }
 
@@ -508,7 +549,31 @@ async fn preview(State(s): State<AppState>) -> Response {
                                     .await;
                             let encoded: Arc<[u8]> = match encoded {
                                 Ok(Some(b)) => Arc::from(b),
-                                _ => continue,
+                                // This exact frame cannot be encoded. Advance
+                                // the cursor to `Failed` so the next tick skips
+                                // it (Issue #169) instead of re-taking a permit
+                                // and re-spawning the same doomed encode ~15
+                                // times a second. Warn once per frame — the
+                                // `Failed` cursor rate-limits us to one log per
+                                // stuck frame, not one per tick.
+                                other => {
+                                    tracing::warn!(
+                                        "/preview: dropping un-encodable frame \
+                                         ({}x{}, hash {:016x}): {}",
+                                        f.width,
+                                        f.height,
+                                        f.hash,
+                                        match other {
+                                            Ok(None) =>
+                                                "encode produced no bytes \
+                                                 (malformed pixel buffer)",
+                                            Err(_) => "encode task panicked",
+                                            Ok(Some(_)) => unreachable!(),
+                                        },
+                                    );
+                                    last_served = Some(Served::Failed(f.captured_at));
+                                    continue;
+                                }
                             };
                             if let Ok(mut c) = preview_cache.lock() {
                                 *c = Some((f.captured_at, Arc::clone(&encoded)));
@@ -739,6 +804,60 @@ fn no_target_response() -> Response {
         .into_response()
 }
 
+/// Ceiling on one power-hook subprocess (`paniolo power on|off`, `power-cycle`,
+/// `power-state`). Deliberately generous next to OCR's 30s: a real hook may
+/// toggle a relay, wait on a smart plug's HTTP RPC, or power-cycle hardware and
+/// poll it back up, none of which is instant. But a wedged hook must not pin
+/// the request — nor, for the action endpoints, leave the dashboard unsure
+/// whether the target ever moved — indefinitely. 60s clears a slow-but-working
+/// cycle with room to spare while still bounding the hang.
+const POWER_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Spawn `paniolo <args…>`, wait up to `timeout`, and map the outcome to a
+/// Response for the power *action* endpoints (on/off/cycle). `label` names the
+/// action for error messages. `kill_on_drop(true)` plus [`wait_with_timeout`]
+/// means a hook that outruns `timeout` is killed (its `Child` is dropped) and
+/// answered with 504 rather than holding the request open forever (Issue #171).
+async fn run_paniolo_action(
+    paniolo: &str,
+    args: &[&str],
+    label: &str,
+    timeout: Duration,
+) -> Response {
+    let child = match tokio::process::Command::new(paniolo)
+        .args(args)
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to run {paniolo}: {e}"),
+            )
+                .into_response()
+        }
+    };
+    match wait_with_timeout(child, timeout).await {
+        Ok(out) if out.status.success() => (StatusCode::OK, "ok").into_response(),
+        Ok(out) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("paniolo {label} exited with {}", out.status),
+        )
+            .into_response(),
+        Err(WaitError::TimedOut) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("paniolo {label} timed out after {timeout:?}\n"),
+        )
+            .into_response(),
+        Err(WaitError::Io(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to run {paniolo}: {e}"),
+        )
+            .into_response(),
+    }
+}
+
 /// Run `paniolo <action…> <target>` and map its exit status to a Response. The
 /// action endpoints (on/off/cycle) all funnel through here, so a request is the
 /// only thing that ever changes the target's power.
@@ -750,23 +869,7 @@ async fn run_power_action(action: &[&str]) -> Response {
     let paniolo = std::env::var("PANIOLO_BIN").unwrap_or_else(|_| "paniolo".to_string());
     let mut args: Vec<&str> = action.to_vec();
     args.push(&target);
-    match tokio::process::Command::new(&paniolo)
-        .args(&args)
-        .status()
-        .await
-    {
-        Ok(s) if s.success() => (StatusCode::OK, "ok").into_response(),
-        Ok(s) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("paniolo {} exited with {s}", action.join(" ")),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to run {paniolo}: {e}"),
-        )
-            .into_response(),
-    }
+    run_paniolo_action(&paniolo, &args, &action.join(" "), POWER_TIMEOUT).await
 }
 
 /// `POST /power-cycle` — `paniolo power-cycle <target>`.
@@ -794,11 +897,27 @@ async fn power_state() -> Response {
         None => return no_target_response(),
     };
     let paniolo = std::env::var("PANIOLO_BIN").unwrap_or_else(|_| "paniolo".to_string());
-    match tokio::process::Command::new(&paniolo)
+    // Unlike the action hooks, this one needs stdout, so spawn with a piped
+    // stdout and read it back through `wait_with_timeout` (Issue #171): same
+    // `kill_on_drop(true)` + timeout treatment as `run_paniolo_action` and
+    // `ocr`, so a wedged `power-state` hook is killed rather than holding the
+    // request forever.
+    let child = match tokio::process::Command::new(&paniolo)
         .args(["power-state", &target])
-        .output()
-        .await
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
     {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to run {paniolo}: {e}"),
+            )
+                .into_response()
+        }
+    };
+    match wait_with_timeout(child, POWER_TIMEOUT).await {
         Ok(o) if o.status.success() => {
             // `power-state` prints a human line like "Power ON  (pi5)"; pull the
             // on/off token out of it (case-insensitive, position-independent).
@@ -811,7 +930,12 @@ async fn power_state() -> Response {
             (StatusCode::OK, state).into_response()
         }
         Ok(_) => (StatusCode::OK, "unknown").into_response(),
-        Err(e) => (
+        Err(WaitError::TimedOut) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("paniolo power-state timed out after {POWER_TIMEOUT:?}\n"),
+        )
+            .into_response(),
+        Err(WaitError::Io(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to run {paniolo}: {e}"),
         )
@@ -820,8 +944,13 @@ async fn power_state() -> Response {
 }
 
 async fn devices() -> Response {
-    match crate::capture::enumerate() {
-        Ok(list) => Json(
+    // `enumerate()` is synchronous and can block (V4L ioctls on Linux, an
+    // AVFoundation discovery-session query on macOS), so run it off the async
+    // runtime rather than on a tokio worker (Issue #171 — same class of fix as
+    // M21 for PNG encoding). It returns an owned `Vec`, so nothing needs to be
+    // borrowed across the hop.
+    match tokio::task::spawn_blocking(crate::capture::enumerate).await {
+        Ok(Ok(list)) => Json(
             list.into_iter()
                 .map(|d| {
                     serde_json::json!({"index": d.index, "name": d.name, "misc": d.misc, "id": d.id})
@@ -829,7 +958,12 @@ async fn devices() -> Response {
                 .collect::<Vec<_>>(),
         )
         .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("device enumeration task failed: {e}"),
+        )
+            .into_response(),
     }
 }
 
@@ -1252,5 +1386,284 @@ mod tests {
             second.is_err(),
             "the stale placeholder was resent on a later tick"
         );
+    }
+
+    // ── Issue #169: an un-encodable frame is attempted once, not every tick ──
+
+    /// A `PixelData::Rgb` frame whose buffer is the wrong length for its
+    /// dimensions: `ImageBuffer::from_raw` rejects it, so `encode_preview_jpeg`
+    /// returns `None` and /preview's fallback encode fails for this frame.
+    fn bad_rgb_frame(w: u32, h: u32, signal: Signal, captured_at: Instant) -> FrameState {
+        FrameState {
+            jpeg: None,
+            // Far shorter than w*h*3 — a malformed buffer.
+            pixels: PixelData::Rgb(Arc::from(vec![0u8; 3])),
+            width: w,
+            height: h,
+            hash: 7,
+            signal,
+            resolution_epoch: 1,
+            captured_at,
+        }
+    }
+
+    /// The failing encode really does fail, so the tests below drive the
+    /// Issue #169 path rather than a frame that quietly encodes.
+    #[test]
+    fn encode_preview_jpeg_rejects_a_malformed_rgb_frame() {
+        let bad = bad_rgb_frame(16, 8, Signal::Stable, Instant::now());
+        assert!(encode_preview_jpeg(&bad).is_none());
+    }
+
+    /// The cursor bookkeeping that fixes Issue #169, exercised the way
+    /// `preview()` uses it. A single un-encodable frame stays in the watch
+    /// channel with a fixed `captured_at`; across many ticks the loop must run
+    /// the expensive encode for it exactly once — the failed attempt advances
+    /// the cursor to `Served::Failed`, and every later tick skips it.
+    ///
+    /// On the old code there was no `Served::Failed`: the failed-encode arm did
+    /// a bare `continue` that left `last_served` untouched, so the equivalent
+    /// of `should_attempt_live` returned `true` on every tick and this loop
+    /// would count 10 attempts, not 1.
+    #[test]
+    fn an_unencodable_frame_is_attempted_once_across_many_ticks() {
+        let stuck = Instant::now();
+        let mut last_served: Option<Served> = None;
+        let mut attempts = 0usize;
+        for _ in 0..10 {
+            if !should_attempt_live(&last_served, stuck) {
+                continue;
+            }
+            // Where preview() takes an `expensive` permit and spawns the
+            // encode. It fails, so the cursor advances to `Failed`.
+            attempts += 1;
+            last_served = Some(Served::Failed(stuck));
+        }
+        assert_eq!(
+            attempts, 1,
+            "an un-encodable frame must be attempted once, not once per tick"
+        );
+
+        // A new, encodable frame resumes normal service whatever the last
+        // outcome was.
+        let fresh = stuck + Duration::from_millis(67);
+        assert!(should_attempt_live(&last_served, fresh));
+        // And a frame already served for real is likewise not re-attempted.
+        assert!(!should_attempt_live(&Some(Served::Frame(fresh)), fresh));
+    }
+
+    /// End-to-end through `preview()`: an un-encodable frame yields no chunk
+    /// and, crucially, does not wedge the stream — a later encodable frame is
+    /// served normally. (The once-vs-every-tick attempt count is asserted by
+    /// the cursor test above; this proves the real handler drives that cursor
+    /// and recovers.)
+    #[tokio::test]
+    async fn preview_recovers_after_an_unencodable_frame() {
+        let bad = Arc::new(bad_rgb_frame(16, 8, Signal::Stable, Instant::now()));
+        let (tx, rx) = watch::channel(bad);
+        let state = AppState::new(rx);
+
+        let app = router(state, preview_auth());
+        let resp = app.oneshot(preview_request()).await.unwrap();
+        let mut stream = resp.into_body().into_data_stream();
+
+        // The malformed frame is never put on the wire.
+        let none = tokio::time::timeout(Duration::from_millis(300), stream.next()).await;
+        assert!(
+            none.is_err(),
+            "an un-encodable frame must not yield a chunk"
+        );
+
+        // A subsequent good frame is served for real: the failed cursor did not
+        // wedge the loop.
+        let good = nv12_frame(16, 8, Signal::Stable, Instant::now());
+        let good_encode = encode_preview_jpeg(&good).expect("reference encode");
+        tx.send(Arc::new(good)).unwrap();
+
+        let chunk = next_chunk(&mut stream).await;
+        assert_eq!(chunk_jpeg_payload(&chunk), good_encode.as_slice());
+    }
+
+    // ── Issue #170: /snapshot wait=stable&changed_since needs BOTH ──────────
+
+    /// A `Stable` NV12 frame with a chosen hash, for the readiness predicate.
+    fn stable_frame_with_hash(hash: u64) -> FrameState {
+        FrameState {
+            hash,
+            ..nv12_frame(16, 8, Signal::Stable, Instant::now())
+        }
+    }
+
+    /// The readiness predicate: with both `wait=stable` and `changed_since`
+    /// given, a stable-but-unchanged frame is NOT ready (Issue #170); each
+    /// single condition still stands on its own. On the old code the
+    /// both-given case answered on stability alone, so the marked assertion
+    /// (`!ready` for a stable frame whose hash equals the caller's) failed.
+    #[test]
+    fn snapshot_ready_requires_both_when_stable_and_changed_since_are_given() {
+        let h = 0xABCDu64;
+        let stable = stable_frame_with_hash(h);
+
+        // wait=stable alone: a stable frame is ready regardless of hash.
+        assert!(snapshot_ready(&stable, true, None));
+        assert!(snapshot_ready(&stable, true, Some(0x1234)));
+
+        // Both given, hash EQUALS the caller's -> not ready (must also differ).
+        assert!(
+            !snapshot_ready(&stable, true, Some(h)),
+            "a stable frame the caller already has must not satisfy the wait"
+        );
+        // Both given, hash differs -> ready.
+        assert!(snapshot_ready(&stable, true, Some(h + 1)));
+
+        // changed_since alone keys purely on hash, stability aside.
+        let switching = FrameState {
+            signal: Signal::ModeSwitching,
+            ..stable_frame_with_hash(h)
+        };
+        assert!(snapshot_ready(&switching, false, Some(0x1234))); // differs
+        assert!(!snapshot_ready(&switching, false, Some(h))); // same
+                                                              // Neither condition -> any frame is ready.
+        assert!(snapshot_ready(&switching, false, None));
+    }
+
+    /// End-to-end through the `/snapshot` handler. `nv12_frame` publishes a
+    /// stable frame with `hash == 1`. Asking for `wait=stable&changed_since=1`
+    /// names the frame the caller already has, so the handler must WAIT out the
+    /// (short) deadline — the timed-out PNG carries `x-timeout: 1`. On the old
+    /// code the both-given case answered on stability alone and returned this
+    /// very frame at once, with `x-timeout: 0`. `wait=stable` alone still
+    /// returns the stable frame promptly (`x-timeout: 0`).
+    #[tokio::test]
+    async fn snapshot_stable_and_changed_since_waits_for_a_different_frame() {
+        let frame = Arc::new(nv12_frame(16, 8, Signal::Stable, Instant::now()));
+        // Keep the Sender alive so `rx.changed()` never fires: the loop must
+        // reach its deadline rather than being handed a new frame.
+        let (_tx, rx) = watch::channel(frame);
+        let state = AppState::new(rx);
+        let app = router(state, preview_auth());
+
+        let waited = app
+            .clone()
+            .oneshot(snapshot_request(
+                "/snapshot?wait=stable&changed_since=1&timeout=200",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(waited.status(), StatusCode::OK);
+        assert_eq!(
+            header_of(&waited, "x-timeout").as_deref(),
+            Some("1"),
+            "stable+changed_since with the caller's own hash must wait, not return at once"
+        );
+
+        // The mirror: `wait=stable` alone is satisfied immediately.
+        let prompt = app
+            .oneshot(snapshot_request("/snapshot?wait=stable&timeout=200"))
+            .await
+            .unwrap();
+        assert_eq!(prompt.status(), StatusCode::OK);
+        assert_eq!(
+            header_of(&prompt, "x-timeout").as_deref(),
+            Some("0"),
+            "wait=stable alone must return the stable frame promptly"
+        );
+    }
+
+    fn snapshot_request(uri: &str) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .uri(uri)
+            .header(header::HOST, "127.0.0.1:1")
+            .header(header::AUTHORIZATION, "Bearer tok")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn header_of(resp: &Response, name: &'static str) -> Option<String> {
+        resp.headers()
+            .get(header::HeaderName::from_static(name))
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    }
+
+    // ── Issue #171: power hooks time out; devices() runs off-thread ─────────
+
+    /// A power-action hook that outlives its timeout is killed and answered
+    /// promptly with 504, rather than pinning the request (and, before the
+    /// fix, blocking with no timeout at all). Modeled on
+    /// `wait_with_timeout_kills_a_child_that_outlives_the_deadline`, but driven
+    /// through the action mapper the endpoints use. `sh -c 'sleep 30' <target>`
+    /// stands in for a wedged hook; a 200ms timeout must fire well inside 2s.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn power_action_times_out_and_returns_promptly() {
+        let start = Instant::now();
+        // Args as run_power_action builds them: the resolved target is the
+        // trailing arg (here it becomes $0 for `sh -c`, harmlessly).
+        let resp = run_paniolo_action(
+            "sh",
+            &["-c", "sleep 30", "target"],
+            "power on",
+            Duration::from_millis(200),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "power action did not return promptly on timeout: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A hook that finishes inside the timeout is reported on its exit status,
+    /// not as a timeout: `true` -> 200 "ok", `false` -> 500.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn power_action_maps_exit_status_within_the_timeout() {
+        let ok = run_paniolo_action("true", &[], "power on", Duration::from_secs(5)).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        let bad = run_paniolo_action("false", &[], "power off", Duration::from_secs(5)).await;
+        assert_eq!(bad.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// `devices()` now runs `enumerate()` on `spawn_blocking`; the off-thread
+    /// hop must not change what the endpoint returns. Compare the handler's
+    /// JSON against a direct, inline `enumerate()` on this same machine
+    /// (behavior unchanged — this is a preservation test, not a discriminating
+    /// one). If `enumerate()` itself errors here, the handler must surface a
+    /// 500, not hang or panic.
+    #[tokio::test]
+    async fn devices_enumerates_off_thread_with_unchanged_result() {
+        let direct = crate::capture::enumerate();
+        let (_tx, rx) = watch::channel(Arc::new(FrameState::no_device()));
+        let app = router(AppState::new(rx), preview_auth());
+        let req = HttpRequest::builder()
+            .uri("/devices")
+            .header(header::HOST, "127.0.0.1:1")
+            .header(header::AUTHORIZATION, "Bearer tok")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        match direct {
+            Ok(list) => {
+                assert_eq!(resp.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                let got: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let arr = got.as_array().expect("devices returns a JSON array");
+                assert_eq!(arr.len(), list.len(), "device count changed off-thread");
+                for (v, d) in arr.iter().zip(list.iter()) {
+                    assert_eq!(v["index"], d.index);
+                    assert_eq!(v["name"], d.name);
+                    assert_eq!(v["id"], d.id);
+                }
+            }
+            Err(_) => {
+                assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
     }
 }

@@ -110,6 +110,14 @@ paniolo video preview [target-machine]           # print the live-dashboard URL 
 `signal=… hash=…` to stderr; feed that hash to a later `--changed-since` to
 wait for the screen to change.
 
+`--stable` and `--changed-since` **combine** (`GET /snapshot?wait=stable&changed_since=<hash>`):
+the daemon then holds the request until a frame is *both* stable *and* different
+from the hash you passed — the next steady screen that is not the one you
+already have. Given alone, each still stands on its own: `--stable` waits for
+any steady frame, `--changed-since` waits for any differing frame. (Combining
+them used to answer on stability alone and hand back the very frame whose hash
+you supplied.)
+
 `-o <path>` always means the **invoking machine's** filesystem, including when
 the target's video channel lives on a remote control host: the remote shot
 streams over SSH and the PNG is written locally (a failed capture removes the
@@ -148,6 +156,13 @@ dark gray field with a red diagonal X) once per transition, at the last known
 resolution. This is what keeps a browser tab left open on `/preview`
 honest: without it, the `<img>` would freeze on the last real frame forever,
 which looks exactly like a live, unchanging screen.
+
+A live frame whose fallback JPEG encode *fails* (a malformed pixel buffer — its
+length doesn't match its dimensions) is likewise attempted only **once**, not
+re-encoded on every 67 ms tick: `/preview` records the failed frame, logs one
+`warn!` naming the reason, and skips it until a new, encodable frame arrives —
+so a single bad frame stuck in the channel can't spin the fallback encoder or
+drain the shared concurrency limit ~15 times a second.
 
 ---
 
