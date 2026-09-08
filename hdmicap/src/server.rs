@@ -593,7 +593,25 @@ async fn preview(State(s): State<AppState>) -> Response {
                 let jpeg_bytes =
                     match tokio::task::spawn_blocking(move || placeholder_jpeg(dims)).await {
                         Ok(Some(b)) => b,
-                        _ => continue,
+                        // Same rule as the live path above: record the attempt
+                        // before skipping, or a placeholder that cannot be
+                        // encoded is retried on every 67 ms tick for as long as
+                        // the signal stays put. Synthetic bytes make this far
+                        // less reachable than the live case, but the dedup is
+                        // what keeps it bounded either way.
+                        other => {
+                            tracing::warn!(
+                                "/preview: dropping un-encodable {} placeholder: {}",
+                                signal_name(eff),
+                                match other {
+                                    Ok(None) => "encode produced no bytes",
+                                    Err(_) => "encode task panicked",
+                                    Ok(Some(_)) => unreachable!(),
+                                },
+                            );
+                            last_served = Some(Served::Placeholder(eff));
+                            continue;
+                        }
                     };
                 last_served = Some(Served::Placeholder(eff));
                 yield Ok::<Bytes, std::io::Error>(multipart_chunk(&jpeg_bytes, eff));
