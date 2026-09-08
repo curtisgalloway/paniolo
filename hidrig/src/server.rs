@@ -47,12 +47,17 @@ pub struct AppState {
     pub hid: HidHandle,
 }
 
-/// Ceiling on a `POST /send` body: one command line. `type` text is capped at
-/// 4096 characters by the composer, and every other command is a few tokens.
-const MAX_SEND_BYTES: usize = 4096;
+/// Ceiling on a `POST /send` body: one command line. The longest legitimate
+/// line is a full-length `type`: [`crate::compose::MAX_TYPE_CHARS`] characters
+/// of text plus the `"type "` verb and separator. Sizing the limit to that
+/// keeps the documented character cap actually reachable — a flat 4096-byte
+/// limit rejected a 4096-character `type` at ~4091 characters (issue #174).
+/// The composer enforces the exact character count; every other command is a
+/// few tokens.
+const MAX_SEND_BYTES: usize = crate::compose::MAX_TYPE_CHARS + "type ".len();
 
 /// Ceiling on one `/hid` WebSocket message, for the same reason.
-const MAX_WS_MESSAGE_BYTES: usize = 4096;
+const MAX_WS_MESSAGE_BYTES: usize = MAX_SEND_BYTES;
 
 /// The API router. Every route sits behind the auth layer: loopback Host and
 /// Origin, and the daemon token (see `auth.rs`).

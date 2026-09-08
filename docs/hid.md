@@ -215,9 +215,20 @@ endpoint must be stopped with `paniolo daemons stop hid`, which checks the
 process identity first.
 
 **Limits.** One `type` command takes at most 4096 characters, a `move` or
-`scroll` moves at most 32 767 units per axis per call (`ch9329`), a `/send`
-body or WebSocket message is at most 4 KiB, and a command the injector never
-answers fails after 30 s instead of stalling every other client behind it.
+`scroll` moves at most 32 767 units per axis per call (`ch9329`), and a `/send`
+body or WebSocket message is sized to hold exactly one full `type` line — the
+4096 characters plus the `type ` verb — so the documented `type` length is
+actually accepted rather than cut a few characters short. A command the injector
+never answers fails after 30 s instead of stalling every other client behind it.
+
+**Reliability.** A keystroke, click or move is not idempotent, so a single lost
+reply on an input command surfaces as that timeout rather than being retried — a
+retry would inject the command twice; only pure status reads (`ping`, `info`,
+`version`) are retried once. A command whose client has already given up (its
+30 s elapsed) is dropped rather than injected after the fact. On shutdown the
+daemon releases every held key, modifier and mouse button so the target is not
+left with something stuck down — reopening the link first if a transport error
+had dropped it, since the CH9329 chip holds its last report on its own.
 
 **Latency.** HID frames are fire-and-forget over the USB-CDC link (no
 per-frame round-trip), so cursor streaming stays responsive; the dashboard also

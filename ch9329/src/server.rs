@@ -47,12 +47,17 @@ pub struct AppState {
     pub hid: HidHandle,
 }
 
-/// Ceiling on a `POST /send` body: one command line. `type` text is capped at
-/// 4096 characters by the session, and every other command is a few tokens.
-const MAX_SEND_BYTES: usize = 4096;
+/// Ceiling on a `POST /send` body: one command line. The longest legitimate
+/// line is a full-length `type`: [`crate::session::MAX_TYPE_CHARS`] characters
+/// of text plus the `"type "` verb and separator. Sizing the limit to that
+/// keeps the documented character cap actually reachable — a flat 4096-byte
+/// limit rejected a 4096-character `type` at ~4091 characters (issue #174).
+/// The session enforces the exact character count; every other command is a
+/// few tokens.
+const MAX_SEND_BYTES: usize = crate::session::MAX_TYPE_CHARS + "type ".len();
 
 /// Ceiling on one `/hid` WebSocket message, for the same reason.
-const MAX_WS_MESSAGE_BYTES: usize = 4096;
+const MAX_WS_MESSAGE_BYTES: usize = MAX_SEND_BYTES;
 
 /// The API router. Every route sits behind the auth layer: loopback Host and
 /// Origin, and the daemon token (see `auth.rs`).
@@ -101,6 +106,12 @@ async fn version(State(s): State<AppState>) -> Response {
 /// 503 with the `ERR`/transport message. Used by the CLI one-shot path.
 async fn send(State(s): State<AppState>, body: String) -> Response {
     let line = body.trim_end_matches(['\r', '\n']).to_string();
+    // A blank body is a no-op, matching the `/hid` WebSocket loop, which skips
+    // blank frames rather than forwarding them: without this, `execute_line("")`
+    // is reached and answers `ERR unknown command:` (issue #174).
+    if line.trim().is_empty() {
+        return axum::http::StatusCode::OK.into_response();
+    }
     match s.hid.send(line).await {
         Ok(data) => data.into_response(),
         Err(e) => (
@@ -216,5 +227,32 @@ mod tests {
                 if valid { "" } else { "not " }
             );
         }
+    }
+
+    /// #174(b): `POST /send` with an empty body is a no-op — it must not be
+    /// forwarded to the injector as a blank command line. The daemon here owns
+    /// a device that cannot open, so a forwarded blank line would surface a 503
+    /// transport error; the guard returns 200 without ever reaching the owner.
+    #[tokio::test]
+    async fn empty_send_body_is_not_forwarded() {
+        let hid = HidHandle::spawn("/nonexistent/ch9329-empty-send".into());
+        let app = router(
+            AppState { hid },
+            crate::auth::Auth::new("test-token".into(), &[]),
+        )
+        .layer(Extension(Arc::new(tokio::sync::Notify::new())));
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/send")
+            .header(header::HOST, "127.0.0.1:1")
+            .header(header::AUTHORIZATION, "Bearer test-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a blank /send body is a no-op, not a forwarded command"
+        );
     }
 }
