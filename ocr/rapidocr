@@ -59,12 +59,26 @@ VENV_NAMES = ("ocr-venv",)
 
 
 def _reexec_into_venv() -> None:
-    """Re-exec under a sibling venv's interpreter if rapidocr is not importable.
+    """Re-exec under the sibling venv's interpreter whenever one exists.
 
     The helper is invoked by hdmicap as a bare executable, so it cannot rely on
     a virtualenv being active. `paniolo setup` creates `ocr-venv/` next to this
-    script; if the ambient interpreter lacks rapidocr but that venv has it, hand
-    over rather than failing with an ImportError the caller cannot act on.
+    script, and if that interpreter is there this hands over to it -- without
+    first asking whether the ambient interpreter could have served, which the
+    docstring used to claim it did (#168).
+
+    Unconditional hand-over is the behavior to keep, so this corrects the
+    docstring rather than adding the check it described. `paniolo setup`
+    builds that venv for this script alone and curates it: it pins
+    `rapidocr>=3,<4`, then uninstalls the `opencv-python` rapidocr pulls in
+    and force-installs `opencv-python-headless` over it, because the full
+    build needs `libGL.so.1`, which a headless Pi OS does not have
+    (cli/src/setup.rs). An ambient interpreter that merely satisfies
+    `import rapidocr` has none of that curation, and preferring it would make
+    which engine runs -- and whether it runs at all -- depend on what else is
+    installed on the control host. When the venv exists it is the answer;
+    when it does not, the ambient interpreter is tried and main()'s import
+    error names the fix.
     """
     if os.environ.get("PANIOLO_RAPIDOCR_REEXEC"):
         return  # Already tried; do not loop.
@@ -163,6 +177,25 @@ def _read_bounded(stream, max_bytes: int) -> bytes:
     return data
 
 
+def _read_input(path: str) -> bytes:
+    """Read the encoded image from ``path``, or from stdin when it is ``-``.
+
+    Every way this can fail -- a path that does not exist, a directory, a
+    permission denial, an I/O error part-way through -- is the same answer to
+    the caller, and it is the one docs/dev/ocr.md promises: one line on
+    stderr, non-zero exit. A bare `open()` raised `FileNotFoundError` as a
+    traceback instead (#168). Mirrors ocr/linuxocr's copy, for the same
+    reason `_read_bounded` is copied rather than shared.
+    """
+    try:
+        if path == "-":
+            return _read_bounded(sys.stdin.buffer, MAX_ENCODED_BYTES)
+        with open(path, "rb") as f:
+            return _read_bounded(f, MAX_ENCODED_BYTES)
+    except OSError as e:
+        die(f"cannot read {'stdin' if path == '-' else path}: {e}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="OCR a PNG using PP-OCRv6 via RapidOCR (Linux GUI-mode helper)."
@@ -185,11 +218,7 @@ def main() -> None:
             "pip install 'rapidocr>=3,<4' onnxruntime opencv-python-headless"
         )
 
-    if args.input == "-":
-        png = _read_bounded(sys.stdin.buffer, MAX_ENCODED_BYTES)
-    else:
-        with open(args.input, "rb") as f:
-            png = _read_bounded(f, MAX_ENCODED_BYTES)
+    png = _read_input(args.input)
     if not png:
         die("no image data")
 

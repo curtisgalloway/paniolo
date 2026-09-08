@@ -291,6 +291,30 @@ three so a future change to one doesn't silently drift from the rest.
 already uses for "cannot read", "could not decode image", and so on, not a
 new failure mode a caller has to learn to recognize.
 
+## Every failure leaves the same way
+
+That shape is not only for the limits. A missing input file, bytes that are
+not an image, an I/O error part-way through a read — each is routed through
+the helper's own error exit, because the caller is a daemon parsing stderr,
+not a person reading a stack trace. Three paths did not, and were fixed in
+#168:
+
+- `linuxocr` opened its input file bare, so a missing path came back as a
+  `FileNotFoundError` traceback, and its preprocessing caught only
+  `ImportError` (a missing Pillow), so non-image bytes came back as a
+  `PIL.UnidentifiedImageError` traceback. Both now go through `die()`.
+- `rapidocr` opened its input file bare, with the same result.
+- `visionocr` read with `try?`, which turns a failed read into `nil` — the
+  same value that means EOF. A descriptor error therefore did not report at
+  all: the helper OCR'd whatever prefix it had managed to read and returned
+  the text that survived, which is the worst of the three, because nothing
+  downstream can tell a truncated screen from a short one. Its bounded reader
+  now `rethrows`, and the caller dies with the underlying error.
+
+The Python helpers' error paths are covered by `ocr/tests` and `visionocr`'s
+by its own `--self-test`, both of which CI runs; see "Adding an engine" for
+where a new helper hooks in.
+
 ## Adding an engine
 
 1. Read a PNG from stdin or a path; support `--json`.
