@@ -91,6 +91,9 @@ MAX_DIMENSION = 8192  # px, per side
 MAX_PIXELS = 33_177_600  # 7680x4320 total px -- 2x a 4K capture, with margin
 
 
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
 def _png_size(png: bytes) -> "tuple[int, int]":
     """Width and height from the PNG IHDR, without decoding.
 
@@ -98,9 +101,33 @@ def _png_size(png: bytes) -> "tuple[int, int]":
     rather than a shared import because these are standalone scripts, not a
     package.
     """
-    if len(png) < 24 or png[:8] != b"\x89PNG\r\n\x1a\n":
+    if len(png) < 24 or png[:8] != _PNG_SIGNATURE:
         return (0, 0)
     return (int.from_bytes(png[16:20], "big"), int.from_bytes(png[20:24], "big"))
+
+
+def _require_png(png: bytes) -> "tuple[int, int]":
+    """Size a PNG from its header, or die if the input is not a PNG.
+
+    A pre-decode dimension check can only protect the decode it runs before,
+    and `_png_size` can only size a PNG. `cv2.imdecode` accepts JPEG, BMP and
+    WebP as well, so guarding the check with "did the header parse?" silently
+    skipped it for every one of those: a small JPEG whose SOF declared
+    20000x20000 passed the byte cap, parsed as no PNG at all, and was
+    rasterized in full before the post-decode backstop -- which runs after the
+    allocation it exists to prevent -- could see it (issue #167).
+
+    Refusing non-PNG outright, rather than teaching this helper a second
+    header format, is what the contract already says: docs/dev/ocr.md's input
+    is "a PNG on stdin (`-`) or a path argument", hdmicap pipes the output of
+    its own PNG encoder, and nothing else in the tree feeds this helper.
+    """
+    if png[:8] != _PNG_SIGNATURE:
+        die("input is not a PNG (this helper reads a PNG on stdin or a path)")
+    w, h = _png_size(png)
+    if w <= 0 or h <= 0:
+        die("PNG header is truncated or declares an empty image")
+    return (w, h)
 
 
 def _check_dimensions(w: int, h: int) -> None:
@@ -167,18 +194,19 @@ def main() -> None:
         die("no image data")
 
     # Inspect the header before cv2.imdecode ever rasterizes the image, so an
-    # oversized claim is rejected before OpenCV decodes anything.
-    src_w, src_h = _png_size(png)
-    if src_w and src_h:
-        _check_dimensions(src_w, src_h)
+    # oversized claim is rejected before OpenCV decodes anything. Input that
+    # is not a PNG is refused here rather than measured: this helper cannot
+    # size it, and cv2 would decode it anyway -- see `_require_png`.
+    src_w, src_h = _require_png(png)
+    _check_dimensions(src_w, src_h)
 
     img = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         die("could not decode image")
     height, width = img.shape[:2]
-    # Backstop for inputs _png_size couldn't parse a header from (non-PNG, or
-    # malformed) -- the decode already happened, but the OCR engine below has
-    # not run yet.
+    # Backstop: the check above ran on what the IHDR claimed, this one runs on
+    # what OpenCV actually produced. The decode already happened, but the OCR
+    # engine below has not run yet.
     _check_dimensions(width, height)
 
     # Four threads matches a Pi's core count. The key is nested under the

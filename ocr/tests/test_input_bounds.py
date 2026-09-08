@@ -14,7 +14,9 @@
 
 """Tests for the resource-limit checks added to ocr/linuxocr and ocr/rapidocr
 by issue #151: a bounded read that caps encoded input, and a header-based
-dimension check that runs before any full image decode.
+dimension check that runs before any full image decode. Also issue #167's
+follow-up: rapidocr refuses input that is not a PNG at all, because the
+header check it runs before `cv2.imdecode` can only speak for a PNG.
 
 Both scripts have no .py suffix -- like ocr/tests/test_linuxocr_bbox.py, each
 is loaded by path with importlib rather than imported as a regular module.
@@ -65,6 +67,32 @@ def _fake_png_header(width: int, height: int) -> bytes:
         + width.to_bytes(4, "big")
         + height.to_bytes(4, "big")
     )
+
+
+def _fake_jpeg(width: int, height: int) -> bytes:
+    """A JPEG whose baseline SOF0 frame header declares ``width`` x ``height``.
+
+    The SOI marker, a JFIF APP0 and one SOF0 segment -- no Huffman tables and
+    no scan data, so nothing could actually decode an image out of it. What
+    matters for issue #167 is that it is *not a PNG* and that it declares a
+    size far over the shared limits, which is exactly the shape of input that
+    used to walk past rapidocr's pre-decode check.
+    """
+    sof0 = (
+        b"\xff\xc0"
+        + (17).to_bytes(2, "big")  # segment length
+        + b"\x08"  # 8-bit sample precision
+        + height.to_bytes(2, "big")  # JPEG puts height first
+        + width.to_bytes(2, "big")
+        + b"\x03"  # three components, each: id, sampling factors, table
+        + b"\x01\x22\x00\x02\x11\x01\x03\x11\x01"
+    )
+    jfif = (
+        b"\xff\xe0"
+        + (16).to_bytes(2, "big")
+        + b"JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+    )
+    return b"\xff\xd8" + jfif + sof0
 
 
 @pytest.mark.parametrize("module", [linuxocr, rapidocr], ids=["linuxocr", "rapidocr"])
@@ -159,3 +187,52 @@ def test_linuxocr_a_source_that_only_overflows_after_2x_upscale_is_rejected():
     linuxocr._check_dimensions(src_w, src_h)  # source alone: must not raise
     with pytest.raises(SystemExit):
         linuxocr._check_dimensions(src_w * linuxocr._UPSCALE, src_h * linuxocr._UPSCALE)
+
+
+def test_rapidocr_png_size_cannot_size_a_jpeg():
+    """The gap issue #167 was about, stated as a fact about `_png_size`: it
+    answers (0, 0) for anything without the PNG signature, so a check guarded
+    by "did that parse?" had nothing to check -- while `cv2.imdecode`, which
+    runs immediately after, decodes JPEG happily.
+    """
+    assert rapidocr._png_size(_fake_jpeg(20000, 20000)) == (0, 0)
+
+
+def test_rapidocr_rejects_a_jpeg_before_any_decode(capsys):
+    """A JPEG declaring 20000x20000 must be refused on its header alone.
+
+    This is main()'s pre-decode step verbatim -- `_require_png` feeding
+    `_check_dimensions` -- and it runs here without numpy, rapidocr or cv2
+    installed, which is the point: nothing has decoded anything yet.
+    """
+    with pytest.raises(SystemExit):
+        rapidocr._check_dimensions(*rapidocr._require_png(_fake_jpeg(20000, 20000)))
+    err = capsys.readouterr().err
+    assert err.startswith("rapidocr: ")
+    assert err.count("\n") == 1, f"expected one line, got {err!r}"
+
+
+def test_rapidocr_rejects_an_in_bounds_jpeg_too():
+    """Not a size check with a format check bolted on: a JPEG whose declared
+    size is perfectly reasonable is still refused, because the contract
+    (docs/dev/ocr.md) is a PNG and a JPEG's dimensions are not something this
+    helper reads before handing the bytes to OpenCV.
+    """
+    with pytest.raises(SystemExit):
+        rapidocr._require_png(_fake_jpeg(800, 600))
+
+
+def test_rapidocr_accepts_a_well_formed_png_header():
+    header = _fake_png_header(1920, 1080)
+    assert rapidocr._require_png(header) == (1920, 1080)
+
+
+def test_rapidocr_rejects_a_png_signature_with_no_ihdr(capsys):
+    """A truncated PNG -- the signature and nothing else -- is a size this
+    helper cannot establish, so it is an error rather than a skipped check.
+    """
+    with pytest.raises(SystemExit):
+        rapidocr._require_png(b"\x89PNG\r\n\x1a\n")
+    err = capsys.readouterr().err
+    assert err.startswith("rapidocr: ")
+    assert err.count("\n") == 1, f"expected one line, got {err!r}"

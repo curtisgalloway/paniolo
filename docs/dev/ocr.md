@@ -81,6 +81,11 @@ fails at first OCR rather than at install.
 default, one line per recognized line, in reading order. That form is for humans
 running the helper by hand.
 
+`rapidocr` holds callers to that literally and errors on anything without the
+PNG signature; see "Resource limits" for why. The others accept whatever their
+platform's image loader recognizes, which is more than a PNG — but nothing in
+paniolo sends them anything else, so do not rely on it.
+
 **paniolo always passes `--json`**, and that is the machine contract:
 
 ```json
@@ -256,6 +261,15 @@ driving an oversized allocation:
   check doesn't recognize, or Pillow/OpenCV succeeding where it didn't). The
   decode has already happened by then, but the expensive step for
   `linuxocr`/`visionocr` — the 2x upscale — has not.
+
+  `rapidocr` also **refuses input that is not a PNG**, before it decodes
+  anything. Its pre-decode check reads the PNG IHDR, but `cv2.imdecode`
+  accepts JPEG, BMP and WebP too, so a JPEG under the byte cap whose SOF
+  declared an enormous size used to reach the decoder in full with only the
+  post-decode backstop — which runs after the allocation it exists to prevent
+  — left to catch it (#167). Teaching the helper a second header format would
+  fix the symptom; refusing non-PNG is what the input contract above already
+  promises, and what hdmicap actually sends (its own PNG encoder's output).
 
   33,177,600 is exactly 2x a 4K capture (3840x2160) in each dimension, so any
   4K frame passes — with margin on the per-side number, none on the
