@@ -26,9 +26,11 @@
 //                 source dimensions, joined text, and per-line text +
 //                 confidence + [x, y, w, h] bbox in SOURCE pixels, origin
 //                 top-left
-//   --self-test   run the bbox clipping math (clipBoxToSource) against a set
-//                 of edge-crossing cases and exit 0/1; no image or Vision
-//                 needed
+//   --self-test   run the pure helpers and exit 0/1 -- the bbox clipping math
+//                 (clipBoxToSource) against a set of edge-crossing cases, the
+//                 shared dimension limits, and the bounded reader, including
+//                 that it propagates a read error rather than reading it as
+//                 EOF; no image or Vision needed
 
 import CoreGraphics
 import Foundation
@@ -73,11 +75,18 @@ func checkDimensions(_ w: Int, _ h: Int) -> String? {
 // below wrap `FileHandle.read(upToCount:)`. Returns whatever was read,
 // which may be up to one byte more than `maxBytes` -- the caller decides
 // whether that's an error (it always is, here).
-func readBounded(maxBytes: Int, next: (_ want: Int) -> Data?) -> Data {
+//
+// `next` throws and this rethrows, so a read error on the descriptor reaches
+// the caller as an error. The call site used to spell it `try?`, which
+// collapses a failed read into nil -- indistinguishable from EOF, so the
+// helper would go on to OCR a silently truncated image and report whatever
+// text survived (#168). Non-throwing closures, like the self-test's, are
+// unaffected by `rethrows`.
+func readBounded(maxBytes: Int, next: (_ want: Int) throws -> Data?) rethrows -> Data {
     var data = Data()
     while data.count <= maxBytes {
         let want = maxBytes + 1 - data.count
-        guard let chunk = next(want), !chunk.isEmpty else { break }
+        guard let chunk = try next(want), !chunk.isEmpty else { break }
         data.append(chunk)
     }
     return data
@@ -249,6 +258,45 @@ private func runSelfTest() -> Bool {
     if gotChunked != Data([1, 2, 3, 4, 5, 6]) {
         fail("readBounded reassembles multiple chunks", Array(gotChunked), [1, 2, 3, 4, 5, 6])
     }
+    count += 1
+    // A read error must reach the caller rather than looking like EOF -- the
+    // `try?` this replaced turned a failed descriptor read into a short image
+    // the helper then OCR'd without complaint (#168).
+    struct FakeReadError: Error {}
+    var chunksBeforeFailure = 1
+    var propagated = false
+    do {
+        _ = try readBounded(maxBytes: 100) { _ in
+            if chunksBeforeFailure > 0 {
+                chunksBeforeFailure -= 1
+                return Data([1, 2, 3])
+            }
+            throw FakeReadError()
+        }
+    } catch is FakeReadError {
+        propagated = true
+    } catch {
+        // Some other error: still not the one thrown, so the check below fails.
+    }
+    if !propagated {
+        fail("readBounded propagates a read error", "returned normally", "FakeReadError")
+    }
+    count += 1
+    // The error must surface even when it lands on the very first read, with
+    // no partial data to be mistaken for a complete short image.
+    var propagatedImmediately = false
+    do {
+        _ = try readBounded(maxBytes: 100) { _ in throw FakeReadError() }
+    } catch is FakeReadError {
+        propagatedImmediately = true
+    } catch {
+        // As above.
+    }
+    if !propagatedImmediately {
+        fail(
+            "readBounded propagates an error from the first read",
+            "returned normally", "FakeReadError")
+    }
 
     if ok {
         print("visionocr --self-test: all \(count) cases passed")
@@ -294,8 +342,13 @@ if let p = path {
 } else {
     handle = FileHandle.standardInput
 }
-let data = readBounded(maxBytes: maxEncodedBytes) { want in
-    try? handle.read(upToCount: want)
+let data: Data
+do {
+    data = try readBounded(maxBytes: maxEncodedBytes) { want in
+        try handle.read(upToCount: want)
+    }
+} catch {
+    die("cannot read \(path ?? "stdin"): \(error)")
 }
 if data.count > maxEncodedBytes {
     die("input is over \(maxEncodedBytes) bytes (encoded-input limit)")

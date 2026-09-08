@@ -347,13 +347,17 @@ ignored; and only Ethernet clients with a 6-byte hardware address are answered
 at all.
 
 **Single client.** The lease above is the *address* contract; netbootd also
-enforces an *identity* one, by hardware address. The first DISCOVER or REQUEST
-it sees locks in that MAC as the active client for as long as the process runs.
-A DISCOVER or REQUEST from a **different** MAC — a second device plugged into
-the same netboot link — gets no reply at all: no OFFER, ACK, or NAK, just a
-rate-limited warning in the log (`netboot logs`). Retransmissions from the
-already-active MAC are unaffected. There is no lease timer and no way to
-release the lock short of restarting the daemon — `netboot start`/`stop`
+enforces an *identity* one, by hardware address. The first DISCOVER — or the
+first REQUEST netbootd actually answers — locks in that MAC as the active
+client for as long as the process runs. A DISCOVER or REQUEST from a
+**different** MAC — a second device plugged into the same netboot link — gets
+no reply at all: no OFFER, ACK, or NAK, just a rate-limited warning in the log
+(`netboot logs`). Retransmissions from the already-active MAC are unaffected.
+Only a message netbootd answers can take the lock: a DHCPINFORM, DHCPDECLINE
+or DHCPRELEASE, or a REQUEST addressed to another server, changes nothing
+whoever sends it, so a chatty neighbor on the link cannot claim the session
+with a packet that would never have been served. There is no lease timer and
+no way to release the lock short of restarting the daemon — `netboot start`/`stop`
 already restarts `netbootd` per boot session, so switching which device
 netboots on a link means stopping and starting netboot again, exactly as
 switching TFTP roots or boot files already required.

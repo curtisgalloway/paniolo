@@ -85,6 +85,28 @@ def _read_bounded(stream, max_bytes: int) -> bytes:
     return data
 
 
+def _read_input(path: str) -> bytes:
+    """Read the encoded image from ``path``, or from stdin when it is ``-``.
+
+    Every way this can fail -- a path that does not exist, a directory, a
+    permission denial, an I/O error part-way through -- is the same answer to
+    the caller, and it is the one docs/dev/ocr.md promises: one line on
+    stderr, non-zero exit. A bare `open()` raised `FileNotFoundError` as a
+    traceback instead, which a caller parsing stderr cannot act on (#168).
+
+    `_read_bounded`'s own over-the-cap failure goes through `die`, which
+    raises `SystemExit` -- not an `OSError` -- so it passes through here with
+    its own message intact.
+    """
+    try:
+        if path == "-":
+            return _read_bounded(sys.stdin.buffer, MAX_ENCODED_BYTES)
+        with open(path, "rb") as f:
+            return _read_bounded(f, MAX_ENCODED_BYTES)
+    except OSError as e:
+        die(f"cannot read {'stdin' if path == '-' else path}: {e}")
+
+
 def _check_dimensions(w: int, h: int) -> None:
     """Reject dimensions before they drive an allocation.
 
@@ -103,10 +125,26 @@ def _check_dimensions(w: int, h: int) -> None:
 
 
 def _preprocess(png: bytes) -> bytes:
-    """2x upscale + black pad. Falls back to identity if Pillow is absent."""
+    """2x upscale + black pad. Falls back to identity if Pillow is absent.
+
+    The import is its own `try` so that only a *missing Pillow* takes the
+    identity path. It used to wrap the decode as well, which meant a decode
+    failure was reported as a traceback (`UnidentifiedImageError` for bytes
+    that are no image at all, `OSError` for a truncated one) rather than the
+    one-line stderr message docs/dev/ocr.md promises -- and an ImportError
+    raised from inside Pillow, by a missing codec plugin, would have silently
+    skipped preprocessing instead (#168).
+
+    `_check_dimensions` raises `SystemExit`, which is not an `Exception`, so
+    an over-limit image still fails with its own message rather than being
+    relabelled a decode failure here.
+    """
     try:
         from PIL import Image  # type: ignore
+    except ImportError:
+        return png  # No Pillow: hand tesseract the raw PNG, unscaled.
 
+    try:
         img = Image.open(io.BytesIO(png))
         w, h = img.size
         # Belt-and-suspenders: main() already checked the header-derived
@@ -125,8 +163,8 @@ def _preprocess(png: bytes) -> bytes:
         buf = io.BytesIO()
         padded.save(buf, "PNG")
         return buf.getvalue()
-    except ImportError:
-        return png
+    except Exception as e:
+        die(f"could not decode image: {e}")
 
 
 def _png_size(png: bytes) -> "tuple[int, int]":
@@ -270,11 +308,7 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    if args.input == "-":
-        png = _read_bounded(sys.stdin.buffer, MAX_ENCODED_BYTES)
-    else:
-        with open(args.input, "rb") as f:
-            png = _read_bounded(f, MAX_ENCODED_BYTES)
+    png = _read_input(args.input)
 
     src_w, src_h = _png_size(png)
     if src_w and src_h:

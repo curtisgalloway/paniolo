@@ -28,17 +28,24 @@
 //!
 //! One *client*, too, enforced by hardware address rather than by address
 //! alone: the lease above says which IP is handed out, [`accept_client`]
-//! says who it is handed to. The first DISCOVER or REQUEST `serve` sees
-//! locks in that MAC as the active client for the life of the process; a
-//! later request from a different MAC is not the machine on the other end of
-//! this dedicated link, so it gets no OFFER, ACK, or NAK at all — just a
-//! rate-limited `warn!` — rather than being allowed to steal the lease, the
-//! ARP pin, or the MAC handed to TFTP's raw-frame sender. A retransmission
-//! from the already-active MAC is unaffected (`accept_client` is idempotent
-//! for it). There is no lease timer to expire the lock: `paniolo netboot
-//! start`/`stop` restarts this process per boot session, so swapping the
-//! netboot target means restarting netbootd, clearing the lock along with
-//! everything else this process held in memory.
+//! says who it is handed to. The first DISCOVER — or first REQUEST this
+//! server actually answers — locks in that MAC as the active client for the
+//! life of the process; a later request from a different MAC is not the
+//! machine on the other end of this dedicated link, so it gets no OFFER,
+//! ACK, or NAK at all — just a rate-limited `warn!` — rather than being
+//! allowed to steal the lease, the ARP pin, or the MAC handed to TFTP's
+//! raw-frame sender. A retransmission from the already-active MAC is
+//! unaffected (`accept_client` is idempotent for it).
+//!
+//! What locks the client in is decided *after* the message type is, in
+//! [`disposition`]: a message this server never answers — DHCPINFORM,
+//! DHCPDECLINE, DHCPRELEASE, or a REQUEST addressed to another server
+//! (option 54) — takes no lock, whoever sends it, so an unrelated host on
+//! the link cannot claim the session with a packet that would never have
+//! been served (#166). There is no lease timer to expire the lock: `paniolo
+//! netboot start`/`stop` restarts this process per boot session, so swapping
+//! the netboot target means restarting netbootd, clearing the lock along
+//! with everything else this process held in memory.
 
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
@@ -529,6 +536,63 @@ fn accept_client(active: &mut Option<[u8; 6]>, mac: [u8; 6]) -> bool {
     }
 }
 
+/// What `serve` does with one parsed BOOTREQUEST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    /// Answer with this DHCP message type; `label` names the request in the
+    /// log line.
+    Reply { msg_type: u8, label: &'static str },
+    /// A DHCPREQUEST addressed to another server (option 54) — that server's
+    /// business, not ours ([`Verdict::Ignore`]).
+    OtherServer,
+    /// A message type this server never answers: DHCPINFORM, DHCPDECLINE,
+    /// DHCPRELEASE, or anything else that is not a DISCOVER or a REQUEST.
+    Unserved,
+    /// A message we would have answered, from a MAC that is not this
+    /// session's client — which is carried here for the warning.
+    NotTheClient { active: [u8; 6] },
+}
+
+/// Decide what to do with `req`, consulting (and, on the first served
+/// request, setting) the single-client lock in `active`.
+///
+/// The order is the point. `parse_request` accepts any option-53 value, so a
+/// DHCPINFORM, DHCPDECLINE, DHCPRELEASE, or a DHCPREQUEST addressed to some
+/// other server can arrive from an unrelated host sharing the link. Taking
+/// the lock before the message type was known let such a packet install a MAC
+/// that this server would then never answer, and with no lease timer the real
+/// target's DISCOVER was refused until netbootd restarted (#166). So the
+/// message type is settled first: only a DISCOVER, or a REQUEST whose
+/// [`Verdict`] is `Ack` or `Nak` — one this server does answer — ever reaches
+/// [`accept_client`]. A NAKed REQUEST counts: a NAK is a reply, and sending
+/// one commits this process to that client just as an OFFER does.
+fn disposition(
+    active: &mut Option<[u8; 6]>,
+    req: &Request,
+    server_ip: Ipv4Addr,
+    client_ip: Ipv4Addr,
+) -> Disposition {
+    let (msg_type, label) = match req.msg_type {
+        DHCP_DISCOVER => (DHCP_OFFER, "DHCPDISCOVER"),
+        DHCP_REQUEST => match request_verdict(req, server_ip, client_ip) {
+            Verdict::Ack => (DHCP_ACK, "DHCPREQUEST"),
+            Verdict::Nak => (DHCP_NAK, "DHCPREQUEST"),
+            Verdict::Ignore => return Disposition::OtherServer,
+        },
+        _ => return Disposition::Unserved,
+    };
+    let mut mac = [0u8; 6];
+    mac.copy_from_slice(&req.chaddr[..6]);
+    if !accept_client(active, mac) {
+        // `active` is always Some here: accept_client only refuses once a
+        // client is locked in.
+        return Disposition::NotTheClient {
+            active: active.unwrap_or_default(),
+        };
+    }
+    Disposition::Reply { msg_type, label }
+}
+
 /// Bind the broadcast-capable DHCP listen socket on `0.0.0.0:port`, pinned to
 /// the netboot interface.
 ///
@@ -592,7 +656,7 @@ pub async fn serve(
     );
 
     // The single client this process will ever answer, locked in by
-    // `accept_client` on the first accepted DISCOVER/REQUEST — see the
+    // `disposition` on the first request it decides to answer — see the
     // module doc comment. There is no in-process reset; a new client means
     // restarting netbootd.
     let mut active_mac: Option<[u8; 6]> = None;
@@ -618,35 +682,30 @@ pub async fn serve(
         mac_bytes.copy_from_slice(&req.chaddr[..6]);
         let mac = mac_string(&mac_bytes);
 
-        if !accept_client(&mut active_mac, mac_bytes) {
-            // active_mac is always Some here: accept_client only returns
-            // false once a client is already locked in.
-            let active = active_mac.map(|m| mac_string(&m)).unwrap_or_default();
-            warn_rate_limited(
-                &mut last_rejected_warn,
-                REJECTED_CLIENT_WARN_INTERVAL,
-                &format!(
-                    "ignoring DHCP request from {mac}: the netboot lease is held by {active} \
-                     for this session; restart netbootd to switch clients"
-                ),
-            );
-            continue;
-        }
-
-        let (reply_type, label) = match req.msg_type {
-            DHCP_DISCOVER => (DHCP_OFFER, "DHCPDISCOVER"),
-            DHCP_REQUEST => match request_verdict(&req, host_ip, client_ip) {
-                Verdict::Ack => (DHCP_ACK, "DHCPREQUEST"),
-                Verdict::Nak => (DHCP_NAK, "DHCPREQUEST"),
-                Verdict::Ignore => {
-                    info!(
-                        "DHCPREQUEST from {mac} is addressed to server {}; ignoring",
-                        req.server_id.unwrap_or(Ipv4Addr::UNSPECIFIED)
-                    );
-                    continue;
-                }
-            },
-            _ => continue,
+        // The message type decides the reply, and only a request we are
+        // going to answer takes (or has to match) the single-client lock.
+        let (reply_type, label) = match disposition(&mut active_mac, &req, host_ip, client_ip) {
+            Disposition::Reply { msg_type, label } => (msg_type, label),
+            Disposition::OtherServer => {
+                info!(
+                    "DHCPREQUEST from {mac} is addressed to server {}; ignoring",
+                    req.server_id.unwrap_or(Ipv4Addr::UNSPECIFIED)
+                );
+                continue;
+            }
+            Disposition::Unserved => continue,
+            Disposition::NotTheClient { active } => {
+                let active = mac_string(&active);
+                warn_rate_limited(
+                    &mut last_rejected_warn,
+                    REJECTED_CLIENT_WARN_INTERVAL,
+                    &format!(
+                        "ignoring DHCP request from {mac}: the netboot lease is held by {active} \
+                         for this session; restart netbootd to switch clients"
+                    ),
+                );
+                continue;
+            }
         };
         info!("{label} from {mac}");
 
@@ -1016,6 +1075,156 @@ mod tests {
         // ...and the real client can still be served afterward.
         assert!(accept_client(&mut active, MAC_A));
         assert_eq!(active, Some(MAC_A));
+    }
+
+    /// A DHCPINFORM: parsed like any other BOOTREQUEST (option 53 = 8), never
+    /// answered by this server. Declared here rather than beside the served
+    /// message types because nothing outside these tests names it.
+    const DHCP_INFORM: u8 = 8;
+    /// Some other DHCP server on the link.
+    const OTHER_SERVER: Ipv4Addr = Ipv4Addr::new(192, 168, 99, 2);
+
+    /// A parsed BOOTREQUEST of `msg_type` from `mac`, carrying `trailing_opts`
+    /// after the message-type option — the same shape `serve` hands
+    /// `disposition` for every packet off the wire.
+    fn request_from(mac: [u8; 6], msg_type: u8, trailing_opts: &[u8]) -> Request {
+        let mut pkt = request_packet(BOOTREQUEST, Some(msg_type), trailing_opts);
+        pkt[28..34].copy_from_slice(&mac);
+        parse_request(&pkt).expect("request parses")
+    }
+
+    /// An option 54 (server identifier) TLV.
+    fn server_id_opt(ip: Ipv4Addr) -> Vec<u8> {
+        let mut opt = vec![OPT_SERVER_ID, 4];
+        opt.extend_from_slice(&ip.octets());
+        opt
+    }
+
+    /// An option 50 (requested address) TLV.
+    fn requested_ip_opt(ip: Ipv4Addr) -> Vec<u8> {
+        let mut opt = vec![OPT_REQUESTED_IP, 4];
+        opt.extend_from_slice(&ip.octets());
+        opt
+    }
+
+    /// An address this server does not lease, so a REQUEST naming it is NAKed.
+    const STALE: Ipv4Addr = Ipv4Addr::new(192, 168, 99, 50);
+
+    #[test]
+    fn an_unanswered_message_type_does_not_lock_in_its_sender() {
+        let mut active = None;
+
+        // Some other host on the link speaks first, with a message this
+        // server never answers.
+        let inform = request_from(MAC_B, DHCP_INFORM, &[]);
+        assert_eq!(
+            disposition(&mut active, &inform, SERVER, CLIENT),
+            Disposition::Unserved
+        );
+        assert_eq!(
+            active, None,
+            "a message we never answer must not take the lock"
+        );
+
+        // The real target then boots and must still be served.
+        let discover = request_from(MAC_A, DHCP_DISCOVER, &[]);
+        assert_eq!(
+            disposition(&mut active, &discover, SERVER, CLIENT),
+            Disposition::Reply {
+                msg_type: DHCP_OFFER,
+                label: "DHCPDISCOVER",
+            }
+        );
+        assert_eq!(active, Some(MAC_A));
+    }
+
+    #[test]
+    fn a_request_addressed_to_another_server_does_not_lock_in_its_sender() {
+        let mut active = None;
+
+        // Another host on the link accepting another server's offer: option 54
+        // names that server, so this REQUEST is none of our business.
+        let mut opts = requested_ip_opt(CLIENT);
+        opts.extend_from_slice(&server_id_opt(OTHER_SERVER));
+        let elsewhere = request_from(MAC_B, DHCP_REQUEST, &opts);
+        assert_eq!(
+            disposition(&mut active, &elsewhere, SERVER, CLIENT),
+            Disposition::OtherServer
+        );
+        assert_eq!(
+            active, None,
+            "a REQUEST we do not answer must not take the lock"
+        );
+
+        let discover = request_from(MAC_A, DHCP_DISCOVER, &[]);
+        assert_eq!(
+            disposition(&mut active, &discover, SERVER, CLIENT),
+            Disposition::Reply {
+                msg_type: DHCP_OFFER,
+                label: "DHCPDISCOVER",
+            }
+        );
+        assert_eq!(active, Some(MAC_A));
+    }
+
+    #[test]
+    fn a_served_message_locks_in_the_client_and_a_second_mac_gets_no_reply() {
+        let mut active = None;
+        let discover_a = request_from(MAC_A, DHCP_DISCOVER, &[]);
+        assert_eq!(
+            disposition(&mut active, &discover_a, SERVER, CLIENT),
+            Disposition::Reply {
+                msg_type: DHCP_OFFER,
+                label: "DHCPDISCOVER",
+            }
+        );
+        assert_eq!(active, Some(MAC_A));
+
+        // A second device on the link gets nothing at all — not even the NAK
+        // its REQUEST for an address we do not lease would otherwise earn.
+        let discover_b = request_from(MAC_B, DHCP_DISCOVER, &[]);
+        assert_eq!(
+            disposition(&mut active, &discover_b, SERVER, CLIENT),
+            Disposition::NotTheClient { active: MAC_A }
+        );
+        let request_b = request_from(MAC_B, DHCP_REQUEST, &requested_ip_opt(STALE));
+        assert_eq!(
+            disposition(&mut active, &request_b, SERVER, CLIENT),
+            Disposition::NotTheClient { active: MAC_A }
+        );
+        assert_eq!(
+            active,
+            Some(MAC_A),
+            "a rejected MAC must not steal or clear the lock"
+        );
+
+        // ...and the client's retransmission is answered exactly as before.
+        assert_eq!(
+            disposition(&mut active, &discover_a, SERVER, CLIENT),
+            Disposition::Reply {
+                msg_type: DHCP_OFFER,
+                label: "DHCPDISCOVER",
+            }
+        );
+        assert_eq!(active, Some(MAC_A));
+    }
+
+    #[test]
+    fn a_request_we_nak_still_locks_in_the_client() {
+        let mut active = None;
+        let stale_request = request_from(MAC_A, DHCP_REQUEST, &requested_ip_opt(STALE));
+        assert_eq!(
+            disposition(&mut active, &stale_request, SERVER, CLIENT),
+            Disposition::Reply {
+                msg_type: DHCP_NAK,
+                label: "DHCPREQUEST",
+            }
+        );
+        assert_eq!(
+            active,
+            Some(MAC_A),
+            "a NAK is a reply: sending one commits this process to that client"
+        );
     }
 
     // ── Client IP derivation ─────────────────────────────────────────────────
