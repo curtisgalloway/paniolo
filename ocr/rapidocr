@@ -59,12 +59,26 @@ VENV_NAMES = ("ocr-venv",)
 
 
 def _reexec_into_venv() -> None:
-    """Re-exec under a sibling venv's interpreter if rapidocr is not importable.
+    """Re-exec under the sibling venv's interpreter whenever one exists.
 
     The helper is invoked by hdmicap as a bare executable, so it cannot rely on
     a virtualenv being active. `paniolo setup` creates `ocr-venv/` next to this
-    script; if the ambient interpreter lacks rapidocr but that venv has it, hand
-    over rather than failing with an ImportError the caller cannot act on.
+    script, and if that interpreter is there this hands over to it -- without
+    first asking whether the ambient interpreter could have served, which the
+    docstring used to claim it did (#168).
+
+    Unconditional hand-over is the behavior to keep, so this corrects the
+    docstring rather than adding the check it described. `paniolo setup`
+    builds that venv for this script alone and curates it: it pins
+    `rapidocr>=3,<4`, then uninstalls the `opencv-python` rapidocr pulls in
+    and force-installs `opencv-python-headless` over it, because the full
+    build needs `libGL.so.1`, which a headless Pi OS does not have
+    (cli/src/setup.rs). An ambient interpreter that merely satisfies
+    `import rapidocr` has none of that curation, and preferring it would make
+    which engine runs -- and whether it runs at all -- depend on what else is
+    installed on the control host. When the venv exists it is the answer;
+    when it does not, the ambient interpreter is tried and main()'s import
+    error names the fix.
     """
     if os.environ.get("PANIOLO_RAPIDOCR_REEXEC"):
         return  # Already tried; do not loop.
@@ -91,6 +105,9 @@ MAX_DIMENSION = 8192  # px, per side
 MAX_PIXELS = 33_177_600  # 7680x4320 total px -- 2x a 4K capture, with margin
 
 
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
 def _png_size(png: bytes) -> "tuple[int, int]":
     """Width and height from the PNG IHDR, without decoding.
 
@@ -98,9 +115,33 @@ def _png_size(png: bytes) -> "tuple[int, int]":
     rather than a shared import because these are standalone scripts, not a
     package.
     """
-    if len(png) < 24 or png[:8] != b"\x89PNG\r\n\x1a\n":
+    if len(png) < 24 or png[:8] != _PNG_SIGNATURE:
         return (0, 0)
     return (int.from_bytes(png[16:20], "big"), int.from_bytes(png[20:24], "big"))
+
+
+def _require_png(png: bytes) -> "tuple[int, int]":
+    """Size a PNG from its header, or die if the input is not a PNG.
+
+    A pre-decode dimension check can only protect the decode it runs before,
+    and `_png_size` can only size a PNG. `cv2.imdecode` accepts JPEG, BMP and
+    WebP as well, so guarding the check with "did the header parse?" silently
+    skipped it for every one of those: a small JPEG whose SOF declared
+    20000x20000 passed the byte cap, parsed as no PNG at all, and was
+    rasterized in full before the post-decode backstop -- which runs after the
+    allocation it exists to prevent -- could see it (issue #167).
+
+    Refusing non-PNG outright, rather than teaching this helper a second
+    header format, is what the contract already says: docs/dev/ocr.md's input
+    is "a PNG on stdin (`-`) or a path argument", hdmicap pipes the output of
+    its own PNG encoder, and nothing else in the tree feeds this helper.
+    """
+    if png[:8] != _PNG_SIGNATURE:
+        die("input is not a PNG (this helper reads a PNG on stdin or a path)")
+    w, h = _png_size(png)
+    if w <= 0 or h <= 0:
+        die("PNG header is truncated or declares an empty image")
+    return (w, h)
 
 
 def _check_dimensions(w: int, h: int) -> None:
@@ -136,6 +177,25 @@ def _read_bounded(stream, max_bytes: int) -> bytes:
     return data
 
 
+def _read_input(path: str) -> bytes:
+    """Read the encoded image from ``path``, or from stdin when it is ``-``.
+
+    Every way this can fail -- a path that does not exist, a directory, a
+    permission denial, an I/O error part-way through -- is the same answer to
+    the caller, and it is the one docs/dev/ocr.md promises: one line on
+    stderr, non-zero exit. A bare `open()` raised `FileNotFoundError` as a
+    traceback instead (#168). Mirrors ocr/linuxocr's copy, for the same
+    reason `_read_bounded` is copied rather than shared.
+    """
+    try:
+        if path == "-":
+            return _read_bounded(sys.stdin.buffer, MAX_ENCODED_BYTES)
+        with open(path, "rb") as f:
+            return _read_bounded(f, MAX_ENCODED_BYTES)
+    except OSError as e:
+        die(f"cannot read {'stdin' if path == '-' else path}: {e}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="OCR a PNG using PP-OCRv6 via RapidOCR (Linux GUI-mode helper)."
@@ -158,27 +218,24 @@ def main() -> None:
             "pip install 'rapidocr>=3,<4' onnxruntime opencv-python-headless"
         )
 
-    if args.input == "-":
-        png = _read_bounded(sys.stdin.buffer, MAX_ENCODED_BYTES)
-    else:
-        with open(args.input, "rb") as f:
-            png = _read_bounded(f, MAX_ENCODED_BYTES)
+    png = _read_input(args.input)
     if not png:
         die("no image data")
 
     # Inspect the header before cv2.imdecode ever rasterizes the image, so an
-    # oversized claim is rejected before OpenCV decodes anything.
-    src_w, src_h = _png_size(png)
-    if src_w and src_h:
-        _check_dimensions(src_w, src_h)
+    # oversized claim is rejected before OpenCV decodes anything. Input that
+    # is not a PNG is refused here rather than measured: this helper cannot
+    # size it, and cv2 would decode it anyway -- see `_require_png`.
+    src_w, src_h = _require_png(png)
+    _check_dimensions(src_w, src_h)
 
     img = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         die("could not decode image")
     height, width = img.shape[:2]
-    # Backstop for inputs _png_size couldn't parse a header from (non-PNG, or
-    # malformed) -- the decode already happened, but the OCR engine below has
-    # not run yet.
+    # Backstop: the check above ran on what the IHDR claimed, this one runs on
+    # what OpenCV actually produced. The decode already happened, but the OCR
+    # engine below has not run yet.
     _check_dimensions(width, height)
 
     # Four threads matches a Pi's core count. The key is nested under the

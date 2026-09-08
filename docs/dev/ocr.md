@@ -81,6 +81,11 @@ fails at first OCR rather than at install.
 default, one line per recognized line, in reading order. That form is for humans
 running the helper by hand.
 
+`rapidocr` holds callers to that literally and errors on anything without the
+PNG signature; see "Resource limits" for why. The others accept whatever their
+platform's image loader recognizes, which is more than a PNG — but nothing in
+paniolo sends them anything else, so do not rely on it.
+
 **paniolo always passes `--json`**, and that is the machine contract:
 
 ```json
@@ -257,6 +262,15 @@ driving an oversized allocation:
   decode has already happened by then, but the expensive step for
   `linuxocr`/`visionocr` — the 2x upscale — has not.
 
+  `rapidocr` also **refuses input that is not a PNG**, before it decodes
+  anything. Its pre-decode check reads the PNG IHDR, but `cv2.imdecode`
+  accepts JPEG, BMP and WebP too, so a JPEG under the byte cap whose SOF
+  declared an enormous size used to reach the decoder in full with only the
+  post-decode backstop — which runs after the allocation it exists to prevent
+  — left to catch it (#167). Teaching the helper a second header format would
+  fix the symptom; refusing non-PNG is what the input contract above already
+  promises, and what hdmicap actually sends (its own PNG encoder's output).
+
   33,177,600 is exactly 2x a 4K capture (3840x2160) in each dimension, so any
   4K frame passes — with margin on the per-side number, none on the
   pixel-count one, since a 4K frame doubled is precisely at that limit.
@@ -276,6 +290,30 @@ three so a future change to one doesn't silently drift from the rest.
 **Errors are one line, on stderr, non-zero exit** — the same path each helper
 already uses for "cannot read", "could not decode image", and so on, not a
 new failure mode a caller has to learn to recognize.
+
+## Every failure leaves the same way
+
+That shape is not only for the limits. A missing input file, bytes that are
+not an image, an I/O error part-way through a read — each is routed through
+the helper's own error exit, because the caller is a daemon parsing stderr,
+not a person reading a stack trace. Three paths did not, and were fixed in
+#168:
+
+- `linuxocr` opened its input file bare, so a missing path came back as a
+  `FileNotFoundError` traceback, and its preprocessing caught only
+  `ImportError` (a missing Pillow), so non-image bytes came back as a
+  `PIL.UnidentifiedImageError` traceback. Both now go through `die()`.
+- `rapidocr` opened its input file bare, with the same result.
+- `visionocr` read with `try?`, which turns a failed read into `nil` — the
+  same value that means EOF. A descriptor error therefore did not report at
+  all: the helper OCR'd whatever prefix it had managed to read and returned
+  the text that survived, which is the worst of the three, because nothing
+  downstream can tell a truncated screen from a short one. Its bounded reader
+  now `rethrows`, and the caller dies with the underlying error.
+
+The Python helpers' error paths are covered by `ocr/tests` and `visionocr`'s
+by its own `--self-test`, both of which CI runs; see "Adding an engine" for
+where a new helper hooks in.
 
 ## Adding an engine
 

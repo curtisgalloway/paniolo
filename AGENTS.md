@@ -980,9 +980,11 @@ loopback HTTP (Content-Length bounding, HTTP/1.0 close, head timeout). A 65
 K-round-trip block-wraparound test is marked `#[ignore]` — run it with `cargo
 test -- --ignored`. `dhcp::serve` itself is deliberately *not* driven
 end-to-end in tests (it shells out to `sudo arp`/`ip neigh` on every accepted
-request, which a test must never trigger for real); `accept_client`, the pure
-decision function it calls, is what carries the single-client test coverage
-instead. `tftp::run` *is* driven end-to-end over loopback (no such shell-out
+request, which a test must never trigger for real); `disposition` and
+`accept_client`, the pure decision functions it calls, are what carry the
+single-client test coverage instead — `disposition` holds the whole
+per-packet decision, including the order the message type and the client lock
+are settled in, so the tests exercise the sequence `serve` really runs. `tftp::run` *is* driven end-to-end over loopback (no such shell-out
 exists there) for the peer-IP gate and the `MAX_TRANSFERS` semaphore bound,
 including a stalled-transfer-then-freed-slot case (`tftp.rs`'s "Peer gating"
 and "Transfer-slot bound" test groups).
@@ -1023,17 +1025,23 @@ Key differences from the Python servers:
   `validate_client_ip` refuses anything outside the /24). A REQUEST for another
   address is NAKed (`request_verdict`), one addressed to another server
   (option 54) ignored, and non-Ethernet / `hlen != 6` clients dropped.
-- **One client, enforced by MAC** (`dhcp::accept_client`). The lease above is
-  the address contract; this is the identity one: the first DISCOVER/REQUEST
-  `dhcp::serve` sees locks in that hardware address as the active client for
-  the process's lifetime, and a later request from a *different* MAC is
-  ignored outright — no OFFER/ACK/NAK, just a `warn!` rate-limited via
+- **One client, enforced by MAC** (`dhcp::accept_client`, sequenced by
+  `dhcp::disposition`). The lease above is the address contract; this is the
+  identity one: the first DISCOVER — or first REQUEST this server actually
+  answers — locks in that hardware address as the active client for the
+  process's lifetime, and a later request from a *different* MAC is ignored
+  outright — no OFFER/ACK/NAK, just a `warn!` rate-limited via
   `served::warn_rate_limited` — so a second device on the link cannot steal
   the lease, the ARP pin, or the MAC handed to TFTP's raw-frame sender. A
   retransmission from the active MAC is unaffected (`accept_client` is
-  idempotent for it). There is no lease timer and no in-process reset —
-  `paniolo netboot start`/`stop` restarts the process per boot session, so a
-  new client means restarting netbootd.
+  idempotent for it). The message type is settled *before* the lock is
+  touched: a DHCPINFORM/DECLINE/RELEASE, or a REQUEST addressed to another
+  server (option 54), takes no lock no matter who sends it, so an unrelated
+  host on the link cannot lock out the real target with a packet netbootd
+  would never have answered (#166). A NAKed REQUEST does take it — a NAK is a
+  reply. There is no lease timer and no in-process reset — `paniolo netboot
+  start`/`stop` restarts the process per boot session, so a new client means
+  restarting netbootd.
 - **TFTP is gated to the leased client and bounded in concurrency**
   (`tftp::run`). Every RRQ/WRQ whose source IP is not the one DHCP leases on
   this link (`client_ip`, threaded from `main` into `tftp::serve`) is dropped
