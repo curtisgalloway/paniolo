@@ -108,7 +108,11 @@ follow-up. Run through this checklist before calling `gh pr create`:
    this. A companion skill, `skills/kvm-puppeting/SKILL.md`, teaches the
    GUI-puppeting *doctrine* (the look-act-settle-verify loop, keyboard-first
    navigation, pixel→logical mouse scaling) on top of the `video`+`hid`
-   commands; update it too if you change the surface it relies on. These
+   commands; update it too if you change the surface it relies on. A third,
+   `skills/control-host/SKILL.md`, is the executable procedure for *building*
+   a control host from blank media (flashing, the cloud-init seed, enrollment)
+   — it owns those commands, and `docs/control-host.md` points at it rather
+   than repeating them, so keep the procedure in one place. These
    skills ship with paniolo and are reachable via `paniolo skill` (see the
    Rust control-plane notes). **Adding or removing a skill** also means a new
    `contents` entry in `packaging/nfpm.yaml` (one explicit file→dst line per
@@ -376,7 +380,7 @@ Python tree below:
   libexec prepended to PATH, so lab files keep referencing helpers by bare
   name. `paniolo helper [NAME] [ARGS…]` lists or runs them directly.
 - **Bundled skills are self-describing**: the agent skills under `skills/`
-  (`paniolo`, `kvm-puppeting`) install to
+  (`paniolo`, `kvm-puppeting`, `control-host`) install to
   `~/.local/share/paniolo/skills` (and `/usr/share/paniolo/skills` for the
   Linux packages). `paniolo skill [NAME]` lists them with their frontmatter
   descriptions, or prints one `SKILL.md` (`--path` for the file path) — the

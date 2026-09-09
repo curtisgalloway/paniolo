@@ -76,5 +76,9 @@ contents:
     dst: /usr/share/paniolo/skills/kvm-puppeting/SKILL.md
     file_info:
       mode: 0o644
+  - src: skills/control-host/SKILL.md
+    dst: /usr/share/paniolo/skills/control-host/SKILL.md
+    file_info:
+      mode: 0o644
   - src: LICENSE
     dst: /usr/share/doc/paniolo/LICENSE

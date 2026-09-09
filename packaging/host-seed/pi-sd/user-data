@@ -11,15 +11,16 @@
 # the payload type, and anything above it (including this header) would make
 # the file be ignored.
 #
-# Every <placeholder> below must be replaced before flashing. Verify with:
-#   grep -n '<[a-z-]*>' user-data      # must print nothing
+# Five angle-bracket placeholders below must be replaced before flashing.
+# They are listed in ../README.md, and the check that proves none survived is
+# there too. Run `paniolo skill control-host` for the whole procedure.
 
 hostname: <hostname>
 manage_etc_hosts: true
 
 users:
   - name: <user>
-    gecos: <full name>
+    gecos: <full-name>
     # dialout: serial consoles. video: HDMI capture devices. gpio/plugdev:
     # USB helper hardware. The .deb deliberately does not manage group
     # membership (it is a per-user concern), so the seed does it declaratively

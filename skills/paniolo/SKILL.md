@@ -666,6 +666,18 @@ paniolo --lab mylab.toml setup --host bench1       # runs `paniolo setup` on ben
 (The host needs the paniolo CLI + source already present; this builds the Rust
 daemons there over an ssh PTY.)
 
+**If the control host does not exist yet** — a blank Raspberry Pi, or a host
+being re-imaged — that is a different job, and it has its own skill:
+
+```
+paniolo skill control-host
+```
+
+It covers flashing Pi OS to an SD card (including how to identify the right
+removable device before writing to it), the cloud-init seed that brings the
+box up with SSH authorized and paniolo installed, and enrolling the result
+here. Don't improvise a flashing procedure; read that skill.
+
 ## Background daemons — one view of everything
 
 Paniolo runs several per-subsystem daemons (serialcap, hdmicap, the hid

@@ -36,24 +36,37 @@ seed's job ends at first SSH.
 
 ## Using them
 
-The step-by-step walkthrough — flashing, the `ssh` flag file, enrolling the
-host in the lab file, and what to do when a boot does not come up — is in
-[docs/control-host.md](../../docs/control-host.md). In short: copy all three
-files to the FAT `bootfs` partition under exactly these names, `touch` an
-empty `ssh` file beside them, fill in the placeholders, and boot.
+**The executable procedure is `paniolo skill control-host`** — downloading
+the image, identifying the right removable device before writing to it,
+flashing, mounting, installing these files, rendering them, and enrolling the
+result. It has the exact commands for macOS and Linux, and it is the single
+source of truth for the steps. The rationale, host sizing, and troubleshooting
+are in [docs/control-host.md](../../docs/control-host.md).
+
+In short: copy all three files to the FAT `bootfs` partition under exactly
+these names, `touch` an empty `ssh` file beside them, render the placeholders,
+and boot.
 
 Only `user-data` has placeholders. Replace all five, then confirm none
-survive:
+survive. This check strips the file's own comments first, so a clean run means
+the payload really is rendered:
 
 ```bash
-grep -n '<[a-z-]*>' /Volumes/bootfs/user-data     # must print nothing
+grep -v '^[[:space:]]*#' /Volumes/bootfs/user-data | grep '<[^>]*>' \
+  && echo "FAIL: unrendered placeholders above" \
+  || echo "OK: fully rendered"
 ```
+
+Do not simplify that to `grep '<[a-z-]*>' user-data`. It matches the
+explanatory comments in the template, so it can never report success, and its
+character class excludes spaces, so it silently misses a placeholder that
+contains one.
 
 | Placeholder | Value |
 |---|---|
 | `<hostname>` | the host's name, matching what the lab file's `ssh` field will resolve |
 | `<user>` | operator account name |
-| `<full name>` | GECOS field, cosmetic |
+| `<full-name>` | GECOS field, cosmetic |
 | `<ssh-public-key>` | one full public key line, e.g. `ssh-ed25519 AAAA… you@dev` |
 | `<version>` | paniolo release to install, without the `v` — e.g. `0.2.0`, appearing twice on the same line |
 

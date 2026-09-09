@@ -50,60 +50,42 @@ Vision on small console fonts.
 ## Raspberry Pi, from blank card to first SSH
 
 Raspberry Pi OS has shipped cloud-init as its native first-boot mechanism
-since Trixie, so no installer runs and no custom image gets built — the stock
-image is the disk, and three files on its boot partition configure it.
+since Trixie, so no installer runs and no custom image gets built. The stock
+image is the disk, and four files on its boot partition configure it.
 
-Those files live in
-[`packaging/host-seed/pi-sd/`](https://github.com/curtisgalloway/paniolo/tree/main/packaging/host-seed/pi-sd).
-They are the seed that was hardware-validated on a Pi 5, with every gotcha
-from that bring-up encoded in them.
+**The step-by-step procedure lives in the bundled `control-host` agent
+skill**, which is written to be executed rather than skimmed:
 
-1. **Flash Raspberry Pi OS Lite arm64**, Trixie or newer, by any means. Skip
-   Raspberry Pi Imager's customization screen — cloud-init supersedes it.
+```bash
+paniolo skill control-host
+```
 
-2. **Copy the three files** onto the FAT `bootfs` partition, keeping their
-   names exactly. cloud-init silently ignores a misnamed file.
+It is one file, readable by a person or an agent, and it holds the exact
+commands for both macOS and Linux. Keeping them in one place is deliberate:
+a flashing procedure duplicated across two documents is a procedure that
+drifts. You can also
+[read it on GitHub](https://github.com/curtisgalloway/paniolo/blob/main/skills/control-host/SKILL.md).
 
-    ```bash
-    cp packaging/host-seed/pi-sd/user-data \
-       packaging/host-seed/pi-sd/meta-data \
-       packaging/host-seed/pi-sd/network-config /Volumes/bootfs/
-    ```
+The shape of it:
 
-3. **Create an empty `ssh` file** on the same partition. This is what actually
-   enables sshd, and it is not optional.
-
-    ```bash
-    touch /Volumes/bootfs/ssh
-    ```
-
-4. **Replace the placeholders** in `user-data` — hostname, account name and
-   GECOS, your SSH public key, and the paniolo release to install. Then check
-   that none are left:
-
-    ```bash
-    grep -n '<[a-z-]*>' /Volumes/bootfs/user-data     # must print nothing
-    ```
-
-5. **Eject the card, boot the Pi, and wait.** First boot updates apt and
-   downloads the `.deb`, so allow a few minutes. Then confirm from your dev
-   machine:
-
-    ```bash
-    ssh <user>@<hostname> paniolo --version
-    ```
-
-6. **Enroll the host** in the lab file, then propose its targets:
-
-    ```bash
-    paniolo host add <name> --ssh <user>@<hostname>
-    paniolo configure <target> -H <name>
-    ```
-
-    `configure` runs discovery on the named host over SSH and prints a
-    proposed `[targets.<target>]` block, best-guessing the serial device and
-    USB-Ethernet interface. It writes nothing authoritative — you review it,
-    paste it into the lab file, and commit.
+1. **Download** Raspberry Pi OS Lite arm64, Trixie or newer.
+2. **Identify the card.** This is the step that can destroy data, because
+   `dd` to the wrong device overwrites a disk silently. External and backup
+   drives appear in the same listing as the card. Confirm the device node by
+   size and removability before writing anything.
+3. **Write the image**, then mount the FAT boot partition.
+4. **Install the seed** from
+   [`packaging/host-seed/pi-sd/`](https://github.com/curtisgalloway/paniolo/tree/main/packaging/host-seed/pi-sd):
+   three cloud-init files, plus an empty `ssh` file that is what actually
+   enables sshd. Names must be exact, because cloud-init silently ignores a
+   misnamed file.
+5. **Render the five placeholders** in `user-data` (hostname, account, GECOS,
+   public key, paniolo version) and verify none survived.
+6. **Eject and boot.** First boot takes several minutes: it waits for the
+   network, updates apt, downloads the `.deb`, and reboots itself. Then
+   `ssh <user>@<hostname> paniolo --version` should answer.
+7. **Enroll it**: `paniolo host add`, then `paniolo configure <target> -H
+   <name>` to get a proposed target block you review and commit.
 
 You should not need `paniolo setup` on a seeded host. On Linux its packaged
 mode does two things: add your account to the `dialout` and `video` groups,
@@ -111,8 +93,8 @@ and warn if Tesseract is missing. The seed grants both groups at account
 creation and installs `tesseract-ocr`, so setup finds nothing to fix.
 
 The seed carries no lab configuration, no target wiring, and no credential
-beyond that one public key — all of which belong in the lab file, where a
-human reviews them.
+beyond that one public key. All of that belongs in the lab file, where a
+human reviews it.
 
 ## When a boot does not come up
 
@@ -130,8 +112,8 @@ every stage still completes. Judge the run by `errors` and
 
 Two failures are worth recognizing on sight:
 
-- **SSH refuses the connection** even though the boot finished. The `ssh` flag
-  file from step 3 is missing. Pi OS ships sshd disabled, and the
+- **SSH refuses the connection** even though the boot finished. The empty
+  `ssh` flag file is missing. Pi OS ships sshd disabled, and the
   `enable_ssh: true` cloud-config key does not turn it on — it is a downstream
   extension that was a silent no-op on the tested image.
 - **The boot hangs at "Local Stage (pre-network)"** and only a power-cut
