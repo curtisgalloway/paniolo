@@ -46,7 +46,7 @@ caught on serial.
 | [HID injection](docs/hid.md) | `paniolo hid` | USB keyboard/mouse injection via a generic helper hook (`hidrig` KB2040 injector, or `ch9329` for Openterface Mini-KVM / KVM-Go and Sipeed NanoKVM-USB); KVM input from the web console |
 | [adb (Android targets)](docs/adb.md) | `paniolo adb` | Drive an Android DUT over adb — console (`shell`/`run`), screen (`screencap`), and input — one USB cable, no capture/HID/serial rig |
 | [Dashboard](docs/dashboard.md) | `paniolo console` | Combined video + serial web UI; auto-starts daemons; `-i <name>` preselects a serial interface |
-| Agent skills | `paniolo skill` | List the bundled agent guides (driving a target, GUI puppeting, USB-hub power), or print one's `SKILL.md` for an agent to read |
+| Agent skills | `paniolo skill` | List the bundled agent guides (driving a target, GUI puppeting, building a control host), or print one's `SKILL.md` for an agent to read |
 | Lab config & diagnostics | `paniolo target`/`host`/`config`, `paniolo discover`, `paniolo configure`, `paniolo doctor`, `paniolo daemons` | CLI-managed lab file (targets, hosts, channels), hardware discovery with a proposed config block, config-vs-reality probing, and a one-view daemon inventory with stop/restart |
 
 ---

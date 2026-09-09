@@ -34,6 +34,7 @@ on Debian/Raspberry Pi OS the quickest route is the [apt repository](https://cur
 | Doc | What it covers |
 |---|---|
 | [Distributed control: one lab, one file](distributed-control.md) | Driving targets on remote control hosts: a single git-tracked lab file describing hosts + targets, SSH transport with the dev machine as the data-plane hub, per-channel host binding, and a discovery-proposes/human-approves config flow. Shipped: `--lab`, transparent re-exec, tunnelled `console`, remote `setup --host`, `discover`/`configure`. |
+| [Standing up a control host](control-host.md) | Blank Raspberry Pi to agent-reachable control host in one human action, using the hardware-validated cloud-init seed in [`packaging/host-seed/`](https://github.com/curtisgalloway/paniolo/tree/main/packaging/host-seed) — plus how to size the box, and the Pi OS first-boot gotchas worth recognizing on sight. |
 
 ## Developer documentation
 
@@ -91,11 +92,13 @@ the docs tree.
 | [UEFI HTTP Boot design](https://github.com/curtisgalloway/paniolo/blob/main/notes/uefi-http-boot-design.md) | The design netbootd's UEFI PXE / HTTP Boot support was built from (vendor-class dispatch, HTTP serving); the shipped behavior is documented in [netboot.md](netboot.md). |
 | [Openterface KVM-Go — architecture and paniolo support](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-kvm-go.md) | **Bench-verified 2026-08-24**: the keychain-sized Mini-KVM successor (MS2130S capture + CH32V208 emulating the CH9329 protocol) — both paniolo channels work unmodified; hardware findings and deep-control notes. |
 | [Console front door](https://github.com/curtisgalloway/paniolo/blob/main/notes/console-front-door.md) | **Design only — parked**: one stable port with server-side fan-out for the remote dashboard, superseding `?serialws=` stitching. |
+| [Openterface USB mux spec (clean-room)](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-usb-mux-spec.md) | Clean-room protocol spec for switching the Openterface USB mux: the KVM-Go microSD serial command (hardware-verified 2026-08-30, shipped as the `usb` channel) and the Mini-KVM USB-A register write (unblocked, untested). |
+| [Provisioning a Linux control host](https://github.com/curtisgalloway/paniolo/blob/main/notes/control-host-provisioning.md) | The design the cloud-init seed was built from — one shared core, two wrappers (Pi NoCloud files / Ubuntu autoinstall USB), what the seed deliberately omits, host sizing, and the alternatives rejected. The `pi-sd` flavor shipped as [`packaging/host-seed/`](https://github.com/curtisgalloway/paniolo/tree/main/packaging/host-seed); the x86 flavor and the generator are still unbuilt. Current-state guide: [control-host.md](control-host.md). |
 | [Pi 4 control host](https://github.com/curtisgalloway/paniolo/blob/main/notes/pi4-control-host.md) | Bring-up plan for a self-contained Pi 4 control host; everything works on Linux/ARM64 today except the net-new USB-HID-gadget backend (design sketch, not implemented). |
 
 ## Elsewhere in the repo
 
-- **Bundled agent skills** — paniolo ships agent guides under [`skills/`](https://github.com/curtisgalloway/paniolo/tree/main/skills) (`paniolo` for driving a target, `kvm-puppeting` for GUI puppeting). They install alongside the CLI; `paniolo skill` lists them (with descriptions) and `paniolo skill <name>` prints one's `SKILL.md` — so an agent can discover and read them straight from the CLI, without the harness pre-loading them.
+- **Bundled agent skills** — paniolo ships agent guides under [`skills/`](https://github.com/curtisgalloway/paniolo/tree/main/skills) (`paniolo` for driving a target, `kvm-puppeting` for GUI puppeting, `control-host` for building a control host from blank media). They install alongside the CLI; `paniolo skill` lists them (with descriptions) and `paniolo skill <name>` prints one's `SKILL.md` — so an agent can discover and read them straight from the CLI, without the harness pre-loading them.
 - [`AGENTS.md`](https://github.com/curtisgalloway/paniolo/blob/main/AGENTS.md) — module-by-module internals, source constraints, and how to add a subsystem.
 - [`hidrig/README.md`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md) — HID injector host CLI and daemon; the board wiring and firmware are a custom-hardware design in the [`paniolo-hardware`](https://github.com/curtisgalloway/paniolo-hardware) repo (`hidrig-kb2040/`).
 

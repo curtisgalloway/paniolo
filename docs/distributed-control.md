@@ -61,7 +61,8 @@ These fell out of the discussion and constrain everything below:
 3. **Control hosts are stateless executors.** They hold no durable target config.
    paniolo ships the relevant slice of config to a host at command time. A control
    host is therefore *disposable*: re-image it, re-run `paniolo setup` on it, and
-   it resumes its role from the lab file with nothing to restore.
+   it resumes its role from the lab file with nothing to restore. The re-image
+   path itself is [standing up a control host](control-host.md).
 4. **SSH is the transport.** It already solves auth, encryption, and identity, and
    the key infrastructure exists. A custom agent/RPC server would either reinvent
    that or tunnel over SSH anyway. labgrid uses SSH for its data plane for exactly

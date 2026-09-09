@@ -79,6 +79,7 @@ nav:
       - Switchable USB media: usb.md
       - adb (Android targets): adb.md
   - Distributed control: distributed-control.md
+  - Standing up a control host: control-host.md
   - Developer docs:
       - Architecture: dev/architecture.md
       - Requirements & progress: dev/requirements.md
