@@ -19,15 +19,18 @@
 //! used to do: turn the v1 ASCII commands into HID report bytes and wrap them
 //! in the binary frames the control board relays over I2C.
 //!
-//! Frame format (matches `hidrig/firmware/dual/`):
+//! Frame format (matches the paniolo-hardware firmware,
+//! <https://github.com/curtisgalloway/paniolo-hardware/tree/main/hidrig-kb2040/firmware>):
 //! ```text
 //! [type][b1][len][payload .. len bytes]
 //!   0x01  rid  N    N report bytes  (rid 1 = keyboard / 8 B, 2 = abs mouse / 6 B)
 //!   0x02  cmd  N    N arg bytes     (cmd 1 = ping, 2 = version, 3 = power)
 //! ```
-//! Reports match the descriptor in `hidrig/firmware/dual/target/boot.py`:
+//! Reports match the descriptor in paniolo-hardware's
+//! `hidrig-kb2040/firmware/target/boot.py`:
 //! keyboard report id 1 (`[modifier, 0, k1..k6]`), absolute pointer report id 2
-//! (`[buttons, x_lo, x_hi, y_lo, y_hi, wheel]`, axes 0..=32767).
+//! (`[buttons, x_lo, x_hi, y_lo, y_hi, wheel]`, axes 0..=32767). A descriptor
+//! change there requires a matching change here.
 
 use anyhow::{anyhow, Result};
 

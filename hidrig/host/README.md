@@ -67,7 +67,8 @@ Monitoring grant in System Settings.
 > replies, 115200→460800 baud negotiation). The current dual-board rig's
 > control link is a USB-CDC port speaking binary frames with **no baud and no
 > text replies**, so these two tools do not drive it — they are kept for the
-> retired firmware (`hidrig/firmware/{boot,code,config}.py`) and as a
+> retired firmware (paniolo-hardware `hidrig-kb2040/firmware/single-board/{boot,code,config}.py`,
+> https://github.com/curtisgalloway/paniolo-hardware) and as a
 > reference for a future bench port. `hid_capture_usb` and
 > `hid_seize_reports` observe the DUT-facing HID board (same VID/PID for the
 > retired single board and the dual-board target board), so they work with

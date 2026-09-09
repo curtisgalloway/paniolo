@@ -703,7 +703,9 @@ ocr/             OCR helpers (compiled/installed binaries are gitignored):
                    visionocr.swift  Apple Vision OCR (macOS); built by paniolo setup via swiftc
                    linuxocr         Tesseract OCR wrapper (Linux); copied by paniolo setup
 
-hidrig/          USB HID injector: host CLI + daemon (Rust) + dual-board KB2040 firmware
+hidrig/          USB HID injector: host CLI + daemon (Rust). The dual-board KB2040
+                 firmware it drives is a separate custom-hardware design, now in the
+                 paniolo-hardware repo (hidrig-kb2040/), not in this tree
   src/main.rs      `hidrig` CLI — one-shot subcommands of the HID command
                    vocabulary (type/key/.../moveabs/ping/version) + `run` command
                    files; `serve`/`stop` for the daemon. A `Sender` routes each
@@ -771,25 +773,26 @@ hidrig/          USB HID injector: host CLI + daemon (Rust) + dual-board KB2040 
                    the lock file, which stays open (flock'd) until this
                    process exits; see the identical note on hdmicap's
                    daemon.rs above
-  firmware/dual/control/  control board (CircuitPython 9.x): USB-CDC <-> I2C1
-                   controller; reads framed input from usb_cdc.data, relays 0x01
-                   HID frames verbatim over I2C1 to the target, answers 0x02
-                   control frames (ping/version/power -> dual-control/1; power
-                   drives a DUT relay on D5) locally, and bridges 0x03 console
-                   frames to/from the DUT UART (TX=GP0/RX=GP1). Discards a
-                   partial frame after 50ms of no completion (`_rxbuf_started`/
-                   `discard_stale_rxbuf`) so a killed-and-restarted daemon's
-                   resync preamble has something to resync — UNVERIFIED on
-                   hardware
-  firmware/dual/target/   target board (CircuitPython 9.x): I2C1 peripheral that
-                   relays report bytes to usb_hid send_report — no adafruit_hid,
-                   no parsing. boot.py holds the HID descriptor (keyboard + custom
-                   absolute-pointer, 0..32767 axes) and the dev/HID-only NVM flag
-                   (BOOT button GP11 toggles; D2->GND at reset forces dev). Same
-                   50ms stale-partial-frame discard as the control board, guarding
-                   against an interrupted I2C write — UNVERIFIED on hardware
-  firmware/{boot,code,config}.py  retired single-board "smart" firmware (line
-                   protocol + adafruit_hid); kept for the future dumb single-board
+  (no firmware/ here — the dual-board KB2040 CircuitPython firmware, and the
+                   retired single-board "smart" firmware, moved to the paniolo-hardware
+                   repo: https://github.com/curtisgalloway/paniolo-hardware/tree/main/hidrig-kb2040/firmware
+                   Summary, for readers of this crate: the **control** board
+                   (`firmware/control/`) is a USB-CDC <-> I2C1 controller; it reads
+                   framed input from usb_cdc.data, relays 0x01 HID frames verbatim
+                   over I2C1 to the target, answers 0x02 control frames
+                   (ping/version/power -> dual-control/1; power drives a DUT relay on
+                   D5) locally, and bridges 0x03 console frames to/from the DUT UART
+                   (TX=GP0/RX=GP1). The **target** board (`firmware/target/`) is an
+                   I2C1 peripheral that relays report bytes to usb_hid send_report —
+                   no adafruit_hid, no parsing; its boot.py holds the HID descriptor
+                   (keyboard + custom absolute-pointer, 0..32767 axes) and the
+                   dev/HID-only NVM flag (BOOT button GP11 toggles; D2->GND at reset
+                   forces dev). Both discard a partial frame after 50ms of no
+                   completion (`_rxbuf_started`/`discard_stale_rxbuf`) so a
+                   killed-and-restarted daemon's resync preamble has something to
+                   resync — UNVERIFIED on hardware. Any change to the HID descriptor
+                   or frame format there requires a matching change to this crate's
+                   `src/compose.rs` — see docs/dev/hid-dual-board-design.md.
   host/hid_seize_reports.c  macOS IOKit tool: seizes the HID device exclusively
                    and prints raw input reports — for pipeline testing without
                    keystrokes reaching the focused app. Build with host/Makefile.
@@ -1140,8 +1143,12 @@ Key differences from the Python servers:
 
 ## hidrig (USB HID injector)
 
-The `hidrig/` directory holds a DIY USB HID injector: a Rust host CLI/daemon plus
-CircuitPython 9.x firmware for the **dual-board "dumb pipe"** KB2040 rig.  This is only one of many HID injection devices paniolo can use.
+The `hidrig/` directory holds a Rust host CLI/daemon for a DIY USB HID injector: the
+**dual-board "dumb pipe"** KB2040 rig. The CircuitPython 9.x firmware it drives is a
+custom-hardware design that lives in a separate repo, paniolo-hardware
+(https://github.com/curtisgalloway/paniolo-hardware, `hidrig-kb2040/firmware/`) —
+`hidrig/` here is the host side only. This is only one of many HID injection devices
+paniolo can use.
 
 ### Architecture
 
@@ -1164,13 +1171,15 @@ independently host-powered. The command vocabulary (`type`/`key`/`moveabs`/…)
 is the device-independent **HID serial protocol v1** (`docs/dev/hid-serial-protocol.md`),
 but it is the *external* interface only — `hidrig` consumes it and composes; the
 line protocol never reaches a wire. `hidrig` (`src/main.rs`, `src/compose.rs`,
-`src/proto.rs`) is the host client; `firmware/dual/{control,target}/` are the
-reference firmware. The retired single-board "smart" firmware
-(`firmware/{boot,code,config}.py`, line protocol + `adafruit_hid`) is kept for a
-future dumb single-board on the same composition.
+`src/proto.rs`) is the host client; the reference firmware
+(`hidrig-kb2040/firmware/control/`, `hidrig-kb2040/firmware/target/` in
+paniolo-hardware) is the board side. The retired single-board "smart" firmware
+(`hidrig-kb2040/firmware/single-board/{boot,code,config}.py` in paniolo-hardware,
+line protocol + `adafruit_hid`) is kept there for a future dumb single-board on the
+same composition.
 
 
-### USB identity (`firmware/dual/target/boot.py`)
+### USB identity (paniolo-hardware `hidrig-kb2040/firmware/target/boot.py`)
 
 In normal (HID-only) operation the DUT must see a plain keyboard + mouse, so
 the target board's boot.py disables the CIRCUITPY drive, the CDC REPL, and
@@ -1183,9 +1192,9 @@ wedged code.py. Do firmware edits on a dev machine, not the DUT. boot.py only
 re-runs on hard reset. The status NeoPixel (core `neopixel_write`, no /lib
 dependency): blue = up, waiting for the controller over I2C; green blip = a
 frame arrived; red blip = `send_report` failed (DUT not enumerated yet). The
-retired single-board `firmware/boot.py` used the D2 jumper alone and a
-different colour code (blinking red = waiting for enumeration, solid red =
-last command failed).
+retired single-board `boot.py` (paniolo-hardware `hidrig-kb2040/firmware/single-board/`)
+used the D2 jumper alone and a different colour code (blinking red = waiting for
+enumeration, solid red = last command failed).
 
 ### paniolo integration
 

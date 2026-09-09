@@ -20,9 +20,10 @@ bytes, wraps them in binary frames, and writes them to the control board's
 data CDC endpoint. The control board relays HID frames verbatim over I2C1 to
 the target board, which calls `send_report` — so neither board parses
 keycodes or mouse math. The design and rationale live in
-[`../docs/dev/hid-dual-board-design.md`](../docs/dev/hid-dual-board-design.md); the
-firmware bring-up runbook is in
-[`firmware/dual/README.md`](firmware/dual/README.md).
+[`../docs/dev/hid-dual-board-design.md`](../docs/dev/hid-dual-board-design.md).
+This is the **host-side** doc: the boards, BOM, wiring, and firmware bring-up
+runbook live in the [`paniolo-hardware`](https://github.com/curtisgalloway/paniolo-hardware)
+repo — see [Hardware](#hardware) below.
 
 ```
 [Control host]
@@ -72,62 +73,32 @@ uniform frame format on both legs:
 
 Because the host composes reports, its composer must match the target board's
 HID **descriptor** exactly (report IDs, field order, the 0..32767 absolute
-range). That descriptor lives in `firmware/dual/target/boot.py` and is the
-host↔rig contract. See `src/compose.rs` for the composition and framing.
+range). That descriptor is the host↔rig **contract**: it lives in
+[`hidrig-kb2040/firmware/target/boot.py`](https://github.com/curtisgalloway/paniolo-hardware/blob/main/hidrig-kb2040/firmware/target/boot.py)
+in the paniolo-hardware repo, and a change to it there requires a matching
+change to `src/compose.rs` here. See `src/compose.rs` for the composition and
+framing.
 
 ## Hardware
 
-- 2× Adafruit KB2040 (any CircuitPython-capable RP2040 board with a free I2C1
-  works with minor pin edits; the target also needs CircuitPython's
-  `i2ctarget` module).
-- 3 jumper wires between the boards for I2C1 — **straight, not crossed** (I2C
-  is a bus): `SDA→SDA`, `SCL→SCL`, `GND→GND`.
-- **Pull-ups are required:** ~4.7 kΩ from SDA→3.3 V and SCL→3.3 V (one set, on
-  either board). Without them the controller-mode `busio.I2C` rejects the bus
-  ("No pull up found") and the control board blinks red. (`i2ctarget` does
-  *not* check, so a target coming up is not by itself proof of pull-ups.)
+The boards, BOM, wiring diagrams, and firmware flash runbook are a
+custom-hardware design that lives in a separate repo:
+[`paniolo-hardware`](https://github.com/curtisgalloway/paniolo-hardware), under
+[`hidrig-kb2040/`](https://github.com/curtisgalloway/paniolo-hardware/tree/main/hidrig-kb2040) —
+see [`hidrig-kb2040/README.md`](https://github.com/curtisgalloway/paniolo-hardware/blob/main/hidrig-kb2040/README.md)
+for the full build and
+[`hidrig-kb2040/SETUP.md`](https://github.com/curtisgalloway/paniolo-hardware/blob/main/hidrig-kb2040/SETUP.md)
+for the CircuitPython flash runbook. This repo (`hidrig/`) is the host side
+only: the Rust CLI/daemon that talks to already-flashed boards.
 
-I2C1 pins (KB2040 labels): **`D10` = GP10 = SDA**, **`MOSI` = GP19 = SCL**.
-Target peripheral address **0x41**.
-
-**DUT serial console** (control board): hardware **UART0**, **`TX` = GP0**,
-**`RX` = GP1** — wire `TX → DUT RX`, `RX → DUT TX`, common `GND`, at the DUT's
-console logic level (3.3 V; never RS-232 voltages without a level shifter).
-
-**DUT power** (control board): a free GPIO, **`D5` = GP5** by default, drives a
-relay / load-switch on the DUT's 5 V — a Pi 5 pulls ~5 A, so this is a real
-switch, not the GPIO driving the rail. Active-high by default (`RELAY_PIN` /
-`RELAY_ACTIVE_HIGH` in `control/code.py`).
-
-The two boards sit in **different power domains** — the control board is
-host-USB powered, the target board is DUT-USB powered. That's fine while both
-are powered for bench bring-up; see design §7 for the back-powering caution
-before this goes near a real DUT power cycle. Because the target board is
-DUT-powered, a `power cycle` also resets it — it re-enumerates as the DUT boots.
-
-## Firmware setup
-
-Both boards run **CircuitPython 9.x**. See [`SETUP.md`](SETUP.md) for the full
-runbook; in short:
-
-1. Flash CircuitPython 9.x on both boards (hold BOOT, copy the UF2).
-2. Target board: `uvx circup --path /Volumes/CIRCUITPY install adafruit_hid`
-   is *not* needed (the dumb relay uses only core `usb_hid`); copy
-   `firmware/dual/target/boot.py` + `code.py`.
-3. Control board: copy `firmware/dual/control/boot.py` + `code.py`.
-4. Hard-reset both (`boot.py` only runs on a hard reset).
-
-**Target mode switching (dev vs HID-only).** The target's `boot.py` reads a
-1-byte NVM flag: **dev** (CIRCUITPY drive + REPL + HID, for editing) vs
-**HID-only** (only the keyboard + mouse the DUT sees — no drive, no console).
-**Tap the BOOT button (GP11)** to toggle and reset. Grounding **D2 at reset**
-forces dev mode regardless of the flag, as a hardware recovery fallback. In
-HID-only mode the target drops its CIRCUITPY drive and console, so a power blip
-that hard-resets it can make it "vanish" — that's mode, not a dead board.
-
-Status NeoPixel: the target blips green per frame received; the control blips
-green per frame relayed and **solid/blinking red** on I2C failure (target not
-ACKing — check pull-ups / wiring / address / that the target code is running).
+Enough to orient a reader without leaving this page: two **Adafruit KB2040**
+boards, joined by **I2C1** (`GP10` = SDA, `GP19` = SCL, common GND, with
+required ~4.7 kΩ pull-ups), the target board at I2C address **0x41**. The
+control board also carries **UART0** (`GP0` = TX, `GP1` = RX) to the DUT's
+serial console and **`GP5`** driving the DUT power relay. See
+[Wire protocol](#wire-protocol-host--rig) above for the descriptor contract
+and [DUT power and serial console](#dut-power-and-serial-console) below for
+how those two GPIOs surface through `hidrig`.
 
 ## Host CLI (`hidrig`)
 
@@ -318,10 +289,6 @@ hidrig/
   src/pty.rs        # daemon: PTY that re-exports the DUT console into paniolo's serial channel
   src/server.rs     # daemon: axum WebSocket /hid + POST /send
   src/daemon.rs     # daemon: lock, discovery file, console PTY symlink, lifecycle
-  firmware/dual/control/   # control board: routes by type byte; UART console bridge; power relay
-  firmware/dual/target/    # target board: I2C1 peripheral -> USB-HID send_report (dumb relay)
-  firmware/dual/host_send.py  # dependency-free poke tool (push raw frames to the control board)
-  firmware/dual/README.md     # firmware bring-up runbook
   host/hid_capture_usb.m   # macOS leak-safe HID capture (IOUSBHost device-capture)
   host/hid_seize_reports.c # macOS passive raw-report tap (non-exclusive on Darwin 24/25)
   host/hid_bench.py        # latency/throughput bench
@@ -337,8 +304,9 @@ history) used a role-based design where the boards parsed commands and held
 duplicated opcode tables. That was replaced by a **single-board** rig: one
 KB2040 running "smart" CircuitPython firmware that spoke the line-based HID
 serial protocol over a UART (via a USB-serial adapter) and composed HID with
-`adafruit_hid`. The single-board firmware still lives in
-`firmware/{boot,code,config}.py`.
+`adafruit_hid`. That retired single-board firmware, and the current dual-board
+firmware, both now live in the paniolo-hardware repo — see
+[`hidrig-kb2040/firmware/single-board/`](https://github.com/curtisgalloway/paniolo-hardware/tree/main/hidrig-kb2040/firmware/single-board).
 
 The **current** design returns to two boards but as a **dumb pipe**:
 composition moved to the Rust host (`src/compose.rs`), the firmware relays raw
