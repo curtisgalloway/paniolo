@@ -27,7 +27,7 @@ $ until paniolo video read lab-nuc-1 | grep -q -i "bios version"; do sleep 2; do
 $ paniolo hid send -t lab-nuc-1 moveabs 19583 5871 ; paniolo hid send -t lab-nuc-1 click left
 ```
 
-More on the [demos page](docs/demos.md): a live desktop puppeted over HID,
+More on the [demos page](https://curtisgalloway.github.io/paniolo/demos/): a live desktop puppeted over HID,
 out-of-band power over Intel AMT, and a Pi cold-booted through a relay and
 caught on serial.
 
@@ -37,15 +37,17 @@ caught on serial.
 
 | Subsystem | Commands | What it does |
 |---|---|---|
-| [Netboot](docs/netboot.md) | `paniolo netboot` | DHCP + TFTP + HTTP netboot over a direct USB-Ethernet link (Raspberry Pi, plus UEFI PXE / HTTP Boot for EDK2 boards) |
-| [Remote labs](docs/distributed-control.md) | `paniolo --lab …` | Drive targets on remote control hosts transparently over SSH; one git-tracked lab file |
-| [Link mode](docs/netif.md) | `paniolo netif` | Atomically switch the link between netboot, ffx-over-IPv6, bare-link (`link`), and `off` modes; toggle `link`/`off` to test the link up/down, or `down-hard` to force a real carrier drop (WoL off + admin-down) |
-| [Video](docs/video.md) | `paniolo video` | HDMI capture via warm-stream daemon; on-device OCR |
-| [Serial](docs/serial.md) | `paniolo serial` | Serial console — interactive (tio) or daemon-backed with timestamped rolling log |
-| [Power control](docs/power.md) | `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`, `paniolo serial dtr/reset` | DTR-based hardware power button (J2 header; opt-in per serial interface) and generic shell-command hooks (on/off/cycle/state); helpers: `cambrionix` (Cambrionix hub ports), `zigplug` (Zigbee smart plugs), `shellyplug` (Shelly Gen2+ plugs/relays over local HTTP RPC), `amt` (Intel AMT/vPro over WS-Man, with true power-state readback) |
-| [HID injection](docs/hid.md) | `paniolo hid` | USB keyboard/mouse injection via a generic helper hook (`hidrig` KB2040 injector, or `ch9329` for Openterface Mini-KVM / KVM-Go and Sipeed NanoKVM-USB); KVM input from the web console |
-| [adb (Android targets)](docs/adb.md) | `paniolo adb` | Drive an Android DUT over adb — console (`shell`/`run`), screen (`screencap`), and input — one USB cable, no capture/HID/serial rig |
-| [Dashboard](docs/dashboard.md) | `paniolo console` | Combined video + serial web UI; auto-starts daemons; `-i <name>` preselects a serial interface |
+| [Netboot](https://curtisgalloway.github.io/paniolo/netboot/) | `paniolo netboot` | DHCP + TFTP + HTTP netboot over a direct USB-Ethernet link (Raspberry Pi, plus UEFI PXE / HTTP Boot for EDK2 boards) |
+| [Remote labs](https://curtisgalloway.github.io/paniolo/distributed-control/) | `paniolo --lab …` | Drive targets on remote control hosts transparently over SSH; one git-tracked lab file |
+| [Control hosts](https://curtisgalloway.github.io/paniolo/control-host/) | `paniolo skill control-host` | Blank Raspberry Pi to agent-reachable control host in one human action: stock Raspberry Pi OS plus a hardware-validated cloud-init seed that brings it up with SSH authorized and paniolo installed; the bundled skill carries the flashing procedure |
+| [Link mode](https://curtisgalloway.github.io/paniolo/netif/) | `paniolo netif` | Atomically switch the link between netboot, ffx-over-IPv6, bare-link (`link`), and `off` modes; toggle `link`/`off` to test the link up/down, or `down-hard` to force a real carrier drop (WoL off + admin-down) |
+| [Video](https://curtisgalloway.github.io/paniolo/video/) | `paniolo video` | HDMI capture via warm-stream daemon; on-device OCR |
+| [Serial](https://curtisgalloway.github.io/paniolo/serial/) | `paniolo serial` | Serial console — interactive (tio) or daemon-backed with timestamped rolling log |
+| [Power control](https://curtisgalloway.github.io/paniolo/power/) | `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`, `paniolo serial dtr/reset` | DTR-based hardware power button (J2 header; opt-in per serial interface) and generic shell-command hooks (on/off/cycle/state); helpers: `cambrionix` (Cambrionix hub ports), `zigplug` (Zigbee smart plugs), `shellyplug` (Shelly Gen2+ plugs/relays over local HTTP RPC), `amt` (Intel AMT/vPro over WS-Man, with true power-state readback) |
+| [HID injection](https://curtisgalloway.github.io/paniolo/hid/) | `paniolo hid` | USB keyboard/mouse injection via a generic helper hook (`hidrig` KB2040 injector, or `ch9329` for Openterface Mini-KVM / KVM-Go and Sipeed NanoKVM-USB); KVM input from the web console |
+| [Switchable USB media](https://curtisgalloway.github.io/paniolo/usb/) | `paniolo usb` | Route a shared USB device (an Openterface KVM-Go's onboard microSD card) to the control host or the target, for hands-free physical boot media that firmware can see |
+| [adb (Android targets)](https://curtisgalloway.github.io/paniolo/adb/) | `paniolo adb` | Drive an Android DUT over adb — console (`shell`/`run`), screen (`screencap`), and input — one USB cable, no capture/HID/serial rig |
+| [Dashboard](https://curtisgalloway.github.io/paniolo/dashboard/) | `paniolo console` | Combined video + serial web UI; auto-starts daemons; `-i <name>` preselects a serial interface |
 | Agent skills | `paniolo skill` | List the bundled agent guides (driving a target, GUI puppeting, building a control host), or print one's `SKILL.md` for an agent to read |
 | Lab config & diagnostics | `paniolo target`/`host`/`config`, `paniolo discover`, `paniolo configure`, `paniolo doctor`, `paniolo daemons` | CLI-managed lab file (targets, hosts, channels), hardware discovery with a proposed config block, config-vs-reality probing, and a one-view daemon inventory with stop/restart |
 
@@ -53,17 +55,24 @@ caught on serial.
 
 ## Documentation
 
-Full docs live in [`docs/`](docs/README.md) and describe paniolo's verified
-current state. The per-subsystem guides linked above are the user documentation;
-the [demos page](docs/demos.md) shows recorded runs from the CI rack, and the
-[tested-hardware list](docs/hardware.md) covers the bench gear each subsystem is
-verified with.
+Full documentation is published at
+**[curtisgalloway.github.io/paniolo](https://curtisgalloway.github.io/paniolo/)**
+and describes paniolo's verified current state; the source is in
+[`docs/`](docs/README.md). The per-subsystem guides linked above are the user
+documentation. Beyond them, the
+[demos page](https://curtisgalloway.github.io/paniolo/demos/) shows recorded runs
+from the CI rack, the
+[tested-hardware list](https://curtisgalloway.github.io/paniolo/hardware/) covers
+the bench gear each subsystem is verified with, and
+[standing up a control host](https://curtisgalloway.github.io/paniolo/control-host/)
+takes a blank Raspberry Pi to an agent-reachable host in one human action.
 
-Developer documentation is published alongside it under
-[`docs/dev/`](docs/dev): start with the
-[**architecture overview**](docs/dev/architecture.md) for the whole-system
-design, then the [requirements tracker](docs/dev/requirements.md), the interface
-specs, and the Hardware-CI integration (KernelCI/LAVA, Fuchsia/botanist) design.
+Developer documentation is published alongside it: start with the
+[**architecture overview**](https://curtisgalloway.github.io/paniolo/dev/architecture/)
+for the whole-system design, then the
+[requirements tracker](https://curtisgalloway.github.io/paniolo/dev/requirements/),
+the interface specs, and the Hardware-CI integration (KernelCI/LAVA,
+Fuchsia/botanist) design. Its source is [`docs/dev/`](docs/dev).
 
 Point-in-time records — the design a feature was built from, a bring-up's
 findings, a plan that has shipped — live in [`notes/`](notes/README.md). They are
@@ -115,6 +124,15 @@ Signed-By: /etc/apt/keyrings/paniolo.asc
 EOF
 sudo apt update && sudo apt install paniolo
 ```
+
+If the Linux box does not exist yet — a blank Raspberry Pi that is to become
+a control host — skip all of the above. A hardware-validated cloud-init seed
+brings it up with SSH authorized and the release `.deb` installed, in one
+human action: flash the stock Raspberry Pi OS image, drop four files on its
+boot partition, power on. The walkthrough is
+[standing up a control host](https://curtisgalloway.github.io/paniolo/control-host/);
+the exact commands, including how to identify the right SD card before
+writing to it, are in the bundled skill (`paniolo skill control-host`).
 
 The same prebuilt packages (`.deb` and tarball) are attached to each
 [GitHub Release](https://github.com/curtisgalloway/paniolo/releases) for
@@ -174,10 +192,10 @@ UV_TOOL_BIN_DIR=~/.local/libexec/paniolo/bin uv tool install --force ~/src/panio
 ```
 
 USB HID injection (`paniolo hid`) shells out to a helper speaking the
-[HID serial protocol](docs/dev/hid-serial-protocol.md) — `hidrig`, the client
+[HID serial protocol](https://curtisgalloway.github.io/paniolo/dev/hid-serial-protocol/) — `hidrig`, the client
 for the KB2040 injector, or `ch9329` for CH9329-based KVM devices
-(Openterface Mini-KVM / KVM-Go, Sipeed NanoKVM-USB); see
-[docs/hid.md](docs/hid.md).
+(Openterface Mini-KVM / KVM-Go, Sipeed NanoKVM-USB); see the
+[HID injection guide](https://curtisgalloway.github.io/paniolo/hid/).
 
 ---
 
