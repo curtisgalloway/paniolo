@@ -12,14 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for issue #168: every failure in ocr/linuxocr and ocr/rapidocr leaves
-by `die()` -- one line on stderr, non-zero exit -- rather than as a traceback.
+"""Tests for issues #168 and #179: every failure in ocr/linuxocr and
+ocr/rapidocr leaves by `die()` -- one line on stderr, non-zero exit -- rather
+than as a traceback.
 
 docs/dev/ocr.md makes that a promise of the helper protocol ("Errors are one
-line, on stderr, non-zero exit"), and two paths broke it: a bare `open()` on a
-missing input file, and `_preprocess`'s `except ImportError`, which caught a
+line, on stderr, non-zero exit"), and three paths broke it: a bare `open()` on
+a missing input file, `_preprocess`'s `except ImportError`, which caught a
 missing Pillow but not Pillow's own `UnidentifiedImageError` on bytes that are
-no image at all.
+no image at all (#168), and `_tesseract`'s bare `subprocess.run`, which let a
+missing tesseract binary escape as a `FileNotFoundError` traceback and
+forwarded a failing tesseract's multi-line stderr verbatim (#179).
 
 `linuxocr` is exercised end-to-end, as a subprocess, because that is the only
 way to see what a caller actually gets: the exit status, and stderr with no
@@ -39,9 +42,11 @@ import importlib.machinery
 import importlib.util
 import io
 import pathlib
+import struct
 import subprocess
 import sys
 import types
+import zlib
 
 import pytest
 
@@ -192,4 +197,103 @@ def test_linuxocr_subprocess_reports_non_image_stdin():
     proc = _run_linuxocr(["-", "--json"], stdin=b"not a png")
     assert proc.returncode != 0
     _assert_one_line_error(proc.stderr.decode(), "linuxocr")
+    assert proc.stdout == b""
+
+
+def _tiny_png() -> bytes:
+    """A valid 1x1 RGB PNG, built by hand rather than with Pillow.
+
+    The end-to-end test below has to reach `_tesseract`, which means getting
+    past `_preprocess` -- and it should do so on a host *without* Pillow too,
+    because a bare control host missing tesseract is exactly the kind of host
+    that is missing Pillow as well. Hand-built bytes take the identity path
+    there, and decode fine when Pillow is present.
+    """
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        body = tag + data
+        crc = zlib.crc32(body) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", crc)
+
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    idat = zlib.compress(b"\x00\x00\x00\x00")
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", idat)
+        + chunk(b"IEND", b"")
+    )
+
+
+def _fake_tesseract(tmp_path: pathlib.Path, script: str) -> None:
+    """Put an executable named `tesseract` in ``tmp_path``, with this body."""
+    fake = tmp_path / "tesseract"
+    fake.write_text("#!/bin/sh\n" + script)
+    fake.chmod(0o755)
+
+
+_NO_SH = pytest.mark.skipif(
+    sys.platform == "win32", reason="fakes tesseract with a /bin/sh script"
+)
+
+
+def test_linuxocr_tesseract_reports_a_missing_binary(monkeypatch, tmp_path, capsys):
+    """#179's first bullet: with no `tesseract` on PATH, `subprocess.run`
+    raised `FileNotFoundError` as a traceback. PATH is pointed at an empty
+    directory -- set, not unset, because an unset PATH makes Python fall back
+    to `os.defpath`, which may well have the real binary on it.
+    """
+    monkeypatch.setenv("PATH", str(tmp_path))
+    with pytest.raises(SystemExit):
+        linuxocr._tesseract(str(tmp_path / "frame.png"), tsv=True)
+    err = capsys.readouterr().err
+    _assert_one_line_error(err, "linuxocr")
+    assert "tesseract-ocr" in err, "should name the package that provides it"
+
+
+@_NO_SH
+def test_linuxocr_tesseract_summarizes_a_failing_binary(monkeypatch, tmp_path, capsys):
+    """#179's second bullet: a tesseract that exits non-zero used to have its
+    raw, multi-line stderr forwarded as-is. The fake narrates the way the real
+    one does -- the informative line first, a generic one last -- and the
+    one-line summary must keep the informative one.
+    """
+    _fake_tesseract(
+        tmp_path,
+        "echo 'Error opening data file eng.traineddata' >&2\n"
+        "echo 'Could not initialize tesseract.' >&2\n"
+        "exit 3\n",
+    )
+    monkeypatch.setenv("PATH", str(tmp_path))
+    with pytest.raises(SystemExit):
+        linuxocr._tesseract(str(tmp_path / "frame.png"), tsv=True)
+    err = capsys.readouterr().err
+    _assert_one_line_error(err, "linuxocr")
+    assert "exited 3" in err
+    assert "Error opening data file" in err
+
+
+@_NO_SH
+def test_linuxocr_tesseract_still_returns_stdout(monkeypatch, tmp_path):
+    """The happy path has to survive the error handling around it."""
+    _fake_tesseract(tmp_path, "printf 'hello\\n'\n")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert linuxocr._tesseract(str(tmp_path / "frame.png"), tsv=False) == "hello\n"
+
+
+def test_linuxocr_subprocess_reports_a_missing_tesseract(monkeypatch, tmp_path):
+    """End-to-end, from a real PNG all the way to the spawn: on a host without
+    tesseract, `linuxocr frame.png --json` must exit non-zero with one line on
+    stderr and nothing on stdout -- the state a freshly seeded control host is
+    in before `apt-get install tesseract-ocr`. The child inherits the scrubbed
+    PATH; `sys.executable` is absolute, so the interpreter itself still starts.
+    """
+    frame = tmp_path / "frame.png"
+    frame.write_bytes(_tiny_png())
+    monkeypatch.setenv("PATH", str(tmp_path))
+    proc = _run_linuxocr([str(frame), "--json"])
+    assert proc.returncode != 0
+    err = proc.stderr.decode()
+    _assert_one_line_error(err, "linuxocr")
+    assert "tesseract-ocr" in err
     assert proc.stdout == b""

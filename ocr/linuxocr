@@ -178,14 +178,41 @@ def _png_size(png: bytes) -> "tuple[int, int]":
     return (int.from_bytes(png[16:20], "big"), int.from_bytes(png[20:24], "big"))
 
 
+def _one_line(text: str) -> str:
+    """Collapse tesseract's stderr to a single line for `die()`.
+
+    tesseract narrates: a version banner, per-language warnings, then the
+    failure, each on its own line -- and the informative line is usually the
+    first, not the last. So keep every non-empty line, joined, rather than
+    picking one.
+    """
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return "; ".join(lines) if lines else "(nothing on stderr)"
+
+
 def _tesseract(tmp: str, tsv: bool) -> str:
+    """Run tesseract on ``tmp`` and return its stdout.
+
+    Both ways the spawn can fail leave through `die()` -- one line on stderr,
+    non-zero exit -- rather than as what they were before #179: an uncaught
+    `FileNotFoundError` traceback when the binary is not installed, and
+    tesseract's raw multi-line stderr forwarded verbatim when it exits
+    non-zero. A caller parsing stderr (hdmicap's /ocr runs this helper as a
+    child process) can act on neither. A missing tesseract is an ordinary
+    first-run state on a control host -- it is a system package the paniolo
+    .deb only Recommends -- so the message names the package that provides it.
+    """
     args = ["tesseract", tmp, "stdout", "--psm", "6", "--oem", "1"]
     if tsv:
         args.append("tsv")
-    result = subprocess.run(args, capture_output=True, text=True)
+    try:
+        result = subprocess.run(args, capture_output=True, text=True)
+    except FileNotFoundError:
+        die("tesseract not found on PATH (install it: apt-get install tesseract-ocr)")
+    except OSError as e:
+        die(f"could not run tesseract: {e.strerror or e}")
     if result.returncode != 0:
-        sys.stderr.write(result.stderr)
-        sys.exit(1)
+        die(f"tesseract exited {result.returncode}: {_one_line(result.stderr)}")
     return result.stdout
 
 

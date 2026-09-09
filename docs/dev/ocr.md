@@ -311,6 +311,14 @@ not a person reading a stack trace. Three paths did not, and were fixed in
   downstream can tell a truncated screen from a short one. Its bounded reader
   now `rethrows`, and the caller dies with the underlying error.
 
+A fourth, found while fixing those and closed in #179: `linuxocr` spawned
+`tesseract` bare, so a host without the binary — an ordinary first-run state,
+since it is a system package the `.deb` only Recommends — got a
+`FileNotFoundError` traceback, and a tesseract that exited non-zero had its
+raw multi-line stderr forwarded verbatim. Both now go through `die()`: the
+missing-binary message names the apt package that provides it, and the
+non-zero exit is collapsed to one line that keeps tesseract's own message.
+
 The Python helpers' error paths are covered by `ocr/tests` and `visionocr`'s
 by its own `--self-test`, both of which CI runs; see "Adding an engine" for
 where a new helper hooks in.
