@@ -12,7 +12,9 @@ SPDX-License-Identifier: Apache-2.0
 > **Branch:** `i2c-kb2040-dual-board`. **Date:** 2026-06-09, rev. 2026-06-14.
 > This captures the architecture we converged on for the two-board KB2040 rig so the
 > thinking crosses cleanly into implementation. It supersedes the role-based ASCII
-> firmware previously on the branch (`hidrig/firmware/code.py`). The **external** paniolo
+> firmware previously on the branch (`code.py`, now the retired single-board firmware
+> at [`hidrig-kb2040/firmware/single-board/`](https://github.com/curtisgalloway/paniolo-hardware/tree/main/hidrig-kb2040/firmware/single-board)
+> in the paniolo-hardware repo). The **external** paniolo
 > HID interface — the `hidrig` CLI and [`hid-serial-protocol.md`](hid-serial-protocol.md)
 > v1 — is unchanged; only the daemon↔firmware wire format changes.
 >
@@ -219,7 +221,9 @@ releasing usages that were never actually sent. Two mechanisms close this, one o
 
 Because the host composes reports, the host composer must match the target board's HID
 descriptor **exactly** (report IDs, field order, the 0..32767 absolute range). The
-descriptor lives in `hidrig/firmware/boot.py`. Treat it as a versioned contract: the
+descriptor lives in [`hidrig-kb2040/firmware/target/boot.py`](https://github.com/curtisgalloway/paniolo-hardware/blob/main/hidrig-kb2040/firmware/target/boot.py)
+in the paniolo-hardware repo — a change there requires a matching change to this repo's
+`hidrig/src/compose.rs`. Treat it as a versioned contract: the
 `version` control command should let the daemon confirm it is talking to a compatible
 descriptor before composing.
 

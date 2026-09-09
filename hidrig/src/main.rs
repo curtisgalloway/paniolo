@@ -18,8 +18,10 @@
 //! releaseall, move, moveabs, click, mdown, mup, scroll, ping, version) is
 //! turned into HID report bytes (see [`compose`]) and wrapped in the binary
 //! frames the control board relays over I2C to the target board, which injects
-//! them as USB-HID into the DUT — the "dumb pipe" rig in `firmware/dual/`. The
-//! control board is a USB-CDC device; hidrig writes frames to its data endpoint.
+//! them as USB-HID into the DUT — the "dumb pipe" rig whose firmware lives in the
+//! paniolo-hardware repo
+//! (<https://github.com/curtisgalloway/paniolo-hardware/tree/main/hidrig-kb2040/firmware>).
+//! The control board is a USB-CDC device; hidrig writes frames to its data endpoint.
 //!
 //! `run` executes a command file. `serve` runs a daemon that owns the control
 //! link, holds the composition state (held keys, virtual cursor), and re-exposes

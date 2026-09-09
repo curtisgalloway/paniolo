@@ -97,7 +97,7 @@ the docs tree.
 
 - **Bundled agent skills** — paniolo ships agent guides under [`skills/`](https://github.com/curtisgalloway/paniolo/tree/main/skills) (`paniolo` for driving a target, `kvm-puppeting` for GUI puppeting). They install alongside the CLI; `paniolo skill` lists them (with descriptions) and `paniolo skill <name>` prints one's `SKILL.md` — so an agent can discover and read them straight from the CLI, without the harness pre-loading them.
 - [`AGENTS.md`](https://github.com/curtisgalloway/paniolo/blob/main/AGENTS.md) — module-by-module internals, source constraints, and how to add a subsystem.
-- [`hidrig/README.md`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md) — HID injector wiring, firmware, and host CLI.
+- [`hidrig/README.md`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md) — HID injector host CLI and daemon; the board wiring and firmware are a custom-hardware design in the [`paniolo-hardware`](https://github.com/curtisgalloway/paniolo-hardware) repo (`hidrig-kb2040/`).
 
 ---
 

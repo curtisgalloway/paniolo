@@ -68,7 +68,7 @@ and persist between CLI invocations. State lives in plain files, not memory.
 | `hidrig` | Rust | HID-injection helper: protocol client + `serve` daemon for the KB2040 injector, wired in via the generic `hid` channel. |
 | `ch9329` | Rust | The other HID-injection helper: same CLI surface + `serve` daemon, speaking the CH9329 binary frame protocol for Openterface Mini-KVM / KVM-Go and Sipeed NanoKVM-USB devices. |
 | `visionocr` / `linuxocr` | Swift / shell+Tesseract | On-device OCR helpers invoked by `hdmicap` (`GET /ocr`, wrapped by `paniolo video read` and the dashboard OCR button). |
-| HID rig firmware | CircuitPython | Two KB2040 boards — the dual-board "dumb pipe" that relays host-composed HID reports to the DUT as USB keyboard + mouse events (see [`hidrig/`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md)). |
+| HID rig firmware (separate repo) | CircuitPython | Two KB2040 boards — the dual-board "dumb pipe" that relays host-composed HID reports to the DUT as USB keyboard + mouse events. Custom hardware, not part of this repo: see [`paniolo-hardware`](https://github.com/curtisgalloway/paniolo-hardware)'s [`hidrig-kb2040/`](https://github.com/curtisgalloway/paniolo-hardware/tree/main/hidrig-kb2040), driven by the `hidrig` row above. |
 
 Only `paniolo` itself lands on PATH (`~/.cargo/bin`); every helper and daemon installs into the
 private libexec dir `~/.local/libexec/paniolo/bin`, where paniolo resolves them itself —

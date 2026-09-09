@@ -54,7 +54,10 @@ In this rig the HID serial protocol is the *external* interface only: `hidrig`
 consumes it and composes HID reports itself, then writes binary frames to the
 control board's data CDC endpoint — the line protocol never travels on a wire.
 See [`hid-dual-board-design.md`](dev/hid-dual-board-design.md) for the design and the
-frame format, and [`hidrig/README.md`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md) for wiring and bring-up.
+frame format, [`hidrig/README.md`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md)
+for the host CLI, and the [`paniolo-hardware`](https://github.com/curtisgalloway/paniolo-hardware)
+repo's [`hidrig-kb2040/`](https://github.com/curtisgalloway/paniolo-hardware/tree/main/hidrig-kb2040)
+for wiring and firmware bring-up.
 
 
 ---

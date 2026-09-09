@@ -89,7 +89,7 @@
 
 | ID | Requirement | Pri | Status | Notes |
 |---|---|---|---|---|
-| HID-1 | USB keyboard/mouse injection via KB2040 injector (dual-board "dumb pipe": host composes, control board CDC → I2C1 → target HID) | S | ☑ | `hidrig/` crate + `firmware/dual/` |
+| HID-1 | USB keyboard/mouse injection via KB2040 injector (dual-board "dumb pipe": host composes, control board CDC → I2C1 → target HID) | S | ☑ | `hidrig/` crate (this repo) + [`hidrig-kb2040/firmware/`](https://github.com/curtisgalloway/paniolo-hardware/tree/main/hidrig-kb2040/firmware) (paniolo-hardware repo) |
 | HID-2 | Device-independent HID serial protocol (v1) so other microcontrollers can implement the injector | S | ☑ | `docs/dev/hid-serial-protocol.md` |
 | HID-3 | Generic `hid` lab channel: `paniolo hid set/rm/send` appends args to an opaque helper cmd | S | ☑ | mirrors power hooks; SSH dispatch |
 | HID-4 | Absolute mouse (`moveabs`, advertised capability) for click-where-you-point | S | ☑ | abs-pointer HID descriptor in firmware |
