@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: 2026 Curtis Galloway
+# SPDX-License-Identifier: Apache-2.0
+#
+# paniolo control-host seed — pi-sd flavor. Goes on the FAT `bootfs`
+# partition as `network-config`. Wired uplink, DHCP.
+#
+# `optional: false` makes boot wait for this link to come up. That is
+# deliberate: the first boot pulls apt packages and the paniolo .deb over the
+# network, and with `optional: true` those stages can run before the link is
+# ready and fail silently.
+#
+# This covers the UPLINK only. A control host also needs a second interface
+# for the point-to-point DUT link (netbootd refuses to serve on the primary
+# NIC); configure that later through the normal lab-file flow, once its
+# predictable name is known on the running host.
+network:
+  version: 2
+  ethernets:
+    eth0:
+      dhcp4: true
+      optional: false

@@ -12,6 +12,17 @@
 > [pi-sd findings](#pi-sd-hardware-findings-2026-08-20) for what the
 > first pass corrected. The generator and templates land under `packaging/`
 > when built.
+>
+> **Superseded in part (2026-09-09).** The validated `pi-sd` seed was
+> recovered from the master image and now ships, parameterized, as
+> [`packaging/host-seed/pi-sd/`](../packaging/host-seed/pi-sd); the operator
+> walkthrough is [docs/control-host.md](../docs/control-host.md). Still
+> unbuilt: the `x86-usb` flavor and the argument-taking generator sketched
+> below. Note that the shipped seed differs from the sketch in this doc —
+> it pins a `.deb` version rather than resolving latest, adds
+> `adm`/`gpio`/`plugdev` to the group list, installs `avahi-daemon` and
+> `openssh-server`, and sets the uplink non-optional. Read the shipped files
+> for what was actually validated; read this doc for why.
 
 ## The problem
 
