@@ -1288,6 +1288,14 @@ base honors `$PANIOLO_RUNTIME_BASE` (default `/tmp`).
   clean before pushing.
   Run `make fmt` to format every crate. The `zigplug` Python helper is formatted
   with `pyink` at line-length 88 (`zigplug/pyproject.toml`).
+- **Don't call a reference an "oracle".** Name what it actually is:
+  `reference` (the general term), `expected` vs `actual` in tests and
+  assertion messages, `known-good` for a build or board trusted because it
+  has worked, `baseline` for a prior version of our own output, and
+  `ground truth` only when the reference cannot itself be wrong (a
+  human-verified screen reading, a measured value) rather than another
+  implementation that could share the bug. Applies to prose, identifiers,
+  test names, and commit messages.
 - **`paniolo setup` builds the native components from the source tree** when
   run from a clone — `make install` (which invokes the *installed* CLI)
   resolves the checkout by walking up from the cwd (`setup::find_repo_root`).
