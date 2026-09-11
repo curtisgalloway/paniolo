@@ -898,14 +898,66 @@ pub fn daemon_url(name: &str, instance: Option<&str>) -> Option<String> {
 
 /// Block until the named daemon instance answers discovery, or time out.
 pub fn wait_for_daemon(name: &str, instance: Option<&str>, timeout: Duration) -> Option<String> {
+    wait_for_endpoint(name, instance, timeout, None).map(|ep| ep.base_url())
+}
+
+/// [`wait_for_daemon`] for a daemon that is *replacing* the one at `old_pid`:
+/// a discovery file still naming that pid is never accepted as the new
+/// daemon's.
+///
+/// A daemon that is SIGKILLed cannot remove its own discovery file, and the
+/// file outlives it by however long the kernel takes to finish with the pid —
+/// during which `daemon_url` happily returns the dead daemon's port. That is
+/// how `daemons restart --stale` came to report a restart that had actually
+/// failed, quoting the old daemon's port back as the new one's (GitHub #193).
+/// The replacement always gets a fresh pid, so refusing the one being replaced
+/// cannot hide a real success.
+pub fn wait_for_replacement(
+    name: &str,
+    instance: Option<&str>,
+    timeout: Duration,
+    old_pid: i32,
+) -> Option<String> {
+    wait_for_endpoint(name, instance, timeout, Some(old_pid)).map(|ep| ep.base_url())
+}
+
+fn wait_for_endpoint(
+    name: &str,
+    instance: Option<&str>,
+    timeout: Duration,
+    reject_pid: Option<i32>,
+) -> Option<Endpoint> {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        if let Some(url) = daemon_url(name, instance) {
-            return Some(url);
+        if let Some(ep) = daemon_endpoint(name, instance) {
+            if Some(ep.pid) != reject_pid {
+                return Some(ep);
+            }
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     None
+}
+
+/// Remove `<runtime>/<name>[/<instance>]/daemon.json` if — and only if — it
+/// still names `pid`. A daemon removes its own discovery file on a graceful
+/// shutdown; one that was SIGKILLed cannot, and the file it leaves behind is
+/// what a replacement's startup wait would otherwise mistake for its own
+/// (GitHub #193). The pid guard is what makes this safe to call after the
+/// kill: if a new daemon has already published, the file is its, not the dead
+/// one's, and is left alone. Returns whether a file was removed.
+pub fn remove_discovery_for_pid(name: &str, instance: Option<&str>, pid: i32) -> bool {
+    let Ok(Some(base)) = trusted_runtime_base() else {
+        return false;
+    };
+    let path = base.join(runtime_rel(name, instance)).join("daemon.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    match Endpoint::from_json(&text) {
+        Some(ep) if ep.pid == pid => std::fs::remove_file(&path).is_ok(),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -1347,6 +1399,73 @@ mod tests {
             format!(r#"{{"pid":{},"port":{port}}}"#, std::process::id()),
         )
         .unwrap();
+    }
+
+    /// A daemon that is SIGKILLed cannot remove its own discovery file, and
+    /// the file it leaves behind names a pid that is briefly still alive — so
+    /// the replacement's startup wait accepts it and reports a restart that
+    /// never happened, quoting the dead daemon's port (GitHub #193). The
+    /// replacement always gets a new pid, so refusing the one being replaced
+    /// separates the two.
+    #[test]
+    fn wait_for_replacement_refuses_the_discovery_file_of_the_pid_it_replaces() {
+        with_runtime_root(|root| {
+            ensure_runtime_dir("hdmicap", Some("pi5")).unwrap();
+            // A live pid (ours), exactly as a just-killed daemon's leftover
+            // file looks while the kernel is still finishing with it.
+            plant_discovery(&expected_base(root), "hdmicap/pi5", 36989);
+            let me = std::process::id() as i32;
+
+            // The unguarded wait is what reported the false success.
+            assert_eq!(
+                wait_for_daemon("hdmicap", Some("pi5"), Duration::from_millis(300)),
+                Some("http://127.0.0.1:36989".to_string()),
+                "the plain wait accepts any live discovery file"
+            );
+
+            // The guarded one does not, and says so by timing out.
+            assert_eq!(
+                wait_for_replacement("hdmicap", Some("pi5"), Duration::from_millis(300), me),
+                None,
+                "the pid being replaced must never answer for its replacement"
+            );
+
+            // A different pid in the file is somebody else's daemon, which is
+            // a real answer: the guard must not reject everything.
+            assert_eq!(
+                wait_for_replacement(
+                    "hdmicap",
+                    Some("pi5"),
+                    Duration::from_millis(300),
+                    me.wrapping_add(1)
+                ),
+                Some("http://127.0.0.1:36989".to_string())
+            );
+        });
+    }
+
+    /// The other half of #193: the leftover file is removed once the killed
+    /// process is gone, since it is not around to do it. Guarded by pid, so a
+    /// replacement that has already published is never the one deleted.
+    #[test]
+    fn remove_discovery_for_pid_removes_only_the_file_naming_that_pid() {
+        with_runtime_root(|root| {
+            ensure_runtime_dir("hdmicap", Some("pi5")).unwrap();
+            plant_discovery(&expected_base(root), "hdmicap/pi5", 36989);
+            let path = expected_base(root).join("hdmicap/pi5").join("daemon.json");
+            let me = std::process::id() as i32;
+
+            assert!(
+                !remove_discovery_for_pid("hdmicap", Some("pi5"), me.wrapping_add(1)),
+                "a file naming another pid is not ours to delete"
+            );
+            assert!(path.exists(), "and must still be there");
+
+            assert!(remove_discovery_for_pid("hdmicap", Some("pi5"), me));
+            assert!(!path.exists(), "the killed daemon's file is reaped");
+            // Idempotent: nothing left to remove is not a failure to report.
+            assert!(!remove_discovery_for_pid("hdmicap", Some("pi5"), me));
+        });
     }
 
     /// The readers see a daemon when the base is the private directory the
