@@ -378,9 +378,18 @@ mod linux {
     use super::{resolve, CaptureBackend, CapturedFrame, DeviceSpec};
     use crate::pixel::{yuyv_to_rgb, PixelData};
 
+    // Tried in order, highest resolution first, because VIDIOC_S_FMT does not
+    // fail on an unsupported request -- it *substitutes* the driver's nearest
+    // match and returns success. Asking for 720p MJPG on an MS2131 yields YUYV
+    // 720p, which the loop below then accepts, so whatever sits first here is
+    // effectively the only entry that ever runs. Listing 720p first therefore
+    // capped every capture at 720p and put a floor under OCR error: measured
+    // against a 1080p Windows desktop, 720p read as noise while the same screen
+    // at 1080p gave up its icon labels and clock.
     const FORMATS: &[(u32, u32, &[u8; 4])] = &[
-        (1280, 720, b"MJPG"),
         (1920, 1080, b"MJPG"),
+        (1920, 1080, b"YUYV"),
+        (1280, 720, b"MJPG"),
         (1280, 720, b"YUYV"),
         (640, 480, b"YUYV"),
     ];
