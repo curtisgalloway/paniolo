@@ -93,6 +93,16 @@ that keeps stalling right after every reopen (8 in a row with no healthy
 frame in between) makes the daemon give up and exit; at that point `paniolo
 video watch` (or `daemons restart --stale`) is what brings it back.
 
+**The capture format is chosen by what streams, not by what negotiates.**
+On Linux the daemon walks a list of formats highest-resolution first, and
+accepts one only once it has actually delivered a frame (within 2 s) — a mode
+can allocate buffers and then fail when streaming starts, classically
+uncompressed 1080p over USB 2.0. A rejected format is logged to the daemon's
+stderr log (`allocated buffers but produced no frame`). If *nothing* delivers a
+frame — normal when the target is off and the device hands over nothing at all —
+the best format that allocated is opened anyway, so the daemon is sitting on it
+when a signal arrives.
+
 ---
 
 ## Capturing frames
