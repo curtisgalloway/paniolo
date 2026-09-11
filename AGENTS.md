@@ -1553,13 +1553,24 @@ off — the exe's own directory *is* the install prefix:
 paniolo\
   paniolo.exe          <- the only thing that goes on PATH
   libexec\
-    hdmicap.exe  serialcap.exe  netbootd.exe  hidrig.exe  …
+    hdmicap.exe  serialcap.exe  netbootd.exe  hidrig.exe  …  winocr.exe
+  share\paniolo\skills\
+    paniolo\SKILL.md  kvm-puppeting\SKILL.md  control-host\SKILL.md
 ```
 
 `daemons::exe_relative_dirs` adds `<exe dir>\libexec` on Windows, and
-`daemons::find_binary` tries `<name>.exe` before the bare name. `paniolo setup`
-on Windows does nothing but verify that layout: there is no setuid bit, no
-`dialout` group, and no OCR helper to build.
+`daemons::find_binary` tries `<name>.exe` before the bare name.
+`skills::skills_dirs_for_exe` likewise adds `<exe dir>\share\paniolo\skills`
+there — the same `share/paniolo/skills` every other install keeps under its
+prefix, with the exe's directory as the prefix. Through v0.3.0 the zip staged
+only exes and the CLI only looked one level up, so `paniolo skill` on a
+Windows install listed nothing; the first `/release-train` dry run
+(2026-09-10) caught it because that was the first time anything ran the zip.
+`package-windows` now stages the skills and smoke-tests the expanded zip
+(`--help`, `paniolo skill` from outside the tree, every helper's `--help`,
+winocr decoding a tiny PNG) the way the Linux and macOS jobs already did
+theirs. `paniolo setup` on Windows does nothing but verify the helper layout:
+there is no setuid bit, no `dialout` group, and no OCR helper to build.
 
 Signing reuses oh-brother's Azure Artifact Signing setup — same account, same
 OIDC identity, same action. Three differences from that pipeline: the **exes are

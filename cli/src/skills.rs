@@ -52,11 +52,35 @@ fn system_skills_dir() -> PathBuf {
 /// is the keg's bundled skills; an FHS-style prefix install resolves the same
 /// way. A relocated install thus finds its skills without enumerating package
 /// managers.
-fn exe_relative_skills_dir() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
+///
+/// On Windows the portable zip has no `bin/` level: `paniolo\paniolo.exe` sits
+/// in the install prefix itself, next to `libexec\` (see
+/// [`crate::daemons`]'s `exe_relative_dirs`), so `<exe dir>\share\paniolo\skills`
+/// is searched there too. Without it a zip install found no skills at all
+/// (`paniolo skill` on Windows was empty through v0.3.0).
+fn exe_relative_skills_dirs() -> Vec<PathBuf> {
+    let Ok(exe) = std::env::current_exe() else {
+        return Vec::new();
+    };
     let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
-    let prefix = exe.parent()?.parent()?;
-    Some(prefix.join("share/paniolo/skills"))
+    skills_dirs_for_exe(&exe)
+}
+
+/// The exe-relative candidates for a CLI binary at `exe`: the prefix
+/// (grandparent) layout every platform uses, plus the exe's own directory as
+/// prefix on Windows. Pure, so it is testable without relocating the test
+/// binary.
+fn skills_dirs_for_exe(exe: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(prefix) = exe.parent().and_then(|d| d.parent()) {
+        dirs.push(prefix.join("share/paniolo/skills"));
+    }
+    if cfg!(windows) {
+        if let Some(exe_dir) = exe.parent() {
+            dirs.push(exe_dir.join("share/paniolo/skills"));
+        }
+    }
+    dirs
 }
 
 /// The skills directories, in resolution order: the in-repo `skills/` when run
@@ -70,7 +94,7 @@ pub fn skills_dirs() -> Vec<PathBuf> {
         dirs.push(repo.join("skills"));
     }
     dirs.extend(user_skills_dir());
-    dirs.extend(exe_relative_skills_dir());
+    dirs.extend(exe_relative_skills_dirs());
     dirs.push(system_skills_dir());
     dirs
 }
@@ -86,10 +110,16 @@ struct Skill {
 /// Every skill found across [`skills_dirs`], deduped by name (first dir wins),
 /// sorted by name. A "skill" is any `<dir>/<name>/SKILL.md`.
 fn discover() -> Vec<Skill> {
+    discover_in(&skills_dirs())
+}
+
+/// [`discover`] over an explicit search path, so a test can point it at a
+/// layout it built rather than at wherever the test binary happens to live.
+fn discover_in(dirs: &[PathBuf]) -> Vec<Skill> {
     let mut found: Vec<Skill> = Vec::new();
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for dir in skills_dirs() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
         };
         for entry in entries.filter_map(|e| e.ok()) {
@@ -242,4 +272,93 @@ pub fn install_bundled(repo: &Path) -> Result<usize> {
         count += 1;
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lay out `<root>/<exe rel path>` plus one skill under
+    /// `<root>/<skills rel path>/<name>/SKILL.md`, returning the exe path.
+    fn layout(root: &Path, exe_rel: &str, skills_rel: &str, name: &str) -> PathBuf {
+        let exe = root.join(exe_rel);
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"").unwrap();
+        let dir = root.join(skills_rel).join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: a test skill\n---\nbody\n"),
+        )
+        .unwrap();
+        exe
+    }
+
+    /// The prefix layout every platform ships (`bin/paniolo` beside
+    /// `share/paniolo/skills`): the keg, the FHS prefix, the tarball.
+    #[test]
+    fn a_prefix_install_finds_its_skills_one_level_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = layout(
+            tmp.path(),
+            "bin/paniolo",
+            "share/paniolo/skills",
+            "prefixed",
+        );
+        let found = discover_in(&skills_dirs_for_exe(&exe));
+        assert_eq!(
+            found.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["prefixed"]
+        );
+        assert_eq!(found[0].description, "a test skill");
+    }
+
+    /// The portable Windows zip: `paniolo\paniolo.exe` with `share\` beside
+    /// it, the exe's own directory being the prefix. This is the layout that
+    /// listed nothing through v0.3.0, because only the level-up dir was
+    /// searched; the assertion is platform-conditional because that extra
+    /// dir is deliberately Windows-only (a Unix `~/.cargo/bin/paniolo` must
+    /// not start scanning `~/.cargo/bin/share`).
+    #[test]
+    fn the_windows_zip_layout_is_found_only_on_windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = layout(
+            tmp.path(),
+            "paniolo/paniolo.exe",
+            "paniolo/share/paniolo/skills",
+            "zipped",
+        );
+        let names: Vec<String> = discover_in(&skills_dirs_for_exe(&exe))
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        if cfg!(windows) {
+            assert_eq!(names, ["zipped"]);
+        } else {
+            assert!(
+                names.is_empty(),
+                "unix must not search the exe dir: {names:?}"
+            );
+        }
+    }
+
+    /// A skill present in two searched dirs lists once, from the first.
+    #[test]
+    fn an_earlier_dir_shadows_a_later_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        for (dir, desc) in [(&first, "from first"), (&second, "from second")] {
+            let d = dir.join("dup");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("SKILL.md"),
+                format!("---\nname: dup\ndescription: {desc}\n---\n"),
+            )
+            .unwrap();
+        }
+        let found = discover_in(&[first, second]);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].description, "from first");
+    }
 }

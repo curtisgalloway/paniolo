@@ -262,6 +262,17 @@ jobs:
           # netbootd's privileged BPF helper is a macOS-only setuid binary; it
           # builds to a stub off macOS and has no business in a Windows zip.
           Get-ChildItem "$stage/libexec" | Select-Object -ExpandProperty Name
+          # The bundled agent skills, at the same share/paniolo/skills the
+          # .deb, tarball and keg keep under their prefix; here the exe's own
+          # directory is the prefix (skills_dirs_for_exe in cli/src/skills.rs).
+          # Through v0.3.0 the zip had none, and `paniolo skill` on a Windows
+          # install listed nothing.
+          foreach ($manifest in Get-ChildItem skills/*/SKILL.md) {
+            $name = $manifest.Directory.Name
+            New-Item -ItemType Directory -Force -Path "$stage/share/paniolo/skills/$name" | Out-Null
+            Copy-Item $manifest.FullName "$stage/share/paniolo/skills/$name/SKILL.md"
+          }
+          Get-ChildItem -Recurse "$stage/share" -Filter SKILL.md | Select-Object -ExpandProperty FullName
 
       # ---- Signing (skips entirely until the Azure vars are set) ----
       # Same Artifact Signing account and OIDC identity as oh-brother. No
@@ -336,6 +347,46 @@ jobs:
           Get-FileHash "dist/paniolo-$ver-x86_64-pc-windows-msvc.zip" -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |
             Out-File -Encoding ascii "dist/paniolo-$ver-x86_64-pc-windows-msvc.zip.sha256"
+
+      # Expand the zip that ships and run it, as the Linux job does with its
+      # .deb and the macOS job with its tarball. Until 2026-09-10 this job only
+      # built and zipped, so the missing skills above went unnoticed for
+      # every Windows release.
+      - name: Smoke-test the zip
+        shell: pwsh
+        env:
+          REF: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver = ($env:REF -replace '^v','') -replace '[^A-Za-z0-9._-]','-'
+          $extract = Join-Path $env:RUNNER_TEMP "smoke"
+          Expand-Archive "dist/paniolo-$ver-x86_64-pc-windows-msvc.zip" -DestinationPath $extract
+          $root = Join-Path $extract "paniolo"
+          & "$root/paniolo.exe" --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "paniolo.exe --help exited $LASTEXITCODE" }
+          # From outside the checkout, so `skill` resolves the zip's own copy
+          # under share/, not the repo's skills/ dir.
+          Push-Location $env:RUNNER_TEMP
+          $skills = & "$root/paniolo.exe" skill
+          Pop-Location
+          if ($LASTEXITCODE -ne 0) { throw "paniolo.exe skill exited $LASTEXITCODE" }
+          foreach ($name in (Get-ChildItem skills -Directory | Select-Object -ExpandProperty Name)) {
+            if (-not ($skills -match "^$name$")) { throw "paniolo skill does not list '$name': $skills" }
+          }
+          # Run each helper, not just stat it: --help returns 0 only once the
+          # binary has loaded.
+          foreach ($h in "$env:HELPERS".Split(" ")) {
+            & "$root/libexec/$h.exe" --help | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "$h.exe --help exited $LASTEXITCODE" }
+          }
+          # winocr has no --help; it reads an image and prints the v1 OCR JSON
+          # envelope, like visionocr in the macOS job. An 8x8 PNG proves the
+          # Windows.Media.Ocr path actually decodes, not just that it starts.
+          $tiny = Join-Path $env:RUNNER_TEMP "tiny.png"
+          [IO.File]::WriteAllBytes($tiny, [Convert]::FromBase64String("iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAD0lEQVR4nGP4jwMwDC0JALoev0Ewkwr8AAAAAElFTkSuQmCC"))
+          $ocr = & "$root/libexec/winocr.exe" --json $tiny | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "winocr.exe exited $LASTEXITCODE" }
+          if ($ocr.engine -ne "winocr") { throw "winocr envelope has engine '$($ocr.engine)'" }
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
