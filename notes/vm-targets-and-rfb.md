@@ -180,3 +180,79 @@ firmware-level *input* device, the absence of a UTM screenshot API, and the
 console are from general knowledge, not from a node that was touched. The
 vncproxy ticket handshake in particular should be checked against a real node
 before anyone costs out the video work.
+
+---
+
+# Postscript, 2026-09-10: the video half, measured
+
+The note above says the gating evidence is whether agents lose real time to
+screen-blindness, and to go get it before costing out RFB. That happened. The
+answer changed the conclusion, so read this before acting on anything above.
+
+## What was run
+
+Not the Proxmox guest this note proposed — a better experiment turned up. The
+CI rack's **lab-optiplex-1** is a Dell OptiPlex 7060 whose ME already served
+the power channel, and Intel AMT has a built-in VNC server. That makes it an
+RFB source in front of a *physical* machine with a real BIOS, which is the
+transport framing this note argued for, and it sidesteps the fidelity trap
+entirely. It is also the one target carrying a NanoKVM-USB capture device *and*
+a ch9329 HID *and* AMT, so the same screen can be read both ways at the same
+moment — a differential test with a genuine control arm.
+
+AMT KVM was enabled (`amt kvm enable` now ships this; what it took is recorded
+in [docs/power.md](../docs/power.md) and was not guessable). Both paths then
+captured the same idle Windows desktop seconds apart, OCR'd by the same
+tesseract pipeline.
+
+## The first result, which was misleading
+
+| | HDMI via NanoKVM-USB | RFB via AMT |
+|---|---|---|
+| resolution | 1280x720 | **1920x1080** |
+| text recovered | none — `Search` came back as `seach`, the wallpaper as `eecececece,` | `Recycle Bin`, `Microsoft Edge`, `Dell`, `Search`, `6:06 PM` |
+
+Read alone this is a decisive argument for an RFB video backend. It is not one,
+because the two arms were not at the same resolution.
+
+## The actual cause
+
+`hdmicap` was pinned at 720p by a bug, not by the transport. `VIDIOC_S_FMT` does
+not fail on an unsupported request — it substitutes the driver's nearest match
+and returns success — so whichever entry sat first in the format ladder was the
+only one that ever ran, and 720p was first. The list read as a fallback ladder
+and behaved as a constant. Reordering it highest-first is a five-line change.
+
+With that fixed, the same HDMI path on the same screen returned `Recycle Bin`,
+`Microsoft`, `Dell`, `Search` and a partial clock. RFB stays slightly cleaner
+(`Microsoft Edge` in full, `6:06 PM` against `6 12-M`), but the gap collapses
+from *everything* to *a little*.
+
+## What this does to the decision
+
+**Resolution was nearly the whole difference, so OCR quality no longer
+justifies an RFB video backend.** The note's second argument for the server
+direction — dirty rectangles against MJPEG whole frames, as a fix for the known
+latency complaint — is untouched by this and remains the strongest reason to
+build anything here.
+
+What genuinely landed, and is worth keeping separately from the RFB question:
+
+- **AMT KVM is a network KVM in front of a physical machine, for free.** No
+  capture card, no HID rig, native resolution. Any AMT box on the rack can have
+  it. That is a real capability the note only predicted.
+- **The client direction is cheaper than estimated.** `vncdo` drove it with no
+  Rust at all, and its verbs (`type`, `key`, `move`, `click`, `capture`) map
+  onto paniolo's vocabulary almost one to one.
+
+Two cautions for whoever picks this up:
+
+- **Port 5900 is being removed from AMT.** Gone from Kaby Lake 11.8.94, Cannon
+  Lake 12.0.93, Comet Lake 14.1.70, Tiger Lake 15.0.45, Alder/Raptor 16.1.25.
+  lab-optiplex-1 runs 12.0.24 and is one ME update away from losing it, after
+  which KVM only answers on the 16994/16995 redirection protocol, which no
+  standard VNC client speaks.
+- **RFB carries pixels, not text.** A cleaner framebuffer still has to be
+  OCR'd; it is not a change of kind. The serial-pane tradeoff above is also
+  softer than it looks — noVNC is a browser client, so video and serial can
+  still share one page.
