@@ -83,6 +83,30 @@ After an upgrade or rebuild, a daemon still running the old binary is flagged
 stale daemon (no `--restart` needed), or restart it explicitly with
 `paniolo daemons restart hdmicap` (see [architecture](dev/architecture.md)).
 
+**An *untracked* daemon is one that outlived its discovery file.** The file is
+paniolo's only record of a running daemon, and on Linux it sits in `/tmp`,
+which systemd ages out — Debian's stock policy is `q /tmp 1777 root root 10d`,
+so a daemon that has simply been running for ten days without a command against
+it loses the file it published at start. Nothing tells the daemon: it keeps
+running and keeps the capture device, while `video show` reports the channel
+stopped and `video watch` spawns a replacement that dies on the advisory lock
+the orphan still holds (`another hdmicap daemon is already running`).
+
+`video show` now reports such a daemon as `running, untracked (pid N)` rather
+than `stopped`, `paniolo daemons` lists it under **Untracked daemons**, and
+both `video watch` and `video stop` reap it (`SIGTERM`, then `SIGKILL`) instead
+of leaving it to `ps` and `kill`. Its port and token died with the file, so
+there is no way to talk to it — a signal is the only handle left.
+
+The `.deb` ships `/usr/lib/tmpfiles.d/paniolo.conf` (`x /tmp/paniolo-*`) so
+this does not happen on a packaged install. **A control host installed with
+`make install` should add that one-line drop-in itself**, or its daemons will
+go untracked every ten days:
+
+```bash
+echo 'x /tmp/paniolo-*' | sudo tee /usr/lib/tmpfiles.d/paniolo.conf
+```
+
 **A stalled capture recovers on its own, most of the time.** The capture
 thread runs a watchdog that notices when no new frame has arrived for a
 while (12s after opening the device, or a further 4s of no progress after
@@ -272,4 +296,6 @@ platforms) and shells out to it per request.
 
 The hdmicap daemon is **per target** (the `<target>` segment), so multiple
 targets capture concurrently on one host; the runtime base honors
-`$PANIOLO_RUNTIME_BASE` (default `/tmp`).
+`$PANIOLO_RUNTIME_BASE` (default `/tmp`). Nothing rewrites these files after
+the daemon starts, which is what makes them vulnerable to a `/tmp` sweep — see
+*untracked daemons* above.
