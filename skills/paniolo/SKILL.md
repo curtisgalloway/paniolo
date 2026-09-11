@@ -714,9 +714,9 @@ daemon's discovery file is paniolo's only record of it, and on Linux `/tmp` is
 swept on an age policy (Debian: 10 days), so a long-running daemon can lose that
 file while still holding its capture device. `paniolo video show` reports it as
 `running, untracked (pid N)` and `paniolo daemons` lists it under **Untracked
-daemons**; `paniolo video watch` and `paniolo video stop` reap it for you. Don't
-reach for `ps`/`kill` — and don't conclude the device is free just because a
-daemon is gone from the tracked list.
+daemons**; `paniolo video watch` / `video stop` and `paniolo serial watch` /
+`serial stop` reap it for you. Don't reach for `ps`/`kill` — and don't conclude
+the device is free just because a daemon is gone from the tracked list.
 
 ## Quick reference — gotchas
 

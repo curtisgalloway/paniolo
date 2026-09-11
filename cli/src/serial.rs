@@ -52,6 +52,18 @@ pub fn daemon_url(target: &str) -> Option<String> {
 
 // ── daemon control ──────────────────────────────────────────────────────────
 
+/// The serialcap daemon holding any of `ifaces`' ports that no discovery file
+/// accounts for, if there is one — an orphan left behind when the runtime file
+/// that named it was deleted out from under it (see the "untracked daemons"
+/// note in daemons.rs). A serial port cannot be opened twice, so it has to be
+/// reaped before a replacement can start.
+pub fn untracked(ifaces: &[SerialChannel]) -> Option<daemons::Untracked> {
+    let devices: Vec<String> = ifaces.iter().map(|ch| ch.device.clone()).collect();
+    daemons::untracked_on_devices(DAEMON, &devices)
+        .into_iter()
+        .next()
+}
+
 /// Format one interface for the daemon's repeatable `--interface` flag:
 /// `NAME=DEVICE@BAUD[:SENSE]`.
 pub fn interface_arg(ch: &SerialChannel) -> String {

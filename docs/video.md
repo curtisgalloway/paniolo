@@ -95,7 +95,8 @@ the orphan still holds (`another hdmicap daemon is already running`).
 `video show` now reports such a daemon as `running, untracked (pid N)` rather
 than `stopped`, `paniolo daemons` lists it under **Untracked daemons**, and
 both `video watch` and `video stop` reap it (`SIGTERM`, then `SIGKILL`) instead
-of leaving it to `ps` and `kill`. Its port and token died with the file, so
+of leaving it to `ps` and `kill`. The serial channel works the same way
+(`paniolo serial show` / `watch` / `stop`); see [serial.md](serial.md). Its port and token died with the file, so
 there is no way to talk to it — a signal is the only handle left.
 
 The `.deb` ships `/usr/lib/tmpfiles.d/paniolo.conf` (`x /tmp/paniolo-*`) so

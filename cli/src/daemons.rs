@@ -688,18 +688,56 @@ pub struct Untracked {
     /// Helper basename as invoked (`hdmicap`, `serialcap`, …).
     pub name: String,
     pub pid: i32,
-    /// The `--device` it was started with, when its command line names one.
-    pub device: Option<String>,
+    /// Every device it holds, however its command line names them: hdmicap
+    /// takes one `--device`, serialcap takes a repeatable `--interface`
+    /// carrying a device per entry. Empty when it names none.
+    pub devices: Vec<String>,
     /// The full command line, for display.
     pub args: String,
 }
 
+impl Untracked {
+    /// The devices for a status line: comma-separated, `-` when it names none.
+    pub fn devices_display(&self) -> String {
+        if self.devices.is_empty() {
+            "-".to_string()
+        } else {
+            self.devices.join(", ")
+        }
+    }
+}
+
+/// The device inside one `--interface` value, which serialcap spells
+/// `NAME=DEVICE@BAUD[:SENSE]` (see `serial::interface_arg`). The baud is cut at
+/// the *last* `@` and the name at the first `=`, so a device path containing
+/// either character still comes back whole. A value with no `@` is taken as
+/// `NAME=DEVICE`, and one with no `=` as a bare device.
+fn interface_device(value: &str) -> Option<String> {
+    let without_baud = value.rsplit_once('@').map_or(value, |(head, _)| head);
+    let device = without_baud
+        .split_once('=')
+        .map_or(without_baud, |(_, dev)| dev);
+    (!device.is_empty()).then(|| device.to_string())
+}
+
+/// The value of `flag` at `i`, whether written `--flag value` or `--flag=value`.
+fn flag_value<'a>(toks: &[&'a str], i: usize, flag: &str) -> Option<&'a str> {
+    let tok = toks.get(i)?;
+    if let Some(v) = tok.strip_prefix(flag).and_then(|r| r.strip_prefix('=')) {
+        return Some(v);
+    }
+    if *tok == flag {
+        return toks.get(i + 1).copied();
+    }
+    None
+}
+
 /// Classify one `ps` command line as a paniolo daemon invocation, returning the
-/// helper's basename and the `--device` it was given. `None` for anything not
-/// running the `daemon` subcommand: a wedged one-shot (`zigplug … on 1`), or a
-/// daemon's own OCR child. Pure, so the classification is unit-testable
-/// without a process to look at.
-fn daemon_invocation(args: &str) -> Option<(String, Option<String>)> {
+/// helper's basename and every device it holds. `None` for anything not running
+/// the `daemon` subcommand: a wedged one-shot (`zigplug … on 1`), or a daemon's
+/// own OCR child. Pure, so the classification is unit-testable without a
+/// process to look at.
+fn daemon_invocation(args: &str) -> Option<(String, Vec<String>)> {
     let mut toks = args.split_whitespace();
     let program = toks.next()?;
     let name = program.rsplit(['/', '\\']).next()?;
@@ -712,16 +750,18 @@ fn daemon_invocation(args: &str) -> Option<(String, Option<String>)> {
     if rest.first() != Some(&"daemon") {
         return None;
     }
-    let mut device = None;
-    let mut it = rest.iter();
-    while let Some(tok) = it.next() {
-        if let Some(v) = tok.strip_prefix("--device=") {
-            device = Some(v.to_string());
-        } else if *tok == "--device" {
-            device = it.next().map(|v| (*v).to_string());
+    // hdmicap names one capture device; serialcap repeats `--interface`, one
+    // per serial port it owns, and an orphan of either kind is identified by
+    // the devices it is sitting on.
+    let mut devices = Vec::new();
+    for i in 0..rest.len() {
+        if let Some(v) = flag_value(&rest, i, "--device") {
+            devices.push(v.to_string());
+        } else if let Some(v) = flag_value(&rest, i, "--interface") {
+            devices.extend(interface_device(v));
         }
     }
-    Some((name.to_string(), device))
+    Some((name.to_string(), devices))
 }
 
 /// One [`list_stray_helpers`] row as an untracked daemon, or `None` when the
@@ -729,11 +769,11 @@ fn daemon_invocation(args: &str) -> Option<(String, Option<String>)> {
 /// listing (the `paniolo daemons` inventory) use this to split it rather than
 /// walking `ps` a second time.
 pub fn untracked_of(pid: i32, args: &str) -> Option<Untracked> {
-    let (name, device) = daemon_invocation(args)?;
+    let (name, devices) = daemon_invocation(args)?;
     Some(Untracked {
         name,
         pid,
-        device,
+        devices,
         args: args.to_string(),
     })
 }
@@ -764,13 +804,20 @@ fn same_device(a: &str, b: &str) -> bool {
     }
 }
 
-/// The untracked daemons named `name` that hold `device` — the orphan standing
-/// between a channel and a daemon it can start.
-pub fn untracked_on_device(name: &str, device: &str) -> Vec<Untracked> {
+/// The untracked daemons named `name` holding any of `devices` — the orphan
+/// standing between a channel and a daemon it can start. A channel can name
+/// several devices (a target's serial interfaces), and one daemon can hold
+/// several; an overlap of one is enough, because that one device is what the
+/// replacement will fail to open.
+pub fn untracked_on_devices(name: &str, devices: &[String]) -> Vec<Untracked> {
     list_untracked()
         .into_iter()
         .filter(|u| u.name == name)
-        .filter(|u| u.device.as_deref().is_some_and(|d| same_device(d, device)))
+        .filter(|u| {
+            u.devices
+                .iter()
+                .any(|held| devices.iter().any(|want| same_device(held, want)))
+        })
         .collect()
 }
 
@@ -1032,21 +1079,21 @@ mod tests {
     fn daemon_invocation_reads_the_helper_and_its_device() {
         let args = "/usr/libexec/paniolo/bin/hdmicap daemon \
                     --device /dev/v4l/by-path/x-video-index0 --port 0";
-        let (name, device) = daemon_invocation(args).expect("this is a daemon");
+        let (name, devices) = daemon_invocation(args).expect("this is a daemon");
         assert_eq!(name, "hdmicap");
-        assert_eq!(device.as_deref(), Some("/dev/v4l/by-path/x-video-index0"));
+        assert_eq!(devices, ["/dev/v4l/by-path/x-video-index0"]);
 
         // `--device=<path>` is the same argument spelled the other way.
-        let (_, device) =
+        let (_, devices) =
             daemon_invocation("/usr/libexec/paniolo/bin/hdmicap daemon --device=/dev/video0")
                 .expect("this is a daemon");
-        assert_eq!(device.as_deref(), Some("/dev/video0"));
+        assert_eq!(devices, ["/dev/video0"]);
 
-        // A daemon that takes no --device is still a daemon.
-        let (name, device) =
+        // A daemon that names no device is still a daemon.
+        let (name, devices) =
             daemon_invocation("/usr/libexec/paniolo/bin/zigplug daemon").expect("still a daemon");
         assert_eq!(name, "zigplug");
-        assert_eq!(device, None);
+        assert!(devices.is_empty());
     }
 
     /// Only the `daemon` subcommand counts. A wedged one-shot holding a serial
@@ -1077,6 +1124,56 @@ mod tests {
         let (name, _) =
             daemon_invocation(r"C:\paniolo\libexec\hdmicap.exe daemon --device 0").unwrap();
         assert_eq!(name, "hdmicap");
+    }
+
+    /// serialcap does not take `--device`: it repeats `--interface`, whose
+    /// value is `NAME=DEVICE@BAUD[:SENSE]` (`serial::interface_arg`). Reading
+    /// only `--device` left every serial orphan with no device to match a
+    /// channel against, so `serial watch` could not recognize the process
+    /// holding its port.
+    #[test]
+    fn daemon_invocation_reads_every_serial_interface_device() {
+        let args = "/usr/libexec/paniolo/bin/serialcap daemon --port 0 \
+                    --interface console=/dev/ttyUSB0@115200 \
+                    --interface aux=/dev/serial/by-id/usb-FTDI_A-if00-port0@9600:cts";
+        let (name, devices) = daemon_invocation(args).expect("this is a daemon");
+        assert_eq!(name, "serialcap");
+        assert_eq!(
+            devices,
+            ["/dev/ttyUSB0", "/dev/serial/by-id/usb-FTDI_A-if00-port0"],
+            "the baud, the sense suffix and the interface name are not the device"
+        );
+    }
+
+    /// The pieces of an `--interface` value, at the edges: the baud is cut at
+    /// the last `@` and the name at the first `=`, so a by-id device path
+    /// carrying either character still comes back whole.
+    #[test]
+    fn interface_device_takes_the_device_and_nothing_else() {
+        assert_eq!(
+            interface_device("console=/dev/ttyUSB0@115200").as_deref(),
+            Some("/dev/ttyUSB0")
+        );
+        assert_eq!(
+            interface_device("console=/dev/ttyUSB0@115200:cts").as_deref(),
+            Some("/dev/ttyUSB0")
+        );
+        assert_eq!(
+            interface_device("a=b=c@115200").as_deref(),
+            Some("b=c"),
+            "only the first `=` separates the name"
+        );
+        assert_eq!(
+            interface_device("n=/dev/by-id/usb-A@B-if00@9600").as_deref(),
+            Some("/dev/by-id/usb-A@B-if00"),
+            "only the last `@` separates the baud"
+        );
+        // Degenerate forms rather than a panic.
+        assert_eq!(
+            interface_device("/dev/ttyUSB0").as_deref(),
+            Some("/dev/ttyUSB0")
+        );
+        assert_eq!(interface_device("console=@115200"), None);
     }
 
     /// A device argument is matched as written before anything is resolved, so
@@ -1125,7 +1222,7 @@ mod tests {
              101 is its child, 300 is a one-shot, 400 is not a paniolo helper"
         );
         assert_eq!(untracked[0].name, "hdmicap");
-        assert_eq!(untracked[0].device.as_deref(), Some("/dev/video1"));
+        assert_eq!(untracked[0].devices, ["/dev/video1"]);
         assert_eq!(rest, vec![300], "the wedged one-shot stays a plain stray");
     }
 

@@ -44,7 +44,7 @@ pub fn daemon(target: &str) -> Option<daemons::Endpoint> {
 /// daemons.rs). It still owns the capture device, so it has to be reaped
 /// before a replacement can start.
 pub fn untracked(device: &str) -> Option<daemons::Untracked> {
-    daemons::untracked_on_device(DAEMON, device)
+    daemons::untracked_on_devices(DAEMON, &[device.to_string()])
         .into_iter()
         .next()
 }
