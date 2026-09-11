@@ -51,7 +51,40 @@ const XMLNS_ADDR: &str = "http://schemas.xmlsoap.org/ws/2004/08/addressing";
 const XMLNS_WSMAN: &str = "http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd";
 const ANON: &str = "http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous";
 const TRANSFER_GET: &str = "http://schemas.xmlsoap.org/ws/2004/09/transfer/Get";
+const TRANSFER_PUT: &str = "http://schemas.xmlsoap.org/ws/2004/09/transfer/Put";
 const CIM: &str = "http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/";
+const IPS: &str = "http://intel.com/wbem/wscim/1/ips-schema/1/";
+
+/// `CIM_KVMRedirectionSAP.EnabledState`: the KVM service access point is
+/// serving. AMT also reports 6 ("Enabled but Offline") once redirection is on
+/// with no session attached, which for our purposes counts as enabled.
+pub const KVM_ENABLED: u16 = 2;
+/// `CIM_KVMRedirectionSAP.EnabledState`: KVM redirection is off.
+pub const KVM_DISABLED: u16 = 3;
+/// `EnabledState` 6 — enabled, no session attached.
+pub const KVM_ENABLED_OFFLINE: u16 = 6;
+
+/// The order `IPS_KVMRedirectionSettingData` elements must appear in on a Put.
+///
+/// AMT returns them **alphabetically** on a Get but validates a Put against an
+/// `xsd:sequence` in **inheritance order**, so a Get response cannot be sent
+/// back unchanged — it is rejected as `InvalidRepresentation` with an empty
+/// fault Detail. This order is the one the firmware accepts (verified against
+/// AMT 12.0.24). `OptInPolicyTimeout` belongs here even though the Intel
+/// reference's *request* struct omits it; this firmware's schema matches their
+/// *response* struct.
+const KVM_PUT_ORDER: &[&str] = &[
+    "ElementName",
+    "InstanceID",
+    "EnabledByMEBx",
+    "BackToBackFbMode",
+    "Is5900PortEnabled",
+    "OptInPolicy",
+    "OptInPolicyTimeout",
+    "SessionTimeout",
+    "RFBPassword",
+    "DefaultScreen",
+];
 
 /// `CIM_PowerManagementService.RequestPowerStateChange` PowerState values
 /// (DMTF CIM PowerState value map). AMT implements 2/5/8/10; this helper
@@ -91,6 +124,24 @@ pub fn power_state_name(ps: u16) -> &'static str {
 /// to keep polling through that window instead of failing the hook.
 #[derive(Debug)]
 pub struct Transient;
+
+/// The subset of `IPS_KVMRedirectionSettingData` this helper reports.
+///
+/// `RFBPassword` is deliberately absent: a Get always returns it empty, so
+/// there is nothing truthful to put here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvmSettings {
+    /// Whether the ME serves RFB to standard VNC clients on port 5900.
+    pub port_5900_enabled: bool,
+    /// Whether a person at the machine must consent before a session opens.
+    /// Must be false for a headless bench target to be reachable.
+    pub opt_in_policy: bool,
+    /// Idle minutes before the ME drops a KVM session; 0 disables the timeout.
+    pub session_timeout: u16,
+    /// Whether KVM is enabled at the firmware level in MEBx. When false,
+    /// nothing this helper writes will bring the port up.
+    pub enabled_by_mebx: bool,
+}
 
 impl std::fmt::Display for Transient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -288,6 +339,99 @@ impl Client {
         }
     }
 
+    /// Read `IPS_KVMRedirectionSettingData`, returning both the parsed view and
+    /// the raw response — [`Client::set_kvm`] needs the raw instance to seed a
+    /// Put with the fields it does not itself change.
+    fn kvm_settings_raw(&self) -> Result<(KvmSettings, String)> {
+        let uri = format!("{IPS}IPS_KVMRedirectionSettingData");
+        let body = self.post(
+            &envelope(&self.url, TRANSFER_GET, &uri, "", ""),
+            CALL_TIMEOUT,
+        )?;
+        let flag = |name: &str| xml_text(&body, name).map(|v| v == "true").unwrap_or(false);
+        let settings = KvmSettings {
+            port_5900_enabled: flag("Is5900PortEnabled"),
+            opt_in_policy: flag("OptInPolicy"),
+            session_timeout: xml_text(&body, "SessionTimeout")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            enabled_by_mebx: flag("EnabledByMEBx"),
+        };
+        Ok((settings, body))
+    }
+
+    /// The KVM redirection settings as the ME currently reports them.
+    pub fn kvm_settings(&self) -> Result<KvmSettings> {
+        Ok(self.kvm_settings_raw()?.0)
+    }
+
+    /// `CIM_KVMRedirectionSAP.EnabledState`.
+    ///
+    /// Fetched **without a SelectorSet**. The instance's own keys
+    /// (`Name=CIM_KVMRedirectionSAP`, `SystemName=ManagedSystem`) are reported
+    /// by the Get but addressing the singleton with them fails routing, so
+    /// unkeyed is the only form that works here.
+    pub fn kvm_enabled_state(&self) -> Result<u16> {
+        let uri = format!("{CIM}CIM_KVMRedirectionSAP");
+        let body = self.post(
+            &envelope(&self.url, TRANSFER_GET, &uri, "", ""),
+            CALL_TIMEOUT,
+        )?;
+        xml_text(&body, "EnabledState")
+            .ok_or_else(|| anyhow!("no EnabledState in CIM_KVMRedirectionSAP response"))?
+            .parse()
+            .context("unparseable EnabledState")
+    }
+
+    /// Write the KVM redirection settings.
+    ///
+    /// `rfb_password` is required the first time port 5900 is enabled — AMT
+    /// refuses to open the port without one — and must be exactly 8 characters
+    /// with an upper, a lower, a digit and a special character. Passing `None`
+    /// leaves whatever is stored (a Get never returns it).
+    pub fn set_kvm(
+        &self,
+        rfb_password: Option<&str>,
+        port_5900: bool,
+        opt_in: bool,
+        session_timeout: u16,
+    ) -> Result<()> {
+        let (_, current) = self.kvm_settings_raw()?;
+        let uri = format!("{IPS}IPS_KVMRedirectionSettingData");
+        let body = kvm_put_body(&current, rfb_password, port_5900, opt_in, session_timeout);
+
+        let selectors = "\n  <w:SelectorSet>\
+             \n   <w:Selector Name=\"InstanceID\">Intel(r) KVM Redirection Settings</w:Selector>\
+             \n  </w:SelectorSet>";
+        self.post(
+            &envelope(&self.url, TRANSFER_PUT, &uri, selectors, &body),
+            CALL_TIMEOUT,
+        )?;
+        Ok(())
+    }
+
+    /// Invoke `CIM_KVMRedirectionSAP.RequestStateChange`, unkeyed (see
+    /// [`Client::kvm_enabled_state`] for why). Errors on a non-zero ReturnValue.
+    pub fn kvm_request_state(&self, state: u16) -> Result<()> {
+        let uri = format!("{CIM}CIM_KVMRedirectionSAP");
+        let action = format!("{uri}/RequestStateChange");
+        let body = format!(
+            "<r:RequestStateChange_INPUT xmlns:r=\"{uri}\">\
+             <r:RequestedState>{state}</r:RequestedState>\
+             </r:RequestStateChange_INPUT>"
+        );
+        let resp = self.post(&envelope(&self.url, &action, &uri, "", &body), CALL_TIMEOUT)?;
+        let rv = xml_text(&resp, "ReturnValue")
+            .ok_or_else(|| anyhow!("no ReturnValue in RequestStateChange response"))?;
+        match rv {
+            "0" => Ok(()),
+            code => bail!(
+                "RequestStateChange({state}) failed: ReturnValue {code} ({})",
+                return_value_name(code)
+            ),
+        }
+    }
+
     /// The one place every WS-Man request is issued, including the HTTP
     /// Digest handshake: POST unauthenticated, answer the 401 challenge,
     /// retry once. `budget` bounds the whole exchange — the second leg of the
@@ -418,6 +562,56 @@ fn auth_failed(rechallenge: Option<&str>) -> anyhow::Error {
 /// inside it must be backslash-escaped, or a username containing either
 /// would corrupt the header (the digest itself is computed over the raw
 /// value, per the RFC).
+/// Build the `IPS_KVMRedirectionSettingData` Put body from a Get response.
+///
+/// Seeded from `current` so fields this helper does not manage are echoed back
+/// unchanged, but re-emitted in [`KVM_PUT_ORDER`] rather than the alphabetical
+/// order AMT returns — see that constant for why the distinction matters. A
+/// field absent from `current` is omitted: this firmware's schema is whatever
+/// it reported, and inventing elements is another way to earn
+/// `InvalidRepresentation`.
+fn kvm_put_body(
+    current: &str,
+    rfb_password: Option<&str>,
+    port_5900: bool,
+    opt_in: bool,
+    session_timeout: u16,
+) -> String {
+    let uri = format!("{IPS}IPS_KVMRedirectionSettingData");
+    let mut body = format!("<h:IPS_KVMRedirectionSettingData xmlns:h=\"{uri}\">");
+    for name in KVM_PUT_ORDER {
+        let value = match *name {
+            "Is5900PortEnabled" => Some(port_5900.to_string()),
+            "OptInPolicy" => Some(opt_in.to_string()),
+            "SessionTimeout" => Some(session_timeout.to_string()),
+            "RFBPassword" => rfb_password.map(str::to_owned),
+            other => xml_text(current, other).map(str::to_owned),
+        };
+        if let Some(v) = value {
+            let _ = write!(body, "<h:{name}>{}</h:{name}>", xml_escape(&v));
+        }
+    }
+    body.push_str("</h:IPS_KVMRedirectionSettingData>");
+    body
+}
+
+/// Escape a value for an XML text node. The RFB password is chosen by a human
+/// and must contain a special character, so `&`, `<` and `>` are live
+/// possibilities — unescaped, they make the Put a malformed document and AMT
+/// reports the useless `The XML content is not valid.`
+fn xml_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn quote_param(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
@@ -925,6 +1119,81 @@ mod tests {
         );
         let selfclosed = "<g:PowerState/>";
         assert_eq!(xml_text(selfclosed, "PowerState"), Some(""));
+    }
+
+    /// A real AMT 12.0.24 Get response: alphabetical, which is *not* the order
+    /// a Put may use.
+    const KVM_GET: &str = "<g:IPS_KVMRedirectionSettingData xmlns:g=\"urn:x\">\
+         <g:BackToBackFbMode>false</g:BackToBackFbMode>\
+         <g:DefaultScreen>0</g:DefaultScreen>\
+         <g:ElementName>Intel(r) KVM Redirection Settings</g:ElementName>\
+         <g:EnabledByMEBx>true</g:EnabledByMEBx>\
+         <g:InstanceID>Intel(r) KVM Redirection Settings</g:InstanceID>\
+         <g:Is5900PortEnabled>false</g:Is5900PortEnabled>\
+         <g:OptInPolicy>true</g:OptInPolicy>\
+         <g:OptInPolicyTimeout>300</g:OptInPolicyTimeout>\
+         <g:RFBPassword></g:RFBPassword>\
+         <g:SessionTimeout>3</g:SessionTimeout>\
+         </g:IPS_KVMRedirectionSettingData>";
+
+    /// The Put must be re-ordered into schema sequence, not echoed back in the
+    /// order the Get supplied. AMT rejects the alphabetical form outright, so
+    /// this is the difference between a working call and
+    /// `InvalidRepresentation`.
+    #[test]
+    fn kvm_put_body_is_in_schema_order_not_alphabetical() {
+        let body = kvm_put_body(KVM_GET, Some("Ab3!defG"), true, false, 0);
+        let positions: Vec<usize> = KVM_PUT_ORDER
+            .iter()
+            .map(|f| {
+                body.find(&format!("<h:{f}>"))
+                    .unwrap_or_else(|| panic!("{f} missing from Put body: {body}"))
+            })
+            .collect();
+        let mut sorted = positions.clone();
+        sorted.sort_unstable();
+        assert_eq!(positions, sorted, "fields out of schema order: {body}");
+        // Alphabetical would put BackToBackFbMode first; schema order does not.
+        assert!(body.starts_with(
+            "<h:IPS_KVMRedirectionSettingData xmlns:h=\
+             \"http://intel.com/wbem/wscim/1/ips-schema/1/IPS_KVMRedirectionSettingData\">\
+             <h:ElementName>"
+        ));
+    }
+
+    #[test]
+    fn kvm_put_body_applies_overrides_and_escapes_the_password() {
+        let body = kvm_put_body(KVM_GET, Some("A&b<c>1!"), true, false, 0);
+        assert!(body.contains("<h:Is5900PortEnabled>true</h:Is5900PortEnabled>"));
+        assert!(body.contains("<h:OptInPolicy>false</h:OptInPolicy>"));
+        assert!(body.contains("<h:SessionTimeout>0</h:SessionTimeout>"));
+        // Unescaped, these three characters make the document malformed and
+        // AMT answers with the unhelpful "The XML content is not valid."
+        assert!(body.contains("<h:RFBPassword>A&amp;b&lt;c&gt;1!</h:RFBPassword>"));
+        // Untouched fields are echoed back verbatim.
+        assert!(body.contains("<h:OptInPolicyTimeout>300</h:OptInPolicyTimeout>"));
+        assert!(body.contains("<h:EnabledByMEBx>true</h:EnabledByMEBx>"));
+    }
+
+    /// Omitting the password must leave the stored one alone rather than
+    /// writing an empty string, which would lock KVM out on the next connect.
+    #[test]
+    fn kvm_put_body_omits_the_password_when_not_supplied() {
+        let body = kvm_put_body(KVM_GET, None, false, true, 3);
+        assert!(!body.contains("RFBPassword"), "{body}");
+        assert!(body.contains("<h:Is5900PortEnabled>false</h:Is5900PortEnabled>"));
+    }
+
+    /// A field this firmware does not report must not be invented.
+    #[test]
+    fn kvm_put_body_omits_fields_the_firmware_did_not_report() {
+        let lean = "<g:IPS_KVMRedirectionSettingData xmlns:g=\"urn:x\">\
+             <g:ElementName>n</g:ElementName><g:InstanceID>i</g:InstanceID>\
+             </g:IPS_KVMRedirectionSettingData>";
+        let body = kvm_put_body(lean, None, true, false, 0);
+        assert!(!body.contains("OptInPolicyTimeout"), "{body}");
+        assert!(!body.contains("BackToBackFbMode"), "{body}");
+        assert!(body.contains("<h:ElementName>n</h:ElementName>"));
     }
 
     #[test]

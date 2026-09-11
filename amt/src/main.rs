@@ -33,7 +33,8 @@ use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand};
 
 use rpc::{
-    is_transient, power_state_name, Client, CALL_TIMEOUT, MIN_CALL_TIMEOUT, PS_OFF_SOFT, PS_ON,
+    is_transient, power_state_name, Client, CALL_TIMEOUT, KVM_DISABLED, KVM_ENABLED,
+    KVM_ENABLED_OFFLINE, MIN_CALL_TIMEOUT, PS_OFF_SOFT, PS_ON,
 };
 
 /// How long a commanded transition may take before read-back confirmation
@@ -123,6 +124,34 @@ enum Cmd {
     },
     /// Human-readable AMT firmware identity and power state detail.
     Status,
+    /// Inspect or change KVM redirection (the ME's built-in VNC server).
+    Kvm {
+        #[command(subcommand)]
+        cmd: KvmCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum KvmCmd {
+    /// Report whether port 5900 is open, whether a local user must consent,
+    /// and the redirection service's EnabledState.
+    Status,
+    /// Open port 5900 to standard VNC clients and enable redirection.
+    ///
+    /// The RFB password comes from AMT_RFB_PASSWORD in the environment, never
+    /// a flag: it must contain a special character, and a shell eats those.
+    Enable {
+        /// Require a person at the machine to consent to each session. Off by
+        /// default — a headless bench target has nobody to click the prompt.
+        #[arg(long)]
+        opt_in: bool,
+        /// Idle minutes before the ME drops a session; 0 disables the timeout.
+        #[arg(long, default_value_t = 0)]
+        session_timeout: u16,
+    },
+    /// Close port 5900 and disable redirection. Leaves the stored RFB password
+    /// alone, so re-enabling does not require setting it again.
+    Disable,
 }
 
 fn main() -> Result<()> {
@@ -145,7 +174,123 @@ fn main() -> Result<()> {
         Cmd::Off => cmd_off(&client),
         Cmd::Cycle { delay_ms } => cmd_cycle(&client, delay_ms),
         Cmd::Status => cmd_status(&client),
+        Cmd::Kvm { cmd } => match cmd {
+            KvmCmd::Status => cmd_kvm_status(&client),
+            KvmCmd::Enable {
+                opt_in,
+                session_timeout,
+            } => cmd_kvm_enable(&client, opt_in, session_timeout),
+            KvmCmd::Disable => cmd_kvm_disable(&client),
+        },
     }
+}
+
+/// Name a `CIM_KVMRedirectionSAP.EnabledState` value.
+fn kvm_state_name(state: u16) -> &'static str {
+    match state {
+        KVM_ENABLED => "enabled",
+        KVM_DISABLED => "disabled",
+        KVM_ENABLED_OFFLINE => "enabled (no session attached)",
+        _ => "unknown",
+    }
+}
+
+fn cmd_kvm_status(client: &Client) -> Result<()> {
+    let s = client.kvm_settings()?;
+    let state = client.kvm_enabled_state()?;
+    println!("redirection    {} ({state})", kvm_state_name(state));
+    println!(
+        "port 5900      {}",
+        if s.port_5900_enabled {
+            "open to VNC clients"
+        } else {
+            "closed"
+        }
+    );
+    println!(
+        "user consent   {}",
+        if s.opt_in_policy {
+            "required (a person must approve each session)"
+        } else {
+            "not required"
+        }
+    );
+    println!(
+        "session timeout {}",
+        if s.session_timeout == 0 {
+            "none".to_string()
+        } else {
+            format!("{} min", s.session_timeout)
+        }
+    );
+    println!(
+        "enabled in MEBx {}",
+        if s.enabled_by_mebx { "yes" } else { "NO" }
+    );
+    Ok(())
+}
+
+/// Validate the RFB password here rather than letting AMT reject it: AMT
+/// **locks** the password after a few failed authentication attempts, so a
+/// malformed one is worth catching before it is ever written or tried.
+fn check_rfb_password(pw: &str) -> Result<()> {
+    let mut problems = Vec::new();
+    if pw.chars().count() != 8 {
+        problems.push(format!(
+            "must be exactly 8 characters (got {})",
+            pw.chars().count()
+        ));
+    }
+    if !pw.chars().any(|c| c.is_ascii_uppercase()) {
+        problems.push("needs a capital letter".into());
+    }
+    if !pw.chars().any(|c| c.is_ascii_lowercase()) {
+        problems.push("needs a lowercase letter".into());
+    }
+    if !pw.chars().any(|c| c.is_ascii_digit()) {
+        problems.push("needs a digit".into());
+    }
+    if !pw.chars().any(|c| !c.is_alphanumeric()) {
+        problems.push("needs a special character".into());
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        bail!("AMT_RFB_PASSWORD rejected: {}", problems.join("; "))
+    }
+}
+
+fn cmd_kvm_enable(client: &Client, opt_in: bool, session_timeout: u16) -> Result<()> {
+    let before = client.kvm_settings()?;
+    if !before.enabled_by_mebx {
+        bail!(
+            "KVM is not enabled in MEBx on this machine; no remote setting can \
+             turn it on — enable it in the firmware setup screen first"
+        );
+    }
+    let rfb = std::env::var("AMT_RFB_PASSWORD").ok();
+    match rfb.as_deref() {
+        Some(pw) => check_rfb_password(pw)?,
+        None if !before.port_5900_enabled => bail!(
+            "AMT_RFB_PASSWORD is not set — AMT will not open port 5900 without \
+             an RFB password. It is a separate secret from AMT_PASSWORD: exactly \
+             8 characters with a capital, a lowercase, a digit and a special \
+             character. Pass it in the environment, never on the command line, \
+             where a shell will eat the special character."
+        ),
+        None => {}
+    }
+
+    client.set_kvm(rfb.as_deref(), true, opt_in, session_timeout)?;
+    client.kvm_request_state(KVM_ENABLED)?;
+    cmd_kvm_status(client)
+}
+
+fn cmd_kvm_disable(client: &Client) -> Result<()> {
+    let before = client.kvm_settings()?;
+    client.kvm_request_state(KVM_DISABLED)?;
+    client.set_kvm(None, false, before.opt_in_policy, before.session_timeout)?;
+    cmd_kvm_status(client)
 }
 
 /// The `state_cmd` token for a CIM PowerState. `on` only for On (2); `off`
