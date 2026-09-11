@@ -80,5 +80,11 @@ contents:
     dst: /usr/share/paniolo/skills/control-host/SKILL.md
     file_info:
       mode: 0o644
+  # Keeps systemd-tmpfiles from deleting a long-running daemon's discovery
+  # file out from under it -- see the file's own comment and GitHub #187.
+  - src: packaging/tmpfiles.d/paniolo.conf
+    dst: /usr/lib/tmpfiles.d/paniolo.conf
+    file_info:
+      mode: 0o644
   - src: LICENSE
     dst: /usr/share/doc/paniolo/LICENSE

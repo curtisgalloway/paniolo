@@ -955,9 +955,20 @@ fn cmd_daemons_list() -> Result<()> {
     let netboots = running_netboots();
     let mut known: Vec<i32> = discovered.iter().map(|d| d.pid).collect();
     known.extend(netboots.iter().map(|(_, st)| st.dhcp_pid));
-    let strays = daemons::list_stray_helpers(&known);
+    // A stray running a `daemon` subcommand is not a wedged one-shot: it is a
+    // daemon whose discovery file went missing under it (#187). It still holds
+    // its device, so it is reported as what it is, with the verb that reclaims
+    // it — not buried in the stray list with a shrug.
+    let mut untracked: Vec<daemons::Untracked> = Vec::new();
+    let mut strays: Vec<(i32, String)> = Vec::new();
+    for (pid, args) in daemons::list_stray_helpers(&known) {
+        match daemons::untracked_of(pid, &args) {
+            Some(u) => untracked.push(u),
+            None => strays.push((pid, args)),
+        }
+    }
 
-    if discovered.is_empty() && netboots.is_empty() && strays.is_empty() {
+    if discovered.is_empty() && netboots.is_empty() && strays.is_empty() && untracked.is_empty() {
         println!("No paniolo daemons running.");
         return Ok(());
     }
@@ -981,6 +992,17 @@ fn cmd_daemons_list() -> Result<()> {
         println!(
             "netbootd\tpid {}\tport -\ttarget {target} ({})",
             st.dhcp_pid, st.interface
+        );
+    }
+    if !untracked.is_empty() {
+        println!("\nUntracked daemons (running, but no discovery file names them):");
+        for u in &untracked {
+            let device = u.device.as_deref().unwrap_or("-");
+            println!("  {}\tpid {}\tport ?\t{}", u.name, u.pid, device);
+        }
+        println!(
+            "These still hold their devices. `paniolo video watch` reclaims a video one; \n\
+             `paniolo daemons stop --all` reaps the rest."
         );
     }
     if !strays.is_empty() {
@@ -1215,6 +1237,47 @@ fn stop_capture_daemon_and_wait(name: &str, target: &str) -> Result<()> {
         bail!(
             "old {name} daemon (pid {pid}) is still running after SIGKILL; not starting a \
              replacement that would race it for the device"
+        );
+    }
+    Ok(())
+}
+
+/// TERM (then KILL) an untracked daemon and wait for the process to go.
+///
+/// The same gate as [`stop_capture_daemon_and_wait`] — until the process is
+/// gone it still owns the device — but there is no discovery file to reach
+/// this one through, so its own `stop` (an authenticated HTTP call to a port
+/// only that file recorded) is not available and a signal is the only handle
+/// left. See the "untracked daemons" note in daemons.rs for how a daemon ends
+/// up in this state.
+fn reap_untracked(u: &daemons::Untracked) -> Result<()> {
+    let (pid, name) = (u.pid, u.name.clone());
+    let still_it = || state::is_named_child_alive(pid, &name);
+    if !still_it() {
+        return Ok(());
+    }
+    eprintln!("Reaping untracked {name} daemon (pid {pid}) that still holds the device…");
+    if !signal_or_report(&format!("untracked {name}"), pid, platform::Signal::Term) {
+        bail!("could not stop the untracked {name} daemon (pid {pid})");
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while still_it() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if !still_it() {
+        return Ok(());
+    }
+    eprintln!("untracked {name} daemon (pid {pid}) ignored TERM; killing it");
+    platform::try_signal_pid(pid, platform::Signal::Kill)
+        .map_err(|e| anyhow!("could not SIGKILL the untracked {name} daemon (pid {pid}): {e}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while still_it() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if still_it() {
+        bail!(
+            "untracked {name} daemon (pid {pid}) is still running after SIGKILL; not starting \
+             a replacement that would race it for the device"
         );
     }
     Ok(())
@@ -2941,6 +3004,14 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
                 }
                 stop_capture_daemon_and_wait(video::DAEMON, &target)?;
             }
+            // Nothing tracked is running. An orphan that outlived its
+            // discovery file still holds the capture device and the advisory
+            // lock, so a replacement started over the top of it dies on the
+            // lock ("another hdmicap daemon is already running") while every
+            // other command keeps calling the channel stopped (#187).
+            else if let Some(orphan) = video::untracked(&device) {
+                reap_untracked(&orphan)?;
+            }
             eprintln!("Starting video daemon for '{target}' ('{device}')…");
             video::start_daemon(&device, port, &target, v.ocr_mode.as_deref())?;
             match daemons::wait_for_daemon(
@@ -2965,7 +3036,21 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
         VideoCmd::Stop { target } => {
             // Resolve the target (routing to its video channel's host if
             // remote) so we stop the right per-target daemon instance.
-            let (target, _v) = video_runtime(lab_flag, target.as_deref())?;
+            let (target, v) = video_runtime(lab_flag, target.as_deref())?;
+            // An orphan has no discovery file, so `hdmicap stop` cannot see it
+            // and the operator has nothing left but `ps` and `kill` (#187).
+            // Only consulted when nothing is tracked: a healthy daemon is
+            // never in this set, and its own stop is the clean shutdown.
+            if video::daemon(&target).is_none() {
+                if let Some(orphan) = v.device.as_deref().and_then(video::untracked) {
+                    reap_untracked(&orphan)?;
+                    println!(
+                        "Untracked video daemon for '{target}' (pid {}) stopped.",
+                        orphan.pid
+                    );
+                    return Ok(());
+                }
+            }
             let code = video::stop_daemon(&target)?;
             if code == 0 {
                 println!("Video daemon for '{target}' stopped.");
@@ -3077,7 +3162,18 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
                         stale_note(video::DAEMON, &target)
                     )
                 }
-                None => println!("daemon\tstopped"),
+                // "stopped" has to mean the device is free. A daemon whose
+                // discovery file was deleted under it is still running and
+                // still holding the device, and saying otherwise is what makes
+                // the next `video watch` fail inexplicably (#187).
+                None => match v.device.as_deref().and_then(video::untracked) {
+                    Some(u) => println!(
+                        "daemon\trunning, untracked (pid {}) — no discovery file; \
+                         `paniolo video watch` reclaims it",
+                        u.pid
+                    ),
+                    None => println!("daemon\tstopped"),
+                },
             }
             Ok(())
         }

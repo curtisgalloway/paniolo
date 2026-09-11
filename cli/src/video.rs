@@ -38,6 +38,17 @@ pub fn daemon(target: &str) -> Option<daemons::Endpoint> {
     daemons::daemon_endpoint(DAEMON, Some(target))
 }
 
+/// The hdmicap daemon holding `device` that no discovery file accounts for,
+/// if there is one — an orphan left behind when the runtime file that named it
+/// was deleted out from under it (see the "untracked daemons" note in
+/// daemons.rs). It still owns the capture device, so it has to be reaped
+/// before a replacement can start.
+pub fn untracked(device: &str) -> Option<daemons::Untracked> {
+    daemons::untracked_on_device(DAEMON, device)
+        .into_iter()
+        .next()
+}
+
 /// The dashboard URL for a human to open: the daemon's `GET /` with the token
 /// a browser needs carried as `?token=`. None if the daemon isn't running.
 pub fn preview_url(target: &str) -> Option<String> {

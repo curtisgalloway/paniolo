@@ -433,6 +433,19 @@ Python tree below:
   install --root …/libexec/paniolo` that `make install` runs) — and children
   of a known daemon (sudo's netbootd on Linux, hdmicap's OCR helper) are
   never strays.
+  A stray running a `daemon` subcommand is not a wedged one-shot but an
+  **untracked daemon** — one that outlived its discovery file, which is
+  paniolo's only record of it. On Linux the runtime base is under `/tmp`, and
+  Debian's stock `q /tmp 1777 root root 10d` deletes a discovery file once its
+  daemon has been running ten days without a command against it; the daemon
+  keeps its capture device, `show` calls the channel stopped, and the next
+  `watch` dies on the advisory lock the orphan still holds. `paniolo daemons`
+  lists these separately, `video show` reports `running, untracked (pid N)`,
+  and `video watch` / `video stop` reap one (TERM, then KILL) before starting a
+  replacement — its port and token died with the file, so a signal is the only
+  handle left (`daemons::untracked_of`/`untracked_on_device`, GitHub #187). The
+  `.deb` ships `/usr/lib/tmpfiles.d/paniolo.conf` (`x /tmp/paniolo-*`) so the
+  files stop being swept; a `make install` host should add that drop-in itself.
   A daemon keeps running its binary from when it started; an upgrade or rebuild
   replaces that binary on disk but not the running process. The CLI stamps each
   capture daemon's binary identity at spawn (`binmeta.json`) and flags a daemon
