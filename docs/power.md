@@ -616,7 +616,9 @@ card or HID rig in the path. It is not a power verb; it is here because the
 The RFB password comes from **`AMT_RFB_PASSWORD`** in the environment, never a
 flag. It is a different secret from `AMT_PASSWORD`, and AMT's rules on it are
 strict: **exactly 8 characters**, with a capital, a lowercase, a digit and a
-special character. The helper checks that itself before writing, because AMT
+special character — but **not** `"`, `,` or `:`, which AMT rejects even though
+they satisfy the special-character rule. The helper checks that itself before
+writing, because AMT
 **locks the RFB password** after a few failed authentication attempts — and a
 shell will silently eat the special character if you put it on a command line
 (`!` in double quotes is history expansion). Re-Putting the password over

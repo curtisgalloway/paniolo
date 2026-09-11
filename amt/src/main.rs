@@ -29,7 +29,7 @@ mod rpc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 use clap::{Parser, Subcommand};
 
 use rpc::{
@@ -253,6 +253,24 @@ fn check_rfb_password(pw: &str) -> Result<()> {
     if !pw.chars().any(|c| !c.is_alphanumeric()) {
         problems.push("needs a special character".into());
     }
+    // Intel's IPS_KVMRedirectionSettingData reference: "RFB password can't
+    // accept the characters: '"' ',' ':'". They satisfy the special-character
+    // rule above, so without this a password like `Ab3:defG` looks valid here
+    // and is refused by the firmware instead.
+    let forbidden: Vec<char> = pw
+        .chars()
+        .filter(|c| matches!(c, '"' | ',' | ':'))
+        .collect();
+    if !forbidden.is_empty() {
+        problems.push(format!(
+            "AMT forbids these characters in an RFB password: {}",
+            forbidden
+                .iter()
+                .map(|c| format!("'{c}'"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+    }
     if problems.is_empty() {
         Ok(())
     } else {
@@ -269,27 +287,64 @@ fn cmd_kvm_enable(client: &Client, opt_in: bool, session_timeout: u16) -> Result
         );
     }
     let rfb = std::env::var("AMT_RFB_PASSWORD").ok();
-    match rfb.as_deref() {
-        Some(pw) => check_rfb_password(pw)?,
-        None if !before.port_5900_enabled => bail!(
-            "AMT_RFB_PASSWORD is not set — AMT will not open port 5900 without \
-             an RFB password. It is a separate secret from AMT_PASSWORD: exactly \
-             8 characters with a capital, a lowercase, a digit and a special \
-             character. Pass it in the environment, never on the command line, \
-             where a shell will eat the special character."
-        ),
-        None => {}
+    if let Some(pw) = rfb.as_deref() {
+        check_rfb_password(pw)?;
     }
 
-    client.set_kvm(rfb.as_deref(), true, opt_in, session_timeout)?;
-    client.kvm_request_state(KVM_ENABLED)?;
+    // Port 5900 can be opened when a password "is already set or is set in the
+    // same Put request" (Intel's IPS_KVMRedirectionSettingData reference), and
+    // a Get never reveals whether one is stored — it always returns the field
+    // empty. So do not refuse up front for a missing AMT_RFB_PASSWORD: a
+    // previous `kvm enable` may have set one that `kvm disable` preserved.
+    // Attempt the Put and explain only if the firmware actually objects. This
+    // costs nothing: a Put authenticates with the AMT admin Digest credential,
+    // so a rejection cannot contribute to the RFB password lockout.
+    client
+        .set_kvm(rfb.as_deref(), true, opt_in, session_timeout)
+        .map_err(|e| {
+            if rfb.is_none() {
+                e.context(
+                    "AMT_RFB_PASSWORD is not set, and the firmware refused to open port \
+                     5900 — most likely no RFB password is stored. It is a separate \
+                     secret from AMT_PASSWORD: exactly 8 characters with a capital, a \
+                     lowercase, a digit and a special character, and not '\"' ',' or \
+                     ':'. Pass it in the environment, never on the command line, where \
+                     a shell will eat the special character.",
+                )
+            } else {
+                e
+            }
+        })?;
+
+    // The settings are now applied. If enabling redirection fails, say so
+    // rather than returning a bare error: the firmware has already changed,
+    // and an operator who does not know that will not think to back it out.
+    client.kvm_request_state(KVM_ENABLED).map_err(|e| {
+        e.context(
+            "the settings were written (RFB password, consent policy and timeout are \
+             applied) but redirection could not be enabled. The machine is in a \
+             half-applied state: re-run `kvm enable` to retry just the state change, \
+             or `kvm disable` to back it out.",
+        )
+    })?;
     cmd_kvm_status(client)
 }
 
 fn cmd_kvm_disable(client: &Client) -> Result<()> {
     let before = client.kvm_settings()?;
-    client.kvm_request_state(KVM_DISABLED)?;
-    client.set_kvm(None, false, before.opt_in_policy, before.session_timeout)?;
+    // Close the port before stopping redirection, so that a failure partway
+    // leaves the more conservative half applied: a closed 5900 with redirection
+    // still running is strictly less exposed than an open one.
+    client
+        .set_kvm(None, false, before.opt_in_policy, before.session_timeout)
+        .context("port 5900 could not be closed; nothing was changed")?;
+    client.kvm_request_state(KVM_DISABLED).map_err(|e| {
+        e.context(
+            "port 5900 is now closed, but redirection could not be stopped. No VNC \
+             client can reach the machine, so this is not an exposure — but the \
+             machine is half-applied: re-run `kvm disable` to finish.",
+        )
+    })?;
     cmd_kvm_status(client)
 }
 
@@ -492,5 +547,49 @@ mod tests {
             attempt_timeout(now + Duration::from_secs(5), now),
             MIN_CALL_TIMEOUT
         );
+    }
+
+    #[test]
+    fn rfb_password_accepts_a_conforming_secret() {
+        assert!(check_rfb_password("Ab3!defG").is_ok());
+        assert!(check_rfb_password("xY9@zwvU").is_ok());
+    }
+
+    #[test]
+    fn rfb_password_enforces_length_and_all_four_classes() {
+        // Each of these is wrong in exactly one way.
+        for (pw, want) in [
+            ("Ab3!def", "exactly 8"),
+            ("Ab3!defGH", "exactly 8"),
+            ("ab3!defg", "capital"),
+            ("AB3!DEFG", "lowercase"),
+            ("Abc!defG", "digit"),
+            ("Ab3xdefG", "special"),
+        ] {
+            let err = check_rfb_password(pw)
+                .expect_err(&format!("{pw:?} should have been rejected"))
+                .to_string();
+            assert!(
+                err.contains(want),
+                "{pw:?} rejected for the wrong reason: {err}"
+            );
+        }
+    }
+
+    /// Intel forbids `"`, `,` and `:` in an RFB password. All three satisfy
+    /// the special-character rule, so without an explicit check they look
+    /// valid locally and are refused by the firmware instead — which is the
+    /// failure this local check exists to avoid.
+    #[test]
+    fn rfb_password_rejects_the_characters_amt_forbids() {
+        for pw in ["Ab3:defG", "Ab3,defG", "Ab3\"defG"] {
+            let err = check_rfb_password(pw)
+                .expect_err(&format!("{pw:?} should have been rejected"))
+                .to_string();
+            assert!(
+                err.contains("forbids"),
+                "{pw:?} rejected for the wrong reason: {err}"
+            );
+        }
     }
 }

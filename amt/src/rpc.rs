@@ -580,25 +580,35 @@ fn kvm_put_body(
     let uri = format!("{IPS}IPS_KVMRedirectionSettingData");
     let mut body = format!("<h:IPS_KVMRedirectionSettingData xmlns:h=\"{uri}\">");
     for name in KVM_PUT_ORDER {
-        let value = match *name {
+        // Every arm yields text that is already XML-ready. Values echoed from
+        // the Get are encoded as the firmware sent them -- `xml_text` returns
+        // the raw span and decodes nothing -- so escaping them again would
+        // turn `A&amp;B` into `A&amp;amp;B` and corrupt a value on round trip.
+        // Only the password is raw input, so only it is escaped here; the
+        // booleans and integers cannot contain a metacharacter.
+        let encoded = match *name {
             "Is5900PortEnabled" => Some(port_5900.to_string()),
             "OptInPolicy" => Some(opt_in.to_string()),
             "SessionTimeout" => Some(session_timeout.to_string()),
-            "RFBPassword" => rfb_password.map(str::to_owned),
+            "RFBPassword" => rfb_password.map(xml_escape),
             other => xml_text(current, other).map(str::to_owned),
         };
-        if let Some(v) = value {
-            let _ = write!(body, "<h:{name}>{}</h:{name}>", xml_escape(&v));
+        if let Some(v) = encoded {
+            let _ = write!(body, "<h:{name}>{v}</h:{name}>");
         }
     }
     body.push_str("</h:IPS_KVMRedirectionSettingData>");
     body
 }
 
-/// Escape a value for an XML text node. The RFB password is chosen by a human
-/// and must contain a special character, so `&`, `<` and `>` are live
+/// Escape *raw* text for an XML text node. The RFB password is chosen by a
+/// human and must contain a special character, so `&`, `<` and `>` are live
 /// possibilities — unescaped, they make the Put a malformed document and AMT
 /// reports the useless `The XML content is not valid.`
+///
+/// Only ever apply this to input that is not already encoded: text read back
+/// out of a response with [`xml_text`] arrives encoded, and escaping it a
+/// second time changes the value.
 fn xml_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for c in value.chars() {
@@ -1140,25 +1150,62 @@ mod tests {
     /// order the Get supplied. AMT rejects the alphabetical form outright, so
     /// this is the difference between a working call and
     /// `InvalidRepresentation`.
+    /// The sequence AMT 12.0.24 accepts, written out literally rather than
+    /// derived from [`KVM_PUT_ORDER`]. Deriving it from the same constant the
+    /// builder uses would only prove the builder is self-consistent — the
+    /// firmware cares about this exact order, so the test has to state it
+    /// independently to be able to catch the constant itself being wrong.
+    const EXPECTED_PUT_SEQUENCE: &[&str] = &[
+        "ElementName",
+        "InstanceID",
+        "EnabledByMEBx",
+        "BackToBackFbMode",
+        "Is5900PortEnabled",
+        "OptInPolicy",
+        "OptInPolicyTimeout",
+        "SessionTimeout",
+        "RFBPassword",
+        "DefaultScreen",
+    ];
+
     #[test]
     fn kvm_put_body_is_in_schema_order_not_alphabetical() {
         let body = kvm_put_body(KVM_GET, Some("Ab3!defG"), true, false, 0);
-        let positions: Vec<usize> = KVM_PUT_ORDER
-            .iter()
-            .map(|f| {
-                body.find(&format!("<h:{f}>"))
-                    .unwrap_or_else(|| panic!("{f} missing from Put body: {body}"))
+        let emitted: Vec<&str> = body
+            .match_indices("<h:")
+            .filter_map(|(i, _)| {
+                let rest = &body[i + 3..];
+                let name = &rest[..rest.find('>')?];
+                // Skip the wrapper element, which carries an xmlns attribute.
+                (!name.contains(' ')).then_some(name)
             })
             .collect();
-        let mut sorted = positions.clone();
-        sorted.sort_unstable();
-        assert_eq!(positions, sorted, "fields out of schema order: {body}");
-        // Alphabetical would put BackToBackFbMode first; schema order does not.
-        assert!(body.starts_with(
-            "<h:IPS_KVMRedirectionSettingData xmlns:h=\
-             \"http://intel.com/wbem/wscim/1/ips-schema/1/IPS_KVMRedirectionSettingData\">\
-             <h:ElementName>"
-        ));
+        assert_eq!(
+            emitted, EXPECTED_PUT_SEQUENCE,
+            "Put body is not in the sequence AMT accepts: {body}"
+        );
+    }
+
+    /// Values echoed from the Get are already XML-encoded; escaping them again
+    /// silently rewrites them. `InstanceID` is an immutable key, so corrupting
+    /// it on round trip is how a working Put starts failing.
+    #[test]
+    fn kvm_put_body_does_not_double_escape_echoed_fields() {
+        let encoded = "<g:IPS_KVMRedirectionSettingData xmlns:g=\"urn:x\">\
+             <g:ElementName>Tom &amp; Jerry</g:ElementName>\
+             <g:InstanceID>a&lt;b</g:InstanceID>\
+             </g:IPS_KVMRedirectionSettingData>";
+        let body = kvm_put_body(encoded, None, true, false, 0);
+        assert!(
+            body.contains("<h:ElementName>Tom &amp; Jerry</h:ElementName>"),
+            "echoed value was re-escaped: {body}"
+        );
+        assert!(
+            body.contains("<h:InstanceID>a&lt;b</h:InstanceID>"),
+            "echoed value was re-escaped: {body}"
+        );
+        assert!(!body.contains("&amp;amp;"), "double-escaped: {body}");
+        assert!(!body.contains("&amp;lt;"), "double-escaped: {body}");
     }
 
     #[test]
