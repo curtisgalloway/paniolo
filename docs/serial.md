@@ -149,6 +149,24 @@ After an upgrade or rebuild, a daemon still running the old binary is flagged
 `paniolo serial watch` auto-restarts a stale daemon, or restart it explicitly
 with `paniolo daemons restart serialcap` (see [architecture](dev/architecture.md)).
 
+**An *untracked* daemon is one that outlived its discovery file.** The file is
+paniolo's only record of a running daemon, and on Linux it sits in `/tmp`,
+which systemd ages out — Debian's stock policy is `q /tmp 1777 root root 10d`,
+so a daemon that has simply been running for ten days without a command against
+it loses the file it published at start. It keeps running and keeps the serial
+ports, while `serial show` reports the channel stopped and `serial watch`
+spawns a replacement that cannot open the port.
+
+`serial show` reports such a daemon as `running, untracked (pid N)`,
+`paniolo daemons` lists it under **Untracked daemons**, and both
+`serial watch` and `serial stop` reap it (`SIGTERM`, then `SIGKILL`). Its port
+and token died with the file, so a signal is the only handle left. A daemon is
+matched to the channel by the devices its command line names — serialcap's
+repeated `--interface NAME=DEVICE@BAUD[:SENSE]` — and holding any one of the
+target's ports is enough, since that is the port the replacement would fail to
+open. See [video.md](video.md) for why the file goes missing and the
+`tmpfiles.d` drop-in that stops it.
+
 ---
 
 ## Querying captured output

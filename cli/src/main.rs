@@ -997,12 +997,16 @@ fn cmd_daemons_list() -> Result<()> {
     if !untracked.is_empty() {
         println!("\nUntracked daemons (running, but no discovery file names them):");
         for u in &untracked {
-            let device = u.device.as_deref().unwrap_or("-");
-            println!("  {}\tpid {}\tport ?\t{}", u.name, u.pid, device);
+            println!(
+                "  {}\tpid {}\tport ?\t{}",
+                u.name,
+                u.pid,
+                u.devices_display()
+            );
         }
         println!(
-            "These still hold their devices. `paniolo video watch` reclaims a video one; \n\
-             `paniolo daemons stop --all` reaps the rest."
+            "These still hold their devices. `paniolo video watch` / `paniolo serial watch` \n\
+             reclaim a capture one; `paniolo daemons stop --all` reaps the rest."
         );
     }
     if !strays.is_empty() {
@@ -2052,8 +2056,22 @@ fn serial_cmd(lab_flag: Option<&str>, cmd: SerialCmd) -> Result<()> {
         SerialCmd::Stop { target } => {
             // Resolve the target (routing to its serial channel's host if
             // remote) so we stop the right per-target daemon instance.
-            let (target, _serials) =
+            let (target, serials) =
                 serial_runtime(lab_flag, target.as_deref(), None, dispatch::Mode::Reexec)?;
+            // An orphan has no discovery file, so `serialcap stop` cannot see
+            // it and the operator has nothing left but `ps` and `kill` (#187).
+            // Only consulted when nothing is tracked: a healthy daemon is never
+            // in this set, and its own stop is the clean shutdown.
+            if serial::daemon(&target).is_none() {
+                if let Some(orphan) = serial::untracked(&serials) {
+                    reap_untracked(&orphan)?;
+                    println!(
+                        "Untracked serial daemon for '{target}' (pid {}) stopped.",
+                        orphan.pid
+                    );
+                    return Ok(());
+                }
+            }
             let code = serial::stop_daemon(&target)?;
             if code == 0 {
                 println!("Serial daemon for '{target}' stopped.");
@@ -2805,6 +2823,15 @@ fn cmd_serial_watch(lab_flag: Option<&str>, target: Option<&str>, port: u16) -> 
             return Ok(());
         }
     }
+    // Nothing tracked is running. An orphan that outlived its discovery file
+    // still holds the serial ports and the advisory lock, so a replacement
+    // started over the top of it dies on the lock while every other command
+    // keeps calling the channel stopped (#187).
+    if replaced.is_none() {
+        if let Some(orphan) = serial::untracked(&serials) {
+            reap_untracked(&orphan)?;
+        }
+    }
     serial::start_daemon(&serials, port, &target)?;
     let names: Vec<&str> = serials.iter().map(|s| s.name.as_str()).collect();
     eprintln!(
@@ -2929,7 +2956,17 @@ fn cmd_serial_show(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
             "daemon\trunning at {url}{}",
             stale_note(serial::DAEMON, &target)
         ),
-        None => println!("daemon\tstopped"),
+        // "stopped" has to mean the ports are free. A daemon whose discovery
+        // file was deleted under it is still running and still holding them
+        // (#187).
+        None => match serial::untracked(&serials) {
+            Some(u) => println!(
+                "daemon\trunning, untracked (pid {}) — no discovery file; \
+                 `paniolo serial watch` reclaims it",
+                u.pid
+            ),
+            None => println!("daemon\tstopped"),
+        },
     }
     Ok(())
 }

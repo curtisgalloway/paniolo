@@ -440,10 +440,16 @@ Python tree below:
   daemon has been running ten days without a command against it; the daemon
   keeps its capture device, `show` calls the channel stopped, and the next
   `watch` dies on the advisory lock the orphan still holds. `paniolo daemons`
-  lists these separately, `video show` reports `running, untracked (pid N)`,
-  and `video watch` / `video stop` reap one (TERM, then KILL) before starting a
-  replacement — its port and token died with the file, so a signal is the only
-  handle left (`daemons::untracked_of`/`untracked_on_device`, GitHub #187). The
+  lists these separately, `video show` / `serial show` report `running,
+  untracked (pid N)`, and `video watch` / `video stop` / `serial watch` /
+  `serial stop` reap one (TERM, then KILL) before starting a replacement — its
+  port and token died with the file, so a signal is the only handle left
+  (`daemons::untracked_of`/`untracked_on_devices`, GitHub #187). A daemon is
+  matched to a channel by the devices its command line names, and the two
+  capture daemons spell that differently: hdmicap takes one `--device`,
+  serialcap repeats `--interface NAME=DEVICE@BAUD[:SENSE]`, so the device is
+  parsed out of each interface value. An overlap of one device is enough — that
+  is the one the replacement would fail to open. The
   `.deb` ships `/usr/lib/tmpfiles.d/paniolo.conf` (`x /tmp/paniolo-*`) so the
   files stop being swept; a `make install` host should add that drop-in itself.
   A daemon keeps running its binary from when it started; an upgrade or rebuild

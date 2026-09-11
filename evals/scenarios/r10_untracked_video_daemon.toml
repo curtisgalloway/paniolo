@@ -22,6 +22,8 @@ reference = [
   'paniolo video show                   # running, untracked (pid N)',
   'paniolo video watch                  # reaps the orphan, then starts a fresh daemon',
 ]
+# The serial channel behaves identically (`paniolo serial show` / `watch` /
+# `stop`); the same reasoning has to transfer.
 
 seed = "bench.toml"
 
