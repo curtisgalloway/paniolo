@@ -1199,14 +1199,25 @@ fn cmd_daemons_restart(
 /// exit — not just for its discovery file to clear, which a daemon releases
 /// while still shutting down. Until the process is gone it owns the device (a
 /// V4L2 node or a serial port can't be opened twice), and while it is alive
-/// its discovery file can still satisfy `wait_for_daemon` on behalf of a
+/// its discovery file can still satisfy a startup wait on behalf of a
 /// replacement that actually failed to start. A process that overstays the
 /// 5 s grace is SIGKILLed — after re-checking, by name, that the pid is still
 /// the daemon — and one that survives even that is an error rather than a
 /// silent race. Every path that replaces a running capture daemon comes
 /// through here: `daemons restart`, and the stale-binary restart in
 /// `serial watch` / `video watch`.
-fn stop_capture_daemon_and_wait(name: &str, target: &str) -> Result<()> {
+///
+/// Returns the pid it stopped, if there was one, so the caller can refuse that
+/// pid's leftover discovery file while waiting for the replacement — see
+/// [`daemons::wait_for_replacement`].
+///
+/// Two things here exist because of GitHub #193, where a restart reported
+/// success while the replacement had died on the old daemon's advisory lock:
+/// the wait is for [`state::is_named_process_pending`] rather than a bare name
+/// match (a SIGKILLed process reads as alive-but-nameless while the kernel is
+/// still finishing with it, which released the device early), and the killed
+/// daemon's discovery file is removed here, since it is not around to do it.
+fn stop_capture_daemon_and_wait(name: &str, target: &str) -> Result<Option<i32>> {
     let old_pid = daemons::daemon_pid(name, Some(target));
     // The daemon's own `stop` owns the clean shutdown; it failing (already
     // gone, no discovery file) is not fatal — the pid wait is the real gate.
@@ -1216,30 +1227,35 @@ fn stop_capture_daemon_and_wait(name: &str, target: &str) -> Result<()> {
         video::stop_daemon(target)
     };
     let Some(pid) = old_pid else {
-        return Ok(());
+        return Ok(None);
     };
-    let still_it = || state::is_named_child_alive(pid, name);
+    let pending = || state::is_named_process_pending(pid, name);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while still_it() && std::time::Instant::now() < deadline {
+    while pending() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    if !still_it() {
-        return Ok(());
+    if pending() {
+        // Only signal a pid that is still identifiably the daemon; a pid in
+        // teardown is already dying and one that was recycled is not ours.
+        if state::is_named_child_alive(pid, name) {
+            eprintln!("old {name} daemon (pid {pid}) ignored stop; killing it");
+            platform::try_signal_pid(pid, platform::Signal::Kill)
+                .map_err(|e| anyhow!("could not SIGKILL the old {name} daemon (pid {pid}): {e}"))?;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while pending() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if pending() {
+            bail!(
+                "old {name} daemon (pid {pid}) is still running after SIGKILL; not starting a \
+                 replacement that would race it for the device"
+            );
+        }
     }
-    eprintln!("old {name} daemon (pid {pid}) ignored stop; killing it");
-    platform::try_signal_pid(pid, platform::Signal::Kill)
-        .map_err(|e| anyhow!("could not SIGKILL the old {name} daemon (pid {pid}): {e}"))?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while still_it() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    if still_it() {
-        bail!(
-            "old {name} daemon (pid {pid}) is still running after SIGKILL; not starting a \
-             replacement that would race it for the device"
-        );
-    }
-    Ok(())
+    // A daemon that did not exit gracefully leaves its discovery file behind.
+    daemons::remove_discovery_for_pid(name, Some(target), pid);
+    Ok(Some(pid))
 }
 
 /// TERM (then KILL) an untracked daemon and wait for the process to go.
@@ -1312,15 +1328,30 @@ fn restart_capture_daemon(lab: &Lab, name: &str, target: &str) -> Result<String>
         bail!("'{name}' is not a restartable capture daemon");
     };
 
-    stop_capture_daemon_and_wait(name, target)?;
+    let replaced = stop_capture_daemon_and_wait(name, target)?;
 
     match start {
         Start::Serial(serials) => serial::start_daemon(&serials, 0, target)?,
         Start::Video(device, mode) => video::start_daemon(&device, 0, target, mode.as_deref())?,
     }
-    daemons::wait_for_daemon(name, Some(target), std::time::Duration::from_secs(5)).ok_or_else(
-        || daemons::start_failure(name, Some(target), std::time::Duration::from_secs(5)),
-    )
+    wait_for_started_daemon(name, Some(target), replaced)
+}
+
+/// Wait for a just-spawned daemon to publish discovery, refusing the discovery
+/// file of `replaced` (the pid this one is taking over from, if any) — a
+/// SIGKILLed daemon's file outlives it, and accepting it reports a restart
+/// that never happened (GitHub #193). Failure carries the daemon's own stderr.
+fn wait_for_started_daemon(
+    name: &str,
+    instance: Option<&str>,
+    replaced: Option<i32>,
+) -> Result<String> {
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    let url = match replaced {
+        Some(old) => daemons::wait_for_replacement(name, instance, TIMEOUT, old),
+        None => daemons::wait_for_daemon(name, instance, TIMEOUT),
+    };
+    url.ok_or_else(|| daemons::start_failure(name, instance, TIMEOUT))
 }
 
 // ── helper passthrough ──────────────────────────────────────────────────────
@@ -2764,10 +2795,11 @@ fn cmd_serial_watch(lab_flag: Option<&str>, target: Option<&str>, port: u16) -> 
     if serials.is_empty() {
         bail!("no serial interfaces configured (paniolo serial add ...)");
     }
+    let mut replaced = None;
     if let Some(url) = serial::daemon_url(&target) {
         if daemons::binary_is_stale(serial::DAEMON, Some(&target)) == Some(true) {
             eprintln!("Serial daemon for '{target}' was built from an older binary; restarting…");
-            stop_capture_daemon_and_wait(serial::DAEMON, &target)?;
+            replaced = stop_capture_daemon_and_wait(serial::DAEMON, &target)?;
         } else {
             println!("Serial daemon for '{target}' already running at {url}");
             return Ok(());
@@ -2780,21 +2812,9 @@ fn cmd_serial_watch(lab_flag: Option<&str>, target: Option<&str>, port: u16) -> 
         serials.len(),
         names.join(", ")
     );
-    match daemons::wait_for_daemon(
-        serial::DAEMON,
-        Some(&target),
-        std::time::Duration::from_secs(5),
-    ) {
-        Some(url) => {
-            println!("Serial daemon started. {url}");
-            Ok(())
-        }
-        None => Err(daemons::start_failure(
-            serial::DAEMON,
-            Some(&target),
-            std::time::Duration::from_secs(5),
-        )),
-    }
+    let url = wait_for_started_daemon(serial::DAEMON, Some(&target), replaced)?;
+    println!("Serial daemon started. {url}");
+    Ok(())
 }
 
 fn cmd_serial_send(
@@ -2991,6 +3011,7 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
             let device = v
                 .device
                 .ok_or_else(|| anyhow!("video channel for '{target}' has no device set"))?;
+            let mut replaced = None;
             if let Some(url) = video::preview_url(&target) {
                 let stale = daemons::binary_is_stale(video::DAEMON, Some(&target)) == Some(true);
                 if !restart && !stale {
@@ -3002,7 +3023,7 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
                         "Video daemon for '{target}' was built from an older binary; restarting…"
                     );
                 }
-                stop_capture_daemon_and_wait(video::DAEMON, &target)?;
+                replaced = stop_capture_daemon_and_wait(video::DAEMON, &target)?;
             }
             // Nothing tracked is running. An orphan that outlived its
             // discovery file still holds the capture device and the advisory
@@ -3014,24 +3035,12 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
             }
             eprintln!("Starting video daemon for '{target}' ('{device}')…");
             video::start_daemon(&device, port, &target, v.ocr_mode.as_deref())?;
-            match daemons::wait_for_daemon(
-                video::DAEMON,
-                Some(&target),
-                std::time::Duration::from_secs(5),
-            ) {
-                Some(url) => {
-                    // A browser can only present the token as ?token=, so the
-                    // URL a human opens carries it.
-                    let url = video::preview_url(&target).unwrap_or(url);
-                    println!("Video daemon started. Preview at {url}");
-                    Ok(())
-                }
-                None => Err(daemons::start_failure(
-                    video::DAEMON,
-                    Some(&target),
-                    std::time::Duration::from_secs(5),
-                )),
-            }
+            let url = wait_for_started_daemon(video::DAEMON, Some(&target), replaced)?;
+            // A browser can only present the token as ?token=, so the URL a
+            // human opens carries it.
+            let url = video::preview_url(&target).unwrap_or(url);
+            println!("Video daemon started. Preview at {url}");
+            Ok(())
         }
         VideoCmd::Stop { target } => {
             // Resolve the target (routing to its video channel's host if

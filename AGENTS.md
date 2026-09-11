@@ -455,6 +455,18 @@ Python tree below:
   channel config; it waits for the old process to exit so the new one doesn't
   race it for an exclusive device). netbootd is not auto-restarted — cycle it
   via `paniolo netboot start/stop`, since that touches an in-flight boot.
+  Replacing a daemon has two traps, both of which bit in #193 when a restart
+  across the `0.1.17` token boundary made every graceful stop fail and every
+  daemon get SIGKILLed. First, "the old process is gone" is
+  `state::is_named_process_pending`, not a bare name match: a process between
+  SIGKILL and reaping is alive to `kill(pid, 0)` and *nameless* to a
+  command-line match, so a name match alone releases the device to a
+  replacement while the corpse still holds its advisory lock. Second, a killed
+  daemon cannot remove its own discovery file, so the replacement's startup
+  wait must refuse it — `daemons::wait_for_replacement` rejects the pid being
+  replaced, and `stop_capture_daemon_and_wait` reaps the file (guarded by pid)
+  once the process is gone. Without both, a failed restart reports success and
+  quotes the dead daemon's port as the new one's.
 
 ```
 cli/src/

@@ -135,6 +135,33 @@ pub fn is_named_child_alive(pid: i32, needle: &str) -> bool {
     is_pid_alive(pid) && pid_cmdline(pid).contains(needle)
 }
 
+/// The classification behind [`is_named_process_pending`], over the two facts
+/// it reads: pure, so the teardown case is testable without a process to kill.
+///
+/// `cmdline` empty while the pid is alive is the case that matters. On Linux
+/// `/proc/<pid>/cmdline` reads empty for a process between its death and its
+/// reaping, and `ps -o args=` on macOS does the same for a `<defunct>` entry —
+/// so a process that has just been SIGKILLed reports *alive* to `kill(pid, 0)`
+/// and *not ours* to a name match, at the same instant. Reading that as "the
+/// daemon is gone" releases the device before the kernel has, which is how a
+/// replacement ends up losing the race for an exclusive device to a corpse
+/// (GitHub #193). A non-empty command line that is not ours is different: that
+/// pid has genuinely been recycled for something else, and waiting on it would
+/// never end.
+fn named_process_pending(alive: bool, cmdline: &str, needle: &str) -> bool {
+    alive && (cmdline.is_empty() || cmdline.contains(needle))
+}
+
+/// True while `pid` must still be treated as the named daemon — it is alive
+/// and either still running that program or showing no command line at all
+/// (see [`named_process_pending`]). The test to wait on before taking over a
+/// daemon's exclusive device; [`is_named_child_alive`] answers the different
+/// question of whether a pid is *identifiably* still that daemon, which is the
+/// right test before signalling it.
+pub fn is_named_process_pending(pid: i32, needle: &str) -> bool {
+    named_process_pending(is_pid_alive(pid), &pid_cmdline(pid), needle)
+}
+
 /// True only if the netboot process for `target` is alive (rust engine: the
 /// single netbootd; legacy python engine: both children).
 pub fn is_netboot_running(target: &str) -> bool {
@@ -212,5 +239,39 @@ mod tests {
     #[test]
     fn target_dir_leaves_a_plain_name_unchanged() {
         assert_eq!(target_dir("pi5"), state_dir().join("pi5"));
+    }
+
+    /// The case that cost a capture daemon (GitHub #193): a process between
+    /// SIGKILL and reaping is alive to `kill(pid, 0)` and nameless to a
+    /// command-line match, at the same instant. Reading that as "gone" hands
+    /// the device to a replacement while the corpse still holds it. The two
+    /// predicates must disagree here, and agree everywhere else.
+    #[test]
+    fn a_process_in_teardown_is_pending_but_not_identifiably_ours() {
+        // alive, no command line — the teardown window.
+        assert!(named_process_pending(true, "", "hdmicap"));
+        // The old test, spelled out, is what read this as finished.
+        assert!(!(true && "".contains("hdmicap")));
+
+        // Alive and still running the daemon: pending, and identifiable.
+        assert!(named_process_pending(
+            true,
+            "/usr/libexec/paniolo/bin/hdmicap daemon --device /dev/video0",
+            "hdmicap"
+        ));
+        // A pid the kernel handed to something else: not ours, and waiting on
+        // it would never end.
+        assert!(!named_process_pending(
+            true,
+            "/usr/bin/vim notes.txt",
+            "hdmicap"
+        ));
+        // Dead is dead, whatever the command line said.
+        assert!(!named_process_pending(false, "", "hdmicap"));
+        assert!(!named_process_pending(
+            false,
+            "/usr/libexec/paniolo/bin/hdmicap daemon",
+            "hdmicap"
+        ));
     }
 }
