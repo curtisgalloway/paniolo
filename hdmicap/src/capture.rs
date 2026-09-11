@@ -396,6 +396,50 @@ mod linux {
 
     const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
+    /// How long a candidate format gets to deliver its first frame before the
+    /// ladder moves on (see [`LinuxV4LBackend::open`]). Deliberately shorter
+    /// than [`FRAME_TIMEOUT`]: a device that is streaming at all delivers well
+    /// inside it, even at 1 fps, and this is paid once per rejected entry at
+    /// open time.
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// Bookkeeping for one walk over [`FORMATS`].
+    #[derive(Default)]
+    struct Ladder {
+        /// Every *negotiated* `(w, h, fourcc)` already attempted. Because
+        /// `VIDIOC_S_FMT` substitutes rather than fails, two different entries
+        /// can land on the same actual format; without this the second one
+        /// spends another [`PROBE_TIMEOUT`] re-learning that it does not work.
+        tried: Vec<(u32, u32, FourCC)>,
+        /// The first *requested* entry whose buffers allocated but which
+        /// delivered no frame — the fallback when nothing streams at all.
+        allocated: Option<(u32, u32, &'static [u8; 4])>,
+    }
+
+    impl Ladder {
+        /// Record `actual` as attempted; `false` if an earlier entry already
+        /// negotiated down to exactly this format, so the caller should skip it.
+        fn first_try(&mut self, actual: &Format) -> bool {
+            let key = (actual.width, actual.height, actual.fourcc);
+            if self.tried.contains(&key) {
+                return false;
+            }
+            self.tried.push(key);
+            true
+        }
+
+        /// Note that `entry` got as far as allocating buffers. Only the first
+        /// such entry is kept: `FORMATS` is ordered best-first, so the earliest
+        /// one that allocated is the best fallback.
+        fn note_allocated(&mut self, entry: (u32, u32, &'static [u8; 4])) {
+            self.allocated.get_or_insert(entry);
+        }
+
+        fn fallback(&self) -> Option<(u32, u32, &'static [u8; 4])> {
+            self.allocated
+        }
+    }
+
     pub struct LinuxV4LBackend {
         stream: Stream<'static>,
         dev: Box<Device>,
@@ -404,43 +448,117 @@ mod linux {
     }
 
     impl LinuxV4LBackend {
+        /// Open `spec` on the best format it will actually stream.
+        ///
+        /// Each entry of [`FORMATS`] is selected, given buffers, and then made
+        /// to produce a frame. The frame is the point: allocating buffers and
+        /// running a stream are different things, and a mode can pass
+        /// `VIDIOC_REQBUFS` and then fail once `STREAMON` starts moving data —
+        /// classically uncompressed 1080p over USB 2.0, about 4.1 MB a frame
+        /// against 480 Mbps. Accepting on allocation alone turned the list into
+        /// a first-match-wins constant with no way back into the loop (#188).
+        ///
+        /// If *nothing* delivers a frame, the first entry that at least
+        /// allocated is opened anyway rather than failing: a capture device
+        /// with no input signal is a normal state here (the target is off, or
+        /// not booted yet), some devices deliver no frames at all in it, and
+        /// the daemon must be sitting on the best format when a signal finally
+        /// arrives. That keeps the no-signal case behaving exactly as it did
+        /// before the probe existed.
         pub fn open(spec: &DeviceSpec) -> Result<Self> {
             let idx = resolve(spec)?;
             let dev = Box::new(
                 Device::new(idx as usize).map_err(|e| anyhow!("open /dev/video{idx}: {e}"))?,
             );
 
+            let mut ladder = Ladder::default();
             let mut last_err = anyhow!("no formats succeeded");
             for &(w, h, fourcc) in FORMATS {
                 let fmt = Format::new(w, h, FourCC::new(fourcc));
                 if dev.set_format(&fmt).is_err() {
                     continue;
                 }
+                // What the driver actually gave us, which is not necessarily
+                // what was asked for.
+                let actual = dev.format().unwrap_or(fmt);
+                if !ladder.first_try(&actual) {
+                    continue;
+                }
                 let dev_ref: &'static Device = unsafe { &*(dev.as_ref() as *const Device) };
-                match Stream::with_buffers(dev_ref, Type::VideoCapture, 4) {
-                    Ok(mut stream) => {
-                        stream.set_timeout(FRAME_TIMEOUT);
-                        let actual_fmt = dev.format().unwrap_or(fmt);
-                        let is_mjpeg = actual_fmt.fourcc == FourCC::new(b"MJPG");
-                        tracing::info!(
-                            "capture opened {}x{} {:?}",
-                            actual_fmt.width,
-                            actual_fmt.height,
-                            if is_mjpeg { "MJPEG" } else { "YUYV" }
-                        );
-                        return Ok(LinuxV4LBackend {
-                            stream,
-                            dev,
-                            dims: (actual_fmt.width, actual_fmt.height),
-                            is_mjpeg,
-                        });
-                    }
+                let mut stream = match Stream::with_buffers(dev_ref, Type::VideoCapture, 4) {
+                    Ok(s) => s,
                     Err(e) => {
                         last_err = anyhow!("stream init {w}x{h}: {e}");
+                        continue;
                     }
+                };
+                // `next()` is what issues STREAMON in this crate, so this call
+                // is the first moment the format is really exercised. Dropping
+                // the stream on failure issues STREAMOFF and releases the
+                // buffers, leaving the device free for the next entry.
+                stream.set_timeout(PROBE_TIMEOUT);
+                if let Err(e) = stream.next() {
+                    tracing::warn!(
+                        "{}x{} {} allocated buffers but produced no frame in {:?}: {e}",
+                        actual.width,
+                        actual.height,
+                        actual.fourcc,
+                        PROBE_TIMEOUT
+                    );
+                    last_err = anyhow!(
+                        "no frame from {}x{} {}: {e}",
+                        actual.width,
+                        actual.height,
+                        actual.fourcc
+                    );
+                    ladder.note_allocated((w, h, fourcc));
+                    continue;
                 }
+                stream.set_timeout(FRAME_TIMEOUT);
+                tracing::info!(
+                    "capture opened {}x{} {:?}",
+                    actual.width,
+                    actual.height,
+                    if actual.fourcc == FourCC::new(b"MJPG") {
+                        "MJPEG"
+                    } else {
+                        "YUYV"
+                    }
+                );
+                return Ok(Self::accept(stream, dev, &actual));
             }
-            Err(last_err)
+
+            let Some((w, h, fourcc)) = ladder.fallback() else {
+                return Err(last_err);
+            };
+            let fmt = Format::new(w, h, FourCC::new(fourcc));
+            dev.set_format(&fmt)
+                .map_err(|e| anyhow!("re-select {w}x{h}: {e}"))?;
+            let actual = dev.format().unwrap_or(fmt);
+            let dev_ref: &'static Device = unsafe { &*(dev.as_ref() as *const Device) };
+            let mut stream = Stream::with_buffers(dev_ref, Type::VideoCapture, 4)
+                .map_err(|e| anyhow!("stream init {w}x{h}: {e}"))?;
+            stream.set_timeout(FRAME_TIMEOUT);
+            tracing::warn!(
+                "no capture format delivered a frame; opening {}x{} {} anyway \
+                 (buffers allocate — frames should follow once there is a signal)",
+                actual.width,
+                actual.height,
+                actual.fourcc
+            );
+            Ok(Self::accept(stream, dev, &actual))
+        }
+
+        /// Build the backend around an accepted stream. `dev` moves into the
+        /// struct; the stream's `'static` reference aliases the same heap
+        /// allocation, which moving the `Box` does not disturb.
+        fn accept(stream: Stream<'static>, dev: Box<Device>, actual: &Format) -> Self {
+            LinuxV4LBackend {
+                stream,
+                dev,
+                dims: (actual.width, actual.height),
+                is_mjpeg: actual.fourcc == FourCC::new(b"MJPG"),
+            }
         }
     }
 
@@ -487,6 +605,49 @@ mod linux {
                     height: h,
                 })
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// `VIDIOC_S_FMT` substitutes the driver's nearest match instead of
+        /// failing, so asking for 1080p MJPG and then 1080p YUYV on a device
+        /// that offers neither lands on the same actual format twice. Probing
+        /// it twice costs a second `PROBE_TIMEOUT` for an answer already known.
+        #[test]
+        fn a_format_the_driver_substitutes_to_twice_is_tried_once() {
+            let mut ladder = Ladder::default();
+            let substituted = Format::new(1280, 720, FourCC::new(b"YUYV"));
+            assert!(
+                ladder.first_try(&substituted),
+                "the first ask must be tried"
+            );
+            assert!(
+                !ladder.first_try(&substituted),
+                "a repeat of an already-tried negotiated format must be skipped"
+            );
+            // A genuinely different negotiated format is still its own attempt.
+            assert!(ladder.first_try(&Format::new(1280, 720, FourCC::new(b"MJPG"))));
+            assert!(ladder.first_try(&Format::new(640, 480, FourCC::new(b"YUYV"))));
+        }
+
+        /// `FORMATS` is ordered best-first, so when nothing streams the
+        /// fallback must be the *first* entry that allocated, not the last one
+        /// tried — otherwise a no-signal device opens at 640x480 and is stuck
+        /// there when a signal finally arrives.
+        #[test]
+        fn the_fallback_is_the_first_entry_that_allocated() {
+            let mut ladder = Ladder::default();
+            assert_eq!(
+                ladder.fallback(),
+                None,
+                "nothing allocated, nothing to fall back to"
+            );
+            ladder.note_allocated((1920, 1080, b"MJPG"));
+            ladder.note_allocated((640, 480, b"YUYV"));
+            assert_eq!(ladder.fallback(), Some((1920, 1080, b"MJPG")));
         }
     }
 }
