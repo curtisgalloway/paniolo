@@ -1,14 +1,16 @@
 # Release train profile: paniolo
 
-Derived from commit b1b8654 on 2026-09-11. Executed by the `release-train`
+Derived from commit 5256dc1 on 2026-09-11. Executed by the `release-train`
 skill (public-skills, `plugins/dev-tools/skills/release-train`); kept honest by
 its `profile_check.py` against the `## Sources` table below. Read `AGENTS.md`
 "Cutting a release" first: everything there still holds, this file only adds
 what the train needs to build, install and run each channel before the tag.
 
 The first dry run (2026-09-10) PASSed the homebrew, deb and source arms and
-FAILed the windows arm (the zip shipped no skills; fixed on branch
-`windows-zip-skills`), so every arm below except windows is verified once.
+FAILed the windows arm (the zip shipped no skills; fixed in #197, which also
+added the zip smoke step to `package-windows`), so every arm below except
+windows is verified once by the train; windows is verified by that fix's
+bench-host run and by CI's new smoke step.
 
 ## Project
 
@@ -134,15 +136,15 @@ feeds needs re-reading before `--update` re-pins it.
 
 | path | blob | feeds |
 |---|---|---|
-| `.github/workflows/release.yml` | 2269f9768b1d | Channels (every arm's build and staging), Publish |
+| `.github/workflows/release.yml` | 92b68a1e95a6 | Channels (every arm's build and staging), Publish |
 | `.github/workflows/docs.yml` | 2d69ff629252 | Publish: re-verify apt |
 | `packaging/nfpm.yaml` | b348d64432f4 | Channels: deb |
 | `packaging/scripts/build-apt-repo.sh` | fb2205eeab8e | Channels: deb, install like a user |
 | `Makefile` | 449aa1fe4b37 | Project: helpers; Channels: source |
 | `cli/src/setup.rs` | 67a6d1e41824 | Channels: source |
-| `cli/src/skills.rs` | 299ad01f27bc | Smoke contract S2; Channels: homebrew, windows |
+| `cli/src/skills.rs` | eada6fa6ec0c | Smoke contract S2; Channels: homebrew, windows |
 | `cli/src/daemons.rs` | 2f8f0ec1f955 | Smoke contract S3 |
 | `scripts/ci-coverage-check.sh` | 8d0d03ddf496 | Project: helpers |
 | `scripts/sync-brik.sh` | b8b5a15775a9 | Channels: windows |
 | `README.md` | 00ee1992abb7 | Channels: source; Publish: re-verify apt |
-| `AGENTS.md` | fadf34fbea9c | Project: bump rules, tag format; Publish |
+| `AGENTS.md` | 78496253ba4d | Project: bump rules, tag format; Publish |
