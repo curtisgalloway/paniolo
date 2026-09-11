@@ -167,6 +167,14 @@ serialcap's capture files are created 0600:
 | serialcap capture log (per interface) | `/tmp/paniolo-<uid>/serialcap/<target>/capture/<name>/serial.jsonl(.1..)` |
 | serialcap pending (unterminated) line | `/tmp/paniolo-<uid>/serialcap/<target>/capture/<name>/pending.json` |
 
+Nothing rewrites these runtime files after the daemon that publishes them
+starts, so a `/tmp` age policy (Debian's stock `q /tmp 1777 root root 10d`)
+deletes them out from under a long-running daemon — which then keeps its device
+while paniolo reports the channel stopped. The `.deb` ships
+`/usr/lib/tmpfiles.d/paniolo.conf` (`x /tmp/paniolo-*`) to prevent that, and
+`paniolo daemons` / `video show` / `video watch` recognize and reap an orphan
+that happens anyway (GitHub #187).
+
 ## 5. Subsystems
 
 ### Netboot / deploy ([`netboot.md`](../netboot.md))

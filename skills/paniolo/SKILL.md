@@ -709,6 +709,15 @@ cleanly cycles serialcap/hdmicap from the current binary, reusing the lab's
 channel config. `serial watch` / `video watch` also auto-restart a stale
 instance. netbootd is excluded — cycle it via `paniolo netboot start/stop`.
 
+**Untracked daemons: `show` says stopped, `watch` says already running.** A
+daemon's discovery file is paniolo's only record of it, and on Linux `/tmp` is
+swept on an age policy (Debian: 10 days), so a long-running daemon can lose that
+file while still holding its capture device. `paniolo video show` reports it as
+`running, untracked (pid N)` and `paniolo daemons` lists it under **Untracked
+daemons**; `paniolo video watch` and `paniolo video stop` reap it for you. Don't
+reach for `ps`/`kill` — and don't conclude the device is free just because a
+daemon is gone from the tracked list.
+
 ## Quick reference — gotchas
 
 - **Drive through paniolo, not around it.** Don't reconfigure or open a
