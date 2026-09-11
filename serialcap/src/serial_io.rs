@@ -244,8 +244,12 @@ impl SerialHandle {
     /// When `pace` is non-zero, the bytes are dripped one at a time with `pace`
     /// between each, throttling input for a slow polled console that has no
     /// hardware flow control (each byte is consumed before the next arrives, so
-    /// the receiver's RX FIFO can't overflow). When `pace` is zero the whole
-    /// buffer is sent in one message (full line-rate, same as interactive input).
+    /// the receiver's RX FIFO can't overflow). The delay sits *between* bytes
+    /// only: there is no trailing sleep after the last one, so a caller that
+    /// subscribes to the fan-out as soon as this returns ([`SerialHandle::expect`])
+    /// is listening before the device can have answered the terminating byte.
+    /// When `pace` is zero the whole buffer is sent in one message (full
+    /// line-rate, same as interactive input).
     ///
     /// The supervisor's select loop is unchanged: it just sees one or many write
     /// messages. The interactive WebSocket path shares `write_tx` but never paces,
@@ -256,12 +260,15 @@ impl SerialHandle {
             self.write_tx.send(data).await.map_err(dead)?;
             return Ok(());
         }
+        let last = data.len().saturating_sub(1);
         for i in 0..data.len() {
             self.write_tx
                 .send(data.slice(i..i + 1))
                 .await
                 .map_err(dead)?;
-            tokio::time::sleep(pace).await;
+            if i < last {
+                tokio::time::sleep(pace).await;
+            }
         }
         Ok(())
     }
@@ -300,7 +307,10 @@ impl SerialHandle {
                 .map_err(|_| ExpectError::SupervisorDead)?;
         }
         // Subscribe only now: broadcast receivers see nothing sent before the
-        // subscription, which is exactly the only-after-send contract.
+        // subscription, which is exactly the only-after-send contract. This
+        // relies on write_paced returning as soon as the last byte is handed
+        // off (no trailing pace): a reply the device emits within one pace of
+        // the terminating byte must land inside the window, not before it.
         let mut rx = self.to_clients.subscribe();
 
         let started = std::time::Instant::now();
@@ -808,6 +818,40 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         });
+    }
+
+    /// A paced send must not leave a pace-long blind spot after its last byte.
+    /// The "device" here answers within a small fraction of one pace of seeing
+    /// the terminating byte; if expect() subscribed only after a trailing
+    /// sleep, that reply would be broadcast to no one and the exchange would
+    /// report a false timeout.
+    #[tokio::test]
+    async fn expect_paced_send_sees_reply_arriving_right_after_last_byte() {
+        let (h, mut write_rx) = test_handle();
+        let tx = h.to_clients.clone();
+        tokio::spawn(async move {
+            let mut seen = 0;
+            while seen < 3 {
+                if write_rx.recv().await.is_none() {
+                    return;
+                }
+                seen += 1;
+            }
+            let since_last_byte = tokio::time::Instant::now();
+            while tx.receiver_count() == 0 && since_last_byte.elapsed() < Duration::from_millis(50)
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            let _ = tx.send(Bytes::from_static(b"ok\r\n"));
+        });
+        let mut req = expect_req(Some(b"abc"), r"ok\r\n", 1_000);
+        req.pace = Duration::from_millis(200);
+        match h.expect(req).await.unwrap() {
+            ExpectOutcome::Match { .. } => {}
+            ExpectOutcome::Timeout { tail, lagged } => {
+                panic!("reply within one pace of the last byte was missed (tail={tail:?}, lagged={lagged})")
+            }
+        }
     }
 
     #[tokio::test]
