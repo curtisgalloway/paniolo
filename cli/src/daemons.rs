@@ -658,6 +658,122 @@ fn strays_in_ps(
         .collect()
 }
 
+// ── untracked daemons ────────────────────────────────────────────────────────
+//
+// A daemon's only record is its discovery file under the runtime base, and on
+// Linux that base is under /tmp, which systemd-tmpfiles ages out: Debian's
+// stock policy is `q /tmp 1777 root root 10d`, so every file under it that has
+// not been touched for ten days is deleted — including the discovery file of a
+// daemon that has simply been *running* that long without a command being run
+// against it. Nothing tells the daemon; it keeps running and keeps its capture
+// device. Paniolo, whose only handle on it was the deleted file, reports the
+// channel `stopped`, and the next `watch` spawns a replacement that dies on
+// the orphan's advisory lock — one command says stopped, the next says already
+// running, and neither can fix it. Measured on a Pi 5 control host: three
+// hdmicap daemons, 13 days old, ~95 CPU-hours, invisible (GitHub issue #187).
+//
+// The .deb now ships a tmpfiles.d exclusion so this stops happening on a
+// packaged install, but a `make install` host, a different distro policy, or a
+// hand-cleaned /tmp all produce the same orphan — and an operator looking at
+// one needs a way out of it regardless of how it got there.
+//
+// The way out is to recognize the *process*: paniolo's daemons are spawned
+// from a helper dir, with a `daemon` subcommand and a `--device`, all of which
+// `ps` still shows long after the file is gone.
+
+/// A helper process running as a daemon that no live discovery file accounts
+/// for — see the note above.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Untracked {
+    /// Helper basename as invoked (`hdmicap`, `serialcap`, …).
+    pub name: String,
+    pub pid: i32,
+    /// The `--device` it was started with, when its command line names one.
+    pub device: Option<String>,
+    /// The full command line, for display.
+    pub args: String,
+}
+
+/// Classify one `ps` command line as a paniolo daemon invocation, returning the
+/// helper's basename and the `--device` it was given. `None` for anything not
+/// running the `daemon` subcommand: a wedged one-shot (`zigplug … on 1`), or a
+/// daemon's own OCR child. Pure, so the classification is unit-testable
+/// without a process to look at.
+fn daemon_invocation(args: &str) -> Option<(String, Option<String>)> {
+    let mut toks = args.split_whitespace();
+    let program = toks.next()?;
+    let name = program.rsplit(['/', '\\']).next()?;
+    let name = name.strip_suffix(".exe").unwrap_or(name);
+    if name.is_empty() {
+        return None;
+    }
+    let rest: Vec<&str> = toks.collect();
+    // The subcommand is the first word after the program: `hdmicap daemon …`.
+    if rest.first() != Some(&"daemon") {
+        return None;
+    }
+    let mut device = None;
+    let mut it = rest.iter();
+    while let Some(tok) = it.next() {
+        if let Some(v) = tok.strip_prefix("--device=") {
+            device = Some(v.to_string());
+        } else if *tok == "--device" {
+            device = it.next().map(|v| (*v).to_string());
+        }
+    }
+    Some((name.to_string(), device))
+}
+
+/// One [`list_stray_helpers`] row as an untracked daemon, or `None` when the
+/// process is a stray of some other kind. Callers that already have a stray
+/// listing (the `paniolo daemons` inventory) use this to split it rather than
+/// walking `ps` a second time.
+pub fn untracked_of(pid: i32, args: &str) -> Option<Untracked> {
+    let (name, device) = daemon_invocation(args)?;
+    Some(Untracked {
+        name,
+        pid,
+        device,
+        args: args.to_string(),
+    })
+}
+
+/// Every untracked daemon on this host: a process launched from a paniolo
+/// helper dir, running its `daemon` subcommand, whose pid no live discovery
+/// file names. Tracked daemons and their children are excluded by
+/// [`list_stray_helpers`], so a healthy daemon never appears here.
+pub fn list_untracked() -> Vec<Untracked> {
+    let tracked: Vec<i32> = list_discovered().iter().map(|d| d.pid).collect();
+    list_stray_helpers(&tracked)
+        .into_iter()
+        .filter_map(|(pid, args)| untracked_of(pid, &args))
+        .collect()
+}
+
+/// True when two device arguments name the same node. Compared as written
+/// first, then through `canonicalize`: the lab names a capture device by its
+/// stable `/dev/v4l/by-path/…` symlink, and an orphan could have been started
+/// from a different spelling of the same device.
+fn same_device(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// The untracked daemons named `name` that hold `device` — the orphan standing
+/// between a channel and a daemon it can start.
+pub fn untracked_on_device(name: &str, device: &str) -> Vec<Untracked> {
+    list_untracked()
+        .into_iter()
+        .filter(|u| u.name == name)
+        .filter(|u| u.device.as_deref().is_some_and(|d| same_device(d, device)))
+        .collect()
+}
+
 /// Percent-encode a query-parameter value: everything but RFC 3986's
 /// unreserved characters. Used for every value spliced into a daemon URL or
 /// API path that didn't come from this process's own fixed vocabulary —
@@ -854,6 +970,111 @@ mod tests {
             hook_helper_name("weird!name* --flag").as_deref(),
             Some("weird_name_")
         );
+    }
+
+    /// The orphan-recovery path keys entirely on the command line, because the
+    /// discovery file that named the daemon is what went missing (#187). A
+    /// daemon invocation is a helper running `daemon`, and the device it holds
+    /// is the `--device` it was handed.
+    #[test]
+    fn daemon_invocation_reads_the_helper_and_its_device() {
+        let args = "/usr/libexec/paniolo/bin/hdmicap daemon \
+                    --device /dev/v4l/by-path/x-video-index0 --port 0";
+        let (name, device) = daemon_invocation(args).expect("this is a daemon");
+        assert_eq!(name, "hdmicap");
+        assert_eq!(device.as_deref(), Some("/dev/v4l/by-path/x-video-index0"));
+
+        // `--device=<path>` is the same argument spelled the other way.
+        let (_, device) =
+            daemon_invocation("/usr/libexec/paniolo/bin/hdmicap daemon --device=/dev/video0")
+                .expect("this is a daemon");
+        assert_eq!(device.as_deref(), Some("/dev/video0"));
+
+        // A daemon that takes no --device is still a daemon.
+        let (name, device) =
+            daemon_invocation("/usr/libexec/paniolo/bin/zigplug daemon").expect("still a daemon");
+        assert_eq!(name, "zigplug");
+        assert_eq!(device, None);
+    }
+
+    /// Only the `daemon` subcommand counts. A wedged one-shot holding a serial
+    /// port, and a daemon's own OCR child, are both strays — reaping them as
+    /// if they were the channel's daemon would kill the wrong process.
+    #[test]
+    fn daemon_invocation_rejects_anything_that_is_not_a_daemon() {
+        assert_eq!(
+            daemon_invocation("/usr/libexec/paniolo/bin/zigplug -d /dev/x on 1"),
+            None
+        );
+        assert_eq!(
+            daemon_invocation("/usr/libexec/paniolo/bin/linuxocr --json /tmp/frame.png"),
+            None
+        );
+        // `--device` alone, with no subcommand, is not a daemon either.
+        assert_eq!(
+            daemon_invocation("/usr/libexec/paniolo/bin/hdmicap shot --device /dev/video0"),
+            None
+        );
+        assert_eq!(daemon_invocation(""), None);
+    }
+
+    /// The Windows helper name carries `.exe`; the daemon it is compared
+    /// against is named bare everywhere in the CLI.
+    #[test]
+    fn daemon_invocation_strips_the_windows_suffix() {
+        let (name, _) =
+            daemon_invocation(r"C:\paniolo\libexec\hdmicap.exe daemon --device 0").unwrap();
+        assert_eq!(name, "hdmicap");
+    }
+
+    /// A device argument is matched as written before anything is resolved, so
+    /// the comparison works for a path that does not exist on this machine
+    /// (every non-Linux host running these tests, for one).
+    #[test]
+    fn same_device_matches_identical_paths_without_touching_the_filesystem() {
+        assert!(same_device(
+            "/dev/v4l/by-path/platform-xhci-hcd.0-usbv2-0:1.1.3.3.2:1.0-video-index0",
+            "/dev/v4l/by-path/platform-xhci-hcd.0-usbv2-0:1.1.3.3.2:1.0-video-index0"
+        ));
+        assert!(!same_device("/dev/video0", "/dev/video1"));
+    }
+
+    /// The whole recovery pipeline over a realistic `ps` listing: the stray
+    /// walk excludes the tracked daemon and its OCR child, and the
+    /// classification then separates the orphaned daemon from a wedged
+    /// one-shot. This is the exact split `paniolo daemons` prints, and the set
+    /// `video watch` searches before it starts a replacement (#187).
+    #[test]
+    fn an_orphaned_daemon_is_separated_from_a_tracked_one_and_from_a_one_shot() {
+        let libexec = PathBuf::from("/usr/libexec/paniolo/bin");
+        let ps = "\
+  100   1 /usr/libexec/paniolo/bin/hdmicap daemon --device /dev/video0 --port 0
+  101 100 /usr/libexec/paniolo/bin/linuxocr --json /tmp/frame.png
+  200   1 /usr/libexec/paniolo/bin/hdmicap daemon --device /dev/video1 --port 0
+  300   1 /usr/libexec/paniolo/bin/zigplug -d /dev/tty.usb on 1
+  400   1 /usr/bin/vim daemon --device /dev/video9
+";
+        // pid 100 is the one daemon with a live discovery file.
+        let strays = strays_in_ps(ps, std::slice::from_ref(&libexec), 999, &[100]);
+
+        let mut untracked = Vec::new();
+        let mut rest = Vec::new();
+        for (pid, args) in strays {
+            match untracked_of(pid, &args) {
+                Some(u) => untracked.push(u),
+                None => rest.push(pid),
+            }
+        }
+
+        assert_eq!(
+            untracked.iter().map(|u| u.pid).collect::<Vec<_>>(),
+            vec![200],
+            "only the daemon with no discovery file is untracked: 100 is tracked, \
+             101 is its child, 300 is a one-shot, 400 is not a paniolo helper"
+        );
+        assert_eq!(untracked[0].name, "hdmicap");
+        assert_eq!(untracked[0].device.as_deref(), Some("/dev/video1"));
+        assert_eq!(rest, vec![300], "the wedged one-shot stays a plain stray");
     }
 
     #[test]

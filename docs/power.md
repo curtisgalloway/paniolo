@@ -600,7 +600,50 @@ amt -d <host> state                  # print exactly "on" or "off" (state_cmd co
 amt -d <host> on                     # power on, confirm by read-back
 amt -d <host> off                    # power off (hard), confirm by read-back
 amt -d <host> cycle [--delay-ms 3000]  # off → confirm → delay → on → confirm
+
+amt -d <host> kvm status             # is port 5900 open, is consent required
+amt -d <host> kvm enable             # open 5900 to VNC clients, enable redirection
+amt -d <host> kvm disable            # close 5900, keep the stored RFB password
 ```
+
+#### KVM redirection (the ME's built-in VNC server)
+
+`kvm enable` turns an AMT machine into a **network KVM any standard VNC client
+can drive** — the framebuffer and input of a *physical* box, with no capture
+card or HID rig in the path. It is not a power verb; it is here because the
+`amt` helper already speaks WS-Man to the ME.
+
+The RFB password comes from **`AMT_RFB_PASSWORD`** in the environment, never a
+flag. It is a different secret from `AMT_PASSWORD`, and AMT's rules on it are
+strict: **exactly 8 characters**, with a capital, a lowercase, a digit and a
+special character — but **not** `"`, `,` or `:`, which AMT rejects even though
+they satisfy the special-character rule. The helper checks that itself before
+writing, because AMT
+**locks the RFB password** after a few failed authentication attempts — and a
+shell will silently eat the special character if you put it on a command line
+(`!` in double quotes is history expansion). Re-Putting the password over
+WS-Man clears a lock.
+
+```bash
+AMT_PASSWORD=… AMT_RFB_PASSWORD='Ab3!defG' amt -d <host> kvm enable
+```
+
+By default `kvm enable` sets `OptInPolicy=false` (no local user has to approve
+the session — a headless bench target has nobody to click the prompt) and
+`SessionTimeout=0`. Pass `--opt-in` to require consent, `--session-timeout
+<minutes>` for an idle drop.
+
+Two things worth knowing before relying on this:
+
+- **KVM must already be enabled in MEBx.** `enabled in MEBx` in `kvm status`
+  reports it; when it is `NO`, nothing this helper writes will open the port,
+  and the firmware setup screen is the only place to change it.
+- **Port 5900 is gone in newer firmware.** Intel removed it from Kaby Lake
+  11.8.94, Cannon Lake 12.0.93, Comet Lake 14.1.70, Tiger Lake 15.0.45 and
+  Alder/Raptor Lake 16.1.25 onward; past those versions KVM is only reachable
+  over the 16994/16995 redirection protocol, which no standard VNC client
+  speaks and this helper does not implement. Check `amt -d <host> status`
+  before planning around it.
 
 - `-d <host>` is a hostname, IPv4 address, or bracketed IPv6 literal
   (`[fe80::1]`), optionally with a port (default 16992); an `http://` prefix

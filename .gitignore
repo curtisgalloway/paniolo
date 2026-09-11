@@ -15,6 +15,7 @@ site/
 # macOS
 .DS_Store
 
-# oxbox review audit trail (ox-review skill): keep locally, never commit
+# oxbox review audit trail (oxbox-review skill): keep locally, never commit
 logs/
+.oxbox-review/
 .ox-review/
