@@ -31,6 +31,9 @@ enum Status {
     Missing,
     Unreachable,
     Incomplete,
+    /// Present, but configured against another channel: two netboot links on
+    /// one host sharing a /24 (`model::netboot_subnet_clash`).
+    Conflict,
 }
 
 impl Status {
@@ -40,10 +43,14 @@ impl Status {
             Status::Missing => "MISSING",
             Status::Unreachable => "unreachable",
             Status::Incomplete => "incomplete",
+            Status::Conflict => "CONFLICT",
         }
     }
     fn is_problem(&self) -> bool {
-        matches!(self, Status::Missing | Status::Unreachable)
+        matches!(
+            self,
+            Status::Missing | Status::Unreachable | Status::Conflict
+        )
     }
 }
 
@@ -275,10 +282,33 @@ fn check_channel(lab: &Lab, ch: &ResolvedChannel, rt: &ResolvedTarget) -> (Statu
         },
         ChannelKind::Netboot => match field(ch, "interface") {
             None => (Status::Incomplete, "no interface set".to_string()),
-            Some(iface) => interpret(
-                probe(lab, &ch.host, &Probe::NetInterface(iface.to_string())),
-                iface,
-            ),
+            Some(iface) => {
+                let (status, detail) = interpret(
+                    probe(lab, &ch.host, &Probe::NetInterface(iface.to_string())),
+                    iface,
+                );
+                if status.is_problem() {
+                    return (status, detail);
+                }
+                // A lab that already has two links in one /24 still loads
+                // (validate_for_save refuses to *create* one); this is where
+                // the existing clash gets reported.
+                match crate::model::netboot_subnet_clash(lab, &rt.name) {
+                    Some(c) => (
+                        Status::Conflict,
+                        format!(
+                            "{iface} at {}{} shares {} with '{}' on {}; give one link its \
+                             own /24 (paniolo netboot set --host-ip)",
+                            c.host_ip,
+                            if c.defaulted { " (default)" } else { "" },
+                            c.subnet,
+                            c.other_target,
+                            c.other_interface
+                        ),
+                    ),
+                    None => (status, detail),
+                }
+            }
         },
         ChannelKind::Power => {
             if let Some(si) = field(ch, "serial_interface") {

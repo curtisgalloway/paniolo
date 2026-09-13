@@ -91,6 +91,14 @@ paniolo adb set -t <name> [--serial <adb-id>] [--adb <path>]  # an Android DUT o
 Every channel-config command also takes `[--host <labhost>]` to bind that
 channel to a remote control host (see the lab section below).
 
+- **One subnet per link.** The default `--host-ip` (`192.168.99.1`) is for
+  the *first* netboot link on a host. Every further link on that host needs
+  its own /24 (`--host-ip 192.168.100.1`, `…101.1`, …) or every route to a
+  target on either link is ambiguous. `netboot set` refuses a clash — a second
+  link left at the default included — and `doctor` reports an existing one as
+  `CONFLICT`. Check with `paniolo target show <name>`: the host IP is always
+  printed, marked `(default)` when unset. Never record the intended subnet in a
+  lab-file comment alone; the field is what runs.
 - `paniolo netboot devices` lists candidate USB-Ethernet interfaces (the
   primary NIC is excluded); `paniolo discover` (`--json` for machines) lists
   all lab-relevant hardware;
@@ -127,7 +135,10 @@ paniolo netboot stop [target]
 `start` refuses an interface that carries the system default route (a primary
 NIC) — the netboot link must be a dedicated USB-Ethernet adapter — and refuses
 to start a second target on an interface another target's netboot already runs
-on (one netboot per interface; `netboot stop` the other first). It watches the
+on (one netboot per interface; `netboot stop` the other first), and refuses to
+put the interface in a /24 that any other interface on the host already holds
+(one subnet per link; `netif mode off` the other target, or set a different
+`--host-ip`). It watches the
 daemon for ~2 s before reporting success: if netbootd exits during startup (a
 port in use, an interface it cannot pin), `start` fails and quotes the last
 lines of the log — read them, do not just retry. Netboot is served by the
