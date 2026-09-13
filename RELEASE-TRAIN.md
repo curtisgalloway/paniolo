@@ -1,6 +1,6 @@
 # Release train profile: paniolo
 
-Derived from commit 79545c2 on 2026-09-11. Executed by the `release-train`
+Derived from commit 5eca231 on 2026-09-11. Executed by the `release-train`
 skill (public-skills, `plugins/dev-tools/skills/release-train`); kept honest by
 its `profile_check.py` against the `## Sources` table below. Read `AGENTS.md`
 "Cutting a release" first: everything there still holds, this file only adds
@@ -143,7 +143,7 @@ feeds needs re-reading before `--update` re-pins it.
 | `Makefile` | 449aa1fe4b37 | Project: helpers; Channels: source |
 | `cli/src/setup.rs` | 67a6d1e41824 | Channels: source |
 | `cli/src/skills.rs` | eada6fa6ec0c | Smoke contract S2; Channels: homebrew, windows |
-| `cli/src/daemons.rs` | 2f8f0ec1f955 | Smoke contract S3 |
+| `cli/src/daemons.rs` | e9a5a52692c2 | Smoke contract S3 |
 | `scripts/ci-coverage-check.sh` | 8d0d03ddf496 | Project: helpers |
 | `scripts/sync-brik.sh` | b8b5a15775a9 | Channels: windows |
 | `README.md` | 00ee1992abb7 | Channels: source; Publish: re-verify apt |
