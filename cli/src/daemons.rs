@@ -1565,6 +1565,46 @@ mod tests {
         });
     }
 
+    /// The *call site* of the guard above. `wait_for_replacement` only helps
+    /// where a restart actually asks for it, and every path that replaces a
+    /// capture daemon — `daemons restart`, the stale-binary restart in
+    /// `serial watch` and `video watch` — picks between the two waits in one
+    /// place, `crate::wait_for_started_daemon`. Choosing the unguarded wait
+    /// there is the whole of GitHub #193: `daemons restart --stale` printed
+    ///
+    ///   hdmicap[lab-optiplex-1] restarted — http://127.0.0.1:36989
+    ///
+    /// while the replacement had died on the old daemon's advisory lock and
+    /// 36989 was the *old* daemon's port. The two tests above pin the
+    /// mechanism; this pins the wiring, so the branch cannot be dropped
+    /// without a failure — the mechanism's own tests keep passing when it is.
+    #[test]
+    fn a_restart_never_reports_the_replaced_daemons_port_as_the_new_ones() {
+        with_runtime_root(|root| {
+            ensure_runtime_dir("hdmicap", Some("lab-optiplex-1")).unwrap();
+            // #193's exact shape: the killed daemon's leftover file, naming a
+            // pid the kernel has not finished with (ours) and the port the
+            // restart wrongly reported back.
+            plant_discovery(&expected_base(root), "hdmicap/lab-optiplex-1", 36989);
+            let old = std::process::id() as i32;
+
+            let err = crate::wait_for_started_daemon("hdmicap", Some("lab-optiplex-1"), Some(old))
+                .expect_err("a replacement must not be answered for by the pid it replaced");
+            assert!(
+                !err.to_string().contains("36989"),
+                "the replaced daemon's port must never reach the operator as the \
+                 new one's: {err:#}"
+            );
+
+            // A cold start replaces nothing, so the same file is a real answer:
+            // the guard must not refuse every startup wait.
+            assert_eq!(
+                crate::wait_for_started_daemon("hdmicap", Some("lab-optiplex-1"), None).unwrap(),
+                "http://127.0.0.1:36989"
+            );
+        });
+    }
+
     /// The readers see a daemon when the base is the private directory the
     /// writer creates — the everyday path, which must keep working with the
     /// trust check in front of it.
