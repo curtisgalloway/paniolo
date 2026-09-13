@@ -1,6 +1,6 @@
 # Release train profile: paniolo
 
-Derived from commit 5256dc1 on 2026-09-11. Executed by the `release-train`
+Derived from commit 79545c2 on 2026-09-11. Executed by the `release-train`
 skill (public-skills, `plugins/dev-tools/skills/release-train`); kept honest by
 its `profile_check.py` against the `## Sources` table below. Read `AGENTS.md`
 "Cutting a release" first: everything there still holds, this file only adds
@@ -147,4 +147,4 @@ feeds needs re-reading before `--update` re-pins it.
 | `scripts/ci-coverage-check.sh` | 8d0d03ddf496 | Project: helpers |
 | `scripts/sync-brik.sh` | b8b5a15775a9 | Channels: windows |
 | `README.md` | 00ee1992abb7 | Channels: source; Publish: re-verify apt |
-| `AGENTS.md` | 78496253ba4d | Project: bump rules, tag format; Publish |
+| `AGENTS.md` | 893cca3b4a4f | Project: bump rules, tag format; Publish |
