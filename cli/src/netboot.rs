@@ -28,7 +28,9 @@
 //! dies, reports the tail of its log instead of writing a state file for a
 //! daemon that is not there. It also keeps one netboot per interface: a
 //! second target starting on an interface another target's netbootd already
-//! serves would only fight it for the port.
+//! serves would only fight it for the port. The complementary rule — one
+//! /24 per interface, so a second *link* never shares the first's subnet —
+//! is enforced where the address is assigned (`netif::configure_interface`).
 
 use std::path::Path;
 use std::process::{Command, Stdio};

@@ -63,7 +63,7 @@ netboot channel fields:
 | Field | Default | Description |
 |---|---|---|
 | `--interface` | (required) | USB-Ethernet interface name (e.g. `en3`). Every netbootd listener is pinned to it — see [Interface pinning](#interface-pinning) |
-| `--host-ip` | `192.168.99.1` | Static IP assigned to the interface; also the TFTP/HTTP server address and the router the client is told about. The client's lease is derived from it (same /24, last octet `100` — `192.168.99.100` by default) — see [Lease](#dhcp--tftp-behavior-notes) |
+| `--host-ip` | `192.168.99.1` | Static IP assigned to the interface; also the TFTP/HTTP server address and the router the client is told about. The client's lease is derived from it (same /24, last octet `100` — `192.168.99.100` by default) — see [Lease](#dhcp--tftp-behavior-notes). **The default is for the first link on a host only**: every further link needs its own /24 — see [One subnet per link](#one-subnet-per-link) |
 | `--tftp-root` | (none) | Directory whose contents are served over TFTP **and** HTTP |
 | `--boot-file` | `kernel_2712.img` | Boot program (filename under the root, e.g. `grubaa64.efi`); served as a TFTP filename to PXE and wrapped in an `http://` URL for HTTP Boot |
 | `--http-port` | `80` | HTTP server port; also embedded in the HTTP Boot URL (omitted from the URL when 80). `0` binds an OS-assigned ephemeral port — the URL always carries the port actually bound, never a literal `0` |
@@ -106,6 +106,51 @@ its log (`netbootd exited with … during startup; last lines of
 interface where another target's netbootd is already alive (`netboot for
 '<other>' is already running on <iface> … stop it first`). Two servers on one
 link would only fight for the DHCP/TFTP ports; give each target its own adapter.
+
+### One subnet per link
+
+Several targets can netboot from one control host at the same time — one
+adapter each — **as long as every link is in its own /24.** netbootd's own
+sockets are pinned to their interface, so two daemons on two adapters coexist
+even at the same address; but everything else that dials a target address
+(ssh into the booted target, the AMT helper, ffx, fastboot) asks the routing
+table, and a kernel with two interfaces in `192.168.99.0/24` sends that
+traffic out whichever one it listed first. The symptom is a target that is
+reachable only some of the time, or only after a hand-added host route.
+
+So the rule is: the default `192.168.99.1` is for the **first** netboot link
+on a host; every further link on that host sets `--host-ip` in an unused /24
+(`192.168.100.1`, `192.168.101.1`, …). The client lease follows the host IP
+into that /24. paniolo enforces it in three places:
+
+- **`netboot set` refuses** a link whose /24 another target's link already
+  uses on a different interface of the same host — including a link left at
+  the default: `target 'pi4' netboot: host_ip 192.168.99.1 (the default, since
+  none is set) puts eth4 in 192.168.99.0/24, which target 'optiplex' already
+  uses on eth3 of host 'bench1'`. A lab file that already carries a clash
+  still loads (so `netboot stop` keeps working); `paniolo doctor` reports it
+  as `CONFLICT`.
+- **`netboot start` and `netif mode link` refuse** to assign the address when
+  any *other* interface on the host currently holds that /24 — whether
+  paniolo put it there (a target left in `mode link`) or somebody did by hand:
+  `refusing to put 'eth4' in 192.168.99.0/24: 'eth3' already holds
+  192.168.99.1 on this host`. Release the other link (`paniolo netif mode off
+  <target>`) or give this one its own subnet.
+- **`target show` and `netboot status` always print the host IP**, marked
+  `(default)` when the field is unset, so the address a link actually runs at
+  is never invisible.
+
+Two targets that share one adapter (a bench slot that is re-cabled between
+boards) may keep the same address: the clash is between *interfaces*, and the
+per-interface daemon check above already keeps them from running together.
+
+> **macOS control hosts run one netboot at a time.** `IP_BOUND_IF` (the macOS
+> pin) does not split the bind namespace the way Linux's `SO_BINDTODEVICE`
+> does, so a second netbootd's `bind` of port 67 fails with `EADDRINUSE`
+> even on a different adapter and subnet. `SO_REUSEPORT` would lift that, but
+> it would also let two daemons on the *same* interface share the port
+> silently, which netbootd deliberately refuses today. Not fixed; the subnet
+> rule still applies there so the links stay routable.
 
 **Privileged ports (67/69, and 80 by default):** macOS 10.14+ allows binding
 `0.0.0.0` on privileged ports without root, so on macOS the only step needing

@@ -193,9 +193,12 @@ required at runtime.
 `paniolo netboot start` refuses an interface that carries the system default route (a primary
 NIC), since it reconfigures the interface to the static `host_ip` — the netboot link must be a
 dedicated secondary (USB-Ethernet) interface — and refuses a second target on an interface
-another target's live netbootd already serves (one netboot per interface). After spawning it
-watches the daemon for ~2 s and, if netbootd exits during startup, fails with the tail of the
-log rather than recording a dead daemon.
+another target's live netbootd already serves (one netboot per interface). The address
+assignment underneath (`netif::configure_interface`) refuses a /24 that any *other* interface on
+the host already holds (one subnet per link — see docs/netboot.md), the same rule
+`LabFile::set_netboot` applies to the lab file at edit time (judging only the link being
+edited, so a lab with two clashing pairs stays repairable) and `doctor` reports as `CONFLICT`. After spawning it watches the daemon for ~2 s and, if netbootd exits during startup,
+fails with the tail of the log rather than recording a dead daemon.
 
 `netbootd` only ever hears the netboot link: every listener (DHCP, TFTP, HTTP) is pinned to the
 interface (`IP_BOUND_IF` / `SO_BINDTODEVICE`) before it is bound, and a pin that fails is fatal

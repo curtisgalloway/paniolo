@@ -3283,7 +3283,9 @@ fn netboot_cmd(lab_flag: Option<&str>, cmd: NetbootCmd) -> Result<()> {
             Ok(())
         }
         NetbootCmd::Status { target } => {
-            let NetbootRuntime { target, .. } = netboot_runtime(lab_flag, target.as_deref())?;
+            let NetbootRuntime {
+                target, host_ip, ..
+            } = netboot_runtime(lab_flag, target.as_deref())?;
             let st = netboot::status(&target);
             match st.state {
                 None => println!("netboot\tnot running (no state)"),
@@ -3298,6 +3300,7 @@ fn netboot_cmd(lab_flag: Option<&str>, cmd: NetbootCmd) -> Result<()> {
                     );
                     println!("pid\t{}", s.dhcp_pid);
                     println!("interface\t{}", s.interface);
+                    println!("host_ip\t{host_ip}");
                     println!("tftp_root\t{}", s.tftp_root);
                     if let Some(up) = st.uptime_seconds {
                         println!("uptime\t{:.0}s", up);
@@ -3376,12 +3379,10 @@ fn netboot_runtime(lab_flag: Option<&str>, target: Option<&str>) -> Result<Netbo
     if !channel_is_local(&lab, nb.host.as_deref(), &dh) {
         bail!("netboot channel for '{target}' is not on this host");
     }
+    let host_ip = nb.effective_host_ip().to_string();
     let interface = nb
         .interface
         .ok_or_else(|| anyhow!("netboot channel for '{target}' has no interface set"))?;
-    let host_ip = nb
-        .host_ip
-        .unwrap_or_else(|| model::DEFAULT_HOST_IP.to_string());
     Ok(NetbootRuntime {
         target,
         interface,

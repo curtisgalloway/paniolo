@@ -1174,7 +1174,12 @@ Key differences from the Python servers:
   writes the state file; an early exit fails `start` with the last 20 log
   lines instead. It also refuses to start a second target on an interface
   another target's live netbootd already serves (`state::running_netboots`,
-  one netboot per interface).
+  one netboot per interface), and `netif::configure_interface` refuses a /24
+  any other interface on the host already holds (one subnet per link:
+  `model::netboot_subnet_clash` is the lab-file side, refused by `netboot
+  set` for the link being edited and reported by `doctor` as `CONFLICT`; the
+  live side lists the host's addresses). `target show` always prints the netboot host IP, `(default)`
+  when unset.
 
 ## hidrig (USB HID injector)
 

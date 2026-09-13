@@ -403,7 +403,15 @@ impl LabFile {
                 ("content_type", content_type),
                 ("host", host),
             ],
-        )
+        )?;
+        // No edit may leave *this* link sharing a /24 with another link on
+        // its host — a second link left at the default host_ip included. Only
+        // the edited target is judged: a clash between two other targets is
+        // `doctor`'s to report and must never block the edit that repairs it.
+        if let Some(c) = model::netboot_subnet_clash(&lab_of(&self.doc)?, target) {
+            return Err(LabError(model::subnet_clash_message(target, &c)));
+        }
+        Ok(())
     }
 
     pub fn remove_netboot(&mut self, target: &str) -> Result<(), LabError> {
@@ -1016,5 +1024,97 @@ mod tests {
         lf.remove_serial("t", "console").unwrap();
         let e = lf.save().unwrap_err();
         assert!(e.0.contains("power.serial_interface 'console'"), "{}", e.0);
+    }
+
+    /// A second netboot link on the same host must not be left in the first
+    /// link's /24 — not by an explicit `--host-ip`, and not by omitting it.
+    /// The edit that gives it its own /24 goes through, as does an edit to a
+    /// target that is not part of the clash.
+    #[test]
+    fn set_netboot_refuses_a_second_link_in_the_first_links_slash_24() {
+        let (_d, path) = tmp();
+        let mut lf = LabFile::create(&path);
+        lf.add_host("bench1", "u@bench1", None, None, None, None, None)
+            .unwrap();
+        for t in ["a", "b", "c"] {
+            lf.add_target(t, Some("bench1"), None).unwrap();
+        }
+        lf.set_netboot("a", Some("eth1"), None, None, None, None, None, None)
+            .unwrap();
+        // b at the default by omission: refused, and said so.
+        let e = lf
+            .set_netboot("b", Some("eth2"), None, None, None, None, None, None)
+            .unwrap_err();
+        assert!(e.0.contains("(the default, since none is set)"), "{}", e.0);
+        assert!(e.0.contains("target 'a' already uses on eth1"), "{}", e.0);
+        // b explicitly in a's /24: refused too.
+        let e = lf
+            .set_netboot(
+                "b",
+                None,
+                Some("192.168.99.7"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(e.0.contains("host_ip 192.168.99.7 puts eth2"), "{}", e.0);
+        // Its own /24 is fine, and the file saves.
+        lf.set_netboot(
+            "b",
+            None,
+            Some("192.168.100.1"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        lf.save().unwrap();
+        // The same adapter time-shared by another target is not a clash.
+        lf.set_netboot("c", Some("eth1"), None, None, None, None, None, None)
+            .unwrap();
+        // A clash written by hand still loads and saves: editing an uninvolved
+        // target is never blocked by it, and the repair itself goes through.
+        std::fs::write(
+            &path,
+            "[hosts.bench1]\nssh = \"u@bench1\"\n\
+             [targets.a]\nhost = \"bench1\"\n[targets.a.netboot]\ninterface = \"eth1\"\n\
+             [targets.b]\nhost = \"bench1\"\n[targets.b.netboot]\ninterface = \"eth2\"\n\
+             [targets.c]\nhost = \"bench1\"\n",
+        )
+        .unwrap();
+        let mut lf = LabFile::load(&path).unwrap();
+        lf.set_netboot(
+            "c",
+            Some("eth3"),
+            Some("192.168.101.1"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        lf.save().unwrap();
+        let e = lf
+            .set_netboot("b", None, None, Some("/srv/tftp/b"), None, None, None, None)
+            .unwrap_err();
+        assert!(e.0.contains("target 'b' netboot"), "{}", e.0);
+        lf.set_netboot(
+            "b",
+            None,
+            Some("192.168.100.1"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        lf.save().unwrap();
     }
 }

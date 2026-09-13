@@ -33,6 +33,38 @@ use serde::Deserialize;
 /// ssh destination meaning "the dev machine itself — no SSH".
 pub const LOCAL: &str = "local";
 pub const DEFAULT_HOST_IP: &str = "192.168.99.1";
+
+/// The /24 a netboot link occupies, as its first three octets. netbootd
+/// advertises a `255.255.255.0` mask and derives the client lease inside it
+/// (`netbootd::dhcp::derive_client_ip`), so the link *is* the host IP's /24.
+/// `None` when the address is not IPv4, which [`validate`] reports on its own.
+pub fn netboot_subnet(host_ip: &str) -> Option<[u8; 3]> {
+    let [a, b, c, _] = host_ip.parse::<std::net::Ipv4Addr>().ok()?.octets();
+    Some([a, b, c])
+}
+
+/// `192.0.2.0/24`-style rendering of a [`netboot_subnet`].
+pub fn subnet_str(subnet: [u8; 3]) -> String {
+    format!("{}.{}.{}.0/24", subnet[0], subnet[1], subnet[2])
+}
+
+/// A netboot link that shares its /24 with another target's link on the same
+/// control host, on a different interface. See [`netboot_subnet_clash`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubnetClash {
+    /// The control host both links are on.
+    pub host: String,
+    /// The shared subnet, e.g. `192.0.2.0/24`.
+    pub subnet: String,
+    /// This target's interface and effective host IP.
+    pub interface: String,
+    pub host_ip: String,
+    /// Whether this target's host IP is [`DEFAULT_HOST_IP`] by omission.
+    pub defaulted: bool,
+    /// The other target and the interface its link is on.
+    pub other_target: String,
+    pub other_interface: String,
+}
 pub const VALID_SENSE_SIGNALS: [&str; 4] = ["cts", "dsr", "dcd", "ri"];
 /// The `video.ocr_mode` values (see [`VideoChannel::ocr_mode`]).
 pub const VALID_OCR_MODES: [&str; 2] = ["text", "gui"];
@@ -164,6 +196,15 @@ pub struct NetbootChannel {
     /// `Content-Type` for HTTP responses (default `application/octet-stream`).
     pub content_type: Option<String>,
     pub host: Option<String>,
+}
+
+impl NetbootChannel {
+    /// The host IP the link will actually use: the field, else
+    /// [`DEFAULT_HOST_IP`]. Every consumer that assigns or displays the
+    /// address goes through here so the default is never invisible.
+    pub fn effective_host_ip(&self) -> &str {
+        self.host_ip.as_deref().unwrap_or(DEFAULT_HOST_IP)
+    }
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -366,7 +407,16 @@ impl Lab {
         if let Some(nb) = &t.netboot {
             let mut f = Vec::new();
             push_opt(&mut f, "interface", &nb.interface);
-            push_opt(&mut f, "host_ip", &nb.host_ip);
+            // Always shown, and marked when it is the default: a link that
+            // silently ran at the default while a comment claimed otherwise
+            // is how two links on one host ended up sharing a /24.
+            f.push((
+                "host_ip",
+                match &nb.host_ip {
+                    Some(ip) => ip.clone(),
+                    None => format!("{DEFAULT_HOST_IP} (default)"),
+                },
+            ));
             push_opt(&mut f, "tftp_root", &nb.tftp_root);
             push_opt(&mut f, "boot_file", &nb.boot_file);
             push_opt(&mut f, "http_port", &nb.http_port);
@@ -675,11 +725,76 @@ pub fn validate(lab: &Lab) -> Result<(), LabError> {
     Ok(())
 }
 
+/// The first other target whose netboot link shares `target`'s /24 on the
+/// same control host, on a *different* interface.
+///
+/// Two targets time-sharing one adapter (the same interface) are fine: the
+/// cable goes to one of them at a time and `netboot start` keeps one daemon
+/// per interface. Two *interfaces* in one /24 are not: netbootd's own sockets
+/// are pinned to their interface, but everything else that dials a target
+/// address — ssh, AMT, ffx, fastboot — asks the routing table, which cannot
+/// tell two identical /24s apart. The effective host IP counts, so a second
+/// link left at the default clashes with the first. `None` when either link
+/// has no interface yet, or the host IP is not IPv4 ([`validate`] covers that).
+pub fn netboot_subnet_clash(lab: &Lab, target: &str) -> Option<SubnetClash> {
+    let t = lab.targets.get(target)?;
+    let nb = t.netboot.as_ref()?;
+    let interface = nb.interface.as_deref()?;
+    let host = nb.host.as_deref().unwrap_or(t.default_host());
+    let subnet = netboot_subnet(nb.effective_host_ip())?;
+    lab.targets.iter().find_map(|(other_name, other)| {
+        if other_name == target {
+            return None;
+        }
+        let onb = other.netboot.as_ref()?;
+        let oiface = onb.interface.as_deref()?;
+        let ohost = onb.host.as_deref().unwrap_or(other.default_host());
+        if ohost != host || oiface == interface {
+            return None;
+        }
+        if netboot_subnet(onb.effective_host_ip())? != subnet {
+            return None;
+        }
+        Some(SubnetClash {
+            host: host.to_string(),
+            subnet: subnet_str(subnet),
+            interface: interface.to_string(),
+            host_ip: nb.effective_host_ip().to_string(),
+            defaulted: nb.host_ip.is_none(),
+            other_target: other_name.clone(),
+            other_interface: oiface.to_string(),
+        })
+    })
+}
+
+/// The refusal `netboot set` gives for a [`SubnetClash`] on the link it just
+/// edited: what is where, and the one flag that fixes it.
+pub fn subnet_clash_message(target: &str, c: &SubnetClash) -> String {
+    let how = if c.defaulted {
+        format!("host_ip {} (the default, since none is set)", c.host_ip)
+    } else {
+        format!("host_ip {}", c.host_ip)
+    };
+    format!(
+        "target '{target}' netboot: {how} puts {} in {}, which target '{}' already uses on \
+         {} of host '{}'. Every netboot link on a host needs its own /24, or every route to \
+         a target on either link is ambiguous — give this one a different subnet: \
+         `paniolo netboot set -t {target} --host-ip <addr>`",
+        c.interface, c.subnet, c.other_target, c.other_interface, c.host
+    )
+}
+
 /// [`validate`], plus the cross-references a *write* must not leave dangling:
 /// a `power.serial_interface` has to name one of the target's own serial
 /// interfaces. Applied by the editor before every save and not on load, so a
 /// lab that already carries a stale reference still loads (`doctor` reports
 /// it) — but no CLI edit may create one, or remove the interface it names.
+///
+/// A shared netboot /24 ([`netboot_subnet_clash`]) is deliberately *not*
+/// checked here but in `LabFile::set_netboot`, against the one link being
+/// edited: a lab with two independent clashing pairs could otherwise never be
+/// repaired through the CLI, because each single edit still leaves the other
+/// pair clashing and every save would be refused.
 pub fn validate_for_save(lab: &Lab) -> Result<(), LabError> {
     validate(lab)?;
     for (name, t) in &lab.targets {
@@ -1026,6 +1141,122 @@ mod tests {
         )
         .unwrap();
         validate_for_save(&fine).unwrap();
+    }
+
+    /// Two netboot links on one host: `a` explicit at the default address,
+    /// `b` with no host_ip at all (so at the default by omission).
+    fn two_links(b_extra: &str) -> Lab {
+        parse(&format!(
+            "[hosts.bench1]\nssh = \"u@bench1\"\n\
+             [targets.a]\nhost = \"bench1\"\n\
+             [targets.a.netboot]\ninterface = \"eth1\"\nhost_ip = \"192.168.99.1\"\n\
+             [targets.b]\nhost = \"bench1\"\n\
+             [targets.b.netboot]\ninterface = \"eth2\"\n{b_extra}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn netboot_subnet_clash_finds_two_interfaces_in_one_slash_24() {
+        let lab = two_links("");
+        let c = netboot_subnet_clash(&lab, "b").unwrap();
+        assert_eq!(c.host, "bench1");
+        assert_eq!(c.subnet, "192.168.99.0/24");
+        assert_eq!(
+            (c.interface.as_str(), c.host_ip.as_str()),
+            ("eth2", DEFAULT_HOST_IP)
+        );
+        assert!(c.defaulted, "b has no host_ip, so it is at the default");
+        assert_eq!(
+            (c.other_target.as_str(), c.other_interface.as_str()),
+            ("a", "eth1")
+        );
+        // Seen from the other side, the same clash — with the explicit address.
+        let c = netboot_subnet_clash(&lab, "a").unwrap();
+        assert!(!c.defaulted);
+        assert_eq!(c.other_target, "b");
+        // A different /24 on the second link, and there is no clash.
+        assert!(netboot_subnet_clash(&two_links("host_ip = \"192.168.100.1\"\n"), "b").is_none());
+        // The same address on the *same* interface is a time-shared adapter,
+        // not a clash; `netboot start` keeps one daemon per interface.
+        let shared = parse(
+            "[targets.a]\n[targets.a.netboot]\ninterface = \"eth1\"\n\
+             [targets.b]\n[targets.b.netboot]\ninterface = \"eth1\"\n",
+        )
+        .unwrap();
+        assert!(netboot_subnet_clash(&shared, "a").is_none());
+        // Different hosts never clash, whatever their addresses.
+        let apart = parse(
+            "[hosts.bench1]\nssh = \"u@bench1\"\n\
+             [targets.a]\n[targets.a.netboot]\ninterface = \"eth1\"\n\
+             [targets.b]\nhost = \"bench1\"\n[targets.b.netboot]\ninterface = \"eth2\"\n",
+        )
+        .unwrap();
+        assert!(netboot_subnet_clash(&apart, "a").is_none());
+        // A channel with no interface yet cannot be placed, so it is not judged.
+        let bare = parse(
+            "[targets.a]\n[targets.a.netboot]\ninterface = \"eth1\"\n\
+             [targets.b]\n[targets.b.netboot]\ntftp_root = \"/x\"\n",
+        )
+        .unwrap();
+        assert!(netboot_subnet_clash(&bare, "a").is_none());
+        assert!(netboot_subnet_clash(&bare, "b").is_none());
+    }
+
+    /// A shared /24 still *loads* and still *saves* (a lab with two clashing
+    /// pairs must stay repairable one edit at a time); the refusal lives in
+    /// `LabFile::set_netboot`, and its message says which link is at the
+    /// default by omission.
+    #[test]
+    fn a_shared_slash_24_loads_and_saves_and_the_message_names_the_fix() {
+        let clash = two_links("");
+        validate_for_save(&clash).unwrap();
+        let e = subnet_clash_message("b", &netboot_subnet_clash(&clash, "b").unwrap());
+        assert!(
+            e.contains(
+                "target 'b' netboot: host_ip 192.168.99.1 (the default, since none is set) \
+                 puts eth2 in 192.168.99.0/24"
+            ),
+            "{e}"
+        );
+        assert!(
+            e.contains("target 'a' already uses on eth1 of host 'bench1'"),
+            "{e}"
+        );
+        assert!(e.contains("paniolo netboot set -t b --host-ip"), "{e}");
+        let e = subnet_clash_message("a", &netboot_subnet_clash(&clash, "a").unwrap());
+        assert!(
+            e.contains("target 'a' netboot: host_ip 192.168.99.1 puts eth1"),
+            "{e}"
+        );
+    }
+
+    /// `target show` must never hide the address a link will run at.
+    #[test]
+    fn netboot_host_ip_is_always_shown_and_marked_when_defaulted() {
+        let lab = two_links("");
+        let field = |t: &str| {
+            lab.resolved_target(t)
+                .unwrap()
+                .channels
+                .into_iter()
+                .find(|c| c.kind == ChannelKind::Netboot)
+                .unwrap()
+                .fields
+                .into_iter()
+                .find(|(k, _)| *k == "host_ip")
+                .map(|(_, v)| v)
+        };
+        assert_eq!(field("a").as_deref(), Some("192.168.99.1"));
+        assert_eq!(field("b").as_deref(), Some("192.168.99.1 (default)"));
+    }
+
+    #[test]
+    fn netboot_subnet_is_the_first_three_octets() {
+        assert_eq!(netboot_subnet("192.168.99.1"), Some([192, 168, 99]));
+        assert_eq!(subnet_str([10, 20, 30]), "10.20.30.0/24");
+        assert_eq!(netboot_subnet("fe80::1"), None);
+        assert_eq!(netboot_subnet("192.168.99"), None);
     }
 
     /// Naming an interface the target does not have is an error at

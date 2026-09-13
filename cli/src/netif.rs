@@ -219,6 +219,102 @@ fn guard_primary_interface(what: &str, interface: &str) -> Result<()> {
     refuse_primary_interface(what, interface, default_route_interface().as_deref())
 }
 
+/// Every IPv4 address on every interface of this host, as `(interface,
+/// address)`. Empty when the listing tool is missing (Windows) or fails, in
+/// which case [`guard_shared_subnet`] has nothing to refuse on.
+pub fn all_ipv4_addrs() -> Vec<(String, String)> {
+    let out = if macos() {
+        run(&["ifconfig"])
+    } else {
+        run(&["ip", "-4", "-o", "addr", "show"])
+    };
+    let Ok(o) = out else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&o.stdout);
+    if macos() {
+        parse_ifconfig_inet(&text)
+    } else {
+        parse_ip_addr_show(&text)
+    }
+}
+
+/// `(interface, address)` pairs from `ip -4 -o addr show` (all interfaces):
+/// one address per line, the interface in the second column, the address
+/// (with its prefix stripped) after `inet`. Pure, pinned by a test.
+fn parse_ip_addr_show(out: &str) -> Vec<(String, String)> {
+    out.lines()
+        .filter_map(|line| {
+            let mut toks = line.split_whitespace();
+            let _index = toks.next()?;
+            let iface = toks.next()?;
+            toks.find(|t| *t == "inet")?;
+            let addr = toks.next()?.split('/').next()?;
+            Some((iface.to_string(), addr.to_string()))
+        })
+        .collect()
+}
+
+/// `(interface, address)` pairs from macOS `ifconfig` (all interfaces): an
+/// unindented `en3: flags=…` line opens each interface's block and its
+/// indented `inet A.B.C.D netmask …` lines carry the addresses. Pure.
+fn parse_ifconfig_inet(out: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut current: Option<String> = None;
+    for line in out.lines() {
+        if !line.starts_with([' ', '\t']) {
+            current = line.split(':').next().map(str::to_string);
+            continue;
+        }
+        if let Some(rest) = line.trim().strip_prefix("inet ") {
+            if let (Some(iface), Some(addr)) = (&current, rest.split_whitespace().next()) {
+                pairs.push((iface.clone(), addr.to_string()));
+            }
+        }
+    }
+    pairs
+}
+
+/// The first *other* interface holding an address in `host_ip`'s /24, if any.
+/// Pure: `addrs` is what [`all_ipv4_addrs`] listed.
+fn shared_subnet_holder<'a>(
+    interface: &str,
+    host_ip: &str,
+    addrs: &'a [(String, String)],
+) -> Option<&'a (String, String)> {
+    let subnet = crate::model::netboot_subnet(host_ip)?;
+    addrs.iter().find(|(iface, addr)| {
+        iface != interface && crate::model::netboot_subnet(addr) == Some(subnet)
+    })
+}
+
+/// The refusal behind [`guard_shared_subnet`], free of probing so the decision
+/// and its message are unit-testable.
+fn refuse_shared_subnet(interface: &str, host_ip: &str, addrs: &[(String, String)]) -> Result<()> {
+    if let Some((other, addr)) = shared_subnet_holder(interface, host_ip, addrs) {
+        let subnet = crate::model::netboot_subnet(host_ip)
+            .map(crate::model::subnet_str)
+            .unwrap_or_default();
+        bail!(
+            "refusing to put '{interface}' in {subnet}: '{other}' already holds {addr} on this \
+             host. Two links in one /24 leave every route to a target ambiguous — ssh, AMT, \
+             ffx and fastboot all follow whichever link the kernel lists first. Give each \
+             link its own /24 (paniolo netboot set -t <target> --host-ip <addr>), or release \
+             the other link first (paniolo netif mode off <its target>)."
+        );
+    }
+    Ok(())
+}
+
+/// Never put a second interface on this host into a /24 another one already
+/// holds — whether paniolo assigned that address (a target left in `mode
+/// link`, a live netboot) or somebody did by hand. The lab-file check in
+/// `model::validate_for_save` catches the configured case at edit time; this
+/// is the live one, run wherever an address is about to be assigned.
+pub fn guard_shared_subnet(interface: &str, host_ip: &str) -> Result<()> {
+    refuse_shared_subnet(interface, host_ip, &all_ipv4_addrs())
+}
+
 /// The interface's addresses: (inet, inet6) with IPv6 scope suffixes stripped.
 pub fn iface_addresses(interface: &str) -> (Vec<String>, Vec<String>) {
     let mut inet = Vec::new();
@@ -320,6 +416,7 @@ fn ip_addr_replace(interface: &str, cidr: &str) -> Result<()> {
 
 /// Assign the static netboot host IP to the interface (sudo).
 pub fn configure_interface(interface: &str, host_ip: &str) -> Result<()> {
+    guard_shared_subnet(interface, host_ip)?;
     if macos() {
         if let Some(service) = find_network_service(interface) {
             // Tell configd the service is manual, so a carrier flap (every
@@ -652,6 +749,76 @@ mod tests {
     fn a_dedicated_adapter_passes_the_guard() {
         assert!(refuse_primary_interface("mode link", "en14", Some("en0")).is_ok());
         assert!(refuse_primary_interface("down-hard", "en14", None).is_ok());
+    }
+
+    #[test]
+    fn all_interface_listings_parse_on_both_platforms() {
+        let linux = "\
+1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever
+2: eth0    inet 192.0.2.10/24 brd 192.0.2.255 scope global dynamic eth0\\       valid_lft 3242sec preferred_lft 3242sec
+5: eth3    inet 198.51.100.1/24 brd 198.51.100.255 scope global eth3\\       valid_lft forever preferred_lft forever
+6: eth4    inet 198.51.100.1/24 brd 198.51.100.255 scope global eth4\\       valid_lft forever preferred_lft forever
+";
+        assert_eq!(
+            parse_ip_addr_show(linux),
+            vec![
+                ("lo".to_string(), "127.0.0.1".to_string()),
+                ("eth0".to_string(), "192.0.2.10".to_string()),
+                ("eth3".to_string(), "198.51.100.1".to_string()),
+                ("eth4".to_string(), "198.51.100.1".to_string()),
+            ]
+        );
+        let mac = "\
+lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+\tinet 127.0.0.1 netmask 0xff000000
+\tinet6 ::1 prefixlen 128
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tether 00:11:22:33:44:55
+\tinet 192.0.2.10 netmask 0xffffff00 broadcast 192.0.2.255
+en14: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 198.51.100.1 netmask 0xffffff00 broadcast 198.51.100.255
+en16: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tstatus: active
+";
+        assert_eq!(
+            parse_ifconfig_inet(mac),
+            vec![
+                ("lo0".to_string(), "127.0.0.1".to_string()),
+                ("en0".to_string(), "192.0.2.10".to_string()),
+                ("en14".to_string(), "198.51.100.1".to_string()),
+            ]
+        );
+        assert!(parse_ip_addr_show("").is_empty());
+        assert!(parse_ifconfig_inet("").is_empty());
+    }
+
+    #[test]
+    fn a_second_interface_in_the_same_slash_24_is_refused() {
+        let addrs = vec![
+            ("eth0".to_string(), "192.0.2.10".to_string()),
+            ("eth3".to_string(), "198.51.100.1".to_string()),
+        ];
+        // eth4 wants eth3's /24: refused, naming eth3 and its address.
+        let e = refuse_shared_subnet("eth4", "198.51.100.1", &addrs).unwrap_err();
+        let msg = e.to_string();
+        assert!(
+            msg.contains("refusing to put 'eth4' in 198.51.100.0/24"),
+            "{msg}"
+        );
+        assert!(msg.contains("'eth3' already holds 198.51.100.1"), "{msg}");
+        assert!(msg.contains("--host-ip"), "{msg}");
+        // A different host address in the same /24 is still the same link.
+        assert!(refuse_shared_subnet("eth4", "198.51.100.7", &addrs).is_err());
+        // Re-applying to the interface that already holds it is fine (that is
+        // every `mode link` re-run and every netbootd IP restore).
+        refuse_shared_subnet("eth3", "198.51.100.1", &addrs).unwrap();
+        // A /24 nobody holds is fine, and so is an empty listing (no tool).
+        refuse_shared_subnet("eth4", "198.51.101.1", &addrs).unwrap();
+        refuse_shared_subnet("eth4", "198.51.100.1", &[]).unwrap();
+        assert_eq!(
+            shared_subnet_holder("eth4", "198.51.100.1", &addrs),
+            Some(&("eth3".to_string(), "198.51.100.1".to_string()))
+        );
     }
 
     #[test]
