@@ -1,6 +1,6 @@
 # Release train profile: paniolo
 
-Derived from commit 5256dc1 on 2026-09-11. Executed by the `release-train`
+Derived from commit 5eca231 on 2026-09-11. Executed by the `release-train`
 skill (public-skills, `plugins/dev-tools/skills/release-train`); kept honest by
 its `profile_check.py` against the `## Sources` table below. Read `AGENTS.md`
 "Cutting a release" first: everything there still holds, this file only adds
@@ -69,7 +69,7 @@ exists and is not an arm.
 - build: in the worktree, `cargo build --release --target <triple>` for `cli` and every helper, both Apple targets, `CARGO_PROFILE_RELEASE_STRIP=symbols`; `swiftc -O -target <arch>-apple-macos12.0 ocr/visionocr.swift` per slice; `lipo` everything including `netbootd-bpf-helper`; stage the keg layout (`bin/paniolo`, `libexec/bin/*`, `share/paniolo/skills/*`); ad-hoc `codesign`; tarball and sidecar, exactly as the `package-macos` job does. Use a persistent `CARGO_TARGET_DIR` outside the worktree so trains are incremental
 - install like a user: the tap's stable formula pours this tarball, so write a throwaway formula `paniolo-rt.rb` (`keg_only "release-train dry run"`, `url "file://<tarball>"`, the real `sha256`, `bin.install "bin/paniolo"`, `(libexec/"bin").install Dir["libexec/bin/*"]`, and skills to the literal `prefix/"share/paniolo/skills"` because the CLI hardcodes `share/paniolo` and `pkgshare` for `paniolo-rt` would be `share/paniolo-rt`); `HOMEBREW_DEVELOPER=1 brew install --formula ./paniolo-rt.rb` (Homebrew 6 refuses a bare `.rb` outside a tap otherwise). keg-only means nothing links into the developer's `bin`
 - smoke: S1..S7 against `$(brew --prefix paniolo-rt)/bin/paniolo`
-- cleanup: `brew uninstall paniolo-rt`, always
+- cleanup: `HOMEBREW_NO_AUTOREMOVE=1 brew uninstall paniolo-rt`, always. The variable is not optional: Homebrew 7 runs `autoremove` after every uninstall, and on 2026-09-13 a bare `brew uninstall paniolo-rt` swept four unrelated orphaned leaves (`rust`, `llvm@22`, `libgit2`, `libssh2`, ~2 GB) out of the shared Cellar
 - caveats: the real tap formula (`curtisgalloway/homebrew-tap`) is re-pinned by the release workflow's `bump-tap` job, not exercised here; re-verify covers it
 
 ### deb
@@ -102,7 +102,7 @@ exists and is not an arm.
 - artifact: none (the README's from-source path: `cargo install --path cli` then `paniolo setup`; also what `brew install --HEAD paniolo` does)
 - workflow job: none
 - host: local
-- build: `cargo install --path cli --root $S/.cargo` from the worktree with `HOME=$S`, `CARGO_HOME` left at the real one (registry cache), a persistent `CARGO_TARGET_DIR`, and **`CARGO_INSTALL_ROOT=$S/.cargo`**: `paniolo setup` reinstalls the CLI itself with `cargo install --path cli --force` and no `--root` (`cli/src/setup.rs`), which without that variable overwrites the developer's real CLI (it did, 2026-09-10)
+- build: `cargo install --path cli --root $S/.cargo` from the worktree with `HOME=$S`, `CARGO_HOME` **and `RUSTUP_HOME` exported explicitly at their real paths** (with `HOME` overridden rustup otherwise looks under `$S/.rustup`, finds no toolchain, and cargo fails with "could not choose a version of cargo"; the registry cache is the other reason), a persistent `CARGO_TARGET_DIR`, and **`CARGO_INSTALL_ROOT=$S/.cargo`**: `paniolo setup` reinstalls the CLI itself with `cargo install --path cli --force` and no `--root` (`cli/src/setup.rs`), which without that variable overwrites the developer's real CLI (it did, 2026-09-10)
 - install like a user: `HOME=$S paniolo setup --rust-only` from the worktree root (helpers land in `$S/.local/libexec/paniolo/bin`); then by hand the two non-`--rust-only` steps that need no sudo, because `--rust-only` exists to skip the setuid BPF helper but also skips these: `swiftc -O -o $S/.local/libexec/paniolo/bin/visionocr ocr/visionocr.swift`, and copy `skills/<name>/SKILL.md` to `$S/.local/share/paniolo/skills/<name>/SKILL.md` (what `skills::install_bundled` does); then `UV_TOOL_DIR=$S/uv UV_TOOL_BIN_DIR=$S/.local/libexec/paniolo/bin uv tool install ./zigplug` and `zigplug --help`
 - smoke: S1..S7 against `$S/.cargo/bin/paniolo` with `HOME=$S`
 - cleanup: nothing outside `$S`
@@ -124,7 +124,7 @@ exists and is not an arm.
 - steps: push the release branch; `gh pr create --base main` with only the archaeology commits; `gh pr checks --watch`; `gh pr merge --squash`; `git fetch origin && git checkout main && git pull --ff-only`; annotated tag on the merged head with the releaser identity above; `git push origin vX.Y.Z`; watch `release.yml` (`gh run watch`), then the dispatched `docs.yml` run (it rebuilds the apt pool from the newest 5 Releases; a red docs run means apt clients keep the previous version)
 - re-verify github: `gh release view vX.Y.Z --json assets` lists 12 assets (2 `.deb`, 2 Linux `.tar.gz`, macOS `.tar.gz`, Windows `.zip`, each with `.sha256`); download all, `shasum -a 256 -c` each against its sidecar
 - re-verify homebrew: the tap's `Formula/paniolo.rb` shows `version "X.Y.Z"` and the new sha256s; `brew update && brew fetch paniolo` succeeds; install the fetched tarball `paniolo-rt`-style and run S1..S3
-- re-verify apt: `https://curtisgalloway.github.io/paniolo/apt/dists/stable/InRelease` is signed and its `Packages` lists X.Y.Z; on linux-builder configure the `.sources` from `README.md`, `apt-get update`, `apt-cache policy paniolo` shows X.Y.Z, `apt-get install paniolo`, run S1..S3
+- re-verify apt: fetch with `curl -H "Cache-Control: no-cache"` and a cache-busting query (`?rt=<run>`), because the Pages CDN served a pre-publish `Packages` for at least 28 minutes after a rebuild on 2026-09-13 and a plain GET reported the newest release as missing; then `https://curtisgalloway.github.io/paniolo/apt/dists/stable/InRelease` is signed and its `Packages` lists X.Y.Z; on linux-builder configure the `.sources` from `README.md`, `apt-get update`, `apt-cache policy paniolo` shows X.Y.Z, `apt-get install paniolo`, run S1..S3
 - re-verify windows: download the zip, verify the sidecar, expand and run S1..S3 on windows-bench if reachable, else inspect the layout and report PARTIAL
 - re-verify source: `cargo install --git https://github.com/curtisgalloway/paniolo --tag vX.Y.Z paniolo` into a temp root, run S1
 - a re-verify failure never rolls back the tag; open an issue and report `PUBLISHED, unverified on <channel>`
@@ -143,8 +143,8 @@ feeds needs re-reading before `--update` re-pins it.
 | `Makefile` | 449aa1fe4b37 | Project: helpers; Channels: source |
 | `cli/src/setup.rs` | 67a6d1e41824 | Channels: source |
 | `cli/src/skills.rs` | eada6fa6ec0c | Smoke contract S2; Channels: homebrew, windows |
-| `cli/src/daemons.rs` | 2f8f0ec1f955 | Smoke contract S3 |
+| `cli/src/daemons.rs` | e9a5a52692c2 | Smoke contract S3 |
 | `scripts/ci-coverage-check.sh` | 8d0d03ddf496 | Project: helpers |
 | `scripts/sync-brik.sh` | b8b5a15775a9 | Channels: windows |
 | `README.md` | 00ee1992abb7 | Channels: source; Publish: re-verify apt |
-| `AGENTS.md` | 78496253ba4d | Project: bump rules, tag format; Publish |
+| `AGENTS.md` | 893cca3b4a4f | Project: bump rules, tag format; Publish |

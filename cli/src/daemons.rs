@@ -1226,6 +1226,45 @@ mod tests {
         assert_eq!(rest, vec![300], "the wedged one-shot stays a plain stray");
     }
 
+    /// The row `paniolo daemons` prints for an orphan, end to end from the
+    /// command line `ps` shows to the text an operator reads. On waldo,
+    /// upgraded to 0.3.0, the two serialcap orphans holding serial ports
+    /// printed as
+    ///
+    ///   serialcap    pid 14488    port ?    -
+    ///
+    /// because the inventory read only `--device` and serialcap names its
+    /// ports with a repeatable `--interface` (#195). The `-` is what left an
+    /// operator with no way to tell which target an orphan belonged to, so the
+    /// devices reaching the row — all of them, for a daemon holding several —
+    /// is the fix, not an incidental of it.
+    #[test]
+    fn the_inventory_row_names_every_port_an_orphan_is_sitting_on() {
+        let serialcap = "/usr/libexec/paniolo/bin/serialcap daemon --port 0 \
+                         --interface console=/dev/ttyUSB0@115200 \
+                         --interface aux=/dev/ttyUSB1@9600:cts";
+        let u = untracked_of(14488, serialcap).expect("this is a daemon");
+        assert_eq!(
+            u.devices_display(),
+            "/dev/ttyUSB0, /dev/ttyUSB1",
+            "both ports, and no baud or sense suffix"
+        );
+
+        // The video orphan that already worked, so the serial case did not buy
+        // itself at the other's expense.
+        let u = untracked_of(
+            200,
+            "/usr/libexec/paniolo/bin/hdmicap daemon --device /dev/video1",
+        )
+        .expect("this is a daemon");
+        assert_eq!(u.devices_display(), "/dev/video1");
+
+        // A daemon that holds no device still gets a row; `-` is right here.
+        let u =
+            untracked_of(300, "/usr/libexec/paniolo/bin/zigplug daemon").expect("still a daemon");
+        assert_eq!(u.devices_display(), "-");
+    }
+
     #[test]
     fn query_escape_keeps_unreserved_and_encodes_the_rest() {
         assert_eq!(query_escape("abc-_.~09"), "abc-_.~09");
@@ -1562,6 +1601,46 @@ mod tests {
             assert!(!path.exists(), "the killed daemon's file is reaped");
             // Idempotent: nothing left to remove is not a failure to report.
             assert!(!remove_discovery_for_pid("hdmicap", Some("pi5"), me));
+        });
+    }
+
+    /// The *call site* of the guard above. `wait_for_replacement` only helps
+    /// where a restart actually asks for it, and every path that replaces a
+    /// capture daemon — `daemons restart`, the stale-binary restart in
+    /// `serial watch` and `video watch` — picks between the two waits in one
+    /// place, `crate::wait_for_started_daemon`. Choosing the unguarded wait
+    /// there is the whole of GitHub #193: `daemons restart --stale` printed
+    ///
+    ///   hdmicap[lab-optiplex-1] restarted — http://127.0.0.1:36989
+    ///
+    /// while the replacement had died on the old daemon's advisory lock and
+    /// 36989 was the *old* daemon's port. The two tests above pin the
+    /// mechanism; this pins the wiring, so the branch cannot be dropped
+    /// without a failure — the mechanism's own tests keep passing when it is.
+    #[test]
+    fn a_restart_never_reports_the_replaced_daemons_port_as_the_new_ones() {
+        with_runtime_root(|root| {
+            ensure_runtime_dir("hdmicap", Some("lab-optiplex-1")).unwrap();
+            // #193's exact shape: the killed daemon's leftover file, naming a
+            // pid the kernel has not finished with (ours) and the port the
+            // restart wrongly reported back.
+            plant_discovery(&expected_base(root), "hdmicap/lab-optiplex-1", 36989);
+            let old = std::process::id() as i32;
+
+            let err = crate::wait_for_started_daemon("hdmicap", Some("lab-optiplex-1"), Some(old))
+                .expect_err("a replacement must not be answered for by the pid it replaced");
+            assert!(
+                !err.to_string().contains("36989"),
+                "the replaced daemon's port must never reach the operator as the \
+                 new one's: {err:#}"
+            );
+
+            // A cold start replaces nothing, so the same file is a real answer:
+            // the guard must not refuse every startup wait.
+            assert_eq!(
+                crate::wait_for_started_daemon("hdmicap", Some("lab-optiplex-1"), None).unwrap(),
+                "http://127.0.0.1:36989"
+            );
         });
     }
 
