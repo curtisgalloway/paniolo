@@ -215,6 +215,11 @@ the signed apt repository served from the GitHub Pages docs site. There is no ve
 source — the **tag is the single source of truth**. Every crate's
 `Cargo.toml` stays at `version = "0.1.0"`; the workflow derives the package
 version from the tag name (`${GITHUB_REF_NAME#v}`), so don't bump the manifests.
+`paniolo --version` reports that same string because every package build
+exports it as `PANIOLO_VERSION` and `cli/src/main.rs` bakes it in at compile
+time; a build without the variable (`cargo install --path`, a dev checkout)
+prints `0.1.0 (unversioned dev build)` so nobody mistakes the placeholder
+for an installed version. Each package smoke step asserts the two agree.
 
 Steps:
 

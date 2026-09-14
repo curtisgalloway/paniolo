@@ -90,15 +90,6 @@ jobs:
             shellyplug
             amt
 
-      - name: Build release binaries
-        env:
-          CARGO_PROFILE_RELEASE_STRIP: symbols
-        run: |
-          for crate in cli $HELPERS; do
-            echo "==> cargo build --release ($crate)"
-            cargo build --release --manifest-path "$crate/Cargo.toml"
-          done
-
       # GITHUB_SHA, not `git rev-parse`: the container's uid differs from the
       # workspace owner, so git refuses with "dubious ownership" (and the
       # failure hides inside the command substitution). printf is POSIX —
@@ -111,6 +102,18 @@ jobs:
           else
             echo "version=0.0.0~dev.$(printf '%.7s' "$GITHUB_SHA")" >> "$GITHUB_OUTPUT"
           fi
+
+      # PANIOLO_VERSION is what `paniolo --version` prints (cli/src/main.rs);
+      # it is the same string the package carries, so the two never disagree.
+      - name: Build release binaries
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+          PANIOLO_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          for crate in cli $HELPERS; do
+            echo "==> cargo build --release ($crate)"
+            cargo build --release --manifest-path "$crate/Cargo.toml"
+          done
 
       - name: Stage package tree
         run: |
@@ -197,6 +200,8 @@ jobs:
           /usr/libexec/paniolo/bin/rapidocr --help >/dev/null
           test -f /usr/share/paniolo/skills/paniolo/SKILL.md
           /usr/bin/paniolo --help
+          # The binary reports the version the package carries.
+          test "$(/usr/bin/paniolo --version)" = "paniolo $(dpkg-query -W -f='${Version}' paniolo)"
           # Run outside the checkout so `skill` resolves the packaged copy
           # under /usr/share rather than the repo's skills/ dir.
           ( cd /tmp && /usr/bin/paniolo skill )
@@ -244,6 +249,9 @@ jobs:
         run: |
           $stage = "dist/paniolo"
           New-Item -ItemType Directory -Force -Path "$stage/libexec" | Out-Null
+          # What `paniolo --version` prints: the tag, or a dev stamp on a
+          # non-tag run (the same shape the Linux job's version step uses).
+          $env:PANIOLO_VERSION = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME -replace "^v", "" } else { "0.0.0-dev." + $env:GITHUB_SHA.Substring(0, 7) }
           cargo build --release --manifest-path cli/Cargo.toml
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Copy-Item cli/target/release/paniolo.exe "$stage/paniolo.exe"
@@ -364,6 +372,10 @@ jobs:
           $root = Join-Path $extract "paniolo"
           & "$root/paniolo.exe" --help | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "paniolo.exe --help exited $LASTEXITCODE" }
+          # The binary reports the version the build stamped (see "Build every crate").
+          $expected = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME -replace "^v", "" } else { "0.0.0-dev." + $env:GITHUB_SHA.Substring(0, 7) }
+          $reported = (& "$root/paniolo.exe" --version | Out-String).Trim()
+          if ($reported -ne "paniolo $expected") { throw "paniolo.exe --version printed '$reported', expected 'paniolo $expected'" }
           # From outside the checkout, so `skill` resolves the zip's own copy
           # under share/, not the repo's skills/ dir.
           Push-Location $env:RUNNER_TEMP
@@ -469,6 +481,7 @@ jobs:
       - name: Build release binaries (both targets)
         env:
           CARGO_PROFILE_RELEASE_STRIP: symbols
+          PANIOLO_VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           for target in aarch64-apple-darwin x86_64-apple-darwin; do
@@ -667,6 +680,8 @@ jobs:
           done
 
           "$root/bin/paniolo" --help >/dev/null
+          # The binary reports the version the tarball carries.
+          test "$("$root/bin/paniolo" --version)" = "paniolo $VERSION"
           # Run outside the checkout so `skill` resolves the packaged copy
           # under the extracted share/ dir, not the repo's own skills/ dir
           # (cli/src/skills.rs skills_dirs() checks a repo checkout first).
