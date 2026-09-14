@@ -47,10 +47,22 @@ use clap::{Parser, Subcommand};
 use labfile::LabFile;
 use model::{Lab, ResolvedChannel, ResolvedTarget};
 
+/// What `--version` prints. The tag is the only version source in this repo
+/// (every `Cargo.toml` stays at its placeholder), so the release workflow
+/// exports `PANIOLO_VERSION` from the tag when it builds each package and the
+/// binary bakes it in here. A build without it — `cargo install --path`, a
+/// dev checkout, `brew install --HEAD` — says so, rather than print the
+/// placeholder as if it were an installed version. `cli/build.rs` makes cargo
+/// rebuild when the variable changes.
+const VERSION: &str = match option_env!("PANIOLO_VERSION") {
+    Some(v) => v,
+    None => concat!(env!("CARGO_PKG_VERSION"), " (unversioned dev build)"),
+};
+
 #[derive(Parser)]
 #[command(
     name = "paniolo",
-    version,
+    version = VERSION,
     about = "Agent-controlled target machine wrangler."
 )]
 struct Cli {
@@ -4106,6 +4118,25 @@ fn print_resolved_target(rt: &ResolvedTarget) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--version` is the stamped release version when the build had one,
+    /// and never the bare manifest placeholder when it did not.
+    #[test]
+    fn version_is_the_stamp_or_says_it_is_a_dev_build() {
+        use clap::CommandFactory;
+        let rendered = Cli::command().render_version();
+        assert!(rendered.starts_with("paniolo "), "{rendered}");
+        match option_env!("PANIOLO_VERSION") {
+            Some(v) => assert_eq!(rendered.trim(), format!("paniolo {v}")),
+            None => assert_eq!(
+                rendered.trim(),
+                format!(
+                    "paniolo {} (unversioned dev build)",
+                    env!("CARGO_PKG_VERSION")
+                )
+            ),
+        }
+    }
 
     /// `main()`'s top-level `eprintln!("{e:#}")` (anyhow's *alternate* Display)
     /// prints the whole `.context()` chain; the old plain `{e}` printed only
