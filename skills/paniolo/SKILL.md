@@ -263,10 +263,10 @@ paniolo video stop [target]           # stop the daemon (on the target's host)
   when the target has a `hid` channel — a **⌨ Capture input** button that turns
   the page into a KVM (see HID injection below).
 - **The token in that URL is a live credential — keep it out of your
-  transcript.** `video show`, and `video watch` against an already-running
-  daemon, print the token-free `http://127.0.0.1:<port>`. The openable form is
-  printed only by `video preview` and by `video watch` when it actually starts
-  a daemon. Never paste a `?token=` URL into an issue, a commit message, or a
+  transcript.** Every command prints the token-free
+  `http://127.0.0.1:<port>`; `paniolo video preview` is the only one that
+  prints the openable form, and it exists for a human about to paste it into a
+  browser. Never paste a `?token=` URL into an issue, a commit message, or a
   chat.
 - **Opening a browser is a human's job, not yours.** `paniolo video preview
   --open` only works on a machine with a desktop session, and it is refused

@@ -59,8 +59,8 @@ paniolo video stop  [target-machine]   # stop it (on the target's host)
 paniolo video show  [target-machine]   # show daemon address and status
 ```
 
-`watch` starts `hdmicap daemon` detached and polls for startup. The dashboard
-URL is printed — open exactly that URL in a browser for the live preview: it
+`watch` starts `hdmicap daemon` detached and polls for startup, then prints the
+daemon's address. To open the dashboard, run `paniolo video preview` — that URL
 carries the daemon's `?token=`, and the daemon answers nothing without it.
 
 **`show` and `console` print the address without the token, on purpose.** The
@@ -71,10 +71,10 @@ terminal output in issues, and — because paniolo is driven by agents that run
 `http://127.0.0.1:<port>`, which is enough to identify the daemon and useless
 on its own.
 
-`video watch` prints the openable URL when it **starts** a daemon, because that
-is a human asking where to look. Against an already-running daemon it prints the
-token-free form: that branch starts nothing and is the idempotent call an agent
-makes before every screenshot.
+**`video preview` is the only command that prints the openable URL**, and the
+only place in the CLI that builds one. There is deliberately no helper for it,
+so no other command can reach for it by accident; `video watch` prints the
+token-free address and points at `preview`.
 
 If no browser could be launched — a headless control host, a container, no
 `xdg-open` — `console` does not simply give up: an address you cannot open would

@@ -375,14 +375,14 @@ Python tree below:
   token (the CLI then sends none) — `paniolo daemons restart --stale`
   replaces it. The URL handed to a **browser** always carries `?token=`, and
   `dispatch::remote_daemon_endpoint` reads the token over SSH so a tunnelled
-  `console` carries it too — but only the commands whose job is to produce an
-  openable URL **print** it: `video watch` when it starts a daemon, and
-  `video preview`. `video show`, `video watch` against an already-running
-  daemon, and `console` print the token-free `http://127.0.0.1:<port>`,
-  because that output lands in agent transcripts and CI logs (#196).
-  `video preview --open` and a `console` whose browser launch fails are the
-  two exceptions in each direction: the first prints nothing openable, the
-  second prints the full URL because the reader has no other way in.
+  `console` carries it too — but **`video preview` is the only command that
+  prints it**, and the only place that builds one (inline, in its own arm:
+  there is no `preview_url` helper any more, so nothing else can reach for it
+  by accident). Every other command prints the token-free
+  `http://127.0.0.1:<port>` from `Endpoint::base_url`, because that output
+  lands in agent transcripts and CI logs (#196). `video preview --open` prints
+  nothing openable at all, and a `console` whose browser launch fails writes
+  the URL to a 0600 file rather than printing it.
 - **Netboot is rust-engine only** (netbootd); the pure-Python DHCP/TFTP engine
   exists only in the legacy tree.
 - **Helpers live off PATH** in the private libexec dir

@@ -49,16 +49,13 @@ pub fn untracked(device: &str) -> Option<daemons::Untracked> {
         .next()
 }
 
-/// The dashboard URL for a human to open: the daemon's `GET /` with the token
-/// a browser needs carried as `?token=`. None if the daemon isn't running.
-pub fn preview_url(target: &str) -> Option<String> {
-    daemon(target).map(|d| d.http_url("/"))
-}
-
-/// The daemon's address with no token: `http://127.0.0.1:<port>`. Status
-/// output prints this rather than [`preview_url`], because it lands in agent
-/// transcripts, CI logs and pasted terminal output, which is not where a
-/// bearer credential belongs (#196). None if the daemon isn't running.
+/// The daemon's address with no token: `http://127.0.0.1:<port>`. This is what
+/// paniolo prints, everywhere: its output lands in agent transcripts, CI logs
+/// and pasted terminal output, which is not where a bearer credential belongs
+/// (#196). The token-bearing form is built inline in the one command whose job
+/// is to produce it, `video preview`, and nowhere else — there is deliberately
+/// no helper for it, so it cannot be reached for by accident. None if the
+/// daemon isn't running.
 ///
 /// Mirrors `serial::daemon_url`, the same accessor on the sibling channel.
 pub fn daemon_url(target: &str) -> Option<String> {

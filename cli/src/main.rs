@@ -3277,7 +3277,10 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
                 .device
                 .ok_or_else(|| anyhow!("video channel for '{target}' has no device set"))?;
             let mut replaced = None;
-            if let Some(url) = video::preview_url(&target) {
+            // `daemon_url`, not `preview_url`: this scope only needs to know
+            // whether a daemon is there and what to print, and no token-bearing
+            // string should exist here to be printed by accident (#196).
+            if let Some(url) = video::daemon_url(&target) {
                 let stale = daemons::binary_is_stale(video::DAEMON, Some(&target)) == Some(true);
                 if !restart && !stale {
                     // A status line, not an invitation: this branch starts
@@ -3286,9 +3289,8 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
                     // the token would land in the transcript on every one
                     // (#196). `video preview` is where the openable URL lives.
                     println!(
-                        "Video daemon for '{target}' already running at {}",
-                        daemons::daemon_url(video::DAEMON, Some(&target))
-                            .unwrap_or_else(|| url.clone())
+                        "Video daemon for '{target}' already running at {url} — \
+                         `paniolo video preview {target}` opens the dashboard."
                     );
                     return Ok(());
                 }
@@ -3310,10 +3312,15 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
             eprintln!("Starting video daemon for '{target}' ('{device}')…");
             video::start_daemon(&device, port, &target, v.ocr_mode.as_deref())?;
             let url = wait_for_started_daemon(video::DAEMON, Some(&target), replaced)?;
-            // A browser can only present the token as ?token=, so the URL a
-            // human opens carries it.
-            let url = video::preview_url(&target).unwrap_or(url);
-            println!("Video daemon started. Preview at {url}");
+            // Token-free, like every other line paniolo prints: the openable
+            // URL lives behind `video preview`, which is the one command whose
+            // job is to produce it (#196). Printing it here would put a live
+            // credential in the transcript of every daemon start.
+            let url = video::daemon_url(&target).unwrap_or(url);
+            println!(
+                "Video daemon started at {url} — `paniolo video preview {target}` \
+                 opens the dashboard."
+            );
             Ok(())
         }
         VideoCmd::Stop { target } => {
