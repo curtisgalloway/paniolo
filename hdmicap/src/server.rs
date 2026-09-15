@@ -438,7 +438,7 @@ fn multipart_chunk(jpeg_bytes: &[u8], signal: Signal) -> Bytes {
 }
 
 /// What this /preview connection last put on the wire — so a signal that
-/// hasn't changed (the common case: a real frame across several 67ms ticks,
+/// hasn't changed (the common case: a real frame across several preview ticks,
 /// or a placeholder while nothing has recovered) is neither re-encoded nor
 /// re-sent every tick.
 enum Served {
@@ -450,7 +450,7 @@ enum Served {
     /// `spawn_blocking` join error means the encode task panicked; either way
     /// this exact frame cannot be encoded. Recording the attempt stops the
     /// stream from re-acquiring an `expensive` permit and re-spawning the same
-    /// doomed encode on every 67ms tick. A new frame (different `captured_at`)
+    /// doomed encode on every preview tick. A new frame (different `captured_at`)
     /// resumes normal service.
     Failed(Instant),
     /// The last placeholder served, keyed by the effective signal that caused
@@ -461,7 +461,7 @@ enum Served {
 /// Whether `preview` should attempt to encode and serve a live frame given
 /// what it last put on the wire. A frame already served (`Frame`) or already
 /// tried and found un-encodable (`Failed`) — same `captured_at` — is skipped,
-/// so an un-encodable frame is attempted once, not re-attempted on every 67ms
+/// so an un-encodable frame is attempted once, not re-attempted on every
 /// tick (Issue #169). Any frame with a new `captured_at` is always attempted,
 /// whatever the previous outcome, so service resumes as soon as an encodable
 /// frame arrives.
@@ -493,7 +493,7 @@ async fn preview(State(s): State<AppState>) -> Response {
     let preview_cache = s.preview_cache.clone();
 
     let stream = async_stream::stream! {
-        let mut interval = tokio::time::interval(Duration::from_millis(67));
+        let mut interval = tokio::time::interval(crate::frame::TARGET_FRAME_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_served: Option<Served> = None;
         // The last live frame's dimensions, so a placeholder shown after a
@@ -595,7 +595,7 @@ async fn preview(State(s): State<AppState>) -> Response {
                         Ok(Some(b)) => b,
                         // Same rule as the live path above: record the attempt
                         // before skipping, or a placeholder that cannot be
-                        // encoded is retried on every 67 ms tick for as long as
+                        // encoded is retried on every tick for as long as
                         // the signal stays put. Synthetic bytes make this far
                         // less reachable than the live case, but the dedup is
                         // what keeps it bounded either way.
@@ -1379,7 +1379,7 @@ mod tests {
         assert_eq!(chunk_jpeg_payload(&chunk), real_encode.as_slice());
     }
 
-    /// A stale placeholder must be sent once per transition, not every 67ms
+    /// A stale placeholder must be sent once per transition, not every
     /// tick: after the first placeholder part, no further chunk should
     /// arrive while the signal stays `Stale`. This particular frame's fixed
     /// `captured_at` means the *old* code's `last_served == Some(captured_at)`
@@ -1464,7 +1464,7 @@ mod tests {
 
         // A new, encodable frame resumes normal service whatever the last
         // outcome was.
-        let fresh = stuck + Duration::from_millis(67);
+        let fresh = stuck + crate::frame::TARGET_FRAME_INTERVAL;
         assert!(should_attempt_live(&last_served, fresh));
         // And a frame already served for real is likewise not re-attempted.
         assert!(!should_attempt_live(&Some(Served::Frame(fresh)), fresh));
