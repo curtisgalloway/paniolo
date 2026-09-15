@@ -240,6 +240,18 @@ pub fn classify_nv12(y: &[u8], w: u32, h: u32) -> (u64, bool) {
     })
 }
 
+/// Classify a full-range luma plane, as JPEG grayscale decoding delivers it.
+///
+/// No normalization, unlike [`classify_nv12`]: a JPEG's Y is already 0-255, and
+/// stretching it again would push a dim screen toward `Stable` and a black one
+/// toward lit.
+pub fn classify_gray(y: &[u8], w: u32, h: u32) -> (u64, bool) {
+    classify(w, h, |x, yy| {
+        *y.get((yy as usize) * (w as usize) + x as usize)
+            .unwrap_or(&0)
+    })
+}
+
 /// Classify a packed RGB8 buffer (Rec.601 luma, integer).
 pub fn classify_rgb(rgb: &[u8], w: u32, h: u32) -> (u64, bool) {
     classify(w, h, |x, y| {
@@ -258,6 +270,59 @@ mod tests {
 
     fn solid_rgb(r: u8, g: u8, b: u8, w: u32, h: u32) -> Vec<u8> {
         (0..w * h).flat_map(|_| [r, g, b]).collect()
+    }
+
+    /// A scaled luma plane must be classified against ITS dimensions, not the
+    /// frame's. The Linux MJPEG path decodes grayscale at half scale (#211),
+    /// so passing the frame's `w`/`h` walks a plane a quarter the size.
+    ///
+    /// The failure is quiet rather than loud, which is why `LumaPlane` carries
+    /// its own dimensions: `classify_gray` reads an out-of-range sample as 0,
+    /// so roughly the first quarter of sampled rows land in real pixels and the
+    /// rest come back black. The result is not an error and not "no signal" —
+    /// it is a plausible-looking hash computed mostly from absent data, and the
+    /// hash is what `/snapshot?changed_since=` uses to decide a screen changed.
+    #[test]
+    fn a_scaled_plane_classified_at_frame_dimensions_hashes_differently() {
+        // A uniformly lit half-scale plane: 960x540 of mid-grey.
+        let (pw, ph) = (960u32, 540u32);
+        let plane = vec![200u8; (pw * ph) as usize];
+
+        let (right_hash, no_signal) = classify_gray(&plane, pw, ph);
+        assert!(!no_signal, "a lit plane at its own dimensions is lit");
+
+        // The same bytes, classified as if they were the 1920x1080 frame.
+        let (wrong_hash, wrong_no_signal) = classify_gray(&plane, pw * 2, ph * 2);
+        assert!(
+            !wrong_no_signal,
+            "it still reads as lit, which is exactly what makes this quiet — \
+             a loud failure would be easier to catch"
+        );
+        assert_ne!(
+            right_hash, wrong_hash,
+            "the wrong dimensions must at least produce a different hash; \
+             equal hashes would mean this mistake is undetectable"
+        );
+    }
+
+    /// JPEG grayscale is full-range, so `classify_gray` must not apply the
+    /// video-range stretch `classify_nv12` does. A plane just above the
+    /// `BRIGHT` guard must stay lit, not be pushed around by normalization.
+    #[test]
+    fn classify_gray_does_not_normalize_like_video_range() {
+        let (w, h) = (128u32, 128u32);
+        let mut plane = vec![0u8; (w * h) as usize];
+        // One bright cell, enough for the max-luma guard and nothing else.
+        for y in 0..h {
+            for x in 0..16 {
+                plane[(y * w + x) as usize] = 70;
+            }
+        }
+        let (_, no_signal) = classify_gray(&plane, w, h);
+        assert!(
+            !no_signal,
+            "70 is above BRIGHT (64), so this is lit without any stretching"
+        );
     }
 
     #[test]

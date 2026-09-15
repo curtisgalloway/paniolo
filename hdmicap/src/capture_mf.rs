@@ -439,6 +439,7 @@ impl CaptureBackend for MfBackend {
                 }
                 return Ok(CapturedFrame {
                     jpeg: None,
+                    luma: None,
                     pixels: PixelData::Nv12 {
                         y: Arc::from(y),
                         cbcr: Arc::from(cbcr),

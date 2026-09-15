@@ -29,7 +29,7 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::capture::{open_backend, DeviceSpec};
-use crate::frame::{classify_nv12, classify_rgb, FrameState, Signal, STABLE_FRAMES};
+use crate::frame::{classify_gray, classify_nv12, classify_rgb, FrameState, Signal, STABLE_FRAMES};
 use crate::pixel::PixelData;
 
 pub type FrameRx = watch::Receiver<Arc<FrameState>>;
@@ -240,10 +240,15 @@ fn capture_loop(spec: DeviceSpec, tx: watch::Sender<Arc<FrameState>>) {
             // One-pass strided classification: hash + no-signal from ~1k luma
             // samples, resolution-independent (the old full-image pass cost
             // hundreds of ms at 8 MP).
-            let (hash, no_signal) = match &captured.pixels {
-                PixelData::Nv12 { y, .. } => classify_nv12(y, w, h),
-                PixelData::Rgb(buf) => classify_rgb(buf, w, h),
-                PixelData::Empty => (0, true),
+            // A pre-scaled luma plane wins, and is classified against ITS
+            // dimensions rather than the frame's: the Linux MJPEG path decodes
+            // grayscale at half scale (#211), so passing `w`/`h` here would
+            // read past the end of a plane a quarter the expected size.
+            let (hash, no_signal) = match (&captured.luma, &captured.pixels) {
+                (Some(l), _) => classify_gray(&l.data, l.width, l.height),
+                (None, PixelData::Nv12 { y, .. }) => classify_nv12(y, w, h),
+                (None, PixelData::Rgb(buf)) => classify_rgb(buf, w, h),
+                (None, PixelData::Empty) => (0, true),
             };
 
             let signal = if no_signal {
