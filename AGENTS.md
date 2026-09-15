@@ -373,9 +373,16 @@ Python tree below:
   byte-identical across the four like `platform.rs`; only hdmicap's vendored
   `/xterm*` assets are exempt. A daemon started by an older paniolo has no
   token (the CLI then sends none) — `paniolo daemons restart --stale`
-  replaces it. Printed browser URLs (`video watch`/`preview`/`show`,
-  `console`) carry `?token=`; `dispatch::remote_daemon_endpoint` reads the
-  token over SSH so a tunnelled `console` carries it too.
+  replaces it. The URL handed to a **browser** always carries `?token=`, and
+  `dispatch::remote_daemon_endpoint` reads the token over SSH so a tunnelled
+  `console` carries it too — but **`video preview` is the only command that
+  prints it**, and the only place that builds one (inline, in its own arm:
+  there is no `preview_url` helper any more, so nothing else can reach for it
+  by accident). Every other command prints the token-free
+  `http://127.0.0.1:<port>` from `Endpoint::base_url`, because that output
+  lands in agent transcripts and CI logs (#196). `video preview --open` prints
+  nothing openable at all, and a `console` whose browser launch fails writes
+  the URL to a 0600 file rather than printing it.
 - **Netboot is rust-engine only** (netbootd); the pure-Python DHCP/TFTP engine
   exists only in the legacy tree.
 - **Helpers live off PATH** in the private libexec dir
@@ -511,7 +518,8 @@ cli/src/
   power.rs      generic power hooks (on/off/cycle/state_cmd via sh -c), DTR via
                 serialcap /button (+ direct-serial fallback), power_on sense
   state.rs      netboot state files (JSON-compatible with the Python's)
-  doctor.rs     config-vs-reality probing (local + over SSH)
+  doctor.rs     config-vs-reality probing (local + over SSH), including
+                whether a netboot interface holds its configured host_ip
   discover.rs   hardware inventory + the configure proposal block
   setup.rs      installer: paniolo CLI onto PATH (~/.cargo/bin); helpers into
                 the private libexec dir (~/.local/libexec/paniolo/bin) via
@@ -1353,7 +1361,15 @@ base honors `$PANIOLO_RUNTIME_BASE` (default `/tmp`).
   the platform-finish steps only (`setup::run_packaged`): setuid the
   installed `netbootd-bpf-helper` on macOS, group membership on Linux — no
   builds. `--rust-only` still requires a clone and errors clearly without
-  one.
+  one. It does the steps needing nothing beyond cargo — the crate builds, the
+  bundled-skills copy, the stale-copy cleanup — and skips whatever needs sudo
+  or a second toolchain: the OCR helper and zigplug everywhere, the setuid
+  bpf-helper on macOS, the dialout/video group check on Linux. That split is
+  `setup::SourceStep::on_the_fast_path`, and it is not documentation: every
+  skippable step in `setup::run` is gated on `source_steps()`, and the message
+  the flag ends on is derived from the same list, so the two cannot disagree
+  (#207). Adding a step means adding a `SourceStep` variant, which the
+  compiler then forces you to classify.
 
 ## Remote control pattern
 

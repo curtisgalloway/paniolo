@@ -197,7 +197,7 @@
     function pollVideo() {
       fetch(withToken('/status')).then(r => {
         if (r.status === 401) {
-          vst.textContent = 'unauthorized — open the URL paniolo printed; it carries the token';
+          vst.textContent = 'unauthorized — this page needs the token in its URL; run `paniolo video preview` and open that URL';
           vst.style.color = '#f44';
           return;
         }

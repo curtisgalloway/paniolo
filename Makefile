@@ -93,10 +93,13 @@ check-shadow:
 		echo "         shadowing copy (e.g. 'brew uninstall paniolo')."; \
 	fi
 
-# Fast path for iterating on the Rust code without re-running the full setup
-# (skips OCR and the macOS setuid step — re-run `make install` if you need
-# those). Bootstraps the CLI first so install-layout changes in setup.rs take
-# effect, then lets `paniolo setup --rust-only` place the helpers — the
+# Fast path for iterating on the Rust code without re-running the full setup.
+# `--rust-only` does what needs nothing beyond cargo -- the crate builds, the
+# bundled skills, the stale-copy cleanup -- and skips what needs sudo or a
+# second toolchain (OCR, zigplug, the macOS setuid step, the Linux device-group
+# check); re-run `make install` when you need those. Bootstraps the CLI first so
+# install-layout changes in setup.rs take effect, then lets
+# `paniolo setup --rust-only` place the helpers and skills -- the
 # libexec-vs-PATH layout logic lives in one place (cli/src/setup.rs).
 rust: check-deps
 	cargo install --path cli
