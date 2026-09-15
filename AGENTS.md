@@ -1687,7 +1687,14 @@ Per-subsystem behavior:
     system libturbojpeg is too old for its pkg-config path, and the crate's
     `require-simd` default makes nasm mandatory on x86-64). `make install` fails
     early with a hint if any are missing (`check-deps` in the Makefile);
-    `paniolo setup` prints a reminder.
+    `paniolo setup` prints a reminder. `CaptureStream::next` hands back the
+    whole mmap'd arena buffer, sized once at the format's worst-case
+    `sizeimage` — for MJPG that is the *uncompressed* frame, 4,147,200 bytes at
+    1080p — so `frame()` must trim it to the `Metadata.bytesused` the driver
+    actually filled (the V4L2 twin of the Media Foundation stride lesson
+    below). Skipping the trim is invisible to every consumer, because JPEG
+    decoders stop at EOI: the preview rendered correctly while shipping a
+    216 KB frame inside a 4.1 MB part, 94.8% zeros.
   - *Windows:* our own Media Foundation layer (`hdmicap/src/capture_mf.rs`),
     delivering NV12 so it reuses the macOS pixel path. It enumerates the
     device's *native* media types and selects one explicitly — the Windows form
