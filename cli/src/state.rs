@@ -248,10 +248,13 @@ mod tests {
     /// predicates must disagree here, and agree everywhere else.
     #[test]
     fn a_process_in_teardown_is_pending_but_not_identifiably_ours() {
-        // alive, no command line — the teardown window.
+        // alive, no command line — the teardown window. The superseded
+        // predicate was `alive && cmdline.contains(name)`, which is false
+        // here: that is what read a corpse still holding the device as
+        // finished. It is described rather than spelled out, because written
+        // inline with these literals it is a constant expression and clippy's
+        // `nonminimal_bool` fails the build on it (GitHub #205).
         assert!(named_process_pending(true, "", "hdmicap"));
-        // The old test, spelled out, is what read this as finished.
-        assert!(!(true && "".contains("hdmicap")));
 
         // Alive and still running the daemon: pending, and identifiable.
         assert!(named_process_pending(

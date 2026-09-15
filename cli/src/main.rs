@@ -140,15 +140,22 @@ enum Command {
     },
     /// Open the combined video+serial dashboard, starting daemons if needed.
     Console {
-        target: Option<String>,
+        #[command(flatten)]
+        target: TargetArg,
         /// Serial interface name to preselect in the dashboard terminal.
         #[arg(long, short)]
         interface: Option<String>,
     },
     /// Run the target's configured power-cycle command.
-    PowerCycle { target: Option<String> },
+    PowerCycle {
+        #[command(flatten)]
+        target: TargetArg,
+    },
     /// Show whether the target is powered on (via the serial sense line).
-    PowerState { target: Option<String> },
+    PowerState {
+        #[command(flatten)]
+        target: TargetArg,
+    },
     /// Probe configured channels against reality over SSH (config vs hardware).
     Doctor {
         /// Target to check (default: all).
@@ -206,6 +213,38 @@ enum Command {
         #[command(subcommand)]
         cmd: Option<DaemonsCmd>,
     },
+}
+
+/// A runtime verb's target: named either positionally (`netboot stop pi5`) or
+/// as `-t/--target` (`netboot stop -t pi5`), never both, and optional wherever
+/// the lab has exactly one target.
+///
+/// Flattened into every runtime verb rather than spelled out per variant, so
+/// the two spellings cannot drift apart again (GitHub #203) and so the
+/// "specify one with -t" that [`resolve_single_target`] prints is true of
+/// every command that can print it. The config verbs (`set`, `rm`, `add`)
+/// deliberately do not use this: they require `-t`, because a command that
+/// creates or destroys configuration should not act on an implicit target.
+#[derive(clap::Args, Debug, Clone, Default)]
+struct TargetArg {
+    /// Target to act on (optional when the lab has exactly one).
+    #[arg(value_name = "TARGET", conflicts_with = "target")]
+    target_pos: Option<String>,
+    /// The same target, named the way the config verbs name it. Give it this
+    /// way or positionally, not both.
+    #[arg(long, short)]
+    target: Option<String>,
+}
+
+impl TargetArg {
+    /// The target the user named, whichever spelling they used; `None` when
+    /// they named none and the sole configured target should be resolved.
+    ///
+    /// The single place the two spellings are merged. Every runtime verb goes
+    /// through it, so there is no per-verb merge to get wrong or forget.
+    fn name(&self) -> Option<&str> {
+        self.target_pos.as_deref().or(self.target.as_deref())
+    }
 }
 
 #[derive(Subcommand)]
@@ -378,21 +417,23 @@ enum SerialCmd {
     },
     /// Open an interactive serial console (via tio) on the channel's host.
     Connect {
-        target: Option<String>,
+        #[command(flatten)]
+        target: TargetArg,
         /// Interface name (default: the only one).
         #[arg(long, short)]
         interface: Option<String>,
     },
     /// Start the serialcap daemon (owning every configured interface).
     Watch {
-        target: Option<String>,
+        #[command(flatten)]
+        target: TargetArg,
         #[arg(long, default_value_t = serial::DEFAULT_PORT)]
         port: u16,
     },
     /// Stop the running serialcap daemon.
     Stop {
-        /// Target whose serial host's daemon to stop (optional when local).
-        target: Option<String>,
+        #[command(flatten)]
+        target: TargetArg,
     },
     /// Send a line of input to the console through the running daemon.
     Send {
@@ -416,11 +457,8 @@ enum SerialCmd {
     },
     /// Print captured serial output (reads serialcap's on-disk log).
     Log {
-        /// Target (optional when the lab has one); `-t` also accepted.
-        #[arg(value_name = "TARGET", conflicts_with = "target")]
-        target_pos: Option<String>,
-        #[arg(long, short)]
-        target: Option<String>,
+        #[command(flatten)]
+        target: TargetArg,
         #[arg(long, short)]
         interface: Option<String>,
         /// Show only the most recent N lines.
@@ -448,10 +486,14 @@ enum SerialCmd {
     /// List available serial devices on this machine.
     Devices,
     /// Show a target's serial interfaces and the daemon status.
-    Show { target: Option<String> },
+    Show {
+        #[command(flatten)]
+        target: TargetArg,
+    },
     /// Pulse the DTR line (J2 power-button header) on a serial interface.
     Dtr {
-        target: Option<String>,
+        #[command(flatten)]
+        target: TargetArg,
         /// Pulse duration in ms (≤500 = soft power-button event, ≥3000 = hard off).
         #[arg(long, default_value_t = 200)]
         ms: u64,
@@ -462,7 +504,8 @@ enum SerialCmd {
     },
     /// Send a soft-reset signal via a brief J2 power-button press.
     Reset {
-        target: Option<String>,
+        #[command(flatten)]
+        target: TargetArg,
         #[arg(long, default_value_t = 200)]
         ms: u64,
         #[arg(long, short)]
@@ -502,14 +545,24 @@ enum NetbootCmd {
         target: String,
     },
     /// Start DHCP+TFTP netboot (the netbootd daemon) for a target.
-    Start { target: Option<String> },
+    Start {
+        #[command(flatten)]
+        target: TargetArg,
+    },
     /// Stop netboot and restore the interface.
-    Stop { target: Option<String> },
+    Stop {
+        #[command(flatten)]
+        target: TargetArg,
+    },
     /// Show netboot daemon status.
-    Status { target: Option<String> },
+    Status {
+        #[command(flatten)]
+        target: TargetArg,
+    },
     /// Show the netboot log (combined DHCP+TFTP).
     Logs {
-        target: Option<String>,
+        #[command(flatten)]
+        target: TargetArg,
         /// Show only the most recent N lines.
         #[arg(long, short = 'n', default_value_t = 50)]
         tail: usize,
@@ -518,7 +571,10 @@ enum NetbootCmd {
         follow: bool,
     },
     /// Print the target's TFTP root path.
-    TftpRoot { target: Option<String> },
+    TftpRoot {
+        #[command(flatten)]
+        target: TargetArg,
+    },
     /// List candidate USB-Ethernet interfaces on this machine.
     Devices,
 }
@@ -533,7 +589,8 @@ enum NetifCmd {
     Mode {
         /// netboot | link | ffx | off.
         mode: String,
-        target: Option<String>,
+        #[command(flatten)]
+        target: TargetArg,
     },
     /// Force the link down hard: release addresses, disable Wake-on-LAN, and
     /// admin-down the interface so the peer sees carrier loss.
@@ -541,9 +598,15 @@ enum NetifCmd {
     /// `mode off` only releases the host IP and can leave the carrier up (a NIC
     /// with Wake-on-LAN keeps the PHY energized) — use this when the target must
     /// actually detect link loss. Bring it back with `mode link`/`mode netboot`.
-    DownHard { target: Option<String> },
+    DownHard {
+        #[command(flatten)]
+        target: TargetArg,
+    },
     /// Show which mode the link is in, its carrier state, and its addresses.
-    Status { target: Option<String> },
+    Status {
+        #[command(flatten)]
+        target: TargetArg,
+    },
 }
 
 #[derive(Subcommand)]
@@ -574,9 +637,15 @@ enum PowerCmd {
         target: String,
     },
     /// Power on the target via the configured on_cmd.
-    On { target: Option<String> },
+    On {
+        #[command(flatten)]
+        target: TargetArg,
+    },
     /// Power off the target via the configured off_cmd.
-    Off { target: Option<String> },
+    Off {
+        #[command(flatten)]
+        target: TargetArg,
+    },
 }
 
 #[derive(Subcommand)]
@@ -609,9 +678,15 @@ enum HidCmd {
     /// Start the injection daemon (the KVM path): the helper owns the UART and
     /// re-exposes it over a WebSocket. `paniolo console` starts it on demand;
     /// run this to warm it ahead of time. Idempotent.
-    Serve { target: Option<String> },
+    Serve {
+        #[command(flatten)]
+        target: TargetArg,
+    },
     /// Stop the running injection daemon.
-    Stop { target: Option<String> },
+    Stop {
+        #[command(flatten)]
+        target: TargetArg,
+    },
 }
 
 #[derive(Subcommand)]
@@ -673,9 +748,15 @@ enum AdbCmd {
         target: String,
     },
     /// Show the target's adb channel config and device state.
-    Show { target: Option<String> },
+    Show {
+        #[command(flatten)]
+        target: TargetArg,
+    },
     /// Open an interactive `adb shell` on the channel's host.
-    Shell { target: Option<String> },
+    Shell {
+        #[command(flatten)]
+        target: TargetArg,
+    },
     /// Run a one-shot command on the device, e.g.
     /// `paniolo adb run -t pixel getprop ro.build.version.release`.
     Run {
@@ -687,7 +768,8 @@ enum AdbCmd {
     },
     /// Capture one PNG screenshot (`adb exec-out screencap`).
     Screencap {
-        target: Option<String>,
+        #[command(flatten)]
+        target: TargetArg,
         /// Output path; "-" for stdout.
         #[arg(long, short, default_value = "-")]
         out: String,
@@ -732,7 +814,8 @@ enum VideoCmd {
     },
     /// Start the hdmicap warm-stream daemon for the target's capture device.
     Watch {
-        target: Option<String>,
+        #[command(flatten)]
+        target: TargetArg,
         #[arg(long, default_value_t = video::DEFAULT_PORT)]
         port: u16,
         /// Force-restart a running (possibly stalled) daemon.
@@ -741,12 +824,13 @@ enum VideoCmd {
     },
     /// Stop the running hdmicap daemon.
     Stop {
-        /// Target whose video host's daemon to stop (optional when local).
-        target: Option<String>,
+        #[command(flatten)]
+        target: TargetArg,
     },
     /// Fetch one PNG screenshot from the running daemon.
     Shot {
-        target: Option<String>,
+        #[command(flatten)]
+        target: TargetArg,
         /// Wait until the signal is stable before capturing.
         #[arg(long)]
         stable: bool,
@@ -762,7 +846,8 @@ enum VideoCmd {
     },
     /// OCR the current frame via the running daemon, printing the text.
     Read {
-        target: Option<String>,
+        #[command(flatten)]
+        target: TargetArg,
         /// Wait until the signal is stable before reading.
         #[arg(long)]
         stable: bool,
@@ -781,8 +866,8 @@ enum VideoCmd {
     /// a log. `--open` hands it to the browser instead and prints only the
     /// token-free address.
     Preview {
-        /// Target whose daemon to print (optional when the lab has one).
-        target: Option<String>,
+        #[command(flatten)]
+        target: TargetArg,
         /// Open the URL in the default browser instead of printing it.
         #[arg(long)]
         open: bool,
@@ -790,7 +875,10 @@ enum VideoCmd {
     /// List available capture devices.
     Devices,
     /// Show the target's video channel and daemon status.
-    Show { target: Option<String> },
+    Show {
+        #[command(flatten)]
+        target: TargetArg,
+    },
 }
 
 fn main() {
@@ -826,10 +914,10 @@ fn run(cli: Cli) -> Result<()> {
         Command::Usb { cmd } => usb_cmd(lab_flag, cmd),
         Command::Adb { cmd } => adb_cmd(lab_flag, cmd),
         Command::Console { target, interface } => {
-            cmd_console(lab_flag, target.as_deref(), interface.as_deref())
+            cmd_console(lab_flag, target.name(), interface.as_deref())
         }
-        Command::PowerCycle { target } => cmd_power_cycle(lab_flag, target.as_deref()),
-        Command::PowerState { target } => cmd_power_state(lab_flag, target.as_deref()),
+        Command::PowerCycle { target } => cmd_power_cycle(lab_flag, target.name()),
+        Command::PowerState { target } => cmd_power_state(lab_flag, target.name()),
         Command::Doctor { target, host } => {
             cmd_doctor(lab_flag, target.as_deref(), host.as_deref())
         }
@@ -2073,14 +2161,14 @@ fn serial_cmd(lab_flag: Option<&str>, cmd: SerialCmd) -> Result<()> {
             Ok(())
         }
         SerialCmd::Connect { target, interface } => {
-            cmd_serial_connect(lab_flag, target.as_deref(), interface.as_deref())
+            cmd_serial_connect(lab_flag, target.name(), interface.as_deref())
         }
-        SerialCmd::Watch { target, port } => cmd_serial_watch(lab_flag, target.as_deref(), port),
+        SerialCmd::Watch { target, port } => cmd_serial_watch(lab_flag, target.name(), port),
         SerialCmd::Stop { target } => {
             // Resolve the target (routing to its serial channel's host if
             // remote) so we stop the right per-target daemon instance.
             let (target, serials) =
-                serial_runtime(lab_flag, target.as_deref(), None, dispatch::Mode::Reexec)?;
+                serial_runtime(lab_flag, target.name(), None, dispatch::Mode::Reexec)?;
             // An orphan has no discovery file, so `serialcap stop` cannot see
             // it and the operator has nothing left but `ps` and `kill` (#187).
             // Only consulted when nothing is tracked: a healthy daemon is never
@@ -2127,7 +2215,6 @@ fn serial_cmd(lab_flag: Option<&str>, cmd: SerialCmd) -> Result<()> {
             )
         }
         SerialCmd::Log {
-            target_pos,
             target,
             interface,
             tail,
@@ -2139,7 +2226,7 @@ fn serial_cmd(lab_flag: Option<&str>, cmd: SerialCmd) -> Result<()> {
             no_pending,
         } => cmd_serial_log(
             lab_flag,
-            target_pos.or(target).as_deref(),
+            target.name(),
             interface.as_deref(),
             tail,
             from,
@@ -2159,14 +2246,14 @@ fn serial_cmd(lab_flag: Option<&str>, cmd: SerialCmd) -> Result<()> {
             }
             Ok(())
         }
-        SerialCmd::Show { target } => cmd_serial_show(lab_flag, target.as_deref()),
+        SerialCmd::Show { target } => cmd_serial_show(lab_flag, target.name()),
         SerialCmd::Dtr {
             target,
             ms,
             interface,
         } => cmd_serial_dtr(
             lab_flag,
-            target.as_deref(),
+            target.name(),
             ms,
             interface.as_deref(),
             "DTR pulse",
@@ -2177,7 +2264,7 @@ fn serial_cmd(lab_flag: Option<&str>, cmd: SerialCmd) -> Result<()> {
             interface,
         } => cmd_serial_dtr(
             lab_flag,
-            target.as_deref(),
+            target.name(),
             ms,
             interface.as_deref(),
             "Soft reset",
@@ -3151,7 +3238,7 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
             port,
             restart,
         } => {
-            let (target, v) = video_runtime(lab_flag, target.as_deref())?;
+            let (target, v) = video_runtime(lab_flag, target.name())?;
             let device = v
                 .device
                 .ok_or_else(|| anyhow!("video channel for '{target}' has no device set"))?;
@@ -3198,7 +3285,7 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
         VideoCmd::Stop { target } => {
             // Resolve the target (routing to its video channel's host if
             // remote) so we stop the right per-target daemon instance.
-            let (target, v) = video_runtime(lab_flag, target.as_deref())?;
+            let (target, v) = video_runtime(lab_flag, target.name())?;
             // An orphan has no discovery file, so `hdmicap stop` cannot see it
             // and the operator has nothing left but `ps` and `kill` (#187).
             // Only consulted when nothing is tracked: a healthy daemon is
@@ -3234,7 +3321,7 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
             // re-execing verbatim (which would write on the control host).
             if out != "-" {
                 let lab = load_for_read(lab_flag)?;
-                let target_name = resolve_single_target(&lab, target.as_deref())?;
+                let target_name = resolve_single_target(&lab, target.name())?;
                 let rt = lab
                     .resolved_target(&target_name)
                     .ok_or_else(|| anyhow!("target '{target_name}' not found in lab"))?;
@@ -3269,7 +3356,7 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
                     std::process::exit(code);
                 }
             }
-            let (target, _v) = video_runtime(lab_flag, target.as_deref())?;
+            let (target, _v) = video_runtime(lab_flag, target.name())?;
             let mut args = vec![
                 "shot".to_string(),
                 "--timeout".to_string(),
@@ -3292,7 +3379,7 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
             timeout,
             json,
         } => {
-            let (target, _v) = video_runtime(lab_flag, target.as_deref())?;
+            let (target, _v) = video_runtime(lab_flag, target.name())?;
             let body = video::ocr(&target, stable, timeout)?;
             let out = if json { body } else { video::text_of(&body) };
             print!("{out}");
@@ -3303,9 +3390,9 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
         }
         VideoCmd::Preview { target, open } => {
             if open {
-                refuse_remote_open(lab_flag, target.as_deref())?;
+                refuse_remote_open(lab_flag, target.name())?;
             }
-            let (target, _v) = video_runtime(lab_flag, target.as_deref())?;
+            let (target, _v) = video_runtime(lab_flag, target.name())?;
             let Some(daemon) = video::daemon(&target) else {
                 bail!("no video daemon running — start one with `paniolo video watch`");
             };
@@ -3330,7 +3417,7 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
             std::process::exit(video::passthrough(&["devices".to_string()], None)?);
         }
         VideoCmd::Show { target } => {
-            let (target, v) = video_runtime(lab_flag, target.as_deref())?;
+            let (target, v) = video_runtime(lab_flag, target.name())?;
             println!("device\t{}", v.device.as_deref().unwrap_or("(not set)"));
             match video::daemon_url(&target) {
                 Some(url) => {
@@ -3402,7 +3489,7 @@ fn netboot_cmd(lab_flag: Option<&str>, cmd: NetbootCmd) -> Result<()> {
                 host_ip,
                 tftp_root,
                 boot,
-            } = netboot_runtime(lab_flag, target.as_deref())?;
+            } = netboot_runtime(lab_flag, target.name())?;
             let root = tftp_root.ok_or_else(|| {
                 anyhow!(
                     "no tftp_root configured \
@@ -3414,7 +3501,7 @@ fn netboot_cmd(lab_flag: Option<&str>, cmd: NetbootCmd) -> Result<()> {
             Ok(())
         }
         NetbootCmd::Stop { target } => {
-            let NetbootRuntime { target, .. } = netboot_runtime(lab_flag, target.as_deref())?;
+            let NetbootRuntime { target, .. } = netboot_runtime(lab_flag, target.name())?;
             netboot::stop(&target)?;
             println!("netboot stopped for '{target}'.");
             Ok(())
@@ -3422,7 +3509,7 @@ fn netboot_cmd(lab_flag: Option<&str>, cmd: NetbootCmd) -> Result<()> {
         NetbootCmd::Status { target } => {
             let NetbootRuntime {
                 target, host_ip, ..
-            } = netboot_runtime(lab_flag, target.as_deref())?;
+            } = netboot_runtime(lab_flag, target.name())?;
             let st = netboot::status(&target);
             match st.state {
                 None => println!("netboot\tnot running (no state)"),
@@ -3451,11 +3538,11 @@ fn netboot_cmd(lab_flag: Option<&str>, cmd: NetbootCmd) -> Result<()> {
             tail,
             follow,
         } => {
-            let NetbootRuntime { target, .. } = netboot_runtime(lab_flag, target.as_deref())?;
+            let NetbootRuntime { target, .. } = netboot_runtime(lab_flag, target.name())?;
             cmd_netboot_logs(&target, tail, follow)
         }
         NetbootCmd::TftpRoot { target } => {
-            let NetbootRuntime { tftp_root, .. } = netboot_runtime(lab_flag, target.as_deref())?;
+            let NetbootRuntime { tftp_root, .. } = netboot_runtime(lab_flag, target.name())?;
             match tftp_root {
                 Some(r) => {
                     println!("{r}");
@@ -3638,7 +3725,7 @@ fn netif_cmd(lab_flag: Option<&str>, cmd: NetifCmd) -> Result<()> {
                 host_ip,
                 tftp_root,
                 boot,
-            } = netboot_runtime(lab_flag, target.as_deref())?;
+            } = netboot_runtime(lab_flag, target.name())?;
             match mode.as_str() {
                 "netboot" => {
                     let root = tftp_root.clone().ok_or_else(|| {
@@ -3659,7 +3746,7 @@ fn netif_cmd(lab_flag: Option<&str>, cmd: NetifCmd) -> Result<()> {
                 interface: iface,
                 host_ip,
                 ..
-            } = netboot_runtime(lab_flag, target.as_deref())?;
+            } = netboot_runtime(lab_flag, target.name())?;
             netif::down_hard(&target, &iface, &host_ip)?;
             print_netif_status(&target, &iface, &host_ip);
             Ok(())
@@ -3670,7 +3757,7 @@ fn netif_cmd(lab_flag: Option<&str>, cmd: NetifCmd) -> Result<()> {
                 interface: iface,
                 host_ip,
                 ..
-            } = netboot_runtime(lab_flag, target.as_deref())?;
+            } = netboot_runtime(lab_flag, target.name())?;
             print_netif_status(&target, &iface, &host_ip);
             Ok(())
         }
@@ -3745,8 +3832,8 @@ fn power_cmd(lab_flag: Option<&str>, cmd: PowerCmd) -> Result<()> {
             println!("power channel removed from '{target}'.");
             Ok(())
         }
-        PowerCmd::On { target } => cmd_power_on(lab_flag, target.as_deref()),
-        PowerCmd::Off { target } => cmd_power_off(lab_flag, target.as_deref()),
+        PowerCmd::On { target } => cmd_power_on(lab_flag, target.name()),
+        PowerCmd::Off { target } => cmd_power_off(lab_flag, target.name()),
     }
 }
 
@@ -3765,8 +3852,8 @@ fn hid_cmd(lab_flag: Option<&str>, cmd: HidCmd) -> Result<()> {
             Ok(())
         }
         HidCmd::Send { target, args } => cmd_hid_send(lab_flag, target.as_deref(), &args),
-        HidCmd::Serve { target } => cmd_hid_serve(lab_flag, target.as_deref()),
-        HidCmd::Stop { target } => cmd_hid_stop(lab_flag, target.as_deref()),
+        HidCmd::Serve { target } => cmd_hid_serve(lab_flag, target.name()),
+        HidCmd::Stop { target } => cmd_hid_stop(lab_flag, target.name()),
     }
 }
 
@@ -4062,9 +4149,9 @@ fn adb_cmd(lab_flag: Option<&str>, cmd: AdbCmd) -> Result<()> {
             println!("adb channel removed from '{target}'.");
             Ok(())
         }
-        AdbCmd::Show { target } => cmd_adb_show(lab_flag, target.as_deref()),
+        AdbCmd::Show { target } => cmd_adb_show(lab_flag, target.name()),
         AdbCmd::Shell { target } => {
-            let a = adb_runtime(lab_flag, target.as_deref(), dispatch::Mode::Interactive)?;
+            let a = adb_runtime(lab_flag, target.name(), dispatch::Mode::Interactive)?;
             adb::exec_shell(a.adb.as_deref(), a.serial.as_deref())
         }
         AdbCmd::Run { target, args } => {
@@ -4085,7 +4172,7 @@ fn adb_cmd(lab_flag: Option<&str>, cmd: AdbCmd) -> Result<()> {
             // host) — mirrors `video shot` above.
             if out != "-" {
                 let lab = load_for_read(lab_flag)?;
-                let target_name = resolve_single_target(&lab, target.as_deref())?;
+                let target_name = resolve_single_target(&lab, target.name())?;
                 let rt = lab
                     .resolved_target(&target_name)
                     .ok_or_else(|| anyhow!("target '{target_name}' not found in lab"))?;
@@ -4111,7 +4198,7 @@ fn adb_cmd(lab_flag: Option<&str>, cmd: AdbCmd) -> Result<()> {
                     std::process::exit(code);
                 }
             }
-            let a = adb_runtime(lab_flag, target.as_deref(), dispatch::Mode::Reexec)?;
+            let a = adb_runtime(lab_flag, target.name(), dispatch::Mode::Reexec)?;
             adb::screencap(a.adb.as_deref(), a.serial.as_deref(), &out)
         }
         AdbCmd::Input { target, args } => {
@@ -4379,29 +4466,31 @@ mod tests {
     }
 
     /// `video preview --open` is the form that keeps the token off the
-    /// terminal; without it the flag is false and the URL is printed.
+    /// terminal; without it the flag is false and the URL is printed. The
+    /// target still takes either spelling (#203).
     #[test]
     fn video_preview_parses_the_open_flag() {
-        let cli = Cli::try_parse_from(["paniolo", "video", "preview", "--open"]).unwrap();
-        match cli.command {
-            Command::Video {
-                cmd: VideoCmd::Preview { target, open },
-            } => {
-                assert_eq!(target, None);
-                assert!(open);
+        let preview = |argv: &[&str]| {
+            let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            match cli.command {
+                Command::Video {
+                    cmd: VideoCmd::Preview { target, open },
+                } => (target.name().map(str::to_string), open),
+                _ => panic!("{argv:?}: parsed as a different command"),
             }
-            _ => panic!("parsed as a different command"),
-        }
-        let cli = Cli::try_parse_from(["paniolo", "video", "preview", "dut"]).unwrap();
-        match cli.command {
-            Command::Video {
-                cmd: VideoCmd::Preview { target, open },
-            } => {
-                assert_eq!(target.as_deref(), Some("dut"));
-                assert!(!open);
-            }
-            _ => panic!("parsed as a different command"),
-        }
+        };
+        assert_eq!(
+            preview(&["paniolo", "video", "preview", "--open"]),
+            (None, true)
+        );
+        assert_eq!(
+            preview(&["paniolo", "video", "preview", "dut"]),
+            (Some("dut".to_string()), false)
+        );
+        assert_eq!(
+            preview(&["paniolo", "video", "preview", "-t", "dut", "--open"]),
+            (Some("dut".to_string()), true)
+        );
     }
 
     /// The dashboard URL carries the video daemon's token for the page itself
@@ -4673,5 +4762,223 @@ mod tests {
             &["definitely-not-this".to_string(), exe_name]
         ));
         assert!(!pid_runs_one_of(me, &["netbootd".to_string()]));
+    }
+
+    // Regression (#203): the config verbs took `-t/--target` and the runtime
+    // verbs took the target positionally, so `netboot stop -t pi5` failed with
+    // "unexpected argument '-t'" — while `resolve_single_target` told the user
+    // to "specify one with -t". Every runtime verb now flattens `TargetArg`,
+    // which accepts either spelling and refuses both at once.
+
+    /// Every runtime verb that takes an optional target, as the argv prefix
+    /// that reaches it. The list is the test's own; a verb added without a
+    /// line here is simply uncovered, which is why the parse assertions below
+    /// are cheap enough to keep the list complete.
+    const RUNTIME_VERBS: &[&[&str]] = &[
+        &["console"],
+        &["power-cycle"],
+        &["power-state"],
+        &["serial", "connect"],
+        &["serial", "watch"],
+        &["serial", "stop"],
+        &["serial", "show"],
+        &["serial", "log"],
+        &["serial", "dtr"],
+        &["serial", "reset"],
+        &["video", "watch"],
+        &["video", "stop"],
+        &["video", "shot"],
+        &["video", "read"],
+        &["video", "preview"],
+        &["video", "show"],
+        &["netboot", "start"],
+        &["netboot", "stop"],
+        &["netboot", "status"],
+        &["netboot", "logs"],
+        &["netboot", "tftp-root"],
+        &["netif", "mode", "link"],
+        &["netif", "down-hard"],
+        &["netif", "status"],
+        &["power", "on"],
+        &["power", "off"],
+        &["hid", "serve"],
+        &["hid", "stop"],
+        &["adb", "shell"],
+        &["adb", "screencap"],
+    ];
+
+    fn parse(argv: &[&str]) -> Result<Cli, clap::Error> {
+        let mut full = vec!["paniolo"];
+        full.extend_from_slice(argv);
+        Cli::try_parse_from(full)
+    }
+
+    /// The merge every runtime verb goes through. Four combinations, one
+    /// place: there is no per-verb merge left to get wrong.
+    #[test]
+    fn target_arg_takes_either_spelling_and_prefers_neither() {
+        let pos = TargetArg {
+            target_pos: Some("pi5".into()),
+            target: None,
+        };
+        let flag = TargetArg {
+            target_pos: None,
+            target: Some("pi5".into()),
+        };
+        assert_eq!(pos.name(), Some("pi5"));
+        assert_eq!(flag.name(), Some("pi5"));
+        assert_eq!(TargetArg::default().name(), None);
+        // Both at once is refused by clap before this is reached (see
+        // `every_runtime_verb_refuses_both_spellings_at_once`), so the merge
+        // never has to arbitrate between two different names.
+    }
+
+    /// The bug, on every verb that had it: `-t` and `--target` must parse
+    /// wherever the positional does.
+    #[test]
+    fn every_runtime_verb_accepts_both_target_spellings() {
+        for verb in RUNTIME_VERBS {
+            for spelling in [vec!["pi5"], vec!["-t", "pi5"], vec!["--target", "pi5"]] {
+                let mut argv = verb.to_vec();
+                argv.extend(spelling.iter().copied());
+                parse(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            }
+            // Naming no target stays legal: a lab with one target needs none.
+            parse(verb).unwrap_or_else(|e| panic!("{verb:?} (no target): {e}"));
+        }
+    }
+
+    /// Both spellings at once is a clean clap error, not a silent precedence
+    /// rule the reader has to know about.
+    #[test]
+    fn every_runtime_verb_refuses_both_spellings_at_once() {
+        for verb in RUNTIME_VERBS {
+            let mut argv = verb.to_vec();
+            argv.extend(["pi5", "-t", "pi5"]);
+            let err = parse(&argv)
+                .err()
+                .unwrap_or_else(|| panic!("{argv:?} must be refused"));
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{argv:?}: {err}"
+            );
+        }
+    }
+
+    /// `resolve_single_target` tells the user to "specify one with -t" for
+    /// every runtime verb. That advice was false for most of them; these are
+    /// the verbs that print it, so `-t` has to work on each.
+    #[test]
+    fn the_multiple_targets_message_names_a_spelling_that_works() {
+        let lab = model::parse(
+            "[targets.a]\n[targets.a.power]\ncycle_cmd = \"true\"\n\
+             [targets.b]\n[targets.b.power]\ncycle_cmd = \"true\"\n",
+        )
+        .expect("two-target lab");
+        let err = resolve_single_target(&lab, None).unwrap_err().to_string();
+        assert!(
+            err.contains("-t"),
+            "the message should name a spelling: {err}"
+        );
+        // ...and that spelling parses on the verbs that can print it.
+        for verb in RUNTIME_VERBS {
+            let mut argv = verb.to_vec();
+            argv.extend(["-t", "a"]);
+            parse(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        }
+    }
+
+    /// The merged value is what the handler acts on, for both spellings.
+    #[test]
+    fn netboot_and_netif_handlers_see_the_merged_target() {
+        let target_of = |argv: &[&str]| -> Option<String> {
+            let cli = parse(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            match cli.command {
+                Command::Netboot { cmd } => match cmd {
+                    NetbootCmd::Start { target }
+                    | NetbootCmd::Stop { target }
+                    | NetbootCmd::Status { target }
+                    | NetbootCmd::TftpRoot { target }
+                    | NetbootCmd::Logs { target, .. } => target.name().map(str::to_string),
+                    _ => panic!("{argv:?}: not a netboot runtime verb"),
+                },
+                Command::Netif { cmd } => match cmd {
+                    NetifCmd::Mode { target, .. }
+                    | NetifCmd::DownHard { target }
+                    | NetifCmd::Status { target } => target.name().map(str::to_string),
+                },
+                _ => panic!("{argv:?}: not netboot or netif"),
+            }
+        };
+        for verb in [
+            vec!["netboot", "start"],
+            vec!["netboot", "stop"],
+            vec!["netboot", "status"],
+            vec!["netboot", "logs"],
+            vec!["netboot", "tftp-root"],
+            vec!["netif", "mode", "link"],
+            vec!["netif", "down-hard"],
+            vec!["netif", "status"],
+        ] {
+            let mut pos = verb.clone();
+            pos.push("pi5");
+            let mut flag = verb.clone();
+            flag.extend(["-t", "pi5"]);
+            assert_eq!(
+                target_of(&pos).as_deref(),
+                Some("pi5"),
+                "{verb:?} positional"
+            );
+            assert_eq!(target_of(&flag).as_deref(), Some("pi5"), "{verb:?} -t");
+            assert_eq!(target_of(&verb), None, "{verb:?} with no target");
+        }
+    }
+
+    /// `netboot logs` keeps its own short flags next to the shared `-t`.
+    #[test]
+    fn netboot_logs_keeps_tail_and_follow_alongside_target_flag() {
+        let cli = parse(&["netboot", "logs", "-t", "pi5", "-n", "7", "-f"]).unwrap();
+        let Command::Netboot {
+            cmd:
+                NetbootCmd::Logs {
+                    target,
+                    tail,
+                    follow,
+                },
+        } = cli.command
+        else {
+            panic!("expected netboot logs");
+        };
+        assert_eq!(target.target_pos, None);
+        assert_eq!(target.name(), Some("pi5"));
+        assert_eq!(tail, 7);
+        assert!(follow);
+    }
+
+    /// The config verbs are deliberately NOT part of this: they still require
+    /// `-t` and still refuse a positional, because a command that creates or
+    /// destroys configuration should not act on an implicit target.
+    #[test]
+    fn config_verbs_still_require_the_target_flag() {
+        // Verbs whose only required argument is the target, so the positional
+        // and missing-target assertions below are unambiguous.
+        for verb in [
+            vec!["netboot", "rm"],
+            vec!["power", "rm"],
+            vec!["hid", "rm"],
+        ] {
+            let mut flag = verb.clone();
+            flag.extend(["-t", "pi5"]);
+            parse(&flag).unwrap_or_else(|e| panic!("{flag:?}: {e}"));
+
+            let mut pos = verb.clone();
+            pos.push("pi5");
+            assert!(
+                parse(&pos).is_err(),
+                "{pos:?} must not take the target positionally"
+            );
+            assert!(parse(&verb).is_err(), "{verb:?} must require --target");
+        }
     }
 }

@@ -132,6 +132,12 @@ paniolo netboot logs -f [target]          # follow the combined log (-n N for la
 paniolo netboot stop [target]
 ```
 
+**Naming the target.** Every *runtime* verb takes it either way — positionally
+(`paniolo netboot stop pi5`) or as `-t/--target` (`paniolo netboot stop -t
+pi5`) — and both at once is refused. Omit it when the lab has one target. The
+*config* verbs (`set`, `add`, `rm`) require `-t` and do not take a positional.
+`paniolo doctor [target]` is positional-only: with no target it checks them all.
+
 `start` refuses an interface that carries the system default route (a primary
 NIC) — the netboot link must be a dedicated USB-Ethernet adapter — and refuses
 to start a second target on an interface another target's netboot already runs
@@ -185,6 +191,7 @@ paniolo netif mode off [target]            # soft DOWN: release host IP (+ ffx L
 paniolo netif down-hard [target]           # hard DOWN: also kill WoL + admin-down the iface
 paniolo netif status [target]              # mode, carrier, addresses, ffx peer
 ```
+
 
 **Testing the link up/down.** To check that the link itself comes up and drops —
 without serving anything — toggle `link` ↔ `off` and read `netif status`:
@@ -754,11 +761,14 @@ the device is free just because a daemon is gone from the tracked list.
   (e.g. a Homebrew keg from the tap can shadow it). The helper binaries are
   *not* on PATH — they live in `~/.local/libexec/paniolo/bin`
   (`paniolo helper <name> …` to run one by hand).
-- `paniolo console` auto-starts both daemons if they aren't running and opens
-  a URL carrying every daemon's token (`?token=`, `?serialws=…token=…`,
-  `?hidws=…`); the daemons answer nothing without it, so use the URL paniolo
-  prints rather than a bare `http://127.0.0.1:<port>/`. A daemon left over
-  from an older paniolo has no token — `paniolo daemons restart --stale`.
+- `paniolo console` auto-starts both daemons if they aren't running and hands
+  the browser a URL carrying every daemon's token (`?token=`,
+  `?serialws=…token=…`, `?hidws=…`); the daemons answer nothing without it.
+  What `console` *prints* is the token-free address, because that line lands in
+  your transcript — so do not paste it into a browser and expect the page to
+  work. If no browser could be launched, `console` prints the full URL instead
+  and says so. A daemon left over from an older paniolo has no token —
+  `paniolo daemons restart --stale`.
 - Netboot requires passwordless `sudo` (`ip` on Linux, `ifconfig` on macOS).
 - netboot and ffx are mutually exclusive on the link — use `paniolo netif mode`
   to switch; entering ffx mode stops netboot so a power-cycle boots from SD.

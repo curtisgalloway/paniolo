@@ -398,13 +398,22 @@ Python tree below:
   descriptions, or prints one `SKILL.md` (`--path` for the file path) — the
   share/ analogue of `paniolo helper`, so an agent can discover and read them
   without the harness pre-loading them (skills.rs).
-- **CLI argument convention**: every runtime command takes the target as an
-  optional positional (`netboot start pi5`, `serial log pi5`, `video stop
-  pi5`); channel-config commands (`set`/`add`/`rm`) take `-t/--target`.
-  `serial send` and `serial log` accept `-t` as well (`serial send` reads two
-  positionals as `<target> <text>`, one as just the text); `hid send`, `adb
-  run`, and `adb input` take `-t` only, because their positional tail is the
-  helper's / `adb`'s args. One config-command exception: `target rename OLD
+- **CLI argument convention**: every runtime command takes the target
+  **either** as an optional positional (`netboot start pi5`, `video stop pi5`)
+  **or** as `-t/--target` (`netboot start -t pi5`) — never both at once, which
+  clap refuses. One flattened `TargetArg` (main.rs) supplies both spellings and
+  the single `name()` that merges them, so the two cannot drift apart per verb
+  the way they had (#203) and so `resolve_single_target`'s "specify one with
+  -t" is true of every command that prints it. A new runtime verb flattens
+  `TargetArg`; it does not spell out its own target field.
+  Channel-config commands (`set`/`add`/`rm`) take `-t/--target` only, and
+  refuse a positional: a command that creates or destroys configuration should
+  not act on an implicit target. `hid send`, `adb run`, `adb input`, and the
+  `usb` verbs also take `-t` only, because their positional tail is the
+  helper's / `adb`'s args; `serial send` likewise (it reads two positionals as
+  `<target> <text>`, one as just the text). `doctor` keeps a bare positional:
+  omitting it checks **all** targets rather than a single implied one, so it is
+  not the same argument. One config-command exception: `target rename OLD
   NEW` takes two bare positionals and no `-t` (it renames the target itself,
   carrying all channels and lab-file comments; config-only — running daemons
   keep their runtime dirs under the old name, so `stop` and re-`watch` them).

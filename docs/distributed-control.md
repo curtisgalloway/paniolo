@@ -38,6 +38,13 @@ conventional path). That file declares every **host** in the lab and every
 one file — deliberately simple; multi-file / multi-lab composition can come
 later if it ever earns its keep.
 
+**The control host runs the same paniolo.** A re-exec forwards your argv
+verbatim (`dispatch::subcommand_args`), so a flag this version accepts is sent
+as typed and a control host on an older release answers `unexpected argument`.
+That is true of every flag paniolo has added; keep the hosts on the release the
+dev machine runs. Where a spelling is optional — the target as `-t` rather than
+positionally — the positional form is the one every past release understands.
+
 The file is the contract. It is plain, reviewable config under version control,
 edited by a human (optionally with an agent's help — see
 [Configuration workflow](#configuration-workflow)); paniolo reads it but is not
