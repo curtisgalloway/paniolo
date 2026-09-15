@@ -511,7 +511,8 @@ cli/src/
   power.rs      generic power hooks (on/off/cycle/state_cmd via sh -c), DTR via
                 serialcap /button (+ direct-serial fallback), power_on sense
   state.rs      netboot state files (JSON-compatible with the Python's)
-  doctor.rs     config-vs-reality probing (local + over SSH)
+  doctor.rs     config-vs-reality probing (local + over SSH), including
+                whether a netboot interface holds its configured host_ip
   discover.rs   hardware inventory + the configure proposal block
   setup.rs      installer: paniolo CLI onto PATH (~/.cargo/bin); helpers into
                 the private libexec dir (~/.local/libexec/paniolo/bin) via
