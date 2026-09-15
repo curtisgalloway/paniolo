@@ -247,7 +247,7 @@ paniolo video set -t <target> --device "<id-or-name>" [--ocr-mode text|gui]  # c
                                            #   for GUI screens (unset = platform default)
 paniolo video watch [target] [--restart]   # start the capture daemon (background);
                                            #   --restart force-restarts a stalled one
-paniolo video preview                 # print the daemon's dashboard URL (no browser)
+paniolo video preview [--open]        # print the daemon's dashboard URL (--open: hand it to a browser instead)
 paniolo video shot [target] [--stable] [--out frame.png]   # one lossless PNG
 paniolo video shot --changed-since <hex-hash> --timeout <ms>   # block until the
                                            #   frame differs from a previous shot's hash
@@ -257,11 +257,23 @@ paniolo video stop [target]           # stop the daemon (on the target's host)
 ```
 
 - The **dashboard** (the video daemon's URL — ports are OS-assigned, and the
-  URL `video watch`/`video preview`/`console` print carries the daemon's
-  `?token=`; open exactly that URL) shows live video on top, a
+  URL `video watch` and `video preview` print carries the daemon's `?token=`;
+  open exactly that URL) shows live video on top, a
   serial terminal below, an **OCR button** that reads the current screen, and —
   when the target has a `hid` channel — a **⌨ Capture input** button that turns
   the page into a KVM (see HID injection below).
+- **The token in that URL is a live credential — keep it out of your
+  transcript.** Every command prints the token-free
+  `http://127.0.0.1:<port>`; `paniolo video preview` is the only one that
+  prints the openable form, and it exists for a human about to paste it into a
+  browser. Never paste a `?token=` URL into an issue, a commit message, or a
+  chat.
+- **Opening a browser is a human's job, not yours.** `paniolo video preview
+  --open` only works on a machine with a desktop session, and it is refused
+  outright when the video channel is on another host. On a headless control
+  host — where you usually are — it writes the URL to a `0600` file and prints
+  that path instead of opening anything, so it is not a way to get a browser
+  open. Hand the human `paniolo console <target>` and let them run it.
 - The `device` may be a **stable id** (preferred — `video devices` prints
   `id=…`: the AVFoundation uniqueID on macOS, the `/dev/v4l/by-path` symlink on
   Linux), a name substring, or a `/dev/video*` path. Ids are derived from USB
@@ -757,11 +769,14 @@ the device is free just because a daemon is gone from the tracked list.
   (e.g. a Homebrew keg from the tap can shadow it). The helper binaries are
   *not* on PATH — they live in `~/.local/libexec/paniolo/bin`
   (`paniolo helper <name> …` to run one by hand).
-- `paniolo console` auto-starts both daemons if they aren't running and opens
-  a URL carrying every daemon's token (`?token=`, `?serialws=…token=…`,
-  `?hidws=…`); the daemons answer nothing without it, so use the URL paniolo
-  prints rather than a bare `http://127.0.0.1:<port>/`. A daemon left over
-  from an older paniolo has no token — `paniolo daemons restart --stale`.
+- `paniolo console` auto-starts both daemons if they aren't running and hands
+  the browser a URL carrying every daemon's token (`?token=`,
+  `?serialws=…token=…`, `?hidws=…`); the daemons answer nothing without it.
+  What `console` *prints* is the token-free address, because that line lands in
+  your transcript — so do not paste it into a browser and expect the page to
+  work. If no browser could be launched, `console` writes the full URL to a
+  `0600` file and prints that path — never the URL itself. A daemon left over from an older paniolo has no token —
+  `paniolo daemons restart --stale`.
 - Netboot requires passwordless `sudo` (`ip` on Linux, `ifconfig` on macOS).
 - netboot and ffx are mutually exclusive on the link — use `paniolo netif mode`
   to switch; entering ffx mode stops netboot so a power-cycle boots from SD.
