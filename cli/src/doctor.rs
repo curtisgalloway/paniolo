@@ -34,6 +34,10 @@ enum Status {
     /// Present, but configured against another channel: two netboot links on
     /// one host sharing a /24 (`model::netboot_subnet_clash`).
     Conflict,
+    /// Present, but not running as configured: a netboot interface holding
+    /// an IPv4 address that is not the channel's effective host IP
+    /// ([`netboot_ip_drift`]).
+    Mismatch,
 }
 
 impl Status {
@@ -44,12 +48,13 @@ impl Status {
             Status::Unreachable => "unreachable",
             Status::Incomplete => "incomplete",
             Status::Conflict => "CONFLICT",
+            Status::Mismatch => "MISMATCH",
         }
     }
     fn is_problem(&self) -> bool {
         matches!(
             self,
-            Status::Missing | Status::Unreachable | Status::Conflict
+            Status::Missing | Status::Unreachable | Status::Conflict | Status::Mismatch
         )
     }
 }
@@ -76,6 +81,11 @@ enum Probe {
     Video(String),
     /// The network interface is present on this host.
     NetInterface(String),
+    /// The interface holds no IPv4 address, or holds `host_ip`. Exit 1 — and
+    /// the offending address on stdout — when it holds only other addresses:
+    /// a link that drifted from its configured host IP
+    /// ([`netboot_ip_drift`]).
+    NetInterfaceHolds { iface: String, host_ip: String },
     /// adb reaches the device: the binary resolves (else exit 3), then
     /// `get-state` succeeds.
     Adb { bin: String, serial: Option<String> },
@@ -94,6 +104,9 @@ impl Probe {
             Probe::NetInterface(iface) => {
                 let q = ssh::shell_quote(iface);
                 format!("test -e /sys/class/net/{q} || ifconfig {q} >/dev/null 2>&1")
+            }
+            Probe::NetInterfaceHolds { iface, host_ip } => {
+                net_interface_holds_script(iface, host_ip)
             }
             Probe::Adb { bin, serial } => {
                 let q_bin = ssh::shell_quote(bin);
@@ -129,6 +142,9 @@ impl Probe {
                 ok(String::from_utf8_lossy(&out.stdout).contains(dev.as_str()))
             }
             Probe::NetInterface(iface) => local_interface_exists(iface),
+            Probe::NetInterfaceHolds { iface, host_ip } => {
+                ok(local_netboot_ip_drift(iface, host_ip).is_none())
+            }
             Probe::Adb { bin, serial } => {
                 let found = if bin.starts_with('/') {
                     is_executable(std::path::Path::new(bin)).then(|| bin.into())
@@ -192,6 +208,126 @@ fn local_interface_exists(iface: &str) -> Option<i32> {
             .map(|s| s.code().unwrap_or(-1));
     }
     None
+}
+
+/// The address a netboot interface holds that is not its effective host IP,
+/// if it holds any address at all. `held` is what `netif::iface_addresses`
+/// listed: bare on macOS, `A.B.C.D/NN` on Linux, so a prefix is stripped
+/// before comparing. No IPv4 address at all (`netif mode off`) is not drift;
+/// neither is holding `host_ip` alongside others, since that is the address
+/// netbootd serves at. Pure, so the decision is unit-testable.
+fn netboot_ip_drift(held: &[String], host_ip: &str) -> Option<String> {
+    let bare: Vec<&str> = held
+        .iter()
+        .map(|a| a.split('/').next().unwrap_or(a))
+        .collect();
+    if bare.contains(&host_ip) {
+        return None;
+    }
+    bare.first().map(|a| a.to_string())
+}
+
+/// [`netboot_ip_drift`] against this host's live addresses.
+fn local_netboot_ip_drift(iface: &str, host_ip: &str) -> Option<String> {
+    netboot_ip_drift(&crate::netif::iface_addresses(iface).0, host_ip)
+}
+
+/// POSIX rendering of [`Probe::NetInterfaceHolds`]: list the interface's
+/// IPv4 addresses (`ip -4 -o addr show` on Linux, `ifconfig` on macOS —
+/// both put the address right after an `inet` token, Linux with a `/NN`
+/// prefix), exit 0 when there are none or `host_ip` is among them, else
+/// print the first other address and exit 1.
+fn net_interface_holds_script(iface: &str, host_ip: &str) -> String {
+    let q_iface = ssh::shell_quote(iface);
+    let q_ip = ssh::shell_quote(host_ip);
+    format!(
+        // `ip` lives in /usr/sbin and `ifconfig` in /sbin, and a
+        // non-interactive SSH shell often has neither on PATH. Without this
+        // both legs exit 127, the address list comes back empty, and a
+        // drifted link reads as fine — the one direction this check must not
+        // fail in. Same reason `HOOK_PATH_PREFIX` exists.
+        "PATH=\"$PATH:/usr/sbin:/sbin\"; \
+         out=$({{ ip -4 -o addr show dev {q_iface} || ifconfig {q_iface}; }} 2>/dev/null); \
+         test -n \"$out\" || exit 3; \
+         addrs=$(printf '%s\\n' \"$out\" | \
+         awk '{{ for (i = 1; i < NF; i++) if ($i == \"inet\") {{ \
+         sub(/^addr:/, \"\", $(i + 1)); split($(i + 1), a, \"/\"); print a[1] }} }}'); \
+         test -z \"$addrs\" && exit 0; \
+         for a in $addrs; do test \"$a\" = {q_ip} && exit 0; done; \
+         set -- $addrs; echo \"$1\"; exit 1"
+    )
+}
+
+/// What a netboot interface holds instead of its host IP: `None` when the
+/// host is unreachable, `Some(None)` when the link is fine, `Some(Some(addr))`
+/// when it drifted. Local hosts answer through [`local_netboot_ip_drift`];
+/// remote ones run [`Probe::NetInterfaceHolds`], whose stdout carries the
+/// address (the exit status alone would only say "some other address").
+fn probe_netboot_ip_drift(
+    lab: &Lab,
+    host_name: &str,
+    iface: &str,
+    host_ip: &str,
+) -> Option<Option<String>> {
+    let host = lab.host(host_name);
+    if host.is_local(host_name) {
+        return Some(local_netboot_ip_drift(iface, host_ip));
+    }
+    let p = Probe::NetInterfaceHolds {
+        iface: iface.to_string(),
+        host_ip: host_ip.to_string(),
+    };
+    let out = ssh::run(
+        &host,
+        &["sh".to_string(), "-c".to_string(), p.to_posix()],
+        None,
+        &[],
+    )
+    .ok()?;
+    match out.status {
+        0 => Some(None),
+        // 255 is ssh's own failure; 3 is the script's "neither `ip` nor
+        // `ifconfig` told me anything". Both mean the question was not
+        // answered, which must not be rendered as a hardware-state claim.
+        255 | 3 => None,
+        _ => {
+            // Drift is asserted only when the script actually named the
+            // address. An exit with nothing on stdout is a probe that failed
+            // (a signal, a non-POSIX login shell), not a link that moved —
+            // reporting `MISMATCH` there would be a confident claim about
+            // something never read.
+            let addr = out.stdout.lines().next().unwrap_or("").trim();
+            if addr.is_empty() {
+                None
+            } else {
+                Some(Some(addr.to_string()))
+            }
+        }
+    }
+}
+
+/// The `MISMATCH` detail for [`netboot_ip_drift`]: what the interface holds,
+/// what the lab file says (marked when that is the default), and the remedy.
+///
+/// The remedy is `netif mode link` (or `netboot start`) on its own.
+/// `configure_interface` assigns the configured address and then removes every
+/// other IPv4 on the interface, so it repairs drift by itself. Telling the
+/// operator to run `mode off` first would be worse than redundant: `mode off`
+/// deletes the *configured* address — the one that is not assigned when a link
+/// has drifted — so it cannot release the stale one, and on the way it stops a
+/// running netbootd and, on macOS, hands the service back to DHCP.
+fn netboot_drift_detail(
+    target: &str,
+    iface: &str,
+    held: &str,
+    host_ip: &str,
+    defaulted: bool,
+) -> String {
+    format!(
+        "{iface} holds {held} but host_ip is {host_ip}{}; run `paniolo netif mode link \
+         {target}` (or `netboot start {target}`) to re-apply it",
+        if defaulted { " (default)" } else { "" }
+    )
 }
 
 /// Run a probe on a host: natively when it is this machine, over SSH as a
@@ -293,8 +429,8 @@ fn check_channel(lab: &Lab, ch: &ResolvedChannel, rt: &ResolvedTarget) -> (Statu
                 // A lab that already has two links in one /24 still loads
                 // (validate_for_save refuses to *create* one); this is where
                 // the existing clash gets reported.
-                match crate::model::netboot_subnet_clash(lab, &rt.name) {
-                    Some(c) => (
+                if let Some(c) = crate::model::netboot_subnet_clash(lab, &rt.name) {
+                    return (
                         Status::Conflict,
                         format!(
                             "{iface} at {}{} shares {} with '{}' on {}; give one link its \
@@ -305,8 +441,26 @@ fn check_channel(lab: &Lab, ch: &ResolvedChannel, rt: &ResolvedTarget) -> (Statu
                             c.other_target,
                             c.other_interface
                         ),
+                    );
+                }
+                // The lab file's host IP is only what the link *should* run
+                // at. A stale `mode link`, a hand-assigned address, or an
+                // edit made while the daemon was down leaves the interface
+                // holding something else, and only a running netbootd
+                // re-applies it — so ask the interface. The effective IP
+                // comes from the channel, not from the rendered field, which
+                // reads `192.168.99.1 (default)` when unset.
+                let Some(nb) = lab.targets.get(&rt.name).and_then(|t| t.netboot.as_ref()) else {
+                    return (status, detail);
+                };
+                let host_ip = nb.effective_host_ip();
+                match probe_netboot_ip_drift(lab, &ch.host, iface, host_ip) {
+                    None => (Status::Unreachable, "host unreachable".to_string()),
+                    Some(Some(held)) => (
+                        Status::Mismatch,
+                        netboot_drift_detail(&rt.name, iface, &held, host_ip, nb.host_ip.is_none()),
                     ),
-                    None => (status, detail),
+                    Some(None) => (status, detail),
                 }
             }
         },
@@ -482,6 +636,158 @@ mod tests {
         );
     }
 
+    // ── netboot host_ip drift (#202) ────────────────────────────────────
+    //
+    // The lab file's host_ip is only what the link *should* run at. netbootd's
+    // IP monitor re-applies it while a daemon runs, so a stopped link drifts
+    // indefinitely: a target sat at the default 192.168.99.1 for weeks while
+    // its lab comment claimed another /24, colliding with a second link, and
+    // nothing reported it.
+
+    fn held(addrs: &[&str]) -> Vec<String> {
+        addrs.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn an_interface_holding_its_host_ip_has_not_drifted() {
+        assert_eq!(
+            netboot_ip_drift(&held(&["192.168.99.1"]), "192.168.99.1"),
+            None
+        );
+        // Linux prints a prefix; macOS does not. Both must compare equal.
+        assert_eq!(
+            netboot_ip_drift(&held(&["192.168.99.1/24"]), "192.168.99.1"),
+            None,
+            "the /NN prefix must be stripped before comparing"
+        );
+        // Serving at the right address alongside another one is still serving.
+        assert_eq!(
+            netboot_ip_drift(&held(&["10.0.0.5/8", "192.168.99.1/24"]), "192.168.99.1"),
+            None
+        );
+    }
+
+    #[test]
+    fn an_interface_holding_no_address_has_not_drifted() {
+        // `netif mode off` releases the address. That is a link that is down,
+        // not a link running at the wrong place, and doctor already reports
+        // the channel's state elsewhere.
+        assert_eq!(netboot_ip_drift(&[], "192.168.99.1"), None);
+    }
+
+    #[test]
+    fn an_interface_holding_only_another_address_has_drifted() {
+        // The case from the report: configured for one /24, running in another.
+        assert_eq!(
+            netboot_ip_drift(&held(&["192.168.99.1/24"]), "192.168.100.1"),
+            Some("192.168.99.1".to_string())
+        );
+        assert_eq!(
+            netboot_ip_drift(&held(&["192.0.2.10"]), "192.168.99.1"),
+            Some("192.0.2.10".to_string()),
+            "a hand-assigned address counts too"
+        );
+    }
+
+    /// The remedy has to be actionable *and* safe: `configure_interface`
+    /// assigns the configured address and removes every other IPv4, so
+    /// `netif mode link` repairs drift on its own.
+    #[test]
+    fn the_drift_detail_names_both_addresses_and_the_remedy() {
+        let d = netboot_drift_detail("pi5", "eth4", "192.168.99.1", "192.168.100.1", false);
+        assert!(d.contains("192.168.99.1"), "{d}");
+        assert!(d.contains("192.168.100.1"), "{d}");
+        assert!(d.contains("netif mode link pi5"), "{d}");
+        assert!(!d.contains("(default)"), "{d}");
+        // NOT `mode off` first: it deletes the configured address, which is
+        // the one that is not assigned when a link has drifted, and it stops
+        // a running netbootd on the way. `mode link` repairs drift alone.
+        assert!(
+            !d.contains("mode off"),
+            "`mode off` cannot release a drifted address: {d}"
+        );
+        // An unset host_ip is marked, so the reader knows where it came from.
+        let d = netboot_drift_detail("pi5", "eth4", "192.0.2.10", "192.168.99.1", true);
+        assert!(d.contains("192.168.99.1 (default)"), "{d}");
+    }
+
+    /// The POSIX rendering, for a remote control host. Exit 0 covers both
+    /// "no address" and "holds host_ip"; anything else prints the offending
+    /// address, because the exit status alone would only say "some other one".
+    #[test]
+    fn the_holds_probe_renders_a_posix_script() {
+        let script = net_interface_holds_script("eth4", "192.168.99.1");
+        assert!(script.contains("ip -4 -o addr show dev eth4"), "{script}");
+        assert!(script.contains("ifconfig eth4"), "macOS fallback: {script}");
+        assert!(script.contains("192.168.99.1"), "{script}");
+        assert!(script.contains("exit 1"), "{script}");
+        // A non-interactive SSH shell often has neither sbin dir on PATH; if
+        // both legs exit 127 the address list is empty and a drifted link
+        // reads as fine, which is the one direction this must not fail in.
+        assert!(script.contains("/usr/sbin"), "{script}");
+        assert!(script.contains("/sbin"), "{script}");
+        // "no output at all" is a probe that could not answer (exit 3), not a
+        // link holding nothing.
+        assert!(script.contains("exit 3"), "{script}");
+        // Legacy net-tools and BusyBox print `inet addr:A.B.C.D`.
+        assert!(script.contains("sub(/^addr:/"), "{script}");
+        // An interface name cannot break out of the script: `shell_quote`
+        // leaves a plain name bare and quotes anything that needs it. (Names
+        // are validated on the way into the lab file too — this is the second
+        // line of defense, for a file edited by hand.)
+        let nasty = net_interface_holds_script("eth4; rm -rf /", "192.168.99.1");
+        assert!(
+            nasty.contains("'eth4; rm -rf /'"),
+            "a name with a metacharacter must be quoted: {nasty}"
+        );
+    }
+
+    /// The probe RUNS, rather than only rendering — on both Unix platforms,
+    /// because `netif::iface_addresses` parses `ip -4 -o addr show` on Linux
+    /// and `ifconfig` on macOS, two entirely different parsers. Asserting on
+    /// the script text alone is how `doctor` once shipped depending on a
+    /// binary that does not exist on Windows (AGENTS.md, "Testing the platform
+    /// split"). Loopback is the one interface both platforms always have, with
+    /// an address known in advance.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_holds_probe_runs_natively_against_loopback() {
+        let lo = if cfg!(target_os = "macos") {
+            "lo0"
+        } else {
+            "lo"
+        };
+        // A host whose loopback carries no address at all (a bare netns, a
+        // container with an unconfigured lo) has nothing to compare, and
+        // "holds nothing" is deliberately not drift — so there would be no
+        // signal either way. Skip rather than fail on an unrelated condition.
+        if crate::netif::iface_addresses(lo).0.is_empty() {
+            return;
+        }
+        let holds = |host_ip: &str| {
+            Probe::NetInterfaceHolds {
+                iface: lo.to_string(),
+                host_ip: host_ip.to_string(),
+            }
+            .run_local()
+        };
+        assert_eq!(holds("127.0.0.1"), Some(0), "{lo} holds 127.0.0.1");
+        assert_eq!(
+            holds("192.0.2.10"),
+            Some(1),
+            "{lo} does not hold 192.0.2.10, so this is drift"
+        );
+    }
+
+    /// MISMATCH counts as a problem, so `paniolo doctor` exits non-zero and a
+    /// script gating on it notices. A status that reported nothing would make
+    /// the whole check decorative.
+    #[test]
+    fn a_mismatch_is_a_problem() {
+        assert!(Status::Mismatch.is_problem());
+        assert_eq!(Status::Mismatch.label(), "MISMATCH");
+    }
+
     #[test]
     fn hook_probe_picks_path_vs_name_lookup() {
         assert!(matches!(hook_probe("/opt/bin/zigplug"), Probe::Exists(_)));
@@ -536,6 +842,10 @@ mod tests {
             Probe::OnHookPath("zigplug".to_string()),
             Probe::Video("/dev/video0".to_string()),
             Probe::NetInterface("eth0".to_string()),
+            Probe::NetInterfaceHolds {
+                iface: "eth0".to_string(),
+                host_ip: "192.168.99.1".to_string(),
+            },
             Probe::Adb {
                 bin: "adb".to_string(),
                 serial: Some("XYZ".to_string()),

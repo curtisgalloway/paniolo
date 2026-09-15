@@ -96,7 +96,14 @@ channel to a remote control host (see the lab section below).
   its own /24 (`--host-ip 192.168.100.1`, `…101.1`, …) or every route to a
   target on either link is ambiguous. `netboot set` refuses a clash — a second
   link left at the default included — and `doctor` reports an existing one as
-  `CONFLICT`. Check with `paniolo target show <name>`: the host IP is always
+  `CONFLICT`. `doctor` also reports `MISMATCH` when the interface holds
+  addresses and the configured one is not among them: the lab file says only
+  where the link should be, and netbootd re-applies that address only while its
+  daemon runs, so a stopped link drifts silently. Fix it with
+  `paniolo netif mode link <target>` (or `netboot start`), which assigns the
+  configured address and drops the others — not by editing the lab file to
+  match what drifted. An interface holding nothing is `mode off`, not drift.
+  Check with `paniolo target show <name>`: the host IP is always
   printed, marked `(default)` when unset. Never record the intended subnet in a
   lab-file comment alone; the field is what runs.
 - `paniolo netboot devices` lists candidate USB-Ethernet interfaces (the
@@ -117,7 +124,8 @@ channel to a remote control host (see the lab section below).
   lab-file comments) to the new name. Config-only — running daemons keep the
   old name, so `stop` and re-`watch`/`serve` them under the new one.
 - `paniolo doctor` probes every configured channel against reality (devices
-  exist, over SSH for remote hosts); `doctor [target]` checks one target,
+  exist, netboot interfaces hold the address they are configured for, over SSH
+  for remote hosts); `doctor [target]` checks one target,
   `doctor --host <name>` only channels on that host.
 
 ## Netboot (DHCP + TFTP + HTTP)

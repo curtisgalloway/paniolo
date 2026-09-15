@@ -128,7 +128,7 @@ reachable only some of the time, or only after a hand-added host route.
 So the rule is: the default `192.168.99.1` is for the **first** netboot link
 on a host; every further link on that host sets `--host-ip` in an unused /24
 (`192.168.100.1`, `192.168.101.1`, …). The client lease follows the host IP
-into that /24. paniolo enforces it in three places:
+into that /24. paniolo enforces it in four places:
 
 - **`netboot set` refuses** a link whose /24 another target's link already
   uses on a different interface of the same host — including a link left at
@@ -143,6 +143,19 @@ into that /24. paniolo enforces it in three places:
   `refusing to put 'eth4' in 192.168.99.0/24: 'eth3' already holds
   192.168.99.1 on this host`. Release the other link (`paniolo netif mode off
   <target>`) or give this one its own subnet.
+- **`paniolo doctor` reports a link running somewhere else** as `MISMATCH`:
+  the interface holds IPv4 addresses and the effective host IP is not among
+  them. The lab file says only where the link *should* be, and netbootd
+  re-applies that address only while its daemon runs — so a stale `netif mode
+  link` from an older config, an address assigned by hand, or an edit made
+  while the daemon was down leaves the link somewhere else indefinitely, with
+  nothing saying so. Two cases are deliberately **not** a mismatch: an
+  interface holding no IPv4 at all (`netif mode off` — a link that is down,
+  not one in the wrong place), and one holding the configured address
+  *alongside* another (it is serving where it should; the extra address is a
+  routing question this check does not judge). The remedy is in the message:
+  `paniolo netif mode link <target>`, or `netboot start <target>`, either of
+  which assigns the configured address and drops the others.
 - **`target show` and `netboot status` always print the host IP**, marked
   `(default)` when the field is unset, so the address a link actually runs at
   is never invisible.
