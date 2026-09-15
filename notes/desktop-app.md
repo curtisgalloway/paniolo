@@ -10,9 +10,8 @@ SPDX-License-Identifier: Apache-2.0
 > [console-front-door.md](console-front-door.md), which diagnosed the same
 > problem in June and worked out the proxy design; this note argues the app is
 > that design's Phase C in a different runtime, and revises the phasing
-> accordingly. Two load-bearing facts about the existing daemons were verified
-> while writing it; one assumption about Tauri was **not**, and gates the whole
-> architecture — see *Verification status*.
+> accordingly. The architecture's one load-bearing assumption was **spiked
+> against a real daemon the same day and held** — see *Verification status*.
 
 ## What prompted it
 
@@ -86,9 +85,15 @@ on the dashboard page, deliberately.
 
 The way through is neither. **Open each target's dashboard as its own Tauri
 window, navigated directly to `http://127.0.0.1:<port>/?token=…`.** A
-navigation is not a frame, so the anti-framing headers do not apply; the
-window's origin *becomes* the daemon's, so every fetch the page makes is
-same-origin and the loopback check is satisfied by construction.
+navigation is not a frame, so the anti-framing headers do not apply, and the
+window's origin *becomes* the daemon's.
+
+The check then passes by the route its own comment names first — *"Origin:
+absent (CLI, same-origin page loads) or loopback"*. A same-origin fetch sends
+**no `Origin` header at all**, so the page's requests take the `absent` branch
+rather than the loopback one. Same outcome, and worth knowing precisely,
+because it means the page never depends on the allowlist matching whatever
+authority the tunnel happens to expose.
 
 The app therefore has two kinds of window, with two different trust positions:
 
@@ -207,8 +212,9 @@ no daemon changes, no page changes, no new installed binary.
 
 ## Open questions
 
-- **Does the Tauri origin behave as assumed?** Gates everything. One-day spike,
-  first milestone, before any UI work. See below.
+- ~~**Does the Tauri origin behave as assumed?**~~ **Answered 2026-09-14 by a
+  spike against a live daemon — it does.** See *Verification status*. The
+  estimate below no longer carries the risk of Phase B being pulled into v1.
 - **Where does the crate live?** A `desktop/` member of the existing workspace
   keeps it close, but Tauri pulls in a webview toolchain and JS build step to a
   repo that currently builds ten clean Rust crates behind a Makefile, and CI
@@ -243,18 +249,36 @@ Verified in this session, on this machine and on waldo:
   20 s of streaming at 30 fps ≈ 16 ms/frame, 47.5% of one core.
 - The lab declares six targets, three of them on waldo.
 
-**Not verified, and load-bearing:**
+**Spiked and confirmed (2026-09-14, same day).** A throwaway Tauri 2.11 app on
+macOS against a live `hdmicap` 0.3.1 on waldo, reached through an `ssh -L`
+tunnel with a logging proxy in front of it so every request's `Origin` was
+observed rather than assumed:
 
-- **That a Tauri webview's origin is `tauri://localhost` (or
-  `http://tauri.localhost` on Windows) and that navigating a window to
-  `http://127.0.0.1:<port>/` gives that window the daemon's origin.** The whole
-  two-window architecture rests on this. It follows from how browsers treat
-  navigation versus framing, but it was reasoned, not run. **Spike it first:** a
-  bare Tauri app, one window navigated to a live `hdmicap` URL, click a power
-  button. If the fetch is refused, the architecture changes shape — the Rust
-  side must proxy or mediate every call, which is Phase B pulled forward into
-  v1 and roughly doubles the estimate.
+- The app window's origin is **`tauri://localhost`**, as predicted.
+- A `fetch()` from that window is refused **twice over**: the daemon answers
+  **403**, and the webview rejects the response for want of CORS headers before
+  any of it reaches JavaScript. What the developer actually sees is
+  `TypeError: Load failed` — an opaque client-side error, not a readable 403.
+  Worth recording, because that symptom does not point at the cause.
+- A window **navigated** to the daemon's URL loaded the whole dashboard: `/`,
+  all three vendored xterm assets, the `/preview` MJPEG stream, and the page's
+  own `/status` and `/power` calls — **every one 200**, every one carrying no
+  `Origin` header at all.
+
+So the two-window architecture stands, `assets/index.html` is reused verbatim,
+and `hdmicap` needs no change. The spike is not kept; it was ~80 lines and a
+generated icon.
+
+**Still not verified:**
+
 - Bundle size, build time and the real cost of Tauri in CI on three platforms.
+  The spike's debug binary was 22 MB and its first build pulled the full
+  `tauri`/`wry`/`muda` tree; neither number was measured in a release or CI
+  configuration.
+- Everything above is macOS only. Windows' origin is `http://tauri.localhost`,
+  which `is_loopback_origin` would also reject — `is_loopback_authority` is an
+  exact-match allowlist and `tauri.localhost` is not in it — so the same
+  architecture should hold there, but it was reasoned, not run.
 - That `/snapshot` polling at 1 Hz is cheap on the *daemon* side. It reads the
   warm buffer, so it should be, but the PNG encode is on the `expensive`
   semaphore shared with `/ocr` and was never measured under repeated polling.
