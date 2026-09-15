@@ -35,7 +35,7 @@ use crate::pixel::PixelData;
 /// pre-cut desktop. Age is the only thing that distinguishes "the screen has
 /// not changed" from "we have stopped being told what the screen is".
 ///
-/// Generous next to the 10 fps capture cap, so an occasional slow frame is not
+/// Generous next to the 30 fps capture cap, so an occasional slow frame is not
 /// reported as a fault, and far below the minutes-long staleness observed.
 pub const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
 

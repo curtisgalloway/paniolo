@@ -278,12 +278,18 @@ fn capture_loop(spec: DeviceSpec, tx: watch::Sender<Arc<FrameState>>) {
                 captured_at: Instant::now(),
             }));
 
-            // Linux: cap to 10fps — the v4l device delivers as fast as we
-            // dequeue, and the per-frame turbojpeg decode has real cost.
+            // Linux: cap to 30fps — the v4l device delivers as fast as we
+            // dequeue, and the per-frame turbojpeg decode has real cost. The
+            // dongle itself offers 50 fps at 1080p (measured on the MS2131 in
+            // front of lab-optiplex-1), so this cap, not the hardware, sets the
+            // floor under how stale the newest frame can be: 33 ms rather than
+            // the 100 ms it was through v0.3.1. Raised once the preview stopped
+            // shipping the untrimmed arena buffer — at 19x amplification the
+            // wire, not the frame rate, was the binding constraint.
             // macOS: no cap; the backend blocks until the next frame.
             #[cfg(target_os = "linux")]
             {
-                const TARGET_INTERVAL: Duration = Duration::from_millis(1000 / 10);
+                const TARGET_INTERVAL: Duration = Duration::from_millis(1000 / 30);
                 let elapsed = frame_start.elapsed();
                 if elapsed < TARGET_INTERVAL {
                     thread::sleep(TARGET_INTERVAL - elapsed);
