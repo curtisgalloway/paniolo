@@ -56,12 +56,36 @@ device is present, and lists id alternatives when there are several.
 paniolo video watch [target-machine]   # start hdmicap daemon for a target
 paniolo video watch --restart          # force-restart a running (stalled) daemon
 paniolo video stop  [target-machine]   # stop it (on the target's host)
-paniolo video show  [target-machine]   # show daemon URL and status
+paniolo video show  [target-machine]   # show daemon address and status
 ```
 
-`watch` starts `hdmicap daemon` detached and polls for startup. The dashboard
-URL is printed — open exactly that URL in a browser for the live preview: it
+`watch` starts `hdmicap daemon` detached and polls for startup, then prints the
+daemon's address. To open the dashboard, run `paniolo video preview` — that URL
 carries the daemon's `?token=`, and the daemon answers nothing without it.
+
+**`show` and `console` print the address without the token, on purpose.** The
+token is a live bearer credential, and those two lines land where credentials
+should not: terminal scrollback, `script`/`asciinema` captures, CI logs, pasted
+terminal output in issues, and — because paniolo is driven by agents that run
+`video show` constantly — agent transcripts. They print
+`http://127.0.0.1:<port>`, which is enough to identify the daemon and useless
+on its own.
+
+**`video preview` is the only command that prints the openable URL**, and the
+only place in the CLI that builds one. There is deliberately no helper for it,
+so no other command can reach for it by accident; `video watch` prints the
+token-free address and points at `preview`.
+
+If no browser could be launched — a headless control host, a container, no
+`xdg-open` — `console` does not simply give up: an address you cannot open would
+strand you, and on the remote path the SSH tunnels die with the command, so
+there is no second chance. It writes the full URL to a `0600`
+`dashboard-url.txt` in the target's runtime dir and prints the **path**, which
+keeps the token out of the terminal while leaving it one `cat` away:
+
+```bash
+xdg-open "$(cat /tmp/paniolo-1000/hdmicap/target-machine/dashboard-url.txt)"
+```
 
 **Every request to the daemon needs its token.** hdmicap generates a fresh one
 each start and publishes it as `token` in its discovery file (see *Runtime
@@ -139,7 +163,20 @@ paniolo video shot --stable -o out.png           # wait for a steady frame first
 paniolo video shot --changed-since <hex-hash> --timeout 10000 -o out.png
                                                  # block until the frame differs
 paniolo video preview [target-machine]           # print the live-dashboard URL (optional target, like `show`)
+paniolo video preview --open                     # open it in a browser instead of printing it
 ```
+
+`preview` prints the URL **with** the token, because a browser can present it
+no other way — treat that output as a credential and paste it into a browser,
+not into a log. `--open` hands it to the default browser and prints only the
+token-free address, which is the safer form when anything is recording the
+terminal; if no browser can be launched it writes the URL to the same `0600`
+file `console` uses and prints that path.
+
+`--open` is refused when the target's video channel is on another host. The
+command would re-exec there and open a browser on the bench machine, not on
+yours. Use `paniolo console <target>`, which forwards the ports and opens a
+browser locally, or plain `preview` and open the URL through your own tunnel.
 
 `shot` fetches a single PNG-encoded frame from the running daemon and prints
 `signal=… hash=…` to stderr; feed that hash to a later `--changed-since` to

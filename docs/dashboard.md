@@ -14,9 +14,16 @@ paniolo console                  # open in the default browser
 
 `paniolo console` starts any daemon that isn't already running — hdmicap,
 serialcap, and the hid daemon when the target has a `hid` channel — then opens
-the dashboard. The URL it opens (and prints) carries each daemon's token —
-hdmicap's as `?token=`, the others' inside their `?serialws=`/`?hidws=` URLs —
-so open that URL, not a bare `http://127.0.0.1:<port>/`. (`paniolo video watch` / `paniolo serial watch` still start them
+the dashboard. The URL it opens carries each daemon's token — hdmicap's as
+`?token=`, the others' inside their `?serialws=`/`?hidws=` URLs — so open the
+URL the browser was handed, not a bare `http://127.0.0.1:<port>/`. What
+`console` *prints* is that bare address: the full URL carries three daemons'
+credentials in one line, and console output is transcribed and pasted far too
+often for that. If no browser could be launched, `console` writes the full URL to a `0600`
+`dashboard-url.txt` in the target's runtime dir and prints that path — on a
+headless host, or over SSH where the tunnels close with the command, an address
+you cannot open would leave you with no way in, and the token still never
+reaches the terminal. (`paniolo video watch` / `paniolo serial watch` still start them
 individually.) The page fetches the serialcap interface list and builds one
 terminal pane per interface, displayed side by side in the serial panel (or
 stacked in right-panel layout). With a single interface the panel looks the
