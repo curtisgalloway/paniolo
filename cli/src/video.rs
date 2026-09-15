@@ -136,8 +136,26 @@ pub fn text_of(body: &str) -> String {
 /// `Windows.Media.Ocr` win both screen types on their own platforms, so a mode
 /// field there would only add a way to choose wrongly.
 fn ocr_helper(ocr_mode: Option<&str>) -> Option<std::path::PathBuf> {
-    if cfg!(target_os = "linux") && ocr_mode == Some("gui") {
-        if let Some(p) = daemons::find_binary("rapidocr") {
+    ocr_helper_with(ocr_mode, cfg!(target_os = "linux"), daemons::find_binary)
+}
+
+/// [`ocr_helper`] with its two host dependencies passed in: which platform this
+/// is, and how a helper name resolves.
+///
+/// Both are parameters so the whole matrix is testable from one host. The
+/// lookup, because the real `find_binary` searches the libexec dirs before
+/// `$PATH`, so a packaged `rapidocr` in `/usr/libexec/paniolo/bin` beat any
+/// `$PATH` a test set and the test read the machine instead of the code
+/// (GitHub #206). The platform, because a `cfg!` folded in here would leave
+/// each CI platform exercising only its own half, and the claim this function
+/// makes is about the *difference* between them.
+fn ocr_helper_with(
+    ocr_mode: Option<&str>,
+    is_linux: bool,
+    find: impl Fn(&str) -> Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    if is_linux && ocr_mode == Some("gui") {
+        if let Some(p) = find("rapidocr") {
             return Some(p);
         }
         eprintln!(
@@ -146,9 +164,9 @@ fn ocr_helper(ocr_mode: Option<&str>) -> Option<std::path::PathBuf> {
              Install it with `paniolo setup`."
         );
     }
-    daemons::find_binary("visionocr")
-        .or_else(|| daemons::find_binary("winocr"))
-        .or_else(|| daemons::find_binary("linuxocr"))
+    find("visionocr")
+        .or_else(|| find("winocr"))
+        .or_else(|| find("linuxocr"))
 }
 
 /// Start the `target`'s hdmicap daemon for `device`, detached; caller polls
@@ -220,47 +238,80 @@ mod tests {
 
     /// `ocr_mode = "gui"` must reach `rapidocr` on Linux and must NOT change
     /// anything anywhere else — Apple Vision and Windows.Media.Ocr win both
-    /// screen types on their own platforms, so honouring the field there would
+    /// screen types on their own platforms, so honoring the field there would
     /// only be a way to pick the wrong engine.
+    ///
+    /// Both platforms are asserted from whichever host runs the test: the
+    /// `cfg!` lives in `ocr_helper`, not in the function under test, so the
+    /// Linux and non-Linux arms are both reachable here. With the `cfg!`
+    /// inside, each CI platform only ever ran its own half and the
+    /// "only on Linux" in the name was never actually checked.
     #[test]
     fn gui_mode_selects_rapidocr_only_on_linux() {
         let dir = tempfile::tempdir().unwrap();
-        let fake = dir.path().join("rapidocr");
-        std::fs::write(&fake, b"").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut p = std::fs::metadata(&fake).unwrap().permissions();
-            p.set_mode(0o755);
-            std::fs::set_permissions(&fake, p).unwrap();
+        for name in ["rapidocr", "visionocr", "linuxocr"] {
+            std::fs::write(dir.path().join(name), b"").unwrap();
         }
+        let find = |name: &str| {
+            let p = dir.path().join(name);
+            p.is_file().then_some(p)
+        };
+        let rapidocr = dir.path().join("rapidocr");
+        let visionocr = dir.path().join("visionocr");
 
-        let prev = std::env::var_os("PATH");
-        // Only our temp dir: otherwise a real visionocr/linuxocr on this
-        // machine decides the outcome and the test proves nothing.
-        // Safe: single-threaded test, restored below.
-        unsafe { std::env::set_var("PATH", dir.path()) };
-        let picked = ocr_helper(Some("gui"));
-        let default = ocr_helper(None);
-        match prev {
-            Some(p) => unsafe { std::env::set_var("PATH", p) },
-            None => unsafe { std::env::remove_var("PATH") },
-        }
-
-        if cfg!(target_os = "linux") {
+        // Linux + gui: the one case that selects rapidocr.
+        assert_eq!(
+            ocr_helper_with(Some("gui"), true, find).as_deref(),
+            Some(rapidocr.as_path()),
+            "gui mode must select rapidocr on Linux"
+        );
+        // Same mode off Linux: rapidocr is never the answer.
+        assert_eq!(
+            ocr_helper_with(Some("gui"), false, find).as_deref(),
+            Some(visionocr.as_path()),
+            "gui mode must not select rapidocr off Linux"
+        );
+        // No mode set: rapidocr is never the answer on any platform.
+        for is_linux in [true, false] {
             assert_eq!(
-                picked.as_deref(),
-                Some(fake.as_path()),
-                "gui mode must select rapidocr on Linux"
+                ocr_helper_with(None, is_linux, find).as_deref(),
+                Some(visionocr.as_path()),
+                "the default engine wins with no mode set (is_linux={is_linux})"
             );
-        } else {
-            assert!(
-                picked.as_deref() != Some(fake.as_path()),
-                "gui mode must not select rapidocr off Linux"
+            assert_eq!(
+                ocr_helper_with(Some("text"), is_linux, find).as_deref(),
+                Some(visionocr.as_path()),
+                "text mode never reaches rapidocr (is_linux={is_linux})"
             );
         }
-        // With no mode set, rapidocr is never the answer on any platform.
-        assert!(default.as_deref() != Some(fake.as_path()));
+    }
+
+    /// The fallback chain, in order: `visionocr`, then `winocr`, then
+    /// `linuxocr`. Dropping a link used to leave the suite green while
+    /// `ocr_helper` returned `None` on every host of that platform, which
+    /// silently disables `paniolo video read` and the dashboard's OCR button.
+    #[test]
+    fn the_default_engine_falls_back_through_every_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let only = |present: &'static str| {
+            let root = root.clone();
+            move |name: &str| (name == present).then(|| root.join(name))
+        };
+        for name in ["visionocr", "winocr", "linuxocr"] {
+            assert_eq!(
+                ocr_helper_with(None, false, only(name)).as_deref(),
+                Some(root.join(name).as_path()),
+                "{name} alone must be found"
+            );
+        }
+        // Nothing installed: no engine, rather than a wrong one.
+        assert_eq!(ocr_helper_with(None, true, |_| None), None);
+        // gui mode with no rapidocr falls through to the default chain.
+        assert_eq!(
+            ocr_helper_with(Some("gui"), true, only("linuxocr")).as_deref(),
+            Some(root.join("linuxocr").as_path()),
+        );
     }
 
     #[test]
