@@ -1344,7 +1344,15 @@ base honors `$PANIOLO_RUNTIME_BASE` (default `/tmp`).
   the platform-finish steps only (`setup::run_packaged`): setuid the
   installed `netbootd-bpf-helper` on macOS, group membership on Linux — no
   builds. `--rust-only` still requires a clone and errors clearly without
-  one.
+  one. It does the steps needing nothing beyond cargo — the crate builds, the
+  bundled-skills copy, the stale-copy cleanup — and skips whatever needs sudo
+  or a second toolchain: the OCR helper and zigplug everywhere, the setuid
+  bpf-helper on macOS, the dialout/video group check on Linux. That split is
+  `setup::SourceStep::on_the_fast_path`, and it is not documentation: every
+  skippable step in `setup::run` is gated on `source_steps()`, and the message
+  the flag ends on is derived from the same list, so the two cannot disagree
+  (#207). Adding a step means adding a `SourceStep` variant, which the
+  compiler then forces you to classify.
 
 ## Remote control pattern
 

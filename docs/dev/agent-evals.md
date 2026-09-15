@@ -393,9 +393,10 @@ show` (prints the lab you already have).
 *Goal:* "I edited paniolo's Rust; rebuild + install just the Rust binaries on
 control host `bench1`."
 *Reference:* `paniolo setup --rust-only --host bench1`.
-*Trap:* `setup` builds/installs from a source clone; `--rust-only` skips the OCR/
-setuid/zigplug steps; `--host` provisions a lab host over SSH — it is not a
-per-target command.
+*Trap:* `setup` builds/installs from a source clone; `--rust-only` skips the
+steps needing sudo or a second toolchain (OCR and zigplug everywhere, setuid on
+macOS, the device-group check on Linux) and still installs the bundled skills;
+`--host` provisions a lab host over SSH — it is not a per-target command.
 
 ---
 

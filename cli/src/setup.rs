@@ -442,9 +442,147 @@ pub fn run_packaged() -> Result<()> {
     Ok(())
 }
 
+/// A step of the source-checkout setup that [`run`] may perform.
+///
+/// Every step `run` can skip is gated on membership of [`source_steps`], and
+/// the `--rust-only` completion message is derived from the same list, so the
+/// message cannot claim one thing while the code does another. That is not
+/// hypothetical: the bundled-skills copy sat below the `--rust-only` return
+/// while the message named only OCR, setuid and zigplug, so the skills were
+/// skipped silently and `paniolo skill` came up empty with nothing saying why
+/// (GitHub #207).
+///
+/// Same shape, and for the same reason, as [`PackagedStep`] above, whose
+/// comment records the Linux group step once sitting under a Windows branch
+/// with nothing noticing.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum SourceStep {
+    /// Linux: add the user to the device-access groups (needs sudo).
+    LinuxGroups,
+    /// Copy the bundled `SKILL.md` guides into the per-user data dir.
+    InstallSkills,
+    /// Drop pre-libexec helper copies from `~/.cargo/bin`.
+    DropStaleCopies,
+    /// macOS: make the installed netbootd-bpf-helper setuid-root (needs sudo).
+    SetuidBpfHelper,
+    /// Build or copy the platform's OCR helper.
+    OcrHelper,
+    /// Install the zigplug power helper (needs uv).
+    Zigplug,
+}
+
+impl SourceStep {
+    /// How the step is named in the `--rust-only` completion message.
+    fn label(self) -> &'static str {
+        match self {
+            Self::LinuxGroups => "group membership",
+            Self::InstallSkills => "skills",
+            Self::DropStaleCopies => "stale-copy cleanup",
+            Self::SetuidBpfHelper => "setuid",
+            Self::OcrHelper => "OCR",
+            Self::Zigplug => "zigplug",
+        }
+    }
+
+    /// Whether `--rust-only` keeps this step.
+    ///
+    /// The fast path exists to skip what needs sudo or a second toolchain
+    /// while iterating on the Rust code. Everything else belongs on it:
+    /// copying three `SKILL.md` files and deleting stale binaries need
+    /// neither, and skipping them only ever produced a half-installed tree.
+    fn on_the_fast_path(self) -> bool {
+        match self {
+            Self::InstallSkills | Self::DropStaleCopies => true,
+            Self::LinuxGroups | Self::SetuidBpfHelper | Self::OcrHelper | Self::Zigplug => false,
+        }
+    }
+}
+
+/// The skippable steps [`run`] performs on `os`, in order. With `rust_only`,
+/// only those needing nothing beyond cargo.
+///
+/// Parameterized by `os` because the answer differs — there is no setuid bit
+/// to set off macOS and no group to join off Linux — and a list that claimed
+/// otherwise would mis-report what was skipped on two platforms out of three.
+/// The unconditional steps (building the helper crates and the CLI) are not
+/// here: nothing can skip them, so there is no decision to record.
+fn source_steps(os: &str, rust_only: bool) -> Vec<SourceStep> {
+    let mut steps = vec![SourceStep::InstallSkills, SourceStep::DropStaleCopies];
+    if os == "linux" {
+        steps.insert(0, SourceStep::LinuxGroups);
+    }
+    if os == "macos" {
+        steps.push(SourceStep::SetuidBpfHelper);
+    }
+    steps.push(SourceStep::OcrHelper);
+    steps.push(SourceStep::Zigplug);
+    if rust_only {
+        steps.retain(|s| s.on_the_fast_path());
+    }
+    steps
+}
+
+/// What `--rust-only` leaves undone on `os`: the difference between the full
+/// list and the fast one, so the message is derived from the list `run` gates
+/// on rather than from a second copy of the same prose.
+fn rust_only_skips(os: &str) -> Vec<SourceStep> {
+    let fast = source_steps(os, true);
+    source_steps(os, false)
+        .into_iter()
+        .filter(|s| !fast.contains(s))
+        .collect()
+}
+
+/// The line `--rust-only` ends on, naming exactly what it skipped.
+///
+/// `skills_ok` is whether the skills copy actually landed: claiming it did
+/// when it did not would be the same defect as #207 in the other direction.
+fn rust_only_done_message(os: &str, skills_ok: bool) -> String {
+    let skipped: Vec<&str> = rust_only_skips(os).into_iter().map(|s| s.label()).collect();
+    let installed = if skills_ok {
+        "Rust crates and skills installed"
+    } else {
+        "Rust crates installed; the skills copy did not succeed (see above)"
+    };
+    format!(
+        "{installed} (skipped {} — run `paniolo setup`).",
+        skipped.join(", ")
+    )
+}
+
+/// Agent skills: copy the bundled SKILL.md guides into the per-user data dir
+/// so `paniolo skill` finds them when the installed CLI runs outside this
+/// tree. From a checkout the repo copy is used directly, so this keeps an
+/// installed paniolo in sync. (Linux packages ship them to /usr/share, so
+/// `run_packaged` does not do this; both source-checkout paths do, including
+/// `--rust-only`, since it needs no sudo and no toolchain.)
+///
+/// Returns whether anything was installed, so the caller's completion message
+/// can say what actually happened rather than assuming.
+fn install_skills(repo: &Path) -> bool {
+    match crate::skills::install_bundled(repo) {
+        Ok(0) => {
+            println!(
+                "  … skills: none found under {}",
+                repo.join("skills").display()
+            );
+            false
+        }
+        Ok(n) => {
+            let dst = crate::skills::user_skills_dir().unwrap_or_default();
+            println!("  ✓ {:12} {n} installed → {}", "skills", dst.display());
+            true
+        }
+        Err(e) => {
+            eprintln!("  ! skills: {e}");
+            false
+        }
+    }
+}
+
 /// Run the local setup from a source checkout at `repo`. With `rust_only`,
-/// stop after the cargo installs (skip the OCR, setuid, zigplug, and
-/// stale-copy-cleanup steps) — the fast path for iterating on the Rust code.
+/// perform only the steps needing nothing beyond cargo — see [`source_steps`],
+/// which decides that and which every skippable step below is gated on.
 /// `lab_flag` is `--lab`, if given; it decides which lab file `install_rapidocr_venv`
 /// checks for `ocr_mode = "gui"`.
 pub fn run(repo: &Path, rust_only: bool, lab_flag: Option<&str>) -> Result<()> {
@@ -456,6 +594,11 @@ pub fn run(repo: &Path, rust_only: bool, lab_flag: Option<&str>) -> Result<()> {
     let libexec = libexec_root.join("bin");
     std::fs::create_dir_all(&libexec)?;
 
+    // The one list every skippable step below consults, so what `--rust-only`
+    // does and what its closing message claims cannot disagree (#207).
+    let steps = source_steps(std::env::consts::OS, rust_only);
+    let will = |s: SourceStep| steps.contains(&s);
+
     if !rust_only {
         if cfg!(target_os = "macos") {
             println!("  ℹ macOS: netbootd serves DHCP+TFTP; no system TFTP tool needed.");
@@ -464,13 +607,15 @@ pub fn run(repo: &Path, rust_only: bool, lab_flag: Option<&str>) -> Result<()> {
                 "  ℹ Linux: before building, ensure system packages are installed:\n\
                  \x20   sudo apt-get install build-essential pkg-config libudev-dev libclang-dev cmake nasm"
             );
-            println!("\nChecking group membership…");
-            if ensure_linux_groups()? {
-                println!(
-                    "\nNote: group changes take effect after you log out and back in \
-                     (or run `newgrp dialout` in the current shell)."
-                );
-            }
+        }
+    }
+    if will(SourceStep::LinuxGroups) {
+        println!("\nChecking group membership…");
+        if ensure_linux_groups()? {
+            println!(
+                "\nNote: group changes take effect after you log out and back in \
+                 (or run `newgrp dialout` in the current shell)."
+            );
         }
     }
 
@@ -513,38 +658,40 @@ pub fn run(repo: &Path, rust_only: bool, lab_flag: Option<&str>) -> Result<()> {
     }
     println!("  ✓ {:12} {}", "paniolo", bin_dir.join("paniolo").display());
 
-    if rust_only {
-        println!("\nRust crates installed (skipped OCR/setuid/zigplug — run `paniolo setup`).");
-        return Ok(());
-    }
+    // On the fast path too: the copy needs no sudo and no toolchain, and an
+    // install that stopped short of it used to leave `paniolo skill` empty
+    // with nothing saying why (GitHub #207).
+    let skills_ok = will(SourceStep::InstallSkills) && install_skills(repo);
 
     // One-time migration: drop pre-libexec helper copies from ~/.cargo/bin so
     // a stale binary can't shadow or version-skew against the libexec install.
     // cargo uninstall keeps the install receipts tidy; the direct remove
     // covers receiptless leftovers (and visionocr/linuxocr, never cargo's).
-    for crate_name in HELPER_CRATES {
-        let installed = bin_dir.join(crate_name);
-        if !installed.is_file() {
-            continue;
+    if will(SourceStep::DropStaleCopies) {
+        for crate_name in HELPER_CRATES {
+            let installed = bin_dir.join(crate_name);
+            if !installed.is_file() {
+                continue;
+            }
+            let _ = Command::new(&cargo)
+                .args(["uninstall", crate_name])
+                .output();
+            if installed.is_file() {
+                let _ = std::fs::remove_file(&installed);
+            }
+            if !installed.is_file() {
+                println!("  ✓ removed stale {}", installed.display());
+            }
         }
-        let _ = Command::new(&cargo)
-            .args(["uninstall", crate_name])
-            .output();
-        if installed.is_file() {
-            let _ = std::fs::remove_file(&installed);
-        }
-        if !installed.is_file() {
-            println!("  ✓ removed stale {}", installed.display());
-        }
-    }
-    for loose in ["netbootd-bpf-helper", "visionocr", "linuxocr"] {
-        let stale = bin_dir.join(loose);
-        if stale.is_file() && std::fs::remove_file(&stale).is_ok() {
-            println!("  ✓ removed stale {}", stale.display());
+        for loose in ["netbootd-bpf-helper", "visionocr", "linuxocr"] {
+            let stale = bin_dir.join(loose);
+            if stale.is_file() && std::fs::remove_file(&stale).is_ok() {
+                println!("  ✓ removed stale {}", stale.display());
+            }
         }
     }
 
-    if cfg!(target_os = "macos") {
+    if will(SourceStep::SetuidBpfHelper) {
         let helper = libexec.join("netbootd-bpf-helper");
         if helper.is_file() {
             setuid_bpf_helper(&helper);
@@ -555,73 +702,75 @@ pub fn run(repo: &Path, rust_only: bool, lab_flag: Option<&str>) -> Result<()> {
 
     // OCR helper, one per platform: visionocr (swiftc) on macOS, winocr (cargo)
     // on Windows, a linuxocr copy on Linux. See docs/ocr.md.
-    if cfg!(windows) {
-        let source = repo.join("ocr/winocr");
-        if !source.join("Cargo.toml").is_file() {
-            println!("  … winocr: source not found, skipped");
-        } else {
-            let ok = Command::new(&cargo)
-                .args(["build", "--release", "--manifest-path"])
-                .arg(source.join("Cargo.toml"))
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            let built = source.join("target/release/winocr.exe");
-            if ok && built.is_file() {
-                let dest = libexec.join("winocr.exe");
-                std::fs::copy(&built, &dest)?;
-                println!("  ✓ {:12} {}", "winocr", dest.display());
+    if will(SourceStep::OcrHelper) {
+        if cfg!(windows) {
+            let source = repo.join("ocr/winocr");
+            if !source.join("Cargo.toml").is_file() {
+                println!("  … winocr: source not found, skipped");
             } else {
-                println!("  … winocr: build failed, skipped");
+                let ok = Command::new(&cargo)
+                    .args(["build", "--release", "--manifest-path"])
+                    .arg(source.join("Cargo.toml"))
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                let built = source.join("target/release/winocr.exe");
+                if ok && built.is_file() {
+                    let dest = libexec.join("winocr.exe");
+                    std::fs::copy(&built, &dest)?;
+                    println!("  ✓ {:12} {}", "winocr", dest.display());
+                } else {
+                    println!("  … winocr: build failed, skipped");
+                }
             }
-        }
-    } else if cfg!(target_os = "macos") {
-        let source = repo.join("ocr/visionocr.swift");
-        let dest = libexec.join("visionocr");
-        if !source.is_file() {
-            println!("  … visionocr: source not found, skipped");
-        } else if crate::daemons::find_binary("swiftc").is_none() {
-            println!("  … visionocr: swiftc not found (install Xcode CLT), skipped");
-        } else {
-            let ok = Command::new("swiftc")
-                .args(["-O", "-o"])
-                .arg(&dest)
-                .arg(&source)
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if ok {
-                println!("  ✓ {:12} {}", "visionocr", dest.display());
+        } else if cfg!(target_os = "macos") {
+            let source = repo.join("ocr/visionocr.swift");
+            let dest = libexec.join("visionocr");
+            if !source.is_file() {
+                println!("  … visionocr: source not found, skipped");
+            } else if crate::daemons::find_binary("swiftc").is_none() {
+                println!("  … visionocr: swiftc not found (install Xcode CLT), skipped");
             } else {
-                println!("  … visionocr: build failed, skipped");
+                let ok = Command::new("swiftc")
+                    .args(["-O", "-o"])
+                    .arg(&dest)
+                    .arg(&source)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if ok {
+                    println!("  ✓ {:12} {}", "visionocr", dest.display());
+                } else {
+                    println!("  … visionocr: build failed, skipped");
+                }
             }
-        }
-    } else {
-        let source = repo.join("ocr/linuxocr");
-        let dest = libexec.join("linuxocr");
-        if source.is_file() {
-            std::fs::copy(&source, &dest)?;
-            crate::platform::make_executable(&dest)?;
-            println!("  ✓ {:12} {}", "linuxocr", dest.display());
         } else {
-            println!("  … linuxocr: source not found, skipped");
-        }
-        // rapidocr: the GUI-mode engine on Linux. The script is small and always
-        // copied; the heavy part is its venv, installed only when a lab file
-        // actually asks for GUI OCR.
-        let rsrc = repo.join("ocr/rapidocr");
-        if rsrc.is_file() {
-            let rdest = libexec.join("rapidocr");
-            std::fs::copy(&rsrc, &rdest)?;
-            crate::platform::make_executable(&rdest)?;
-            println!("  ✓ {:12} {}", "rapidocr", rdest.display());
-            install_rapidocr_venv(&libexec, lab_flag);
-        }
-        if crate::daemons::find_binary("tesseract").is_none() {
-            println!(
-                "  ! tesseract not found — install it for OCR:\n\
+            let source = repo.join("ocr/linuxocr");
+            let dest = libexec.join("linuxocr");
+            if source.is_file() {
+                std::fs::copy(&source, &dest)?;
+                crate::platform::make_executable(&dest)?;
+                println!("  ✓ {:12} {}", "linuxocr", dest.display());
+            } else {
+                println!("  … linuxocr: source not found, skipped");
+            }
+            // rapidocr: the GUI-mode engine on Linux. The script is small and always
+            // copied; the heavy part is its venv, installed only when a lab file
+            // actually asks for GUI OCR.
+            let rsrc = repo.join("ocr/rapidocr");
+            if rsrc.is_file() {
+                let rdest = libexec.join("rapidocr");
+                std::fs::copy(&rsrc, &rdest)?;
+                crate::platform::make_executable(&rdest)?;
+                println!("  ✓ {:12} {}", "rapidocr", rdest.display());
+                install_rapidocr_venv(&libexec, lab_flag);
+            }
+            if crate::daemons::find_binary("tesseract").is_none() {
+                println!(
+                    "  ! tesseract not found — install it for OCR:\n\
                  \x20   sudo apt-get install tesseract-ocr"
-            );
+                );
+            }
         }
     }
 
@@ -660,20 +809,12 @@ pub fn run(repo: &Path, rust_only: bool, lab_flag: Option<&str>) -> Result<()> {
         println!("  … zigplug: uv not found (https://docs.astral.sh/uv), skipped");
     }
 
-    // Agent skills: copy the bundled SKILL.md guides into the per-user data
-    // dir so `paniolo skill` finds them when the installed CLI runs outside
-    // this tree. From a checkout the repo copy is used directly, so this keeps
-    // an installed paniolo in sync. (Linux packages ship them to /usr/share.)
-    match crate::skills::install_bundled(repo) {
-        Ok(0) => println!(
-            "  … skills: none found under {}",
-            repo.join("skills").display()
-        ),
-        Ok(n) => {
-            let dst = crate::skills::user_skills_dir().unwrap_or_default();
-            println!("  ✓ {:12} {n} installed → {}", "skills", dst.display());
-        }
-        Err(e) => eprintln!("  ! skills: {e}"),
+    if rust_only {
+        println!(
+            "\n{}",
+            rust_only_done_message(std::env::consts::OS, skills_ok)
+        );
+        return Ok(());
     }
 
     println!("\nSetup complete.");
@@ -732,7 +873,100 @@ mod tests {
         assert_eq!(packaged_steps("macos"), vec![PackagedStep::SetuidBpfHelper]);
     }
 
-    /// The markers `is_repo_root` keys off must match the *real* tree.
+    /// Regression (#207): `--rust-only` skipped the bundled-skills copy while
+    /// its completion message named only OCR, setuid and zigplug, so a
+    /// from-source install that stopped there left `paniolo skill` empty with
+    /// no hint why. The copy needs neither sudo nor a toolchain beyond cargo,
+    /// so it is on the fast path — on every platform.
+    #[test]
+    fn rust_only_installs_the_bundled_skills() {
+        for os in ["linux", "macos", "windows"] {
+            assert!(
+                source_steps(os, true).contains(&SourceStep::InstallSkills),
+                "{os}: --rust-only must still install the skills"
+            );
+            assert!(
+                !rust_only_skips(os).contains(&SourceStep::InstallSkills),
+                "{os}: skills must not be reported as skipped"
+            );
+        }
+    }
+
+    /// The fast path is the full list minus what needs sudo or a second
+    /// toolchain — nothing else. Stated per platform, because the answer
+    /// differs and a list that ignored that would mis-report two of three.
+    #[test]
+    fn the_fast_path_skips_only_sudo_and_second_toolchain_steps() {
+        assert_eq!(
+            source_steps("linux", true),
+            vec![SourceStep::InstallSkills, SourceStep::DropStaleCopies]
+        );
+        assert_eq!(
+            rust_only_skips("linux"),
+            vec![
+                SourceStep::LinuxGroups,
+                SourceStep::OcrHelper,
+                SourceStep::Zigplug
+            ],
+            "Linux skips the group step (sudo), not the setuid one (macOS only)"
+        );
+        assert_eq!(
+            rust_only_skips("macos"),
+            vec![
+                SourceStep::SetuidBpfHelper,
+                SourceStep::OcrHelper,
+                SourceStep::Zigplug
+            ],
+        );
+        assert_eq!(
+            rust_only_skips("windows"),
+            vec![SourceStep::OcrHelper, SourceStep::Zigplug],
+            "there is no setuid bit and no dialout group on Windows"
+        );
+    }
+
+    /// The message names every step the platform actually skipped, and claims
+    /// nothing it did not do. The old message was a literal that named three
+    /// steps on every platform while the code skipped a different set.
+    #[test]
+    fn the_message_names_exactly_what_was_skipped() {
+        for os in ["linux", "macos", "windows"] {
+            let msg = rust_only_done_message(os, true);
+            assert!(msg.contains("skills installed"), "{os}: {msg}");
+            for step in rust_only_skips(os) {
+                assert!(
+                    msg.contains(step.label()),
+                    "{os}: {:?} was skipped but is unnamed in: {msg}",
+                    step
+                );
+            }
+            for step in source_steps(os, true) {
+                assert!(
+                    !msg.contains(&format!("skipped {}", step.label())),
+                    "{os}: {:?} runs on the fast path but reads as skipped: {msg}",
+                    step
+                );
+            }
+        }
+        // macOS names setuid; Linux must not, and vice versa for the groups.
+        assert!(rust_only_done_message("macos", true).contains("setuid"));
+        assert!(!rust_only_done_message("linux", true).contains("setuid"));
+        assert!(rust_only_done_message("linux", true).contains("group membership"));
+    }
+
+    /// If the skills copy did not land, the message must not say it did —
+    /// that is #207 in the other direction, and the release-train source arm
+    /// now trusts this line instead of copying the files by hand.
+    #[test]
+    fn the_message_does_not_claim_skills_it_failed_to_install() {
+        let ok = rust_only_done_message("linux", true);
+        let failed = rust_only_done_message("linux", false);
+        assert!(ok.contains("skills installed"), "{ok}");
+        assert!(!failed.contains("and skills installed"), "{failed}");
+        assert!(failed.contains("did not succeed"), "{failed}");
+    }
+
+    /// The markers `is_repo_root` keys off must match the *real* tree.    /// The markers `is_repo_root` keys off must match the *real* tree.
     ///
     /// A tmpdir-fixture test would be useless here: it would create whatever
     /// files the predicate currently names and keep passing forever after one

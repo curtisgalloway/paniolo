@@ -1,6 +1,6 @@
 # Release train profile: paniolo
 
-Derived from commit 2964411 on 2026-09-11. Executed by the `release-train`
+Derived from commit 6a95671 on 2026-09-14. Executed by the `release-train`
 skill (public-skills, `plugins/dev-tools/skills/release-train`); kept honest by
 its `profile_check.py` against the `## Sources` table below. Read `AGENTS.md`
 "Cutting a release" first: everything there still holds, this file only adds
@@ -103,10 +103,10 @@ exists and is not an arm.
 - workflow job: none
 - host: local
 - build: `PANIOLO_VERSION=X.Y.Z cargo install --path cli --root $S/.cargo` from the worktree with `HOME=$S`, `CARGO_HOME` **and `RUSTUP_HOME` exported explicitly at their real paths** (with `HOME` overridden rustup otherwise looks under `$S/.rustup`, finds no toolchain, and cargo fails with "could not choose a version of cargo"; the registry cache is the other reason), a persistent `CARGO_TARGET_DIR`, and **`CARGO_INSTALL_ROOT=$S/.cargo`**: `paniolo setup` reinstalls the CLI itself with `cargo install --path cli --force` and no `--root` (`cli/src/setup.rs`), which without that variable overwrites the developer's real CLI (it did, 2026-09-10)
-- install like a user: `HOME=$S paniolo setup --rust-only` from the worktree root (helpers land in `$S/.local/libexec/paniolo/bin`); then by hand the two non-`--rust-only` steps that need no sudo, because `--rust-only` exists to skip the setuid BPF helper but also skips these: `swiftc -O -o $S/.local/libexec/paniolo/bin/visionocr ocr/visionocr.swift`, and copy `skills/<name>/SKILL.md` to `$S/.local/share/paniolo/skills/<name>/SKILL.md` (what `skills::install_bundled` does); then `UV_TOOL_DIR=$S/uv UV_TOOL_BIN_DIR=$S/.local/libexec/paniolo/bin uv tool install ./zigplug` and `zigplug --help`
+- install like a user: `HOME=$S paniolo setup --rust-only` from the worktree root (helpers land in `$S/.local/libexec/paniolo/bin`, and since #207 the bundled skills land in `$S/.local/share/paniolo/skills` on this path too); then by hand the OCR helper, which `--rust-only` skips because it needs a second toolchain: `swiftc -O -o $S/.local/libexec/paniolo/bin/visionocr ocr/visionocr.swift`; then `UV_TOOL_DIR=$S/uv UV_TOOL_BIN_DIR=$S/.local/libexec/paniolo/bin uv tool install ./zigplug` and `zigplug --help`
 - smoke: S1..S7 against `$S/.cargo/bin/paniolo` with `HOME=$S`
 - cleanup: nothing outside `$S`
-- caveats: `paniolo setup` rebuilds the CLI with `cargo install --force` and inherits `PANIOLO_VERSION` from the environment, so keep it exported for that step too or S1 sees `0.1.0 (unversioned dev build)`; `--rust-only`'s own message names only OCR/setuid/zigplug as skipped, not skills (minor doc gap in `cli/src/setup.rs`)
+- caveats: `paniolo setup` rebuilds the CLI with `cargo install --force` and inherits `PANIOLO_VERSION` from the environment, so keep it exported for that step too or S1 sees `0.1.0 (unversioned dev build)`
 
 ## Archaeology
 
@@ -140,11 +140,11 @@ feeds needs re-reading before `--update` re-pins it.
 | `.github/workflows/docs.yml` | 2d69ff629252 | Publish: re-verify apt |
 | `packaging/nfpm.yaml` | b348d64432f4 | Channels: deb |
 | `packaging/scripts/build-apt-repo.sh` | fb2205eeab8e | Channels: deb, install like a user |
-| `Makefile` | 449aa1fe4b37 | Project: helpers; Channels: source |
-| `cli/src/setup.rs` | 67a6d1e41824 | Channels: source |
+| `Makefile` | 0e29b48ae719 | Project: helpers; Channels: source |
+| `cli/src/setup.rs` | 02317a3946d1 | Channels: source |
 | `cli/src/skills.rs` | eada6fa6ec0c | Smoke contract S2; Channels: homebrew, windows |
 | `cli/src/daemons.rs` | e9a5a52692c2 | Smoke contract S3 |
 | `scripts/ci-coverage-check.sh` | 8d0d03ddf496 | Project: helpers |
 | `scripts/sync-brik.sh` | b8b5a15775a9 | Channels: windows |
 | `README.md` | 00ee1992abb7 | Channels: source; Publish: re-verify apt |
-| `AGENTS.md` | 136258efd34f | Project: bump rules, tag format; Publish |
+| `AGENTS.md` | 672f64ba53fa | Project: bump rules, tag format; Publish |
