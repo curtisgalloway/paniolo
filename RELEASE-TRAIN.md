@@ -60,13 +60,22 @@ Only the channels this repo ships. There is no crates.io or PyPI publish; the
 from-source path is the `source` arm. winget is a no-op until its token
 exists and is not an arm.
 
+The arms run in parallel and the release worktree is their **source only**:
+an arm that stages files (the homebrew keg layout and tarball, the deb
+staging tree, the throwaway formula) does so in a per-arm directory outside
+the worktree, under the run's log dir or on the builder's own disk. The deb
+arm rsyncs the worktree to the builder with `--delete` mid-run, so anything
+another arm has left in the worktree is either carried along (the v0.3.1 train
+shipped the macOS tarball into the builder's copy) or, on a later sync,
+clobbered while that arm is still using it (#208).
+
 ### homebrew
 
 - kind: homebrew
 - artifact: `paniolo-X.Y.Z-macos-universal.tar.gz` plus `.sha256`
 - workflow job: package-macos
 - host: local
-- build: in the worktree, with `PANIOLO_VERSION=X.Y.Z` exported, `cargo build --release --target <triple>` for `cli` and every helper, both Apple targets, `CARGO_PROFILE_RELEASE_STRIP=symbols`; `swiftc -O -target <arch>-apple-macos12.0 ocr/visionocr.swift` per slice; `lipo` everything including `netbootd-bpf-helper`; stage the keg layout (`bin/paniolo`, `libexec/bin/*`, `share/paniolo/skills/*`); ad-hoc `codesign`; tarball and sidecar, exactly as the `package-macos` job does. Use a persistent `CARGO_TARGET_DIR` outside the worktree so trains are incremental
+- build: in the worktree, with `PANIOLO_VERSION=X.Y.Z` exported, `cargo build --release --target <triple>` for `cli` and every helper, both Apple targets, `CARGO_PROFILE_RELEASE_STRIP=symbols`; `swiftc -O -target <arch>-apple-macos12.0 ocr/visionocr.swift` per slice; `lipo` everything including `netbootd-bpf-helper`; stage the keg layout (`bin/paniolo`, `libexec/bin/*`, `share/paniolo/skills/*`) in this arm's own directory under the run's log dir, never inside the worktree (see the rule above the channels); ad-hoc `codesign`; tarball and sidecar, exactly as the `package-macos` job does. Use a persistent `CARGO_TARGET_DIR` outside the worktree so trains are incremental
 - install like a user: the tap's stable formula pours this tarball, so write a throwaway formula `paniolo-rt.rb` (`keg_only "release-train dry run"`, `url "file://<tarball>"`, the real `sha256`, `bin.install "bin/paniolo"`, `(libexec/"bin").install Dir["libexec/bin/*"]`, and skills to the literal `prefix/"share/paniolo/skills"` because the CLI hardcodes `share/paniolo` and `pkgshare` for `paniolo-rt` would be `share/paniolo-rt`); `HOMEBREW_DEVELOPER=1 brew install --formula ./paniolo-rt.rb` (Homebrew 6 refuses a bare `.rb` outside a tap otherwise). keg-only means nothing links into the developer's `bin`
 - smoke: S1..S7 against `$(brew --prefix paniolo-rt)/bin/paniolo`
 - cleanup: `HOMEBREW_NO_AUTOREMOVE=1 brew uninstall paniolo-rt`, always. The variable is not optional: Homebrew 7 runs `autoremove` after every uninstall, and on 2026-09-13 a bare `brew uninstall paniolo-rt` swept four unrelated orphaned leaves (`rust`, `llvm@22`, `libgit2`, `libssh2`, ~2 GB) out of the shared Cellar
@@ -78,11 +87,11 @@ exists and is not an arm.
 - artifact: `paniolo_X.Y.Z_<arch>.deb` plus `.sha256`, via `packaging/nfpm.yaml`
 - workflow job: package
 - host: linux-builder
-- build: rsync the worktree to a VM-local dir (never build on a shared mount; exclude `target`, `.venv`, `.git`); build `cli` and every helper `--release` with `PANIOLO_VERSION=X.Y.Z` exported; stage the gitignored staging tree under `packaging` (`stage/bin` with the CLI, `stage/libexec` with the helpers plus `ocr/linuxocr` and `ocr/rapidocr`) as the `package` job does; fetch `nfpm` at the workflow's `NFPM_VERSION` and verify its `checksums.txt`; `VERSION=X.Y.Z ARCH=<arch> nfpm package -f packaging/nfpm.yaml -p deb`
+- build: rsync the worktree to a VM-local dir that only this arm uses (never build on a shared mount; exclude `target`, `.venv`, `.git`, `dist*`, `logs`, and the gitignored staging tree under `packaging`, so another arm's staging never rides along or gets deleted by the sync); build `cli` and every helper `--release` with `PANIOLO_VERSION=X.Y.Z` exported; stage the gitignored staging tree under `packaging` (`stage/bin` with the CLI, `stage/libexec` with the helpers plus `ocr/linuxocr` and `ocr/rapidocr`) as the `package` job does; fetch `nfpm` at the workflow's `NFPM_VERSION` and verify its `checksums.txt`; `VERSION=X.Y.Z ARCH=<arch> nfpm package -f packaging/nfpm.yaml -p deb`
 - install like a user: assemble a real repo with `packaging/scripts/build-apt-repo.sh <debs> <out> <fpr>` under a throwaway GPG key, install the public key under `/etc/apt/keyrings/paniolo-rt.asc`, write a deb822 `.sources` (`URIs: file:///<out>`, `Suites: stable`, `Components: main`, `Signed-By` that key), `apt-get update`, `apt-cache policy paniolo` shows X.Y.Z, `apt-get install paniolo=X.Y.Z`; record whether an older paniolo was present (upgrade path) or not (fresh path)
 - smoke: S1..S7 against `/usr/bin/paniolo`; S3 also `/usr/libexec/paniolo/bin/linuxocr --help` and `rapidocr --help`; also `/usr/share/paniolo/skills/paniolo/SKILL.md` and `/usr/lib/tmpfiles.d/paniolo.conf` exist
 - cleanup: `apt-get remove paniolo` unless it was installed before; remove the `.sources` file, the keyring, the throwaway key
-- caveats: the builder is Ubuntu 24.04 (glibc 2.39), not the `debian:bookworm` (glibc 2.36) container CI builds in, so glibc-floor regressions are CI's to catch; an amd64 `.deb` is built only by CI
+- caveats: the builder is Ubuntu 24.04 (glibc 2.39), not the `debian:bookworm` (glibc 2.36) container CI builds in, so glibc-floor regressions are CI's to catch; an amd64 `.deb` is built only by CI. The builder mounts the host home **read-only**, so a script run inside the VM cannot write its log or verdict into the run dir: write them under the VM's own home and copy them out afterward (the v0.3.1 apt re-verify had to; `RELEASE-TRAIN.local.md` has the mount details)
 
 ### windows
 
@@ -124,7 +133,7 @@ exists and is not an arm.
 - steps: push the release branch; `gh pr create --base main` with only the archaeology commits; `gh pr checks --watch`; `gh pr merge --squash`; `git fetch origin && git checkout main && git pull --ff-only`; annotated tag on the merged head with the releaser identity above; `git push origin vX.Y.Z`; watch `release.yml` (`gh run watch`), then the dispatched `docs.yml` run (it rebuilds the apt pool from the newest 5 Releases; a red docs run means apt clients keep the previous version)
 - re-verify github: `gh release view vX.Y.Z --json assets` lists 12 assets (2 `.deb`, 2 Linux `.tar.gz`, macOS `.tar.gz`, Windows `.zip`, each with `.sha256`); download all, `shasum -a 256 -c` each against its sidecar
 - re-verify homebrew: the tap's `Formula/paniolo.rb` shows `version "X.Y.Z"` and the new sha256s; `brew update && brew fetch paniolo` succeeds; install the fetched tarball `paniolo-rt`-style and run S1..S3
-- re-verify apt: fetch with `curl -H "Cache-Control: no-cache"` and a cache-busting query (`?rt=<run>`), because the Pages CDN served a pre-publish `Packages` for at least 28 minutes after a rebuild on 2026-09-13 and a plain GET reported the newest release as missing; then `https://curtisgalloway.github.io/paniolo/apt/dists/stable/InRelease` is signed and its `Packages` lists X.Y.Z; on linux-builder configure the `.sources` from `README.md`, `apt-get update`, `apt-cache policy paniolo` shows X.Y.Z, `apt-get install paniolo`, run S1..S3
+- re-verify apt: fetch with `curl -H "Cache-Control: no-cache"` and a cache-busting query (`?rt=<run>`), because the Pages CDN served a pre-publish `Packages` for at least 28 minutes after a rebuild on 2026-09-13 and a plain GET reported the newest release as missing; then `https://curtisgalloway.github.io/paniolo/apt/dists/stable/InRelease` is signed and its `Packages` lists X.Y.Z; on linux-builder configure the `.sources` from `README.md`, `apt-get update`, `apt-cache policy paniolo` shows X.Y.Z, `apt-get install paniolo`, run S1..S3 (the builder's mount of the host home is read-only, so the log and verdict are written under the VM home and copied out, as in the deb arm's caveats)
 - re-verify windows: download the zip, verify the sidecar, expand and run S1..S3 on windows-bench if reachable, else inspect the layout and report PARTIAL
 - re-verify source: `cargo install --git https://github.com/curtisgalloway/paniolo --tag vX.Y.Z paniolo` into a temp root, run S1
 - a re-verify failure never rolls back the tag; open an issue and report `PUBLISHED, unverified on <channel>`
