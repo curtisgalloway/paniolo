@@ -39,6 +39,26 @@ pub enum PixelData {
     Nv12 { y: Arc<[u8]>, cbcr: Arc<[u8]> },
 }
 
+/// A full-range luma plane for signal classification, carrying its own
+/// dimensions because they need not be the frame's.
+///
+/// The Linux MJPEG path decodes grayscale at half scale (GitHub #211): the only
+/// consumer of those pixels is [`crate::frame::classify`]'s 64x64 sample
+/// lattice, so reconstructing ~2M full-colour pixels to read ~4k of them was
+/// most of what the capture thread cost. Half scale, not quarter or eighth,
+/// because averaging dilutes isolated bright pixels and `BRIGHT` is what keeps
+/// a sparse console screen from reading as no-signal -- see the calibration on
+/// that issue.
+///
+/// `width`/`height` are the plane's, NOT the frame's. Classifying a scaled
+/// plane against the frame's dimensions would read past its end.
+#[derive(Clone)]
+pub struct LumaPlane {
+    pub data: Arc<[u8]>,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Video-range BT.601 YCbCr -> RGB, integer arithmetic.
 /// y is the raw luma byte (16..235 nominal), cb/cr raw chroma bytes.
 #[inline]

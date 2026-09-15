@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 
-use crate::pixel::PixelData;
+use crate::pixel::{LumaPlane, PixelData};
 
 #[derive(Clone, Debug)]
 pub struct DeviceInfo {
@@ -91,8 +91,14 @@ pub struct CapturedFrame {
     /// Raw MJPEG bytes from the device. Present on the Linux v4l path when
     /// the device is in MJPEG mode; None on macOS (the OS decodes upstream).
     pub jpeg: Option<Arc<[u8]>>,
-    /// Native pixel data: RGB on decode paths, NV12 on the macOS path.
+    /// Native pixel data: RGB on decode paths, NV12 on the macOS path, and
+    /// `Empty` on the Linux MJPEG path, where `jpeg` carries the image and
+    /// `luma` carries what classification needs.
     pub pixels: PixelData,
+    /// A pre-scaled luma plane for classification, when the backend produced
+    /// one more cheaply than a full decode. Carries its own dimensions, which
+    /// are NOT `width`/`height`.
+    pub luma: Option<LumaPlane>,
     pub width: u32,
     pub height: u32,
 }
@@ -376,7 +382,7 @@ mod linux {
     use v4l::video::Capture;
 
     use super::{resolve, CaptureBackend, CapturedFrame, DeviceSpec};
-    use crate::pixel::{yuyv_to_rgb, PixelData};
+    use crate::pixel::{yuyv_to_rgb, LumaPlane, PixelData};
 
     // Tried in order, highest resolution first, because VIDIOC_S_FMT does not
     // fail on an unsupported request -- it *substitutes* the driver's nearest
@@ -445,7 +451,19 @@ mod linux {
         dev: Box<Device>,
         dims: (u32, u32),
         is_mjpeg: bool,
+        /// Reused across frames: constructing one per frame would put the
+        /// setup cost back that the scaled decode exists to remove. Lazily
+        /// built because `Decompressor::new` can fail and `accept` cannot.
+        decompressor: Option<turbojpeg::Decompressor>,
     }
+
+    /// Scale the classification decode runs at. Half, not quarter or eighth:
+    /// a bright stroke `s` pixels wide averaged over an `f`x`f` block peaks
+    /// near `255 * s / f`, and `classify`'s `BRIGHT` guard needs that at or
+    /// above 64, so `f <= 4 * s`. One-pixel strokes are the thinnest real
+    /// console text, which caps `f` at 2 -- measured, with 1/4 flipping a
+    /// sparse text screen to no-signal by a single point (GitHub #211).
+    const CLASSIFY_SCALE: turbojpeg::ScalingFactor = turbojpeg::ScalingFactor::ONE_HALF;
 
     impl LinuxV4LBackend {
         /// Open `spec` on the best format it will actually stream.
@@ -558,7 +576,51 @@ mod linux {
                 dev,
                 dims: (actual.width, actual.height),
                 is_mjpeg: actual.fourcc == FourCC::new(b"MJPG"),
+                decompressor: None,
             }
+        }
+
+        /// Decode `jpeg` to a half-scale grayscale plane for classification,
+        /// and report the frame's true dimensions from its header.
+        ///
+        /// The header is read rather than inferred from the output, because
+        /// the output is deliberately not the frame's size: taking dimensions
+        /// from a scaled decode would report 960x540 for a 1080p capture and
+        /// silently bump the resolution epoch on every frame.
+        fn classify_plane(&mut self, jpeg: &[u8]) -> Result<(LumaPlane, u32, u32)> {
+            if self.decompressor.is_none() {
+                self.decompressor =
+                    Some(turbojpeg::Decompressor::new().context("turbojpeg decompressor init")?);
+            }
+            let d = self.decompressor.as_mut().expect("just initialised");
+            let header = d.read_header(jpeg).context("turbojpeg header read")?;
+            d.set_scaling_factor(CLASSIFY_SCALE)
+                .context("turbojpeg scaling factor")?;
+
+            let sw = CLASSIFY_SCALE.scale(header.width);
+            let sh = CLASSIFY_SCALE.scale(header.height);
+            let mut plane = vec![0u8; sw * sh];
+            d.decompress(
+                jpeg,
+                turbojpeg::Image {
+                    pixels: &mut plane[..],
+                    width: sw,
+                    pitch: sw,
+                    height: sh,
+                    format: turbojpeg::PixelFormat::GRAY,
+                },
+            )
+            .context("turbojpeg grayscale decode failed")?;
+
+            Ok((
+                LumaPlane {
+                    data: Arc::from(plane.into_boxed_slice()),
+                    width: sw as u32,
+                    height: sh as u32,
+                },
+                header.width as u32,
+                header.height as u32,
+            ))
         }
     }
 
@@ -598,16 +660,24 @@ mod linux {
                 // Keep a copy of the raw JPEG bytes for zero-cost preview serving.
                 let jpeg_bytes: Arc<[u8]> = Arc::from(buf.to_vec().into_boxed_slice());
 
-                // Decode with turbojpeg (libjpeg-turbo) for signal detection
-                // and lazy snapshot encoding. ~5ms at 720p.
-                let rgb = turbojpeg::decompress_image::<image::Rgb<u8>>(buf)
-                    .context("turbojpeg MJPEG decode failed")?;
-                let (w, h) = (rgb.width(), rgb.height());
+                // Grayscale at half scale, for signal detection only. The
+                // capture thread discards `pixels` whenever raw JPEG bytes are
+                // present -- snapshot and OCR re-decode from them on demand --
+                // so a full-resolution RGB decode here reconstructed ~2M
+                // colour pixels, copied them into an `Arc`, and dropped both,
+                // to feed a 64x64 luma lattice (GitHub #211). At 1080p that is
+                // 518,400 bytes instead of 6,220,800, and no second copy.
+                // From the owned copy, not `buf`: `buf` borrows the stream, so
+                // classifying through it would hold that borrow across a
+                // `&mut self` call. Classifying exactly the bytes served is
+                // the better guarantee anyway.
+                let (luma, w, h) = self.classify_plane(&jpeg_bytes)?;
                 self.dims = (w, h);
 
                 Ok(CapturedFrame {
                     jpeg: Some(jpeg_bytes),
-                    pixels: PixelData::Rgb(Arc::from(rgb.into_raw().into_boxed_slice())),
+                    pixels: PixelData::Empty,
+                    luma: Some(luma),
                     width: w,
                     height: h,
                 })
@@ -623,6 +693,7 @@ mod linux {
                 Ok(CapturedFrame {
                     jpeg: None,
                     pixels: PixelData::Rgb(Arc::from(rgb.into_raw().into_boxed_slice())),
+                    luma: None,
                     width: w,
                     height: h,
                 })
@@ -849,6 +920,7 @@ mod macos {
                             y: Arc::from(y),
                             cbcr: Arc::from(cbcr),
                         },
+                        luma: None,
                         width: w,
                         height: h,
                     }
@@ -858,6 +930,7 @@ mod macos {
                     CapturedFrame {
                         jpeg: None,
                         pixels: PixelData::Rgb(Arc::from(rgb.into_raw().into_boxed_slice())),
+                        luma: None,
                         width: w,
                         height: h,
                     }
