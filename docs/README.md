@@ -15,6 +15,22 @@ on Debian/Raspberry Pi OS the quickest route is the [apt repository](https://cur
 | [Tested hardware](hardware.md) | The bench hardware each subsystem is verified with, by category, with purchase links. |
 | [Demos](demos.md) | Recorded runs from the CI rack — a NUC's BIOS puppeted through the KVM, a live desktop driven by emulated HID, out-of-band power over Intel AMT, a Pi cold-booted through a relay — each capture beside the transcript of what the agent typed. |
 
+## Naming the target
+
+Every **runtime** command takes the target either positionally or as
+`-t/--target`, whichever reads better, and refuses both at once:
+
+```bash
+paniolo video stop target-machine        # positional
+paniolo video stop -t target-machine     # the same command
+```
+
+Omit it entirely when the lab has exactly one target. The **config** verbs
+(`set`, `add`, `rm`) require `-t` and take no positional, because a command that
+creates or destroys configuration should not act on an implicit target.
+`paniolo doctor [target]` is the one positional-only runtime command: with no
+target it checks them all, so it is a filter rather than a subject.
+
 ## Subsystem guides
 
 | Guide | Commands | Summary |

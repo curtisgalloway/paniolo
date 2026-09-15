@@ -82,6 +82,13 @@ paniolo netboot start [target-machine]
 paniolo netboot stop  [target-machine]
 ```
 
+`[target-machine]` may be omitted when exactly one target is configured, and
+every runtime verb (`start`, `stop`, `status`, `logs`, `tftp-root`) also
+accepts it as `-t/--target` — so `paniolo netboot stop -t target-machine` and
+`paniolo netboot stop target-machine` are the same command. Giving both at once
+is refused. The config verbs (`set`, `rm`) still require `-t` and take no
+positional.
+
 `start` assigns the static `host_ip` to the interface, then launches paniolo's
 own **DHCP + TFTP + HTTP server** — the single `netbootd` binary (Rust), serving
 all three protocols from one background process. No external daemons (`dnsmasq`,
