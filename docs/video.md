@@ -56,12 +56,31 @@ device is present, and lists id alternatives when there are several.
 paniolo video watch [target-machine]   # start hdmicap daemon for a target
 paniolo video watch --restart          # force-restart a running (stalled) daemon
 paniolo video stop  [target-machine]   # stop it (on the target's host)
-paniolo video show  [target-machine]   # show daemon URL and status
+paniolo video show  [target-machine]   # show daemon address and status
 ```
 
 `watch` starts `hdmicap daemon` detached and polls for startup. The dashboard
 URL is printed — open exactly that URL in a browser for the live preview: it
 carries the daemon's `?token=`, and the daemon answers nothing without it.
+
+**`show` and `console` print the address without the token, on purpose.** The
+token is a live bearer credential, and those two lines land where credentials
+should not: terminal scrollback, `script`/`asciinema` captures, CI logs, pasted
+terminal output in issues, and — because paniolo is driven by agents that run
+`video show` constantly — agent transcripts. They print
+`http://127.0.0.1:<port>`, which is enough to identify the daemon and useless
+on its own.
+
+`video watch` prints the openable URL when it **starts** a daemon, because that
+is a human asking where to look. Against an already-running daemon it prints the
+token-free form: that branch starts nothing and is the idempotent call an agent
+makes before every screenshot.
+
+`console` is the one place the rule reverses. If no browser could be launched —
+a headless control host, a container, no `xdg-open` — it prints the **full** URL
+and says so. An address you cannot open is worse than a token in your
+scrollback, and on the remote path the SSH tunnels die with the command, so
+there is no second chance to get the URL.
 
 **Every request to the daemon needs its token.** hdmicap generates a fresh one
 each start and publishes it as `token` in its discovery file (see *Runtime
@@ -139,7 +158,20 @@ paniolo video shot --stable -o out.png           # wait for a steady frame first
 paniolo video shot --changed-since <hex-hash> --timeout 10000 -o out.png
                                                  # block until the frame differs
 paniolo video preview [target-machine]           # print the live-dashboard URL (optional target, like `show`)
+paniolo video preview --open                     # open it in a browser instead of printing it
 ```
+
+`preview` prints the URL **with** the token, because a browser can present it
+no other way — treat that output as a credential and paste it into a browser,
+not into a log. `--open` hands it to the default browser and prints only the
+token-free address, which is the safer form when anything is recording the
+terminal; if no browser can be launched it prints the full URL rather than
+leaving you with nothing.
+
+`--open` is refused when the target's video channel is on another host. The
+command would re-exec there and open a browser on the bench machine, not on
+yours. Use `paniolo console <target>`, which forwards the ports and opens a
+browser locally, or plain `preview` and open the URL through your own tunnel.
 
 `shot` fetches a single PNG-encoded frame from the running daemon and prints
 `signal=… hash=…` to stderr; feed that hash to a later `--changed-since` to

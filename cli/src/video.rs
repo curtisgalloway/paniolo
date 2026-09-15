@@ -55,6 +55,16 @@ pub fn preview_url(target: &str) -> Option<String> {
     daemon(target).map(|d| d.http_url("/"))
 }
 
+/// The daemon's address with no token: `http://127.0.0.1:<port>`. Status
+/// output prints this rather than [`preview_url`], because it lands in agent
+/// transcripts, CI logs and pasted terminal output, which is not where a
+/// bearer credential belongs (#196). None if the daemon isn't running.
+///
+/// Mirrors `serial::daemon_url`, the same accessor on the sibling channel.
+pub fn daemon_url(target: &str) -> Option<String> {
+    daemons::daemon_url(DAEMON, Some(target))
+}
+
 /// The local request timeout (ms) for a stable-frame wait of `timeout_ms`:
 /// the daemon's own `wait=stable&timeout=` plus 5s of slack, so the local
 /// timeout never fires first. `saturating_add` rather than `+`: `timeout_ms`

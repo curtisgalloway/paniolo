@@ -775,7 +775,18 @@ enum VideoCmd {
         json: bool,
     },
     /// Print the live-preview URL of the target's running daemon.
-    Preview { target: Option<String> },
+    ///
+    /// The URL carries the daemon's token (a browser can present it no other
+    /// way), so the output is a credential: paste it into a browser, not into
+    /// a log. `--open` hands it to the browser instead and prints only the
+    /// token-free address.
+    Preview {
+        /// Target whose daemon to print (optional when the lab has one).
+        target: Option<String>,
+        /// Open the URL in the default browser instead of printing it.
+        #[arg(long)]
+        open: bool,
+    },
     /// List available capture devices.
     Devices,
     /// Show the target's video channel and daemon status.
@@ -2342,17 +2353,70 @@ fn dashboard_url(video: &daemons::Endpoint, links: &DashboardLinks) -> String {
     }
 }
 
-fn open_in_browser(url: &str) {
+/// What `console` prints once the dashboard URL is in the browser's hands.
+///
+/// The URL itself carries every running daemon's token and this line lands in
+/// transcripts, CI logs and pasted terminal output (#196), so only the
+/// token-free address is printed. `withheld` says whether there was anything
+/// to withhold: against a daemon old enough to have no token, and with no
+/// serial or hid links, `dashboard_url` returns exactly this address, and
+/// claiming a credential was held back would be false and would steer the
+/// reader away from the one address that works.
+fn console_banner(video: &daemons::Endpoint, withheld: bool) -> String {
+    let base = video.base_url();
+    if withheld {
+        format!(
+            "Opened the dashboard in the browser. Its URL carries the daemons' tokens, \
+             so it is not printed here; the page is at {base}."
+        )
+    } else {
+        format!("Opened {base} in the browser.")
+    }
+}
+
+/// `video show`'s daemon line: the token-free address, plus whatever
+/// `stale_note` had to say.
+///
+/// Its own function so a test can execute it. The token belongs nowhere in
+/// here — an agent driving a target runs `video show` constantly and every
+/// line of it lands in the transcript (#196) — and a rendering this small is
+/// exactly the kind that gets reverted by a one-word edit with the suite still
+/// green.
+fn video_show_daemon_line(url: &str, stale: &str) -> String {
+    format!("daemon\trunning at {url}{stale}")
+}
+
+/// The line to print when the OS opener could not be launched: the full URL,
+/// tokens and all, because an address the reader cannot open is worse than a
+/// credential in their scrollback — they have no other way to reach the page.
+fn console_fallback(url: &str) -> String {
+    format!(
+        "Could not launch a browser. Open this URL yourself (it carries the daemons' \
+         tokens, so treat it as a credential):\n{url}"
+    )
+}
+
+/// Hand `url` to the OS opener. Returns whether the opener could be launched
+/// at all — false on a headless host, in a container, or anywhere `xdg-open`
+/// is not installed.
+///
+/// The caller has to know: since #196 the token-bearing URL is no longer
+/// printed alongside, so a silently failed launch would leave the dashboard
+/// unreachable with nothing to paste. A successful spawn is not proof a window
+/// appeared (the opener may still fail asynchronously), but it distinguishes
+/// "no opener here" from "handed off", which is the case that strands people.
+fn open_in_browser(url: &str) -> bool {
     let opener = if cfg!(target_os = "macos") {
         "open"
     } else {
         "xdg-open"
     };
-    let _ = std::process::Command::new(opener)
+    std::process::Command::new(opener)
         .arg(url)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn();
+        .spawn()
+        .is_ok()
 }
 
 /// The combined dashboard is a composite command: it needs the serial and video
@@ -2446,8 +2510,11 @@ fn cmd_console(
             hid_ws: hid_ws.as_deref(),
         },
     );
-    open_in_browser(&url);
-    println!("Opened {url}");
+    if open_in_browser(&url) {
+        println!("{}", console_banner(&video, url != video.base_url()));
+    } else {
+        println!("{}", console_fallback(&url));
+    }
     Ok(())
 }
 
@@ -2537,8 +2604,11 @@ fn remote_console(lab: &Lab, target: &str, host_name: &str, interface: Option<&s
             hid_ws: hid_ws.as_deref(),
         },
     );
-    open_in_browser(&url);
-    println!("Opened {url}");
+    if open_in_browser(&url) {
+        println!("{}", console_banner(&video, url != video.base_url()));
+    } else {
+        println!("{}", console_fallback(&url));
+    }
     println!("Tunnels to {host_name} open. Press Ctrl-C to close.");
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -3013,6 +3083,31 @@ fn local_video(lab: &Lab, target: &str) -> Result<model::VideoChannel> {
     Ok(v)
 }
 
+/// Refuse `--open` when the target's video channel lives on another host.
+///
+/// A remote channel re-execs the whole argv on the control host
+/// (`dispatch::subcommand_args`), `--open` included, so the browser would open
+/// *there* — on a headless bench machine, silently, while the caller is told it
+/// opened. Checked before `video_runtime`, which is where that re-exec happens
+/// and never returns.
+fn refuse_remote_open(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    let target = resolve_single_target(&lab, target)?;
+    let rt = lab
+        .resolved_target(&target)
+        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+    let host_name = model::channel_host(&rt, model::ChannelKind::Video, None)?;
+    if lab.host(&host_name).is_local(&host_name) {
+        return Ok(());
+    }
+    bail!(
+        "`video preview --open` opens a browser on the machine that runs it, and \
+         '{target}'s video channel is on '{host_name}' — it would open there. \
+         Use `paniolo console {target}`, which forwards the ports and opens a browser \
+         here, or `paniolo video preview {target}` to print the URL and open it yourself."
+    )
+}
+
 fn video_runtime(
     lab_flag: Option<&str>,
     target: Option<&str>,
@@ -3064,7 +3159,16 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
             if let Some(url) = video::preview_url(&target) {
                 let stale = daemons::binary_is_stale(video::DAEMON, Some(&target)) == Some(true);
                 if !restart && !stale {
-                    println!("Video daemon for '{target}' already running at {url}");
+                    // A status line, not an invitation: this branch starts
+                    // nothing, and it is the idempotent "make sure the daemon
+                    // is up" call an agent makes before every screenshot, so
+                    // the token would land in the transcript on every one
+                    // (#196). `video preview` is where the openable URL lives.
+                    println!(
+                        "Video daemon for '{target}' already running at {}",
+                        daemons::daemon_url(video::DAEMON, Some(&target))
+                            .unwrap_or_else(|| url.clone())
+                    );
                     return Ok(());
                 }
                 if stale && !restart {
@@ -3197,15 +3301,30 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
             }
             Ok(())
         }
-        VideoCmd::Preview { target } => {
-            let (target, _v) = video_runtime(lab_flag, target.as_deref())?;
-            match video::preview_url(&target) {
-                Some(url) => {
-                    println!("{url}");
-                    Ok(())
-                }
-                None => bail!("no video daemon running — start one with `paniolo video watch`"),
+        VideoCmd::Preview { target, open } => {
+            if open {
+                refuse_remote_open(lab_flag, target.as_deref())?;
             }
+            let (target, _v) = video_runtime(lab_flag, target.as_deref())?;
+            let Some(daemon) = video::daemon(&target) else {
+                bail!("no video daemon running — start one with `paniolo video watch`");
+            };
+            let url = daemon.http_url("/");
+            if open {
+                // The token goes to the browser, not the terminal (#196) —
+                // unless there is no browser, in which case printing it is the
+                // only way the caller reaches the page at all.
+                if open_in_browser(&url) {
+                    println!("Opened {} in the browser.", daemon.base_url());
+                } else {
+                    println!("{}", console_fallback(&url));
+                }
+            } else {
+                // A browser can only present the token as ?token=, and the
+                // caller asked for the URL to open, so this one carries it.
+                println!("{url}");
+            }
+            Ok(())
         }
         VideoCmd::Devices => {
             std::process::exit(video::passthrough(&["devices".to_string()], None)?);
@@ -3213,12 +3332,18 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
         VideoCmd::Show { target } => {
             let (target, v) = video_runtime(lab_flag, target.as_deref())?;
             println!("device\t{}", v.device.as_deref().unwrap_or("(not set)"));
-            match video::preview_url(&target) {
+            match video::daemon_url(&target) {
                 Some(url) => {
                     println!(
-                        "daemon\trunning at {url}{}",
-                        stale_note(video::DAEMON, &target)
-                    )
+                        "{}",
+                        video_show_daemon_line(&url, stale_note(video::DAEMON, &target))
+                    );
+                    // A one-time pointer, not a field: `show`'s stdout is
+                    // `key<TAB>value` that scripts split on, and this is prose.
+                    eprintln!(
+                        "note: `paniolo video preview` prints the openable URL; it \
+                         carries the daemon's token, which is not shown here (#196)."
+                    );
                 }
                 // "stopped" has to mean the device is free. A daemon whose
                 // discovery file was deleted under it is still running and
@@ -4158,6 +4283,125 @@ mod tests {
             assert!(full.contains(part), "{part:?} missing from {full:?}");
         }
         assert_ne!(full, short, "{{e:#}} must show more than {{e}}");
+    }
+
+    fn endpoint(port: u16, token: Option<&str>) -> daemons::Endpoint {
+        daemons::Endpoint {
+            pid: 1,
+            port,
+            token: token.map(str::to_string),
+        }
+    }
+
+    /// What `console` prints names the port and never a token, while the URL
+    /// it hands the browser for the same endpoint still carries one (#196).
+    #[test]
+    fn console_banner_names_the_port_and_never_the_token() {
+        let video = endpoint(1000, Some("s3cr3t"));
+        let banner = console_banner(&video, true);
+        assert!(banner.contains("http://127.0.0.1:1000"), "{banner}");
+        assert!(!banner.contains("token="), "{banner}");
+        assert!(!banner.contains("s3cr3t"), "{banner}");
+        let url = dashboard_url(
+            &video,
+            &DashboardLinks {
+                serial_ws: None,
+                interface: None,
+                hid_ws: None,
+            },
+        );
+        assert_eq!(url, "http://127.0.0.1:1000/?token=s3cr3t");
+    }
+
+    /// Against a daemon too old to have a token, and with no links, the
+    /// dashboard URL *is* the base address — so the banner must not claim a
+    /// credential was withheld and send the reader looking for another URL.
+    #[test]
+    fn console_banner_claims_nothing_withheld_when_there_is_no_token() {
+        let video = endpoint(1000, None);
+        let url = dashboard_url(
+            &video,
+            &DashboardLinks {
+                serial_ws: None,
+                interface: None,
+                hid_ws: None,
+            },
+        );
+        assert_eq!(url, "http://127.0.0.1:1000", "nothing to withhold");
+        let banner = console_banner(&video, url != video.base_url());
+        assert!(banner.contains("http://127.0.0.1:1000"), "{banner}");
+        assert!(
+            !banner.contains("not printed"),
+            "must not claim a withheld URL that does not exist: {banner}"
+        );
+    }
+
+    /// When no browser could be launched the full URL is printed after all.
+    /// An address the reader cannot open is worse than a token in their
+    /// scrollback: without this they have no way to reach the dashboard, and
+    /// on the remote path the tunnels die with the command.
+    #[test]
+    fn console_falls_back_to_the_full_url_when_no_browser_opens() {
+        let video = endpoint(1000, Some("s3cr3t"));
+        let url = dashboard_url(
+            &video,
+            &DashboardLinks {
+                serial_ws: Some("ws://127.0.0.1:2000/stream?token=ser"),
+                interface: None,
+                hid_ws: None,
+            },
+        );
+        let msg = console_fallback(&url);
+        assert!(
+            msg.contains(&url),
+            "the fallback must carry the whole URL: {msg}"
+        );
+        assert!(msg.contains("credential"), "and say what it is: {msg}");
+    }
+
+    /// The `video show` daemon line — the command the issue names, and the one
+    /// an agent runs constantly. Rendered by its own function so this executes
+    /// the real thing; before, a one-word revert put the token back with the
+    /// whole suite still green.
+    #[test]
+    fn video_show_daemon_line_never_carries_the_token() {
+        let ep = endpoint(1000, Some("s3cr3t"));
+        let line = video_show_daemon_line(&ep.base_url(), "");
+        assert_eq!(line, "daemon\trunning at http://127.0.0.1:1000");
+        assert!(!line.contains("s3cr3t"), "{line}");
+        assert!(!line.contains("token="), "{line}");
+        // The stale marker still rides along, and still carries no token.
+        let stale = video_show_daemon_line(&ep.base_url(), " (stale)");
+        assert!(stale.ends_with(" (stale)"), "{stale}");
+        assert!(!stale.contains("s3cr3t"), "{stale}");
+        // The openable form, for contrast: same endpoint, token attached.
+        assert_eq!(ep.http_url("/"), "http://127.0.0.1:1000/?token=s3cr3t");
+    }
+
+    /// `video preview --open` is the form that keeps the token off the
+    /// terminal; without it the flag is false and the URL is printed.
+    #[test]
+    fn video_preview_parses_the_open_flag() {
+        let cli = Cli::try_parse_from(["paniolo", "video", "preview", "--open"]).unwrap();
+        match cli.command {
+            Command::Video {
+                cmd: VideoCmd::Preview { target, open },
+            } => {
+                assert_eq!(target, None);
+                assert!(open);
+            }
+            _ => panic!("parsed as a different command"),
+        }
+        let cli = Cli::try_parse_from(["paniolo", "video", "preview", "dut"]).unwrap();
+        match cli.command {
+            Command::Video {
+                cmd: VideoCmd::Preview { target, open },
+            } => {
+                assert_eq!(target.as_deref(), Some("dut"));
+                assert!(!open);
+            }
+            _ => panic!("parsed as a different command"),
+        }
     }
 
     /// The dashboard URL carries the video daemon's token for the page itself

@@ -373,9 +373,16 @@ Python tree below:
   byte-identical across the four like `platform.rs`; only hdmicap's vendored
   `/xterm*` assets are exempt. A daemon started by an older paniolo has no
   token (the CLI then sends none) — `paniolo daemons restart --stale`
-  replaces it. Printed browser URLs (`video watch`/`preview`/`show`,
-  `console`) carry `?token=`; `dispatch::remote_daemon_endpoint` reads the
-  token over SSH so a tunnelled `console` carries it too.
+  replaces it. The URL handed to a **browser** always carries `?token=`, and
+  `dispatch::remote_daemon_endpoint` reads the token over SSH so a tunnelled
+  `console` carries it too — but only the commands whose job is to produce an
+  openable URL **print** it: `video watch` when it starts a daemon, and
+  `video preview`. `video show`, `video watch` against an already-running
+  daemon, and `console` print the token-free `http://127.0.0.1:<port>`,
+  because that output lands in agent transcripts and CI logs (#196).
+  `video preview --open` and a `console` whose browser launch fails are the
+  two exceptions in each direction: the first prints nothing openable, the
+  second prints the full URL because the reader has no other way in.
 - **Netboot is rust-engine only** (netbootd); the pure-Python DHCP/TFTP engine
   exists only in the legacy tree.
 - **Helpers live off PATH** in the private libexec dir

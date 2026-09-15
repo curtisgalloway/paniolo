@@ -226,6 +226,12 @@ stitches the two together and does not care that the daemons are on different
 hosts, only that both resolve as forwarded local ports. This needs **zero
 changes to hdmicap or serialcap.**
 
+That URL carries three daemons' bearer tokens in one line, so `paniolo console`
+hands it to the browser and prints only `http://127.0.0.1:<local-hdmi>` — a
+remote console is exactly the case where the terminal is being recorded or
+pasted. `paniolo video preview` prints the openable video URL when you need it,
+and `--open` skips printing it at all.
+
 We explicitly considered, and rejected, making hdmicap **reverse-proxy** serialcap
 to collapse the dashboard to one origin/one forward. It would require hdmicap on
 one host to connect to serialcap on another — exactly the cross-host path
