@@ -2473,14 +2473,48 @@ fn video_show_daemon_line(url: &str, stale: &str) -> String {
     format!("daemon\trunning at {url}{stale}")
 }
 
-/// The line to print when the OS opener could not be launched: the full URL,
-/// tokens and all, because an address the reader cannot open is worse than a
-/// credential in their scrollback — they have no other way to reach the page.
-fn console_fallback(url: &str) -> String {
-    format!(
-        "Could not launch a browser. Open this URL yourself (it carries the daemons' \
-         tokens, so treat it as a credential):\n{url}"
-    )
+/// What to print when the OS opener could not be launched.
+///
+/// An address the reader cannot open would strand them — on a headless control
+/// host, and worse over SSH, where the tunnels die with the command and the
+/// ephemeral ports the URL names never come back. So the URL has to be
+/// reachable. It goes to a 0600 file rather than to stdout: the same
+/// protection the discovery file gets, and the reader can open it without a
+/// credential passing through a transcript on the way.
+///
+/// If even that fails there is nothing left to protect the token *with*, so
+/// the URL is printed — being locked out of your own dashboard is the worse
+/// outcome, and the caller is told what it is handing them.
+fn console_fallback(target: &str, url: &str) -> String {
+    match write_private_url(target, url) {
+        Ok(path) => format!(
+            "Could not launch a browser. The URL carries the daemons' tokens, so it is \
+             in {} (mode 0600) rather than printed — open it with \
+             `open \"$(cat {})\"` (macOS) or `xdg-open \"$(cat {})\"`.",
+            path.display(),
+            path.display(),
+            path.display()
+        ),
+        Err(e) => format!(
+            "Could not launch a browser, and could not write the URL to a private file \
+             ({e}). Open this yourself — it carries the daemons' tokens, so treat it as \
+             a credential:\n{url}"
+        ),
+    }
+}
+
+/// Write `url` to a 0600 file in the target's runtime dir and return its path.
+fn write_private_url(target: &str, url: &str) -> Result<std::path::PathBuf> {
+    let dir = daemons::ensure_runtime_dir(video::DAEMON, Some(target))?;
+    let path = dir.join("dashboard-url.txt");
+    let mut o = std::fs::OpenOptions::new();
+    o.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    let mut f = o.open(&path)?;
+    use std::io::Write;
+    writeln!(f, "{url}")?;
+    Ok(path)
 }
 
 /// Hand `url` to the OS opener. Returns whether the opener could be launched
@@ -2600,7 +2634,7 @@ fn cmd_console(
     if open_in_browser(&url) {
         println!("{}", console_banner(&video, url != video.base_url()));
     } else {
-        println!("{}", console_fallback(&url));
+        println!("{}", console_fallback(&target, &url));
     }
     Ok(())
 }
@@ -2694,7 +2728,7 @@ fn remote_console(lab: &Lab, target: &str, host_name: &str, interface: Option<&s
     if open_in_browser(&url) {
         println!("{}", console_banner(&video, url != video.base_url()));
     } else {
-        println!("{}", console_fallback(&url));
+        println!("{}", console_fallback(target, &url));
     }
     println!("Tunnels to {host_name} open. Press Ctrl-C to close.");
     loop {
@@ -3404,7 +3438,7 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
                 if open_in_browser(&url) {
                     println!("Opened {} in the browser.", daemon.base_url());
                 } else {
-                    println!("{}", console_fallback(&url));
+                    println!("{}", console_fallback(&target, &url));
                 }
             } else {
                 // A browser can only present the token as ?token=, and the
@@ -4423,12 +4457,17 @@ mod tests {
         );
     }
 
-    /// When no browser could be launched the full URL is printed after all.
-    /// An address the reader cannot open is worse than a token in their
-    /// scrollback: without this they have no way to reach the dashboard, and
-    /// on the remote path the tunnels die with the command.
+    /// When no browser could be launched the URL still has to be reachable —
+    /// an address the reader cannot open would strand them, and over SSH the
+    /// tunnels die with the command. It goes to a 0600 file rather than to
+    /// stdout, so `console` prints no token under any circumstance.
     #[test]
-    fn console_falls_back_to_the_full_url_when_no_browser_opens() {
+    fn console_falls_back_to_a_private_file_not_the_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        // Safe: mutated and restored within this test.
+        let prev = std::env::var_os("PANIOLO_RUNTIME_BASE");
+        unsafe { std::env::set_var("PANIOLO_RUNTIME_BASE", dir.path()) };
+
         let video = endpoint(1000, Some("s3cr3t"));
         let url = dashboard_url(
             &video,
@@ -4438,12 +4477,33 @@ mod tests {
                 hid_ws: None,
             },
         );
-        let msg = console_fallback(&url);
+        let msg = console_fallback("dut", &url);
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("PANIOLO_RUNTIME_BASE", v) },
+            None => unsafe { std::env::remove_var("PANIOLO_RUNTIME_BASE") },
+        }
+
         assert!(
-            msg.contains(&url),
-            "the fallback must carry the whole URL: {msg}"
+            !msg.contains("s3cr3t") && !msg.contains("token="),
+            "the token must not reach the terminal: {msg}"
         );
-        assert!(msg.contains("credential"), "and say what it is: {msg}");
+        assert!(
+            msg.contains("dashboard-url.txt"),
+            "and the reader must be told where it is: {msg}"
+        );
+        let path = msg
+            .split_whitespace()
+            .find(|w| w.ends_with("dashboard-url.txt"))
+            .expect("the message names the file");
+        let body = std::fs::read_to_string(path).expect("the file was written");
+        assert_eq!(body.trim(), url);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "the URL file must be private");
+        }
     }
 
     /// The `video show` daemon line — the command the issue names, and the one

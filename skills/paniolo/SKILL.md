@@ -263,9 +263,9 @@ paniolo video stop [target]           # stop the daemon (on the target's host)
 - **Opening a browser is a human's job, not yours.** `paniolo video preview
   --open` only works on a machine with a desktop session, and it is refused
   outright when the video channel is on another host. On a headless control
-  host — where you usually are — it prints the full URL instead, tokens and
-  all, so do not reach for it to avoid the credential. Hand the human
-  `paniolo console <target>` and let them run it.
+  host — where you usually are — it writes the URL to a `0600` file and prints
+  that path instead of opening anything, so it is not a way to get a browser
+  open. Hand the human `paniolo console <target>` and let them run it.
 - The `device` may be a **stable id** (preferred — `video devices` prints
   `id=…`: the AVFoundation uniqueID on macOS, the `/dev/v4l/by-path` symlink on
   Linux), a name substring, or a `/dev/video*` path. Ids are derived from USB
@@ -766,8 +766,8 @@ the device is free just because a daemon is gone from the tracked list.
   `?serialws=…token=…`, `?hidws=…`); the daemons answer nothing without it.
   What `console` *prints* is the token-free address, because that line lands in
   your transcript — so do not paste it into a browser and expect the page to
-  work. If no browser could be launched, `console` prints the full URL instead
-  and says so. A daemon left over from an older paniolo has no token —
+  work. If no browser could be launched, `console` writes the full URL to a
+  `0600` file and prints that path — never the URL itself. A daemon left over from an older paniolo has no token —
   `paniolo daemons restart --stale`.
 - Netboot requires passwordless `sudo` (`ip` on Linux, `ifconfig` on macOS).
 - netboot and ffx are mutually exclusive on the link — use `paniolo netif mode`

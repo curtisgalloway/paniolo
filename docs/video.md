@@ -76,11 +76,16 @@ is a human asking where to look. Against an already-running daemon it prints the
 token-free form: that branch starts nothing and is the idempotent call an agent
 makes before every screenshot.
 
-`console` is the one place the rule reverses. If no browser could be launched —
-a headless control host, a container, no `xdg-open` — it prints the **full** URL
-and says so. An address you cannot open is worse than a token in your
-scrollback, and on the remote path the SSH tunnels die with the command, so
-there is no second chance to get the URL.
+If no browser could be launched — a headless control host, a container, no
+`xdg-open` — `console` does not simply give up: an address you cannot open would
+strand you, and on the remote path the SSH tunnels die with the command, so
+there is no second chance. It writes the full URL to a `0600`
+`dashboard-url.txt` in the target's runtime dir and prints the **path**, which
+keeps the token out of the terminal while leaving it one `cat` away:
+
+```bash
+xdg-open "$(cat /tmp/paniolo-1000/hdmicap/target-machine/dashboard-url.txt)"
+```
 
 **Every request to the daemon needs its token.** hdmicap generates a fresh one
 each start and publishes it as `token` in its discovery file (see *Runtime
@@ -165,8 +170,8 @@ paniolo video preview --open                     # open it in a browser instead 
 no other way — treat that output as a credential and paste it into a browser,
 not into a log. `--open` hands it to the default browser and prints only the
 token-free address, which is the safer form when anything is recording the
-terminal; if no browser can be launched it prints the full URL rather than
-leaving you with nothing.
+terminal; if no browser can be launched it writes the URL to the same `0600`
+file `console` uses and prints that path.
 
 `--open` is refused when the target's video channel is on another host. The
 command would re-exec there and open a browser on the bench machine, not on
