@@ -62,7 +62,9 @@ paniolo netif down-hard <target>
 paniolo netif status <target>
 ```
 
-`<target>` may be omitted when exactly one target is configured.
+`<target>` may be omitted when exactly one target is configured, and every verb
+also accepts it as `-t/--target` (`paniolo netif mode link -t pi5`) — the same
+spelling the config verbs use. Giving both at once is refused.
 
 Every mode is **idempotent and safe to re-run**. Because the host IPv6
 link-local is ephemeral (lost on a control-host reboot), re-running
