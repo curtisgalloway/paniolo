@@ -35,9 +35,24 @@ use crate::pixel::PixelData;
 /// pre-cut desktop. Age is the only thing that distinguishes "the screen has
 /// not changed" from "we have stopped being told what the screen is".
 ///
-/// Generous next to the 10 fps capture cap, so an occasional slow frame is not
+/// Generous next to the 30 fps capture cap, so an occasional slow frame is not
 /// reported as a fault, and far below the minutes-long staleness observed.
 pub const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How often a frame is meant to reach a viewer: the Linux capture loop's rate
+/// cap and the `/preview` stream's tick, which must be the same number.
+///
+/// They were separate constants until 2026-09-14 — a 100 ms capture cap against
+/// a 67 ms preview tick — and the preview was the slower of the two whenever
+/// capture got faster. Raising the capture cap to 30 fps therefore changed
+/// nothing a browser could see: the stream still ticked at 67 ms and delivered
+/// 14.9 fps, measured on lab-optiplex-1. Neither constant was wrong on its own,
+/// which is why the drift went unnoticed; sharing one is what stops it
+/// recurring.
+///
+/// Not a floor on freshness for pull callers — `/snapshot` and `/ocr` read the
+/// warm buffer directly and see every captured frame.
+pub const TARGET_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
 
 /// How many consecutive same-resolution, non-black frames we require before
 /// trusting the signal as `Stable`. A booting machine renegotiates HDMI at

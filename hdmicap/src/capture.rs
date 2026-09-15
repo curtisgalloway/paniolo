@@ -562,15 +562,37 @@ mod linux {
         }
     }
 
+    /// The bytes of the current frame within the arena buffer v4l2 hands back.
+    ///
+    /// `CaptureStream::next` returns the whole mmap'd arena buffer — allocated
+    /// once at the format's worst-case `sizeimage`, which for MJPG on the
+    /// MS2131 is the *uncompressed* 1920x1080x2 = 4,147,200 bytes — paired with
+    /// the `bytesused` the driver actually filled. Only that prefix is this
+    /// frame; the rest is whatever the buffer held before.
+    ///
+    /// Serving the untrimmed buffer is invisible to every consumer, because
+    /// every JPEG decoder stops at EOI: the browser preview, turbojpeg and the
+    /// OCR path all render correctly while the preview stream ships the padding
+    /// too. Measured on lab-optiplex-1 before this trim: a real 216,468-byte
+    /// frame inside a 4,147,200-byte multipart part, 94.8% zeros, 335 Mbit/s on
+    /// the wire to carry 17 Mbit/s of picture.
+    ///
+    /// `bytesused` is clamped: a driver that reports more than it allocated
+    /// must not panic the capture loop.
+    fn frame_bytes(buf: &[u8], bytesused: u32) -> &[u8] {
+        &buf[..(bytesused as usize).min(buf.len())]
+    }
+
     impl CaptureBackend for LinuxV4LBackend {
         fn frame(&mut self) -> Result<CapturedFrame> {
-            let (buf, _meta) = self.stream.next().map_err(|e| {
+            let (buf, meta) = self.stream.next().map_err(|e| {
                 if e.kind() == io::ErrorKind::TimedOut {
                     anyhow!("frame timeout (device stalled)")
                 } else {
                     anyhow!("VIDIOC_DQBUF: {e}")
                 }
             })?;
+            let buf = frame_bytes(buf, meta.bytesused);
 
             if self.is_mjpeg {
                 // Keep a copy of the raw JPEG bytes for zero-cost preview serving.
@@ -648,6 +670,52 @@ mod linux {
             ladder.note_allocated((1920, 1080, b"MJPG"));
             ladder.note_allocated((640, 480, b"YUYV"));
             assert_eq!(ladder.fallback(), Some((1920, 1080, b"MJPG")));
+        }
+
+        /// One MJPG arena buffer as v4l2 hands it back: a real JPEG in the
+        /// first `bytesused` bytes, the rest of the worst-case `sizeimage`
+        /// allocation untouched.
+        fn padded_mjpg_buffer() -> (Vec<u8>, u32) {
+            const SIZEIMAGE: usize = 1920 * 1080 * 2;
+            let mut jpeg = vec![0xFF, 0xD8]; // SOI
+            jpeg.extend(std::iter::repeat_n(0x5A, 216_464));
+            jpeg.extend_from_slice(&[0xFF, 0xD9]); // EOI
+            assert_eq!(jpeg.len(), 216_468, "the frame measured on lab-optiplex-1");
+
+            let used = jpeg.len() as u32;
+            let mut arena = jpeg;
+            arena.resize(SIZEIMAGE, 0);
+            (arena, used)
+        }
+
+        /// The bug this trim fixes: the preview served the whole arena buffer,
+        /// so every frame shipped ~3.9 MB of zeros after the EOI. JPEG decoders
+        /// stop at EOI, so nothing rendered wrong and only the byte count told.
+        #[test]
+        fn a_frame_is_the_bytesused_prefix_not_the_whole_arena_buffer() {
+            let (arena, used) = padded_mjpg_buffer();
+            let frame = frame_bytes(&arena, used);
+
+            assert_eq!(
+                frame.len(),
+                216_468,
+                "the frame is bytesused long, not sizeimage long"
+            );
+            assert_eq!(
+                &frame[frame.len() - 2..],
+                &[0xFF, 0xD9],
+                "the trimmed frame ends exactly at EOI"
+            );
+            assert_ne!(*frame.last().unwrap(), 0, "no padding survives the trim");
+        }
+
+        /// A driver that reports more than it allocated must not panic the
+        /// capture loop with a slice out of range.
+        #[test]
+        fn a_bytesused_past_the_end_of_the_buffer_is_clamped() {
+            let buf = [0xFF, 0xD8, 0xFF, 0xD9];
+            assert_eq!(frame_bytes(&buf, u32::MAX), &buf);
+            assert_eq!(frame_bytes(&buf, 0), &[] as &[u8]);
         }
     }
 }
