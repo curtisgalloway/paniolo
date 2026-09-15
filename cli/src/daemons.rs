@@ -121,30 +121,44 @@ pub fn helper_dirs() -> Vec<PathBuf> {
 /// transitional fallback). Never the in-repo build tree, so a running daemon
 /// can't point at an ephemeral build artifact.
 pub fn find_binary(name: &str) -> Option<PathBuf> {
-    let names = binary_names(name);
-    for dir in helper_dirs() {
-        for n in &names {
-            let p = dir.join(n);
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-    }
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            for n in &names {
-                let p = dir.join(n);
-                if p.is_file() {
-                    return Some(p);
-                }
-            }
-        }
-    }
-    let cargo_bin = dirs::home_dir()?.join(".cargo/bin");
-    names
-        .iter()
-        .map(|n| cargo_bin.join(n))
-        .find(|p| p.is_file())
+    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    let cargo_bin = dirs::home_dir().map(|h| h.join(".cargo/bin"));
+    let dirs = search_dirs(helper_dirs(), path_dirs, cargo_bin);
+    first_match(&dirs, &binary_names(name), |p| p.is_file())
+}
+
+/// The directories [`find_binary`] searches, in order: the paniolo helper dirs,
+/// then `$PATH`, then `~/.cargo/bin`.
+///
+/// Pure, so the **order** is testable without a host that happens to have a
+/// helper installed. The order is the whole point: a packaged helper in
+/// `/usr/libexec/paniolo/bin` must win over a stale one on the operator's
+/// `$PATH`, so a daemon always runs the binary paniolo installed. That
+/// guarantee had no test of its own until GitHub #206 removed the one that
+/// exercised it by accident.
+fn search_dirs(
+    helper: Vec<PathBuf>,
+    path: Vec<PathBuf>,
+    cargo_bin: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut dirs = helper;
+    dirs.extend(path);
+    dirs.extend(cargo_bin);
+    dirs
+}
+
+/// The first `<dir>/<name>` that `exists` accepts, scanning `dirs` in order and
+/// `names` within each. `exists` is a parameter so the search can be tested
+/// against a set of paths rather than against the filesystem.
+fn first_match(
+    dirs: &[PathBuf],
+    names: &[String],
+    exists: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    dirs.iter()
+        .find_map(|dir| names.iter().map(|n| dir.join(n)).find(|p| exists(p)))
 }
 
 /// PATH value with the libexec dir prepended, for `sh -c` hook commands
@@ -1343,6 +1357,62 @@ mod tests {
         }
         // An explicit .exe is never doubled up.
         assert_eq!(binary_names("hdmicap.exe"), vec!["hdmicap.exe"]);
+    }
+
+    /// A packaged helper must beat a stale one on the operator's `$PATH`.
+    ///
+    /// This is what makes "the daemon always runs the binary paniolo
+    /// installed" true, and it had no test of its own: the one test that
+    /// exercised the ordering did so by accident, and only on a host that
+    /// happened to have a packaged helper (GitHub #206). Reversing the two
+    /// loops in `find_binary` used to leave the whole suite green.
+    #[test]
+    fn helper_dirs_are_searched_before_path_and_cargo_bin() {
+        let libexec = PathBuf::from("/usr/libexec/paniolo/bin");
+        let on_path = PathBuf::from("/usr/local/bin");
+        let cargo_bin = PathBuf::from("/home/u/.cargo/bin");
+        let dirs = search_dirs(
+            vec![libexec.clone()],
+            vec![on_path.clone()],
+            Some(cargo_bin.clone()),
+        );
+        assert_eq!(
+            dirs,
+            vec![libexec.clone(), on_path.clone(), cargo_bin.clone()]
+        );
+
+        // With the same name in all three, the helper dir wins.
+        let names = vec!["hdmicap".to_string()];
+        assert_eq!(
+            first_match(&dirs, &names, |_| true),
+            Some(libexec.join("hdmicap")),
+            "a packaged helper must win over $PATH"
+        );
+        // With it missing from the helper dir, $PATH is next, then cargo bin.
+        assert_eq!(
+            first_match(&dirs, &names, |p| !p.starts_with(&libexec)),
+            Some(on_path.join("hdmicap")),
+        );
+        assert_eq!(
+            first_match(&dirs, &names, |p| p.starts_with(&cargo_bin)),
+            Some(cargo_bin.join("hdmicap")),
+        );
+        assert_eq!(first_match(&dirs, &names, |_| false), None);
+    }
+
+    /// Within one directory the Windows-suffixed name is tried first, so a
+    /// packaged `hdmicap.exe` is found before an extension-less sibling.
+    #[test]
+    fn first_match_tries_every_candidate_name_in_order() {
+        let dir = PathBuf::from("/opt/paniolo/libexec");
+        let names = binary_names("hdmicap");
+        let found = first_match(std::slice::from_ref(&dir), &names, |_| true).unwrap();
+        assert_eq!(found, dir.join(&names[0]));
+        if cfg!(windows) {
+            assert_eq!(found, dir.join("hdmicap.exe"));
+        } else {
+            assert_eq!(found, dir.join("hdmicap"));
+        }
     }
 
     /// The lookup is exercised through $PATH, which `find_binary` searches on
