@@ -51,6 +51,21 @@ jobs:
       - name: Check every action reference is a commit SHA
         run: bash scripts/ci-actions-pinned.sh
 
+  profile-pins:
+    # The release-train profile states facts derived from other files; its
+    # `## Sources` table pins each one's blob id so a release knows which prose
+    # to re-read. Nothing enforced that, and it drifted twice through green CI
+    # (#219). Deliberately a repo-local check, not the skill's profile_check.py:
+    # that lives in another repository and answers the broader "is this profile
+    # executable" question at release time, and CI must not depend on a
+    # personal skills repo.
+    name: profile pins (RELEASE-TRAIN.md sources are current)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check every pinned source still matches its blob id
+        run: bash scripts/ci-profile-pins.sh
+
   shellcheck:
     # Every tracked shell script, at shellcheck's default (info) severity. A
     # finding that is intended carries a `# shellcheck disable=` directive
