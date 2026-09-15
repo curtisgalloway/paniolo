@@ -184,8 +184,12 @@ enum Command {
         /// paniolo CLI + source already on the host).
         #[arg(long)]
         host: Option<String>,
-        /// Only build + install the Rust crates (skip the OCR, setuid, and
-        /// zigplug steps) — the fast path for iterating on the Rust code.
+        /// Do only the steps that need nothing beyond cargo: build and
+        /// install the Rust crates, copy the bundled agent skills, and drop
+        /// stale helper copies. Skips whatever needs sudo or a second
+        /// toolchain — the OCR helper and zigplug everywhere, the setuid
+        /// bpf-helper on macOS, the device-group check on Linux. The fast
+        /// path for iterating on the Rust code.
         #[arg(long)]
         rust_only: bool,
     },
