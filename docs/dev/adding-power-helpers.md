@@ -8,6 +8,12 @@ target's power on and off. Three shipped helpers serve as examples:
 [`zigplug/`](https://github.com/curtisgalloway/paniolo/tree/main/zigplug) (Python, Zigbee smart plugs via a CC2652 coordinator
 dongle).
 
+> Not a power switch? Hardware with its *own* verbs — a custom panel that
+> presses a board's buttons, a strap controller, a JTAG mux, anything private
+> or unreleased — is a [hardware plugin](../plugins.md), not a power helper:
+> same helper-off-PATH conventions, but the vocabulary is yours and nothing
+> about the device needs to reach this repo.
+
 **The design principle** (from [power.md](../power.md)): device-specific control
 logic never goes in the core crates. It lives in a standalone helper binary,
 and paniolo drives it through four generic shell-command hooks on the target's

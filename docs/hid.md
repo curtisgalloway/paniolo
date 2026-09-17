@@ -21,7 +21,9 @@ Two helpers ship in-tree, as peers:
 Anything else drops in the same way without touching paniolo: implement the
 command vocabulary, then point the channel at it. That vocabulary — `type`,
 `key`, `moveabs`, … — is the device-independent
-[HID serial protocol](dev/hid-serial-protocol.md).
+[HID serial protocol](dev/hid-serial-protocol.md). (Hardware that types
+nothing — a fixture that presses a board's *physical* buttons, say — is a
+[hardware plugin](plugins.md), with a vocabulary of its own.)
 
 Baud rates differ by device: the `ch9329` helper autodetects among 115200
 (Openterface), 57600 (Sipeed NanoKVM-USB) and 9600 (a factory CH9329), and

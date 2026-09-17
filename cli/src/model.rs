@@ -283,6 +283,27 @@ pub struct UsbChannel {
     pub host: Option<String>,
 }
 
+/// A hardware plugin: an opaque command that drives one piece of private or
+/// unreleased bench hardware — a custom control panel that presses a board's
+/// buttons, a strap/DIP-switch controller, a JTAG mux — that has no channel
+/// of its own in paniolo and never will (its protocol may not be public).
+///
+/// A target may carry several, each with a name (`[[plugin]]`, like
+/// `[[serial]]`). `paniolo plugin run` appends the caller's arguments to
+/// `cmd` and runs it on the plugin's host, exactly like `hid send`; `paniolo
+/// plugin describe` runs `<cmd> describe` so an agent can learn the plugin's
+/// verbs without paniolo knowing them. The device-specific tool lives outside
+/// paniolo — typically in the owner's private repo — like the power hooks.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct PluginChannel {
+    pub name: String,
+    pub cmd: String,
+    /// One-line summary shown by `plugin list` / `target show`, so an agent
+    /// can tell the plugins apart before running `describe` on any of them.
+    pub description: Option<String>,
+    pub host: Option<String>,
+}
+
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct AdbChannel {
     pub serial: Option<String>,
@@ -306,6 +327,8 @@ pub struct Target {
     pub hid: Option<HidChannel>,
     pub usb: Option<UsbChannel>,
     pub adb: Option<AdbChannel>,
+    #[serde(default)]
+    pub plugin: Vec<PluginChannel>,
 }
 
 impl Target {
@@ -333,6 +356,7 @@ pub enum ChannelKind {
     Hid,
     Usb,
     Adb,
+    Plugin,
 }
 
 impl ChannelKind {
@@ -345,7 +369,16 @@ impl ChannelKind {
             ChannelKind::Hid => "hid",
             ChannelKind::Usb => "usb",
             ChannelKind::Adb => "adb",
+            ChannelKind::Plugin => "plugin",
         }
+    }
+
+    /// Whether a target may carry several channels of this kind, told apart
+    /// by name (`[[serial]]`, `[[plugin]]`), as opposed to at most one whose
+    /// name is the kind itself. [`channel_host`] resolves a named kind by
+    /// that name.
+    pub fn is_named(self) -> bool {
+        matches!(self, ChannelKind::Serial | ChannelKind::Plugin)
     }
 }
 
@@ -353,7 +386,8 @@ impl ChannelKind {
 #[derive(Debug, Clone)]
 pub struct ResolvedChannel {
     pub kind: ChannelKind,
-    /// Serial interface name, or the kind name for singleton channels.
+    /// Serial interface / plugin name, or the kind name for singleton
+    /// channels.
     pub name: String,
     pub host: String,
     /// Remaining scalar config, in display order (host and name excluded).
@@ -497,6 +531,16 @@ impl Lab {
                 fields: f,
             });
         }
+        for p in &t.plugin {
+            let mut f = vec![("cmd", p.cmd.clone())];
+            push_opt(&mut f, "description", &p.description);
+            channels.push(ResolvedChannel {
+                kind: ChannelKind::Plugin,
+                name: p.name.clone(),
+                host: host_of(&p.host),
+                fields: f,
+            });
+        }
         Some(ResolvedTarget {
             name: name.to_string(),
             default_host,
@@ -529,34 +573,36 @@ fn push_opt(fields: &mut Vec<(&'static str, String)>, key: &'static str, v: &Opt
 
 /// Resolve the host a command should run on, given the channel it touches.
 ///
-/// Singleton kinds use that channel's host (else the target default). Serial
-/// with a name uses that interface's host — a name the target does not have
-/// is an error here, before anything is dispatched, rather than a silent
-/// fall-through to the default host (where `console -i typo` used to open a
-/// dashboard on the wrong interface); serial without a name uses the common
-/// host of all interfaces, erroring if they span hosts (the `serial watch`
-/// case, where the daemon owns every interface). A missing channel *kind*
-/// falls back to the target's default host so the body can report it.
+/// Singleton kinds use that channel's host (else the target default). A
+/// named kind (serial, plugin — [`ChannelKind::is_named`]) with a name uses
+/// that channel's host — a name the target does not have is an error here,
+/// before anything is dispatched, rather than a silent fall-through to the
+/// default host (where `console -i typo` used to open a dashboard on the
+/// wrong interface); without a name it uses the common host of all channels
+/// of that kind, erroring if they span hosts (the `serial watch` case, where
+/// the daemon owns every interface; for a plugin, the caller then asks for
+/// `--name`). A missing channel *kind* falls back to the target's default
+/// host so the body can report it.
 pub fn channel_host(
     rt: &ResolvedTarget,
     kind: ChannelKind,
-    serial_name: Option<&str>,
+    name: Option<&str>,
 ) -> Result<String, LabError> {
-    if kind == ChannelKind::Serial {
-        let serials: Vec<&ResolvedChannel> = rt
-            .channels
-            .iter()
-            .filter(|c| c.kind == ChannelKind::Serial)
-            .collect();
-        if let Some(n) = serial_name {
-            return serials
+    if kind.is_named() {
+        let (what, flag) = match kind {
+            ChannelKind::Serial => ("serial interface", "--interface"),
+            _ => ("plugin", "--name"),
+        };
+        let named: Vec<&ResolvedChannel> = rt.channels.iter().filter(|c| c.kind == kind).collect();
+        if let Some(n) = name {
+            return named
                 .iter()
                 .find(|c| c.name == n)
                 .map(|c| c.host.clone())
                 .ok_or_else(|| {
-                    let have: Vec<&str> = serials.iter().map(|c| c.name.as_str()).collect();
+                    let have: Vec<&str> = named.iter().map(|c| c.name.as_str()).collect();
                     LabError(format!(
-                        "target '{}' has no serial interface '{n}' (have: {})",
+                        "target '{}' has no {what} '{n}' (have: {})",
                         rt.name,
                         if have.is_empty() {
                             "none".to_string()
@@ -566,20 +612,20 @@ pub fn channel_host(
                     ))
                 });
         }
-        if serials.is_empty() {
+        if named.is_empty() {
             return Ok(rt.default_host.clone());
         }
-        let hosts: BTreeSet<&str> = serials.iter().map(|c| c.host.as_str()).collect();
+        let hosts: BTreeSet<&str> = named.iter().map(|c| c.host.as_str()).collect();
         if hosts.len() > 1 {
             let list: Vec<&str> = hosts.into_iter().collect();
             return lab_err(format!(
-                "target '{}' has serial interfaces on multiple hosts ({}); \
-                 specify one with --interface",
+                "target '{}' has {what}s on multiple hosts ({}); \
+                 specify one with {flag}",
                 rt.name,
                 list.join(", ")
             ));
         }
-        return Ok(serials[0].host.clone());
+        return Ok(named[0].host.clone());
     }
     for c in &rt.channels {
         if c.kind == kind {
@@ -690,6 +736,24 @@ pub fn validate(lab: &Lab) -> Result<(), LabError> {
         if let Some(usb) = &t.usb {
             let h = usb.host.as_deref().unwrap_or(default_host);
             check_host_ref(h, &declared, &format!("target '{name}' usb"))?;
+        }
+        let mut seen_plugins: BTreeSet<&str> = BTreeSet::new();
+        for p in &t.plugin {
+            if p.name.is_empty() || p.cmd.trim().is_empty() {
+                return lab_err(format!("target '{name}': each [[plugin]] needs name + cmd"));
+            }
+            if !seen_plugins.insert(p.name.as_str()) {
+                return lab_err(format!(
+                    "target '{name}': duplicate plugin name '{}'",
+                    p.name
+                ));
+            }
+            let h = p.host.as_deref().unwrap_or(default_host);
+            check_host_ref(
+                h,
+                &declared,
+                &format!("target '{name}' plugin '{}'", p.name),
+            )?;
         }
         let mut seen: BTreeSet<&str> = BTreeSet::new();
         for s in &t.serial {
@@ -1279,6 +1343,143 @@ mod tests {
         let lab = parse("[targets.bare]\n").unwrap();
         let rt = lab.resolved_target("bare").unwrap();
         assert_eq!(channel_host(&rt, ChannelKind::Serial, None).unwrap(), LOCAL);
+    }
+
+    fn plugin_lab() -> Lab {
+        parse(
+            r#"
+            [hosts.bench1]
+            ssh = "u@bench1"
+            [hosts.bench2]
+            ssh = "u@bench2"
+            [targets.board]
+            host = "bench1"
+            [[targets.board.plugin]]
+            name = "panel"
+            cmd = "panel-ctl -d /dev/ttyACM3"
+            description = "front-panel buttons"
+            [[targets.board.plugin]]
+            name = "straps"
+            cmd = "/opt/rig/straps.sh"
+            host = "bench2"
+            "#,
+        )
+        .unwrap()
+    }
+
+    /// Plugins resolve like serial interfaces: one channel per entry, named
+    /// by the entry, each on its own host, with cmd + description as fields.
+    #[test]
+    fn plugins_resolve_as_named_channels() {
+        let rt = plugin_lab().resolved_target("board").unwrap();
+        let ps: Vec<&ResolvedChannel> = rt
+            .channels
+            .iter()
+            .filter(|c| c.kind == ChannelKind::Plugin)
+            .collect();
+        assert_eq!(ps.len(), 2);
+        assert_eq!(ps[0].name, "panel");
+        assert_eq!(ps[0].host, "bench1");
+        assert_eq!(
+            ps[0].fields,
+            vec![
+                ("cmd", "panel-ctl -d /dev/ttyACM3".to_string()),
+                ("description", "front-panel buttons".to_string()),
+            ]
+        );
+        assert_eq!(ps[1].name, "straps");
+        assert_eq!(ps[1].host, "bench2");
+        assert_eq!(
+            ps[1].fields,
+            vec![("cmd", "/opt/rig/straps.sh".to_string())]
+        );
+        assert_eq!(rt.hosts(), vec!["bench1", "bench2"]);
+        assert!(ChannelKind::Plugin.is_named());
+        assert!(!ChannelKind::Usb.is_named());
+    }
+
+    /// `channel_host` treats a plugin name like a serial interface name: a
+    /// named plugin routes to its own host, an unknown name is refused
+    /// before dispatch, and no name with plugins on several hosts asks for
+    /// `--name` (not `--interface`).
+    #[test]
+    fn channel_host_routes_plugins_by_name() {
+        let rt = plugin_lab().resolved_target("board").unwrap();
+        assert_eq!(
+            channel_host(&rt, ChannelKind::Plugin, Some("panel")).unwrap(),
+            "bench1"
+        );
+        assert_eq!(
+            channel_host(&rt, ChannelKind::Plugin, Some("straps")).unwrap(),
+            "bench2"
+        );
+        let e = channel_host(&rt, ChannelKind::Plugin, Some("typo")).unwrap_err();
+        assert!(
+            e.0.contains("no plugin 'typo' (have: panel, straps)"),
+            "{}",
+            e.0
+        );
+        let e = channel_host(&rt, ChannelKind::Plugin, None).unwrap_err();
+        assert!(
+            e.0.contains("plugins on multiple hosts (bench1, bench2); specify one with --name"),
+            "{}",
+            e.0
+        );
+        // A target with no plugins routes to its default host so the body
+        // can report the missing channel; the serial wording is unchanged.
+        let lab = parse("[targets.bare]\n").unwrap();
+        let rt = lab.resolved_target("bare").unwrap();
+        assert_eq!(channel_host(&rt, ChannelKind::Plugin, None).unwrap(), LOCAL);
+        let e = channel_host(&rt, ChannelKind::Serial, Some("x")).unwrap_err();
+        assert!(e.0.contains("no serial interface 'x'"), "{}", e.0);
+    }
+
+    /// A plugin entry needs a name and a cmd, names are unique per target,
+    /// and its host must be declared — the same rules as `[[serial]]`.
+    /// `parse` validates, so each bad lab is refused on load.
+    #[test]
+    fn parse_checks_plugin_entries() {
+        let e = parse(
+            r#"
+            [targets.b]
+            [[targets.b.plugin]]
+            name = "panel"
+            cmd = "a"
+            [[targets.b.plugin]]
+            name = "panel"
+            cmd = "b"
+            "#,
+        )
+        .unwrap_err();
+        assert!(e.0.contains("duplicate plugin name 'panel'"), "{}", e.0);
+
+        let e = parse(
+            r#"
+            [targets.b]
+            [[targets.b.plugin]]
+            name = "panel"
+            cmd = "   "
+            "#,
+        )
+        .unwrap_err();
+        assert!(e.0.contains("needs name + cmd"), "{}", e.0);
+
+        let e = parse(
+            r#"
+            [targets.b]
+            [[targets.b.plugin]]
+            name = "panel"
+            cmd = "a"
+            host = "nowhere"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            e.0.contains("target 'b' plugin 'panel' references unknown host 'nowhere'"),
+            "{}",
+            e.0
+        );
+        validate(&plugin_lab()).unwrap();
     }
 
     #[test]

@@ -1,0 +1,38 @@
+# Copyright 2026 Curtis Galloway — Licensed under the Apache License, Version 2.0.
+id = "c9"
+title = "Wire up private bench hardware as a plugin"
+tier = "t1"
+core = false
+conditions = ["cold", "warm", "preloaded"]
+capabilities = ["plugin"]
+goal = """
+Our unreleased board `board1` sits on a custom front-panel fixture whose
+buttons a private tool drives: `panel-ctl -d /dev/ttyACM3` (installed on the
+control host; its verbs are its own business). Register it with paniolo as a
+plugin named `panel`, described as "front-panel buttons", so an agent can
+discover and press the buttons later — without touching the existing serial
+console.
+"""
+traps = [
+  "private hardware is a `plugin` channel (`plugin add`), not a power hook or a hid channel",
+  "the plugin has a name (`panel`) — it is `[[plugin]]`, a named collection like serial",
+  "must not run the plugin (`plugin run`/`describe`) — this is configuration only",
+  "must leave the `console` serial interface in place",
+]
+reference = [
+  'paniolo plugin add panel -t board1 --cmd "panel-ctl -d /dev/ttyACM3" --description "front-panel buttons"',
+]
+seed = "board_console.toml"
+
+[grader]
+type = "t1_config"
+allowlist_violation_fails = true
+[[grader.assert]]
+path = "targets.board1.plugin[name=panel].cmd"
+equals = "panel-ctl -d /dev/ttyACM3"
+[[grader.assert]]
+path = "targets.board1.plugin[name=panel].description"
+equals = "front-panel buttons"
+[[grader.assert]]
+path = "targets.board1.serial[name=console]"
+exists = true

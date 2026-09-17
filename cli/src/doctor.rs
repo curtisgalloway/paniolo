@@ -392,7 +392,7 @@ fn video_probe_script(device: &str) -> String {
     )
 }
 
-/// How a hook program (a power hook, or the hid `cmd`) is probed: an absolute
+/// How a hook program (a power hook, or a hid/usb/plugin `cmd`) is probed: an absolute
 /// path just has to exist; a bare name has to resolve the way the hook itself
 /// will resolve it — libexec dirs, then PATH.
 fn hook_probe(prog: &str) -> Probe {
@@ -500,7 +500,7 @@ fn check_channel(lab: &Lab, ch: &ResolvedChannel, rt: &ResolvedTarget) -> (Statu
                 (Status::Ok, configured.join(","))
             }
         }
-        ChannelKind::Hid | ChannelKind::Usb => match field(ch, "cmd") {
+        ChannelKind::Hid | ChannelKind::Usb | ChannelKind::Plugin => match field(ch, "cmd") {
             None => (Status::Incomplete, "no cmd set".to_string()),
             // Like the power hooks: absolute-path helpers are probed for
             // existence; bare names are probed under libexec-then-PATH; a

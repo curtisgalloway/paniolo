@@ -1,6 +1,6 @@
 ---
 name: paniolo
-description: Control a physical target machine (SBC, e.g. a Raspberry Pi) with the paniolo CLI during low-level bring-up — netboot it over a direct USB-Ethernet link, watch and OCR its HDMI screen, drive its serial console, power-cycle it, switch the link between netboot and ffx, and drive targets on remote control hosts transparently via a single git-tracked lab file over SSH. Use when you need to boot, observe, type into, screenshot, read the screen of, power, or remotely control a target/board through paniolo — including across multiple control hosts.
+description: Control a physical target machine (SBC, e.g. a Raspberry Pi) with the paniolo CLI during low-level bring-up — netboot it over a direct USB-Ethernet link, watch and OCR its HDMI screen, drive its serial console, power-cycle it, switch the link between netboot and ffx, drive private or unreleased bench hardware (a custom panel that presses a board's buttons, a strap controller) through self-describing hardware plugins, and drive targets on remote control hosts transparently via a single git-tracked lab file over SSH. Use when you need to boot, observe, type into, screenshot, read the screen of, power, press the buttons of, or remotely control a target/board through paniolo — including across multiple control hosts.
 ---
 
 # Paniolo — controlling a target machine
@@ -86,6 +86,7 @@ paniolo video set -t <name> --device "<capture id or name>" [--ocr-mode text|gui
 paniolo hid set -t <name> --cmd "hidrig -d <uart>"   # USB HID injection helper
 paniolo usb set -t <name> --cmd "ch9329 -d <uart>"   # switchable USB media (KVM-Go microSD)
 paniolo adb set -t <name> [--serial <adb-id>] [--adb <path>]  # an Android DUT over adb
+paniolo plugin add <plugin> -t <name> --cmd "<tool …>" [--description <text>]  # private/unreleased hardware (repeatable, by name)
 ```
 
 Every channel-config command also takes `[--host <labhost>]` to bind that
@@ -119,7 +120,7 @@ channel to a remote control host (see the lab section below).
   <name>`; `paniolo target set <name>` updates its `--host`/`--description`.
 - Remove: `paniolo target rm <name>`, or per channel (`netboot rm`,
   `serial rm <iface> -t <name>`, `power rm`, `video rm`, `hid rm`, `usb rm`,
-  `adb rm`).
+  `adb rm`, `plugin rm <plugin> -t <name>`).
 - Rename: `paniolo target rename <old> <new>` carries all channels (and your
   lab-file comments) to the new name. Config-only — running daemons keep the
   old name, so `stop` and re-`watch`/`serve` them under the new one.
@@ -327,8 +328,9 @@ paniolo serial reset [target] [-i name]        # soft reset via brief DTR pulse
 optional positional (omit it when the lab has one target); channel-config
 commands (`add`/`set`/`rm`) take `-t`. `serial send`/`serial log` accept
 `-t` too — `serial send` reads two positionals as `<target> <text>`, one as
-just the text. The `-t`-only runtime commands are `hid send`, `adb run`, and
-`adb input`, whose positional tails belong to the helper / to `adb`.
+just the text. The `-t`-only runtime commands are `hid send`, `adb run`,
+`adb input`, and `plugin run`, whose positional tails belong to the helper /
+to `adb` / to the plugin.
 
 The interface name is a required positional on `add`/`set`/`rm` (`console` is
 just the conventional name for the main one). With
@@ -611,6 +613,42 @@ and navigating a desktop/app/installer/BIOS you can only see over the capture
 and only touch through emulated HID — read the companion **`kvm-puppeting`**
 skill (the look-act-settle-verify discipline): `paniolo skill kvm-puppeting`.
 
+## Hardware plugins — private and unreleased hardware
+
+A target can carry **plugins**: named, out-of-tree commands for bench hardware
+paniolo has no channel for — a custom front-panel fixture that presses an
+unreleased board's buttons, a strap/DIP-switch controller, a JTAG mux.
+paniolo runs the command on the plugin's host with your arguments appended
+and knows nothing about the protocol; the plugin's verbs are its own, and it
+tells you them. The discovery loop:
+
+```
+paniolo plugin list [<name>]                       # what's configured: target, plugin, host, cmd, description — runs nothing
+paniolo plugin describe <name> -n <plugin>         # what can it do? runs `<cmd> describe`, prints the reply
+paniolo plugin run -t <name> -n <plugin> <verb…>   # act — e.g. `press reset`, `press boot --hold-ms 3000`, `set strap on`
+```
+
+- `target show <name>` lists each plugin as `plugin <plugin> @<host>
+  cmd=… description=…`; read the description to pick one, then `describe`
+  before the first `run` — the verbs vary per fixture and are not in this
+  skill. Common conventions (not guaranteed): `press <button> [--hold-ms N]`,
+  `hold`/`release <button>`, `set <switch> on|off`, `state`.
+- `-n` is optional when the target has exactly one plugin. With several,
+  paniolo refuses and names them — it never guesses.
+- Keep `-t`/`-n` **first** on `plugin run`: everything after them belongs to
+  the plugin, hyphens included (`-- --flag` if the first plugin argument
+  starts with a dash).
+- Exit code and output are the plugin's. A non-zero exit with a message on
+  stderr is the fixture refusing or failing, not paniolo breaking — read it.
+- A plugin **is not** the power channel: `power-cycle` / `power on|off` /
+  `power-state` stay the way to switch a target's power, even when the same
+  fixture could. Likewise typing/clicking is `hid`, and USB media is `usb`.
+- Nothing about the hardware is in this repo or these docs by design — if
+  `describe` fails, the lab-file description and the human are your only
+  sources. Ask; do not invent verbs.
+
+Guide + plugin contract (for writing one): `docs/plugins.md`.
+
 ## Companion skills
 
 Paniolo ships its own agent skills; list them and read any one from the CLI,
@@ -791,6 +829,9 @@ the device is free just because a daemon is gone from the tracked list.
 - AMT-backed power hooks need `AMT_PASSWORD` in the environment of the
   `paniolo power …` invocation (see the Intel AMT power example) — a clean
   "AMT_PASSWORD is not set" failure means inject the secret, not a bug.
+- Plugins (`paniolo plugin …`) have their own verbs: `plugin describe` first,
+  then `plugin run`. `plugin list`/`target show` only read config; a plugin
+  that lacks `describe` leaves you with its lab-file description and the human.
 
 ---
 

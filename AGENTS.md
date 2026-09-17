@@ -332,6 +332,7 @@ Current capabilities:
 - On-device OCR of the captured screen (`paniolo video read [target] [--stable]`, which wraps hdmicap's `GET /ocr`; also the dashboard OCR button): Apple Vision on macOS, Tesseract on Linux
 - USB HID input (keyboard/mouse injection) via a generic helper hook (`paniolo hid send`); the `hidrig` helper drives the dual-board KB2040 injector — it composes HID reports in Rust and writes binary frames to the control board's USB-CDC endpoint, which relays them over I2C1 to the target board (the "dumb pipe", docs/dev/hid-dual-board-design.md; command vocabulary in docs/dev/hid-serial-protocol.md). `hidrig serve` runs a daemon that owns the control link and re-exposes the command vocabulary over a WebSocket, so `paniolo console` works as a **KVM** — stream the browser's keyboard + absolute mouse (`moveabs`) to the target, intermixed with CLI injection on the one wire. The same control board can also **bridge the DUT serial console** (its hardware UART, re-exported by the daemon as a PTY into the `serial` channel) and **switch DUT power** via a relay (`hidrig power off|on|cycle`), so one USB device backs the target's HID, console, and power (design §6–§7; the relay/power path is hardware-verified, incl. NVM state persistence across a control-board reset — the console bridge is not yet)
 - Switchable USB media via a generic per-target `usb` channel (`paniolo usb attach-host|attach-target|state`): one physical USB device routed to the control host or the target, never both. Supported today on the **Openterface KVM-Go**, whose onboard microSD reader sits behind an FSUSB42 mux driven by the same CH32V208 (and the same serial port) as its `hid` channel — so the `ch9329` helper backs both, and the two channels normally carry the same `--cmd`. The point is hands-free *physical* boot media, which firmware can see and streamed virtual media generally cannot. Like the power hooks the helper is opaque, but the vocabulary is **fixed** rather than passed through: paniolo appends `usb host`, `usb target`, or `usb state`, keeping the surface a constrained remote host must expose to three verbs. Guide: docs/usb.md; clean-room protocol: notes/openterface-usb-mux-spec.md. The Mini-KVM's switchable USB-A port uses a different mechanism (a register write over the capture chip's HID config interface) that is documented but not yet implemented by any helper
+- Hardware plugins for private or unreleased bench hardware (`paniolo plugin`): a target carries any number of named `[[plugin]]` entries, each an opaque out-of-tree command (a custom front-panel fixture that presses a board's buttons, a strap/DIP controller, a JTAG mux) that `plugin run -t <target> -n <name> <args…>` runs on the plugin's host with the args appended shell-quoted, like `hid send` — but with the plugin's *own* vocabulary, which `plugin describe` asks it for (`<cmd> describe`, the one verb paniolo sends). `plugin list`/`target show` show name, host, cmd and a one-line description without running anything; `doctor` probes the program like a power hook. Besides the hook env (helper dirs on PATH, `PANIOLO_STATE_DIR`/`PANIOLO_RUNTIME_DIR` keyed `<program>/<target>`), a plugin gets `PANIOLO_TARGET` and `PANIOLO_PLUGIN`. Guide + contract: docs/plugins.md. The point is that the hardware, its protocol and its driver stay in the owner's private repo
 - Power control via DTR (J2 wiring; **opt-in per serial interface** via `power_button = true` — `serial dtr`/`reset` refuse interfaces that haven't declared it) or generic shell-command hooks (`on_cmd`, `off_cmd`, `cycle_cmd`, `state_cmd`): `paniolo serial dtr`, `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`. Note: "reboot over the serial console" means `serial send <t> "reboot"` (software), *not* the DTR `serial reset` (hardware). Helpers that wire into the hooks: `cambrionix` (Cambrionix hub port power via control UART), `zigplug` (Zigbee smart plugs via a CC2652 coordinator dongle), `shellyplug` (Shelly Gen2+ smart plugs/relays over the device's local HTTP RPC API — no cloud/HA/Matter), and `amt` (Intel AMT/vPro machines over WS-Management on port 16992 with HTTP Digest auth — per-target power with no plug hardware, plus true power-state readback from the ME; password only via `AMT_PASSWORD` env). The dual-board `hidrig` control board can also drive a DUT power relay (`hidrig power off|on|cycle`) as a power-helper backend, consolidating HID + console + power on one USB device
 
 ## Architecture
@@ -351,8 +352,8 @@ Python tree below:
 
 - **Config is one CLI-managed lab file** (`~/.config/paniolo/lab.toml`, or
   `--lab`/`PANIOLO_LAB`): hosts + targets, each target's hardware as *channels*
-  (`netboot`, `serial[]`, `power`, `video`, `hid`, `usb`, `adb`) with per-channel host
-  binding.
+  (`netboot`, `serial[]`, `power`, `video`, `hid`, `usb`, `adb`, `plugin[]`) with per-channel
+  host binding.
   Edited surgically via `toml_edit` (hand-comments survive); validated on load
   and before every save. The legacy `~/.config/paniolo/targets/*.toml` files are
   not used by the Rust CLI.
@@ -408,16 +409,19 @@ Python tree below:
   `TargetArg`; it does not spell out its own target field.
   Channel-config commands (`set`/`add`/`rm`) take `-t/--target` only, and
   refuse a positional: a command that creates or destroys configuration should
-  not act on an implicit target. `hid send`, `adb run`, `adb input`, and the
-  `usb` verbs also take `-t` only, because their positional tail is the
-  helper's / `adb`'s args; `serial send` likewise (it reads two positionals as
-  `<target> <text>`, one as just the text). `doctor` keeps a bare positional:
+  not act on an implicit target. `hid send`, `adb run`, `adb input`, `plugin
+  run`, and the `usb` verbs also take `-t` only, because their positional tail
+  is the helper's / `adb`'s / the plugin's args; `serial send` likewise (it
+  reads two positionals as `<target> <text>`, one as just the text). The named
+  collections (`serial`, `plugin`) select an entry with `-i` / `-n`, optional
+  when the target has exactly one; `model::channel_host` resolves both
+  through `ChannelKind::is_named`. `doctor` keeps a bare positional:
   omitting it checks **all** targets rather than a single implied one, so it is
   not the same argument. One config-command exception: `target rename OLD
   NEW` takes two bare positionals and no `-t` (it renames the target itself,
   carrying all channels and lab-file comments; config-only — running daemons
   keep their runtime dirs under the old name, so `stop` and re-`watch` them).
-- **Name rule**: target, host, and serial interface names are constrained to
+- **Name rule**: target, host, serial interface, and plugin names are constrained to
   `model::NAME_RULE` — letters, digits, `.`, `_`, `-`; never `.` or `..`;
   never leading `-` (it would read as an option where the name becomes a
   positional). Enforced by `model::validate_name` in the labfile editor at
@@ -1393,6 +1397,14 @@ a standalone helper binary wired in via the generic power hooks. Follow
 helper CLI conventions, Rust/Python skeletons, verification ladder, PR
 checklist); `cambrionix/`, `zigplug/`, and `shellyplug/` (the
 simplest one — a stateless HTTP one-shot) are the exemplars.
+
+**Private, unreleased, or one-off bench hardware is not a subsystem either**
+— it is a `plugin` (docs/plugins.md): an out-of-tree command registered on
+the target by name, run with the caller's arguments appended, self-describing
+via `<cmd> describe`. Nothing about it needs to land in this public repo, and
+that is the point. Reach for a real channel only when the hardware is
+general enough that paniolo's other parts (the dashboard, the skills, the
+evals) should know its verbs.
 
 For a genuine new subsystem (a channel with its own commands/daemon), in the
 Rust `cli/` crate:

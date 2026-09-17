@@ -139,6 +139,7 @@ SAFE: dict[str, set | None] = {
     "video": {"set", "rm", "devices", "show"},
     "hid": {"set", "rm"},
     "adb": {"set", "rm", "show", "devices"},
+    "plugin": {"add", "set", "rm", "list"},  # `describe`/`run` invoke the plugin (unsafe)
     "host": {"add", "set", "rm", "list", "show"},
     "daemons": {"list"},
     "helper": set(),  # bare `helper` lists (safe); `helper <name>` runs one (unsafe)

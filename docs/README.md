@@ -44,6 +44,7 @@ target it checks them all, so it is a filter rather than a subject.
 | [Switchable USB media](usb.md) | `paniolo usb` | Route a shared USB device — an Openterface KVM-Go's onboard microSD card — to the control host or the target, for hands-free physical boot media that firmware can see. |
 | [HID injection](hid.md) | `paniolo hid` | USB keyboard/mouse injection via a generic helper hook; `hidrig` KB2040 injector and `ch9329` CH9329 bridge (Openterface Mini-KVM / KVM-Go, Sipeed NanoKVM-USB); KVM input from the web console. |
 | [adb (Android targets)](adb.md) | `paniolo adb` | Drive an Android DUT over adb — console (`adb shell`/`run`), screen (`screencap`), and input (`adb input`); one transport, no capture/HID/serial rig. |
+| [Hardware plugins](plugins.md) | `paniolo plugin` | Drive private or unreleased bench hardware — a custom panel that presses a board's buttons, a strap controller, a JTAG mux — through an out-of-tree command you own: named per target, run on its host with your arguments appended, self-describing to agents via `plugin describe`. Nothing about the hardware reaches this repo. |
 
 ## Distributed control (Phases 0–5 shipped)
 

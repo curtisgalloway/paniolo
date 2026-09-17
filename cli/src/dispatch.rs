@@ -107,6 +107,11 @@ pub fn build_slice(lab: &Lab, target: &str, host: &str) -> Result<String, LabErr
             lf.set_usb(target, u.cmd.as_deref(), None)?;
         }
     }
+    for p in &t.plugin {
+        if on(&p.host) {
+            lf.add_plugin(target, &p.name, &p.cmd, p.description.as_deref(), None)?;
+        }
+    }
     Ok(lf.doc.to_string())
 }
 
@@ -425,6 +430,14 @@ mod tests {
             [targets.fortune.hid]
             cmd = "ch9329 -d /dev/ttyUSB1"
             host = "bench2"
+            [[targets.fortune.plugin]]
+            name = "panel"
+            cmd = "panel-ctl -d /dev/ttyACM3"
+            description = "front-panel buttons"
+            [[targets.fortune.plugin]]
+            name = "straps"
+            cmd = "/opt/rig/straps.sh"
+            host = "bench2"
             "#,
         )
         .unwrap()
@@ -447,6 +460,16 @@ mod tests {
         assert!(t.host.is_none());
         assert!(t.serial[0].host.is_none());
         assert!(usb.host.is_none());
+        // Of the two plugins only `panel` (inherited default host) ships,
+        // with its description intact and its host stripped.
+        assert_eq!(t.plugin.len(), 1);
+        assert_eq!(t.plugin[0].name, "panel");
+        assert_eq!(t.plugin[0].cmd, "panel-ctl -d /dev/ttyACM3");
+        assert_eq!(
+            t.plugin[0].description.as_deref(),
+            Some("front-panel buttons")
+        );
+        assert!(t.plugin[0].host.is_none());
     }
 
     #[test]
@@ -459,6 +482,9 @@ mod tests {
         assert!(t.usb.is_none());
         assert!(t.netboot.is_none());
         assert!(t.serial.is_empty());
+        assert_eq!(t.plugin.len(), 1);
+        assert_eq!(t.plugin[0].name, "straps");
+        assert!(t.plugin[0].host.is_none());
     }
 
     /// `video.ocr_mode` used to be dropped by `build_slice` (it called

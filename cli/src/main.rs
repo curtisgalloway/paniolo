@@ -138,6 +138,16 @@ enum Command {
         #[command(subcommand)]
         cmd: AdbCmd,
     },
+    /// Drive private or unreleased bench hardware through a plugin.
+    ///
+    /// A plugin is an out-of-tree command — a custom panel that presses a
+    /// board's buttons, a strap controller, a JTAG mux — that paniolo runs on
+    /// the plugin's host with the caller's arguments appended. Its vocabulary
+    /// is its own: `plugin describe` asks it. Guide: docs/plugins.md.
+    Plugin {
+        #[command(subcommand)]
+        cmd: PluginCmd,
+    },
     /// Open the combined video+serial dashboard, starting daemons if needed.
     Console {
         #[command(flatten)]
@@ -732,6 +742,79 @@ enum UsbCmd {
 }
 
 #[derive(Subcommand)]
+enum PluginCmd {
+    /// Add a named hardware plugin to a target (a target may have several).
+    Add {
+        /// Plugin name, e.g. panel, straps — `plugin run -n <name>` selects it.
+        name: String,
+        #[arg(long, short)]
+        target: String,
+        /// The plugin's command, e.g. "panel-ctl -d /dev/ttyACM3" or an
+        /// absolute path. `plugin run` appends its arguments to this and runs
+        /// it via `sh -c` on the plugin's host, helper dirs on PATH.
+        #[arg(long)]
+        cmd: String,
+        /// One-line summary shown by `plugin list` / `target show`.
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Update an existing plugin (only the options you pass change).
+    Set {
+        name: String,
+        #[arg(long, short)]
+        target: String,
+        #[arg(long)]
+        cmd: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Remove a named plugin from a target.
+    Rm {
+        name: String,
+        #[arg(long, short)]
+        target: String,
+    },
+    /// List configured plugins: target, name, host, command, description.
+    ///
+    /// Reads the lab only and runs nothing. Omit the target to list every
+    /// target's plugins.
+    List {
+        #[command(flatten)]
+        target: TargetArg,
+    },
+    /// Ask a plugin what it can do (runs `<cmd> describe` on its host).
+    ///
+    /// Prints the plugin's reply: its own verbs and their arguments, in
+    /// whatever form the plugin's author chose.
+    Describe {
+        #[command(flatten)]
+        target: TargetArg,
+        /// Plugin name (default: the target's only one).
+        #[arg(long, short)]
+        name: Option<String>,
+    },
+    /// Run a plugin with the given arguments appended to its command.
+    ///
+    /// E.g. `paniolo plugin run -t board1 -n panel press reset`. Keep -t/-n
+    /// first: everything after them belongs to the plugin, hyphens included.
+    Run {
+        /// Target to act on (optional when the lab has exactly one).
+        #[arg(long, short)]
+        target: Option<String>,
+        /// Plugin name (default: the target's only one).
+        #[arg(long, short)]
+        name: Option<String>,
+        /// Arguments appended to the plugin's cmd (its own CLI).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        args: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum AdbCmd {
     /// Configure the target's adb channel (one per target).
     Set {
@@ -917,6 +1000,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Hid { cmd } => hid_cmd(lab_flag, cmd),
         Command::Usb { cmd } => usb_cmd(lab_flag, cmd),
         Command::Adb { cmd } => adb_cmd(lab_flag, cmd),
+        Command::Plugin { cmd } => plugin_cmd(lab_flag, cmd),
         Command::Console { target, interface } => {
             cmd_console(lab_flag, target.name(), interface.as_deref())
         }
@@ -4139,6 +4223,216 @@ fn cmd_hid_send(lab_flag: Option<&str>, target: Option<&str>, args: &[String]) -
     Ok(())
 }
 
+// ── plugin (config + runtime) ───────────────────────────────────────────────
+
+fn plugin_cmd(lab_flag: Option<&str>, cmd: PluginCmd) -> Result<()> {
+    match cmd {
+        PluginCmd::Add {
+            name,
+            target,
+            cmd,
+            description,
+            host,
+        } => {
+            edit_lab(lab_flag, |lf| {
+                lf.add_plugin(
+                    &target,
+                    &name,
+                    &cmd,
+                    description.as_deref(),
+                    host.as_deref(),
+                )
+            })?;
+            println!("Plugin '{name}' added to '{target}': {cmd}");
+            Ok(())
+        }
+        PluginCmd::Set {
+            name,
+            target,
+            cmd,
+            description,
+            host,
+        } => {
+            edit_lab(lab_flag, |lf| {
+                lf.update_plugin(
+                    &target,
+                    &name,
+                    cmd.as_deref(),
+                    description.as_deref(),
+                    host.as_deref(),
+                )
+            })?;
+            println!("Plugin '{name}' updated on '{target}'.");
+            Ok(())
+        }
+        PluginCmd::Rm { name, target } => {
+            edit_lab(lab_flag, |lf| lf.remove_plugin(&target, &name))?;
+            println!("Plugin '{name}' removed from '{target}'.");
+            Ok(())
+        }
+        PluginCmd::List { target } => cmd_plugin_list(lab_flag, target.name()),
+        PluginCmd::Describe { target, name } => cmd_plugin_run(
+            lab_flag,
+            target.name(),
+            name.as_deref(),
+            &[PLUGIN_DESCRIBE_VERB.to_string()],
+        ),
+        PluginCmd::Run { target, name, args } => {
+            cmd_plugin_run(lab_flag, target.as_deref(), name.as_deref(), &args)
+        }
+    }
+}
+
+/// The one verb paniolo itself sends a plugin: `<cmd> describe`, which the
+/// plugin answers with its own vocabulary (docs/plugins.md). Everything else
+/// is the caller's, passed through untouched.
+const PLUGIN_DESCRIBE_VERB: &str = "describe";
+
+fn cmd_plugin_list(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    let names: Vec<String> = match target {
+        Some(n) => {
+            if !lab.targets.contains_key(n) {
+                bail!("target '{n}' not found in lab");
+            }
+            vec![n.to_string()]
+        }
+        None => lab.targets.keys().cloned().collect(),
+    };
+    let mut any = false;
+    for tname in &names {
+        let Some(rt) = lab.resolved_target(tname) else {
+            continue;
+        };
+        for ch in rt
+            .channels
+            .iter()
+            .filter(|c| c.kind == model::ChannelKind::Plugin)
+        {
+            any = true;
+            let field = |k: &str| {
+                ch.fields
+                    .iter()
+                    .find(|(key, _)| *key == k)
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or("")
+            };
+            println!(
+                "{tname}\t{}\t{}\t{}\t{}",
+                ch.name,
+                ch.host,
+                field("cmd"),
+                field("description")
+            );
+        }
+    }
+    if !any {
+        match target {
+            Some(n) => println!(
+                "No plugins configured for '{n}'. (paniolo plugin add <name> -t {n} --cmd ...)"
+            ),
+            None => {
+                println!("No plugins configured. (paniolo plugin add <name> -t <target> --cmd ...)")
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Pick the plugin a runtime verb means: the named one, or the target's only
+/// one when no name was given. Several without a name is an error naming
+/// them, so an agent's next command is obvious.
+fn select_plugin<'a>(
+    target: &str,
+    plugins: &'a [model::PluginChannel],
+    name: Option<&str>,
+) -> Result<&'a model::PluginChannel> {
+    if plugins.is_empty() {
+        bail!("target '{target}' has no plugins (paniolo plugin add <name> -t {target} --cmd ...)");
+    }
+    let have = || {
+        plugins
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match name {
+        Some(n) => plugins
+            .iter()
+            .find(|p| p.name == n)
+            .ok_or_else(|| anyhow!("target '{target}' has no plugin '{n}' (have: {})", have())),
+        None if plugins.len() == 1 => Ok(&plugins[0]),
+        None => bail!(
+            "target '{target}' has several plugins ({}); specify one with --name",
+            have()
+        ),
+    }
+}
+
+/// The shell line a plugin invocation runs: the configured cmd with each
+/// argument appended shell-quoted, so what the plugin's argv receives is
+/// exactly what the caller typed — a `hold-ms=3 000`-style argument arrives
+/// as one argument, not two, and `$`/`;` in an argument are data, not shell.
+fn plugin_shell_line(cmd: &str, args: &[String]) -> String {
+    let quoted: Vec<String> = args.iter().map(|a| ssh::shell_quote(a)).collect();
+    if quoted.is_empty() {
+        cmd.to_string()
+    } else {
+        format!("{cmd} {}", quoted.join(" "))
+    }
+}
+
+/// Run one of `target`'s plugins with `args` appended to its cmd, on the
+/// plugin's host, propagating the exit code. Paniolo is agnostic to the
+/// plugin's CLI — the cmd owns it (docs/plugins.md), exactly like `hid send`.
+///
+/// Beyond the hook environment every helper gets (helper dirs on PATH,
+/// `PANIOLO_STATE_DIR`/`PANIOLO_RUNTIME_DIR` — here keyed `<program>/<target>`
+/// like the hid daemon's, so one plugin binary serving several targets keeps
+/// their state apart), a plugin is told which target and which plugin entry
+/// it is acting for (`PANIOLO_TARGET`, `PANIOLO_PLUGIN`): a private script
+/// that serves a whole bench can key its own config on those rather than on
+/// device paths repeated in every cmd string.
+fn cmd_plugin_run(
+    lab_flag: Option<&str>,
+    target: Option<&str>,
+    name: Option<&str>,
+    args: &[String],
+) -> Result<()> {
+    let lab = load_for_read(lab_flag)?;
+    let target = resolve_single_target(&lab, target)?;
+    if let Some(code) = dispatch::maybe_dispatch(
+        &lab,
+        &target,
+        model::ChannelKind::Plugin,
+        name,
+        dispatch::Mode::Reexec,
+    )? {
+        std::process::exit(code);
+    }
+    let t = lab
+        .targets
+        .get(&target)
+        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+    let dh = t.default_host().to_string();
+    let p = select_plugin(&target, &t.plugin, name)?;
+    if !channel_is_local(&lab, p.host.as_deref(), &dh) {
+        bail!("plugin '{}' for '{target}' is not on this host", p.name);
+    }
+    let helper = daemons::hook_helper_name(&p.cmd).unwrap_or_else(|| p.name.clone());
+    let status = platform::shell_command(&plugin_shell_line(&p.cmd, args))
+        .env("PATH", daemons::hook_path())
+        .envs(daemons::helper_env(&helper, Some(&target)))
+        .env("PANIOLO_TARGET", &target)
+        .env("PANIOLO_PLUGIN", &p.name)
+        .status()?;
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
 // ── adb runtime bodies ──────────────────────────────────────────────────────
 
 /// The target's adb channel as visible on *this* host.
@@ -4610,6 +4904,66 @@ mod tests {
         assert_eq!(
             dashboard_url(&old, &DashboardLinks::default()),
             "http://127.0.0.1:1000"
+        );
+    }
+
+    fn plugin(name: &str, cmd: &str) -> model::PluginChannel {
+        model::PluginChannel {
+            name: name.into(),
+            cmd: cmd.into(),
+            description: None,
+            host: None,
+        }
+    }
+
+    /// No name is fine only when there is exactly one plugin to mean; with
+    /// several, the error names them and the flag that picks one, so an
+    /// agent can correct itself without a second lookup.
+    #[test]
+    fn select_plugin_defaults_to_the_only_one_and_names_the_rest() {
+        let one = vec![plugin("panel", "panel-ctl")];
+        assert_eq!(select_plugin("b", &one, None).unwrap().name, "panel");
+        assert_eq!(
+            select_plugin("b", &one, Some("panel")).unwrap().name,
+            "panel"
+        );
+        let e = select_plugin("b", &one, Some("straps")).unwrap_err();
+        assert!(
+            e.to_string().contains("no plugin 'straps' (have: panel)"),
+            "{e}"
+        );
+
+        let two = vec![plugin("panel", "panel-ctl"), plugin("straps", "straps.sh")];
+        let e = select_plugin("b", &two, None).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("several plugins (panel, straps); specify one with --name"),
+            "{e}"
+        );
+        assert_eq!(
+            select_plugin("b", &two, Some("straps")).unwrap().name,
+            "straps"
+        );
+
+        let e = select_plugin("b", &[], None).unwrap_err();
+        assert!(e.to_string().contains("has no plugins"), "{e}");
+    }
+
+    /// Arguments are appended shell-quoted: a plugin's argv gets what the
+    /// caller typed, one argument each, with shell metacharacters as data.
+    #[test]
+    fn plugin_shell_line_quotes_each_argument() {
+        assert_eq!(
+            plugin_shell_line("panel-ctl -d /dev/ttyACM3", &[]),
+            "panel-ctl -d /dev/ttyACM3"
+        );
+        let args: Vec<String> = ["press", "reset", "--hold-ms", "3 000", "$x;rm"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            plugin_shell_line("panel-ctl -d /dev/ttyACM3", &args),
+            "panel-ctl -d /dev/ttyACM3 press reset --hold-ms '3 000' '$x;rm'"
         );
     }
 

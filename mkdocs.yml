@@ -78,6 +78,7 @@ nav:
       - HID injection: hid.md
       - Switchable USB media: usb.md
       - adb (Android targets): adb.md
+      - Hardware plugins: plugins.md
   - Distributed control: distributed-control.md
   - Standing up a control host: control-host.md
   - Developer docs:

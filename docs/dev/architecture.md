@@ -83,7 +83,7 @@ link (§7) is the only cross-subsystem coupling today.
 **All configuration lives in one CLI-managed lab file** — `~/.config/paniolo/lab.toml`, or
 `--lab` / `PANIOLO_LAB` to point elsewhere (e.g. a git-tracked file). It names the **hosts** and
 the **targets**, each target's hardware described as *channels* (`netboot`, `serial`, `power`,
-`video`, `hid`, `adb`) bound to the host they're physically attached to. No daemon is needed to read
+`video`, `hid`, `usb`, `adb`, `plugin`) bound to the host they're physically attached to. No daemon is needed to read
 it; if exactly one target is configured it is the default and may be omitted from every command.
 The schema (`cli/src/model.rs`):
 
@@ -124,6 +124,11 @@ cmd = "hidrig -d /dev/…"         # opaque helper prefix; `paniolo hid send` ap
 
 [targets.target-machine.adb]     # an Android DUT reached over adb
 serial = "33271JEGR02033"        # `adb -s <serial>`; omit for the sole device
+
+[[targets.target-machine.plugin]] # repeatable — private/unreleased bench hardware, by name
+name = "panel"
+cmd = "panel-ctl -d /dev/…"      # opaque out-of-tree command; `paniolo plugin run -n panel`
+description = "front-panel buttons"  #   appends args; `plugin describe` runs `<cmd> describe`
 ```
 
 Every channel also takes an optional `host = "<name>"` to bind it to a remote control host
@@ -293,6 +298,18 @@ console (`paniolo adb shell` interactive, `adb run` one-shot), screen (`adb scre
 transport like SSH — not a device-specific helper — so it lives in the core CLI (`cli/src/adb.rs`)
 and shells out to the host's `adb` binary, routed per-channel by the same dispatch as every other
 channel. Reboot/power needs no new code: wire `adb reboot` through the generic power hooks.
+
+### Hardware plugins ([`plugins.md`](../plugins.md))
+Bench hardware paniolo has no channel for — a custom front-panel fixture that presses an
+unreleased board's buttons, a strap controller, a JTAG mux — is driven through a per-target,
+named `[[plugin]]` entry: an opaque out-of-tree command that `paniolo plugin run -n <name>` runs
+on the plugin's host with the caller's arguments appended shell-quoted (the `hid send` mechanism,
+routed by name the way `serial` interfaces are). Unlike the fixed power/usb verbs and the HID
+protocol, the vocabulary is the plugin's own: `paniolo plugin describe` runs `<cmd> describe` and
+relays the reply, so an agent learns the verbs from the hardware's owner, not from paniolo. The
+plugin gets the hook environment (helper dirs on PATH, `PANIOLO_STATE_DIR`/`PANIOLO_RUNTIME_DIR`
+keyed `<program>/<target>`) plus `PANIOLO_TARGET`/`PANIOLO_PLUGIN`; `doctor` probes its program
+like a power hook. The driver, the protocol and the hardware stay in the owner's private repo.
 
 ### Dashboard ([`dashboard.md`](../dashboard.md))
 `paniolo console` opens hdmicap's `GET /` — a two-pane web UI (live video on top, xterm.js

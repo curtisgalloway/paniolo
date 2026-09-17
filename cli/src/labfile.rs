@@ -349,6 +349,92 @@ impl LabFile {
         Ok(())
     }
 
+    // ── plugin channels (collection) ─────────────────────────────────────────
+
+    /// Add a named hardware plugin to a target (`[[plugin]]`, like
+    /// `[[serial]]`). The name is validated like an interface name: it is a
+    /// positional on the re-exec'd command line and a path component of the
+    /// plugin's state dir.
+    pub fn add_plugin(
+        &mut self,
+        target: &str,
+        name: &str,
+        cmd: &str,
+        description: Option<&str>,
+        host: Option<&str>,
+    ) -> Result<(), LabError> {
+        model::validate_name("plugin", name)?;
+        if cmd.trim().is_empty() {
+            return lab_err(format!("target '{target}': plugin '{name}' needs a cmd"));
+        }
+        let t = self.target_mut(target)?;
+        if !t.contains_key("plugin") {
+            t.insert("plugin", Item::ArrayOfTables(ArrayOfTables::new()));
+        }
+        let aot = t
+            .get_mut("plugin")
+            .and_then(|i| i.as_array_of_tables_mut())
+            .ok_or_else(|| LabError(format!("target '{target}': plugin is not [[plugin]]")))?;
+        if aot
+            .iter()
+            .any(|p| p.get("name").and_then(|v| v.as_str()) == Some(name))
+        {
+            return lab_err(format!("target '{target}': plugin '{name}' already exists"));
+        }
+        let mut p = Table::new();
+        p.insert("name", value(name));
+        p.insert("cmd", value(cmd));
+        set_opt(&mut p, "description", description);
+        set_opt(&mut p, "host", host);
+        aot.push(p);
+        Ok(())
+    }
+
+    /// Update an existing plugin; only the options passed change.
+    pub fn update_plugin(
+        &mut self,
+        target: &str,
+        name: &str,
+        cmd: Option<&str>,
+        description: Option<&str>,
+        host: Option<&str>,
+    ) -> Result<(), LabError> {
+        model::validate_name("plugin", name)?;
+        if cmd.is_some_and(|c| c.trim().is_empty()) {
+            return lab_err(format!("target '{target}': plugin '{name}' needs a cmd"));
+        }
+        let t = self.target_mut(target)?;
+        let aot = t
+            .get_mut("plugin")
+            .and_then(|i| i.as_array_of_tables_mut())
+            .ok_or_else(|| LabError(format!("target '{target}': no plugin '{name}'")))?;
+        let p = aot
+            .iter_mut()
+            .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(name))
+            .ok_or_else(|| LabError(format!("target '{target}': no plugin '{name}'")))?;
+        set_opt(p, "cmd", cmd);
+        set_opt(p, "description", description);
+        set_opt(p, "host", host);
+        Ok(())
+    }
+
+    pub fn remove_plugin(&mut self, target: &str, name: &str) -> Result<(), LabError> {
+        let t = self.target_mut(target)?;
+        let aot = t
+            .get_mut("plugin")
+            .and_then(|i| i.as_array_of_tables_mut())
+            .ok_or_else(|| LabError(format!("target '{target}': no plugin '{name}'")))?;
+        let idx = aot
+            .iter()
+            .position(|p| p.get("name").and_then(|v| v.as_str()) == Some(name))
+            .ok_or_else(|| LabError(format!("target '{target}': no plugin '{name}'")))?;
+        aot.remove(idx);
+        if aot.is_empty() {
+            t.remove("plugin");
+        }
+        Ok(())
+    }
+
     // ── singleton channels (netboot / power / video) ─────────────────────────
 
     fn set_singleton(
@@ -789,6 +875,89 @@ mod tests {
         lf.save().unwrap();
         let lab = model::load(&path).unwrap();
         assert!(lab.targets["t"].hid.is_none());
+    }
+
+    #[test]
+    fn plugins_round_trip_update_and_remove() {
+        let (_d, path) = tmp();
+        let mut lf = LabFile::create(&path);
+        lf.add_host("bench1", "u@b1", None, None, None, None, None)
+            .unwrap();
+        lf.add_target("board", None, None).unwrap();
+        lf.add_plugin(
+            "board",
+            "panel",
+            "panel-ctl -d /dev/ttyACM3",
+            Some("front-panel buttons"),
+            None,
+        )
+        .unwrap();
+        lf.add_plugin(
+            "board",
+            "straps",
+            "/opt/rig/straps.sh",
+            None,
+            Some("bench1"),
+        )
+        .unwrap();
+        // Same name twice is refused, like a duplicate serial interface.
+        let e = lf
+            .add_plugin("board", "panel", "other", None, None)
+            .unwrap_err();
+        assert!(e.to_string().contains("already exists"), "{e}");
+        lf.save().unwrap();
+        let lab = model::load(&path).unwrap();
+        let ps = &lab.targets["board"].plugin;
+        assert_eq!(ps.len(), 2);
+        assert_eq!(ps[0].name, "panel");
+        assert_eq!(ps[0].cmd, "panel-ctl -d /dev/ttyACM3");
+        assert_eq!(ps[0].description.as_deref(), Some("front-panel buttons"));
+        assert_eq!(ps[1].host.as_deref(), Some("bench1"));
+
+        // `set` changes only what it is given.
+        lf.update_plugin(
+            "board",
+            "panel",
+            Some("panel-ctl -d /dev/ttyACM4"),
+            None,
+            None,
+        )
+        .unwrap();
+        lf.save().unwrap();
+        let lab = model::load(&path).unwrap();
+        let p = &lab.targets["board"].plugin[0];
+        assert_eq!(p.cmd, "panel-ctl -d /dev/ttyACM4");
+        assert_eq!(p.description.as_deref(), Some("front-panel buttons"));
+        let e = lf
+            .update_plugin("board", "nope", Some("x"), None, None)
+            .unwrap_err();
+        assert!(e.to_string().contains("no plugin 'nope'"), "{e}");
+
+        lf.remove_plugin("board", "panel").unwrap();
+        lf.remove_plugin("board", "straps").unwrap();
+        lf.save().unwrap();
+        let lab = model::load(&path).unwrap();
+        assert!(lab.targets["board"].plugin.is_empty());
+        // The empty array is dropped, not left as `plugin = []`.
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("plugin"));
+    }
+
+    /// A plugin name is a positional on the re-exec'd command line and a
+    /// path component of its state dir, so it obeys the same rule as a
+    /// serial interface name; an empty cmd would run `sh -c ''` and "succeed".
+    #[test]
+    fn add_plugin_validates_name_and_cmd() {
+        let (_d, path) = tmp();
+        let mut lf = LabFile::create(&path);
+        lf.add_target("board", None, None).unwrap();
+        let e = lf
+            .add_plugin("board", "-panel", "x", None, None)
+            .unwrap_err();
+        assert!(e.to_string().contains("invalid plugin name"), "{e}");
+        let e = lf
+            .add_plugin("board", "panel", "  ", None, None)
+            .unwrap_err();
+        assert!(e.to_string().contains("needs a cmd"), "{e}");
     }
 
     #[test]
