@@ -4530,8 +4530,15 @@ mod tests {
     #[test]
     fn console_falls_back_to_a_private_file_not_the_terminal() {
         let dir = tempfile::tempdir().unwrap();
-        // Safe: mutated and restored within this test.
+        // PANIOLO_RUNTIME_BASE is process-global, not test-local: restoring it
+        // before this test returns does nothing for the daemons tests running
+        // in parallel threads, which read it between planting a discovery file
+        // and listing it. Hold the crate-wide lock they hold.
+        let _guard = crate::daemons::RUNTIME_BASE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let prev = std::env::var_os("PANIOLO_RUNTIME_BASE");
+        // Safe: serialized by the lock above; restored below.
         unsafe { std::env::set_var("PANIOLO_RUNTIME_BASE", dir.path()) };
 
         let video = endpoint(1000, Some("s3cr3t"));

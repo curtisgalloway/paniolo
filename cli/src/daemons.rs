@@ -1021,6 +1021,19 @@ pub fn remove_discovery_for_pid(name: &str, instance: Option<&str>, pid: i32) ->
     }
 }
 
+/// `PANIOLO_RUNTIME_BASE` is process-global and `cargo test` runs the unit
+/// tests as threads of one process, so every test that points it somewhere
+/// holds this — **including the ones in other modules**.
+///
+/// It lives out here, `pub(crate)`, rather than inside `mod tests` because
+/// that is the difference between the two. `main.rs`'s console-fallback test
+/// (#196) set the variable with a comment calling it "safe: mutated and
+/// restored within this test", could not reach a lock it could not name, and
+/// swapped the base out from under `daemons::tests` about once in a dozen
+/// suite runs.
+#[cfg(test)]
+pub(crate) static RUNTIME_BASE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1567,10 +1580,6 @@ mod tests {
             }
         }
     }
-
-    /// `PANIOLO_RUNTIME_BASE` is process-global and the test threads run
-    /// concurrently, so every test that points it somewhere holds this.
-    static RUNTIME_BASE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Run `f` with `PANIOLO_RUNTIME_BASE` pointed at a fresh scratch root
     /// (so `runtime_base()` is `<root>/paniolo-<uid>`), restoring the
