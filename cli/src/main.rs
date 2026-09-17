@@ -4620,6 +4620,59 @@ mod tests {
         );
     }
 
+    /// `video preview --open` must be refused when the target's video channel
+    /// is on another host, and allowed when it is here (#196).
+    ///
+    /// A remote channel re-execs the whole argv on the control host, `--open`
+    /// included, so without this gate the browser opens on the bench machine —
+    /// silently, while the caller is told it opened. That is the shape of
+    /// failure nobody reports: nothing errors, a window just never appears.
+    ///
+    /// Parsing the flag was pinned; acting on it was not, and the refusal is
+    /// one `if` away from being deleted with the suite still green. This drives
+    /// `refuse_remote_open` itself, through a real lab file on disk, so the
+    /// host resolution it does is executed rather than described.
+    #[test]
+    fn video_preview_open_is_refused_when_the_channel_is_on_another_host() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let remote = dir.path().join("remote.toml");
+        std::fs::write(
+            &remote,
+            "[hosts.bench]\n\
+             ssh = \"u@bench\"\n\
+             [targets.dut]\n\
+             host = \"bench\"\n\
+             [targets.dut.video]\n\
+             device = \"/dev/video0\"\n",
+        )
+        .unwrap();
+        let err = refuse_remote_open(remote.to_str(), Some("dut"))
+            .expect_err("a video channel on 'bench' must refuse --open")
+            .to_string();
+        assert!(err.contains("bench"), "{err}");
+        // The refusal has to name a way through, or it is just a wall: both
+        // `console` (which forwards the ports) and plain `preview`.
+        assert!(err.contains("paniolo console dut"), "{err}");
+        assert!(err.contains("paniolo video preview dut"), "{err}");
+
+        // The same target with its video channel here is not refused — the
+        // gate must not cost a local operator the flag.
+        let local = dir.path().join("local.toml");
+        std::fs::write(
+            &local,
+            "[hosts.here]\n\
+             ssh = \"local\"\n\
+             [targets.dut]\n\
+             host = \"here\"\n\
+             [targets.dut.video]\n\
+             device = \"/dev/video0\"\n",
+        )
+        .unwrap();
+        refuse_remote_open(local.to_str(), Some("dut"))
+            .expect("a local video channel must still accept --open");
+    }
+
     /// The dashboard URL carries the video daemon's token for the page itself
     /// and each other daemon's complete WebSocket URL — that daemon's token
     /// inside, encoded as one value — so the page can authenticate to all
