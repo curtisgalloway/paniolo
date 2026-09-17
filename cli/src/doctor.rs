@@ -284,19 +284,27 @@ fn probe_netboot_ip_drift(
         &[],
     )
     .ok()?;
-    match out.status {
+    drift_from_probe(out.status, &out.stdout)
+}
+
+/// [`probe_netboot_ip_drift`]'s verdict from what the remote probe returned.
+///
+/// Pure, so every arm is testable without a second machine: the remote half of
+/// this check had no test of its own, and each arm is a claim about hardware
+/// state that a reader will act on.
+///
+/// 255 is ssh's own failure and 3 is the script's "neither `ip` nor `ifconfig`
+/// told me anything". Both mean the question was not answered, which must not
+/// be rendered as a hardware-state claim. Nor must a non-zero exit with
+/// nothing on stdout — that is a probe that died (a signal, a non-POSIX login
+/// shell), not a link that moved, and reporting `MISMATCH` there would be a
+/// confident claim about an address never read.
+fn drift_from_probe(status: i32, stdout: &str) -> Option<Option<String>> {
+    match status {
         0 => Some(None),
-        // 255 is ssh's own failure; 3 is the script's "neither `ip` nor
-        // `ifconfig` told me anything". Both mean the question was not
-        // answered, which must not be rendered as a hardware-state claim.
         255 | 3 => None,
         _ => {
-            // Drift is asserted only when the script actually named the
-            // address. An exit with nothing on stdout is a probe that failed
-            // (a signal, a non-POSIX login shell), not a link that moved —
-            // reporting `MISMATCH` there would be a confident claim about
-            // something never read.
-            let addr = out.stdout.lines().next().unwrap_or("").trim();
+            let addr = stdout.lines().next().unwrap_or("").trim();
             if addr.is_empty() {
                 None
             } else {
@@ -777,6 +785,54 @@ mod tests {
             Some(1),
             "{lo} does not hold 192.0.2.10, so this is drift"
         );
+    }
+
+    /// The remote half of the drift check: what the probe's exit status and
+    /// stdout are allowed to claim (#202).
+    ///
+    /// Only the local branch was pinned, and every arm here is a statement
+    /// about hardware the reader will act on. Two of them are refusals to
+    /// speak, which is the part that rots quietly: collapsing "I could not
+    /// ask" into "the link is fine" leaves a drifted netboot link reported as
+    /// healthy, and collapsing it into MISMATCH invents an address nobody read.
+    ///
+    /// `None` is "unknown", `Some(None)` is "the link holds its host_ip",
+    /// `Some(Some(addr))` is "it holds `addr` instead".
+    #[test]
+    fn the_remote_probe_claims_drift_only_when_it_read_an_address() {
+        // Exit 0: the script found host_ip among the interface's addresses,
+        // or the interface holds none at all. Either way, not drift.
+        assert_eq!(drift_from_probe(0, ""), Some(None));
+
+        // 255 is ssh's own failure and 3 is "neither `ip` nor `ifconfig` told
+        // me anything". The question was not answered.
+        assert_eq!(drift_from_probe(255, ""), None, "ssh failed; nothing known");
+        assert_eq!(
+            drift_from_probe(3, ""),
+            None,
+            "no tool answered; nothing known"
+        );
+
+        // Exit 1 with the address the script printed: the one case that is
+        // drift, reported with the address, since the status alone would only
+        // say "some other address".
+        assert_eq!(
+            drift_from_probe(1, "10.66.28.9\n"),
+            Some(Some("10.66.28.9".to_string()))
+        );
+        assert_eq!(
+            drift_from_probe(1, "  10.66.28.9  \nnoise\n"),
+            Some(Some("10.66.28.9".to_string())),
+            "the first line, trimmed, is the address"
+        );
+
+        // A non-zero exit with nothing on stdout is a probe that died — a
+        // signal, a non-POSIX login shell — not a link that moved. Claiming
+        // MISMATCH here would be a confident report about an address that was
+        // never read.
+        assert_eq!(drift_from_probe(1, ""), None);
+        assert_eq!(drift_from_probe(1, "\n  \n"), None);
+        assert_eq!(drift_from_probe(137, ""), None, "SIGKILL is not drift");
     }
 
     /// MISMATCH counts as a problem, so `paniolo doctor` exits non-zero and a
