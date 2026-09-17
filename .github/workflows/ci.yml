@@ -65,6 +65,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check every pinned source still matches its blob id
         run: bash scripts/ci-profile-pins.sh
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - name: Test the checker itself
+        # The step above only proves this tree's pins are current; it passes
+        # just as well against a checker that has stopped checking. These run
+        # the script as a subprocess against synthetic profiles, so each of
+        # its three verdicts -- current, stale, unreadable table -- has a test
+        # that fails when it is reverted.
+        run: uv run --with pytest pytest -q scripts/tests
 
   shellcheck:
     # Every tracked shell script, at shellcheck's default (info) severity. A
