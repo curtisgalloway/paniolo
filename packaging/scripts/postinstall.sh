@@ -21,8 +21,26 @@ set -e
 # a routine upgrade would be surprising). After an upgrade, any daemon still
 # running keeps executing the OLD binary until restarted. The CLI detects this
 # (`paniolo daemons` flags such daemons "stale") and heals it on demand.
-echo "paniolo: upgrade complete. Any capture daemons already running still use the"
-echo "         previous binary — restart them with: paniolo daemons restart --stale"
-echo "         (netbootd: restart via 'paniolo netboot start' when convenient)."
+#
+# dpkg runs this as `postinst configure <previously-configured-version>`, and
+# that second argument is empty on a fresh install (Debian Policy 6.5). It is
+# the one thing that tells a first-time installer from an upgrader, and the
+# two need different advice: the upgrader has daemons to restart, the
+# first-timer has nothing running yet and wants to know where to start (#228).
+# nfpm ships this script only in the .deb, so the rpm-style numeric argument
+# convention does not apply.
+case "$1" in
+  configure)
+    if [ -n "${2:-}" ]; then
+      echo "paniolo: upgrade from $2 complete. Any capture daemons already running still use the"
+      echo "         previous binary — restart them with: paniolo daemons restart --stale"
+      echo "         (netbootd: restart via 'paniolo netboot start' when convenient)."
+    else
+      echo "paniolo: installed. Run 'paniolo setup' once (group membership for serial and USB"
+      echo "         devices, the optional zigplug helper), then 'paniolo --help' to start;"
+      echo "         'paniolo skill' prints the bundled agent instructions."
+    fi
+    ;;
+esac
 
 exit 0

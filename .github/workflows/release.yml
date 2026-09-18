@@ -183,7 +183,15 @@ jobs:
       # real and check the layout + helper discovery end to end.
       - name: Smoke-test the .deb
         run: |
-          apt-get install -y ./dist/paniolo_*.deb
+          # This container has never seen paniolo, so this is the fresh-install
+          # path: dpkg runs postinst as `configure` with no old version, and
+          # the package must not describe that as an upgrade (#228).
+          apt-get install -y ./dist/paniolo_*.deb 2>&1 | tee "$RUNNER_TEMP/install.log"
+          grep -q 'paniolo: installed' "$RUNNER_TEMP/install.log"
+          if grep -q 'paniolo: upgrade' "$RUNNER_TEMP/install.log"; then
+            echo "::error::postinst called a fresh install an upgrade"
+            exit 1
+          fi
           test -x /usr/bin/paniolo
           # Run each helper, not just stat it: --help returns 0 only once the
           # binary has loaded, so a missing shared library (libudev, a
@@ -205,6 +213,12 @@ jobs:
           # Run outside the checkout so `skill` resolves the packaged copy
           # under /usr/share rather than the repo's skills/ dir.
           ( cd /tmp && /usr/bin/paniolo skill )
+          # Installing over an installed paniolo is the upgrade path: dpkg
+          # runs postinst as `configure <old version>`, and the message must
+          # say so, naming the version it replaced (#228). A reinstall of the
+          # same version takes exactly that path.
+          apt-get install -y --reinstall ./dist/paniolo_*.deb 2>&1 | tee "$RUNNER_TEMP/reinstall.log"
+          grep -q "paniolo: upgrade from $(dpkg-query -W -f='${Version}' paniolo) complete" "$RUNNER_TEMP/reinstall.log"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
