@@ -769,7 +769,9 @@ the device is free just because a daemon is gone from the tracked list.
   (e.g. a Homebrew keg from the tap can shadow it). The helper binaries are
   *not* on PATH — they live in `~/.local/libexec/paniolo/bin`
   (`paniolo helper <name> …` to run one by hand).
-- `paniolo console` auto-starts both daemons if they aren't running and hands
+- `paniolo console` auto-starts the video daemon, and the serial daemon when
+  the target has a serial channel (a KVM-only target opens as video + input,
+  with no terminal pane), if they aren't running, and hands
   the browser a URL carrying every daemon's token (`?token=`,
   `?serialws=…token=…`, `?hidws=…`); the daemons answer nothing without it.
   What `console` *prints* is the token-free address, because that line lands in

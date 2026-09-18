@@ -304,7 +304,10 @@
     // way the URL must be loopback, or the terminal is refused.
     // ?interface=NAME locks to a single interface (single-pane mode).
     // Without ?interface, all daemon interfaces get their own pane side-by-side.
-    const serialPort = params.get('serial') || '8724';
+    // ?serial=none is what `paniolo console` passes for a target with no
+    // serial channel (video + hid only): a KVM-only page, no terminal (#223).
+    const serialAbsent = params.get('serial') === 'none';
+    const serialPort = (!serialAbsent && params.get('serial')) || '8724';
     const baseWsUrl = params.get('serialws') ||
                       ('ws://' + location.hostname + ':' + serialPort + '/stream');
     const serialWs = loopbackWs(baseWsUrl); // null: refused, no connection is made
@@ -393,7 +396,10 @@
       setTimeout(fitAll, 50);
     }
 
-    if (!serialWs) {
+    if (serialAbsent) {
+      sst.textContent = 'no serial channel';
+      document.getElementById('sidebar').style.display = 'none';
+    } else if (!serialWs) {
       sst.textContent = 'refusing serial URL (not loopback): ' + baseWsUrl;
       sst.style.color = '#f44';
     } else if (singleInterface) {

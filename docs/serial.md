@@ -273,8 +273,10 @@ with the raw bytes as the request body (see HTTP API below).
 
 `paniolo console` opens the combined hdmicap dashboard in a browser, starting
 both daemons if they aren't already running. That page embeds an xterm.js
-terminal that connects cross-port to serialcap's WebSocket (`/stream`). The
-daemons can also be started individually:
+terminal that connects cross-port to serialcap's WebSocket (`/stream`). A
+target with no serial channel still opens: the page is video (and KVM input,
+if the target has a hid channel) with no terminal pane. The daemons can also
+be started individually:
 
 ```bash
 paniolo video watch [target-machine]    # hdmicap — serves the page

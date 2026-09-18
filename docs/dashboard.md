@@ -85,6 +85,7 @@ action — merely loading the dashboard never powers the target.
 | `?token=<token>` | hdmicap's own token; the page puts it on every request it makes back to hdmicap |
 | `?serialws=<url>` | Connect the terminal to this serialcap WebSocket URL, which carries serialcap's `?token=` inside (what `paniolo console` passes; percent-encoded) |
 | `?serial=<port>` | Connect the terminal to serialcap on this local port — no token, so only a daemon started without one accepts it |
+| `?serial=none` | No terminal pane at all: the target has no serial channel (what `paniolo console` passes for a KVM-only target — video, and input if it has a hid channel) |
 | `?interface=<name>` | Preselect a named serial interface |
 | `?hidws=<url>` | Enable KVM input via this hid WebSocket URL, hid's `?token=` inside (what `paniolo console` passes) |
 | `?hid=<port>` | Enable KVM input via the hid daemon on this local port (no token, as for `?serial=`) |

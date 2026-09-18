@@ -2418,6 +2418,10 @@ struct DashboardLinks<'a> {
     serial_ws: Option<&'a str>,
     interface: Option<&'a str>,
     hid_ws: Option<&'a str>,
+    /// The target has no serial channel at all (a KVM-only console, #223):
+    /// tells the page to drop its terminal pane instead of trying the
+    /// hand-opened default port and reporting a failed connection.
+    video_only: bool,
 }
 
 /// The dashboard URL: the video daemon's `GET /`, its token as `?token=` (the
@@ -2435,6 +2439,9 @@ fn dashboard_url(video: &daemons::Endpoint, links: &DashboardLinks) -> String {
     }
     if let Some(ws) = links.hid_ws {
         params.push(format!("hidws={}", daemons::query_escape(ws)));
+    }
+    if links.video_only {
+        params.push("serial=none".to_string());
     }
     let base = video.base_url();
     if params.is_empty() {
@@ -2544,9 +2551,38 @@ fn open_in_browser(url: &str) -> bool {
         .is_ok()
 }
 
-/// The combined dashboard is a composite command: it needs the serial and video
-/// channels co-located on one host. Locally it ensures both daemons; remotely
-/// it starts them over SSH and holds tunnels to both.
+/// Where `console` runs, and whether it has a serial leg. A target with no
+/// serial channel is still a console (#223): the dashboard shows the screen
+/// and, with a hid channel, takes input; only the terminal pane is absent.
+/// With serial, both channels must share a host, because the page is served
+/// by the video daemon and reaches serialcap over loopback.
+fn console_host(rt: &model::ResolvedTarget, interface: Option<&str>) -> Result<(String, bool)> {
+    let has_serial = rt
+        .channels
+        .iter()
+        .any(|c| c.kind == model::ChannelKind::Serial);
+    let video_host = model::channel_host(rt, model::ChannelKind::Video, None)?;
+    if !has_serial {
+        if interface.is_some() {
+            // Names an interface the target cannot have; channel_host words it.
+            model::channel_host(rt, model::ChannelKind::Serial, interface)?;
+        }
+        return Ok((video_host, false));
+    }
+    let serial_host = model::channel_host(rt, model::ChannelKind::Serial, interface)?;
+    if serial_host != video_host {
+        bail!(
+            "console needs the serial and video channels on one host; \
+             serial is on '{serial_host}', video on '{video_host}'"
+        );
+    }
+    Ok((serial_host, true))
+}
+
+/// The combined dashboard is a composite command: it needs the video channel
+/// and, when the target has one, the serial channel co-located on one host.
+/// Locally it ensures the daemons; remotely it starts them over SSH and holds
+/// tunnels to them.
 fn cmd_console(
     lab_flag: Option<&str>,
     target: Option<&str>,
@@ -2557,17 +2593,10 @@ fn cmd_console(
     let rt = lab
         .resolved_target(&target)
         .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
-    let serial_host = model::channel_host(&rt, model::ChannelKind::Serial, interface)?;
-    let video_host = model::channel_host(&rt, model::ChannelKind::Video, None)?;
-    if serial_host != video_host {
-        bail!(
-            "console needs the serial and video channels on one host; \
-             serial is on '{serial_host}', video on '{video_host}'"
-        );
-    }
-    let host = lab.host(&serial_host);
-    if !host.is_local(&serial_host) {
-        return remote_console(&lab, &target, &serial_host, interface);
+    let (host_name, has_serial) = console_host(&rt, interface)?;
+    let host = lab.host(&host_name);
+    if !host.is_local(&host_name) {
+        return remote_console(&lab, &target, &host_name, interface, has_serial);
     }
 
     // Local: ensure both daemons (OS-assigned ports; discovery finds them).
@@ -2592,7 +2621,7 @@ fn cmd_console(
             )
         })?;
     }
-    if serial::daemon(&target).is_none() {
+    if has_serial && serial::daemon(&target).is_none() {
         let serials = local_serials(&lab, &target)?;
         if serials.is_empty() {
             bail!("no serial interfaces configured for '{target}' (paniolo serial add ...)");
@@ -2625,7 +2654,11 @@ fn cmd_console(
     // inside (?serialws= / ?hidws=), and the page's own token as ?token=.
     let video = video::daemon(&target)
         .ok_or_else(|| anyhow!("video daemon for '{target}' is not running"))?;
-    let serial_ws = serial::daemon(&target).map(|d| d.ws_url("/stream"));
+    let serial_ws = if has_serial {
+        serial::daemon(&target).map(|d| d.ws_url("/stream"))
+    } else {
+        None
+    };
     let hid_ws = hid.map(|d| d.ws_url("/hid"));
     let url = dashboard_url(
         &video,
@@ -2633,6 +2666,7 @@ fn cmd_console(
             serial_ws: serial_ws.as_deref(),
             interface,
             hid_ws: hid_ws.as_deref(),
+            video_only: !has_serial,
         },
     );
     if open_in_browser(&url) {
@@ -2643,10 +2677,20 @@ fn cmd_console(
     Ok(())
 }
 
-fn remote_console(lab: &Lab, target: &str, host_name: &str, interface: Option<&str>) -> Result<()> {
+fn remote_console(
+    lab: &Lab,
+    target: &str,
+    host_name: &str,
+    interface: Option<&str>,
+    has_serial: bool,
+) -> Result<()> {
     let host = lab.host(host_name);
     eprintln!("Starting daemons on {host_name}…");
-    for sub in [["video", "watch"], ["serial", "watch"]] {
+    let mut subs = vec![["video", "watch"]];
+    if has_serial {
+        subs.push(["serial", "watch"]);
+    }
+    for sub in subs {
         let out = dispatch::run_subcommand(lab, target, host_name, &[sub[0], sub[1], target])?;
         if out.status != 0 {
             let msg = if out.stderr.trim().is_empty() {
@@ -2664,21 +2708,30 @@ fn remote_console(lab: &Lab, target: &str, host_name: &str, interface: Option<&s
     let video =
         dispatch::remote_daemon_endpoint(&host, &daemons::runtime_rel("hdmicap", Some(target)))
             .ok_or_else(|| anyhow!("could not read the hdmicap daemon port on {host_name}"))?;
-    let serial =
-        dispatch::remote_daemon_endpoint(&host, &daemons::runtime_rel("serialcap", Some(target)))
-            .ok_or_else(|| anyhow!("could not read the serialcap daemon port on {host_name}"))?;
-
     let fwd_video = ssh::forward(&host, video.port)?;
-    let fwd_serial = ssh::forward(&host, serial.port)?;
     // Through the tunnels the daemons answer on local ports; their tokens
     // travel unchanged.
     let video = daemons::Endpoint {
         port: fwd_video.local_port,
         ..video
     };
-    let serial = daemons::Endpoint {
-        port: fwd_serial.local_port,
-        ..serial
+    // The tunnel must live as long as the page does; the binding keeps it.
+    let mut _fwd_serial = None;
+    let serial_ws: Option<String> = if has_serial {
+        let serial = dispatch::remote_daemon_endpoint(
+            &host,
+            &daemons::runtime_rel("serialcap", Some(target)),
+        )
+        .ok_or_else(|| anyhow!("could not read the serialcap daemon port on {host_name}"))?;
+        let fwd = ssh::forward(&host, serial.port)?;
+        let serial = daemons::Endpoint {
+            port: fwd.local_port,
+            ..serial
+        };
+        _fwd_serial = Some(fwd);
+        Some(serial.ws_url("/stream"))
+    } else {
+        None
     };
 
     // Optional KVM leg: start the hid daemon on the host if its channel lives
@@ -2720,13 +2773,13 @@ fn remote_console(lab: &Lab, target: &str, host_name: &str, interface: Option<&s
         None
     };
 
-    let serial_ws = serial.ws_url("/stream");
     let url = dashboard_url(
         &video,
         &DashboardLinks {
-            serial_ws: Some(&serial_ws),
+            serial_ws: serial_ws.as_deref(),
             interface,
             hid_ws: hid_ws.as_deref(),
+            video_only: !has_serial,
         },
     );
     if open_in_browser(&url) {
@@ -4440,6 +4493,7 @@ mod tests {
                 serial_ws: None,
                 interface: None,
                 hid_ws: None,
+                video_only: false,
             },
         );
         assert_eq!(url, "http://127.0.0.1:1000/?token=s3cr3t");
@@ -4457,6 +4511,7 @@ mod tests {
                 serial_ws: None,
                 interface: None,
                 hid_ws: None,
+                video_only: false,
             },
         );
         assert_eq!(url, "http://127.0.0.1:1000", "nothing to withhold");
@@ -4486,6 +4541,7 @@ mod tests {
                 serial_ws: Some("ws://127.0.0.1:2000/stream?token=ser"),
                 interface: None,
                 hid_ws: None,
+                video_only: false,
             },
         );
         let msg = console_fallback("dut", &url);
@@ -4567,6 +4623,74 @@ mod tests {
     /// The dashboard URL carries the video daemon's token for the page itself
     /// and each other daemon's complete WebSocket URL — that daemon's token
     /// inside, encoded as one value — so the page can authenticate to all
+    /// A target with only a KVM (video + hid) is a console: it runs on the
+    /// video channel's host, and the page is told there is no serial (#223).
+    #[test]
+    fn console_host_accepts_a_target_without_serial() {
+        let lab = model::parse(
+            "[hosts.bench]\nssh = \"u@bench\"\n\
+             [targets.t]\n\
+             [targets.t.video]\nhost = \"bench\"\ndevice = \"/dev/video0\"\n",
+        )
+        .unwrap();
+        let rt = lab.resolved_target("t").unwrap();
+        assert_eq!(
+            console_host(&rt, None).unwrap(),
+            ("bench".to_string(), false)
+        );
+        // Asking for an interface it cannot have is still an error, in
+        // channel_host's words.
+        let e = console_host(&rt, Some("console")).unwrap_err().to_string();
+        assert!(
+            e.contains("no serial interface 'console' (have: none)"),
+            "{e}"
+        );
+        let video = daemons::Endpoint {
+            pid: 1,
+            port: 1000,
+            token: Some("vt".into()),
+        };
+        let url = dashboard_url(
+            &video,
+            &DashboardLinks {
+                serial_ws: None,
+                interface: None,
+                hid_ws: None,
+                video_only: true,
+            },
+        );
+        assert_eq!(url, "http://127.0.0.1:1000/?token=vt&serial=none");
+    }
+
+    /// With a serial channel the rule is unchanged: serial and video must
+    /// share a host, and the console runs there with its serial leg.
+    #[test]
+    fn console_host_still_requires_serial_and_video_on_one_host() {
+        let split = model::parse(
+            "[hosts.bench]\nssh = \"u@bench\"\n\
+             [targets.t]\n\
+             [[targets.t.serial]]\nname = \"console\"\ndevice = \"/dev/ttyUSB0\"\n\
+             [targets.t.video]\nhost = \"bench\"\ndevice = \"/dev/video0\"\n",
+        )
+        .unwrap();
+        let rt = split.resolved_target("t").unwrap();
+        let e = console_host(&rt, None).unwrap_err().to_string();
+        assert!(e.contains("on one host"), "{e}");
+
+        let together = model::parse(
+            "[hosts.bench]\nssh = \"u@bench\"\n\
+             [targets.t]\nhost = \"bench\"\n\
+             [[targets.t.serial]]\nname = \"console\"\ndevice = \"/dev/ttyUSB0\"\n\
+             [targets.t.video]\ndevice = \"/dev/video0\"\n",
+        )
+        .unwrap();
+        let rt = together.resolved_target("t").unwrap();
+        assert_eq!(
+            console_host(&rt, None).unwrap(),
+            ("bench".to_string(), true)
+        );
+    }
+
     /// three without any of them sharing a secret.
     #[test]
     fn dashboard_url_carries_every_daemons_token() {
@@ -4593,6 +4717,7 @@ mod tests {
                 serial_ws: Some(&serial_ws),
                 interface: Some("console"),
                 hid_ws: Some(&hid_ws),
+                video_only: false,
             },
         );
         assert_eq!(
