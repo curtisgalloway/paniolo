@@ -1433,8 +1433,8 @@ Paniolo runs on three host platforms:
 
 | Platform | Status | CI | Release artifacts |
 | --- | --- | --- | --- |
-| macOS (Apple Silicon) | Supported | `macos` job in `ci.yml` | Homebrew tap (arm64 bottle) |
-| Linux (Debian/Ubuntu) | Supported | the `ubuntu-latest` jobs in `ci.yml` | `.deb` + tarball from `release.yml` |
+| macOS (Apple Silicon) | Supported | `macos` job in `ci.yml` | Homebrew tap (universal tarball, poured as an `all` bottle) |
+| Linux (Debian/Ubuntu) | Supported | the `ubuntu-latest` jobs in `ci.yml` | `.deb`, tarball and Homebrew bottle from `release.yml` |
 | Windows (x86_64-msvc) | Supported; power and video hardware-verified | `windows` job in `ci.yml` | portable zip + winget |
 
 All ten crates build, lint clean under `clippy -D warnings`, and pass their

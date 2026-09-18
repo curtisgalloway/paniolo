@@ -51,10 +51,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # bottle_tag is the Homebrew bottle tag this arch pours as; see
+          # "Build Homebrew bottle" below.
           - arch: amd64
             runner: ubuntu-latest
+            bottle_tag: x86_64_linux
           - arch: arm64
             runner: ubuntu-24.04-arm
+            bottle_tag: arm64_linux
     steps:
       # Same package list `make check-deps` enforces, plus the toolchain
       # bootstrap bits the container lacks. git must precede checkout so the
@@ -166,6 +170,40 @@ jobs:
           tar -C dist -czf "dist/$tardir.tar.gz" "$tardir"
           rm -r "dist/$tardir"
 
+      # The same binaries once more, as a Homebrew bottle: keg layout
+      # (bin/, libexec/bin/, share/paniolo/skills/) under paniolo/<version>/,
+      # named the way Homebrew fetches a bottle from a plain https root_url
+      # (<name>-<version>.<tag>.bottle.tar.gz). The tap's formula pins this
+      # arch's exact tag, so `brew install` on Linux pours it rather than
+      # copying the flat tarball above. Bottles exist because a pour skips
+      # Homebrew's build-from-source preflight, which refuses outright on a
+      # macOS newer than its Xcode table (#225); Linux gets them too because
+      # the macOS bottle is tagged `all`, and without exact Linux tags a
+      # Linux `brew install` would pour the Mach-O one. Layout mirrors the
+      # tap formula's install block for the flat tarball.
+      - name: Build Homebrew bottle
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          BOTTLE_TAG: ${{ matrix.bottle_tag }}
+        run: |
+          set -euo pipefail
+          keg="$RUNNER_TEMP/bottle/paniolo/${VERSION}"
+          mkdir -p "$keg/bin" "$keg/libexec/bin" "$keg/share/paniolo"
+          cp packaging/stage/bin/paniolo "$keg/bin/"
+          cp packaging/stage/libexec/* "$keg/libexec/bin/"
+          cp -r skills "$keg/share/paniolo/skills"
+          cp LICENSE "$keg/"
+          tar -C "$RUNNER_TEMP/bottle" -czf "dist/paniolo-${VERSION}.${BOTTLE_TAG}.bottle.tar.gz" paniolo
+          rm -r "$RUNNER_TEMP/bottle"
+          # What a pour will put in the Cellar: the CLI and every helper
+          # where the CLI's exe-relative lookup expects them.
+          tar -tzf "dist/paniolo-${VERSION}.${BOTTLE_TAG}.bottle.tar.gz" > "$RUNNER_TEMP/bottle.list"
+          grep -qx "paniolo/${VERSION}/bin/paniolo" "$RUNNER_TEMP/bottle.list"
+          for helper in $HELPERS linuxocr rapidocr; do
+            grep -qx "paniolo/${VERSION}/libexec/bin/$helper" "$RUNNER_TEMP/bottle.list"
+          done
+          grep -qx "paniolo/${VERSION}/share/paniolo/skills/paniolo/SKILL.md" "$RUNNER_TEMP/bottle.list"
+
       # A sidecar per asset (matching the Windows zip's own .sha256), so the
       # Homebrew tap's binary-only formula can verify and re-pin a download
       # without fetching it first. Run from dist/ so the recorded filename
@@ -174,10 +212,12 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
           ARCH: ${{ matrix.arch }}
+          BOTTLE_TAG: ${{ matrix.bottle_tag }}
         run: |
           cd dist
           sha256sum "paniolo_${VERSION}_${ARCH}.deb" > "paniolo_${VERSION}_${ARCH}.deb.sha256"
           sha256sum "paniolo-${VERSION}-linux-${ARCH}.tar.gz" > "paniolo-${VERSION}-linux-${ARCH}.tar.gz.sha256"
+          sha256sum "paniolo-${VERSION}.${BOTTLE_TAG}.bottle.tar.gz" > "paniolo-${VERSION}.${BOTTLE_TAG}.bottle.tar.gz.sha256"
 
       # We're already root inside the bookworm container: install the deb for
       # real and check the layout + helper discovery end to end.
@@ -722,6 +762,79 @@ jobs:
             | base64 --decode -o "$tiny_png"
           "$root/libexec/bin/visionocr" --json "$tiny_png" \
             | python3 -c 'import json, sys; d = json.load(sys.stdin); assert d["engine"] == "visionocr", d'
+
+      # The tarball once more as a Homebrew bottle: the same tree, which is
+      # already in keg layout, under paniolo/<version>/ and named the way
+      # Homebrew fetches a bottle from a plain https root_url
+      # (<name>-<version>.<tag>.bottle.tar.gz). One `all`-tagged bottle
+      # serves every macOS version and both arches because the binaries are
+      # universal, and Homebrew 7 matches a bottle only by its exact tag or
+      # `all`, never an older OS's. Bottles exist because a pour skips
+      # Homebrew's build-from-source preflight, which refuses outright on a
+      # macOS newer than its Xcode table (#225) even though this formula
+      # never compiles anything.
+      - name: Build Homebrew bottle
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bottle/paniolo/${VERSION}"
+          cp -R "dist/paniolo-${VERSION}-macos-universal/." "$RUNNER_TEMP/bottle/paniolo/${VERSION}/"
+          tar -C "$RUNNER_TEMP/bottle" -czf "dist/paniolo-${VERSION}.all.bottle.tar.gz" paniolo
+          rm -r "$RUNNER_TEMP/bottle"
+          cd dist
+          shasum -a 256 "paniolo-${VERSION}.all.bottle.tar.gz" > "paniolo-${VERSION}.all.bottle.tar.gz.sha256"
+
+      # Pour it the way a user's `brew install` will: a throwaway formula
+      # whose only bottle is this file, whose install block refuses to run.
+      # Proves the keg layout and the `all` tag are what Homebrew expects and
+      # that a pour needs no toolchain at all; if Homebrew decides to build
+      # from the tarball instead, `odie` fails the step. keg_only so nothing
+      # links into the runner's prefix.
+      - name: Smoke-test the bottle
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+          HOMEBREW_NO_AUTOREMOVE: "1"
+          HOMEBREW_DEVELOPER: "1"
+        run: |
+          set -euo pipefail
+          probe="$RUNNER_TEMP/bottle-probe"
+          mkdir -p "$probe"
+          cp "dist/paniolo-${VERSION}.all.bottle.tar.gz" "$probe/"
+          bottle_sha="$(cut -d' ' -f1 "dist/paniolo-${VERSION}.all.bottle.tar.gz.sha256")"
+          tarball_sha="$(cut -d' ' -f1 "dist/paniolo-${VERSION}-macos-universal.tar.gz.sha256")"
+          cat > "$probe/paniolo.rb" <<EOF
+          class Paniolo < Formula
+            desc "Bottle pour probe"
+            homepage "https://github.com/curtisgalloway/paniolo"
+            url "file://$PWD/dist/paniolo-${VERSION}-macos-universal.tar.gz"
+            version "${VERSION}"
+            sha256 "$tarball_sha"
+            license "Apache-2.0"
+
+            bottle do
+              root_url "file://$probe"
+              sha256 cellar: :any_skip_relocation, all: "$bottle_sha"
+            end
+
+            keg_only "bottle pour probe"
+
+            def install
+              odie "the probe must pour the bottle, not build from the tarball"
+            end
+          end
+          EOF
+          brew install --formula "$probe/paniolo.rb" 2>&1 | tee "$probe/install.log"
+          grep -q "Pouring paniolo-${VERSION}.all.bottle.tar.gz" "$probe/install.log"
+          keg="$(brew --cellar)/paniolo/${VERSION}"
+          test "$("$keg/bin/paniolo" --version)" = "paniolo $VERSION"
+          ( cd /tmp && "$keg/bin/paniolo" skill | grep -q '^paniolo' )
+          for helper in $HELPERS; do
+            "$keg/libexec/bin/$helper" --help >/dev/null
+          done
+          brew uninstall paniolo
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
