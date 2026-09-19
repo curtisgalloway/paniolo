@@ -4530,8 +4530,15 @@ mod tests {
     #[test]
     fn console_falls_back_to_a_private_file_not_the_terminal() {
         let dir = tempfile::tempdir().unwrap();
-        // Safe: mutated and restored within this test.
+        // PANIOLO_RUNTIME_BASE is process-global, not test-local: restoring it
+        // before this test returns does nothing for the daemons tests running
+        // in parallel threads, which read it between planting a discovery file
+        // and listing it. Hold the crate-wide lock they hold.
+        let _guard = crate::daemons::RUNTIME_BASE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let prev = std::env::var_os("PANIOLO_RUNTIME_BASE");
+        // Safe: serialized by the lock above; restored below.
         unsafe { std::env::set_var("PANIOLO_RUNTIME_BASE", dir.path()) };
 
         let video = endpoint(1000, Some("s3cr3t"));
@@ -4618,6 +4625,59 @@ mod tests {
             preview(&["paniolo", "video", "preview", "-t", "dut", "--open"]),
             (Some("dut".to_string()), true)
         );
+    }
+
+    /// `video preview --open` must be refused when the target's video channel
+    /// is on another host, and allowed when it is here (#196).
+    ///
+    /// A remote channel re-execs the whole argv on the control host, `--open`
+    /// included, so without this gate the browser opens on the bench machine —
+    /// silently, while the caller is told it opened. That is the shape of
+    /// failure nobody reports: nothing errors, a window just never appears.
+    ///
+    /// Parsing the flag was pinned; acting on it was not, and the refusal is
+    /// one `if` away from being deleted with the suite still green. This drives
+    /// `refuse_remote_open` itself, through a real lab file on disk, so the
+    /// host resolution it does is executed rather than described.
+    #[test]
+    fn video_preview_open_is_refused_when_the_channel_is_on_another_host() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let remote = dir.path().join("remote.toml");
+        std::fs::write(
+            &remote,
+            "[hosts.bench]\n\
+             ssh = \"u@bench\"\n\
+             [targets.dut]\n\
+             host = \"bench\"\n\
+             [targets.dut.video]\n\
+             device = \"/dev/video0\"\n",
+        )
+        .unwrap();
+        let err = refuse_remote_open(remote.to_str(), Some("dut"))
+            .expect_err("a video channel on 'bench' must refuse --open")
+            .to_string();
+        assert!(err.contains("bench"), "{err}");
+        // The refusal has to name a way through, or it is just a wall: both
+        // `console` (which forwards the ports) and plain `preview`.
+        assert!(err.contains("paniolo console dut"), "{err}");
+        assert!(err.contains("paniolo video preview dut"), "{err}");
+
+        // The same target with its video channel here is not refused — the
+        // gate must not cost a local operator the flag.
+        let local = dir.path().join("local.toml");
+        std::fs::write(
+            &local,
+            "[hosts.here]\n\
+             ssh = \"local\"\n\
+             [targets.dut]\n\
+             host = \"here\"\n\
+             [targets.dut.video]\n\
+             device = \"/dev/video0\"\n",
+        )
+        .unwrap();
+        refuse_remote_open(local.to_str(), Some("dut"))
+            .expect("a local video channel must still accept --open");
     }
 
     /// The dashboard URL carries the video daemon's token for the page itself

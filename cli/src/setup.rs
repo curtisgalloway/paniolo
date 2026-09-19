@@ -550,6 +550,73 @@ fn rust_only_done_message(os: &str, skills_ok: bool) -> String {
     )
 }
 
+/// What [`zigplug_step`] did, so the decision can be driven by a test without
+/// a uv install standing by.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ZigplugOutcome {
+    /// Off this run's step list — `run` never looked at the checkout or uv.
+    Skipped,
+    /// No `zigplug/pyproject.toml` in the checkout.
+    SourceMissing,
+    /// uv is not installed.
+    UvMissing,
+    Installed,
+    Failed,
+}
+
+/// zigplug: Python (zigpy-znp) Zigbee smart plug helper, installed as a uv
+/// tool. `UV_TOOL_BIN_DIR` points the shim at libexec (the venv stays in uv's
+/// tool dir) so the command resolves from power hooks without living on PATH.
+/// The uninstall first clears any pre-libexec shim from uv's default bin dir
+/// (`~/.local/bin`).
+///
+/// `will` is membership of [`source_steps`], and the early return on `false`
+/// is the whole point: this was the one skippable block in [`run`] written
+/// without that gate, so `--rust-only` shelled out to uv — a second
+/// toolchain, the very thing the fast path exists to avoid — and then printed
+/// a completion line naming zigplug among the steps it had skipped.
+fn zigplug_step(will: bool, repo: &Path, libexec: &Path) -> ZigplugOutcome {
+    if !will {
+        return ZigplugOutcome::Skipped;
+    }
+    let zigplug_dir = repo.join("zigplug");
+    if !zigplug_dir.join("pyproject.toml").is_file() {
+        println!("  … zigplug: source not found, skipped");
+        return ZigplugOutcome::SourceMissing;
+    }
+    let Some(uv) = crate::daemons::find_binary("uv") else {
+        println!("  … zigplug: uv not found (https://docs.astral.sh/uv), skipped");
+        return ZigplugOutcome::UvMissing;
+    };
+    let _ = Command::new(&uv)
+        .args(["tool", "uninstall", "zigplug"])
+        .output();
+    let ok = Command::new(&uv)
+        .env("UV_TOOL_BIN_DIR", libexec)
+        .args(["tool", "install", "--force", "--quiet"])
+        .arg(&zigplug_dir)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if ok {
+        println!("  ✓ {:12} {}", "zigplug", libexec.join("zigplug").display());
+    } else {
+        eprintln!("  ! zigplug: uv tool install failed, skipped");
+    }
+    // Belt and braces: an orphaned pre-libexec shim survives a lost uv
+    // receipt; remove it so PATH can't resolve a stale zigplug.
+    if let Some(stale) = dirs::home_dir().map(|h| h.join(".local/bin/zigplug")) {
+        if stale.is_file() && std::fs::remove_file(&stale).is_ok() {
+            println!("  ✓ removed stale {}", stale.display());
+        }
+    }
+    if ok {
+        ZigplugOutcome::Installed
+    } else {
+        ZigplugOutcome::Failed
+    }
+}
+
 /// Agent skills: copy the bundled SKILL.md guides into the per-user data dir
 /// so `paniolo skill` finds them when the installed CLI runs outside this
 /// tree. From a checkout the repo copy is used directly, so this keeps an
@@ -774,40 +841,7 @@ pub fn run(repo: &Path, rust_only: bool, lab_flag: Option<&str>) -> Result<()> {
         }
     }
 
-    // zigplug: Python (zigpy-znp) Zigbee smart plug helper, installed as a uv
-    // tool. UV_TOOL_BIN_DIR points the shim at libexec (the venv stays in
-    // uv's tool dir) so the command resolves from power hooks without living
-    // on PATH. The uninstall first clears any pre-libexec shim from uv's
-    // default bin dir (~/.local/bin).
-    let zigplug_dir = repo.join("zigplug");
-    if !zigplug_dir.join("pyproject.toml").is_file() {
-        println!("  … zigplug: source not found, skipped");
-    } else if let Some(uv) = crate::daemons::find_binary("uv") {
-        let _ = Command::new(&uv)
-            .args(["tool", "uninstall", "zigplug"])
-            .output();
-        let ok = Command::new(&uv)
-            .env("UV_TOOL_BIN_DIR", &libexec)
-            .args(["tool", "install", "--force", "--quiet"])
-            .arg(&zigplug_dir)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok {
-            println!("  ✓ {:12} {}", "zigplug", libexec.join("zigplug").display());
-        } else {
-            eprintln!("  ! zigplug: uv tool install failed, skipped");
-        }
-        // Belt and braces: an orphaned pre-libexec shim survives a lost uv
-        // receipt; remove it so PATH can't resolve a stale zigplug.
-        if let Some(stale) = dirs::home_dir().map(|h| h.join(".local/bin/zigplug")) {
-            if stale.is_file() && std::fs::remove_file(&stale).is_ok() {
-                println!("  ✓ removed stale {}", stale.display());
-            }
-        }
-    } else {
-        println!("  … zigplug: uv not found (https://docs.astral.sh/uv), skipped");
-    }
+    zigplug_step(will(SourceStep::Zigplug), repo, &libexec);
 
     if rust_only {
         println!(
@@ -888,6 +922,39 @@ mod tests {
             assert!(
                 !rust_only_skips(os).contains(&SourceStep::InstallSkills),
                 "{os}: skills must not be reported as skipped"
+            );
+        }
+    }
+
+    /// Regression: `--rust-only` ran the zigplug install and then said it had
+    /// skipped it. The step list and the message were both right — #215 saw
+    /// to that — but the install block itself was the one skippable step in
+    /// `run` with no `will(...)` gate, so the fast path shelled out to uv on
+    /// every from-source setup while reporting the opposite.
+    ///
+    /// Driven through the step rather than the message: the message was never
+    /// the broken half, and a test that only read it passed throughout.
+    #[test]
+    fn rust_only_never_reaches_uv_for_zigplug() {
+        let repo = tempfile::tempdir().unwrap();
+        let libexec = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            zigplug_step(false, repo.path(), libexec.path()),
+            ZigplugOutcome::Skipped,
+            "off the step list, zigplug must return before the checkout or uv"
+        );
+        // On the list it looks, and says so — this scratch repo has no
+        // zigplug/, which is what stops the test touching a real uv.
+        assert_eq!(
+            zigplug_step(true, repo.path(), libexec.path()),
+            ZigplugOutcome::SourceMissing,
+        );
+
+        for os in ["linux", "macos", "windows"] {
+            assert!(
+                !source_steps(os, true).contains(&SourceStep::Zigplug),
+                "{os}: zigplug needs uv, so it is off the fast path"
             );
         }
     }

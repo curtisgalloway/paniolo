@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::capture::{open_backend, DeviceSpec};
+use crate::capture::{open_backend, CapturedFrame, DeviceSpec};
 use crate::frame::{classify_gray, classify_nv12, classify_rgb, FrameState, Signal, STABLE_FRAMES};
 use crate::pixel::PixelData;
 
@@ -237,19 +237,7 @@ fn capture_loop(spec: DeviceSpec, tx: watch::Sender<Arc<FrameState>>) {
                 info!("resolution -> {w}x{h} (epoch {epoch})");
             }
 
-            // One-pass strided classification: hash + no-signal from ~1k luma
-            // samples, resolution-independent (the old full-image pass cost
-            // hundreds of ms at 8 MP).
-            // A pre-scaled luma plane wins, and is classified against ITS
-            // dimensions rather than the frame's: the Linux MJPEG path decodes
-            // grayscale at half scale (#211), so passing `w`/`h` here would
-            // read past the end of a plane a quarter the expected size.
-            let (hash, no_signal) = match (&captured.luma, &captured.pixels) {
-                (Some(l), _) => classify_gray(&l.data, l.width, l.height),
-                (None, PixelData::Nv12 { y, .. }) => classify_nv12(y, w, h),
-                (None, PixelData::Rgb(buf)) => classify_rgb(buf, w, h),
-                (None, PixelData::Empty) => (0, true),
-            };
+            let (hash, no_signal) = classify_captured(&captured);
 
             let signal = if no_signal {
                 stable_count = 0;
@@ -309,9 +297,34 @@ fn all_receivers_gone(tx: &watch::Sender<Arc<FrameState>>) -> bool {
     tx.receiver_count() == 0
 }
 
+/// One-pass strided classification of a captured frame: hash + no-signal from
+/// ~1k luma samples, resolution-independent (the old full-image pass cost
+/// hundreds of ms at 8 MP).
+///
+/// A pre-scaled luma plane wins over the pixel data, and is classified against
+/// ITS dimensions rather than the frame's: the Linux MJPEG path decodes
+/// grayscale at half scale (#211), so passing the frame's `width`/`height`
+/// here would walk a plane a quarter the expected size.
+///
+/// Its own function so a test can drive that choice. Inline in the capture
+/// loop it was reachable only by running a thread against real hardware, and
+/// the mistake it guards against is silent: out-of-range samples read as 0, so
+/// the wrong dimensions yield a plausible hash computed mostly from absent
+/// data — and that hash is what `/snapshot?changed_since=` trusts.
+fn classify_captured(captured: &CapturedFrame) -> (u64, bool) {
+    let (w, h) = (captured.width, captured.height);
+    match (&captured.luma, &captured.pixels) {
+        (Some(l), _) => classify_gray(&l.data, l.width, l.height),
+        (None, PixelData::Nv12 { y, .. }) => classify_nv12(y, w, h),
+        (None, PixelData::Rgb(buf)) => classify_rgb(buf, w, h),
+        (None, PixelData::Empty) => (0, true),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pixel::LumaPlane;
 
     /// Review low (h): the escalation threshold behind "exit only after ~8
     /// consecutive reopen failures". The Nth stall in a row (not before) is
@@ -350,6 +363,93 @@ mod tests {
         assert!(
             t.stalled(),
             "a fresh run of stalls still gives up at the threshold"
+        );
+    }
+
+    fn frame(luma: Option<LumaPlane>, pixels: PixelData, w: u32, h: u32) -> CapturedFrame {
+        CapturedFrame {
+            jpeg: None,
+            luma,
+            pixels,
+            width: w,
+            height: h,
+        }
+    }
+
+    /// A pre-scaled luma plane is classified at its own dimensions, not the
+    /// frame's (#211).
+    ///
+    /// The Linux MJPEG path decodes grayscale at half scale, so the plane is a
+    /// quarter of the frame's pixel count. Classifying it at the frame's
+    /// dimensions does not error and does not report no-signal — it reads
+    /// past the plane, takes the missing samples as 0, and returns a
+    /// plausible-looking hash computed mostly from absent data. That hash is
+    /// what `/snapshot?changed_since=` uses to decide the screen changed, so
+    /// the whole cost of getting this wrong is paid somewhere else.
+    #[test]
+    fn a_scaled_luma_plane_is_classified_at_the_planes_dimensions() {
+        let (pw, ph) = (960u32, 540u32);
+        let plane: Arc<[u8]> = vec![200u8; (pw * ph) as usize].into();
+        let captured = frame(
+            Some(LumaPlane {
+                data: plane.clone(),
+                width: pw,
+                height: ph,
+            }),
+            PixelData::Empty,
+            pw * 2,
+            ph * 2,
+        );
+
+        assert_eq!(
+            classify_captured(&captured),
+            classify_gray(&plane, pw, ph),
+            "the plane must be classified at 960x540, its own size"
+        );
+        assert_ne!(
+            classify_captured(&captured),
+            classify_gray(&plane, pw * 2, ph * 2),
+            "classifying at the frame's 1920x1080 is the bug; if the two agree \
+             this test cannot see it"
+        );
+    }
+
+    /// The luma plane wins over the pixel data when both are present, so a
+    /// backend that supplies one is never charged for the full-size pass it
+    /// was built to avoid.
+    #[test]
+    fn a_luma_plane_takes_precedence_over_the_pixel_data() {
+        let (pw, ph) = (64u32, 64u32);
+        let plane: Arc<[u8]> = vec![200u8; (pw * ph) as usize].into();
+        // Black RGB at the same dimensions: classified on its own it is
+        // no-signal, so the two sources cannot be confused for one another.
+        let rgb: Arc<[u8]> = vec![0u8; (pw * ph * 3) as usize].into();
+        assert!(classify_rgb(&rgb, pw, ph).1, "the decoy must be black");
+
+        let captured = frame(
+            Some(LumaPlane {
+                data: plane.clone(),
+                width: pw,
+                height: ph,
+            }),
+            PixelData::Rgb(rgb),
+            pw,
+            ph,
+        );
+        assert_eq!(classify_captured(&captured), classify_gray(&plane, pw, ph));
+        assert!(
+            !classify_captured(&captured).1,
+            "a lit luma plane must not be reported as no-signal because the \
+             pixel data happens to be black"
+        );
+    }
+
+    /// No plane and no pixels is no signal, not a hash of nothing.
+    #[test]
+    fn a_frame_with_neither_plane_nor_pixels_is_no_signal() {
+        assert_eq!(
+            classify_captured(&frame(None, PixelData::Empty, 1920, 1080)),
+            (0, true)
         );
     }
 }

@@ -1,6 +1,6 @@
 # Release train profile: paniolo
 
-Derived from commit 47d1d39 on 2026-09-14. Executed by the `release-train`
+Derived from commit 85860bb on 2026-09-16. Executed by the `release-train`
 skill (public-skills, `plugins/dev-tools/skills/release-train`); kept honest by
 its `profile_check.py` against the `## Sources` table below. Read `AGENTS.md`
 "Cutting a release" first: everything there still holds, this file only adds
@@ -74,7 +74,7 @@ the homebrew arm staged its keg and tarball in the worktree and the macOS
 tarball ended up in the builder's copy. Nothing was corrupted that time, and
 `rsync --delete` cannot corrupt the worktree — it only deletes at the
 destination — but an arm's build inputs should not depend on what another arm
-happens to have finished writing (#208).
+happens to have finished writing.
 
 The sync carries `--delete-excluded`, not bare `--delete`. An `--exclude`d path
 is *skipped* by `--delete`, so a plain exclude would leave last train's
@@ -105,7 +105,7 @@ enough.
 - artifact: `paniolo_X.Y.Z_<arch>.deb` plus `.sha256`, via `packaging/nfpm.yaml`
 - workflow job: package
 - host: linux-builder
-- build: rsync the worktree to a VM-local dir that only this arm uses (never build on a shared mount), with `--delete-excluded --filter='P target/' --exclude=target/ --exclude=/.venv/ --exclude=/.git/ --exclude=/dist/ --exclude=/logs/ --exclude=/packaging/stage/` — leading slashes anchor each pattern at the transfer root, since an unanchored `dist*` also matches `docs/distributed-control.md`. `target/` is deliberately unanchored: this repo has no workspace `target/`, only per-crate ones (`cli/target/`, `hdmicap/target/`, …), and the `P` (protect) filter is what keeps them warm on the builder — `--delete-excluded` deletes excluded paths at the destination too, so a bare `--exclude=target/` still cold-builds all nine crates every train (#227; verified with rsync 3.2.7 on the builder). `--delete-excluded` is what stops last train's staging and `.deb` surviving on the builder (see the rule above the channels); build `cli` and every helper `--release` with `PANIOLO_VERSION=X.Y.Z` exported; stage the gitignored staging tree under `packaging` (`stage/bin` with the CLI, `stage/libexec` with the helpers plus `ocr/linuxocr` and `ocr/rapidocr`) as the `package` job does; fetch `nfpm` at the workflow's `NFPM_VERSION` and verify its `checksums.txt`; `VERSION=X.Y.Z ARCH=<arch> nfpm package -f packaging/nfpm.yaml -p deb`
+- build: rsync the worktree to a VM-local dir that only this arm uses (never build on a shared mount), with `--delete-excluded --filter='P target/' --exclude=target/ --exclude=/.venv/ --exclude=/.git/ --exclude=/dist/ --exclude=/logs/ --exclude=/packaging/stage/` — leading slashes anchor each pattern at the transfer root, since an unanchored `dist*` also matches `docs/distributed-control.md`. `target/` is deliberately unanchored: this repo has no workspace `target/`, only per-crate ones (cli/target, hdmicap/target and so on, gitignored), and the `P` (protect) filter is what keeps them warm on the builder — `--delete-excluded` deletes excluded paths at the destination too, so a bare `--exclude=target/` still cold-builds all nine crates every train (#227; verified with rsync 3.2.7 on the builder). `--delete-excluded` is what stops last train's staging and `.deb` surviving on the builder (see the rule above the channels); build `cli` and every helper `--release` with `PANIOLO_VERSION=X.Y.Z` exported; stage the gitignored staging tree under `packaging` (`stage/bin` with the CLI, `stage/libexec` with the helpers plus `ocr/linuxocr` and `ocr/rapidocr`) as the `package` job does; fetch `nfpm` at the workflow's `NFPM_VERSION` and verify its `checksums.txt`; `VERSION=X.Y.Z ARCH=<arch> nfpm package -f packaging/nfpm.yaml -p deb`
 - install like a user: assemble a real repo with `packaging/scripts/build-apt-repo.sh <debs> <out> <fpr>` under a throwaway GPG key, install the public key under `/etc/apt/keyrings/paniolo-rt.asc`, write a deb822 `.sources` (`URIs: file:///<out>`, `Suites: stable`, `Components: main`, `Signed-By` that key), `apt-get update`, `apt-cache policy paniolo` shows X.Y.Z, `apt-get install paniolo=X.Y.Z`; record whether an older paniolo was present (upgrade path) or not (fresh path)
 - smoke: S1..S7 against `/usr/bin/paniolo`; S3 also `/usr/libexec/paniolo/bin/linuxocr --help` and `rapidocr --help`; also `/usr/share/paniolo/skills/paniolo/SKILL.md` and `/usr/lib/tmpfiles.d/paniolo.conf` exist
 - cleanup: `apt-get remove paniolo` unless it was installed before; remove the `.sources` file, the keyring, the throwaway key
@@ -130,7 +130,7 @@ enough.
 - workflow job: none
 - host: local
 - build: `PANIOLO_VERSION=X.Y.Z cargo install --path cli --root $S/.cargo` from the worktree with `HOME=$S`, `CARGO_HOME` **and `RUSTUP_HOME` exported explicitly at their real paths** (with `HOME` overridden rustup otherwise looks under `$S/.rustup`, finds no toolchain, and cargo fails with "could not choose a version of cargo"; the registry cache is the other reason), a persistent `CARGO_TARGET_DIR`, and **`CARGO_INSTALL_ROOT=$S/.cargo`**: `paniolo setup` reinstalls the CLI itself with `cargo install --path cli --force` and no `--root` (`cli/src/setup.rs`), which without that variable overwrites the developer's real CLI (it did, 2026-09-10)
-- install like a user: `HOME=$S paniolo setup --rust-only` from the worktree root (helpers land in `$S/.local/libexec/paniolo/bin`, and since #207 the bundled skills land in `$S/.local/share/paniolo/skills` on this path too); then by hand the OCR helper, which `--rust-only` skips because it needs a second toolchain: `swiftc -O -o $S/.local/libexec/paniolo/bin/visionocr ocr/visionocr.swift`; then `UV_TOOL_DIR=$S/uv UV_TOOL_BIN_DIR=$S/.local/libexec/paniolo/bin uv tool install ./zigplug` and `zigplug --help`
+- install like a user: `HOME=$S paniolo setup --rust-only` from the worktree root (helpers land in `$S/.local/libexec/paniolo/bin`, and since #207 the bundled skills land in `$S/.local/share/paniolo/skills` on this path too); then by hand the OCR helper, which `--rust-only` skips because it needs a second toolchain: `swiftc -O -o $S/.local/libexec/paniolo/bin/visionocr ocr/visionocr.swift`; then zigplug, which `--rust-only` skips for the same reason (it needs uv) — `UV_TOOL_DIR=$S/uv UV_TOOL_BIN_DIR=$S/.local/libexec/paniolo/bin uv tool install ./zigplug` and `zigplug --help`. Both by-hand steps are load-bearing: until the v0.4.0 train the zigplug install ran on the fast path anyway (the block had no `will(...)` gate), so a recipe that omitted it still ended up with a working `zigplug` and nothing said otherwise
 - smoke: S1..S7 against `$S/.cargo/bin/paniolo` with `HOME=$S`
 - cleanup: nothing outside `$S`
 - caveats: `paniolo setup` rebuilds the CLI with `cargo install --force` and inherits `PANIOLO_VERSION` from the environment, so keep it exported for that step too or S1 sees `0.1.0 (unversioned dev build)`
@@ -168,9 +168,9 @@ feeds needs re-reading before `--update` re-pins it.
 | `packaging/nfpm.yaml` | b348d64432f4 | Channels: deb |
 | `packaging/scripts/build-apt-repo.sh` | fb2205eeab8e | Channels: deb, install like a user |
 | `Makefile` | 0e29b48ae719 | Project: helpers; Channels: source |
-| `cli/src/setup.rs` | 02317a3946d1 | Channels: source |
+| `cli/src/setup.rs` | 2b42590a21fa | Channels: source |
 | `cli/src/skills.rs` | eada6fa6ec0c | Smoke contract S2; Channels: homebrew, windows |
-| `cli/src/daemons.rs` | ccc43197c03e | Smoke contract S3 |
+| `cli/src/daemons.rs` | aad8d53a1368 | Smoke contract S3 |
 | `scripts/ci-coverage-check.sh` | 8d0d03ddf496 | Project: helpers |
 | `scripts/sync-brik.sh` | b8b5a15775a9 | Channels: windows |
 | `README.md` | 00ee1992abb7 | Channels: source; Publish: re-verify apt |
