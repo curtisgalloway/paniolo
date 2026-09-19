@@ -66,13 +66,19 @@ jobs:
       - name: Check every pinned source still matches its blob id
         run: bash scripts/ci-profile-pins.sh
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-      - name: Test the checker itself
+      - name: Test the checker itself, and the other script guards
         # The step above only proves this tree's pins are current; it passes
         # just as well against a checker that has stopped checking. These run
         # the script as a subprocess against synthetic profiles, so each of
         # its three verdicts -- current, stale, unreadable table -- has a test
         # that fails when it is reverted.
-        run: uv run --with pytest pytest -q scripts/tests
+        #
+        # pyyaml is for test_workflow_container_shell.py, which parses the
+        # workflows themselves to keep bash-only syntax out of the container
+        # jobs whose steps run under dash. That guard exists because
+        # release.yml runs only on a tag push, so nothing else in CI executes
+        # its steps before a tag is already public.
+        run: uv run --with pytest --with pyyaml pytest -q scripts/tests
 
   shellcheck:
     # Every tracked shell script, at shellcheck's default (info) severity. A

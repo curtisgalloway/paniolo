@@ -186,7 +186,17 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
           BOTTLE_TAG: ${{ matrix.bottle_tag }}
         run: |
-          set -euo pipefail
+          # `set -eu`, not `set -euo pipefail`: this job runs inside the
+          # debian:bookworm container, where the runner's default shell is
+          # `sh -e {0}` and /bin/sh is dash, which has no `pipefail` and exits
+          # 2 on `set -o pipefail` ("Illegal option"). That is what broke the
+          # v0.4.0 tag build on both Linux arches. There is no pipeline in
+          # this step, so -eu is equivalent here; a step that needs pipefail
+          # must declare `shell: bash` too. The bash-only forms elsewhere in
+          # this file are all in the macOS and Windows jobs, which already
+          # run under bash. Enforced by
+          # scripts/tests/test_workflow_container_shell.py.
+          set -eu
           keg="$RUNNER_TEMP/bottle/paniolo/${VERSION}"
           mkdir -p "$keg/bin" "$keg/libexec/bin" "$keg/share/paniolo"
           cp packaging/stage/bin/paniolo "$keg/bin/"
