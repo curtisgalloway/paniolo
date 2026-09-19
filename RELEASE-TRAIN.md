@@ -74,7 +74,7 @@ the homebrew arm staged its keg and tarball in the worktree and the macOS
 tarball ended up in the builder's copy. Nothing was corrupted that time, and
 `rsync --delete` cannot corrupt the worktree — it only deletes at the
 destination — but an arm's build inputs should not depend on what another arm
-happens to have finished writing (#208).
+happens to have finished writing.
 
 The sync carries `--delete-excluded`, not bare `--delete`. An `--exclude`d path
 is *skipped* by `--delete`, so a plain exclude would leave last train's
