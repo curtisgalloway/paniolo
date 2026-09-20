@@ -354,7 +354,7 @@ The Core tree models this as one endpoint with a provider list and a `matches` p
 provider; the shipping Qt app expresses the same thing as a branch in the UI handler. Both resolve
 the same way in practice:
 
-- **Runtime discriminator is the serial port's VID/PID.** `1A86:FE0C` (CH32V208, KVM-Go) → serial
+- **Runtime discriminator is the serial port's VID/PID.** `1A86:FE0C` (CH32V208 — **a revision, not a product: V2 Mini-KVMs carry it too**, see [openterface-v2-linux-serial.md](openterface-v2-linux-serial.md)) → serial
   `0x17` command. `1A86:7523` (CH340, Mini-KVM) → MS2109 `0xDF01` register. In the Core tree the
   same distinction is expressed as a protocol flag attached to the matched device profile
   `[source-observed]`.
