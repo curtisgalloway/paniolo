@@ -71,6 +71,13 @@ USB identities observed on the bench:
 | Host video | `Openterface` (UVC + UAC + HID cfg) | `345f:2132` | SuperSpeed, direct |
 | Host storage | `USB Storage` (GL823K) | `05e3:0751` | behind HUB1, when mux'd host-side |
 | **Target** | `KeyMod` (emulated kbd/mouse) | `1a86:fe00` | behind HUB2 |
+
+> **These IDs are not exclusive to the KVM-Go (2026-09-20).** A V2
+> Mini-KVM enumerates the same `1a86:fe0c` / `1a86:fe00` pair alongside an
+> MS2109 rather than an MS2130S. Identify the *chip* by PID; do not infer
+> the *product* from it. The Linux-specific silence seen on V2 hardware,
+> and its cause in the vendor's own sources, are in
+> [openterface-v2-linux-serial.md](openterface-v2-linux-serial.md).
 | Both hubs | `USB2.0 HUB` (SL2.1s) | `1a40:0101` | — |
 
 Key parts (from the published BOMs):
