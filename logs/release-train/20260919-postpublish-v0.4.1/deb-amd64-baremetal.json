@@ -1,0 +1,22 @@
+{
+  "arm": "deb (amd64, bare metal)",
+  "phase": "post-publish re-verification, opportunistic",
+  "release": "v0.4.1",
+  "verdict": "PASS",
+  "artifact": "paniolo 0.4.1 amd64 .deb from the published apt repo",
+  "installed_as": "deb822 .sources + Signed-By keyring exactly as README.md prescribes, on a bare-metal Ubuntu 26.04.1 x86_64 desktop (systemd-detect-virt: none); apt-get install paniolo; smoke run from a fresh mktemp HOME outside any checkout",
+  "steps": [
+    {"id": "repo", "ok": true, "note": "InRelease fetched and signature-verified with no apt warnings; Packages lists 0.4.1 and 0.3.1 for amd64"},
+    {"id": "install", "ok": true, "note": "apt-get install paniolo -> 0.4.1; paniolo --version prints exactly 'paniolo 0.4.1'"},
+    {"id": "S1", "ok": true, "note": "exit 0, all 8 verbs listed, version string exact"},
+    {"id": "S2", "ok": true, "note": "3 skills listed; paniolo skill paniolo printed a 44673-char body from the packaged copy"},
+    {"id": "S3", "ok": true, "note": "paniolo helper exit 0; all 8 helpers answered -- --help with exit 0"},
+    {"id": "S6-partial", "ok": true, "note": "paniolo helper linuxocr -- --help exit 0 (the Linux form of S6; no image decode run)"}
+  ],
+  "caveats": [
+    "This is the first verification of the amd64 .deb on real hardware; the train's deb arm builds and smokes on an aarch64 Linux VM, so the amd64 package had only ever been checked by the sidecar hash.",
+    "The SKILL.md body measures 44673 chars here vs 45732 on Windows; the difference is CRLF line endings in the zip, not different content.",
+    "The host was also added to the dialout group for upcoming ch9329 work on issue #81; that is unrelated to this verification."
+  ],
+  "repro": "bash /tmp/lw-smoke.sh on the bare-metal Linux host"
+}
