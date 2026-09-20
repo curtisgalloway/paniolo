@@ -31,6 +31,14 @@ finding 8. Tracker: requirements §6.1 (OTF-1…6).*
 > `DTR`→`SW_GND` and `RTS`→`HIDRESET` modem-line behaviours don't exist there.
 > The USB mux `Sel` also moved off the MS2109 GPIO onto the MCU, which makes
 > the **OTF-3 equivalent reachable** on that device.
+>
+> **Correction (2026-09-20): the USB IDs do not identify the product.**
+> A board that is physically a Mini-KVM can carry the CH32V208 and
+> enumerate `1a86:fe0c` + `1a86:fe00` — the vendor names that constant
+> `SERIAL_PID_V2`, a *revision* marker. On such a V2 unit the control port
+> is a CDC-ACM `/dev/ttyACM*`, it is fixed at 115200, and baud
+> autodetection actively wedges the chip. See
+> [openterface-v2-linux-serial.md](openterface-v2-linux-serial.md).
 
 The Openterface Mini-KVM's hardware is open source
 ([TechxArtisanStudio/Openterface_Mini-KVM_Hardware](https://github.com/TechxArtisanStudio/Openterface_Mini-KVM_Hardware),

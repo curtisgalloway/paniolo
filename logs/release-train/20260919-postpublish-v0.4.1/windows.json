@@ -1,0 +1,22 @@
+{
+  "arm": "windows",
+  "phase": "post-publish re-verification",
+  "release": "v0.4.1",
+  "verdict": "PASS",
+  "artifact": "paniolo-0.4.1-x86_64-pc-windows-msvc.zip (16416426 bytes) plus .sha256",
+  "installed_as": "downloaded on windows-bench from the public GitHub release download URL with Invoke-WebRequest, sidecar verified, Expand-Archive into a fresh dir under the host's build-logs scratch; smoke run in a pwsh with that dir's paniolo\\ first on PATH and USERPROFILE/HOME/APPDATA/LOCALAPPDATA pointed at a fresh temp dir, cwd outside any checkout",
+  "steps": [
+    {"id": "download", "ok": true, "note": "fetched zip and .sha256 from https://github.com/curtisgalloway/paniolo/releases/download/v0.4.1/ on the bench host itself -- the path a Windows user takes"},
+    {"id": "sidecar", "ok": true, "note": "Get-FileHash SHA256 == sidecar: 66dffe9085bdd6df69312a91575123d78382454cb567046ff89dd5f15c6ac470"},
+    {"id": "layout", "ok": true, "note": "10 exes (paniolo.exe + libexec: amt, cambrionix, ch9329, hdmicap, hidrig, netbootd, serialcap, shellyplug, winocr) and 3 skills (control-host, kvm-puppeting, paniolo)"},
+    {"id": "S1", "ok": true, "note": "paniolo --help exit 0, lists target/serial/video/hid/doctor/daemons/skill/helper; paniolo --version exit 0, printed exactly 'paniolo 0.4.1'"},
+    {"id": "S2", "ok": true, "note": "paniolo skill exit 0, listed paniolo, kvm-puppeting, control-host; paniolo skill paniolo exit 0, printed a 45732-char SKILL.md body from the packaged copy"},
+    {"id": "S3", "ok": true, "note": "paniolo helper exit 0; paniolo helper <h> -- --help exit 0 for all 8: hdmicap serialcap netbootd cambrionix hidrig ch9329 shellyplug amt"}
+  ],
+  "caveats": [
+    "S4-S6 were not run: the post-publish contract for this channel is S1..S3 (RELEASE-TRAIN.md, 're-verify windows').",
+    "The exes are signed by the release workflow's settings, not checked here.",
+    "This closes the one channel left unverified when v0.4.1 published; all five channels (github assets, homebrew, apt, source, windows) are now verified from public URLs."
+  ],
+  "repro": "pwsh -NoProfile -File build-logs\\win-fetch.ps1 then build-logs\\win-smoke.ps1 on windows-bench; both scripts are in the host's build-logs dir"
+}
