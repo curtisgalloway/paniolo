@@ -298,29 +298,20 @@ async fn handle_ws(socket: WebSocket, serial: SerialHandle) {
     let input = serial.clone();
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
-            match msg {
-                // Wait for the supervisor's driver acknowledgement. A write
-                // failure closes this connection; never silently replay input.
-                Message::Binary(b) => {
-                    if input
-                        .write_paced(Bytes::from(b), std::time::Duration::ZERO)
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Message::Text(t) => {
-                    if input
-                        .write_paced(Bytes::from(t.into_bytes()), std::time::Duration::ZERO)
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
+            let bytes = match msg {
+                Message::Binary(b) => Bytes::from(b),
+                Message::Text(t) => Bytes::from(t.into_bytes()),
                 Message::Close(_) => break,
-                _ => {}
+                _ => continue,
+            };
+            // Wait for the supervisor's driver acknowledgement. A write
+            // failure closes this connection; never silently replay input.
+            if input
+                .write_paced(bytes, std::time::Duration::ZERO)
+                .await
+                .is_err()
+            {
+                break;
             }
         }
     });
