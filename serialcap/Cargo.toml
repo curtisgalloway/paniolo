@@ -25,7 +25,6 @@ serialport = "4"
 clap = { version = "4", features = ["derive"] }
 
 # --- Daemon plumbing -----------------------------------------------------
-fs2 = "0.4"
 
 # --- Errors / logging / serde -------------------------------------------
 anyhow = "1"

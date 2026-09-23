@@ -19,7 +19,6 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -96,7 +95,7 @@ pub fn run(device: DeviceSpec, port: u16) -> Result<()> {
     // 1. Acquire the advisory lock. Held for the lifetime of the process.
     let lock_file = File::create(lock_path()?)?;
     lock_file
-        .try_lock_exclusive()
+        .try_lock()
         .map_err(|_| anyhow!("another hdmicap daemon is already running"))?;
 
     // 2. Spawn the capture thread BEFORE the runtime. It owns the device and
@@ -150,7 +149,7 @@ pub fn run(device: DeviceSpec, port: u16) -> Result<()> {
         //    exits before ever reaching `drop(lock_file)`. Unlinking the path
         //    while the lock is still held replaces the directory entry with a
         //    fresh inode the moment the next daemon starts — that daemon's
-        //    `try_lock_exclusive` succeeds against the NEW inode even while this
+        //    `try_lock` succeeds against the NEW inode even while this
         //    process (and its lock on the OLD, now-unlinked inode) is still
         //    alive, so two daemons could hold the device at once. Leaving the
         //    file in place means the next daemon's `File::create` reopens the

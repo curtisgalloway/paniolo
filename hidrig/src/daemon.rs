@@ -28,7 +28,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -113,7 +112,7 @@ pub fn discover() -> Option<Discovery> {
 /// the lock path is never unlinked on shutdown).
 fn acquire_lock(path: &Path) -> Result<File> {
     let file = File::create(path)?;
-    file.try_lock_exclusive()
+    file.try_lock()
         .map_err(|_| anyhow!("another hid daemon is already running"))?;
     Ok(file)
 }
@@ -195,7 +194,7 @@ pub fn run(device: String, port: u16) -> Result<()> {
         // exits before ever reaching `drop(lock_file)`. Unlinking the path
         // while the lock is still held replaces the directory entry with a
         // fresh inode the moment the next daemon starts — that daemon's
-        // `try_lock_exclusive` succeeds against the NEW inode even while this
+        // `try_lock` succeeds against the NEW inode even while this
         // process (and its lock on the OLD, now-unlinked inode) is still
         // alive, so two daemons could hold the UART at once. Leaving the
         // file in place means the next daemon's `File::create` reopens the
@@ -375,7 +374,7 @@ mod tests {
     /// Reproduces the shutdown race from issue #148 without hardware. The
     /// running daemon holds an exclusive `flock` on `daemon.lock`; shutdown
     /// must not unlink that path, or a second daemon's `File::create` +
-    /// `try_lock_exclusive` opens a fresh inode there and locks IT
+    /// `try_lock` opens a fresh inode there and locks IT
     /// successfully while the first daemon (still holding the lock on the
     /// old, now-unlinked inode) is still alive — two UART owners at once.
     ///
