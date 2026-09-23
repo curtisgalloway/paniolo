@@ -109,7 +109,7 @@ plug with on/off, or boot-on-power + DTR long-press for off), not on missing CLI
   must present a **PTY** proxying the real UART (or cede the port). The `$FUCHSIA_SERIAL_SOCKET`
   unix socket is created **by botanist, downstream** — not by paniolo (DISCREPANCY 1).
 
-**paniolo today.** `serialcap` owns the port exclusively (`fs2` lockfile, `daemon.rs:78-80`)
+**paniolo today.** `serialcap` owns the port exclusively (an exclusive `flock` on a lockfile via `std::fs::File::try_lock`, in `daemon.rs`)
 and is **already a fan-out supervisor**: raw bytes → broadcast to WebSocket clients
 (`serial_io.rs:321`) + tee to the JSONL capture thread (`:317`). It exposes HTTP+WebSocket on
 `127.0.0.1:8724`; `/stream` is **already bidirectional** — clients write bytes back via
