@@ -87,6 +87,7 @@ nav:
           - HID serial protocol: dev/hid-serial-protocol.md
           - OCR helper protocol: dev/ocr.md
           - HID dual-board design: dev/hid-dual-board-design.md
+          - CLI error contract: dev/error-contract/design.md
       - Extending paniolo:
           - Adding power helpers: dev/adding-power-helpers.md
           - Agent evals: dev/agent-evals.md
