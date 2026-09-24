@@ -193,8 +193,7 @@ pub fn dispatch(
     let slice = build_slice(lab, target, host_name)?;
     let remote_path = ship_slice(&host, &slice)?;
 
-    let mut argv = vec![host.paniolo(), "--lab".to_string(), remote_path.clone()];
-    argv.extend(sub_argv.iter().cloned());
+    let argv = remote_argv(&host, &remote_path, sub_argv);
 
     let code = match mode {
         // No environment crosses here: the remote's stdin *is* the terminal
@@ -209,9 +208,31 @@ pub fn dispatch(
     Ok(code)
 }
 
+/// The remote paniolo's argv for a user-facing dispatch: `paniolo --lab
+/// <slice>`, then `--json-errors` when requested here, then `sub_argv`.
+fn remote_argv(host: &crate::model::Host, remote_path: &str, sub_argv: &[String]) -> Vec<String> {
+    let mut argv = vec![host.paniolo(), "--lab".to_string(), remote_path.to_string()];
+    argv.extend(json_errors_arg(crate::error::json_requested()));
+    argv.extend(sub_argv.iter().cloned());
+    argv
+}
+
+/// `--json-errors` for the remote argv when the error contract's JSON object
+/// was requested here (by the flag or `PANIOLO_JSON_ERRORS`). Added even when
+/// `sub_argv` already has one: the flag accepts repeats, and scanning argv
+/// for it cannot tell an option from a payload token of the same spelling.
+/// An argument rather than a forwarded variable: the variable prelude needs a
+/// POSIX shell on the control host and is skipped for interactive dispatch;
+/// an argument crosses both. The cost is version skew: a 0.4.x remote
+/// rejects the flag with a usage error (design D5).
+fn json_errors_arg(requested: bool) -> Option<String> {
+    requested.then(|| "--json-errors".to_string())
+}
+
 /// Run a paniolo subcommand on `host_name` against a shipped slice, captured.
 /// Used by composite commands (e.g. `console`) to drive helper commands on the
-/// host before tunnelling to its daemons.
+/// host before tunnelling to its daemons. Never passes `--json-errors`: the
+/// output is read by this process, which reports any failure itself.
 pub fn run_subcommand(
     lab: &Lab,
     target: &str,
@@ -281,8 +302,7 @@ pub fn dispatch_stdout_to_file(
     let slice = build_slice(lab, target, host_name)?;
     let remote_path = ship_slice(&host, &slice)?;
 
-    let mut argv = vec![host.paniolo(), "--lab".to_string(), remote_path.clone()];
-    argv.extend(sub_argv.iter().cloned());
+    let argv = remote_argv(&host, &remote_path, sub_argv);
 
     let env = ssh::forwarded_env()?;
     let code = capture_to_file(out_path, |sink| {
@@ -332,7 +352,7 @@ pub fn maybe_dispatch(
 ) -> anyhow::Result<Option<i32>> {
     let rt = lab
         .resolved_target(target)
-        .ok_or_else(|| LabError(format!("target '{target}' not found in lab")))?;
+        .ok_or_else(|| crate::error::target_not_found(target))?;
     let host_name = crate::model::channel_host(&rt, kind, serial_name)?;
     let host = lab.host(&host_name);
     if host.is_local(&host_name) {
@@ -473,6 +493,12 @@ mod tests {
         assert_eq!(v.device.as_deref(), Some("/dev/video0"));
         assert_eq!(v.ocr_mode.as_deref(), Some("gui"));
         assert!(v.host.is_none());
+    }
+
+    #[test]
+    fn json_errors_crosses_the_hop_when_requested() {
+        assert_eq!(json_errors_arg(true).as_deref(), Some("--json-errors"));
+        assert_eq!(json_errors_arg(false), None);
     }
 
     #[test]

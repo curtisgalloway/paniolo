@@ -144,13 +144,19 @@ always present (null when unknown) so a consumer need not probe.
 
 ## Decisions
 
-- **D1 — how JSON errors are requested. Recommend: env var
-  `PANIOLO_JSON_ERRORS=1`, plus a global `--json-errors` flag that sets it.**
-  The flag cannot be called `--json`: five subcommands already own that name.
-  The env var reaches nested invocations (hooks that call paniolo) and is
-  added to `FORWARDED_ENV` so dispatch carries it; the global flag would also
-  survive dispatch on its own (only `--lab` is stripped). *Alternative:* flag
-  only — simpler, but a hook calling paniolo would not inherit it.
+- **D1 — how JSON errors are requested: env var `PANIOLO_JSON_ERRORS=1`, or
+  the global `--json-errors` flag, which sets the variable for this process.**
+  (Approved 2026-09-24.) The flag cannot be called `--json`: five subcommands
+  already own that name. The variable reaches nested invocations (hooks that
+  call paniolo). **Across dispatch the request travels as the
+  `--json-errors` argument, not the variable** (changed during M1): the
+  `FORWARDED_ENV` prelude needs a POSIX shell on the control host, so a
+  Windows host would fail the whole command, and interactive dispatch skips
+  the prelude entirely. An argument crosses both. The cost is D5. Captured
+  internal sub-runs (`dispatch::run_subcommand`) do not pass it, since the
+  local paniolo reads their output and reports the failure itself. Clap
+  parse errors (exit 2) also get the object when requested, with clap's first
+  line as `message`.
 - **D2 — unclassified errors. Recommend: 109 `internal`.** Keeping 1 would blur
   "negative answer" (R1) and hide unclassified sites. 109 makes them visible,
   and the milestones shrink that set. *Cost:* any script testing `== 1` for
@@ -168,10 +174,13 @@ always present (null when unknown) so a consumer need not probe.
   keeps current readers working and gives the consumer a way to ask. *Needs the
   user's call*: the other options are "always 100" (breaks readers of old logs)
   or "leave unchanged".
-- **D5 — version skew.** A 0.4.x remote paniolo exits 1 with no JSON. The local
-  side cannot tell that from a negative answer. Accept it: control hosts
-  upgrade through apt, and the consumer can check `paniolo --version` on the
-  host (via `doctor`) before trusting codes.
+- **D5 — version skew.** Without JSON requested, a 0.4.x remote paniolo exits
+  1 for any error, which the local side cannot tell from a negative answer.
+  With JSON requested, a 0.4.x remote rejects the forwarded `--json-errors`
+  (exit 2, `unexpected argument '--json-errors' found`) and the command does
+  not run: loud rather than silent. Accepted 2026-09-24 (review finding F5):
+  control hosts upgrade through apt, and a consumer that relies on the
+  contract needs 0.5.0 on the host anyway.
 
 ## Cross-cutting concerns
 
