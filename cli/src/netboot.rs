@@ -52,8 +52,11 @@ const STARTUP_POLL: Duration = Duration::from_millis(100);
 const LOG_TAIL_LINES: usize = 20;
 
 fn resolve_netbootd() -> Result<std::path::PathBuf> {
-    daemons::find_binary("netbootd")
-        .ok_or_else(|| anyhow!("netbootd not found — build and install it with `paniolo setup`"))
+    Ok(daemons::find_binary("netbootd").ok_or_else(|| {
+        crate::error::PanioloError::not_configured(
+            "netbootd not found — build and install it with `paniolo setup`",
+        )
+    })?)
 }
 
 /// The other target (name and state) whose live netbootd already owns

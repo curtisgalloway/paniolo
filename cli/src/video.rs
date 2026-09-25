@@ -182,8 +182,11 @@ fn ocr_helper_with(
 /// dashboard's power-cycle button. `ocr_mode` picks the OCR helper the daemon
 /// will run — see [`ocr_helper`].
 pub fn start_daemon(device: &str, port: u16, target: &str, ocr_mode: Option<&str>) -> Result<()> {
-    let binary = daemons::find_binary(DAEMON)
-        .ok_or_else(|| anyhow!("hdmicap not found (libexec or PATH) — run `paniolo setup`"))?;
+    let binary = daemons::find_binary(DAEMON).ok_or_else(|| {
+        crate::error::PanioloError::not_configured(
+            "hdmicap not found (libexec or PATH) — run `paniolo setup`".to_string(),
+        )
+    })?;
     // Record which binary this daemon runs, so a later upgrade/rebuild can be
     // detected as stale (see daemons::binary_is_stale).
     daemons::record_binmeta(&binary, DAEMON, Some(target));
@@ -209,25 +212,27 @@ pub fn start_daemon(device: &str, port: u16, target: &str, ocr_mode: Option<&str
 
 /// Stop the target's running daemon via `hdmicap stop`. The per-target
 /// `helper_env` points `hdmicap stop` at the right instance's discovery file.
-pub fn stop_daemon(target: &str) -> Result<i32> {
-    let binary = daemons::find_binary(DAEMON).ok_or_else(|| anyhow!("hdmicap not found"))?;
+pub fn stop_daemon(target: &str) -> Result<std::process::ExitStatus> {
+    let binary =
+        daemons::find_binary(DAEMON).ok_or_else(|| crate::error::helper_missing("hdmicap"))?;
     let status = Command::new(binary)
         .arg("stop")
         .envs(daemons::helper_env(DAEMON, Some(target)))
         .status()?;
-    Ok(status.code().unwrap_or(1))
+    Ok(status)
 }
 
 /// Run an `hdmicap` client subcommand (shot/devices/…) with stdio passed
 /// through; returns the exit code. `instance` is the target whose daemon to
 /// reach (`None` for daemon-less subcommands like `devices`).
 pub fn passthrough(args: &[String], instance: Option<&str>) -> Result<i32> {
-    let binary = daemons::find_binary(DAEMON).ok_or_else(|| anyhow!("hdmicap not found"))?;
+    let binary =
+        daemons::find_binary(DAEMON).ok_or_else(|| crate::error::helper_missing("hdmicap"))?;
     let status = Command::new(binary)
         .args(args)
         .envs(daemons::helper_env(DAEMON, instance))
         .status()?;
-    Ok(status.code().unwrap_or(1))
+    Ok(crate::error::shell_code(status))
 }
 
 #[cfg(test)]

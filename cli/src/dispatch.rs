@@ -157,7 +157,21 @@ pub fn subcommand_args() -> Vec<String> {
 ///
 /// The returned name is **relative**, and the remote `--lab` depends on that:
 /// see [`ssh::sftp_put`] for why an absolute path is not usable on Windows.
-pub fn ship_slice(host: &crate::model::Host, slice_toml: &str) -> std::io::Result<String> {
+///
+/// Errors are classified here, where their source is still known: the SFTP
+/// put is the first network contact of a dispatch, so its failure is the
+/// usual sign of an unreachable control host (`unreachable`, exit 4), and an
+/// `sftp` that is not installed is `not_configured` (3). A failure writing the
+/// local temp copy is neither and stays unclassified. Exit 4 here strictly
+/// means "the copy to the control host failed": a host that answers but
+/// refuses the write, or a local ssh control directory that cannot be made
+/// private, reports the same way; the message carries sftp's own reason.
+pub fn ship_slice(
+    host: &crate::model::Host,
+    host_name: &str,
+    target: &str,
+    slice_toml: &str,
+) -> anyhow::Result<String> {
     // Unique per invocation: several dispatches to one host can overlap, and a
     // shared name would let one clobber another's lab slice mid-run.
     let stamp = std::time::SystemTime::now()
@@ -170,18 +184,34 @@ pub fn ship_slice(host: &crate::model::Host, slice_toml: &str) -> std::io::Resul
     // `tempfile` picks a private, collision-free name in the system temp dir
     // and removes it on drop, so a failed put (or this process being killed)
     // never leaves a stray lab slice behind the way a hand-rolled name could.
-    let mut local = tempfile::NamedTempFile::new()?;
+    use anyhow::Context;
+    let mut local = tempfile::NamedTempFile::new().context("creating the local lab slice")?;
     use std::io::Write;
-    local.write_all(slice_toml.as_bytes())?;
-    let sent = ssh::sftp_put(host, local.path(), &remote);
-    sent.map_err(|e| {
-        std::io::Error::other(format!("failed to ship lab slice to {}: {e}", host.ssh))
+    local
+        .write_all(slice_toml.as_bytes())
+        .context("writing the local lab slice")?;
+    ssh::sftp_put(host, local.path(), &remote).map_err(|e| {
+        let err = if e.kind() == std::io::ErrorKind::NotFound {
+            crate::error::PanioloError::not_configured(format!(
+                "sftp not found — cannot ship the lab slice to '{host_name}': {e}"
+            ))
+        } else {
+            crate::error::unreachable_host(
+                host_name,
+                format!(
+                    "cannot reach control host '{host_name}': failed to ship lab slice to {}: {e}",
+                    host.ssh
+                ),
+            )
+        };
+        err.target(target)
     })?;
     Ok(remote)
 }
 
 /// Re-exec `sub_argv` on `host` against a shipped slice; return the remote exit
-/// code. Cleans up the slice file afterward.
+/// code, except that ssh's own 255 becomes an `unreachable` error (see
+/// [`transport_checked`]). Cleans up the slice file afterward either way.
 pub fn dispatch(
     lab: &Lab,
     target: &str,
@@ -191,7 +221,7 @@ pub fn dispatch(
 ) -> anyhow::Result<i32> {
     let host = lab.host(host_name);
     let slice = build_slice(lab, target, host_name)?;
-    let remote_path = ship_slice(&host, &slice)?;
+    let remote_path = ship_slice(&host, host_name, target, &slice)?;
 
     let argv = remote_argv(&host, &remote_path, sub_argv);
 
@@ -203,8 +233,29 @@ pub fn dispatch(
         Mode::Reexec => ssh::run_passthrough(&host, &argv, &ssh::forwarded_env()?),
     }?;
 
-    // Best-effort cleanup of the shipped slice.
+    // Best-effort cleanup of the shipped slice, before judging the code: a
+    // 255 does not always mean the host is gone (see `transport_checked`),
+    // and when it is, the removal just fails.
     let _ = ssh::sftp_rm(&host, &remote_path);
+    transport_checked(code, host_name, target)
+}
+
+/// The remote exit code, unless it is ssh's own 255, which is reported as
+/// `unreachable` (exit 4) instead of being passed on. OpenSSH exits 255 when
+/// the connection fails (it has already printed why) but also when the remote
+/// command is killed by a signal, and a passthrough child on the far side may
+/// exit 255 itself; a remote paniolo never does under the error contract. So
+/// the message says the outcome is unknown: check state before retrying a
+/// mutation.
+fn transport_checked(code: i32, host_name: &str, target: &str) -> anyhow::Result<i32> {
+    if code == crate::error::SSH_TRANSPORT_FAILURE {
+        return Err(crate::error::unreachable_host(
+            host_name,
+            crate::error::ssh_255_message(host_name),
+        )
+        .target(target)
+        .into());
+    }
     Ok(code)
 }
 
@@ -241,12 +292,27 @@ pub fn run_subcommand(
 ) -> anyhow::Result<ssh::Output> {
     let host = lab.host(host_name);
     let slice = build_slice(lab, target, host_name)?;
-    let remote_path = ship_slice(&host, &slice)?;
+    let remote_path = ship_slice(&host, host_name, target, &slice)?;
     let mut argv = vec![host.paniolo(), "--lab".to_string(), remote_path.clone()];
     argv.extend(subargs.iter().map(|s| s.to_string()));
     let out = ssh::run(&host, &argv, None, &ssh::forwarded_env()?);
     let _ = ssh::sftp_rm(&host, &remote_path);
-    Ok(out?)
+    let out = out?;
+    if out.status == crate::error::SSH_TRANSPORT_FAILURE {
+        // Captured, so ssh's own reason is in `out.stderr`, not on the
+        // terminal: carry it in the message.
+        return Err(crate::error::unreachable_host(
+            host_name,
+            format!(
+                "{}: {}",
+                crate::error::ssh_255_message(host_name),
+                out.stderr.trim()
+            ),
+        )
+        .target(target)
+        .into());
+    }
+    Ok(out)
 }
 
 /// Run `write_body` with a writable sink prepared for `out_path` — a sibling
@@ -300,7 +366,7 @@ pub fn dispatch_stdout_to_file(
 ) -> anyhow::Result<i32> {
     let host = lab.host(host_name);
     let slice = build_slice(lab, target, host_name)?;
-    let remote_path = ship_slice(&host, &slice)?;
+    let remote_path = ship_slice(&host, host_name, target, &slice)?;
 
     let argv = remote_argv(&host, &remote_path, sub_argv);
 
@@ -309,8 +375,9 @@ pub fn dispatch_stdout_to_file(
         Ok(ssh::run_stdout_to(&host, &argv, &env, sink)?)
     });
 
+    // Best-effort cleanup first, as in `dispatch`.
     let _ = ssh::sftp_rm(&host, &remote_path);
-    code
+    transport_checked(code?, host_name, target)
 }
 
 /// Read a daemon's discovery record — port and token — from its `daemon.json`

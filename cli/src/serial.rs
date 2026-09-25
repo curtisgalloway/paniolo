@@ -78,8 +78,11 @@ pub fn interface_arg(ch: &SerialChannel) -> String {
 /// Start the target's serialcap daemon (owning every given interface),
 /// detached. The caller polls [`daemon_url`] for readiness.
 pub fn start_daemon(ifaces: &[SerialChannel], port: u16, target: &str) -> Result<()> {
-    let binary = daemons::find_binary(DAEMON)
-        .ok_or_else(|| anyhow!("serialcap not found (libexec or PATH) — run `paniolo setup`"))?;
+    let binary = daemons::find_binary(DAEMON).ok_or_else(|| {
+        crate::error::PanioloError::not_configured(
+            "serialcap not found (libexec or PATH) — run `paniolo setup`".to_string(),
+        )
+    })?;
     // Record which binary this daemon runs, so a later upgrade/rebuild can be
     // detected as stale (see daemons::binary_is_stale).
     daemons::record_binmeta(&binary, DAEMON, Some(target));
@@ -102,13 +105,14 @@ pub fn start_daemon(ifaces: &[SerialChannel], port: u16, target: &str) -> Result
 /// Stop the target's running daemon via `serialcap stop` (it owns the clean
 /// shutdown). The per-target `helper_env` points `serialcap stop` at the right
 /// instance's discovery file.
-pub fn stop_daemon(target: &str) -> Result<i32> {
-    let binary = daemons::find_binary(DAEMON).ok_or_else(|| anyhow!("serialcap not found"))?;
+pub fn stop_daemon(target: &str) -> Result<std::process::ExitStatus> {
+    let binary =
+        daemons::find_binary(DAEMON).ok_or_else(|| crate::error::helper_missing("serialcap"))?;
     let status = Command::new(binary)
         .arg("stop")
         .envs(daemons::helper_env(DAEMON, Some(target)))
         .status()?;
-    Ok(status.code().unwrap_or(1))
+    Ok(status)
 }
 
 // ── input ───────────────────────────────────────────────────────────────────
@@ -143,8 +147,11 @@ pub fn send_input(
 /// Replace this process with `tio` on the given device (never returns on
 /// success).
 pub fn exec_tio(device: &str, baud: i64) -> Result<()> {
-    let tio = daemons::find_binary("tio")
-        .ok_or_else(|| anyhow!("tio not found in PATH — install it (e.g. brew install tio)"))?;
+    let tio = daemons::find_binary("tio").ok_or_else(|| {
+        crate::error::PanioloError::not_configured(
+            "tio not found in PATH — install it (e.g. brew install tio)".to_string(),
+        )
+    })?;
     let err = crate::platform::exec_replace(
         Command::new(tio)
             .arg("--baudrate")

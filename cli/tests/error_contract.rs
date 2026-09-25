@@ -33,15 +33,23 @@ fn scratch(name: &str, lab: &str) -> PathBuf {
 }
 
 fn paniolo(dir: &Path, json: bool, args: &[&str]) -> Output {
+    paniolo_env(dir, json, args, &[])
+}
+
+fn paniolo_env(dir: &Path, json: bool, args: &[&str], env: &[(&str, String)]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_paniolo"));
     cmd.arg("--lab")
         .arg(dir.join("lab.toml"))
         .args(args)
         .env("PANIOLO_RUNTIME_BASE", dir.join("run"))
+        .env("XDG_RUNTIME_DIR", dir.join("run"))
         .env_remove("PANIOLO_JSON_ERRORS")
         .env_remove("PANIOLO_LAB");
     if json {
         cmd.env("PANIOLO_JSON_ERRORS", "1");
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
     }
     cmd.output().unwrap()
 }
@@ -283,4 +291,192 @@ fn a_repeated_json_errors_flag_is_accepted() {
     );
     assert_eq!(out.status.code(), Some(3), "{out:?}");
     assert_eq!(error_object(&out)["kind"], "not_configured");
+}
+
+// ── M2: the child boundary ──────────────────────────────────────────────────
+
+fn power_lab(cycle_cmd: &str) -> String {
+    format!("[targets.nuc]\n[targets.nuc.power]\ncycle_cmd = {cycle_cmd:?}\n")
+}
+
+#[test]
+fn a_failing_power_hook_is_helper_failed_with_its_code() {
+    let dir = scratch("hook_7", &power_lab("exit 7"));
+    let out = paniolo(&dir, true, &["power-cycle", "nuc"]);
+    assert_eq!(out.status.code(), Some(101), "{out:?}");
+    let e = error_object(&out);
+    assert_eq!(e["kind"], "helper_failed");
+    assert_eq!(e["child_exit"], 7);
+    assert_eq!(e["target"], "nuc");
+    assert_eq!(e["channel"], "power");
+    // A hook exiting 2 no longer reads as a usage error.
+    let dir = scratch("hook_2", &power_lab("exit 2"));
+    let out = paniolo(&dir, false, &["power-cycle", "nuc"]);
+    assert_eq!(out.status.code(), Some(101), "{out:?}");
+}
+
+#[test]
+fn a_missing_power_hook_is_not_configured() {
+    let dir = scratch("hook_127", &power_lab("/nonexistent/relay-script"));
+    let out = paniolo(&dir, true, &["power-cycle", "nuc"]);
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    let e = error_object(&out);
+    assert_eq!(e["kind"], "not_configured");
+    assert_eq!(e["child_exit"], 127);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hook_killed_by_a_signal_is_helper_failed_without_a_code() {
+    let dir = scratch("hook_sig", &power_lab("kill -TERM $$"));
+    let out = paniolo(&dir, true, &["power-cycle", "nuc"]);
+    assert_eq!(out.status.code(), Some(101), "{out:?}");
+    assert!(error_object(&out)["child_exit"].is_null());
+}
+
+/// A directory with fake `ssh` and `sftp` first on PATH. `sftp` logs its
+/// batch commands to `sftp.log` and succeeds (or fails with STUB_SFTP=fail);
+/// `ssh` records its argv in `ssh.args` and
+/// then behaves per STUB_SSH: `down` is a transport failure (255), `remote3`
+/// is a 0.5 remote paniolo reporting not_configured with its JSON line.
+#[cfg(unix)]
+fn stub_bin(dir: &Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let ssh = format!(
+        r#"#!/bin/sh
+printf '%s\n' "$@" > '{args}'
+cat >/dev/null
+case "$STUB_SSH" in
+  down) echo "ssh: connect to host bench1 port 22: Connection refused" >&2; exit 255 ;;
+  remote3)
+    echo "target 'nuc' not found in lab" >&2
+    echo '{{"error":{{"kind":"not_configured","code":3,"message":"target '"'"'nuc'"'"' not found in lab","target":"nuc","channel":null,"host":null,"child_exit":null}}}}' >&2
+    exit 3 ;;
+esac
+exit 0
+"#,
+        args = dir.join("ssh.args").display()
+    );
+    let sftp = format!(
+        "#!/bin/sh\ncat >> '{log}'\n[ \"$STUB_SFTP\" = fail ] && {{ echo 'Connection closed' >&2; exit 1; }}\nexit 0\n",
+        log = dir.join("sftp.log").display()
+    );
+    for (name, body) in [("ssh", ssh.as_str()), ("sftp", sftp.as_str())] {
+        let p = bin.join(name);
+        std::fs::write(&p, body).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+#[cfg(unix)]
+const REMOTE_LAB: &str = r#"
+[hosts.bench1]
+ssh = "u@bench1"
+[targets.nuc]
+host = "bench1"
+[targets.nuc.power]
+cycle_cmd = "true"
+"#;
+
+#[cfg(unix)]
+#[test]
+fn ssh_transport_failure_is_unreachable_not_255() {
+    let dir = scratch("ssh_down", REMOTE_LAB);
+    let path = stub_bin(&dir);
+    let env = [("PATH", path), ("STUB_SSH", "down".to_string())];
+    let out = paniolo_env(&dir, true, &["power-cycle", "nuc"], &env);
+    assert_eq!(out.status.code(), Some(4), "{out:?}");
+    let e = error_object(&out);
+    assert_eq!(e["kind"], "unreachable");
+    assert_eq!(e["host"], "bench1");
+    assert_eq!(e["target"], "nuc");
+    // A 255 can come from a live host (a remote signal death), so the
+    // shipped slice is still removed.
+    let log = std::fs::read_to_string(dir.join("sftp.log")).unwrap();
+    assert!(log.contains("rm "), "{log}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_missing_sftp_is_not_configured() {
+    let dir = scratch("no_sftp", REMOTE_LAB);
+    let path = stub_bin(&dir);
+    std::fs::remove_file(dir.join("bin").join("sftp")).unwrap();
+    // Only the stub directory: no system sftp to fall back on.
+    let bin = path.split(':').next().unwrap().to_string();
+    let out = paniolo_env(&dir, true, &["power-cycle", "nuc"], &[("PATH", bin)]);
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    assert_eq!(error_object(&out)["kind"], "not_configured");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_slice_copy_is_unreachable() {
+    let dir = scratch("sftp_down", REMOTE_LAB);
+    let path = stub_bin(&dir);
+    let env = [("PATH", path), ("STUB_SFTP", "fail".to_string())];
+    let out = paniolo_env(&dir, true, &["power-cycle", "nuc"], &env);
+    assert_eq!(out.status.code(), Some(4), "{out:?}");
+    assert_eq!(error_object(&out)["host"], "bench1");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_remote_failure_arrives_with_its_code_and_one_json_object() {
+    let dir = scratch("remote3", REMOTE_LAB);
+    let path = stub_bin(&dir);
+    let env = [("PATH", path), ("STUB_SSH", "remote3".to_string())];
+    let out = paniolo_env(&dir, true, &["power-cycle", "nuc"], &env);
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stderr.matches("\"error\"").count(), 1, "{stderr}");
+    assert_eq!(error_object(&out)["kind"], "not_configured");
+    // The request crossed the hop as an argument.
+    let args = std::fs::read_to_string(dir.join("ssh.args")).unwrap();
+    assert!(args.contains("--json-errors"), "{args}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_passthrough_killed_by_a_signal_exits_128_plus_n() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("editor_sig", LAB);
+    let editor = dir.join("editor");
+    std::fs::write(&editor, "#!/bin/sh\nkill -TERM $$\n").unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let env = [("EDITOR", editor.display().to_string())];
+    let out = paniolo_env(&dir, false, &["config", "edit"], &env);
+    assert_eq!(out.status.code(), Some(143), "{out:?}");
+    // And the editor's own status is kept (design D3).
+    std::fs::write(&editor, "#!/bin/sh\nexit 5\n").unwrap();
+    let out = paniolo_env(&dir, false, &["config", "edit"], &env);
+    assert_eq!(out.status.code(), Some(5), "{out:?}");
+}
+
+/// Hooks do not inherit the JSON request (design D1, review N1): a hook that
+/// ran paniolo would print its own object ahead of ours. The hook exits 9 if
+/// it can see the variable, 7 otherwise.
+#[test]
+fn hooks_do_not_inherit_the_json_request() {
+    let hook = r#"[ -n "$PANIOLO_JSON_ERRORS" ] && exit 9; exit 7"#;
+    for (name, json, args) in [
+        ("inherit_var", true, vec!["power-cycle", "nuc"]),
+        (
+            "inherit_flag",
+            false,
+            vec!["--json-errors", "power-cycle", "nuc"],
+        ),
+    ] {
+        let dir = scratch(name, &power_lab(hook));
+        let out = paniolo(&dir, json, &args);
+        assert_eq!(out.status.code(), Some(101), "{out:?}");
+        assert_eq!(error_object(&out)["child_exit"], 7, "{name}");
+    }
 }

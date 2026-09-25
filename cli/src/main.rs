@@ -898,12 +898,10 @@ fn main() {
         Ok(cli) => cli,
         Err(e) => std::process::exit(error::report_parse_error(&e, &args)),
     };
-    if cli.json_errors {
-        // Single-threaded here, before any child is spawned. Setting the
-        // variable (not just a flag) lets hooks that call paniolo inherit it;
-        // dispatch turns it back into `--json-errors` for a remote paniolo.
-        std::env::set_var(error::JSON_ERRORS_ENV, "1");
-    }
+    // Single-threaded here, before any child is spawned: record the request
+    // and drop the variable, so no hook or helper inherits it (one JSON
+    // object per failure). Dispatch passes `--json-errors` to a remote.
+    error::take_json_request(cli.json_errors);
     if let Err(e) = run(cli) {
         // `report` prints the full `.context()` chain (`{e:#}`), not just the
         // outermost message — a bare `{e}` drops every cause a command added
@@ -1258,7 +1256,13 @@ fn cmd_daemons_stop(names: &[String], all: bool, force: bool) -> Result<()> {
         }
     }
     if failed || (!force && !pending.is_empty()) {
-        std::process::exit(1);
+        // Not a "negative answer" (exit 1 under the error contract): some
+        // daemon the caller asked to stop is still running.
+        return Err(error::PanioloError::new(
+            error::Kind::Internal,
+            "not every daemon was stopped (see above)",
+        )
+        .into());
     }
     Ok(())
 }
@@ -1323,7 +1327,11 @@ fn cmd_daemons_restart(
         }
     }
     if failures > 0 {
-        std::process::exit(1);
+        return Err(error::PanioloError::new(
+            error::Kind::Internal,
+            format!("{failures} daemon restart(s) failed (see above)"),
+        )
+        .into());
     }
     Ok(())
 }
@@ -1536,8 +1544,11 @@ fn cmd_helper(name: Option<&str>, args: &[String]) -> Result<()> {
         }
         return Ok(());
     };
-    let binary = daemons::find_binary(name)
-        .ok_or_else(|| anyhow!("helper '{name}' not found — run `paniolo setup`"))?;
+    let binary = daemons::find_binary(name).ok_or_else(|| {
+        crate::error::PanioloError::not_configured(format!(
+            "helper '{name}' not found — run `paniolo setup`"
+        ))
+    })?;
     // State/runtime dirs are keyed by helper name, except channel daemons
     // whose discovery name is the channel (any conforming helper may serve
     // it): hidrig publishes under "hid".
@@ -1557,7 +1568,9 @@ fn cmd_helper(name: Option<&str>, args: &[String]) -> Result<()> {
         .envs(daemons::helper_env(&env_name, None))
         .status()?;
     if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+        // A passthrough (design D3): the caller asked for this helper's own
+        // status, so it is kept; only a signal death is rewritten (128+N).
+        std::process::exit(error::shell_code(status));
     }
     Ok(())
 }
@@ -1733,6 +1746,9 @@ fn cmd_setup(lab_flag: Option<&str>, host: Option<&str>, rust_only: bool) -> Res
                 argv.push("--rust-only".to_string());
             }
             let code = ssh::run_interactive(&resolved, &argv)?;
+            if code == error::SSH_TRANSPORT_FAILURE {
+                return Err(error::unreachable_host(name, error::ssh_255_message(name)).into());
+            }
             std::process::exit(code);
         }
         eprintln!("'{name}' is the local machine; setting up here.");
@@ -1853,8 +1869,16 @@ fn config_edit(lab_flag: Option<&str>) -> Result<()> {
     let status = std::process::Command::new(prog)
         .args(parts)
         .arg(&path)
-        .status()?;
-    std::process::exit(status.code().unwrap_or(1));
+        .status()
+        .map_err(|e| -> anyhow::Error {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                error::PanioloError::not_configured(format!("editor '{prog}' not found")).into()
+            } else {
+                e.into()
+            }
+        })?;
+    // A passthrough (design D3): the editor's own status.
+    std::process::exit(error::shell_code(status));
 }
 
 fn config_show(lab_flag: Option<&str>) -> Result<()> {
@@ -2214,12 +2238,21 @@ fn serial_cmd(lab_flag: Option<&str>, cmd: SerialCmd) -> Result<()> {
                     return Ok(());
                 }
             }
-            let code = serial::stop_daemon(&target)?;
-            if code == 0 {
+            let status = serial::stop_daemon(&target)?;
+            if status.success() {
                 println!("Serial daemon for '{target}' stopped.");
                 Ok(())
             } else {
-                std::process::exit(code);
+                Err(error::hook_failed(
+                    status,
+                    format!(
+                        "serialcap stop exited with code {}",
+                        error::shell_code(status)
+                    ),
+                )
+                .target(&target)
+                .channel("serial")
+                .into())
             }
         }
         SerialCmd::Send {
@@ -2909,11 +2942,16 @@ fn run_power_hook(cmd: &str, label: &str, target: &str) -> Result<()> {
     if status.success() {
         Ok(())
     } else {
-        eprintln!(
-            "{label} script exited with code {}",
-            status.code().unwrap_or(1)
-        );
-        std::process::exit(status.code().unwrap_or(1));
+        Err(error::hook_failed(
+            status,
+            format!(
+                "{label} script exited with code {}",
+                error::shell_code(status)
+            ),
+        )
+        .target(target)
+        .channel("power")
+        .into())
     }
 }
 
@@ -3024,10 +3062,16 @@ fn cmd_power_state(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             let stdout = String::from_utf8_lossy(&out.stdout);
-            bail!(
-                "state_cmd '{cmd}' exited with code {} — stdout: {stdout} stderr: {stderr}",
-                out.status.code().unwrap_or(1)
-            );
+            return Err(error::hook_failed(
+                out.status,
+                format!(
+                    "state_cmd '{cmd}' exited with code {} — stdout: {stdout} stderr: {stderr}",
+                    error::shell_code(out.status)
+                ),
+            )
+            .target(&target)
+            .channel("power")
+            .into());
         }
         let text = String::from_utf8_lossy(&out.stdout);
         let token = text
@@ -3257,8 +3301,11 @@ fn cmd_serial_log(
     let (target, serials) = serial_runtime(lab_flag, target, interface, dispatch::Mode::Reexec)?;
     // serialcap reads its own on-disk log, so this works daemon-up or -down.
     // The per-target env points it at this target's capture dir.
-    let binary = daemons::find_binary(serial::DAEMON)
-        .ok_or_else(|| anyhow!("serialcap not found — run `paniolo setup`"))?;
+    let binary = daemons::find_binary(serial::DAEMON).ok_or_else(|| {
+        crate::error::PanioloError::not_configured(
+            "serialcap not found — run `paniolo setup`".to_string(),
+        )
+    })?;
     let mut cmd = std::process::Command::new(binary);
     cmd.arg("log");
     cmd.envs(daemons::helper_env(serial::DAEMON, Some(&target)));
@@ -3297,7 +3344,16 @@ fn cmd_serial_log(
     if status.success() {
         Ok(())
     } else {
-        std::process::exit(status.code().unwrap_or(1));
+        Err(error::hook_failed(
+            status,
+            format!(
+                "serialcap log exited with code {}",
+                error::shell_code(status)
+            ),
+        )
+        .target(&target)
+        .channel("serial")
+        .into())
     }
 }
 
@@ -3509,12 +3565,21 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
                     return Ok(());
                 }
             }
-            let code = video::stop_daemon(&target)?;
-            if code == 0 {
+            let status = video::stop_daemon(&target)?;
+            if status.success() {
                 println!("Video daemon for '{target}' stopped.");
                 Ok(())
             } else {
-                std::process::exit(code);
+                Err(error::hook_failed(
+                    status,
+                    format!(
+                        "hdmicap stop exited with code {}",
+                        error::shell_code(status)
+                    ),
+                )
+                .target(&target)
+                .channel("video")
+                .into())
             }
         }
         VideoCmd::Shot {
@@ -4104,8 +4169,8 @@ fn usb_cmd(lab_flag: Option<&str>, cmd: UsbCmd) -> Result<()> {
     }
 }
 
-/// Run the target's usb helper as `<cmd> usb <verb>`, propagating its exit
-/// code. paniolo stays agnostic to the helper, like the power hooks — but the
+/// Run the target's usb helper as `<cmd> usb <verb>`; a failure is
+/// `helper_failed` with the helper's code in `child_exit`. paniolo stays agnostic to the helper, like the power hooks — but the
 /// vocabulary is fixed rather than passed through, so a constrained remote
 /// host only ever sees the three verbs.
 ///
@@ -4167,7 +4232,13 @@ fn cmd_usb_run(lab_flag: Option<&str>, target: Option<&str>, verb: &str) -> Resu
         .envs(daemons::helper_env(HID_DAEMON, Some(&target)))
         .status()?;
     if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+        return Err(error::hook_failed(
+            status,
+            format!("usb helper exited with code {}", error::shell_code(status)),
+        )
+        .target(&target)
+        .channel("usb")
+        .into());
     }
     Ok(())
 }
@@ -4295,12 +4366,22 @@ fn cmd_hid_stop(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
         .envs(daemons::helper_env(HID_DAEMON, Some(&target)))
         .status()?;
     if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+        return Err(error::hook_failed(
+            status,
+            format!(
+                "hid helper stop exited with code {}",
+                error::shell_code(status)
+            ),
+        )
+        .target(&target)
+        .channel("hid")
+        .into());
     }
     Ok(())
 }
 
-/// Run the target's hid helper with `args` appended, propagating its exit code.
+/// Run the target's hid helper with `args` appended; a failure is
+/// `helper_failed` with the helper's code in `child_exit`.
 /// Paniolo is agnostic to the helper's CLI — the configured cmd owns it (see
 /// docs/hid.md), exactly like the power hooks.
 fn cmd_hid_send(lab_flag: Option<&str>, target: Option<&str>, args: &[String]) -> Result<()> {
@@ -4352,7 +4433,13 @@ fn cmd_hid_send(lab_flag: Option<&str>, target: Option<&str>, args: &[String]) -
         .envs(daemons::helper_env(HID_DAEMON, Some(&target)))
         .status()?;
     if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+        return Err(error::hook_failed(
+            status,
+            format!("hid helper exited with code {}", error::shell_code(status)),
+        )
+        .target(&target)
+        .channel("hid")
+        .into());
     }
     Ok(())
 }
@@ -4527,7 +4614,11 @@ fn cmd_adb_devices(lab_flag: Option<&str>, host: Option<&str>) -> Result<()> {
     }
     let mut argv = vec![adb::DEFAULT_ADB.to_string()];
     argv.extend(rest);
-    std::process::exit(ssh::run_passthrough(&resolved, &argv, &[])?);
+    let code = ssh::run_passthrough(&resolved, &argv, &[])?;
+    if code == error::SSH_TRANSPORT_FAILURE {
+        return Err(error::unreachable_host(host, error::ssh_255_message(host)).into());
+    }
+    std::process::exit(code);
 }
 
 // ── rendering helpers ───────────────────────────────────────────────────────

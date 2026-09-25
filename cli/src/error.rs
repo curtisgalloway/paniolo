@@ -10,9 +10,12 @@ use std::fmt;
 
 use serde_json::json;
 
-/// Set to `1` to request the JSON error object. The global `--json-errors`
-/// flag sets it for this process (so hooks that call paniolo inherit it), and
-/// dispatch passes `--json-errors` to the remote paniolo when it is set.
+/// Set to `1` to request the JSON error object (or pass `--json-errors`).
+/// Read once at startup by [`take_json_request`] and then removed from this
+/// process's environment, so hooks, helpers and daemons never inherit it: a
+/// hook that runs paniolo would otherwise print its own object ahead of this
+/// process's, and the contract is exactly one. Dispatch passes
+/// `--json-errors` to a remote paniolo instead.
 pub const JSON_ERRORS_ENV: &str = "PANIOLO_JSON_ERRORS";
 
 /// What went wrong, in the house exit-code bands.
@@ -24,7 +27,6 @@ pub enum Kind {
     /// or host; a hook or helper that is missing or not executable.
     NotConfigured,
     /// A control host or a configured device that cannot be reached.
-    #[allow(dead_code)]
     Unreachable,
     /// No answer within a deadline; the outcome is unknown.
     #[allow(dead_code)]
@@ -33,7 +35,6 @@ pub enum Kind {
     #[allow(dead_code)]
     DaemonDown,
     /// A hook or helper ran and exited non-zero.
-    #[allow(dead_code)]
     HelperFailed,
     /// Any failure not yet classified.
     Internal,
@@ -105,13 +106,11 @@ impl PanioloError {
         self
     }
 
-    #[allow(dead_code)]
     pub fn host(mut self, host: impl Into<String>) -> Self {
         self.host = Some(host.into());
         self
     }
 
-    #[allow(dead_code)]
     pub fn child_exit(mut self, code: Option<i32>) -> Self {
         self.child_exit = code;
         self
@@ -131,6 +130,60 @@ pub fn channel_missing(target: &str, channel: &str, message: String) -> PanioloE
     PanioloError::not_configured(message)
         .target(target)
         .channel(channel)
+}
+
+/// A child's exit status the way a shell reports it: its code, or 128+N when
+/// signal N killed it. Never the -1 (seen as 255, ssh's own failure code) that
+/// `status.code().unwrap_or(-1)` produced for a killed child. Passthroughs
+/// (design D3) exit with this unchanged.
+pub fn shell_code(status: std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return 128 + sig;
+        }
+    }
+    1
+}
+
+/// A hook or helper that ran and failed, from its exit status. 126 (not
+/// executable) and 127 (not found) mean the lab points at something that is
+/// not there: `not_configured`. Anything else is `helper_failed`, with the
+/// child's code in `child_exit` (null when a signal killed it).
+pub fn hook_failed(status: std::process::ExitStatus, message: String) -> PanioloError {
+    let kind = match status.code() {
+        Some(126 | 127) => Kind::NotConfigured,
+        _ => Kind::HelperFailed,
+    };
+    PanioloError::new(kind, message).child_exit(status.code())
+}
+
+/// A bundled helper binary (serialcap, hdmicap, …) that is not installed.
+pub fn helper_missing(name: &str) -> PanioloError {
+    PanioloError::not_configured(format!("{name} not found"))
+}
+
+/// ssh's own failure code, as opposed to the remote command's.
+pub const SSH_TRANSPORT_FAILURE: i32 = 255;
+
+/// The message for ssh's 255 from `host`: OpenSSH exits 255 when the
+/// connection fails and also when the remote command is killed by a signal,
+/// so the outcome is unknown.
+pub fn ssh_255_message(host: &str) -> String {
+    format!(
+        "ssh to control host '{host}' exited 255: the host is unreachable or the \
+         remote command was killed; its outcome is unknown"
+    )
+}
+
+/// The control host `host` could not be reached (ssh exited 255, or the lab
+/// slice could not be copied to it).
+pub fn unreachable_host(host: &str, message: String) -> PanioloError {
+    PanioloError::new(Kind::Unreachable, message).host(host)
 }
 
 impl fmt::Display for PanioloError {
@@ -161,9 +214,26 @@ pub fn classify(err: &anyhow::Error) -> PanioloError {
     PanioloError::new(Kind::Internal, message)
 }
 
-/// Whether the JSON error object was requested for this process.
-pub fn json_requested() -> bool {
+static JSON_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn env_requests_json() -> bool {
     std::env::var_os(JSON_ERRORS_ENV).is_some_and(|v| v == "1")
+}
+
+/// Record whether this process was asked for the JSON object (`flag`, or
+/// [`JSON_ERRORS_ENV`]) and remove the variable from the environment so no
+/// child inherits it. Call once, from `main`, before anything is spawned.
+pub fn take_json_request(flag: bool) {
+    let requested = flag || env_requests_json();
+    JSON_REQUESTED.store(requested, std::sync::atomic::Ordering::Relaxed);
+    std::env::remove_var(JSON_ERRORS_ENV);
+}
+
+/// Whether the JSON error object was requested for this process. Before
+/// [`take_json_request`] (a command-line parse failure) the variable is
+/// still in the environment and is read directly.
+pub fn json_requested() -> bool {
+    JSON_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) || env_requests_json()
 }
 
 /// A command-line parse failure (clap's error, exit 2). Clap's own text goes
@@ -263,6 +333,36 @@ mod tests {
         let lab = anyhow::Error::new(crate::model::LabError("bad".into()));
         assert_eq!(classify(&lab).kind, Kind::NotConfigured);
         assert_eq!(classify(&anyhow::anyhow!("boom")).kind, Kind::Internal);
+    }
+
+    #[cfg(unix)]
+    fn status(raw: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(raw)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_code_reports_signals_as_128_plus_n() {
+        assert_eq!(shell_code(status(7 << 8)), 7);
+        assert_eq!(shell_code(status(15)), 143, "SIGTERM");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_failed_classifies_by_status() {
+        let e = hook_failed(status(7 << 8), "m".into());
+        assert_eq!((e.kind, e.child_exit), (Kind::HelperFailed, Some(7)));
+        let e = hook_failed(status(127 << 8), "m".into());
+        assert_eq!((e.kind, e.child_exit), (Kind::NotConfigured, Some(127)));
+        let e = hook_failed(status(9), "m".into());
+        assert_eq!((e.kind, e.child_exit), (Kind::HelperFailed, None));
+        let e = hook_failed(status(200 << 8), "m".into());
+        assert_eq!(
+            (e.kind, e.child_exit),
+            (Kind::HelperFailed, Some(200)),
+            "a real exit code of 128 or more is kept, not read as a signal"
+        );
     }
 
     #[test]

@@ -98,7 +98,7 @@ success output where one does not already exist.
 | 1 | — | completed with a negative answer only: `doctor` found problems (the only such command today). **No longer "any error".** |
 | 2 | `usage` | bad flags or arguments (clap, unchanged) |
 | 3 | `not_configured` | no lab file, lab invalid (`LabError`), unknown target, channel, interface or host; a hook or helper binary missing or not executable (child 126/127) |
-| 4 | `unreachable` | control host not reachable (ssh 255 from a dispatch); a configured device node absent |
+| 4 | `unreachable` | control host not reachable: the lab slice could not be copied to it, or ssh exited 255 (which OpenSSH also does when the remote command is killed, so the outcome is unknown); a configured device node absent |
 | 22 | `timeout` | no answer within a deadline; outcome unknown, so check state before retrying a mutation |
 | 100 | `daemon_down` | the channel's daemon (serialcap, hdmicap, hid, netbootd) is not running and the command needs it |
 | 101 | `helper_failed` | a hook or helper ran and exited non-zero; its code is in `child_exit` |
@@ -145,10 +145,14 @@ always present (null when unknown) so a consumer need not probe.
 ## Decisions
 
 - **D1 — how JSON errors are requested: env var `PANIOLO_JSON_ERRORS=1`, or
-  the global `--json-errors` flag, which sets the variable for this process.**
+  the global `--json-errors` flag, which has the same effect.**
   (Approved 2026-09-24.) The flag cannot be called `--json`: five subcommands
-  already own that name. The variable reaches nested invocations (hooks that
-  call paniolo). **Across dispatch the request travels as the
+  already own that name. paniolo reads the variable once at startup and then
+  removes it from its own environment, so hooks, helpers and daemons do not
+  inherit it (changed during M2, review finding N1: a hook that runs paniolo
+  would otherwise print its own object ahead of the outer one, breaking R2's
+  "exactly one"). A hook that wants JSON from a nested paniolo sets the
+  variable itself. **Across dispatch the request travels as the
   `--json-errors` argument, not the variable** (changed during M1): the
   `FORWARDED_ENV` prelude needs a POSIX shell on the control host, so a
   Windows host would fail the whole command, and interactive dispatch skips

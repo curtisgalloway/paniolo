@@ -402,7 +402,7 @@ pub fn run(
     };
     let out = launch(cmd, argv, env, source)?.wait_with_output()?;
     Ok(Output {
-        status: out.status.code().unwrap_or(-1),
+        status: crate::error::shell_code(out.status),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     })
@@ -419,7 +419,7 @@ pub fn run_passthrough(
 ) -> std::io::Result<i32> {
     let cmd = ssh_command(host, false)?;
     let status = launch(cmd, argv, env, StdinSource::Inherit)?.wait()?;
-    Ok(status.code().unwrap_or(-1))
+    Ok(crate::error::shell_code(status))
 }
 
 /// Run `argv` on `host` with stdout redirected into `sink` (stderr and stdin
@@ -435,7 +435,7 @@ pub fn run_stdout_to(
     let mut cmd = ssh_command(host, false)?;
     cmd.stdout(Stdio::from(sink));
     let status = launch(cmd, argv, env, StdinSource::Inherit)?.wait()?;
-    Ok(status.code().unwrap_or(-1))
+    Ok(crate::error::shell_code(status))
 }
 
 /// Run `argv` on `host` over an `ssh -t` PTY (for interactive tools like tio).
@@ -450,7 +450,7 @@ pub fn run_interactive(host: &Host, argv: &[String]) -> std::io::Result<i32> {
     let status = ssh_command(host, true)?
         .arg(remote_command(argv, &[]))
         .status()?;
-    Ok(status.code().unwrap_or(-1))
+    Ok(crate::error::shell_code(status))
 }
 
 /// A held `ssh -L` tunnel to a port on `host`; killed on drop.
