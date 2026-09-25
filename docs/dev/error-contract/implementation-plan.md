@@ -33,7 +33,7 @@ Project checks (from `cli/`): `cargo fmt --check`, `cargo clippy --all-targets
 |----|---------|--------------|--------|
 | M1 | Error type, `main()` mapping, JSON object, not_configured/internal | — | complete ([evidence](evidence/M1.md)) |
 | M2 | Child boundary: hooks, dispatch, passthroughs | M1 | complete ([evidence](evidence/M2.md)) |
-| M3 | daemon_down, timeout, unreachable device; `serial log --require-live` | M1 | pending |
+| M3 | daemon_down, timeout, unreachable device; `serial log --require-live` | M1 | complete ([evidence](evidence/M3.md)) |
 | M4 | Docs, `--help`, skill, evals; final verification incl. R6 on hardware | M2, M3 | pending |
 | M5 | Release 0.5.0 through `RELEASE-TRAIN.md` | M4, user's push go-ahead | pending |
 
@@ -67,16 +67,17 @@ paths other than power are covered by construction, not by integration tests
 (they need real helpers). Design D1 changed: hooks no longer inherit
 `PANIOLO_JSON_ERRORS` (review N1, user decision).
 
-## M3 — Daemons, timeouts, device nodes, `serial log`
+## M3 — Daemons, timeouts, `serial log`
 
-**Outcome:** `serial send` with serialcap stopped → 100 (`channel: serial`);
-same for hdmicap/hid/netbootd checks; the forwarded-port and other waits →
-22; an absent configured device node → 4; `serial log` with serialcap
-stopped prints a warning and exits 0, and with `--require-live` exits 100.
-**Design coverage:** R1 (daemon_down, timeout, unreachable), D4.
-**Dependencies:** M1. **First step:** inventory the daemon-down, timeout and
-device-node sites (`rg` over `cli/src`) and list them in the evidence file.
-**Status:** pending.
+**Outcome:** a stopped or stale daemon exits 100; a daemon still starting
+at its deadline, or a timed-out daemon request or port forward, exits 22; a
+daemon that exited non-zero during startup or answered an error status exits
+101; `serial log` warns when serialcap is stopped and `--require-live` makes
+it exit 100. No exit 4 for device nodes (paniolo never probes them).
+**Status:** complete — [evidence](evidence/M3.md). **Open limitations:** the
+untracked-daemon case of `serial log` is covered by construction, not by a
+test. A non-timeout transport error to a daemon (connection reset) is still
+`internal`.
 
 ## M4 — Documentation and final verification
 
@@ -105,9 +106,11 @@ schedule. After `apt upgrade` on a control host: `paniolo daemons restart
 
 ## Next session
 
-M2 complete (checkpoint commit `cli: error contract M2 — the child
-boundary`). Next: **M3 — daemons, timeouts, device nodes, `serial log`**, on
-branch `error-contract`. Its first step is the inventory of daemon-down,
-timeout and device-node sites. Read the design (D4), the M3 section above and
-`cli/src/error.rs`. Build with the rustup toolchain (`~/.cargo/bin/cargo`; a
-distro cargo may lack rustfmt/clippy).
+M3 complete (checkpoint commit `cli: error contract M3 — daemons, timeouts,
+serial log`). Next: **M4 — documentation and final verification**, on branch
+`error-contract`. Read the design (the code table is the contract to
+document), the M4 section above, the three evidence files, and AGENTS.md's
+"Before opening a PR" checklist (docs, `--help`, `skills/paniolo/SKILL.md`,
+evals). The hardware part (R6 and the consumer's cases on a control host)
+needs a control host running this build. Build with the rustup toolchain
+(`~/.cargo/bin/cargo`).

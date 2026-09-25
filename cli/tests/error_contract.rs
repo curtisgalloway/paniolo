@@ -173,17 +173,56 @@ fn clap_usage_errors_exit_2_with_a_usage_object() {
     assert!(!String::from_utf8_lossy(&out.stderr).contains("\"error\""));
 }
 
-/// Not yet classified: the stopped-daemon check. M3 of the plan moves it to
-/// `daemon_down` (100); until then it is the standing example of `internal`.
+/// The stopped-daemon check (was the M1 example of `internal`).
 #[test]
-fn unclassified_error_is_internal() {
+fn a_stopped_serial_daemon_is_daemon_down() {
     expect(
-        "internal",
+        "serial_down",
         &["serial", "send", "-t", "dut", "hello"],
-        109,
-        "internal",
-        None,
-        None,
+        100,
+        "daemon_down",
+        Some("dut"),
+        Some("serial"),
+    );
+}
+
+/// `serial log` still reads the on-disk log with the daemon stopped, but says
+/// so on stderr; `--require-live` refuses instead (design D4).
+#[test]
+fn serial_log_warns_when_the_daemon_is_stopped_and_can_require_it() {
+    expect(
+        "log_live",
+        &["serial", "log", "-t", "dut", "--require-live"],
+        100,
+        "daemon_down",
+        Some("dut"),
+        Some("serial"),
+    );
+    let dir = scratch("log_warn", LAB);
+    let out = paniolo(&dir, false, &["serial", "log", "-t", "dut"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.starts_with("warning: serialcap daemon for 'dut' is not running"),
+        "{stderr}"
+    );
+    // Whatever serialcap then does on this machine, it is not refused.
+    assert_ne!(out.status.code(), Some(100), "{out:?}");
+}
+
+#[test]
+fn a_missing_required_argument_names_it() {
+    let dir = scratch("missing_arg", LAB);
+    let out = paniolo(&dir, true, &["hid", "set", "-t", "dut"]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert_eq!(
+        error_object(&out)["message"],
+        "the following required arguments were not provided: --cmd <CMD>"
+    );
+    // Several missing: all named, not just the first.
+    let out = paniolo(&dir, true, &["serial", "add", "-t", "dut"]);
+    assert_eq!(
+        error_object(&out)["message"],
+        "the following required arguments were not provided: --device <DEVICE>, <NAME>"
     );
 }
 

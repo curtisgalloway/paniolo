@@ -506,7 +506,11 @@ pub fn forward(host: &Host, remote_port: u16) -> anyhow::Result<Forward> {
         }
         if std::time::Instant::now() > deadline {
             let _ = child.kill();
-            bail!("timed out waiting for forwarded port {local_port}");
+            return Err(crate::error::PanioloError::new(
+                crate::error::Kind::Timeout,
+                format!("timed out waiting for forwarded port {local_port}"),
+            )
+            .into());
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }

@@ -98,10 +98,10 @@ success output where one does not already exist.
 | 1 | — | completed with a negative answer only: `doctor` found problems (the only such command today). **No longer "any error".** |
 | 2 | `usage` | bad flags or arguments (clap, unchanged) |
 | 3 | `not_configured` | no lab file, lab invalid (`LabError`), unknown target, channel, interface or host; a hook or helper binary missing or not executable (child 126/127) |
-| 4 | `unreachable` | control host not reachable: the lab slice could not be copied to it, or ssh exited 255 (which OpenSSH also does when the remote command is killed, so the outcome is unknown); a configured device node absent |
-| 22 | `timeout` | no answer within a deadline; outcome unknown, so check state before retrying a mutation |
-| 100 | `daemon_down` | the channel's daemon (serialcap, hdmicap, hid, netbootd) is not running and the command needs it |
-| 101 | `helper_failed` | a hook or helper ran and exited non-zero; its code is in `child_exit` |
+| 4 | `unreachable` | control host not reachable: the lab slice could not be copied to it, or ssh exited 255 (which OpenSSH also does when the remote command is killed, so the outcome is unknown). paniolo itself never probes device nodes, so it does not emit 4 for one: a daemon that cannot open its device fails to start (22) or answers with an error (101) |
+| 22 | `timeout` | no answer within a deadline — a daemon still starting when its deadline passed, a daemon request that timed out, an ssh port forward that never opened; outcome unknown, so check state before retrying a mutation |
+| 100 | `daemon_down` | the channel's daemon (serialcap, hdmicap) is not running and the command needs it, or its discovery record is stale (connection refused) |
+| 101 | `helper_failed` | a hook or helper ran and exited non-zero (its code is in `child_exit`), a daemon exited non-zero during startup (its code in `child_exit`, its last stderr in the message), or a running daemon refused a request with an error status (its reason is the message) |
 | 109 | `internal` | any failure not yet classified (D2) |
 
 No other `1xx` codes are proposed. Adding one later is compatible; changing a
@@ -160,7 +160,8 @@ always present (null when unknown) so a consumer need not probe.
   internal sub-runs (`dispatch::run_subcommand`) do not pass it, since the
   local paniolo reads their output and reports the failure itself. Clap
   parse errors (exit 2) also get the object when requested, with clap's first
-  line as `message`.
+  line as `message` (plus the arguments it names when that line ends in `:`;
+  "a subcommand is required" when clap shows a group's help instead).
 - **D2 — unclassified errors. Recommend: 109 `internal`.** Keeping 1 would blur
   "negative answer" (R1) and hide unclassified sites. 109 makes them visible,
   and the milestones shrink that set. *Cost:* any script testing `== 1` for
@@ -172,12 +173,13 @@ always present (null when unknown) so a consumer need not probe.
   (unknown target, unreachable host) use the contract. A signal-killed child
   exits 128+N as a shell would, not 255. *Alternative:* wrap every non-zero as
   101 — hides the status callers asked for.
-- **D4 — `serial log` with the daemon stopped. Recommend: keep rc 0, print a
-  warning on stderr (`serialcap daemon not running; showing the log as of
-  <mtime>`), and add `--require-live` that makes it exit 100 instead.** This
-  keeps current readers working and gives the consumer a way to ask. *Needs the
-  user's call*: the other options are "always 100" (breaks readers of old logs)
-  or "leave unchanged".
+- **D4 — `serial log` with the daemon stopped: keep rc 0 and print a warning
+  on stderr (`warning: serialcap daemon for '<t>' is not running — the log
+  shows nothing captured since it stopped …`), and `--require-live` makes it
+  exit 100 instead.** (Approved 2026-09-24; implemented in M3. The warning
+  names the gap rather than the log's modification time, which paniolo does
+  not read.) Current readers keep working, and a consumer can ask for a
+  live daemon.
 - **D5 — version skew.** Without JSON requested, a 0.4.x remote paniolo exits
   1 for any error, which the local side cannot tell from a negative answer.
   With JSON requested, a 0.4.x remote rejects the forwarded `--json-errors`
@@ -189,8 +191,13 @@ always present (null when unknown) so a consumer need not probe.
 ## Cross-cutting concerns
 
 - **Compatibility:** exit 1 → 3/4/100/101/109 for errors is a breaking change
-  for scripts matching `== 1`. Message text does not change, so eval scenarios
-  asserting text keep passing; scenarios asserting rc 1 must be updated.
+  for scripts matching `== 1`. Message text mostly does not change, so eval
+  scenarios asserting text keep passing; scenarios asserting rc 1 must be
+  updated. The exceptions (M2/M3): a failing daemon request (`serialcap
+  /input`, `/button`, the stable-frame wait before OCR) now reports the
+  daemon's own explanation instead of the HTTP library's status line; hook
+  and daemon-stop failures print one `… exited with code N` line; `serial
+  log` with the daemon stopped adds a `warning:` line on stderr.
 - **Public repo:** tests and docs use `bench1`, `nuc`, `192.0.2.10`.
 - **Consumer follow-up:** when released, tell the user the version. The
   consumer (`bringup-kit`, `classify_failure` on branch `m6-paniolo-adapter`)

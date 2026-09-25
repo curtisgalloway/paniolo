@@ -26,13 +26,12 @@ pub enum Kind {
     /// No lab file, an invalid one, or an unknown target, channel, interface
     /// or host; a hook or helper that is missing or not executable.
     NotConfigured,
-    /// A control host or a configured device that cannot be reached.
+    /// A control host that cannot be reached (paniolo does not probe device
+    /// nodes itself; the daemons report those).
     Unreachable,
     /// No answer within a deadline; the outcome is unknown.
-    #[allow(dead_code)]
     Timeout,
     /// The channel's daemon is not running and the command needs it.
-    #[allow(dead_code)]
     DaemonDown,
     /// A hook or helper ran and exited non-zero.
     HelperFailed,
@@ -117,6 +116,22 @@ impl PanioloError {
     }
 }
 
+/// Fill in the `target` of a classified error that was raised without one
+/// (a lower layer that does not know the target name); any other error is
+/// returned unchanged. Call it on the error as the lower layer returned it:
+/// the by-value downcast would drop `.context()` added on top.
+pub fn with_target(err: anyhow::Error, target: &str) -> anyhow::Error {
+    match err.downcast::<PanioloError>() {
+        Ok(mut e) => {
+            if e.target.is_none() {
+                e.target = Some(target.to_string());
+            }
+            e.into()
+        }
+        Err(other) => other,
+    }
+}
+
 /// `target '<t>' not found in lab`, classified.
 pub fn target_not_found(target: &str) -> PanioloError {
     PanioloError::not_configured(format!("target '{target}' not found in lab")).target(target)
@@ -165,6 +180,92 @@ pub fn hook_failed(status: std::process::ExitStatus, message: String) -> Paniolo
 /// A bundled helper binary (serialcap, hdmicap, …) that is not installed.
 pub fn helper_missing(name: &str) -> PanioloError {
     PanioloError::not_configured(format!("{name} not found"))
+}
+
+/// The channel a paniolo daemon serves, for the JSON `channel` field.
+pub fn daemon_channel(daemon: &str) -> &str {
+    match daemon {
+        "serialcap" => "serial",
+        "hdmicap" => "video",
+        "netbootd" => "netboot",
+        other => other,
+    }
+}
+
+/// `daemon` (serialcap, hdmicap, …) is not running and the command needs it.
+pub fn daemon_down(daemon: &str, message: impl Into<String>) -> PanioloError {
+    PanioloError::new(Kind::DaemonDown, message).channel(daemon_channel(daemon))
+}
+
+/// A daemon did not become ready within its start deadline (the caller puts
+/// the deadline and the daemon's last stderr in `message`) and is still
+/// running: `timeout`, since it may yet come up.
+pub fn daemon_start_timeout(daemon: &str, message: String) -> PanioloError {
+    PanioloError::new(Kind::Timeout, message).channel(daemon_channel(daemon))
+}
+
+/// A failed HTTP request to a running daemon's discovery endpoint, classified:
+/// a refused connection means the discovery record outlived the daemon
+/// (`daemon_down`); a connect or read that timed out leaves the outcome
+/// unknown (`timeout`); an error status is the daemon refusing the request
+/// (`helper_failed`, with the daemon's own explanation, stripped of control
+/// characters and capped, since whatever answers on a stale port is not
+/// authenticated). `what` names the request (`"serialcap /input"`).
+pub fn daemon_request_failed(daemon: &str, what: &str, e: ureq::Error) -> PanioloError {
+    let kind = match &e {
+        ureq::Error::Status(..) => Kind::HelperFailed,
+        ureq::Error::Transport(t) => match t.kind() {
+            // ureq reports a connect that hit its deadline as ConnectionFailed
+            // too; the io error underneath tells the two apart.
+            ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Io if is_timeout(t) => {
+                Kind::Timeout
+            }
+            ureq::ErrorKind::ConnectionFailed => Kind::DaemonDown,
+            _ => Kind::Internal,
+        },
+    };
+    let message = match e {
+        ureq::Error::Status(code, resp) => {
+            let body = printable(resp.into_string().unwrap_or_default().trim());
+            match body.trim() {
+                "" => format!("{what} failed: daemon returned status {code}"),
+                msg => format!("{what} failed: {msg}"),
+            }
+        }
+        e => format!("{what} failed: {e}"),
+    };
+    PanioloError::new(kind, message).channel(daemon_channel(daemon))
+}
+
+/// `s` with control characters (ANSI escapes included) replaced by spaces
+/// and cut to [`BODY_LIMIT`] characters, for text from a daemon that is going
+/// to a terminal.
+fn printable(s: &str) -> String {
+    let mut out: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(BODY_LIMIT)
+        .collect();
+    if s.chars().count() > BODY_LIMIT {
+        out.push('…');
+    }
+    out
+}
+
+const BODY_LIMIT: usize = 300;
+
+fn is_timeout(t: &ureq::Transport) -> bool {
+    let mut src = std::error::Error::source(t);
+    while let Some(e) = src {
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            );
+        }
+        src = e.source();
+    }
+    false
 }
 
 /// ssh's own failure code, as opposed to the remote command's.
@@ -259,8 +360,19 @@ pub fn report_parse_error(err: &clap::Error, args: &[std::ffi::OsString]) -> i32
                 "a subcommand is required".to_string()
             } else {
                 let text = err.to_string();
-                let first = text.lines().next().unwrap_or_default();
-                first.strip_prefix("error: ").unwrap_or(first).to_string()
+                let mut lines = text.lines().map(str::trim);
+                let first = lines.next().unwrap_or_default();
+                let first = first.strip_prefix("error: ").unwrap_or(first);
+                // "the following required arguments were not provided:"
+                // names them, one per line, up to a blank line; keep them.
+                if first.ends_with(':') {
+                    let named: Vec<&str> = lines
+                        .take_while(|l| !l.is_empty() && !l.starts_with("Usage:"))
+                        .collect();
+                    format!("{first} {}", named.join(", "))
+                } else {
+                    first.to_string()
+                }
             };
         eprintln!("{}", to_json(&PanioloError::new(Kind::Usage, message)));
     }
@@ -363,6 +475,57 @@ mod tests {
             (Kind::HelperFailed, Some(200)),
             "a real exit code of 128 or more is kept, not read as a signal"
         );
+    }
+
+    #[test]
+    fn a_refused_daemon_request_is_daemon_down() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        let e = ureq::get(&format!("http://127.0.0.1:{port}/x"))
+            .call()
+            .unwrap_err();
+        let pe = daemon_request_failed("serialcap", "serialcap /input", e);
+        assert_eq!(pe.kind, Kind::DaemonDown, "{}", pe.message);
+        assert_eq!(pe.channel.as_deref(), Some("serial"));
+    }
+
+    #[test]
+    fn a_daemon_that_never_answers_is_a_timeout() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let e = ureq::get(&format!("http://127.0.0.1:{port}/x"))
+            .timeout(std::time::Duration::from_millis(200))
+            .call()
+            .unwrap_err();
+        drop(l);
+        let pe = daemon_request_failed("hdmicap", "OCR", e);
+        assert_eq!(pe.kind, Kind::Timeout, "{}", pe.message);
+        assert_eq!(pe.channel.as_deref(), Some("video"));
+    }
+
+    #[test]
+    fn a_daemon_error_status_is_helper_failed_with_its_reason() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let server = crate::stubhttp::serve_one(
+            l,
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 15\r\nConnection: close\r\n\r\nno video signal",
+        );
+        let e = ureq::get(&format!("http://127.0.0.1:{port}/ocr"))
+            .call()
+            .unwrap_err();
+        server.join().unwrap();
+        let pe = daemon_request_failed("hdmicap", "OCR", e);
+        assert_eq!(pe.kind, Kind::HelperFailed);
+        assert_eq!(pe.message, "OCR failed: no video signal");
+    }
+
+    #[test]
+    fn daemon_text_loses_control_characters_and_is_capped() {
+        assert_eq!(printable("no \x1b[31msignal\r\n"), "no  [31msignal  ");
+        let long = "x".repeat(BODY_LIMIT + 10);
+        assert_eq!(printable(&long).chars().count(), BODY_LIMIT + 1);
     }
 
     #[test]

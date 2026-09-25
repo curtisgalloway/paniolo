@@ -26,7 +26,7 @@
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 
 use crate::daemons;
 use crate::model::SerialChannel;
@@ -77,7 +77,11 @@ pub fn interface_arg(ch: &SerialChannel) -> String {
 
 /// Start the target's serialcap daemon (owning every given interface),
 /// detached. The caller polls [`daemon_url`] for readiness.
-pub fn start_daemon(ifaces: &[SerialChannel], port: u16, target: &str) -> Result<()> {
+pub fn start_daemon(
+    ifaces: &[SerialChannel],
+    port: u16,
+    target: &str,
+) -> Result<std::process::Child> {
     let binary = daemons::find_binary(DAEMON).ok_or_else(|| {
         crate::error::PanioloError::not_configured(
             "serialcap not found (libexec or PATH) — run `paniolo setup`".to_string(),
@@ -98,8 +102,7 @@ pub fn start_daemon(ifaces: &[SerialChannel], port: u16, target: &str) -> Result
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
     // Detach into its own process group so it survives this CLI exiting.
     crate::platform::detach(&mut cmd);
-    cmd.spawn()?;
-    Ok(())
+    Ok(cmd.spawn()?)
 }
 
 /// Stop the target's running daemon via `serialcap stop` (it owns the clean
@@ -139,7 +142,7 @@ pub fn send_input(
         .timeout(Duration::from_millis(timeout_ms))
         .send_bytes(data)
         .map(|_| ())
-        .map_err(|e| anyhow!("serialcap /input failed: {e}"))
+        .map_err(|e| crate::error::daemon_request_failed(DAEMON, "serialcap /input", e).into())
 }
 
 // ── interactive console ─────────────────────────────────────────────────────

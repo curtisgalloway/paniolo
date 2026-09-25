@@ -75,8 +75,13 @@ fn stable_wait_timeout_ms(timeout_ms: u64) -> u64 {
 /// OCR the target daemon's current frame via `GET /ocr` (optionally waiting for
 /// a stable signal first), returning the raw v1 envelope (see docs/dev/ocr.md).
 pub fn ocr(target: &str, stable: bool, timeout_ms: u64) -> Result<String> {
-    let daemon = daemon(target)
-        .ok_or_else(|| anyhow!("no video daemon running — start one with `paniolo video watch`"))?;
+    let daemon = daemon(target).ok_or_else(|| {
+        crate::error::daemon_down(
+            DAEMON,
+            "no video daemon running — start one with `paniolo video watch`",
+        )
+        .target(target)
+    })?;
     if stable {
         // The snapshot blocks until the signal settles (or times out); the
         // body is discarded — only the wait matters.
@@ -86,7 +91,10 @@ pub fn ocr(target: &str, stable: bool, timeout_ms: u64) -> Result<String> {
                 timeout_ms,
             )))
             .call()
-            .map_err(|e| anyhow!("waiting for a stable frame failed: {e}"))?;
+            .map_err(|e| {
+                crate::error::daemon_request_failed(DAEMON, "waiting for a stable frame", e)
+                    .target(target)
+            })?;
     }
     match daemon
         .get("/ocr")
@@ -99,16 +107,9 @@ pub fn ocr(target: &str, stable: bool, timeout_ms: u64) -> Result<String> {
         // Surface the daemon's own explanation ("no video signal", "no capture
         // device") instead of a bare status code — an agent must be able to
         // tell "display is off" apart from "screen is blank".
-        Err(ureq::Error::Status(code, resp)) => {
-            let msg = resp.into_string().unwrap_or_default();
-            let msg = msg.trim();
-            if msg.is_empty() {
-                Err(anyhow!("OCR failed: daemon returned status {code}"))
-            } else {
-                Err(anyhow!("OCR failed: {msg}"))
-            }
-        }
-        Err(e) => Err(anyhow!("OCR failed: {e}")),
+        Err(e) => Err(crate::error::daemon_request_failed(DAEMON, "OCR", e)
+            .target(target)
+            .into()),
     }
 }
 
@@ -181,7 +182,12 @@ fn ocr_helper_with(
 /// targets' daemons coexist) and rides along as `PANIOLO_TARGET` for the
 /// dashboard's power-cycle button. `ocr_mode` picks the OCR helper the daemon
 /// will run — see [`ocr_helper`].
-pub fn start_daemon(device: &str, port: u16, target: &str, ocr_mode: Option<&str>) -> Result<()> {
+pub fn start_daemon(
+    device: &str,
+    port: u16,
+    target: &str,
+    ocr_mode: Option<&str>,
+) -> Result<std::process::Child> {
     let binary = daemons::find_binary(DAEMON).ok_or_else(|| {
         crate::error::PanioloError::not_configured(
             "hdmicap not found (libexec or PATH) — run `paniolo setup`".to_string(),
@@ -206,8 +212,7 @@ pub fn start_daemon(device: &str, port: u16, target: &str, ocr_mode: Option<&str
     let log = daemons::create_log(DAEMON, Some(target))?;
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
     crate::platform::detach(&mut cmd);
-    cmd.spawn()?;
-    Ok(())
+    Ok(cmd.spawn()?)
 }
 
 /// Stop the target's running daemon via `hdmicap stop`. The per-target
