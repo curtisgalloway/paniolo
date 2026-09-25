@@ -50,6 +50,7 @@ caught on serial.
 | [Dashboard](https://curtisgalloway.github.io/paniolo/dashboard/) | `paniolo console` | Combined video + serial web UI; auto-starts daemons; `-i <name>` preselects a serial interface |
 | Agent skills | `paniolo skill` | List the bundled agent guides (driving a target, GUI puppeting, building a control host), or print one's `SKILL.md` for an agent to read |
 | Lab config & diagnostics | `paniolo target`/`host`/`config`, `paniolo discover`, `paniolo configure`, `paniolo doctor`, `paniolo daemons` | CLI-managed lab file (targets, hosts, channels), hardware discovery with a proposed config block, config-vs-reality probing, and a one-view daemon inventory with stop/restart |
+| [Exit status and errors](https://curtisgalloway.github.io/paniolo/errors/) | `paniolo --json-errors …` | Every failure exits with a code naming its kind (not configured, host unreachable, daemon down, hook failed, timeout); `--json-errors` adds a one-line JSON object so scripts and agents branch without parsing messages |
 
 ---
 

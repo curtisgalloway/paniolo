@@ -541,7 +541,8 @@ pub fn channel_host(
     rt: &ResolvedTarget,
     kind: ChannelKind,
     serial_name: Option<&str>,
-) -> Result<String, LabError> {
+) -> Result<String, crate::error::PanioloError> {
+    use crate::error::{channel_missing, Kind, PanioloError};
     if kind == ChannelKind::Serial {
         let serials: Vec<&ResolvedChannel> = rt
             .channels
@@ -555,7 +556,7 @@ pub fn channel_host(
                 .map(|c| c.host.clone())
                 .ok_or_else(|| {
                     let have: Vec<&str> = serials.iter().map(|c| c.name.as_str()).collect();
-                    LabError(format!(
+                    let msg = format!(
                         "target '{}' has no serial interface '{n}' (have: {})",
                         rt.name,
                         if have.is_empty() {
@@ -563,7 +564,8 @@ pub fn channel_host(
                         } else {
                             have.join(", ")
                         }
-                    ))
+                    );
+                    channel_missing(&rt.name, "serial", msg)
                 });
         }
         if serials.is_empty() {
@@ -572,12 +574,19 @@ pub fn channel_host(
         let hosts: BTreeSet<&str> = serials.iter().map(|c| c.host.as_str()).collect();
         if hosts.len() > 1 {
             let list: Vec<&str> = hosts.into_iter().collect();
-            return lab_err(format!(
-                "target '{}' has serial interfaces on multiple hosts ({}); \
-                 specify one with --interface",
-                rt.name,
-                list.join(", ")
-            ));
+            // Answerable by the caller alone (name an interface): usage, the
+            // same as an ambiguous target.
+            return Err(PanioloError::new(
+                Kind::Usage,
+                format!(
+                    "target '{}' has serial interfaces on multiple hosts ({}); \
+                     specify one with --interface",
+                    rt.name,
+                    list.join(", ")
+                ),
+            )
+            .target(&rt.name)
+            .channel("serial"));
         }
         return Ok(serials[0].host.clone());
     }
@@ -1270,10 +1279,13 @@ mod tests {
         );
         let e = channel_host(&rt, ChannelKind::Serial, Some("typo")).unwrap_err();
         assert!(
-            e.0.contains("no serial interface 'typo' (have: console)"),
+            e.message
+                .contains("no serial interface 'typo' (have: console)"),
             "{}",
-            e.0
+            e.message
         );
+        assert_eq!(e.kind, crate::error::Kind::NotConfigured);
+        assert_eq!(e.target.as_deref(), Some("fortune"));
         // No serial at all, none asked for by name: still the default host,
         // so the command body can say what is missing.
         let lab = parse("[targets.bare]\n").unwrap();

@@ -170,8 +170,8 @@ feeds needs re-reading before `--update` re-pins it.
 | `Makefile` | 0e29b48ae719 | Project: helpers; Channels: source |
 | `cli/src/setup.rs` | 2b42590a21fa | Channels: source |
 | `cli/src/skills.rs` | eada6fa6ec0c | Smoke contract S2; Channels: homebrew, windows |
-| `cli/src/daemons.rs` | aad8d53a1368 | Smoke contract S3 |
+| `cli/src/daemons.rs` | 7ac65873b125 | Smoke contract S3 |
 | `scripts/ci-coverage-check.sh` | 8d0d03ddf496 | Project: helpers |
 | `scripts/sync-brik.sh` | b8b5a15775a9 | Channels: windows |
-| `README.md` | 00ee1992abb7 | Channels: source; Publish: re-verify apt |
-| `AGENTS.md` | 0fcf13c745c3 | Project: bump rules, tag format; Publish |
+| `README.md` | d2a393ffdfd2 | Channels: source; Publish: re-verify apt |
+| `AGENTS.md` | 1810f5594138 | Project: bump rules, tag format; Publish |

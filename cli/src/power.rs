@@ -22,7 +22,7 @@
 
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 
 use crate::daemons::{self, Endpoint};
 
@@ -51,7 +51,10 @@ pub fn dtr_press_daemon(daemon: &Endpoint, interface: &str, ms: u64) -> Result<(
         .timeout(Duration::from_millis(timeout))
         .send_bytes(&[])
         .map(|_| ())
-        .map_err(|e| anyhow!("serialcap /button failed: {e}"))
+        .map_err(|e| {
+            crate::error::daemon_request_failed(crate::serial::DAEMON, "serialcap /button", e)
+                .into()
+        })
 }
 
 /// Assert DTR for `ms` directly (fallback when the daemon isn't running).

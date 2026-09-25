@@ -152,7 +152,8 @@ services speaking HTTP/WebSocket on a discovery port.
 **One-shot control commands** — `power-cycle`, `netboot start/stop`,
 `video shot`, `serial log`, `serial send`, config reads — **re-exec over SSH.**
 For a resource on `bench1`, paniolo runs the same command on `bench1` and
-forwards stdin/stdout/stderr and the exit code. The far-side paniolo is
+forwards stdin/stdout/stderr and the exit code (an SSH failure exits 4; see
+[Exit status and errors](errors.md)). The far-side paniolo is
 unchanged, so this reuses 100% of existing logic; runtime state (logs, locks,
 discovery) naturally stays on the control host where it belongs.
 
