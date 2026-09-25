@@ -354,8 +354,8 @@ fn a_failing_power_hook_is_helper_failed_with_its_code() {
     assert_eq!(out.status.code(), Some(101), "{out:?}");
 }
 
-/// `sh` reports a missing script as 127. (`cmd.exe` reports a missing path
-/// as 1, indistinguishable from a failing script; see the Windows test below.)
+/// `sh` reports a missing script as 127. (`cmd.exe` exits 1 for it, the same
+/// as a failing script; see the Windows test below.)
 #[cfg(unix)]
 #[test]
 fn a_missing_power_hook_is_not_configured() {
@@ -367,16 +367,21 @@ fn a_missing_power_hook_is_not_configured() {
     assert_eq!(e["child_exit"], 127);
 }
 
-/// `cmd.exe` reports an unknown command name as 9009: `not_configured`.
+/// `cmd.exe /C` exits 1 for an unknown command (9009 is only `%ERRORLEVEL%`
+/// inside a batch file), indistinguishable from a failing script, so on
+/// Windows a missing hook is `helper_failed` (documented in docs/errors.md).
 #[cfg(windows)]
 #[test]
-fn an_unknown_hook_command_is_not_configured_on_windows() {
-    let dir = scratch("hook_9009", &power_lab("paniolo-no-such-relay-command"));
+fn a_missing_hook_is_helper_failed_on_windows() {
+    let dir = scratch(
+        "hook_missing_win",
+        &power_lab("paniolo-no-such-relay-command"),
+    );
     let out = paniolo(&dir, true, &["power-cycle", "nuc"]);
-    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    assert_eq!(out.status.code(), Some(101), "{out:?}");
     let e = error_object(&out);
-    assert_eq!(e["kind"], "not_configured");
-    assert_eq!(e["child_exit"], 9009);
+    assert_eq!(e["kind"], "helper_failed");
+    assert_eq!(e["child_exit"], 1);
 }
 
 #[cfg(unix)]

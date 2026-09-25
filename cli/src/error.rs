@@ -217,22 +217,18 @@ pub fn shell_code(status: std::process::ExitStatus) -> i32 {
 
 /// A hook or helper that ran and failed, from its exit status. 126 (not
 /// executable) and 127 (not found) mean the lab points at something that is
-/// not there: `not_configured`; so does `cmd.exe`'s 9009 ("is not recognized
-/// as a command") on Windows. A missing *path* under `cmd.exe` exits 1, which
-/// cannot be told from a script's own failure, so it stays `helper_failed`.
+/// not there: `not_configured`. On Windows hooks run under `cmd.exe /C`,
+/// which exits 1 for an unknown command or a missing path alike, the same as
+/// a script's own failure, so there a missing hook is `helper_failed`.
 /// Anything else is `helper_failed`, with the child's code in `child_exit`
 /// (null when a signal killed it).
 pub fn hook_failed(status: std::process::ExitStatus, message: String) -> PanioloError {
     let kind = match status.code() {
         Some(126 | 127) => Kind::NotConfigured,
-        Some(CMD_NOT_RECOGNIZED) if cfg!(windows) => Kind::NotConfigured,
         _ => Kind::HelperFailed,
     };
     PanioloError::new(kind, message).child_exit(status.code())
 }
-
-/// `cmd.exe`'s exit status for a command name it cannot find.
-const CMD_NOT_RECOGNIZED: i32 = 9009;
 
 /// A bundled helper binary (serialcap, hdmicap, …) that is not installed.
 pub fn helper_missing(name: &str) -> PanioloError {
