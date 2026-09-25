@@ -24,6 +24,7 @@ mod daemons;
 mod discover;
 mod dispatch;
 mod doctor;
+mod error;
 mod labfile;
 mod model;
 mod netboot;
@@ -63,12 +64,19 @@ const VERSION: &str = match option_env!("PANIOLO_VERSION") {
 #[command(
     name = "paniolo",
     version = VERSION,
-    about = "Agent-controlled target machine wrangler."
+    about = "Agent-controlled target machine wrangler.",
+    after_help = error::EXIT_STATUS_HELP
 )]
 struct Cli {
     /// Path to the lab config file (default: $PANIOLO_LAB or ~/.config/paniolo/lab.toml).
     #[arg(long, global = true)]
     lab: Option<String>,
+    /// On failure, also print a one-line JSON error object as the last line
+    /// of stderr (same as PANIOLO_JSON_ERRORS=1).
+    // Overrides itself so a repeat is accepted: dispatch always adds one for
+    // the remote paniolo, whether or not the user's argv already had it.
+    #[arg(long, global = true, overrides_with = "json_errors")]
+    json_errors: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -486,6 +494,11 @@ enum SerialCmd {
         /// Exclude the current unterminated line.
         #[arg(long)]
         no_pending: bool,
+        /// Fail (exit 100, daemon_down) instead of reading the on-disk log
+        /// when the serialcap daemon is not running. Without it, a stopped
+        /// daemon only prints a warning on stderr: the log may be stale.
+        #[arg(long)]
+        require_live: bool,
     },
     /// List available serial devices on this machine.
     Devices,
@@ -886,15 +899,20 @@ enum VideoCmd {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(e) => std::process::exit(error::report_parse_error(&e, &args)),
+    };
+    // Single-threaded here, before any child is spawned: record the request
+    // and drop the variable, so no hook or helper inherits it (one JSON
+    // object per failure). Dispatch passes `--json-errors` to a remote.
+    error::take_json_request(cli.json_errors);
     if let Err(e) = run(cli) {
-        // `{e:#}` — anyhow's alternate Display — prints the full `.context()`
-        // chain ("error: outer: middle: root cause") instead of just the
-        // outermost message; a bare `{e}` drops every cause a command added
-        // on the way up, which is often the only clue to what actually failed
-        // (Review low #7).
-        eprintln!("{e:#}");
-        std::process::exit(1);
+        // `report` prints the full `.context()` chain (`{e:#}`), not just the
+        // outermost message — a bare `{e}` drops every cause a command added
+        // on the way up (Review low #7) — then exits with the kind's code.
+        std::process::exit(error::report(&e));
     }
 }
 
@@ -1244,7 +1262,13 @@ fn cmd_daemons_stop(names: &[String], all: bool, force: bool) -> Result<()> {
         }
     }
     if failed || (!force && !pending.is_empty()) {
-        std::process::exit(1);
+        // Not a "negative answer" (exit 1 under the error contract): some
+        // daemon the caller asked to stop is still running.
+        return Err(error::PanioloError::new(
+            error::Kind::Internal,
+            "not every daemon was stopped (see above)",
+        )
+        .into());
     }
     Ok(())
 }
@@ -1309,7 +1333,11 @@ fn cmd_daemons_restart(
         }
     }
     if failures > 0 {
-        std::process::exit(1);
+        return Err(error::PanioloError::new(
+            error::Kind::Internal,
+            format!("{failures} daemon restart(s) failed (see above)"),
+        )
+        .into());
     }
     Ok(())
 }
@@ -1433,15 +1461,23 @@ fn restart_capture_daemon(lab: &Lab, name: &str, target: &str) -> Result<String>
     let start = if name == serial::DAEMON {
         let serials = local_serials(lab, target)?;
         if serials.is_empty() {
-            bail!("no serial interfaces for '{target}' in the lab");
+            return Err(error::channel_missing(
+                target,
+                "serial",
+                format!("no serial interfaces for '{target}' in the lab"),
+            )
+            .into());
         }
         Start::Serial(serials)
     } else if name == video::DAEMON {
         let v = local_video(lab, target)?;
-        let device = v
-            .device
-            .clone()
-            .ok_or_else(|| anyhow!("video channel for '{target}' has no device set"))?;
+        let device = v.device.clone().ok_or_else(|| {
+            error::channel_missing(
+                target,
+                "video",
+                format!("video channel for '{target}' has no device set"),
+            )
+        })?;
         Start::Video(device, v.ocr_mode.clone())
     } else {
         bail!("'{name}' is not a restartable capture daemon");
@@ -1449,11 +1485,11 @@ fn restart_capture_daemon(lab: &Lab, name: &str, target: &str) -> Result<String>
 
     let replaced = stop_capture_daemon_and_wait(name, target)?;
 
-    match start {
+    let mut child = match start {
         Start::Serial(serials) => serial::start_daemon(&serials, 0, target)?,
         Start::Video(device, mode) => video::start_daemon(&device, 0, target, mode.as_deref())?,
-    }
-    wait_for_started_daemon(name, Some(target), replaced)
+    };
+    wait_for_started_daemon(name, Some(target), replaced, Some(&mut child))
 }
 
 /// Wait for a just-spawned daemon to publish discovery, refusing the discovery
@@ -1464,13 +1500,14 @@ fn wait_for_started_daemon(
     name: &str,
     instance: Option<&str>,
     replaced: Option<i32>,
+    spawned: Option<&mut std::process::Child>,
 ) -> Result<String> {
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
     let url = match replaced {
         Some(old) => daemons::wait_for_replacement(name, instance, TIMEOUT, old),
         None => daemons::wait_for_daemon(name, instance, TIMEOUT),
     };
-    url.ok_or_else(|| daemons::start_failure(name, instance, TIMEOUT))
+    url.ok_or_else(|| daemons::start_failure(name, instance, TIMEOUT, spawned))
 }
 
 // ── helper passthrough ──────────────────────────────────────────────────────
@@ -1514,8 +1551,11 @@ fn cmd_helper(name: Option<&str>, args: &[String]) -> Result<()> {
         }
         return Ok(());
     };
-    let binary = daemons::find_binary(name)
-        .ok_or_else(|| anyhow!("helper '{name}' not found — run `paniolo setup`"))?;
+    let binary = daemons::find_binary(name).ok_or_else(|| {
+        crate::error::PanioloError::not_configured(format!(
+            "helper '{name}' not found — run `paniolo setup`"
+        ))
+    })?;
     // State/runtime dirs are keyed by helper name, except channel daemons
     // whose discovery name is the channel (any conforming helper may serve
     // it): hidrig publishes under "hid".
@@ -1535,7 +1575,9 @@ fn cmd_helper(name: Option<&str>, args: &[String]) -> Result<()> {
         .envs(daemons::helper_env(&env_name, None))
         .status()?;
     if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+        // A passthrough (design D3): the caller asked for this helper's own
+        // status, so it is kept; only a signal death is rewritten (128+N).
+        std::process::exit(error::shell_code(status));
     }
     Ok(())
 }
@@ -1711,6 +1753,9 @@ fn cmd_setup(lab_flag: Option<&str>, host: Option<&str>, rust_only: bool) -> Res
                 argv.push("--rust-only".to_string());
             }
             let code = ssh::run_interactive(&resolved, &argv)?;
+            if code == error::SSH_TRANSPORT_FAILURE {
+                return Err(error::unreachable_host(name, error::ssh_255_message(name)).into());
+            }
             std::process::exit(code);
         }
         eprintln!("'{name}' is the local machine; setting up here.");
@@ -1736,11 +1781,16 @@ fn resolve_single_target(lab: &Lab, name: Option<&str>) -> Result<String> {
     let names = lab.target_names();
     match names.len() {
         1 => Ok(names[0].to_string()),
-        0 => bail!("No targets configured."),
-        _ => bail!(
-            "Multiple targets ({}) — specify one with -t.",
-            names.join(", ")
-        ),
+        0 => Err(error::PanioloError::not_configured("No targets configured.").into()),
+        // Answerable by the caller alone (name a target), so a usage error.
+        _ => Err(error::PanioloError::new(
+            error::Kind::Usage,
+            format!(
+                "Multiple targets ({}) — specify one with -t.",
+                names.join(", ")
+            ),
+        )
+        .into()),
     }
 }
 
@@ -1758,9 +1808,9 @@ fn cmd_doctor(lab_flag: Option<&str>, target: Option<&str>, host: Option<&str>) 
 
 fn load_for_read(lab_flag: Option<&str>) -> Result<Lab> {
     let path = model::resolve_lab_path(lab_flag).ok_or_else(|| {
-        anyhow!(
+        error::PanioloError::not_configured(
             "No lab configured. Create one with `paniolo init`, or point at one \
-             with --lab / PANIOLO_LAB."
+             with --lab / PANIOLO_LAB.",
         )
     })?;
     Ok(model::load(&path)?)
@@ -1826,8 +1876,16 @@ fn config_edit(lab_flag: Option<&str>) -> Result<()> {
     let status = std::process::Command::new(prog)
         .args(parts)
         .arg(&path)
-        .status()?;
-    std::process::exit(status.code().unwrap_or(1));
+        .status()
+        .map_err(|e| -> anyhow::Error {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                error::PanioloError::not_configured(format!("editor '{prog}' not found")).into()
+            } else {
+                e.into()
+            }
+        })?;
+    // A passthrough (design D3): the editor's own status.
+    std::process::exit(error::shell_code(status));
 }
 
 fn config_show(lab_flag: Option<&str>) -> Result<()> {
@@ -2187,12 +2245,21 @@ fn serial_cmd(lab_flag: Option<&str>, cmd: SerialCmd) -> Result<()> {
                     return Ok(());
                 }
             }
-            let code = serial::stop_daemon(&target)?;
-            if code == 0 {
+            let status = serial::stop_daemon(&target)?;
+            if status.success() {
                 println!("Serial daemon for '{target}' stopped.");
                 Ok(())
             } else {
-                std::process::exit(code);
+                Err(error::hook_failed(
+                    status,
+                    format!(
+                        "serialcap stop exited with code {}",
+                        error::shell_code(status)
+                    ),
+                )
+                .target(&target)
+                .channel("serial")
+                .into())
             }
         }
         SerialCmd::Send {
@@ -2228,6 +2295,7 @@ fn serial_cmd(lab_flag: Option<&str>, cmd: SerialCmd) -> Result<()> {
             raw,
             json,
             no_pending,
+            require_live,
         } => cmd_serial_log(
             lab_flag,
             target.name(),
@@ -2239,6 +2307,7 @@ fn serial_cmd(lab_flag: Option<&str>, cmd: SerialCmd) -> Result<()> {
             raw,
             json,
             no_pending,
+            require_live,
         ),
         SerialCmd::Devices => {
             let devices = serial::list_devices();
@@ -2305,10 +2374,11 @@ fn cmd_serial_dtr(
         std::process::exit(code);
     }
     let serials = local_serials(&lab, &target)?;
-    let ch = pick_serial(&serials, Some(&iface))?;
+    let ch = pick_serial(&target, &serials, Some(&iface))?;
     if let Some(daemon) = serial::daemon(&target) {
         eprintln!("{label} on '{target}' ({ms} ms via serialcap daemon)");
-        power::dtr_press_daemon(&daemon, &ch.name, ms)?;
+        power::dtr_press_daemon(&daemon, &ch.name, ms)
+            .map_err(|e| error::with_target(e, &target))?;
     } else {
         eprintln!("{label} on '{target}' ({ms} ms via {} directly)", ch.device);
         power::dtr_press_direct(&ch.device, ms)?;
@@ -2330,7 +2400,7 @@ fn resolve_dtr_interface(lab: &Lab, target: &str, interface: Option<&str>) -> Re
     let t = lab
         .targets
         .get(target)
-        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+        .ok_or_else(|| error::target_not_found(target))?;
     let have = || {
         t.serial
             .iter()
@@ -2340,16 +2410,24 @@ fn resolve_dtr_interface(lab: &Lab, target: &str, interface: Option<&str>) -> Re
     };
     let chosen = if let Some(name) = interface {
         t.serial.iter().find(|s| s.name == name).ok_or_else(|| {
-            anyhow!(
-                "no serial interface '{name}' on '{target}' (have: {})",
-                have()
+            error::channel_missing(
+                target,
+                "serial",
+                format!(
+                    "no serial interface '{name}' on '{target}' (have: {})",
+                    have()
+                ),
             )
         })?
     } else if let Some(name) = t.power.as_ref().and_then(|p| p.serial_interface.as_deref()) {
         t.serial.iter().find(|s| s.name == name).ok_or_else(|| {
-            anyhow!(
-                "power serial_interface '{name}' not found among '{target}' interfaces ({})",
-                have()
+            error::channel_missing(
+                target,
+                "power",
+                format!(
+                    "power serial_interface '{name}' not found among '{target}' interfaces ({})",
+                    have()
+                ),
             )
         })?
     } else {
@@ -2357,15 +2435,30 @@ fn resolve_dtr_interface(lab: &Lab, target: &str, interface: Option<&str>) -> Re
             t.serial.iter().filter(|s| s.power_button).collect();
         match buttons.as_slice() {
             [one] => *one,
-            [] => bail!("{}", dtr_opt_in_hint(target, t, None)),
-            _ => bail!(
-                "multiple DTR power-button interfaces on '{target}' ({}); pick one with -i",
-                buttons
-                    .iter()
-                    .map(|s| s.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
+            [] => {
+                return Err(error::channel_missing(
+                    target,
+                    "serial",
+                    dtr_opt_in_hint(target, t, None),
+                )
+                .into())
+            }
+            _ => {
+                return Err(error::PanioloError::new(
+                    error::Kind::Usage,
+                    format!(
+                        "multiple DTR power-button interfaces on '{target}' ({}); pick one with -i",
+                        buttons
+                            .iter()
+                            .map(|s| s.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                )
+                .target(target)
+                .channel("serial")
+                .into())
+            }
         }
     };
     if !chosen.power_button {
@@ -2592,7 +2685,7 @@ fn cmd_console(
     let target = resolve_single_target(&lab, target)?;
     let rt = lab
         .resolved_target(&target)
-        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+        .ok_or_else(|| error::target_not_found(&target))?;
     let (host_name, has_serial) = console_host(&rt, interface)?;
     let host = lab.host(&host_name);
     if !host.is_local(&host_name) {
@@ -2602,12 +2695,15 @@ fn cmd_console(
     // Local: ensure both daemons (OS-assigned ports; discovery finds them).
     if video::daemon(&target).is_none() {
         let v = local_video(&lab, &target)?;
-        let device = v
-            .device
-            .clone()
-            .ok_or_else(|| anyhow!("video channel for '{target}' has no device set"))?;
+        let device = v.device.clone().ok_or_else(|| {
+            error::channel_missing(
+                &target,
+                "video",
+                format!("video channel for '{target}' has no device set"),
+            )
+        })?;
         eprintln!("Starting video daemon…");
-        video::start_daemon(&device, 0, &target, v.ocr_mode.as_deref())?;
+        let mut child = video::start_daemon(&device, 0, &target, v.ocr_mode.as_deref())?;
         daemons::wait_for_daemon(
             video::DAEMON,
             Some(&target),
@@ -2618,16 +2714,22 @@ fn cmd_console(
                 video::DAEMON,
                 Some(&target),
                 std::time::Duration::from_secs(5),
+                Some(&mut child),
             )
         })?;
     }
     if has_serial && serial::daemon(&target).is_none() {
         let serials = local_serials(&lab, &target)?;
         if serials.is_empty() {
-            bail!("no serial interfaces configured for '{target}' (paniolo serial add ...)");
+            return Err(error::channel_missing(
+                &target,
+                "serial",
+                format!("no serial interfaces configured for '{target}' (paniolo serial add ...)"),
+            )
+            .into());
         }
         eprintln!("Starting serial daemon…");
-        serial::start_daemon(&serials, 0, &target)?;
+        let mut child = serial::start_daemon(&serials, 0, &target)?;
         daemons::wait_for_daemon(
             serial::DAEMON,
             Some(&target),
@@ -2638,6 +2740,7 @@ fn cmd_console(
                 serial::DAEMON,
                 Some(&target),
                 std::time::Duration::from_secs(5),
+                Some(&mut child),
             )
         })?;
     }
@@ -2652,8 +2755,13 @@ fn cmd_console(
     // The dashboard's panes can't discover the daemons' OS-assigned ports or
     // tokens themselves — hand each over as a complete WebSocket URL, token
     // inside (?serialws= / ?hidws=), and the page's own token as ?token=.
-    let video = video::daemon(&target)
-        .ok_or_else(|| anyhow!("video daemon for '{target}' is not running"))?;
+    let video = video::daemon(&target).ok_or_else(|| {
+        error::daemon_down(
+            video::DAEMON,
+            format!("video daemon for '{target}' is not running"),
+        )
+        .target(&target)
+    })?;
     let serial_ws = if has_serial {
         serial::daemon(&target).map(|d| d.ws_url("/stream"))
     } else {
@@ -2810,13 +2918,22 @@ fn local_power(lab: &Lab, target: &str) -> Result<model::PowerChannel> {
     let t = lab
         .targets
         .get(target)
-        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+        .ok_or_else(|| error::target_not_found(target))?;
     let dh = t.default_host().to_string();
     let p = t.power.clone().ok_or_else(|| {
-        anyhow!("target '{target}' has no power channel (paniolo power set -t {target} ...)")
+        error::channel_missing(
+            target,
+            "power",
+            format!("target '{target}' has no power channel (paniolo power set -t {target} ...)"),
+        )
     })?;
     if !channel_is_local(lab, p.host.as_deref(), &dh) {
-        bail!("power channel for '{target}' is not on this host");
+        return Err(error::channel_missing(
+            target,
+            "power",
+            format!("power channel for '{target}' is not on this host"),
+        )
+        .into());
     }
     Ok(p)
 }
@@ -2842,11 +2959,16 @@ fn run_power_hook(cmd: &str, label: &str, target: &str) -> Result<()> {
     if status.success() {
         Ok(())
     } else {
-        eprintln!(
-            "{label} script exited with code {}",
-            status.code().unwrap_or(1)
-        );
-        std::process::exit(status.code().unwrap_or(1));
+        Err(error::hook_failed(
+            status,
+            format!(
+                "{label} script exited with code {}",
+                error::shell_code(status)
+            ),
+        )
+        .target(target)
+        .channel("power")
+        .into())
     }
 }
 
@@ -2864,9 +2986,13 @@ fn cmd_power_cycle(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
     }
     let p = local_power(&lab, &target)?;
     let cmd = p.cycle_cmd.ok_or_else(|| {
-        anyhow!(
-            "no cycle_cmd configured for '{target}' \
+        error::channel_missing(
+            &target,
+            "power",
+            format!(
+                "no cycle_cmd configured for '{target}' \
              (paniolo power set -t {target} --cycle-cmd /path/to/script)"
+            ),
         )
     })?;
     run_power_hook(&cmd, "Power cycling", &target)?;
@@ -2888,9 +3014,13 @@ fn cmd_power_on(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
     }
     let p = local_power(&lab, &target)?;
     let cmd = p.on_cmd.ok_or_else(|| {
-        anyhow!(
-            "no on_cmd configured for '{target}' \
+        error::channel_missing(
+            &target,
+            "power",
+            format!(
+                "no on_cmd configured for '{target}' \
              (paniolo power set -t {target} --on-cmd /path/to/script)"
+            ),
         )
     })?;
     run_power_hook(&cmd, "Powering on", &target)?;
@@ -2912,9 +3042,13 @@ fn cmd_power_off(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
     }
     let p = local_power(&lab, &target)?;
     let cmd = p.off_cmd.ok_or_else(|| {
-        anyhow!(
-            "no off_cmd configured for '{target}' \
+        error::channel_missing(
+            &target,
+            "power",
+            format!(
+                "no off_cmd configured for '{target}' \
              (paniolo power set -t {target} --off-cmd /path/to/script)"
+            ),
         )
     })?;
     run_power_hook(&cmd, "Powering off", &target)?;
@@ -2945,10 +3079,16 @@ fn cmd_power_state(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             let stdout = String::from_utf8_lossy(&out.stdout);
-            bail!(
-                "state_cmd '{cmd}' exited with code {} — stdout: {stdout} stderr: {stderr}",
-                out.status.code().unwrap_or(1)
-            );
+            return Err(error::hook_failed(
+                out.status,
+                format!(
+                    "state_cmd '{cmd}' exited with code {} — stdout: {stdout} stderr: {stderr}",
+                    error::shell_code(out.status)
+                ),
+            )
+            .target(&target)
+            .channel("power")
+            .into());
         }
         let text = String::from_utf8_lossy(&out.stdout);
         let token = text
@@ -2969,13 +3109,21 @@ fn cmd_power_state(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
         }
     } else {
         let si = p.serial_interface.ok_or_else(|| {
-            anyhow!(
-                "no power serial_interface configured for '{target}' \
+            error::channel_missing(
+                &target,
+                "power",
+                format!(
+                    "no power serial_interface configured for '{target}' \
                  (paniolo power set -t {target} --serial-interface <name>)"
+                ),
             )
         })?;
         let daemon = serial::daemon(&target).ok_or_else(|| {
-            anyhow!("serialcap daemon not running — start it with `paniolo serial watch`")
+            error::daemon_down(
+                serial::DAEMON,
+                "serialcap daemon not running — start it with `paniolo serial watch`",
+            )
+            .target(&target)
         })?;
         match power::read_power_state(&daemon, &si) {
             Some(true) => {
@@ -3002,7 +3150,7 @@ fn local_serials(lab: &Lab, target: &str) -> Result<Vec<model::SerialChannel>> {
     let t = lab
         .targets
         .get(target)
-        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+        .ok_or_else(|| error::target_not_found(target))?;
     let dh = t.default_host().to_string();
     Ok(t.serial
         .iter()
@@ -3012,6 +3160,7 @@ fn local_serials(lab: &Lab, target: &str) -> Result<Vec<model::SerialChannel>> {
 }
 
 fn pick_serial<'a>(
+    target: &str,
     serials: &'a [model::SerialChannel],
     name: Option<&str>,
 ) -> Result<&'a model::SerialChannel> {
@@ -3023,17 +3172,32 @@ fn pick_serial<'a>(
             .join(", ")
     };
     match name {
-        Some(n) => serials
-            .iter()
-            .find(|s| s.name == n)
-            .ok_or_else(|| anyhow!("no serial interface '{n}' (have: {})", have())),
+        Some(n) => serials.iter().find(|s| s.name == n).ok_or_else(|| {
+            error::channel_missing(
+                target,
+                "serial",
+                format!("no serial interface '{n}' (have: {})", have()),
+            )
+            .into()
+        }),
         None => match serials.len() {
             1 => Ok(&serials[0]),
-            0 => bail!("no serial interfaces configured (paniolo serial add ...)"),
-            _ => bail!(
-                "multiple serial interfaces ({}); specify one with -i",
-                have()
-            ),
+            0 => Err(error::channel_missing(
+                target,
+                "serial",
+                "no serial interfaces configured (paniolo serial add ...)".to_string(),
+            )
+            .into()),
+            _ => Err(error::PanioloError::new(
+                error::Kind::Usage,
+                format!(
+                    "multiple serial interfaces ({}); specify one with -i",
+                    have()
+                ),
+            )
+            .target(target)
+            .channel("serial")
+            .into()),
         },
     }
 }
@@ -3062,16 +3226,21 @@ fn cmd_serial_connect(
     target: Option<&str>,
     interface: Option<&str>,
 ) -> Result<()> {
-    let (_target, serials) =
+    let (target, serials) =
         serial_runtime(lab_flag, target, interface, dispatch::Mode::Interactive)?;
-    let ch = pick_serial(&serials, interface)?;
+    let ch = pick_serial(&target, &serials, interface)?;
     serial::exec_tio(&ch.device, ch.baud)
 }
 
 fn cmd_serial_watch(lab_flag: Option<&str>, target: Option<&str>, port: u16) -> Result<()> {
     let (target, serials) = serial_runtime(lab_flag, target, None, dispatch::Mode::Reexec)?;
     if serials.is_empty() {
-        bail!("no serial interfaces configured (paniolo serial add ...)");
+        return Err(error::channel_missing(
+            &target,
+            "serial",
+            "no serial interfaces configured (paniolo serial add ...)".to_string(),
+        )
+        .into());
     }
     let mut replaced = None;
     if let Some(url) = serial::daemon_url(&target) {
@@ -3092,14 +3261,14 @@ fn cmd_serial_watch(lab_flag: Option<&str>, target: Option<&str>, port: u16) -> 
             reap_untracked(&orphan)?;
         }
     }
-    serial::start_daemon(&serials, port, &target)?;
+    let mut child = serial::start_daemon(&serials, port, &target)?;
     let names: Vec<&str> = serials.iter().map(|s| s.name.as_str()).collect();
     eprintln!(
         "Starting serial daemon for '{target}' ({} interface(s): {})…",
         serials.len(),
         names.join(", ")
     );
-    let url = wait_for_started_daemon(serial::DAEMON, Some(&target), replaced)?;
+    let url = wait_for_started_daemon(serial::DAEMON, Some(&target), replaced, Some(&mut child))?;
     println!("Serial daemon started. {url}");
     Ok(())
 }
@@ -3113,9 +3282,13 @@ fn cmd_serial_send(
     newline: bool,
 ) -> Result<()> {
     let (target, serials) = serial_runtime(lab_flag, target, interface, dispatch::Mode::Reexec)?;
-    let ch = pick_serial(&serials, interface)?;
+    let ch = pick_serial(&target, &serials, interface)?;
     let daemon = serial::daemon(&target).ok_or_else(|| {
-        anyhow!("serialcap daemon not running — start it with `paniolo serial watch`")
+        error::daemon_down(
+            serial::DAEMON,
+            "serialcap daemon not running — start it with `paniolo serial watch`",
+        )
+        .target(&target)
     })?;
     let mut payload = text.as_bytes().to_vec();
     if newline {
@@ -3131,7 +3304,8 @@ fn cmd_serial_send(
         payload.len(),
         ch.name
     );
-    serial::send_input(&daemon, &ch.name, &payload, pace_ms)?;
+    serial::send_input(&daemon, &ch.name, &payload, pace_ms)
+        .map_err(|e| error::with_target(e, &target))?;
     println!("Sent.");
     Ok(())
 }
@@ -3148,13 +3322,34 @@ fn cmd_serial_log(
     raw: bool,
     json: bool,
     no_pending: bool,
+    require_live: bool,
 ) -> Result<()> {
     // Dispatch to the channel's host; the capture log lives where the daemon ran.
     let (target, serials) = serial_runtime(lab_flag, target, interface, dispatch::Mode::Reexec)?;
+    // The log is read from disk either way, so a stopped daemon still serves
+    // it, with nothing new since it stopped (design D4). Say so; with
+    // --require-live, refuse instead. "Stopped" has to mean no serialcap holds
+    // the ports: one whose discovery file was swept away is still capturing
+    // (#187, #195), so it counts as live, as in `serial show`.
+    if serial::daemon(&target).is_none() && serial::untracked(&serials).is_none() {
+        let msg = format!(
+            "serialcap daemon for '{target}' is not running — the log shows \
+             nothing captured since it stopped (start it with `paniolo serial watch`)"
+        );
+        if require_live {
+            return Err(error::daemon_down(serial::DAEMON, msg)
+                .target(&target)
+                .into());
+        }
+        eprintln!("warning: {msg}");
+    }
     // serialcap reads its own on-disk log, so this works daemon-up or -down.
     // The per-target env points it at this target's capture dir.
-    let binary = daemons::find_binary(serial::DAEMON)
-        .ok_or_else(|| anyhow!("serialcap not found — run `paniolo setup`"))?;
+    let binary = daemons::find_binary(serial::DAEMON).ok_or_else(|| {
+        crate::error::PanioloError::not_configured(
+            "serialcap not found — run `paniolo setup`".to_string(),
+        )
+    })?;
     let mut cmd = std::process::Command::new(binary);
     cmd.arg("log");
     cmd.envs(daemons::helper_env(serial::DAEMON, Some(&target)));
@@ -3193,7 +3388,16 @@ fn cmd_serial_log(
     if status.success() {
         Ok(())
     } else {
-        std::process::exit(status.code().unwrap_or(1));
+        Err(error::hook_failed(
+            status,
+            format!(
+                "serialcap log exited with code {}",
+                error::shell_code(status)
+            ),
+        )
+        .target(&target)
+        .channel("serial")
+        .into())
     }
 }
 
@@ -3248,15 +3452,18 @@ fn local_video(lab: &Lab, target: &str) -> Result<model::VideoChannel> {
     let t = lab
         .targets
         .get(target)
-        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+        .ok_or_else(|| error::target_not_found(target))?;
     let dh = t.default_host().to_string();
     let v = t.video.clone().ok_or_else(|| {
-        anyhow!(
-            "target '{target}' has no video channel (paniolo video set -t {target} --device ...)"
-        )
+        error::channel_missing(target, "video", format!("target '{target}' has no video channel (paniolo video set -t {target} --device ...)"))
     })?;
     if !channel_is_local(lab, v.host.as_deref(), &dh) {
-        bail!("video channel for '{target}' is not on this host");
+        return Err(error::channel_missing(
+            target,
+            "video",
+            format!("video channel for '{target}' is not on this host"),
+        )
+        .into());
     }
     Ok(v)
 }
@@ -3273,7 +3480,7 @@ fn refuse_remote_open(lab_flag: Option<&str>, target: Option<&str>) -> Result<()
     let target = resolve_single_target(&lab, target)?;
     let rt = lab
         .resolved_target(&target)
-        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+        .ok_or_else(|| error::target_not_found(&target))?;
     let host_name = model::channel_host(&rt, model::ChannelKind::Video, None)?;
     if lab.host(&host_name).is_local(&host_name) {
         return Ok(());
@@ -3330,9 +3537,13 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
             restart,
         } => {
             let (target, v) = video_runtime(lab_flag, target.name())?;
-            let device = v
-                .device
-                .ok_or_else(|| anyhow!("video channel for '{target}' has no device set"))?;
+            let device = v.device.ok_or_else(|| {
+                error::channel_missing(
+                    &target,
+                    "video",
+                    format!("video channel for '{target}' has no device set"),
+                )
+            })?;
             let mut replaced = None;
             // `daemon_url`, not `preview_url`: this scope only needs to know
             // whether a daemon is there and what to print, and no token-bearing
@@ -3367,8 +3578,9 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
                 reap_untracked(&orphan)?;
             }
             eprintln!("Starting video daemon for '{target}' ('{device}')…");
-            video::start_daemon(&device, port, &target, v.ocr_mode.as_deref())?;
-            let url = wait_for_started_daemon(video::DAEMON, Some(&target), replaced)?;
+            let mut child = video::start_daemon(&device, port, &target, v.ocr_mode.as_deref())?;
+            let url =
+                wait_for_started_daemon(video::DAEMON, Some(&target), replaced, Some(&mut child))?;
             // Token-free, like every other line paniolo prints: the openable
             // URL lives behind `video preview`, which is the one command whose
             // job is to produce it (#196). Printing it here would put a live
@@ -3398,12 +3610,21 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
                     return Ok(());
                 }
             }
-            let code = video::stop_daemon(&target)?;
-            if code == 0 {
+            let status = video::stop_daemon(&target)?;
+            if status.success() {
                 println!("Video daemon for '{target}' stopped.");
                 Ok(())
             } else {
-                std::process::exit(code);
+                Err(error::hook_failed(
+                    status,
+                    format!(
+                        "hdmicap stop exited with code {}",
+                        error::shell_code(status)
+                    ),
+                )
+                .target(&target)
+                .channel("video")
+                .into())
             }
         }
         VideoCmd::Shot {
@@ -3422,7 +3643,7 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
                 let target_name = resolve_single_target(&lab, target.name())?;
                 let rt = lab
                     .resolved_target(&target_name)
-                    .ok_or_else(|| anyhow!("target '{target_name}' not found in lab"))?;
+                    .ok_or_else(|| error::target_not_found(&target_name))?;
                 let host_name = model::channel_host(&rt, model::ChannelKind::Video, None)?;
                 if !lab.host(&host_name).is_local(&host_name) {
                     let mut sub = vec![
@@ -3492,7 +3713,12 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
             }
             let (target, _v) = video_runtime(lab_flag, target.name())?;
             let Some(daemon) = video::daemon(&target) else {
-                bail!("no video daemon running — start one with `paniolo video watch`");
+                return Err(error::daemon_down(
+                    video::DAEMON,
+                    "no video daemon running — start one with `paniolo video watch`",
+                )
+                .target(&target)
+                .into());
             };
             let url = daemon.http_url("/");
             if open {
@@ -3693,18 +3919,33 @@ fn netboot_runtime(lab_flag: Option<&str>, target: Option<&str>) -> Result<Netbo
     let t = lab
         .targets
         .get(&target)
-        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+        .ok_or_else(|| error::target_not_found(&target))?;
     let dh = t.default_host().to_string();
     let nb = t.netboot.clone().ok_or_else(|| {
-        anyhow!("target '{target}' has no netboot channel (paniolo netboot set -t {target} ...)")
+        error::channel_missing(
+            &target,
+            "netboot",
+            format!(
+                "target '{target}' has no netboot channel (paniolo netboot set -t {target} ...)"
+            ),
+        )
     })?;
     if !channel_is_local(&lab, nb.host.as_deref(), &dh) {
-        bail!("netboot channel for '{target}' is not on this host");
+        return Err(error::channel_missing(
+            &target,
+            "netboot",
+            format!("netboot channel for '{target}' is not on this host"),
+        )
+        .into());
     }
     let host_ip = nb.effective_host_ip().to_string();
-    let interface = nb
-        .interface
-        .ok_or_else(|| anyhow!("netboot channel for '{target}' has no interface set"))?;
+    let interface = nb.interface.ok_or_else(|| {
+        error::channel_missing(
+            &target,
+            "netboot",
+            format!("netboot channel for '{target}' has no interface set"),
+        )
+    })?;
     Ok(NetbootRuntime {
         target,
         interface,
@@ -3978,8 +4219,8 @@ fn usb_cmd(lab_flag: Option<&str>, cmd: UsbCmd) -> Result<()> {
     }
 }
 
-/// Run the target's usb helper as `<cmd> usb <verb>`, propagating its exit
-/// code. paniolo stays agnostic to the helper, like the power hooks — but the
+/// Run the target's usb helper as `<cmd> usb <verb>`; a failure is
+/// `helper_failed` with the helper's code in `child_exit`. paniolo stays agnostic to the helper, like the power hooks — but the
 /// vocabulary is fixed rather than passed through, so a constrained remote
 /// host only ever sees the three verbs.
 ///
@@ -4003,18 +4244,31 @@ fn cmd_usb_run(lab_flag: Option<&str>, target: Option<&str>, verb: &str) -> Resu
     let t = lab
         .targets
         .get(&target)
-        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+        .ok_or_else(|| error::target_not_found(&target))?;
     let dh = t.default_host().to_string();
     let u = t.usb.clone().ok_or_else(|| {
-        anyhow!("target '{target}' has no usb channel (paniolo usb set -t {target} --cmd ...)")
+        error::channel_missing(
+            &target,
+            "usb",
+            format!("target '{target}' has no usb channel (paniolo usb set -t {target} --cmd ...)"),
+        )
     })?;
     if !channel_is_local(&lab, u.host.as_deref(), &dh) {
-        bail!("usb channel for '{target}' is not on this host");
+        return Err(error::channel_missing(
+            &target,
+            "usb",
+            format!("usb channel for '{target}' is not on this host"),
+        )
+        .into());
     }
     let cmd = u.cmd.ok_or_else(|| {
-        anyhow!(
-            "no usb cmd configured for '{target}' \
+        error::channel_missing(
+            &target,
+            "usb",
+            format!(
+                "no usb cmd configured for '{target}' \
              (paniolo usb set -t {target} --cmd 'ch9329 -d /dev/...')"
+            ),
         )
     })?;
     // Deliberately the *hid* daemon's runtime dir, not a usb one. On the
@@ -4028,16 +4282,17 @@ fn cmd_usb_run(lab_flag: Option<&str>, target: Option<&str>, verb: &str) -> Resu
         .envs(daemons::helper_env(HID_DAEMON, Some(&target)))
         .status()?;
     if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+        return Err(error::hook_failed(
+            status,
+            format!("usb helper exited with code {}", error::shell_code(status)),
+        )
+        .target(&target)
+        .channel("usb")
+        .into());
     }
     Ok(())
 }
 
-/// Ensure the hid injection daemon is running locally for `target`, returning
-/// its port, or None when the target has no local hid channel. The helper's
-/// `cmd` is run as `<cmd> serve --port 0` via `sh -c`; the contract is that it
-/// daemonizes and publishes `<runtime-base>/hid/<target>/daemon.json` (its
-/// per-target `PANIOLO_RUNTIME_DIR`).
 /// Prefix a daemon command with `exec` where the shell supports it.
 ///
 /// On Unix `exec` makes the daemon replace the shell, so the pid paniolo
@@ -4053,11 +4308,18 @@ fn exec_prefixed(cmd: &str) -> String {
     }
 }
 
+/// Ensure the hid injection daemon is running locally for `target`, returning
+/// its port, or None when the target has no local hid channel. The helper's
+/// `cmd` is run as `<cmd> serve --port 0` via `sh -c`; the contract is that it
+/// publishes `<runtime-base>/hid/<target>/daemon.json` (its
+/// per-target `PANIOLO_RUNTIME_DIR`).
+/// It may run in the foreground (the bundled helpers do) or fork and exit 0;
+/// either way readiness is the discovery file, not its exit.
 fn ensure_hid_daemon_local(lab: &Lab, target: &str) -> Result<Option<daemons::Endpoint>> {
     let t = lab
         .targets
         .get(target)
-        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+        .ok_or_else(|| error::target_not_found(target))?;
     let dh = t.default_host().to_string();
     let h = match &t.hid {
         Some(h) => h,
@@ -4070,7 +4332,13 @@ fn ensure_hid_daemon_local(lab: &Lab, target: &str) -> Result<Option<daemons::En
         return Ok(Some(ep));
     }
     let cmd = h.cmd.clone().ok_or_else(|| {
-        anyhow!("hid channel for '{target}' has no cmd (paniolo hid set -t {target} --cmd ...)")
+        error::channel_missing(
+            target,
+            "hid",
+            format!(
+                "hid channel for '{target}' has no cmd (paniolo hid set -t {target} --cmd ...)"
+            ),
+        )
     })?;
     eprintln!("Starting hid daemon for '{target}'…");
     let log = daemons::create_log(HID_DAEMON, Some(target))?;
@@ -4084,12 +4352,17 @@ fn ensure_hid_daemon_local(lab: &Lab, target: &str) -> Result<Option<daemons::En
         .stdout(std::process::Stdio::null())
         .stderr(log);
     platform::detach(&mut command);
-    command.spawn()?;
+    let mut child = command.spawn()?;
     Ok(Some(
         daemons::wait_for_daemon(HID_DAEMON, Some(target), std::time::Duration::from_secs(5))
             .and_then(|_| daemons::daemon_endpoint(HID_DAEMON, Some(target)))
             .ok_or_else(|| {
-                daemons::start_failure(HID_DAEMON, Some(target), std::time::Duration::from_secs(5))
+                daemons::start_failure(
+                    HID_DAEMON,
+                    Some(target),
+                    std::time::Duration::from_secs(5),
+                    Some(&mut child),
+                )
             })?,
     ))
 }
@@ -4111,7 +4384,12 @@ fn cmd_hid_serve(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
             println!("hid daemon running for '{target}' (port {}).", ep.port);
             Ok(())
         }
-        None => bail!("target '{target}' has no hid channel on this host"),
+        None => Err(error::channel_missing(
+            &target,
+            "hid",
+            format!("target '{target}' has no hid channel on this host"),
+        )
+        .into()),
     }
 }
 
@@ -4130,12 +4408,14 @@ fn cmd_hid_stop(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
     let t = lab
         .targets
         .get(&target)
-        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
-    let cmd = t
-        .hid
-        .as_ref()
-        .and_then(|h| h.cmd.clone())
-        .ok_or_else(|| anyhow!("target '{target}' has no hid channel"))?;
+        .ok_or_else(|| error::target_not_found(&target))?;
+    let cmd = t.hid.as_ref().and_then(|h| h.cmd.clone()).ok_or_else(|| {
+        error::channel_missing(
+            &target,
+            "hid",
+            format!("target '{target}' has no hid channel"),
+        )
+    })?;
     // The helper owns its own stop (e.g. `hidrig stop`); strip any trailing
     // device args isn't needed — `<cmd> stop` ignores extra args it doesn't use.
     let status = platform::shell_command(&format!("{cmd} stop"))
@@ -4143,12 +4423,22 @@ fn cmd_hid_stop(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
         .envs(daemons::helper_env(HID_DAEMON, Some(&target)))
         .status()?;
     if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+        return Err(error::hook_failed(
+            status,
+            format!(
+                "hid helper stop exited with code {}",
+                error::shell_code(status)
+            ),
+        )
+        .target(&target)
+        .channel("hid")
+        .into());
     }
     Ok(())
 }
 
-/// Run the target's hid helper with `args` appended, propagating its exit code.
+/// Run the target's hid helper with `args` appended; a failure is
+/// `helper_failed` with the helper's code in `child_exit`.
 /// Paniolo is agnostic to the helper's CLI — the configured cmd owns it (see
 /// docs/hid.md), exactly like the power hooks.
 fn cmd_hid_send(lab_flag: Option<&str>, target: Option<&str>, args: &[String]) -> Result<()> {
@@ -4166,18 +4456,31 @@ fn cmd_hid_send(lab_flag: Option<&str>, target: Option<&str>, args: &[String]) -
     let t = lab
         .targets
         .get(&target)
-        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+        .ok_or_else(|| error::target_not_found(&target))?;
     let dh = t.default_host().to_string();
     let h = t.hid.clone().ok_or_else(|| {
-        anyhow!("target '{target}' has no hid channel (paniolo hid set -t {target} --cmd ...)")
+        error::channel_missing(
+            &target,
+            "hid",
+            format!("target '{target}' has no hid channel (paniolo hid set -t {target} --cmd ...)"),
+        )
     })?;
     if !channel_is_local(&lab, h.host.as_deref(), &dh) {
-        bail!("hid channel for '{target}' is not on this host");
+        return Err(error::channel_missing(
+            &target,
+            "hid",
+            format!("hid channel for '{target}' is not on this host"),
+        )
+        .into());
     }
     let cmd = h.cmd.ok_or_else(|| {
-        anyhow!(
-            "no hid cmd configured for '{target}' \
+        error::channel_missing(
+            &target,
+            "hid",
+            format!(
+                "no hid cmd configured for '{target}' \
              (paniolo hid set -t {target} --cmd 'hidrig -d /dev/...')"
+            ),
         )
     })?;
     let quoted: Vec<String> = args.iter().map(|a| ssh::shell_quote(a)).collect();
@@ -4187,7 +4490,13 @@ fn cmd_hid_send(lab_flag: Option<&str>, target: Option<&str>, args: &[String]) -
         .envs(daemons::helper_env(HID_DAEMON, Some(&target)))
         .status()?;
     if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+        return Err(error::hook_failed(
+            status,
+            format!("hid helper exited with code {}", error::shell_code(status)),
+        )
+        .target(&target)
+        .channel("hid")
+        .into());
     }
     Ok(())
 }
@@ -4199,13 +4508,24 @@ fn local_adb(lab: &Lab, target: &str) -> Result<model::AdbChannel> {
     let t = lab
         .targets
         .get(target)
-        .ok_or_else(|| anyhow!("target '{target}' not found in lab"))?;
+        .ok_or_else(|| error::target_not_found(target))?;
     let dh = t.default_host().to_string();
     let a = t.adb.clone().ok_or_else(|| {
-        anyhow!("target '{target}' has no adb channel (paniolo adb set -t {target} --serial <id>)")
+        error::channel_missing(
+            target,
+            "adb",
+            format!(
+                "target '{target}' has no adb channel (paniolo adb set -t {target} --serial <id>)"
+            ),
+        )
     })?;
     if !channel_is_local(lab, a.host.as_deref(), &dh) {
-        bail!("adb channel for '{target}' is not on this host");
+        return Err(error::channel_missing(
+            target,
+            "adb",
+            format!("adb channel for '{target}' is not on this host"),
+        )
+        .into());
     }
     Ok(a)
 }
@@ -4273,7 +4593,7 @@ fn adb_cmd(lab_flag: Option<&str>, cmd: AdbCmd) -> Result<()> {
                 let target_name = resolve_single_target(&lab, target.name())?;
                 let rt = lab
                     .resolved_target(&target_name)
-                    .ok_or_else(|| anyhow!("target '{target_name}' not found in lab"))?;
+                    .ok_or_else(|| error::target_not_found(&target_name))?;
                 let host_name = model::channel_host(&rt, model::ChannelKind::Adb, None)?;
                 if !lab.host(&host_name).is_local(&host_name) {
                     let sub = vec![
@@ -4351,7 +4671,11 @@ fn cmd_adb_devices(lab_flag: Option<&str>, host: Option<&str>) -> Result<()> {
     }
     let mut argv = vec![adb::DEFAULT_ADB.to_string()];
     argv.extend(rest);
-    std::process::exit(ssh::run_passthrough(&resolved, &argv, &[])?);
+    let code = ssh::run_passthrough(&resolved, &argv, &[])?;
+    if code == error::SSH_TRANSPORT_FAILURE {
+        return Err(error::unreachable_host(host, error::ssh_255_message(host)).into());
+    }
+    std::process::exit(code);
 }
 
 // ── rendering helpers ───────────────────────────────────────────────────────

@@ -138,6 +138,7 @@ hypervisor, not in the guest.
 | NF-2 | Changes land as smallest reversible steps, each with tests | M | ◐ | |
 | NF-3 | Core power/serial path stays functional on both macOS and Linux | M | ☑ | CI-only features may be Linux-only (see §9) |
 | NF-4 | External contracts re-verified against upstream before relying on them | M | ◐ | re-check Fuchsia `device.go` (FX-4) |
+| NF-5 | Failures are machine-classifiable: exit code by kind, optional one-line JSON object on stderr | M | ◐ | [error contract](error-contract/design.md), user doc [errors.md](../errors.md); shipped on branch `error-contract`, releases as 0.5.0 |
 
 ---
 

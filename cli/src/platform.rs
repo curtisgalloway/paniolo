@@ -451,7 +451,8 @@ pub fn exec_replace(cmd: &mut Command) -> std::io::Error {
 #[cfg(windows)]
 pub fn exec_replace(cmd: &mut Command) -> std::io::Error {
     match cmd.status() {
-        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+        // A passthrough (design D3): the console's own status.
+        Ok(status) => std::process::exit(crate::error::shell_code(status)),
         Err(e) => e,
     }
 }

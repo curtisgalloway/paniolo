@@ -31,7 +31,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 
 /// The cargo-install root for paniolo's helper binaries. Binaries land in
 /// `<root>/bin` (cargo appends `bin/` itself) — see [`libexec_dir`].
@@ -389,23 +389,49 @@ pub fn hook_helper_name(cmd: &str) -> Option<String> {
 }
 
 /// Error for a daemon that didn't publish discovery in time, carrying the
-/// tail of its stderr log so the failure is diagnosable.
-pub fn start_failure(name: &str, instance: Option<&str>, timeout: Duration) -> anyhow::Error {
+/// tail of its stderr log so the failure is diagnosable. With the `spawned`
+/// process in hand it tells the two cases apart: one that has already exited
+/// (lost a lock to an old daemon, could not open its device — #194) will not
+/// come up, so it is `helper_failed` with its exit code; one still running
+/// may yet, so it is `timeout`. (Its pid alone would not do: an exited child
+/// stays a zombie, alive to a pid probe, until it is waited on.)
+pub fn start_failure(
+    name: &str,
+    instance: Option<&str>,
+    timeout: Duration,
+    spawned: Option<&mut std::process::Child>,
+) -> anyhow::Error {
     let log = std::fs::read_to_string(log_path(name, instance)).unwrap_or_default();
     let mut tail: Vec<&str> = log.lines().rev().take(5).collect();
     tail.reverse();
-    if tail.is_empty() {
-        anyhow!(
-            "{name} daemon did not start within {} s (no stderr captured)",
-            timeout.as_secs()
-        )
+    // A clean exit is not a failure: a helper may fork its daemon and let the
+    // parent exit 0 (the hid `cmd` contract allows it), and that daemon may
+    // still come up. Only a non-zero exit or a signal says it will not.
+    let exited = spawned
+        .and_then(|c| c.try_wait().ok().flatten())
+        .filter(|status| !status.success());
+    let what = match exited {
+        Some(status) => format!(
+            "{name} daemon exited during startup with code {}",
+            crate::error::shell_code(status)
+        ),
+        None => format!("{name} daemon did not start within {} s", timeout.as_secs()),
+    };
+    let message = if tail.is_empty() {
+        format!("{what} (no stderr captured)")
     } else {
-        anyhow!(
-            "{name} daemon did not start within {} s; last stderr:\n  {}",
-            timeout.as_secs(),
-            tail.join("\n  ")
-        )
+        format!("{what}; last stderr:\n  {}", tail.join("\n  "))
+    };
+    let mut e = match exited {
+        Some(status) => {
+            crate::error::hook_failed(status, message).channel(crate::error::daemon_channel(name))
+        }
+        None => crate::error::daemon_start_timeout(name, message),
+    };
+    if let Some(t) = instance {
+        e = e.target(t);
     }
+    e.into()
 }
 
 fn pid_alive(pid: i32) -> bool {
@@ -1706,8 +1732,9 @@ mod tests {
             plant_discovery(&expected_base(root), "hdmicap/lab-optiplex-1", 36989);
             let old = std::process::id() as i32;
 
-            let err = crate::wait_for_started_daemon("hdmicap", Some("lab-optiplex-1"), Some(old))
-                .expect_err("a replacement must not be answered for by the pid it replaced");
+            let err =
+                crate::wait_for_started_daemon("hdmicap", Some("lab-optiplex-1"), Some(old), None)
+                    .expect_err("a replacement must not be answered for by the pid it replaced");
             assert!(
                 !err.to_string().contains("36989"),
                 "the replaced daemon's port must never reach the operator as the \
@@ -1717,7 +1744,8 @@ mod tests {
             // A cold start replaces nothing, so the same file is a real answer:
             // the guard must not refuse every startup wait.
             assert_eq!(
-                crate::wait_for_started_daemon("hdmicap", Some("lab-optiplex-1"), None).unwrap(),
+                crate::wait_for_started_daemon("hdmicap", Some("lab-optiplex-1"), None, None)
+                    .unwrap(),
                 "http://127.0.0.1:36989"
             );
         });
@@ -1856,5 +1884,63 @@ mod tests {
                 "/usr/libexec/paniolo/bin/zigplug -d /dev/ttyUSB1 on 1".to_string()
             )]
         );
+    }
+
+    /// A daemon that already exited during startup will not come up, so it is
+    /// `helper_failed` with its code; one still running is a `timeout`
+    /// (review finding F10, #194).
+    #[cfg(unix)]
+    #[test]
+    fn start_failure_tells_an_exited_daemon_from_a_slow_one() {
+        use crate::error::{Kind, PanioloError};
+        let kind_of = |e: anyhow::Error| {
+            let pe = e.downcast::<PanioloError>().expect("classified");
+            (pe.kind, pe.child_exit)
+        };
+        // Wait for the exit without a fixed sleep; std caches the status, so
+        // start_failure's own try_wait still sees it.
+        let mut fresh = std::process::Command::new("sh")
+            .args(["-c", "exit 3"])
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while fresh.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let e = start_failure(
+            "paniolo-test-daemon",
+            None,
+            Duration::from_secs(5),
+            Some(&mut fresh),
+        );
+        assert_eq!(kind_of(e), (Kind::HelperFailed, Some(3)));
+
+        let mut slow = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let e = start_failure(
+            "paniolo-test-daemon",
+            None,
+            Duration::from_secs(5),
+            Some(&mut slow),
+        );
+        assert_eq!(kind_of(e), (Kind::Timeout, None));
+        let _ = slow.kill();
+        let _ = slow.wait();
+
+        let e = start_failure("paniolo-test-daemon", None, Duration::from_secs(5), None);
+        assert_eq!(kind_of(e), (Kind::Timeout, None));
+
+        // A helper that forked and exited 0 may still bring its daemon up.
+        let mut forked = std::process::Command::new("true").spawn().unwrap();
+        let _ = forked.wait();
+        let e = start_failure(
+            "paniolo-test-daemon",
+            None,
+            Duration::from_secs(5),
+            Some(&mut forked),
+        );
+        assert_eq!(kind_of(e), (Kind::Timeout, None));
     }
 }

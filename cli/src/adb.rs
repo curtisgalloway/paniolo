@@ -44,10 +44,12 @@ pub fn argv(adb_cmd: Option<&str>, serial: Option<&str>, rest: &[String]) -> Vec
 /// Friendlier error when the adb binary itself can't be run.
 fn spawn_err(adb_cmd: Option<&str>, e: std::io::Error) -> anyhow::Error {
     if e.kind() == std::io::ErrorKind::NotFound {
-        anyhow!(
+        crate::error::PanioloError::not_configured(format!(
             "'{}' not found — install the Android platform-tools (adb) on this host",
             adb_cmd.unwrap_or(DEFAULT_ADB)
-        )
+        ))
+        .channel("adb")
+        .into()
     } else {
         anyhow!("failed to run adb: {e}")
     }
@@ -76,7 +78,7 @@ pub fn run_passthrough(
 ) -> Result<i32> {
     let av = argv(adb_cmd, serial, rest);
     let status = command(&av).status().map_err(|e| spawn_err(adb_cmd, e))?;
-    Ok(status.code().unwrap_or(-1))
+    Ok(crate::error::shell_code(status))
 }
 
 /// Capture one PNG via `adb exec-out screencap -p` and write it to `out`

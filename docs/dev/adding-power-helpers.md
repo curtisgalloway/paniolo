@@ -23,7 +23,7 @@ Paniolo runs each hook with `sh -c <cmd>` (`cli/src/main.rs`,
 
 | Hook | Run by | Contract |
 |---|---|---|
-| `on_cmd` | `paniolo power on` | exit 0 = success; non-zero exit code is propagated |
+| `on_cmd` | `paniolo power on` | exit 0 = success; a non-zero exit makes paniolo exit 101 (`helper_failed`, the hook's code in `child_exit`), or 3 (`not_configured`) for 126/127 — the hook is missing or not executable |
 | `off_cmd` | `paniolo power off` | same |
 | `cycle_cmd` | `paniolo power-cycle` | same; the hook owns the *full* sequence (off, delay, on, confirm) — paniolo adds no timing of its own |
 | `state_cmd` | `paniolo power-state` | the **first whitespace-delimited token of stdout** must be `on` or `off` (case-insensitive); anything else, or a non-zero exit, is an error. Takes precedence over serial sense-line state when configured |
