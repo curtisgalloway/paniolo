@@ -140,6 +140,9 @@ always present (null when unknown) so a consumer need not probe.
      the remote paniolo's own and is returned unchanged, with no local object.
    - hook result: non-zero → `helper_failed` with `child_exit`; 126/127 →
      `not_configured`; killed by a signal → `helper_failed`, `child_exit` null.
+     On Windows (`cmd.exe /C`), 9009 (unknown command) → `not_configured`; a
+     missing script path exits 1 there and stays `helper_failed` (decided
+     2026-09-25, when Windows CI first ran the branch).
    - passthrough: see D3.
 
 ## Decisions

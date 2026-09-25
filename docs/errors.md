@@ -39,6 +39,12 @@ matching any English message text.
 | 101 | `helper_failed` | A hook or helper ran and failed: it exited non-zero (its code is in `child_exit`), a daemon exited during startup, or a running daemon refused the request (its reason is the message). |
 | 109 | `internal` | A failure paniolo does not classify yet. Treat it as a bug report waiting to happen; the message says what went wrong. |
 
+**Hooks on Windows.** Windows runs hooks through `cmd.exe`, which reports an
+unknown command name as 9009 (paniolo maps it to 3, `not_configured`, with
+`child_exit` 9009) but a missing script *path* as plain exit 1, the same as a
+script that ran and failed. That case reports 101 `helper_failed`; the message
+above the JSON line carries `cmd.exe`'s own "cannot find the path" text.
+
 Codes follow the tens-digit bands: 2–9 will fail the same way again, 20s may
 succeed on a retry, 100 and up are specific to paniolo. Nothing exits 125 or
 above except a [passthrough](#passthrough-commands) reporting its child.

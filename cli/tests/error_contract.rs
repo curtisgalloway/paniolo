@@ -354,6 +354,9 @@ fn a_failing_power_hook_is_helper_failed_with_its_code() {
     assert_eq!(out.status.code(), Some(101), "{out:?}");
 }
 
+/// `sh` reports a missing script as 127. (`cmd.exe` reports a missing path
+/// as 1, indistinguishable from a failing script; see the Windows test below.)
+#[cfg(unix)]
 #[test]
 fn a_missing_power_hook_is_not_configured() {
     let dir = scratch("hook_127", &power_lab("/nonexistent/relay-script"));
@@ -362,6 +365,18 @@ fn a_missing_power_hook_is_not_configured() {
     let e = error_object(&out);
     assert_eq!(e["kind"], "not_configured");
     assert_eq!(e["child_exit"], 127);
+}
+
+/// `cmd.exe` reports an unknown command name as 9009: `not_configured`.
+#[cfg(windows)]
+#[test]
+fn an_unknown_hook_command_is_not_configured_on_windows() {
+    let dir = scratch("hook_9009", &power_lab("paniolo-no-such-relay-command"));
+    let out = paniolo(&dir, true, &["power-cycle", "nuc"]);
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    let e = error_object(&out);
+    assert_eq!(e["kind"], "not_configured");
+    assert_eq!(e["child_exit"], 9009);
 }
 
 #[cfg(unix)]
@@ -504,7 +519,12 @@ fn a_passthrough_killed_by_a_signal_exits_128_plus_n() {
 /// it can see the variable, 7 otherwise.
 #[test]
 fn hooks_do_not_inherit_the_json_request() {
-    let hook = r#"[ -n "$PANIOLO_JSON_ERRORS" ] && exit 9; exit 7"#;
+    // Hooks run under `sh -c`, or `cmd.exe /C` on Windows.
+    let hook = if cfg!(windows) {
+        "if defined PANIOLO_JSON_ERRORS (exit 9) else (exit 7)"
+    } else {
+        r#"[ -n "$PANIOLO_JSON_ERRORS" ] && exit 9; exit 7"#
+    };
     for (name, json, args) in [
         ("inherit_var", true, vec!["power-cycle", "nuc"]),
         (
