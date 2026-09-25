@@ -35,7 +35,7 @@ Project checks (from `cli/`): `cargo fmt --check`, `cargo clippy --all-targets
 | M2 | Child boundary: hooks, dispatch, passthroughs | M1 | complete ([evidence](evidence/M2.md)) |
 | M3 | daemon_down, timeout, unreachable device; `serial log --require-live` | M1 | complete ([evidence](evidence/M3.md)) |
 | M4 | Docs, `--help`, skill, evals; final verification (R6 hardware moved to M5) | M2, M3 | complete ([evidence](evidence/M4.md)) |
-| M5 | R6 + consumer cases on a control host; release 0.5.0 through `RELEASE-TRAIN.md` | M4, a control host, user's push go-ahead | pending |
+| M5 | R6 + consumer cases on a control host; release 0.5.0 through `RELEASE-TRAIN.md` | M4, a control host, user's push go-ahead | in_progress (control-host check done, [evidence](evidence/M5.md); release pending) |
 
 ## Design coverage
 
@@ -106,7 +106,10 @@ user for the consumer.
 **Design coverage:** R6 (control host), R1–R3 end to end.
 **Dependencies:** M4; a reachable control host with a lab file (the user
 names it); the user's push go-ahead.
-**Status:** pending.
+**Status:** in_progress. The control-host check passed on 2026-09-25
+([evidence](evidence/M5.md)): all six cases give the expected code and one
+JSON object; the 0.4.1 silence did not reproduce, so R6 is closed as
+satisfied with a note. Remaining: the release train.
 
 ## Backlog
 
@@ -115,11 +118,9 @@ names it); the user's push go-ahead.
 
 ## Next session
 
-M4 complete (checkpoint commit `cli: error contract M4 — documentation and
-final verification`). Next: **M5 — control-host verification and release**,
-on branch `error-contract`. Ask the user which control host to use (none is
-recorded on the Linux dev machine; `RELEASE-TRAIN.local.md` is absent here).
-Read the M5 section above, `evidence/M4.md` ("Scope change"), and
-`RELEASE-TRAIN.md`. Do the R6 + consumer-case check before any tag. Build with
-the rustup toolchain (`~/.cargo/bin/cargo`); `python3.12` is absent here, use
-`uv run --no-project --python 3.12 python evals/run.py --check`.
+M5 in progress: the control-host check is done ([evidence](evidence/M5.md));
+PR #242 is open with M1–M4. Next: after PR #242 merges, run
+`RELEASE-TRAIN.md` for **0.5.0** on the user's go-ahead (push, tag and publish
+only then). Build with the rustup toolchain (`~/.cargo/bin/cargo`);
+`python3.12` is absent on the Linux dev machine, use `uv run --no-project
+--python 3.12 python evals/run.py --check`.
