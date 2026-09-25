@@ -149,7 +149,7 @@ enough.
 
 - gate: `date`; the repo is public on GitHub, so the user-level business-hours push rule applies; ask before any push, tag, or PR
 - steps: push the release branch; `gh pr create --base main` with only the archaeology commits; `gh pr checks --watch`; `gh pr merge --squash`; `git fetch origin && git checkout main && git pull --ff-only`; annotated tag on the merged head with the releaser identity above; `git push origin vX.Y.Z`; watch `release.yml` (`gh run watch`), then the dispatched `docs.yml` run (it rebuilds the apt pool from the newest 5 Releases; a red docs run means apt clients keep the previous version)
-- re-verify github: `gh release view vX.Y.Z --json assets` lists 12 assets (2 `.deb`, 2 Linux `.tar.gz`, macOS `.tar.gz`, Windows `.zip`, each with `.sha256`); download all, `shasum -a 256 -c` each against its sidecar
+- re-verify github: `gh release view vX.Y.Z --json assets` lists 18 assets (2 `.deb`, 2 Linux `.tar.gz`, 3 `.bottle.tar.gz` (`all`, `arm64_linux`, `x86_64_linux`), macOS `.tar.gz`, Windows `.zip`, each with `.sha256`); download all, `shasum -a 256 -c` each against its sidecar (Perl `shasum`, which rejects a CRLF sidecar that some `sha256sum` builds accept, #243; the release job runs the same check before attaching)
 - re-verify homebrew: the tap's `Formula/paniolo.rb` shows `version "X.Y.Z"`, the new tarball sha256s, and a `bottle do` block whose `root_url` is this release's download directory with `all`, `arm64_linux` and `x86_64_linux` digests matching the release's `.bottle.tar.gz.sha256` sidecars; `brew update && brew fetch paniolo` succeeds and fetches `paniolo-X.Y.Z.all.bottle.tar.gz` (a tarball fetch instead means the bottle block is missing and every macOS user with an Xcode older than Homebrew's table is back to #225); install the fetched bottle `paniolo-rt`-style (retar its keg as `paniolo-rt/X.Y.Z/`, pour it through a throwaway formula as the homebrew arm does) and run S1..S3
 - re-verify apt: fetch with `curl -H "Cache-Control: no-cache"` and a cache-busting query (`?rt=<run>`), because the Pages CDN served a pre-publish `Packages` for at least 28 minutes after a rebuild on 2026-09-13 and a plain GET reported the newest release as missing; then `https://curtisgalloway.github.io/paniolo/apt/dists/stable/InRelease` is signed and its `Packages` lists X.Y.Z; on linux-builder configure the `.sources` from `README.md`, `apt-get update`, `apt-cache policy paniolo` shows X.Y.Z, `apt-get install paniolo`, run S1..S3 (the builder's mount of the host home is read-only, so the log and verdict are written under the VM home and pulled by the control host, as in the deb arm's caveats)
 - re-verify windows: download the zip, verify the sidecar, expand and run S1..S3 on windows-bench if reachable, else inspect the layout and report PARTIAL
@@ -163,7 +163,7 @@ feeds needs re-reading before `--update` re-pins it.
 
 | path | blob | feeds |
 |---|---|---|
-| `.github/workflows/release.yml` | 9d4604e3969c | Channels (every arm's build and staging), Publish |
+| `.github/workflows/release.yml` | 1541994350e9 | Channels (every arm's build and staging), Publish |
 | `.github/workflows/docs.yml` | 0ffe09ec9fa4 | Publish: re-verify apt |
 | `packaging/nfpm.yaml` | b348d64432f4 | Channels: deb |
 | `packaging/scripts/build-apt-repo.sh` | fb2205eeab8e | Channels: deb, install like a user |

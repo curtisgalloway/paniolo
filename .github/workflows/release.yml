@@ -416,9 +416,13 @@ jobs:
           # valid file name; keep only file-safe characters.
           $ver = ($env:REF -replace '^v','') -replace '[^A-Za-z0-9._-]','-'
           Compress-Archive -Path dist/paniolo -DestinationPath "dist/paniolo-$ver-x86_64-pc-windows-msvc.zip"
-          Get-FileHash "dist/paniolo-$ver-x86_64-pc-windows-msvc.zip" -Algorithm SHA256 |
-            ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |
-            Out-File -Encoding ascii "dist/paniolo-$ver-x86_64-pc-windows-msvc.zip.sha256"
+          # Write the sidecar with an explicit LF. Out-File ends the line with
+          # the platform newline, CRLF here, and `shasum -a 256 -c` on macOS
+          # and Linux then reads the file name with a trailing CR and reports
+          # it missing (#243).
+          $zip = "dist/paniolo-$ver-x86_64-pc-windows-msvc.zip"
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          [IO.File]::WriteAllText((Join-Path $PWD "$zip.sha256"), "$hash  $(Split-Path $zip -Leaf)`n")
 
       # Expand the zip that ships and run it, as the Linux job does with its
       # .deb and the macOS job with its tarball. Until 2026-09-10 this job only
@@ -864,6 +868,12 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      # Verify every sidecar the way a user on macOS or Linux would, before
+      # anything is attached. Perl's shasum, not sha256sum: some sha256sum
+      # implementations accept a CRLF sidecar that shasum rejects (#243).
+      - name: Verify every .sha256 sidecar
+        working-directory: dist
+        run: shasum -a 256 -c ./*.sha256
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: dist/*
