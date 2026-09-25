@@ -49,6 +49,33 @@ If a paniolo command for what you want doesn't seem to exist, run `paniolo
 certainly does (e.g. `netif mode link`/`off` to toggle the bare link, `daemons`
 to find and clear a stuck port).
 
+## When a command fails — read the exit status
+
+The exit status names the kind of failure; branch on it, not on the message
+text. `paniolo --help` prints the table.
+
+| Code | Kind | What to do |
+|---|---|---|
+| 1 | — | Only `doctor`: it found problems (not an error) |
+| 2 | `usage` | Fix the command line (`<cmd> --help`) |
+| 3 | `not_configured` | Wrong target/channel/interface name, or a hook/helper missing. Don't retry; check `paniolo config show`, and don't edit the lab to fix it — report it |
+| 4 | `unreachable` | The control host did not answer over SSH; the command may or may not have run |
+| 22 | `timeout` | Outcome unknown: check state (`power-state`, `serial log`, `video shot`) before repeating a power cycle or other mutation |
+| 100 | `daemon_down` | Start the daemon (`serial watch`, `video watch`); `paniolo daemons` lists what is running |
+| 101 | `helper_failed` | The hook/helper/daemon ran and failed; its message (and its own code in `child_exit`) says why |
+| 109 | `internal` | Unclassified; read the message |
+
+For a machine-readable reason, set `PANIOLO_JSON_ERRORS=1` (or put
+`--json-errors` right after `paniolo`, before any trailing arguments: after
+`hid send …` or `adb run …` it is taken as part of the payload): the **last line of stderr** is then one JSON object,
+`{"error": {"kind", "code", "message", "target", "channel", "host",
+"child_exit"}}`. Passthroughs (`helper`, `config edit`, `video shot`/`devices`,
+`adb run`/`input`/`devices`, `setup --host`, and the consoles `serial connect`
+and `adb shell`) exit with their program's own status instead. `serial log` still reads a stopped daemon's file, with a
+`warning:` on stderr; add `--require-live` to get exit 100 instead of stale
+output. A control host on paniolo 0.4.x or older exits 1 for every error and
+rejects `--json-errors`.
+
 ## First-time setup
 
 ```

@@ -219,7 +219,7 @@ Runs `cycle_cmd`. No built-in timing or sense-signal logic — the script is
 responsible for the full sequence. If the script fails, paniolo exits 101
 (`helper_failed`) and reports the script's own code as `child_exit` in the
 `--json-errors` object; a script that is missing or not executable (shell
-code 127/126) exits 3 (`not_configured`).
+code 127/126) exits 3 (`not_configured`). See [Exit status and errors](errors.md).
 
 ---
 

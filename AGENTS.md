@@ -500,6 +500,10 @@ cli/src/
   main.rs       clap CLI — all command groups + runtime handler bodies
   model.rs      typed lab (serde), validate(), resolved per-channel view, channel_host
   labfile.rs    toml_edit comment-preserving lab editor (the write side)
+  error.rs      the error contract: Kind → exit code, PanioloError (kind +
+                target/channel/host/child_exit), classify/report for main(),
+                hook_failed, shell_code (passthroughs), the --json-errors
+                object and the --help exit-status table (docs/errors.md)
   dispatch.rs   per-channel re-exec: slice building/shipping, maybe_dispatch,
                 run_subcommand, remote_daemon_endpoint (port + token over ssh)
   ssh.rs        SSH transport: ControlMaster run/passthrough/interactive, forward
@@ -532,6 +536,18 @@ cli/src/
                 but under share/), list with frontmatter descriptions, print
                 one SKILL.md (or --path), install_bundled() for setup.rs
 ```
+
+**Errors follow the exit-status contract** ([`docs/errors.md`](docs/errors.md);
+design in `docs/dev/error-contract/design.md`). A new failure a consumer might
+branch on returns an `error::PanioloError` of the right kind (use
+`target_not_found`, `channel_missing`, `hook_failed`, `daemon_down`,
+`daemon_request_failed`, `unreachable_host`); a bare `anyhow!` exits 109
+`internal`. Never `std::process::exit(status.code()…)` with a child's status
+outside the documented passthroughs, and use `error::shell_code` there so a
+signal death is 128+N, not 255. Changing a code is a breaking change; adding a
+kind means updating `Kind`, `Kind::ALL` (an exhaustive match beside it stops
+the test build until you look), `EXIT_STATUS_HELP` (a test pins it to `Kind::ALL`),
+`docs/errors.md` and `skills/paniolo/SKILL.md`.
 
 **Helper state/runtime-dir API** (daemons.rs `helper_env`): paniolo exports
 `PANIOLO_STATE_DIR` (`~/.config/paniolo/helpers/<name>/`, durable) and

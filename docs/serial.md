@@ -198,6 +198,12 @@ Each captured line carries a monotonic sequence number (`seq`, stable across
 log rotation) and a UTC timestamp (`ts_ms`). The `--since` flag polls for lines
 with `seq` greater than the last seen value — safe to re-run from scripts.
 
+Because it reads from disk, `serial log` also works while `serialcap` is
+stopped, but then shows nothing captured since it stopped: it prints a
+`warning:` line on stderr and exits 0. Add `--require-live` to fail with exit
+100 (`daemon_down`) instead, when a stale log would be a wrong answer
+([exit codes](errors.md)).
+
 Completed records take precedence over a stale pending-line sidecar, including
 when applying `--tail` and sequence filters. A pending line may change without
 changing its sequence: advance a polling cursor only past completed records,

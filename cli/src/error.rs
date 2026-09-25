@@ -18,6 +18,27 @@ use serde_json::json;
 /// `--json-errors` to a remote paniolo instead.
 pub const JSON_ERRORS_ENV: &str = "PANIOLO_JSON_ERRORS";
 
+/// The exit-status section of `paniolo --help`: every code paniolo emits, and
+/// no others (a test checks it against [`Kind::ALL`]). The full contract is in
+/// `docs/errors.md`.
+pub const EXIT_STATUS_HELP: &str = "\
+Exit status:
+  0    success
+  1    negative answer only (doctor found problems); no error exits 1
+  2    usage             bad flags or arguments
+  3    not_configured    no lab, or unknown target/channel/interface/host;
+                         a hook or helper missing or not executable
+  4    unreachable       control host not reachable over SSH
+  22   timeout           no answer within a deadline; outcome unknown
+  100  daemon_down       the channel's daemon is not running
+  101  helper_failed     a hook, helper or daemon ran and failed
+  109  internal          not yet classified
+Passthroughs (helper, config edit, video shot/devices, adb run/input/devices,
+adb shell, serial connect, setup --host) exit with their program's own status.
+PANIOLO_JSON_ERRORS=1, or --json-errors before any trailing arguments, adds a
+one-line JSON object as the last line of stderr:
+{\"error\": {kind, code, message, target, channel, host, child_exit}}.";
+
 /// What went wrong, in the house exit-code bands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -40,6 +61,35 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// Every kind, for the tests that pin the help text and the bands.
+    #[cfg(test)]
+    pub const ALL: [Kind; 7] = [
+        Kind::Usage,
+        Kind::NotConfigured,
+        Kind::Unreachable,
+        Kind::Timeout,
+        Kind::DaemonDown,
+        Kind::HelperFailed,
+        Kind::Internal,
+    ];
+
+    /// Never called. A new variant stops the build at this match, which is
+    /// the reminder to add it to [`Kind::ALL`] above too; the help test then
+    /// fails until `EXIT_STATUS_HELP` lists it.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn listed_in_all(self) {
+        match self {
+            Kind::Usage
+            | Kind::NotConfigured
+            | Kind::Unreachable
+            | Kind::Timeout
+            | Kind::DaemonDown
+            | Kind::HelperFailed
+            | Kind::Internal => {}
+        }
+    }
+
     /// The process exit status for this kind.
     pub fn exit_code(self) -> i32 {
         match self {
@@ -412,19 +462,26 @@ mod tests {
 
     #[test]
     fn codes_follow_the_bands() {
-        let all = [
-            Kind::Usage,
-            Kind::NotConfigured,
-            Kind::Unreachable,
-            Kind::Timeout,
-            Kind::DaemonDown,
-            Kind::HelperFailed,
-            Kind::Internal,
-        ];
-        for k in all {
+        for k in Kind::ALL {
             let c = k.exit_code();
             assert!((2..125).contains(&c), "{k:?} -> {c}");
         }
+    }
+
+    #[test]
+    fn help_lists_exactly_the_emitted_codes() {
+        let listed: Vec<(i32, Option<&str>)> = EXIT_STATUS_HELP
+            .lines()
+            .filter_map(|l| {
+                let mut words = l.split_whitespace();
+                let code = words.next()?.parse().ok()?;
+                Some((code, words.next()))
+            })
+            .collect();
+        let mut expected: Vec<(i32, Option<&str>)> =
+            vec![(0, Some("success")), (1, Some("negative"))];
+        expected.extend(Kind::ALL.iter().map(|k| (k.exit_code(), Some(k.as_str()))));
+        assert_eq!(listed, expected);
     }
 
     #[test]

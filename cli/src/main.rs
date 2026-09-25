@@ -64,7 +64,8 @@ const VERSION: &str = match option_env!("PANIOLO_VERSION") {
 #[command(
     name = "paniolo",
     version = VERSION,
-    about = "Agent-controlled target machine wrangler."
+    about = "Agent-controlled target machine wrangler.",
+    after_help = error::EXIT_STATUS_HELP
 )]
 struct Cli {
     /// Path to the lab config file (default: $PANIOLO_LAB or ~/.config/paniolo/lab.toml).

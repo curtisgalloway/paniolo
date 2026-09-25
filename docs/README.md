@@ -31,6 +31,13 @@ creates or destroys configuration should not act on an implicit target.
 `paniolo doctor [target]` is the one positional-only runtime command: with no
 target it checks them all, so it is a filter rather than a subject.
 
+## Exit status and errors
+
+Every failure exits with a code that names its kind (3 not configured, 4
+control host unreachable, 100 daemon not running, 101 hook failed, …), and
+`--json-errors` adds a one-line JSON object, so a script can branch without
+reading messages. See [Exit status and errors](errors.md).
+
 ## Subsystem guides
 
 | Guide | Commands | Summary |
