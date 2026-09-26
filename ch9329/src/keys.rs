@@ -16,7 +16,7 @@
 //!
 //! Two name spaces meet here:
 //!
-//! - The HID serial protocol (`docs/hid-serial-protocol.md` §3) names keys with
+//! - The HID serial protocol (`docs/dev/hid-serial-protocol.md` §3) names keys with
 //!   the `adafruit_hid` `Keycode` convention — `A`, `ENTER`, `LEFT_CONTROL`,
 //!   `FORWARD_SLASH`, `F1`. Those names are what `key`/`combo`/`down`/`up`
 //!   accept, so a `ch9329` injector is a drop-in for the KB2040 `hidrig`.

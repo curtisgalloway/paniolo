@@ -768,7 +768,7 @@ pub fn run(repo: &Path, rust_only: bool, lab_flag: Option<&str>) -> Result<()> {
     }
 
     // OCR helper, one per platform: visionocr (swiftc) on macOS, winocr (cargo)
-    // on Windows, a linuxocr copy on Linux. See docs/ocr.md.
+    // on Windows, a linuxocr copy on Linux. See docs/dev/ocr.md.
     if will(SourceStep::OcrHelper) {
         if cfg!(windows) {
             let source = repo.join("ocr/winocr");

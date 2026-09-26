@@ -1,17 +1,17 @@
 # Video capture
 
-paniolo drives `hdmicap`, a Rust warm-stream daemon that keeps a USB HDMI
-capture device open continuously and serves the current frame over HTTP. This
-avoids the multi-second reopen latency you'd get by running ffmpeg per capture.
+paniolo captures the target's screen through `hdmicap`, a daemon that keeps a
+USB HDMI capture device open and serves the current frame over HTTP, so there
+is no per-capture reopen delay.
 
 ---
 
 ## Hardware
 
-Any USB HDMI capture card that presents as a UVC device (V4L2 / AVFoundation).
-Tested with the MS2109-based cards (e.g. generic "USB3.0 HDMI Capture" dongles).
-
-Connect the target's HDMI output to the capture card, then the card to the Mac.
+Any USB HDMI capture card that presents as a UVC device (standard webcam
+protocol). Tested with MS2109-based cards (e.g. generic "USB3.0 HDMI Capture"
+dongles). Connect the target's HDMI output to the card, and the card to the
+control host.
 
 ---
 
@@ -25,28 +25,22 @@ paniolo video devices
 paniolo video set -t target-machine --device "0x8300000534d2109"
 ```
 
-On Linux, `video devices` hides SoC-internal video nodes (e.g. a Raspberry
-Pi's `pispbe-*` pipeline stages and HEVC decoder, which otherwise flood the
-list) — only external capture devices are shown. `paniolo helper hdmicap
-devices --all` lists everything, and an explicitly configured internal device
-still resolves.
-
 The `--device` value may be:
 
-- a **stable id** (preferred): the AVFoundation `uniqueID` on macOS, the
-  `/dev/v4l/by-path/...` symlink on Linux. Both are derived from USB port
-  topology — they survive reboots and enumeration-order shifts, distinguish
-  two identical dongles, and change only if the dongle moves to a different
-  physical port.
-- a **name substring** (e.g. `"USB Video"`): convenient, but identical dongles
-  share a name. A substring matching more than one device is an error that
-  lists the candidates' ids — never a silent first-match guess.
-- a **`/dev/video*` path** (Linux): accepted, but not stable across reboots.
+| Form | Notes |
+|---|---|
+| **Stable id** (preferred) | The AVFoundation `uniqueID` on macOS, the `/dev/v4l/by-path/...` symlink on Linux. Survives reboots, tells identical dongles apart, and changes only if the dongle moves to another USB port. |
+| **Name substring** (e.g. `"USB Video"`) | A substring matching more than one device is an error listing the candidates' ids. |
+| **`/dev/video*` path** (Linux) | Accepted, but not stable across reboots. |
 
-The device lives on the target's `video` channel in the lab file (see
-[config-redesign.md](https://github.com/curtisgalloway/paniolo/blob/main/notes/config-redesign.md)); `paniolo configure` proposes the
-stable id (with the human name as a comment) when one non-built-in capture
-device is present, and lists id alternatives when there are several.
+On Linux, `video devices` hides SoC-internal video nodes (e.g. a Raspberry
+Pi's `pispbe-*` stages). `paniolo helper hdmicap devices --all` lists
+everything, and an internal device you configure explicitly still resolves.
+
+The device is stored on the target's `video` channel in the lab file (see
+[config-redesign.md](https://github.com/curtisgalloway/paniolo/blob/main/notes/config-redesign.md)).
+`paniolo configure` proposes the stable id when it finds one capture device,
+and lists the ids when it finds several.
 
 ---
 
@@ -59,98 +53,78 @@ paniolo video stop  [target-machine]   # stop it (on the target's host)
 paniolo video show  [target-machine]   # show daemon address and status
 ```
 
-`watch` starts `hdmicap daemon` detached and polls for startup, then prints the
-daemon's address. To open the dashboard, run `paniolo video preview` — that URL
-carries the daemon's `?token=`, and the daemon answers nothing without it.
+`watch` starts `hdmicap daemon` detached and prints its address. To open the
+dashboard, run `paniolo video preview`.
 
-**`show` and `console` print the address without the token, on purpose.** The
-token is a live bearer credential, and those two lines land where credentials
-should not: terminal scrollback, `script`/`asciinema` captures, CI logs, pasted
-terminal output in issues, and — because paniolo is driven by agents that run
-`video show` constantly — agent transcripts. They print
-`http://127.0.0.1:<port>`, which is enough to identify the daemon and useless
-on its own.
+### The token and the dashboard URL
 
-**`video preview` is the only command that prints the openable URL**, and the
-only place in the CLI that builds one. There is deliberately no helper for it,
-so no other command can reach for it by accident; `video watch` prints the
-token-free address and points at `preview`.
+**Every request to the daemon needs its token**, from `token` in the
+discovery file ([Runtime paths](#runtime-paths)), new on each start.
+paniolo's commands (`shot`, `read`, `console`, …) send it automatically. By
+hand, send `Authorization: Bearer <token>` or `?token=<token>`. The daemon
+also requires a loopback `Host` and `Origin`. A daemon from a paniolo older
+than the token has none; `paniolo daemons restart --stale` replaces it.
 
-If no browser could be launched — a headless control host, a container, no
-`xdg-open` — `console` does not simply give up: an address you cannot open would
-strand you, and on the remote path the SSH tunnels die with the command, so
-there is no second chance. It writes the full URL to a `0600`
-`dashboard-url.txt` in the target's runtime dir and prints the **path**, which
-keeps the token out of the terminal while leaving it one `cat` away:
+**`video preview` is the only command that prints the URL with the token.**
+`show`, `console` and `watch` print `http://127.0.0.1:<port>` only, to keep
+the credential out of logs and transcripts.
+
+**If `console` cannot launch a browser** (headless host, no `xdg-open`), it
+writes the full URL to a `0600` `dashboard-url.txt` in the target's runtime
+dir and prints the **path**:
 
 ```bash
 xdg-open "$(cat /tmp/paniolo-1000/hdmicap/target-machine/dashboard-url.txt)"
 ```
 
-**Every request to the daemon needs its token.** hdmicap generates a fresh one
-each start and publishes it as `token` in its discovery file (see *Runtime
-paths*), readable by the operator's uid only. paniolo's own commands (`shot`,
-`read`, `console`, …) send it automatically; by hand, send it as
-`Authorization: Bearer <token>` or `?token=<token>`. The daemon also requires a
-loopback `Host` and `Origin`, so a web page open in your browser cannot reach
-it. A daemon started by a paniolo older than the token has none;
-`paniolo daemons restart --stale` replaces it.
+### Stopping safely
 
-`video stop` (and `hdmicap stop`) shuts the daemon down through its
-authenticated `POST /stop`, never by signaling the PID in the discovery file:
-a record left behind by a crash can name a PID the kernel has since given to
-an unrelated process. A daemon too old to have the endpoint must be stopped
-with `paniolo daemons stop hdmicap`, which checks the process identity first.
+`video stop` (and `hdmicap stop`) uses the authenticated `POST /stop` and
+never signals the discovery-file PID, which a crash could leave pointing at an
+unrelated process. Stop a daemon too old for the endpoint with
+`paniolo daemons stop hdmicap`, which checks process identity first.
 
-After an upgrade or rebuild, a daemon still running the old binary is flagged
-**stale** by `paniolo video show` and `paniolo daemons`; `watch` auto-restarts a
-stale daemon (no `--restart` needed), or restart it explicitly with
+### Stale and untracked daemons
+
+**Stale.** A daemon running an old binary after an upgrade shows as **stale**
+in `paniolo video show` and `paniolo daemons`. `watch` restarts it
+automatically (no `--restart` needed), or run
 `paniolo daemons restart hdmicap` (see [architecture](dev/architecture.md)).
 
-**An *untracked* daemon is one that outlived its discovery file.** The file is
-paniolo's only record of a running daemon, and on Linux it sits in `/tmp`,
-which systemd ages out — Debian's stock policy is `q /tmp 1777 root root 10d`,
-so a daemon that has simply been running for ten days without a command against
-it loses the file it published at start. Nothing tells the daemon: it keeps
-running and keeps the capture device, while `video show` reports the channel
-stopped and `video watch` spawns a replacement that dies on the advisory lock
-the orphan still holds (`another hdmicap daemon is already running`).
+**Untracked.** A daemon whose discovery file was deleted keeps running and
+holding the device. On Linux, systemd's `/tmp` cleanup
+(`q /tmp 1777 root root 10d` on Debian) removes the file after ten idle days.
+A new `video watch` then dies on the advisory lock
+(`another hdmicap daemon is already running`).
 
-`video show` now reports such a daemon as `running, untracked (pid N)` rather
-than `stopped`, `paniolo daemons` lists it under **Untracked daemons**, and
-both `video watch` and `video stop` reap it (`SIGTERM`, then `SIGKILL`) instead
-of leaving it to `ps` and `kill`. The serial channel works the same way
-(`paniolo serial show` / `watch` / `stop`); see [serial.md](serial.md). Its port and token died with the file, so
-there is no way to talk to it — a signal is the only handle left.
+- `video show` reports `running, untracked (pid N)` instead of `stopped`.
+- `paniolo daemons` lists it under **Untracked daemons**.
+- `video watch` and `video stop` reap it (`SIGTERM`, then `SIGKILL`).
 
-The `.deb` ships `/usr/lib/tmpfiles.d/paniolo.conf` (`x /tmp/paniolo-*`) so
-this does not happen on a packaged install. **A control host installed with
-`make install` should add that one-line drop-in itself**, or its daemons will
-go untracked every ten days:
+The serial channel works the same way (`paniolo serial show` / `watch` /
+`stop`); see [serial.md](serial.md).
+
+**Prevention.** The `.deb` ships `/usr/lib/tmpfiles.d/paniolo.conf`
+(`x /tmp/paniolo-*`). **A control host installed with `make install` must add
+it itself**, or its daemons go untracked every ten days:
 
 ```bash
 echo 'x /tmp/paniolo-*' | sudo tee /usr/lib/tmpfiles.d/paniolo.conf
 ```
 
-**A stalled capture recovers on its own, most of the time.** The capture
-thread runs a watchdog that notices when no new frame has arrived for a
-while (12s after opening the device, or a further 4s of no progress after
-that) and reopens the capture device in place, publishing `no_device` while
-it does — no restart needed, and this is why `/snapshot`/`/status` briefly
-show `no_device` rather than a frozen frame during a stall. Only a device
-that keeps stalling right after every reopen (8 in a row with no healthy
-frame in between) makes the daemon give up and exit; at that point `paniolo
-video watch` (or `daemons restart --stale`) is what brings it back.
+### Stall recovery and format choice
 
-**The capture format is chosen by what streams, not by what negotiates.**
-On Linux the daemon walks a list of formats highest-resolution first, and
-accepts one only once it has actually delivered a frame (within 2 s) — a mode
-can allocate buffers and then fail when streaming starts, classically
-uncompressed 1080p over USB 2.0. A rejected format is logged to the daemon's
-stderr log (`allocated buffers but produced no frame`). If *nothing* delivers a
-frame — normal when the target is off and the device hands over nothing at all —
-the best format that allocated is opened anyway, so the daemon is sitting on it
-when a signal arrives.
+**A stalled capture recovers on its own.** A watchdog reopens the device when
+no frame arrives (12s after opening, or 4s without progress after that),
+and `/snapshot`/`/status` show `no_device` meanwhile. The daemon exits only after 8 consecutive
+stalls with no healthy frame between; `paniolo video watch` (or
+`daemons restart --stale`) brings it back.
+
+**The capture format is chosen by what streams.** On Linux the daemon tries
+formats highest resolution first and accepts one only if it delivers a frame
+within 2 s (uncompressed 1080p over USB 2.0 typically fails). A rejected
+format is logged as `allocated buffers but produced no frame`. If nothing
+delivers (e.g. the target is off), the best format that allocated is used.
 
 ---
 
@@ -166,75 +140,46 @@ paniolo video preview [target-machine]           # print the live-dashboard URL 
 paniolo video preview --open                     # open it in a browser instead of printing it
 ```
 
-`preview` prints the URL **with** the token, because a browser can present it
-no other way — treat that output as a credential and paste it into a browser,
-not into a log. `--open` hands it to the default browser and prints only the
-token-free address, which is the safer form when anything is recording the
-terminal; if no browser can be launched it writes the URL to the same `0600`
-file `console` uses and prints that path.
+### `shot`
 
-`--open` is refused when the target's video channel is on another host. The
-command would re-exec there and open a browser on the bench machine, not on
-yours. Use `paniolo console <target>`, which forwards the ports and opens a
-browser locally, or plain `preview` and open the URL through your own tunnel.
+`shot` prints `signal=… hash=…` to stderr. Pass the hash to a later
+`--changed-since` to wait for the screen to change.
 
-`shot` fetches a single PNG-encoded frame from the running daemon and prints
-`signal=… hash=…` to stderr; feed that hash to a later `--changed-since` to
-wait for the screen to change.
+- `--stable` waits for any steady frame.
+- `--changed-since` waits for any frame that differs from the hash.
+- **Both together** (`GET /snapshot?wait=stable&changed_since=<hash>`) wait
+  for the next steady screen that differs.
 
-`--stable` and `--changed-since` **combine** (`GET /snapshot?wait=stable&changed_since=<hash>`):
-the daemon then holds the request until a frame is *both* stable *and* different
-from the hash you passed — the next steady screen that is not the one you
-already have. Given alone, each still stands on its own: `--stable` waits for
-any steady frame, `--changed-since` waits for any differing frame. (Combining
-them used to answer on stability alone and hand back the very frame whose hash
-you supplied.)
+`-o <path>` always writes on the **invoking machine**, even when the video
+channel is on a remote control host. A failed capture removes the stub file.
 
-`-o <path>` always means the **invoking machine's** filesystem, including when
-the target's video channel lives on a remote control host: the remote shot
-streams over SSH and the PNG is written locally (a failed capture removes the
-stub file). No copy-back step needed.
+`GET /snapshot` returns **503** in three cases:
 
-`--stable`/`--changed-since` wait by polling the daemon's internal frame
-channel, not by re-hitting the endpoint; `GET /snapshot` returns **503** in
-three distinct cases, each worth telling apart when scripting against it:
-- `x-signal: stale` — the last frame is too old to describe the screen now
-  (capture has stopped delivering, even though the daemon process is up).
-- `x-signal: no_device` — no capture device is open.
-- **no `x-signal` header, body `capture thread gone`** — the daemon's
-  internal capture thread has exited and is not coming back (this daemon
-  process needs `paniolo video watch --restart`, not another `shot`).
+| Response | Meaning |
+|---|---|
+| `x-signal: stale` | The last frame is too old to describe the screen now (capture stopped delivering, though the daemon process is up). |
+| `x-signal: no_device` | No capture device is open. |
+| **No `x-signal` header, body `capture thread gone`** | The daemon's capture thread has exited and is not coming back. This daemon needs `paniolo video watch --restart`, not another `shot`. |
 
-PNG encoding (and, on Linux, the MJPEG decode feeding it) is real CPU work
-that `/snapshot` and `/ocr` share a small concurrency limit for, so a burst
-of clicks queues briefly rather than piling up unbounded work — see *OCR*
-below.
+### `preview`
 
-`GET /preview` (the MJPEG stream behind `paniolo video preview`/the
-[dashboard](dashboard.md)) shares that same concurrency limit for its own
-JPEG-encode fallback (macOS/Windows NV12; Linux serves the device's raw MJPEG
-bytes directly and never hits this path), and coalesces: every open preview
-connection watching the same frame reuses one encode rather than each running
-its own, so a handful of browser tabs left open can't starve `/snapshot` or
-`/ocr` of the same CPU work.
+`preview` prints the URL **with** the token. Treat it as a credential.
+`--open` opens the default browser and prints only the token-free address. If
+no browser launches, it writes the URL to the same `0600` file `console` uses.
 
-`/preview` also refuses to keep showing a frame once it goes stale. Every
-multipart part carries an `X-Signal` header naming the effective signal that
-produced it; when that signal is anything but `stable`/`mode_switching` —
-most commonly `stale` (capture stopped delivering, the same staleness
-`/snapshot` and `/ocr` refuse), but also `no_signal`/`no_device` — the stream
-stops sending that frame's bytes and instead sends a placeholder image (a
-dark gray field with a red diagonal X) once per transition, at the last known
-resolution. This is what keeps a browser tab left open on `/preview`
-honest: without it, the `<img>` would freeze on the last real frame forever,
-which looks exactly like a live, unchanging screen.
+`--open` is refused when the video channel is on another host. Use
+`paniolo console <target>`, which forwards ports and opens a local browser.
 
-A live frame whose fallback JPEG encode *fails* (a malformed pixel buffer — its
-length doesn't match its dimensions) is likewise attempted only **once**, not
-re-encoded on every 67 ms tick: `/preview` records the failed frame, logs one
-`warn!` naming the reason, and skips it until a new, encodable frame arrives —
-so a single bad frame stuck in the channel can't spin the fallback encoder or
-drain the shared concurrency limit ~15 times a second.
+`GET /preview` is the MJPEG stream behind `paniolo video preview` and the
+[dashboard](dashboard.md):
+
+- Open preview connections share one encode per frame.
+- Each part carries an `X-Signal` header. When the signal is not
+  `stable`/`mode_switching` (e.g. `stale`, `no_signal`, `no_device`), the
+  stream shows a placeholder (dark gray with a red X) instead of a frozen
+  frame.
+- A frame whose JPEG encode fails logs one `warn!` and is skipped until a new
+  frame arrives.
 
 ---
 
@@ -245,81 +190,64 @@ paniolo video read [target-machine]            # OCR the current frame, text to 
 paniolo video read --stable [--timeout <ms>]   # wait for a steady frame first
 ```
 
-**GUI screens on Linux** get more accurate OCR from a different engine than
-console/firmware screens do — see
-[dev/ocr.md](dev/ocr.md#linux-needs-two-engines-the-other-platforms-need-one)
-for the accuracy numbers and why. Ask for it per target:
+OCR runs locally: Apple Vision's `VNRecognizeTextRequest` on macOS, Tesseract
+on Linux. With **no video signal**, `read` fails with `no video signal`
+instead of returning empty text.
 
-```bash
-paniolo video set -t target-machine --device "0x8300000534d2109" --ocr-mode gui
-paniolo video set -t target-machine --ocr-mode text   # back to the platform default
-```
-
-`--ocr-mode` is `text` (the platform default) or `gui`; leaving it unset is the
-same as `text`. It only changes anything on Linux — macOS and Windows already
-use their one native engine regardless. Setting it on a target whose video
-channel lives on a remote control host still works: the field travels with the
-channel when paniolo re-execs there, the same as `--device`. `paniolo setup`
-only builds the ~317 MB `rapidocr` venv when some target in the active lab has
-`--ocr-mode gui` set — see dev/ocr.md for why it's opt-in.
-
-`read` wraps the running daemon's `GET /ocr` endpoint (also reachable via the
-OCR button on the [web dashboard](dashboard.md), or directly with the token
-from the discovery file:
+`read` wraps the daemon's `GET /ocr`, which the [dashboard](dashboard.md)'s
+OCR button also uses:
 
 ```bash
 d=/tmp/paniolo-$(id -u)/hdmicap/target-machine/daemon.json
 curl -s -H "Authorization: Bearer $(jq -r .token "$d")" \
     "http://127.0.0.1:$(jq -r .port "$d")/ocr"
 ```
-).
 
-**Two things `signal` used to get wrong**, both fixed and both worth knowing
-about if you read older captures. A *mostly black* screen — which is what every
-firmware, bootloader and console screen is — was classified as no-signal,
-because the sampling lattice was coarse enough to land on none of the text: a
-Gigaboot screen with 1.35% of its pixels lit reported `no_signal` for minutes.
-And a *stalled* capture kept reporting `stable`: the capture loop publishes only
-on success, so the last frame stayed in place with its old label, and a machine
-whose mains had been cut went on reporting `stable` on its pre-cut desktop. A
-frame older than `STALE_AFTER` now reports `stale`, and `/snapshot`, `/ocr`,
-`--stable`, and `/preview` (which swaps in the placeholder image described
-above rather than refusing outright — a stream can't return an error mid-part)
-all refuse to treat it as live.
+### GUI screens on Linux
 
-The lesson for anything collecting frames: **treat `signal` as a hint, save
-every frame, and de-duplicate by hash afterwards** rather than filtering on the
-label as you go.
+GUI screens on Linux read more accurately with a different engine (see
+[dev/ocr.md](dev/ocr.md#linux-needs-two-engines-the-other-platforms-need-one)).
+Set it per target:
 
-When the capture has **no video signal** (the
-target's display is off or unplugged) `read` errors with `no video signal`
-instead of returning empty text, so "display is off" and "screen is blank"
-stay distinguishable. OCR is on-device on both platforms — no network, no
-model download: Apple Vision's `VNRecognizeTextRequest` on macOS, Tesseract
-on Linux.
+```bash
+paniolo video set -t target-machine --device "0x8300000534d2109" --ocr-mode gui
+paniolo video set -t target-machine --ocr-mode text   # back to the platform default
+```
 
-**OCR is bounded, so a wedged or merely slow helper can't hang the daemon.**
-`GET /ocr` gives the `visionocr`/`linuxocr`/`winocr` subprocess 30 seconds;
-past that, the daemon kills it and answers **504** rather than waiting
-indefinitely. PNG encoding and the OCR subprocess together share a small
-concurrency limit (2 at a time), so repeated OCR/snapshot clicks from the
-dashboard queue briefly instead of spawning an unbounded pile of helper
-processes or CPU work — a burst of clicks is slower, not runaway.
+- `--ocr-mode` is `text` (default) or `gui`. It matters only on Linux.
+- It works when the video channel is on a remote control host.
+- `paniolo setup` builds the ~317 MB `rapidocr` venv only when a target in the
+  active lab has `--ocr-mode gui`.
+
+### Limits
+
+`GET /ocr` gives the `visionocr`/`linuxocr`/`winocr` subprocess 30 seconds,
+then kills it and answers **504**. `/snapshot`, `/ocr` and `/preview`'s encode
+fallback share a concurrency limit (2 at a time), so bursts of clicks queue.
+
+### Treat `signal` as a hint
+
+When collecting frames, **save every frame and de-duplicate by hash
+afterwards** instead of filtering on `signal`. A frame older than
+`STALE_AFTER` reports `stale`, and `/snapshot`, `/ocr`, `--stable`, and
+`/preview` refuse to treat it as live. Captures from older versions may show
+mostly-black firmware screens as `no_signal` and stalled captures as
+`stable`.
+
+### Helper installation
 
 `paniolo setup` installs the platform's helper into the private libexec dir:
-on macOS it compiles `ocr/visionocr.swift` with `swiftc`
-(`~/.local/libexec/paniolo/bin/visionocr`); on Linux it installs `linuxocr`,
-a Python 3 script that shells out to Tesseract (`apt-get install
-tesseract-ocr`; Pillow is optional, for its upscale/pad preprocessing). The
-hdmicap daemon finds the helper there (or via `PANIOLO_VISIONOCR`, on both
-platforms) and shells out to it per request.
 
-**OCR tuning notes:**
-- `.fast` recognition level is used (not `.accurate` — the latter misses small
-  console text entirely; it's tuned for natural document text).
-- The frame is 2×-upscaled and black-padded before recognition to improve
-  accuracy on thin console fonts.
-- `minimumTextHeight` is lowered from the default to catch small terminal text.
+- **macOS:** compiles `ocr/visionocr.swift` with `swiftc`
+  (`~/.local/libexec/paniolo/bin/visionocr`).
+- **Linux:** installs `linuxocr`, which shells out to Tesseract
+  (`apt-get install tesseract-ocr`; Pillow is optional, for preprocessing).
+
+The daemon finds the helper there, or via `PANIOLO_VISIONOCR`.
+
+**OCR tuning:** `.fast` recognition (not `.accurate`, which misses small
+console text), 2× upscale with black padding, and a lowered
+`minimumTextHeight`.
 
 ---
 
@@ -332,8 +260,7 @@ platforms) and shells out to it per request.
 | hdmicap advisory lock | `/tmp/paniolo-<uid>/hdmicap/<target>/daemon.lock` |
 | hdmicap stderr log | `/tmp/paniolo-<uid>/hdmicap/<target>/daemon.log` (truncated on each start; shown on start timeout) |
 
-The hdmicap daemon is **per target** (the `<target>` segment), so multiple
-targets capture concurrently on one host; the runtime base honors
-`$PANIOLO_RUNTIME_BASE` (default `/tmp`). Nothing rewrites these files after
-the daemon starts, which is what makes them vulnerable to a `/tmp` sweep — see
-*untracked daemons* above.
+The daemon is **per target**, so several targets can capture at once. The
+runtime base honors `$PANIOLO_RUNTIME_BASE` (default `/tmp`). A `/tmp` sweep
+can remove these files (see
+[Stale and untracked daemons](#stale-and-untracked-daemons)).

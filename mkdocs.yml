@@ -81,6 +81,7 @@ nav:
   - Distributed control: distributed-control.md
   - Standing up a control host: control-host.md
   - Exit status and errors: errors.md
+  - Glossary: glossary.md
   - Developer docs:
       - Architecture: dev/architecture.md
       - Requirements & progress: dev/requirements.md

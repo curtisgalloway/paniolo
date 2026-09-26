@@ -5,16 +5,17 @@ SPDX-License-Identifier: Apache-2.0
 
 # OCR: the helper protocol
 
-paniolo reads the target's screen by piping a captured frame to an **OCR helper
-binary** and parsing what comes back. The helper is a separate process, not a
-library, because the best engine on each platform is written in a different
-language — Swift against Apple Vision, Rust against Windows' `Windows.Media.Ocr`,
-Python around Tesseract. A process boundary is what lets those coexist.
+paniolo reads the target's screen by piping a captured frame to an **OCR
+helper binary** and parsing the result. This page is the contract a helper
+implements, and which helper runs where.
+
+The helper is a separate process because the best engine on each platform is in
+a different language: Swift for Apple Vision, Rust for Windows'
+`Windows.Media.Ocr`, Python for Tesseract.
 
 ## Which engine runs where
 
-Defaults are **platform-native**, chosen for accuracy and latency on the host
-paniolo is actually running on:
+Defaults are **platform-native**, for accuracy and latency:
 
 | Platform | Helper | Engine | Installed by |
 | --- | --- | --- | --- |
@@ -25,68 +26,62 @@ paniolo is actually running on:
 
 `$PANIOLO_VISIONOCR` overrides the choice with an explicit path.
 
-**Consequence worth knowing:** the same screen OCRs differently depending on
-which control host owns the video channel, so an agent's behaviour can be
-host-dependent. Two things make that tractable rather than mysterious: every
-result names the engine that produced it (`engine`, `engine_detail`), and the
-override above lets a lab force one engine across hosts when comparing runs.
+So the same screen OCRs differently on different control hosts. Every result
+names its engine (`engine`, `engine_detail`), and the override lets a lab force
+one engine across hosts when comparing runs.
 
 ### Linux needs two engines; the other platforms need one
 
-Selected by `ocr_mode` on the target's `video` channel — `"text"` (the default)
-or `"gui"`. Measured on a Pi 5 control host against `evals/ocr`:
+`ocr_mode` on the target's `video` channel selects the Linux engine: `"text"`
+(the default) or `"gui"`. Set it with `paniolo video set -t <target> --ocr-mode
+gui` (see [video.md](../video.md#ocr)). It is configured because it cannot be
+inferred at runtime (see the confidence table under
+[The contract](#the-contract)).
+
+Measured on a Pi 5 control host against `evals/ocr`:
 
 | screen type | rapidocr | linuxocr (Tesseract) |
 | --- | --- | --- |
 | GUI | **0.083** token-recall error, ~4.2 s | 0.312, ~1.7 s |
 | text | 0.025 CER, ~6.5 s | **0.019**, ~2.0 s |
 
-So it is a genuine split rather than a better engine: ~4x more accurate on
-anti-aliased UI text, slightly worse on console text, at 2-3x the latency.
+rapidocr is ~4x more accurate on anti-aliased UI text, slightly worse on
+console text, and 2-3x slower. It wins on GUI screens because:
 
-Three things make that trade worth taking on GUI screens, and they are the
-reasoning to revisit if this is ever reopened:
+1. **Latency is affordable.** Change detection uses the frame hash (`/status`,
+   `--changed-since`); OCR runs only when something asks what the screen says,
+   usually once after a state change.
+2. **Tesseract fails on GUIs by silently omitting text.** On a BIOS boot-order
+   page it returned the headings and dropped every value (see
+   [What the engines actually do](#what-the-engines-actually-do)): a confident,
+   complete-looking, wrong answer.
+3. **So "run Tesseract, fall back on low confidence" cannot work.** Tesseract
+   is confident about the rows it *did* read; the missing ones raise no signal.
 
-1. **Latency is affordable because OCR is not in a polling loop.** Change
-   detection uses the frame hash (`/status`, `--changed-since`); OCR runs only
-   when something asks what the screen says, usually once after a state change,
-   against a boot that took tens of seconds.
-2. **Tesseract's GUI failure is silent omission.** On a BIOS boot-order page it
-   returned the headings and dropped every value. An agent asking "what is the
-   boot order?" gets a confident, complete-looking, wrong answer — worse than a
-   slow correct one.
-3. **That also rules out the obvious hybrid.** "Run Tesseract, fall back on low
-   confidence" cannot work: Tesseract is confident about the rows it *did* read,
-   so the missing ones raise no signal to fall back on.
+**No preprocessing for rapidocr.** Upscaling, inversion and binarization were
+all slower than `raw` and none more accurate. `visionocr` and `linuxocr`
+upscale internally.
 
-`ocr_mode` exists because the choice cannot be inferred at runtime — see the
-confidence table below. Set it with `paniolo video set -t <target> --ocr-mode
-gui` (or `text`, the default) — see [video.md](../video.md#ocr).
-
-**No preprocessing for rapidocr.** The benchmark swept upscaling, inversion and
-binarisation: every variant was slower than `raw` and none more accurate. Unlike
-`visionocr` and `linuxocr`, which upscale internally, it gets the frame
-untouched.
-
-**The venv is opt-in.** ~317 MB (onnxruntime 58 MB, models 31 MB, numpy/opencv
-the rest), built by `paniolo setup` only when some target sets
-`ocr_mode = "gui"`. Pi OS is PEP 668-managed, so a venv rather than a system
-install. `opencv-python-headless` is forced over the `opencv-python` RapidOCR
-pulls in — the full build needs `libGL.so.1`, absent on a headless Pi OS, and it
-fails at first OCR rather than at install.
+**The venv is opt-in.** It is ~317 MB (onnxruntime 58 MB, models 31 MB,
+numpy/opencv the rest); `paniolo setup` builds it only when some target sets
+`ocr_mode = "gui"`. It is a venv because Pi OS is PEP 668-managed (the system
+Python refuses `pip install`). `opencv-python-headless` replaces the
+`opencv-python` RapidOCR pulls in: the full build needs `libGL.so.1`, which
+headless Pi OS lacks, and fails at first OCR rather than at install.
 
 ## The contract
 
-**Input** — a PNG on stdin (`-`) or a path argument. **Output** — plain text by
-default, one line per recognized line, in reading order. That form is for humans
-running the helper by hand.
+**Input:** a PNG on stdin (`-`) or a path argument.
 
-`rapidocr` holds callers to that literally and errors on anything without the
-PNG signature; see "Resource limits" for why. The others accept whatever their
-platform's image loader recognizes, which is more than a PNG — but nothing in
-paniolo sends them anything else, so do not rely on it.
+- `rapidocr` errors on anything without the PNG signature (see
+  [Resource limits](#resource-limits)).
+- The others accept whatever their platform's image loader recognizes; do not
+  rely on that.
 
-**paniolo always passes `--json`**, and that is the machine contract:
+**Output:** plain text by default, one line per recognized line, in reading
+order, for humans.
+
+**paniolo always passes `--json`**, the machine contract:
 
 ```json
 {
@@ -103,99 +98,87 @@ paniolo sends them anything else, so do not rely on it.
 ```
 
 - `version` — this document's version. Bump on any incompatible change.
-- `engine` / `engine_detail` — identity of what produced the result. Not
-  decoration: with platform-native defaults these are how you tell why two hosts
-  disagree about the same screen.
+- `engine` / `engine_detail` — what produced the result; explains why two
+  hosts disagree about a screen.
 - `width` / `height` — **the source image's** dimensions, in pixels.
-- `text` — every line joined with `\n`, in reading order. Retained so consumers
-  that only want text do not have to reassemble it.
-- `lines[].confidence` — `0.0`–`1.0`, and **optional**. Engines that report on
-  another scale are normalized by their helper: Tesseract's `0`–`100` is divided
-  by 100, and its `-1` ("no text") means the line is omitted, never reported as
-  `0.0`. An engine with no confidence to report omits the field; a consumer must
-  not read its absence as zero.
+- `text` — every line joined with `\n`, in reading order.
+- `lines[].confidence` — `0.0`–`1.0`, and **optional**.
+  - A helper normalizes an engine's other scale: Tesseract's `0`–`100` is
+    divided by 100, and its `-1` ("no text") means the line is omitted, never
+    reported as `0.0`.
+  - An engine with no confidence omits the field. Do not read its absence as
+    zero.
 
-  Confidence turned out to be the least dependable part of this contract, so do
-  not design around it:
+  Confidence is the least dependable part of this contract; do not design
+  around it:
 
   | Engine | Confidence |
   | --- | --- |
   | Tesseract | Real per-word values |
-  | Apple Vision | **Constant** — 0.5 for every line in `--fast`, 1.0 in `--accurate`. Measured over a 56-line frame: one distinct value. It indicates the recognition level, not quality. |
+  | Apple Vision | **Constant** — 0.5 for every line in `--fast`, 1.0 in `--accurate` (one distinct value over a 56-line frame). It indicates the recognition level, not quality. |
   | `Windows.Media.Ocr` | **Not exposed at all** — the field is absent |
 
-  That is why routing between engines or recognition levels is configured rather
-  than inferred from confidence: on two of three platforms there is nothing to
-  infer from.
+  So engine routing is configured, not inferred from confidence.
 - `lines[].bbox` — `[x, y, w, h]` in **pixels, origin top-left, in source-image
-  coordinates**. Always the intersection of the recognized box with the source
-  frame: a line whose recognition rectangle crosses an edge is reported at the
-  size it actually occupies inside `[0, width) x [0, height)`, not the size it
-  had before clipping.
+  coordinates**, always intersected with the source frame: a line crossing an
+  edge is reported at the size it occupies inside `[0, width) x [0, height)`.
 
 ### The bbox rule is the sharp edge
 
-Helpers preprocess before recognizing — `visionocr` upscales 2× and pads 16 px,
-because small console fonts recognize far better enlarged and glyphs flush to
-the frame edge get clipped. Engine coordinates therefore refer to a *different
-image* than the caller supplied.
+**Every helper must map its boxes back to the source frame.** Helpers
+preprocess, so engine coordinates refer to a *different image* than the caller
+supplied. `visionocr`, for example, upscales 2× and pads 16 px (small console
+fonts recognize better enlarged; edge glyphs get clipped otherwise).
 
-**Every helper must map its boxes back to the source frame.** A consumer's whole
-reason for wanting a bbox is to act on it — crop it, or click it through the hid
-channel — and a box in the coordinates of an intermediate buffer aims slightly
-wrong, in a way that is easy to miss precisely because it is close.
+Consumers crop or click a bbox through the hid channel. A box in an
+intermediate buffer's coordinates aims slightly wrong, which is easy to miss
+because it is close.
 
-This was a real defect. `visionocr --json` reported coordinates normalized
-against its padded, upscaled buffer rather than the source frame. Scaling those
-back by the source dimensions leaves a systematic error from the padding that
-was never removed — a few pixels at 800x600, and proportionally worse the larger
-the padding is relative to the frame. Enough to clip a tight crop, close enough
-to look plausible. It went unnoticed because nothing consumed `--json` yet, and
-the units differed too: a consumer expecting pixels would have read `0.137`
-where the answer was `104`.
+Each helper undoes its own conventions:
 
-Apple Vision additionally reports **normalized, bottom-left-origin** boxes, so
-`visionocr` flips the y axis as well as undoing its own scale and padding.
+- Apple Vision reports **normalized, bottom-left-origin** boxes against the
+  upscaled, padded buffer. `visionocr` flips the y axis as well as undoing its
+  scale and padding.
+- Tesseract reports pixels on that same preprocessed image.
+- `Windows.Media.Ocr` reports pixels on the source.
 
-A follow-up defect (#149) got the origin right but not the extent: both
-helpers clamped a mapped corner to 0 at the left/top edge without also
-shrinking the width/height that had been measured in the padding, so a line
-flush with the frame's left edge came back a few pixels too wide instead of
-clipped. The fix maps *both* corners of a box into source coordinates,
-intersects the result with `[0, width] x [0, height]`, and derives width and
-height from the clipped corners — so a crossing on any edge shrinks the
-reported box, and a box landing entirely outside the source (only possible for
-garbage input) clips to zero size rather than a negative one.
+**Mapping must clip, not clamp.** Map *both* corners into source coordinates,
+intersect with `[0, width] x [0, height]`, and derive width and height from the
+clipped corners. An edge crossing then shrinks the box, and a box entirely
+outside the source (garbage input) clips to zero size, not negative.
+
+Two past defects:
+
+- `visionocr --json` reported coordinates normalized against its padded,
+  upscaled buffer: off by a few pixels from the unremoved padding, and in the
+  wrong units (`0.137` where the answer was `104`).
+- A later fix clamped a mapped corner to 0 at the left/top edge without
+  shrinking the width/height, so a line flush with the left edge came back a
+  few pixels too wide.
 
 ## What paniolo does with it
 
 `hdmicap`'s `GET /ocr` runs the helper with `--json` and returns the envelope as
-`application/json`. `paniolo video read` prints `text` by default — what a human
-or an agent grepping the screen wants, and what the command printed before the
-envelope existed — and the whole envelope under `--json`.
+`application/json`. `paniolo video read` prints `text` by default and the whole
+envelope under `--json`.
 
-**Version skew degrades rather than fails, in both directions.** If a helper's
-stdout does not parse as an envelope, `/ocr` treats it as plain text from a
-pre-v1 helper and synthesizes an envelope with no `lines`, logging a warning
-that names the binary — omitting boxes is honest, fabricating them is not. And
-`paniolo video read` passes a non-envelope body through unchanged, so a CLI
-newer than the daemon it is talking to still reads screens.
+**Version skew degrades rather than fails, in both directions**, because the
+helper, daemon and CLI upgrade separately:
 
-Both paths matter because the helper, the daemon and the CLI are installed
-separately and upgrade at different times. The failure they replace looks to an
-agent like a broken capture rather than a version mismatch.
+- If a helper's stdout does not parse as an envelope, `/ocr` treats it as plain
+  text from a pre-v1 helper: it synthesizes an envelope with no `lines` (never
+  fabricated boxes) and logs a warning naming the binary.
+- `paniolo video read` passes a non-envelope body through unchanged, so a CLI
+  newer than its daemon still reads screens.
 
-The envelope check is `version` being present, not merely "the body is JSON" —
-otherwise a screen that happens to *show* JSON containing a `text` key would be
-mined for it.
+The envelope check is `version` being present, not "the body is JSON", so a
+screen that *shows* JSON with a `text` key is not mined for it.
 
 ### Coordinates cross-check
 
-The three helpers arrive at boxes from three different native conventions —
-Apple Vision reports normalized, bottom-left-origin boxes against an upscaled
-and padded buffer; Tesseract reports pixels on that same preprocessed image;
-`Windows.Media.Ocr` reports pixels on the source. On the same frame's first
-line they converge:
+From three different native conventions (see
+[the bbox rule](#the-bbox-rule-is-the-sharp-edge)), the helpers converge on the
+same frame's first line:
 
 | Helper | bbox |
 | --- | --- |
@@ -203,16 +186,13 @@ line they converge:
 | `linuxocr` | `[2, 34, 390, 16]` |
 | `winocr` | `[2, 34, 391, 17]` |
 
-Agreement within a few pixels across three independent implementations is the
-check that the mapping-back rule is actually being applied, rather than each
-helper reporting something self-consistent and wrong. Worth re-running when a
-helper's preprocessing changes.
+Agreement within a few pixels shows the mapping-back rule is applied. Re-run
+it when a helper's preprocessing changes.
 
 ## What the engines actually do
 
-Measured on the 13 dongle captures in `evals/ocr/dataset`, same bytes to each.
-The hardest frame is an AMI BIOS page whose boot-order values sit inside
-cyan-filled dropdown widgets:
+Measured on the 13 dongle captures in `evals/ocr/dataset`. The hardest frame
+is an AMI BIOS page whose boot-order values sit in cyan dropdown widgets:
 
 | Engine | Boot Option values |
 | --- | --- |
@@ -220,12 +200,11 @@ cyan-filled dropdown widgets:
 | `Windows.Media.Ocr` | `UEFI: PXE IPva Intel(R) Ethernet C` — reads them, fumbles digits |
 | Tesseract | **None.** The widget text does not survive at all |
 
-Tesseract's failure there is the dangerous one: it returns well-formed text with
-whole rows missing, so an agent asking "what is the boot order?" gets a
-confident, complete-looking, wrong answer. Vision and winocr garble visibly.
+Tesseract's failure is the dangerous one: well-formed text with whole rows
+missing. Vision and winocr garble visibly.
 
-Digit/letter confusion is the common weakness, and it lands hardest on exactly
-the strings bring-up cares about. On a PXE screen's MAC address:
+Digit/letter confusion is common and hits the strings bring-up cares about. On
+a PXE screen's MAC address:
 
 | Engine | Result |
 | --- | --- |
@@ -233,95 +212,68 @@ the strings bring-up cares about. On a PXE screen's MAC address:
 | `Windows.Media.Ocr` | `S4-B2-03-FO-BS-SC` — 5→S, 0→O |
 | Apple Vision `--fast` | `54-B2-03-FO-B5-5C` — one 0→O |
 
-So match on such strings loosely, or corroborate them, rather than trusting an
-exact compare.
+Match such strings loosely or corroborate them; do not trust an exact compare.
 
 ## Resource limits
 
-Every helper is handed whatever bytes and resolution the target's video
-channel produces, which is not bounded by anything paniolo controls. Each
-enforces the same three limits, checked before the expensive work (a full
-image decode, or the 2x upscale `linuxocr`/`visionocr` do for small console
-fonts) happens, so a hostile or merely oversized input fails fast instead of
-driving an oversized allocation:
+paniolo does not bound the bytes or resolution a video channel produces. Every
+helper enforces the same three limits before the expensive work (a full decode,
+or the 2x upscale in `linuxocr`/`visionocr`), so oversized input fails fast
+instead of driving an oversized allocation.
 
-- **64 MiB of encoded input.** Each helper reads stdin/the file argument in
-  bounded chunks (up to the limit plus one byte, so "exactly at the limit" and
-  "over it" are both detectable without ever buffering much past the cap) and
-  errors as soon as it sees more than that arrives.
-- **8192 px on a side, 33,177,600 px total** (7680x4320). Checked against the
-  image header *before* a full decode: `linuxocr`/`rapidocr` parse the PNG
-  IHDR by hand, `visionocr` reads ImageIO's properties
-  (`CGImageSourceCopyPropertiesAtIndex`), and `winocr` reads
-  `BitmapDecoder.PixelWidth`/`PixelHeight` before calling
-  `GetSoftwareBitmapAsync()` — all of which report a header-declared size
-  without rasterizing pixels. Each helper also checks again right after its
-  own decode, unconditionally, before doing anything with the result — a
-  backstop for whatever the header parse missed (a format the PNG-specific
-  check doesn't recognize, or Pillow/OpenCV succeeding where it didn't). The
-  decode has already happened by then, but the expensive step for
-  `linuxocr`/`visionocr` — the 2x upscale — has not.
+**64 MiB of encoded input.** Each helper reads in bounded chunks, up to the
+limit plus one byte, and errors as soon as it sees more than the limit.
 
-  `rapidocr` also **refuses input that is not a PNG**, before it decodes
-  anything. Its pre-decode check reads the PNG IHDR, but `cv2.imdecode`
-  accepts JPEG, BMP and WebP too, so a JPEG under the byte cap whose SOF
-  declared an enormous size used to reach the decoder in full with only the
-  post-decode backstop — which runs after the allocation it exists to prevent
-  — left to catch it (#167). Teaching the helper a second header format would
-  fix the symptom; refusing non-PNG is what the input contract above already
-  promises, and what hdmicap actually sends (its own PNG encoder's output).
+**8192 px on a side, 33,177,600 px total** (7680x4320).
 
-  33,177,600 is exactly 2x a 4K capture (3840x2160) in each dimension, so any
-  4K frame passes — with margin on the per-side number, none on the
-  pixel-count one, since a 4K frame doubled is precisely at that limit.
-  `linuxocr` and `visionocr` check this pixel/dimension pair twice: once
-  against the source size, once against the *working* size their own 2x
-  upscale is about to allocate (before the small fixed padding on top, which
-  isn't part of the limit — a constant ~20-32 px, negligible against this
-  budget). `rapidocr` and `winocr` do no upscaling, so it applies directly to
-  the source. `winocr` additionally intersects the shared per-side limit with
+- **Before decode**, each helper checks the size the image header declares,
+  without rasterizing pixels:
+  - `linuxocr`/`rapidocr` parse the PNG IHDR (header chunk) by hand.
+  - `visionocr` reads ImageIO's properties (`CGImageSourceCopyPropertiesAtIndex`).
+  - `winocr` reads `BitmapDecoder.PixelWidth`/`PixelHeight` before calling
+    `GetSoftwareBitmapAsync()`.
+- **After decode**, each helper checks again, unconditionally, backstopping
+  whatever the header parse missed (Pillow/OpenCV decoding a format the PNG
+  check doesn't recognize). For `linuxocr`/`visionocr` this still precedes the
+  2x upscale.
+- 33,177,600 is exactly 2x a 4K capture (3840x2160) in each dimension, so any
+  4K frame passes, with no margin on the pixel count.
+- `linuxocr` and `visionocr` check the pair against the source size and again
+  against the *working* size of their 2x upscale. The fixed padding (~20-32 px)
+  is not part of the limit.
+- `rapidocr` and `winocr` do no upscaling, so the limit applies directly to the
+  source. `winocr` also intersects the per-side limit with
   `OcrEngine::MaxImageDimension()`, using whichever is stricter.
 
+**`rapidocr` refuses input that is not a PNG**, before decoding anything. Its
+pre-decode check reads the PNG IHDR, but `cv2.imdecode` also accepts JPEG, BMP
+and WebP, so a JPEG whose SOF (JPEG size header) declared an enormous size
+reached the decoder in full (#167). Refusing non-PNG matches the input contract
+and what hdmicap sends.
+
 The three numbers must stay **identical** across `ocr/linuxocr`,
-`ocr/rapidocr`, `ocr/visionocr.swift` and `ocr/winocr/src/main.rs` — each
+`ocr/rapidocr`, `ocr/visionocr.swift` and `ocr/winocr/src/main.rs`. Each
 defines them once as named constants, with a comment pointing at the other
-three so a future change to one doesn't silently drift from the rest.
+three.
 
 **Errors are one line, on stderr, non-zero exit** — the same path each helper
-already uses for "cannot read", "could not decode image", and so on, not a
-new failure mode a caller has to learn to recognize.
+uses for "cannot read", "could not decode image", and so on.
 
 ## Every failure leaves the same way
 
-That shape is not only for the limits. A missing input file, bytes that are
-not an image, an I/O error part-way through a read — each is routed through
-the helper's own error exit, because the caller is a daemon parsing stderr,
-not a person reading a stack trace. Three paths did not, and were fixed in
-#168:
+A missing input file, non-image bytes, and a mid-read I/O error all go through
+the helper's error exit, because the caller is a daemon parsing stderr. These
+paths once escaped it:
 
-- `linuxocr` opened its input file bare, so a missing path came back as a
-  `FileNotFoundError` traceback, and its preprocessing caught only
-  `ImportError` (a missing Pillow), so non-image bytes came back as a
-  `PIL.UnidentifiedImageError` traceback. Both now go through `die()`.
-- `rapidocr` opened its input file bare, with the same result.
-- `visionocr` read with `try?`, which turns a failed read into `nil` — the
-  same value that means EOF. A descriptor error therefore did not report at
-  all: the helper OCR'd whatever prefix it had managed to read and returned
-  the text that survived, which is the worst of the three, because nothing
-  downstream can tell a truncated screen from a short one. Its bounded reader
-  now `rethrows`, and the caller dies with the underlying error.
+| Helper | Was | Now |
+| --- | --- | --- |
+| `linuxocr` | Opened its input file bare: a missing path gave a `FileNotFoundError` traceback. Preprocessing caught only `ImportError` (a missing Pillow), so non-image bytes gave a `PIL.UnidentifiedImageError` traceback. | Both go through `die()`. |
+| `rapidocr` | Opened its input file bare, with the same result. | Goes through the error exit. |
+| `visionocr` | Read with `try?`, which turns a failed read into `nil` (same as EOF), so it OCR'd a truncated prefix silently. | Its bounded reader `rethrows`, and the caller dies with the underlying error. |
+| `linuxocr` | Spawned `tesseract` bare. A host without it (common: the `.deb` only Recommends it) got a `FileNotFoundError` traceback; a non-zero exit forwarded raw multi-line stderr. | Both go through `die()`: the missing-binary message names the apt package, and a non-zero exit collapses to one line keeping tesseract's message. |
 
-A fourth, found while fixing those and closed in #179: `linuxocr` spawned
-`tesseract` bare, so a host without the binary — an ordinary first-run state,
-since it is a system package the `.deb` only Recommends — got a
-`FileNotFoundError` traceback, and a tesseract that exited non-zero had its
-raw multi-line stderr forwarded verbatim. Both now go through `die()`: the
-missing-binary message names the apt package that provides it, and the
-non-zero exit is collapsed to one line that keeps tesseract's own message.
-
-The Python helpers' error paths are covered by `ocr/tests` and `visionocr`'s
-by its own `--self-test`, both of which CI runs; see "Adding an engine" for
-where a new helper hooks in.
+CI runs the Python helpers' error-path tests (`ocr/tests`) and `visionocr`'s
+`--self-test`.
 
 ## Adding an engine
 
@@ -329,8 +281,5 @@ where a new helper hooks in.
 2. Emit the envelope above, with boxes mapped back to source coordinates.
 3. Name it in `daemons::helper_dirs()`'s install path and in `paniolo setup`.
 
-Confidence is what makes the interesting things possible — routing a screen to
-a cheap engine and falling back when it reports low confidence, or keying
-downstream matching on high-confidence tokens rather than raw string equality —
-so an engine that cannot report it should report the absence rather than invent
-a number.
+If the engine cannot report confidence, omit it rather than invent a number;
+real confidence enables fallback routing and high-confidence token matching.

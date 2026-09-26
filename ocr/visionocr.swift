@@ -22,7 +22,7 @@
 //   --fast        use the fast recognition level (lower latency, worse on
 //                 every frame measured — see the note at recognitionLevel
 //                 below)
-//   --json        emit the v1 OCR envelope (see docs/ocr.md): engine identity,
+//   --json        emit the v1 OCR envelope (see docs/dev/ocr.md): engine identity,
 //                 source dimensions, joined text, and per-line text +
 //                 confidence + [x, y, w, h] bbox in SOURCE pixels, origin
 //                 top-left
@@ -438,7 +438,7 @@ if json {
     // Map back to source pixels with a top-left origin: undo the normalization,
     // flip y, then remove the padding and the scale. Reporting boxes in the
     // coordinates of an intermediate buffer would silently aim any consumer
-    // (a crop, or a hid click) at the wrong place. See docs/ocr.md.
+    // (a crop, or a hid click) at the wrong place. See docs/dev/ocr.md.
     let procW = CGFloat(image.width)
     let procH = CGFloat(image.height)
     let srcW = CGFloat(decoded.width)

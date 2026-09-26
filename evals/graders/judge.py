@@ -17,7 +17,7 @@ This module builds the judge prompt from a scenario + the agent transcript.
 It does not hard-code a model client: pass a `judge_cmd` (e.g. "claude -p")
 to `run_judge` and it pipes the prompt in and parses the JSON verdict back.
 With no judge_cmd, callers just persist the prompt for manual/automated
-grading. See docs/agent-evals.md sec. 6.2.
+grading. See docs/dev/agent-evals.md sec. 6.2.
 """
 
 from __future__ import annotations

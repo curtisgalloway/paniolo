@@ -4,19 +4,17 @@
 
 Agent-controlled target machine wrangler for low-level software development.
 
-"Paniolo" is the Hawaiian word for cowboy. The idea: an AI agent sits at the
-reins while you're writing bootloaders, firmware, or OS bring-up code — paniolo
-gives it the controls to netboot the target, watch its output, send it input,
-and power-cycle it without human intervention at each iteration.
+"Paniolo" is Hawaiian for cowboy. For bootloader, firmware, and OS bring-up
+work, it lets an AI agent netboot the target, watch its output, send it input,
+and power-cycle it, with no human in the loop.
 
 <br clear="left">
 
 ## See it work
 
-An agent on a laptop drives an Intel NUC's firmware setup on a CI rack in
-another room: exit, catch `F2` during POST through the KVM's emulated
-keyboard, confirm re-entry by OCR, then navigate by absolute mouse. What the
-dashboard saw:
+An agent on a laptop drives an Intel NUC's firmware setup in another room: it
+exits setup, catches `F2` during POST through the KVM's emulated keyboard,
+confirms by OCR that it is back in setup, then clicks with an absolute mouse:
 
 ![NUC BIOS, driven over the KVM from another room](docs/demo/nuc-bios-puppet-screen.gif)
 
@@ -27,9 +25,7 @@ $ until paniolo video read lab-nuc-1 | grep -q -i "bios version"; do sleep 2; do
 $ paniolo hid send -t lab-nuc-1 moveabs 19583 5871 ; paniolo hid send -t lab-nuc-1 click left
 ```
 
-More on the [demos page](https://curtisgalloway.github.io/paniolo/demos/): a live desktop puppeted over HID,
-out-of-band power over Intel AMT, and a Pi cold-booted through a relay and
-caught on serial.
+More on the [demos page](https://curtisgalloway.github.io/paniolo/demos/).
 
 ---
 
@@ -37,81 +33,47 @@ caught on serial.
 
 | Subsystem | Commands | What it does |
 |---|---|---|
-| [Netboot](https://curtisgalloway.github.io/paniolo/netboot/) | `paniolo netboot` | DHCP + TFTP + HTTP netboot over a direct USB-Ethernet link (Raspberry Pi, plus UEFI PXE / HTTP Boot for EDK2 boards) |
-| [Remote labs](https://curtisgalloway.github.io/paniolo/distributed-control/) | `paniolo --lab …` | Drive targets on remote control hosts transparently over SSH; one git-tracked lab file |
-| [Control hosts](https://curtisgalloway.github.io/paniolo/control-host/) | `paniolo skill control-host` | Blank Raspberry Pi to agent-reachable control host in one human action: stock Raspberry Pi OS plus a hardware-validated cloud-init seed that brings it up with SSH authorized and paniolo installed; the bundled skill carries the flashing procedure |
-| [Link mode](https://curtisgalloway.github.io/paniolo/netif/) | `paniolo netif` | Atomically switch the link between netboot, ffx-over-IPv6, bare-link (`link`), and `off` modes; toggle `link`/`off` to test the link up/down, or `down-hard` to force a real carrier drop (WoL off + admin-down) |
-| [Video](https://curtisgalloway.github.io/paniolo/video/) | `paniolo video` | HDMI capture via warm-stream daemon; on-device OCR |
-| [Serial](https://curtisgalloway.github.io/paniolo/serial/) | `paniolo serial` | Serial console — interactive (tio) or daemon-backed with timestamped rolling log |
-| [Power control](https://curtisgalloway.github.io/paniolo/power/) | `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`, `paniolo serial dtr/reset` | DTR-based hardware power button (J2 header; opt-in per serial interface) and generic shell-command hooks (on/off/cycle/state); helpers: `cambrionix` (Cambrionix hub ports), `zigplug` (Zigbee smart plugs), `shellyplug` (Shelly Gen2+ plugs/relays over local HTTP RPC), `amt` (Intel AMT/vPro over WS-Man, with true power-state readback) |
-| [HID injection](https://curtisgalloway.github.io/paniolo/hid/) | `paniolo hid` | USB keyboard/mouse injection via a generic helper hook (`hidrig` KB2040 injector, or `ch9329` for Openterface Mini-KVM / KVM-Go and Sipeed NanoKVM-USB); KVM input from the web console |
-| [Switchable USB media](https://curtisgalloway.github.io/paniolo/usb/) | `paniolo usb` | Route a shared USB device (an Openterface KVM-Go's onboard microSD card) to the control host or the target, for hands-free physical boot media that firmware can see |
-| [adb (Android targets)](https://curtisgalloway.github.io/paniolo/adb/) | `paniolo adb` | Drive an Android DUT over adb — console (`shell`/`run`), screen (`screencap`), and input — one USB cable, no capture/HID/serial rig |
-| [Dashboard](https://curtisgalloway.github.io/paniolo/dashboard/) | `paniolo console` | Combined video + serial web UI; auto-starts daemons; `-i <name>` preselects a serial interface |
-| Agent skills | `paniolo skill` | List the bundled agent guides (driving a target, GUI puppeting, building a control host), or print one's `SKILL.md` for an agent to read |
-| Lab config & diagnostics | `paniolo target`/`host`/`config`, `paniolo discover`, `paniolo configure`, `paniolo doctor`, `paniolo daemons` | CLI-managed lab file (targets, hosts, channels), hardware discovery with a proposed config block, config-vs-reality probing, and a one-view daemon inventory with stop/restart |
-| [Exit status and errors](https://curtisgalloway.github.io/paniolo/errors/) | `paniolo --json-errors …` | Every failure exits with a code naming its kind (not configured, host unreachable, daemon down, hook failed, timeout); `--json-errors` adds a one-line JSON object so scripts and agents branch without parsing messages |
+| [Netboot](https://curtisgalloway.github.io/paniolo/netboot/) | `paniolo netboot` | DHCP + TFTP + HTTP netboot over a direct USB-Ethernet link (Raspberry Pi; UEFI PXE / HTTP Boot) |
+| [Remote labs](https://curtisgalloway.github.io/paniolo/distributed-control/) | `paniolo --lab …` | Drive targets on remote control hosts over SSH from one git-tracked lab file |
+| [Control hosts](https://curtisgalloway.github.io/paniolo/control-host/) | `paniolo skill control-host` | Blank Raspberry Pi to agent-reachable control host in one human action (stock Pi OS plus a cloud-init seed) |
+| [Link mode](https://curtisgalloway.github.io/paniolo/netif/) | `paniolo netif` | Switch the link between netboot, ffx-over-IPv6, `link`, and `off` modes; `down-hard` forces a real carrier drop (WoL off + admin-down) |
+| [Video](https://curtisgalloway.github.io/paniolo/video/) | `paniolo video` | HDMI capture daemon; on-device OCR |
+| [Serial](https://curtisgalloway.github.io/paniolo/serial/) | `paniolo serial` | Serial console: interactive (tio) or a daemon with a timestamped log |
+| [Power control](https://curtisgalloway.github.io/paniolo/power/) | `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`, `paniolo serial dtr/reset` | DTR power button (J2 header) and shell-command hooks; helpers `cambrionix` (hub ports), `zigplug` (Zigbee plugs), `shellyplug` (Shelly Gen2+), `amt` (Intel AMT/vPro) |
+| [HID injection](https://curtisgalloway.github.io/paniolo/hid/) | `paniolo hid` | USB keyboard/mouse injection via a helper (`hidrig` KB2040 injector, or `ch9329` for Openterface Mini-KVM / KVM-Go and Sipeed NanoKVM-USB) |
+| [Switchable USB media](https://curtisgalloway.github.io/paniolo/usb/) | `paniolo usb` | Switch a KVM-Go's microSD card between control host and target, as boot media |
+| [adb (Android targets)](https://curtisgalloway.github.io/paniolo/adb/) | `paniolo adb` | Drive an Android DUT over one USB cable: console (`shell`/`run`), screen (`screencap`), input |
+| [Dashboard](https://curtisgalloway.github.io/paniolo/dashboard/) | `paniolo console` | Video + serial web UI; auto-starts daemons; `-i <name>` preselects a serial interface |
+| Agent skills | `paniolo skill` | List the bundled agent guides, or print one's `SKILL.md` |
+| Lab config & diagnostics | `paniolo target`/`host`/`config`, `paniolo discover`, `paniolo configure`, `paniolo doctor`, `paniolo daemons` | Manage the lab file, discover hardware, check config against reality, list and restart daemons |
+| [Exit status and errors](https://curtisgalloway.github.io/paniolo/errors/) | `paniolo --json-errors …` | Exit codes name the failure kind; `--json-errors` adds a one-line JSON object |
 
----
-
-## Documentation
-
-Full documentation is published at
-**[curtisgalloway.github.io/paniolo](https://curtisgalloway.github.io/paniolo/)**
-and describes paniolo's verified current state; the source is in
-[`docs/`](docs/README.md). The per-subsystem guides linked above are the user
-documentation. Beyond them, the
-[demos page](https://curtisgalloway.github.io/paniolo/demos/) shows recorded runs
-from the CI rack, the
-[tested-hardware list](https://curtisgalloway.github.io/paniolo/hardware/) covers
-the bench gear each subsystem is verified with, and
-[standing up a control host](https://curtisgalloway.github.io/paniolo/control-host/)
-takes a blank Raspberry Pi to an agent-reachable host in one human action.
-
-Developer documentation is published alongside it: start with the
-[**architecture overview**](https://curtisgalloway.github.io/paniolo/dev/architecture/)
-for the whole-system design, then the
-[requirements tracker](https://curtisgalloway.github.io/paniolo/dev/requirements/),
-the interface specs, and the Hardware-CI integration (KernelCI/LAVA,
-Fuchsia/botanist) design. Its source is [`docs/dev/`](docs/dev).
-
-Point-in-time records — the design a feature was built from, a bring-up's
-findings, a plan that has shipped — live in [`notes/`](notes/README.md). They are
-kept for the record, are not maintained against the current code, and are not
-published.
-
----
-
-## Requirements
-
-- macOS 10.14 (Mojave) or later, or Linux (x86-64 / arm64)
-- [Homebrew](https://brew.sh) (macOS only — Linux uses the system package manager)
-- Rust toolchain (`brew install rustup` on macOS, or `rustup.rs` on Linux)
-- On Linux: `sudo apt-get install pkg-config libudev-dev libclang-dev cmake nasm`
-  (`make install` checks for these and tells you what's missing)
+A **target** (DUT, device under test) is the machine being developed on; a
+**control host** is the machine cabled to it.
 
 ---
 
 ## Installation
 
-On macOS, the easiest install is the Homebrew tap — it installs a prebuilt
-**universal** binary (one download, both Apple Silicon and Intel), so there's
-no Rust or Swift toolchain and no compile step:
+### macOS: Homebrew
+
+The tap installs a prebuilt universal binary (Apple Silicon and Intel):
 
 ```bash
 brew tap curtisgalloway/tap
 brew install paniolo
 ```
 
-New releases then arrive with `brew upgrade`. Run `paniolo setup` once after
-installing — it setuid-installs `netbootd-bpf-helper` (one sudo, for the
-netboot raw-frame send path) and installs the optional zigplug helper.
-`brew install --HEAD paniolo` instead builds from source — the same path as
-`make install` below, useful when tracking `main` between releases.
+Upgrade with `brew upgrade`. Run `paniolo setup` once after installing: it
+setuid-installs `netbootd-bpf-helper` (one sudo) and the optional zigplug helper.
 
-On Linux (Debian 12+ / Raspberry Pi OS, amd64/arm64), the easiest install is
-the signed apt repository served from the docs site — new releases then
-arrive with a normal `apt upgrade`:
+`brew install --HEAD paniolo` builds `main` from source, the same path as
+`make install` below.
+
+### Linux: apt repository
+
+On Debian 12+ / Raspberry Pi OS (amd64/arm64), use the signed apt repository;
+upgrade with `apt upgrade`:
 
 ```bash
 sudo install -d /etc/apt/keyrings
@@ -126,20 +88,32 @@ EOF
 sudo apt update && sudo apt install paniolo
 ```
 
-If the Linux box does not exist yet — a blank Raspberry Pi that is to become
-a control host — skip all of the above. A hardware-validated cloud-init seed
-brings it up with SSH authorized and the release `.deb` installed, in one
-human action: flash the stock Raspberry Pi OS image, drop four files on its
-boot partition, power on. The walkthrough is
-[standing up a control host](https://curtisgalloway.github.io/paniolo/control-host/);
-the exact commands, including how to identify the right SD card before
-writing to it, are in the bundled skill (`paniolo skill control-host`).
+### A new Raspberry Pi control host
 
-The same prebuilt packages (`.deb` and tarball) are attached to each
-[GitHub Release](https://github.com/curtisgalloway/paniolo/releases) for
-direct install — `sudo apt install ./paniolo_<version>_<arch>.deb`. Either
-way, run `paniolo setup` once after installing for group membership and the
-optional zigplug helper. Or build from source:
+For a blank Pi, skip the steps above: flash stock Raspberry Pi OS, drop four
+seed files on its boot partition, and power on. It comes up with SSH
+authorized and the release `.deb` installed. See
+[standing up a control host](https://curtisgalloway.github.io/paniolo/control-host/);
+the exact commands, including how to pick the right SD card, are in
+`paniolo skill control-host`.
+
+### Release packages
+
+Each [GitHub Release](https://github.com/curtisgalloway/paniolo/releases) has
+a `.deb` and a tarball: `sudo apt install ./paniolo_<version>_<arch>.deb`.
+
+After the apt repository or a release package, run `paniolo setup` once: it
+sets group membership and installs the optional zigplug helper.
+
+### From source
+
+Requirements:
+
+- macOS 10.14 (Mojave) or later, or Linux (x86-64 / arm64)
+- [Homebrew](https://brew.sh) (macOS only)
+- Rust toolchain (`brew install rustup` on macOS, or `rustup.rs` on Linux)
+- On Linux: `sudo apt-get install pkg-config libudev-dev libclang-dev cmake nasm`
+  (`make install` checks for these and tells you what's missing)
 
 ```bash
 git clone https://github.com/curtisgalloway/paniolo ~/src/paniolo
@@ -148,36 +122,33 @@ make install           # paniolo CLI + daemons + OCR helper, in one step
 ```
 
 `make install` bootstraps the CLI with `cargo install --path cli`, then runs
-`paniolo setup`, which compiles and installs all of paniolo's binaries. Only
-the `paniolo` CLI lands on PATH (`~/.cargo/bin`); the daemons and helpers
-(`hdmicap`, `serialcap`, `netbootd`, `cambrionix`, `hidrig`, `ch9329`,
-`shellyplug`, `amt`) and the OCR
-helper (`visionocr` on macOS via `swiftc`, `linuxocr` on Linux) install into
-the private libexec dir `~/.local/libexec/paniolo/bin`, where paniolo finds
-them without polluting your PATH — run one directly with
-`paniolo helper <name> [args…]` (no name lists them). One static binary per
-component; the core needs no Python environment. (The optional `zigplug`
-Zigbee smart-plug helper is the one Python component — `setup` installs it as
-a uv tool with its shim in the libexec dir.) `setup` also installs the bundled
-agent skills into `~/.local/share/paniolo/skills` (the `.deb`/tarball ship
-them under `/usr/share/paniolo/skills`); `paniolo skill [NAME]` lists them or
-prints one for an agent to read. Netboot is served by the
-single-binary `netbootd` (Rust) engine. (On macOS, `setup` also installs
-`netbootd-bpf-helper` setuid-root — one sudo — for the `netbootd` raw-frame
-send path.) Configuration is one CLI-managed lab file
-(`~/.config/paniolo/lab.toml`); see
-[notes/config-redesign.md](notes/config-redesign.md).
+`paniolo setup`, which builds and installs the rest. Where things land:
 
-To pick up code changes after pulling or editing, just re-run it:
+- **The `paniolo` CLI** is the only thing on PATH (`~/.cargo/bin`).
+- **Daemons and helpers** (`hdmicap`, `serialcap`, `netbootd`, `cambrionix`,
+  `hidrig`, `ch9329`, `shellyplug`, `amt`) and **the OCR helper** (`visionocr`
+  on macOS via `swiftc`, `linuxocr` on Linux) go in
+  `~/.local/libexec/paniolo/bin`, off PATH. Run one with
+  `paniolo helper <name> [args…]` (no name lists them).
+- **Bundled agent skills** go in `~/.local/share/paniolo/skills` (the
+  `.deb`/tarball ship them under `/usr/share/paniolo/skills`).
+  `paniolo skill [NAME]` lists or prints them.
+- **On macOS**, `setup` also installs `netbootd-bpf-helper` setuid-root (one
+  sudo) for `netbootd`.
+- **Configuration** is one CLI-managed lab file
+  (`~/.config/paniolo/lab.toml`); see
+  [notes/config-redesign.md](notes/config-redesign.md).
+
+The only Python component is the optional `zigplug` helper, which `setup`
+installs as a uv tool. After pulling or editing, re-run:
 
 ```bash
 make install           # rebuilds and reinstalls everything (idempotent)
 ```
 
-Or iterate faster with `make rust` (build + install the Rust crates only,
-skipping the OCR/setuid/zigplug steps). `make help` lists every target. The
-underlying commands still work directly if you prefer — note the helpers
-install with `--root` so they land in libexec, not on PATH:
+`make rust` rebuilds only the Rust crates (no OCR/setuid/zigplug steps);
+`make help` lists every target. To install one component directly, helpers
+need `--root` so they land in libexec:
 
 ```bash
 cargo install --path ~/src/paniolo/cli        # if the CLI changed
@@ -192,18 +163,11 @@ cargo install --path ~/src/paniolo/amt       --root ~/.local/libexec/paniolo  # 
 UV_TOOL_BIN_DIR=~/.local/libexec/paniolo/bin uv tool install --force ~/src/paniolo/zigplug # if zigplug changed
 ```
 
-USB HID injection (`paniolo hid`) shells out to a helper speaking the
-[HID serial protocol](https://curtisgalloway.github.io/paniolo/dev/hid-serial-protocol/) — `hidrig`, the client
-for the KB2040 injector, or `ch9329` for CH9329-based KVM devices
-(Openterface Mini-KVM / KVM-Go, Sipeed NanoKVM-USB); see the
-[HID injection guide](https://curtisgalloway.github.io/paniolo/hid/).
-
 ---
 
 ## Remote control pattern
 
-The intended use is an AI agent or script on a dev machine SSHing into the
-control Mac to drive the target:
+An agent or script on a dev machine SSHes into the control host:
 
 ```bash
 # Configure target once
@@ -223,6 +187,27 @@ ssh control-mac "paniolo serial log -t target-machine -i console --tail 50"
 # Power cycle and repeat
 ssh control-mac "paniolo power-cycle target-machine"
 ```
+
+---
+
+## Documentation
+
+Full documentation:
+**[curtisgalloway.github.io/paniolo](https://curtisgalloway.github.io/paniolo/)**
+(source in [`docs/`](docs/README.md)).
+
+- **User guides:** linked in the [capabilities table](#capabilities).
+- **[Demos](https://curtisgalloway.github.io/paniolo/demos/)** and
+  **[tested hardware](https://curtisgalloway.github.io/paniolo/hardware/)**.
+- **[Glossary](https://curtisgalloway.github.io/paniolo/glossary/):** the
+  hardware, protocol and paniolo terms these docs use.
+- **Developer docs:** start with the
+  [**architecture overview**](https://curtisgalloway.github.io/paniolo/dev/architecture/),
+  then the [requirements tracker](https://curtisgalloway.github.io/paniolo/dev/requirements/).
+  Source in [`docs/dev/`](docs/dev).
+
+[`notes/`](notes/README.md) holds point-in-time design records and bring-up
+findings. They are not kept current and not published.
 
 ---
 

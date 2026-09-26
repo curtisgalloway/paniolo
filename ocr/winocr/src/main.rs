@@ -21,11 +21,11 @@
 //!
 //!   winocr [--json] [PATH | -]
 //!
-//!   --json   emit the v1 OCR envelope (see docs/ocr.md) instead of plain text
+//!   --json   emit the v1 OCR envelope (see docs/dev/ocr.md) instead of plain text
 //!
 //! **No confidence scores.** `Windows.Media.Ocr` does not expose a per-word or
 //! per-line confidence — unlike Tesseract, and unlike Apple Vision, which
-//! exposes one that turns out to be constant. Per docs/ocr.md an engine that
+//! exposes one that turns out to be constant. Per docs/dev/ocr.md an engine that
 //! cannot report confidence reports its absence rather than inventing a number,
 //! so `confidence` is simply omitted from every line here. A consumer that
 //! needs to rank results must not read a missing field as zero.

@@ -5,29 +5,20 @@ SPDX-License-Identifier: Apache-2.0
 
 # Demos
 
-Recordings from the CI rack, made from a laptop with the boards in another
-room. Every command is a real `paniolo` invocation, dispatched over SSH to the
-Raspberry Pi control host that owns the cables. Where a demo drives a screen,
-the capture is followed by the transcript of what the agent typed — static
-text, so you can read it at your own pace while the capture loops.
-
-The transcripts are the terminal output of the asciinema casts in
+Recorded from a laptop, with the boards in another room. Every command is a
+real `paniolo` call, run over SSH on the Raspberry Pi control host. Each
+transcript is an asciinema cast from
 [`docs/demo/`](https://github.com/curtisgalloway/paniolo/tree/main/docs/demo)
-(`asciinema play docs/demo/<name>.cast`), ANSI stripped, otherwise untouched.
+(`asciinema play docs/demo/<name>.cast`), with colors stripped.
 
 ## Puppeting the NUC BIOS
 
 `lab-nuc-1` — Intel NUC11, AMI visual BIOS, Sipeed NanoKVM-USB · channels:
 video + OCR, hid, serial.
 
-The one that is genuinely hard to automate. The NUC is parked in firmware
-setup; the agent OCRs the page, discards and exits, then hammers `F2` through
-the KVM's emulated keyboard during POST and waits for the firmware to come
-back — verified by reading the screen, not by sleeping. Then absolute-mouse to
-the Boot tab, into Boot Priority, OCR the boot order, and back out without
-saving. In the capture you can watch the reboot: setup → black → Intel splash →
-setup again, then the mouse clicks landing. The OCR lines are verbatim
-Tesseract output from the control host, stray glyphs included.
+Starting in firmware setup, the agent OCRs the page, exits, hammers `F2`
+during POST, waits (by OCR, not sleep) for setup to return, then mouses to Boot
+Priority and backs out without saving. OCR lines are raw Tesseract output.
 
 ![paniolo console: the NUC exits BIOS setup, POSTs, re-enters on F2, and is navigated to Boot Priority by mouse](demo/nuc-bios-puppet-screen.gif)
 
@@ -83,11 +74,9 @@ OK
 `lab-pi-1` — Raspberry Pi 5, Pi OS desktop, Sipeed KVM-USB · channels: video,
 hid.
 
-A KVM you can script. The pointer is absolute, so the agent parks it
-mid-screen, clicks the terminal in the taskbar, and types into it keystroke by
-keystroke over the wire — `echo`, then `uname -a` (note the `--`: everything
-after it is text for the helper's `type`, not options) — then leaves the
-desktop as it found it.
+The agent clicks the taskbar terminal with the absolute pointer, types `echo`
+and `uname -a`, then exits. After `--`, everything is text for `type`, not
+options.
 
 ![paniolo console: a terminal opens on the Pi desktop and text is typed into it by emulated HID](demo/pi-desktop-puppet-screen.gif)
 
@@ -127,11 +116,9 @@ OK
 `optiplex` — Dell OptiPlex 7060, Intel AMT/vPro, no plug and no relay ·
 channel: power ([`amt` helper](power.md#intel-amt-power-control-amt)).
 
-This box has no smart plug and no relay. Its power facility is the
-Management Engine inside the chipset, reached over one ethernet cable, awake on
-the standby rail even when the machine is off. `power off` kills it without
-consulting the OS; `power-state` then reports **OFF** from the ME itself — real
-readback, not a guess — and `power on` brings it back.
+AMT powers the box through the chipset's Management Engine over Ethernet,
+even when it is off. `power off` bypasses the OS, `power-state` reads **OFF**
+from the ME itself, and `power on` restores it.
 
 ```console
 # This target has no smart plug and no relay. Its power facility is
@@ -164,10 +151,9 @@ Power ON  (optiplex)
 `lab-pi-1` — Raspberry Pi 5, USB-C power through a relay board on the control
 host, FTDI console · channels: power, serial.
 
-`power-cycle` cuts VBUS, holds five seconds, restores it — and the serial
-capture daemon records every byte of the cold boot. The transcript then greps
-the log for the bootloader's `power-on-reset 1`, the proof it was a genuine
-cold start, back to a login prompt in about 35 seconds.
+`power-cycle` cuts USB power for five seconds while the serial daemon records
+the boot. The log shows `power-on-reset 1` (a real cold start) and a login
+prompt about 35 seconds later.
 
 ```console
 # lab-pi-1: a Raspberry Pi 5 on the CI rack, driven from another room.
@@ -177,7 +163,7 @@ Power ON  (lab-pi-1)
 
 # Cycle it, and catch the machine dying:
 $ paniolo power-cycle lab-pi-1
-Power cycling 'lab-pi-1' via python3 ~/src/usb-relay/host/usbrelay.py --port /dev/serial/by-id/usb-Raspberry_Pi_Pico_AA00BB11CC22DD33-if02 cycle 1
+Power cycling 'lab-pi-1' via python3 usbrelay.py --port /dev/serial/by-id/usb-Raspberry_Pi_Pico_AA00BB11CC22DD33-if02 cycle 1
 OK cycle 1 5.0
 Power cycle complete.
 $ paniolo power-state lab-pi-1
@@ -194,8 +180,8 @@ $ paniolo serial log lab-pi-1 --since 175 | grep -E 'BOOTSYS release|power-on-re
 [2026-08-28T00:56:45.351Z] #298       7.15 Read kernel_2712.img bytes 10172022 hnd 0x13b43
 [2026-08-28T00:56:46.267Z] #312     NOTICE:  BL31: v2.6(release):v2.6-240-gfc45bc492
 [2026-08-28T00:56:46.267Z] #313     NOTICE:  BL31: Built : 12:55:13, Dec  4 2024
-[2026-08-28T00:57:01.473Z] #315     Debian GNU/Linux 13 mablevale ttyAMA10
-[2026-08-28T00:57:01.473Z] #319*    mablevale login:
+[2026-08-28T00:57:01.473Z] #315     Debian GNU/Linux 13 lab-pi-1 ttyAMA10
+[2026-08-28T00:57:01.473Z] #319*    lab-pi-1 login:
 
 # power-on-reset 1 — a genuine cold boot, back to a login prompt in ~35 s.
 # serial + power + video + HID, one CLI:  github.com/curtisgalloway/paniolo
@@ -203,8 +189,7 @@ $ paniolo serial log lab-pi-1 --since 175 | grep -E 'BOOTSYS release|power-on-re
 
 ## Stills
 
-Single frames from the same captures (1280×720) — lighter than any GIF, and
-honest about what the capture path actually sees.
+Single frames from the same captures (1280×720).
 
 | | | |
 |---|---|---|

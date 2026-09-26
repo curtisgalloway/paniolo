@@ -1,14 +1,12 @@
 # Switchable USB media
 
-Some KVM-over-USB devices carry a USB mux: one physical device — a microSD
-card, or whatever is plugged into a switchable USB-A port — routed to either
-the control host or the target, but **never both at once**. paniolo drives that
-mux through a generic per-target **usb channel**.
+`paniolo usb` gives a target hands-free *physical* boot media: write an image
+to a card on the control host, then hand the card to the target, which sees an
+ordinary USB mass-storage device that firmware can boot.
 
-The point of it is hands-free *physical* media. Write an image to the card on
-your control host, hand it to the target, and the target sees an ordinary USB
-mass-storage device — visible to firmware and boot menus, which streamed
-virtual media generally is not. No hands on the bench, no stick to swap.
+It drives a USB mux (switch) inside some KVMs through a per-target
+**usb channel**. The mux routes one device to the control host or the
+target, **never both at once**.
 
 ---
 
@@ -19,17 +17,12 @@ virtual media generally is not. No hands on the bench, no stick to swap.
 | **Openterface KVM-Go** | onboard microSD reader | ✅ works, hardware-verified |
 | **Openterface Mini-KVM** | switchable USB-A port | ⚠️ mechanism known, no helper support yet |
 
-The KVM-Go's mux is driven by its CH32V208 over the same serial port the
-`ch9329` helper already uses for keyboard and mouse, so a device you have
-already wired up as a `hid` channel needs no new hardware — just a second
-channel pointing at the same helper.
+**KVM-Go:** the mux uses the same serial port as the `ch9329` helper, so a
+device already set up as a `hid` channel needs only a second channel.
 
-The Mini-KVM's mux is reachable a different way (a register write over the
-capture chip's HID configuration interface, not the serial port). That path is
-documented in
-[the mux spec](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-usb-mux-spec.md)
-but no shipped helper implements it yet, so `paniolo usb` cannot drive a
-Mini-KVM today.
+**Mini-KVM:** the mux needs a register write over the capture chip's HID
+interface ([mux spec](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-usb-mux-spec.md));
+no helper implements it, so `paniolo usb` cannot drive a Mini-KVM.
 
 ## Wiring it up
 
@@ -37,8 +30,7 @@ Mini-KVM today.
 paniolo usb set -t <target> --cmd "ch9329 -d /dev/cu.usbmodemXXXXX"
 ```
 
-On a KVM-Go this is the same device path as the target's `hid` channel. Setting
-both is normal and correct:
+On a KVM-Go, use the same device path as the `hid` channel:
 
 ```bash
 paniolo hid set -t pi5 --cmd "ch9329 -d /dev/cu.usbmodem51201"
@@ -53,49 +45,39 @@ paniolo usb attach-host    -t pi5    # route the card to the control host
 paniolo usb attach-target  -t pi5    # hand it to the target
 ```
 
-A typical hands-free media hand-off:
+A typical hand-off:
 
 ```bash
 paniolo usb attach-host -t pi5
 # ... wait for the block device, write your image to it, unmount ...
 paniolo usb attach-target -t pi5
-paniolo power cycle -t pi5
+paniolo power-cycle -t pi5
 ```
 
 ---
 
 ## Four things that will bite you
 
-**Unmount before you switch.** Switching physically detaches the device from
-the side that currently has it. If a filesystem is still mounted there, that is
-a surprise removal — the same as yanking a stick out mid-write. paniolo cannot
-see mount state on either side, so it will not stop you. On macOS, plain
-`diskutil unmount` frequently fails because Spotlight has the freshly written
-volume open; use `diskutil unmount force`.
+**Unmount before you switch.** Switching yanks the device from the side that
+has it, and paniolo cannot see mount state, so it will not stop you. On macOS
+use `diskutil unmount force`; plain `diskutil unmount` often fails because
+Spotlight holds the volume open.
 
-**Success means the mux moved, not that the media is ready.** `attach-host` and
-`attach-target` return once the device confirms the new mux position. The USB
-mass-storage device on the receiving side still has to enumerate, which takes a
-few seconds. Wait for the block device to appear — do not assume it is there
-because the command exited zero.
+**Exit 0 means the mux moved, not that the media is ready.** Wait a few
+seconds for the block device to appear on the receiving side.
 
-**Never assume the position persisted.** The mux resets to the host side
-whenever the KVM loses power, and on hardware with a physical switch button
-someone can move it by hand. Ask with `paniolo usb state` rather than
-remembering what you last set.
+**Never assume the position persisted.** The mux resets to host when the KVM
+loses power, and a physical button can move it. Check `paniolo usb state`.
 
-**Not every device has a mux.** On hardware that does not implement switching,
-the underlying protocol has no "unsupported" error — the device simply does not
-answer. That surfaces as a timeout, and the helper says so explicitly rather
-than leaving you to guess whether the device is broken.
+**Not every device has a mux.** A device without one does not answer, which
+the helper reports as a timeout.
 
 ---
 
 ## The helper contract
 
-Like the [power hooks](power.md) and the [hid channel](hid.md), paniolo does not
-talk to mux hardware itself. It runs the configured command with a verb
-appended:
+As with the [power hooks](power.md) and [hid channel](hid.md), paniolo runs
+the configured command with a verb appended:
 
 | paniolo command | what it runs |
 |---|---|
@@ -107,11 +89,8 @@ A helper implementing this contract must:
 
 - exit non-zero on failure, and print the resulting side (`host` or `target`) on
   stdout;
-- **verify** a switch rather than trusting it. On the KVM-Go the device's reply
-  reports the resulting position rather than a success code, so a unit that
-  ignored the request still answers with a well-formed frame stating the old
-  position. The helper compares the two.
+- **verify** the switch: compare the position the device reports with the one
+  requested (a KVM-Go that ignored the request still reports the old position).
 
-Unlike `paniolo hid send`, arguments are **not** passed through — the vocabulary
-is fixed at three verbs. That keeps the surface a constrained or remote control
-host is asked to expose as small as possible.
+Unlike `paniolo hid send`, no arguments are passed through; the vocabulary is
+fixed at these three verbs.

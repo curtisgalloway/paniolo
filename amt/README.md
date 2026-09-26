@@ -10,39 +10,33 @@ You may obtain a copy of the License at
 
 # amt
 
-Power control for **Intel AMT (vPro) machines** over WS-Management — turn the
-host on, off, or power-cycle it, and read its true power state back, over the
-network with no smart plug. Pure Rust via
-[ureq](https://crates.io/crates/ureq); works on **macOS and Linux**.
+Power control for **Intel AMT (vPro) machines** over the network, with no smart
+plug. `amt` turns the host on, off, or power-cycles it, and reads its true
+power state back. Pure Rust via [ureq](https://crates.io/crates/ureq); works on
+**macOS and Linux**.
 
-Commands talk to the machine's **Management Engine** (ME), which runs on
-standby power: it answers with the host on, off, or bare-metal with no OS
-installed. That makes `state` a genuine power *sensor* — something an
-outlet-side smart plug cannot provide at all.
+Commands talk to the **Management Engine** (ME), which runs on standby power, so
+`state` is a real power sensor, even on bare metal with no OS.
 
-- **Protocol:** WS-Management (SOAP over HTTP) on port **16992**, acting on
-  `CIM_PowerManagementService.RequestPowerStateChange` and reading back
+- **Protocol:** WS-Management (SOAP over HTTP) on port **16992**. It calls
+  `CIM_PowerManagementService.RequestPowerStateChange` and reads back
   `CIM_AssociatedPowerManagementService.PowerState`.
-- **Auth:** HTTP **Digest** (MD5, `qop=auth`), implemented in the helper —
-  AMT 11+ advertises Digest-only and rejects plaintext, which is why e.g.
-  Debian's `amtterm` cannot talk to modern AMT.
-- **Not supported:** TLS-provisioned AMT (port 16993). The helper speaks the
-  plain WS-Man port only and says so clearly if pointed at an `https://`
-  address.
+- **Auth:** HTTP **Digest** (MD5, `qop=auth`). AMT 11+ rejects plaintext, so
+  tools such as Debian's `amtterm` cannot talk to it.
+- **Not supported:** TLS-provisioned AMT (port 16993). Given an `https://`
+  address, the helper says so.
 
 ## Credentials
 
 The Digest password comes **only** from the `AMT_PASSWORD` environment
-variable — never from a flag or a config file, so it cannot leak into a lab
-file, shell history, or `ps` output. Inject it at call time; with 1Password:
+variable, never a flag or config file. Inject it at call time; with 1Password:
 
 ```bash
 op run --env-file .env -- bash -c 'amt state -d 192.168.99.50'
 ```
 
-Single quotes matter: the parent shell must not expand `$AMT_PASSWORD` before
-the wrapper sets it. The username (default `admin`) is not secret and lives in
-the hook string via `-u`.
+Keep the single quotes, or the parent shell expands `$AMT_PASSWORD` before the
+wrapper sets it. Pass the username (default `admin`) with `-u`.
 
 ## Usage
 
@@ -54,23 +48,21 @@ amt -d <host> off                   # power off (hard, not a graceful shutdown)
 amt -d <host> cycle [--delay-ms 3000]   # off → confirm → delay → on → confirm
 ```
 
-`<host>` is a hostname, IPv4 address, or bracketed IPv6 literal (`[fe80::1]`),
-optionally with a `:port` (default 16992); anything else URL-shaped is
-rejected. `state` prints `on` only when the host is running (PowerState 2);
-sleep, hibernate, and soft-off all print `off`, and any other reported state
-is an error rather than a guess. `off` is the CIM "Off - Soft" unconditional
-power-off — equivalent to holding the power button, not an OS shutdown.
-`cycle` is built as off → confirm → delay → on → confirm (rather than the
-fixed CIM power-cycle state) so the off-hold duration is controllable and
-matches the other paniolo power helpers' `--delay-ms` semantics; it holds off
-any host not already soft-off, so a sleeping or hibernating machine cold-boots
-instead of resuming. All three mutating commands confirm by read-back and exit
-non-zero if the machine did not comply.
+- **`<host>`**: a hostname, IPv4 address, or bracketed IPv6 literal
+  (`[fe80::1]`), optionally with a `:port` (default 16992). Anything else is rejected.
+- **`state`** prints `on` only when running (PowerState 2). Sleep, hibernate
+  and soft-off print `off`; any other state is an error.
+- **`off`** is the CIM "Off - Soft" unconditional power-off, like holding the
+  power button.
+- **`cycle`** uses the same `--delay-ms` as the other paniolo power helpers. A
+  sleeping or hibernating machine cold-boots instead of resuming.
+- **`on`, `off`, `cycle`** exit non-zero if the read-back shows the machine did
+  not comply.
 
 ## paniolo integration
 
-Installed by `make install` / `paniolo setup` into the private libexec dir;
-run by hand via `paniolo helper amt …`. Wire the four generic power hooks:
+`make install` / `paniolo setup` installs `amt` into paniolo's private libexec
+dir; run it by hand with `paniolo helper amt …`. Wire the four power hooks:
 
 ```bash
 paniolo power set -t <target> \
@@ -80,5 +72,5 @@ paniolo power set -t <target> \
     --state-cmd "amt state -d <host>"
 ```
 
-See `docs/power.md` in the paniolo repository for the full recipe, including
-how to provide `AMT_PASSWORD` to `paniolo power …` invocations.
+See `docs/power.md` for the full recipe, including how to provide
+`AMT_PASSWORD` to `paniolo power …`.

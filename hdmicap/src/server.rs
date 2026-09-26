@@ -654,7 +654,7 @@ fn visionocr_bin() -> std::ffi::OsString {
 /// just without confidences — rather than failing in a way that looks like a
 /// broken capture. The synthesized envelope names the binary so the cause is
 /// visible, and carries no `lines`, because inventing boxes would be worse than
-/// omitting them. See docs/ocr.md.
+/// omitting them. See docs/dev/ocr.md.
 fn legacy_envelope(bin: &str, text: &str, width: u32, height: u32) -> serde_json::Value {
     serde_json::json!({
         "version": 1,
@@ -696,7 +696,7 @@ async fn wait_with_timeout(
 /// OCR the current warm frame by shelling out to the platform's OCR helper
 /// (`visionocr` / `winocr` / `linuxocr`). The daemon links no OCR engine
 /// itself — it pipes a PNG to the tool located by [`visionocr_bin`] and returns
-/// the v1 envelope the helper emits under `--json` (see docs/ocr.md).
+/// the v1 envelope the helper emits under `--json` (see docs/dev/ocr.md).
 async fn ocr(State(s): State<AppState>) -> Response {
     let f = s.frames.borrow().clone();
     if f.effective_signal() == Signal::Stale {

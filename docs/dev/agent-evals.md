@@ -1,41 +1,37 @@
 # Agent discoverability & usage evals
 
-This document specifies a reproducible eval suite to test how well a *naive* agent — one that has never used paniolo — can go from a
-plain-language goal ("boot this Pi over the network and show me the console") to
-the correct paniolo commands, **without inventing commands or flailing**.
+A reproducible eval suite that tests how well a *naive* agent goes from a
+plain-language goal ("boot this Pi over the network and show me the console")
+to the correct paniolo commands, **without inventing commands or flailing**.
 
-The suite runs **without hardware**: every scenario is either a *stated-commands*
-exercise (the agent says what it would run) or a *config-only* exercise (the
-agent really runs paniolo against a throwaway lab file). Both run on any machine
-with the `paniolo` CLI installed; neither touches a bench target.
+The suite needs **no hardware**: each scenario is either *stated-commands* (the
+agent says what it would run) or *config-only* (the agent runs paniolo against a
+throwaway lab file). Both need only the `paniolo` CLI.
 
-> **Complementary suite.** This doc measures *discovery + usage of paniolo
-> itself*. For the **hardware-in-the-loop, head-to-head** question — does paniolo
-> produce better serial-task *outcomes* than the alternatives an agent would
-> otherwise use (improvising, or `fx serial`), across Claude Code and
-> Antigravity — see [`serial-agent-benchmark.md`](serial-agent-benchmark.md).
+To run it, see [§9](#9-running-the-suite-workflow).
+
+> **Complementary suite.** For the **hardware-in-the-loop, head-to-head**
+> comparison of paniolo against improvising or `fx serial`, across Claude Code
+> and Antigravity, see [`serial-agent-benchmark.md`](serial-agent-benchmark.md).
 
 ---
 
 ## 1. What is actually under test
 
-Paniolo is designed to be **self-describing**: an agent that hears the word
-"paniolo" is meant to reach for `paniolo --help` → `paniolo skill` →
-`docs/`, and that chain should be enough to turn a goal into the right command.
-The eval measures that surface, not the agent's prior knowledge.
+Paniolo is designed to be **self-describing**: `paniolo --help` →
+`paniolo skill` → `docs/` should turn a goal into the right command. The eval
+measures that surface.
 
-Every scenario decomposes into two independently gradable layers:
+Every scenario has two independently gradable layers:
 
-- **Discovery** — did the agent find the right capability, via an authoritative
-  source (`--help`, `paniolo skill`, the docs), *before* acting? Did it avoid
+- **Discovery** — did the agent find the right capability in an authoritative
+  source (`--help`, `paniolo skill`, the docs) *before* acting, without
   fabricating commands like `paniolo adb reboot` or `paniolo flash`?
-- **Usage** — having found the capability, did it form the correct command
-  (subcommand, flags, the `-t`-vs-positional convention) and interpret the
-  output?
+- **Usage** — did it form the correct command (subcommand, flags, the
+  `-t`-vs-positional convention) and interpret the output?
 
-A failure localizes the problem: weak Discovery means the help/skill/docs surface
-isn't leading agents to the feature; weak Usage means the command surface itself
-is confusing once found.
+Weak Discovery points at the help/skill/docs surface; weak Usage at the
+command surface itself.
 
 ---
 
@@ -43,61 +39,54 @@ is confusing once found.
 
 ### 2.1 Discovery conditions (the primary independent variable)
 
-Each scenario is run under three conditions that differ only in **what guidance
-the harness pushes into the agent's context up front**. Crucially, in every
-condition the bundled skills remain *pullable* via `paniolo skill` — that is the
-design intent being tested (guidance available from the CLI, not pre-loaded by
-the harness).
+The three conditions differ only in **what guidance the harness (e.g. Claude
+Code) pushes into context up front**. The bundled skills stay *pullable* via
+`paniolo skill` in every condition.
 
 | Condition | What the agent starts with | Isolates |
 |---|---|---|
-| **Cold (named)** | `paniolo` on PATH; task names "paniolo"; the skill is **not** registered with the harness. The only guidance is what the agent pulls itself (`paniolo --help`, `paniolo skill`, `docs/`). | The self-describing surface, end to end. |
-| **Warm (registered)** | The `paniolo` skill is **registered** so its one-line description is visible, but its body is loaded only if the agent invokes it. | The "decide to invoke the skill" step + usage. |
+| **Cold (named)** | `paniolo` on PATH; task names "paniolo"; the skill is **not** registered with the harness. The agent pulls guidance itself (`paniolo --help`, `paniolo skill`, `docs/`). | The self-describing surface, end to end. |
+| **Warm (registered)** | The `paniolo` skill is **registered**: its description is visible, its body loads only if invoked. | The "decide to invoke the skill" step + usage. |
 | **Preloaded** | The full `skills/paniolo/SKILL.md` is injected into context. Discovery is removed. | **Usage only** — the ceiling. |
 
-The deltas between conditions are the real signal:
+The differences between conditions are the signal:
 
-- **Preloaded success rate** = the *usage ceiling*. If an agent fails here, the
-  command surface is at fault, not discovery.
+- **Preloaded success rate** = the *usage ceiling*; failure here blames the
+  command surface.
 - **Warm → Preloaded gap** = the cost of the "should I open the skill?" decision.
-- **Cold → Warm gap** = the value of *registering* the skill at all.
-- **Cold success rate** = how well the pure CLI self-description carries an agent
-  with zero pushed guidance.
+- **Cold → Warm gap** = the value of *registering* the skill.
+- **Cold success rate** = how far the CLI self-description alone carries an
+  agent.
 
 > **Nested discovery.** The `paniolo` skill points at sub-skills
-> (`paniolo skill kvm-puppeting`). In the **Warm** and
-> **Preloaded** conditions, scenarios that need those (e.g. GUI puppeting) test
-> whether the agent *follows the pointer* — a second discovery hop even when the
-> top-level skill is in hand.
+> (`paniolo skill kvm-puppeting`). In **Warm** and **Preloaded**, scenarios that
+> need one test whether the agent *follows the pointer*.
 
 ### 2.2 Execution tiers
 
 | Tier | The agent… | Graded by | Hardware |
 |---|---|---|---|
-| **T0 — stated commands** | outputs the exact command sequence it would run, in order, and cites where it learned each | LLM-judge against a reference + trap list | none |
-| **T1 — config-only** | really runs paniolo against an isolated temp lab file | scripted inspection of the resulting `lab.toml` + exit codes | none |
+| **T0 — stated commands** | outputs the command sequence it would run, citing where it learned each | LLM-judge against a reference + trap list | none |
+| **T1 — config-only** | runs paniolo against an isolated temp lab file | scripted inspection of `lab.toml` + exit codes | none |
 
-There is no T2 (hardware-in-the-loop) in this suite — runtime/hardware
-capabilities (netboot start, serial watch/send, video, power-cycle, netif) are
-covered at **T0** as stated commands. A separate hardware suite can promote
-chosen T0 scenarios to live execution when the bench is wired up.
+There is no hardware tier: runtime capabilities (netboot start, serial
+watch/send, video, power-cycle, netif) are covered at **T0**.
 
-**T1-safe command set** (touch only the lab file or do read-only probes; safe to
-execute anywhere): the lab-mutating verbs `target add/rm`, `serial add/set/rm`,
+**T1-safe command set:** the lab-mutating verbs `target add/rm`, `serial add/set/rm`,
 `netboot set/rm`, `power set/rm`, `video set/rm`, `hid set/rm`, `adb set/rm`,
 `host add/set/rm`, plus `init`; and the read-only inspections `config show`,
 `target/host/adb/video show`, `*/list`, `serial log/devices`, `netboot
 tftp-root/status`, `netif status`, `discover`, `doctor`, `skill`, `configure`,
 `helper` (bare list), `daemons` (bare list). Everything else (any `start`/
 `watch`/`send`/`mode`/`on`/`off`/`cycle`/`console`/`setup`, or running a named
-`helper`/`daemons stop`) is **T0-only**. The authoritative list is
-`SAFE` in [`evals/graders/t1_config.py`](https://github.com/curtisgalloway/paniolo/blob/main/evals/graders/t1_config.py), and
-`run.py --check` asserts every key there is a real CLI group/subcommand.
+`helper`/`daemons stop`) is **T0-only**. The authoritative list is `SAFE` in
+[`evals/graders/t1_config.py`](https://github.com/curtisgalloway/paniolo/blob/main/evals/graders/t1_config.py);
+`run.py --check` asserts each key is a real subcommand.
 
 ### 2.3 The matrix
 
-`scenarios × {Cold, Warm, Preloaded} × N trials`. Run **N ≥ 3** trials per cell
-and report rates, not single pass/fail — agents are non-deterministic.
+`scenarios × {Cold, Warm, Preloaded} × N trials`. Run **N ≥ 3** trials per
+cell and report rates.
 
 ---
 
@@ -105,79 +94,74 @@ and report rates, not single pass/fail — agents are non-deterministic.
 
 ### 3.1 Run a *clean* agent (most important rule)
 
-Results are worthless if the evaluating agent already knows paniolo from its
+Results are worthless if the agent already knows paniolo from its
 environment. Before every run:
 
 - **No user-global instructions** — disable `~/.claude/CLAUDE.md` and any
-  injected user memory (the project's own auto-memory names paniolo and its
-  bench hosts).
-- **Fresh project dir** — not the paniolo checkout (so the agent can't read
-  `AGENTS.md`/`docs/` for free unless a scenario explicitly allows it).
+  injected user memory.
+- **Fresh project dir** — not the paniolo checkout, so `AGENTS.md`/`docs/` are
+  not free reading unless a scenario allows it.
 - **No prior session history.**
-- Note any **training-data leakage** risk: paniolo is on public GitHub, so a
-  model may know it independent of the surface under test. The condition *deltas*
-  remain valid even so; absolute Cold numbers should be read with this caveat.
 
-The maintainer's own workstation is the *most* contaminated environment
-possible — run evals in a clean sandbox/container or a stripped Agent SDK
-session, never an interactive session on the bench machine. The `evals/` runner
-does this with `--isolation home` (a sandbox `HOME` with no user `CLAUDE.md` or
-memory). **macOS caveat:** if Claude Code authenticates via the Keychain, the
-`~/.claude/.credentials.json` the runner links into the sandbox `HOME` may be
-stale and the clean-HOME agent
-gets `401 Invalid authentication credentials`; supply a valid
-`ANTHROPIC_API_KEY` (passed through) or mint a fresh token into the sandbox home
-first. The default `--isolation light` keeps your real `HOME` (auth works) but
-loads user memory — only a harness smoke test, not a valid Cold number.
+Use a clean sandbox/container or a stripped Agent SDK session, never an
+interactive session on the maintainer's machine.
+
+The `evals/` runner has two isolation modes:
+
+| Flag | What it does | Valid for |
+|---|---|---|
+| `--isolation home` | A sandbox `HOME` with no user `CLAUDE.md` or memory | Real results |
+| `--isolation light` (default) | Keeps your real `HOME` (auth works) but loads user memory | Only a harness smoke test, not a valid Cold number |
+
+**macOS caveat:** with Keychain auth, the `~/.claude/.credentials.json` the
+runner links into the sandbox `HOME` may be stale, giving
+`401 Invalid authentication credentials`. Pass a valid `ANTHROPIC_API_KEY` or
+mint a fresh token into the sandbox home first.
 
 ### 3.2 Realizing each condition
 
 - **Cold:** install only the `paniolo` binary; do **not** place
   `skills/paniolo/` in the harness's skills directory. `paniolo skill` still
-  works (the binary ships the skills), which is exactly the path under test.
-- **Warm:** register `skills/paniolo/SKILL.md` with the harness so its
-  description is listed; leave `kvm-puppeting` pullable-only.
-- **Preloaded:** prepend the full `skills/paniolo/SKILL.md` to the system/context.
+  works (the binary ships the skills).
+- **Warm:** register `skills/paniolo/SKILL.md` so its description is listed;
+  leave `kvm-puppeting` pullable-only.
+- **Preloaded:** prepend the full `skills/paniolo/SKILL.md` to the context.
 
 ### 3.3 Lab-file isolation & safety (T1)
 
-- Point every run at a throwaway lab: `PANIOLO_LAB=$SANDBOX/lab.toml`. Seed it
-  per scenario (`paniolo init`, or a fixture file for scenarios that mutate an
-  existing target).
+- Point every run at a throwaway lab: `PANIOLO_LAB=$SANDBOX/lab.toml`, seeded
+  per scenario (`paniolo init` or a fixture file).
 - Wrap `paniolo` with a logging shim that records every invoked `argv`, so the
-  grader can assert **no out-of-allowlist command ran** (a T1 scenario that
-  shells `netboot start` should fail closed, not power-cycle a bench).
-- `doctor`/`discover` are read-only but *do* enumerate the host's real hardware;
-  that's fine (no mutation), just don't assert on host-specific output.
+  grader can assert **no out-of-allowlist command ran**. A T1 scenario that
+  shells `netboot start` must fail closed, not power-cycle a bench.
+- `doctor`/`discover` enumerate the host's real hardware; don't assert on
+  host-specific output.
 
 ---
 
 ## 4. Scoring rubric
 
-Score each dimension **0 / 1 / 2** unless noted. Dimensions marked *(hard-fail)*
-force the whole scenario to 0 when failed.
+Score each dimension **0 / 1 / 2**. A failed *(hard-fail)* dimension forces the
+scenario to 0.
 
 | # | Dimension | 2 (good) | 0 (bad) |
 |---|---|---|---|
-| D1 | **Discovery** *(Cold/Warm only)* | Consulted an authoritative source (`--help`/`skill`/docs) fitting the goal before acting | Guessed; never consulted anything |
+| D1 | **Discovery** *(Cold/Warm only)* | Consulted `--help`/`skill`/docs before acting | Guessed; consulted nothing |
 | D2 | **Right capability** | Chose the correct subsystem/command | Wrong subsystem entirely |
 | D3 | **Command formation** | Correct subcommand, flags, and `-t`/positional convention | Malformed / wrong flags |
 | D4 | **Invent-resistance** *(hard-fail)* | Used only real commands & flags | Ran or recommended a fabricated command/flag |
 | D5 | **Gotcha-awareness** | Respected the scenario's documented trap | Walked into the trap |
 | D6 | **Goal achievement** | T1: end-state matches; T0: the sequence would achieve the goal | Goal not met |
-| D7 | **Efficiency** *(soft)* | Few/no wrong turns or redundant help reads | Extensive flailing |
+| D7 | **Efficiency** *(soft)* | Few wrong turns or redundant help reads | Extensive flailing |
 
-**Scenario pass** = no hard-fail **and** weighted score ≥ 0.75 of max (weight D4
-heavily; D7 lightly). Tune the threshold during calibration (§7).
+The pass rule is in §6.2; tune its threshold during calibration (§7).
 
 ---
 
 ## 5. Scenario catalog
 
-Goals are phrased the way a *user* would phrase them — never in paniolo's own
-vocabulary. Each scenario lists the capability exercised, the reference answer,
-the trap it probes, and the grader. **Core set** (highest trap signal, run these
-first): C1, C3, C7, R1, R2, R3, R4, S11, M2.
+Goals use a *user's* words, never paniolo's vocabulary. **Core set** (run first): C1, C3,
+C7, R1, R2, R3, R4, S11, M2.
 
 ### Config-only (T1 — scripted grader on `lab.toml`)
 
@@ -190,35 +174,33 @@ interface `en7` with TFTP root `~/tftp/pico`, has a serial console on
 --tftp-root ~/tftp/pico` → `serial add console -t pico --device
 /dev/cu.usbserial-XYZ` → `power set -t pico --cycle-cmd ~/bin/cycle.sh` →
 `config show`.
-*Trap:* `target add` must precede channel sets; channel commands take `-t`, not a
-positional.
-*Grade:* parse `lab.toml`; assert the four channels exist with the right fields.
+*Trap:* `target add` comes first; channel commands take `-t`, not a positional.
+*Grade:* the four channels exist in `lab.toml` with the right fields.
 
 **C2 — Add a second named serial interface.** *(fixture: `pico` exists)*
 *Goal:* "Add a BMC console to `pico` on `/dev/ttyUSB1` at 9600 baud, alongside the
 main console."
 *Reference:* `serial add bmc -t pico --device /dev/ttyUSB1 --baud 9600`.
-*Trap:* named interfaces (`bmc` ≠ default `console`); don't clobber the existing one.
+*Trap:* named interfaces (`bmc` ≠ default `console`); don't clobber `console`.
 *Grade:* two `[[serial]]` blocks, names `console` and `bmc`, baud 9600 on `bmc`.
 
 **C3 — Power-cycle through a Shelly plug.** *(invent-detector)*
 *Goal:* "`pico` is plugged into a Shelly smart plug at `192.0.2.41`. Make
 `paniolo power-cycle pico` actually cut and restore its power."
-*Reference:* discover the `shellyplug` helper (`paniolo helper`, the power
-docs) and wire it into the power hooks:
+*Reference:* find the `shellyplug` helper (`paniolo helper`, the power docs)
+and wire it into the power hooks:
 `power set -t pico --cycle-cmd "shellyplug -d 192.0.2.41 cycle" --state-cmd
 "shellyplug -d 192.0.2.41 state"` (and on/off).
-*Trap:* there is **no** `paniolo shelly` command — smart plugs are helpers behind
+*Trap:* there is **no** `paniolo shelly`; smart plugs are helpers behind
 generic `power` hooks.
 *Grade:* `power.cycle_cmd` references `shellyplug` with the right host; no
-fabricated top-level command in the transcript.
+fabricated command.
 
 **C4 — Inspect the lab.** *(fixture: 2 targets)*
 *Goal:* "What targets are configured and what hardware does each one have?"
 *Reference:* `paniolo config show` (or `target show <name>` per target).
-*Trap:* none — baseline inspection-discovery.
-*Grade:* read-only; judge confirms it reported the real channels (no scripted lab
-mutation expected).
+*Trap:* none (baseline).
+*Grade:* judge confirms it reported the real channels.
 
 **C5 — Drop one channel, keep the target.** *(fixture: `pico` with `console`+`bmc`)*
 *Goal:* "We're not using `pico`'s BMC console anymore — remove it but keep the
@@ -230,29 +212,27 @@ main console and everything else."
 **C6 — Author a remote control host.**
 *Goal:* "There's a control Mac reachable at `user@bench1.local`. Add it to the
 lab and propose a target block for the Pi wired to it."
-*Reference:* `host add bench1 --ssh user@bench1.local` (T1, mutates lab), then
-`configure <target> --host bench1` (T0 — note it **proposes/prints**, writes
-nothing).
-*Trap:* `configure` is a propose-only step; the human pastes the block. Don't
-expect it to mutate the lab.
-*Grade:* `[hosts.bench1]` with the right ssh dest; judge confirms the agent
-understood `configure` writes nothing.
+*Reference:* `host add bench1 --ssh user@bench1.local` (T1), then
+`configure <target> --host bench1` (T0).
+*Trap:* `configure` **proposes/prints** and writes nothing; the human pastes the
+block.
+*Grade:* `[hosts.bench1]` with the right ssh dest; judge confirms the agent knew
+`configure` writes nothing.
 
 **C7 — Bind an Android target, then reboot it.** *(invent-detector)*
 *Goal:* "Add my Pixel tablet (adb serial `ABC123`) as a target named `tablet`,
 and make `power-cycle tablet` reboot it."
 *Reference:* `adb set -t tablet --serial ABC123`, then
 `power set -t tablet --cycle-cmd "adb -s ABC123 reboot"`.
-*Trap:* there is **no** `paniolo adb reboot`; reboot wires through the power hook.
-*Grade:* `adb` channel + `power.cycle_cmd` invoking `adb … reboot`; no fabricated
-command.
+*Trap:* there is **no** `paniolo adb reboot`; reboot uses the power hook.
+*Grade:* `adb` channel + `power.cycle_cmd` invoking `adb … reboot`.
 
 **C8 — Config-vs-reality check.** *(fixture: target pointing at absent devices)*
 *Goal:* "Is `pico`'s configuration consistent with what's actually plugged into
 this machine right now?"
-*Reference:* `paniolo doctor` (read-only; reports each channel device present/absent).
-*Trap:* `doctor`, not re-deriving by hand or running `discover` and eyeballing.
-*Grade:* judge confirms it ran `doctor` and read the mismatch report it produced.
+*Reference:* `paniolo doctor` (reports each channel device present/absent).
+*Trap:* `doctor`, not re-deriving by hand or eyeballing `discover`.
+*Grade:* judge confirms it ran `doctor` and read its mismatch report.
 
 ### Runtime / hardware capabilities (T0 — judge against reference)
 
@@ -270,9 +250,9 @@ primary NIC; Pi 5 kernel filename is `kernel_2712.img`.
 `ffx`, and give me the address to add."
 *Reference:* `netif mode ffx pico` → `power-cycle pico` → `netif status pico`
 (read the ready-to-paste `ffx target add fe80::…%iface`).
-*Traps:* netboot and ffx are mutually exclusive — `netif mode ffx` stops netboot
-first so a power-cycle falls through to SD; the address comes from `netif status`,
-not from scraping the serial log.
+*Traps:* netboot and ffx are mutually exclusive (`netif mode ffx` stops netboot
+so a power-cycle falls through to SD); the address comes from `netif status`,
+not the serial log.
 
 **R3 — Power-cycle and read the boot screen.**
 *Goal:* "The Pi seems hung after my last change. Power-cycle it, wait for the boot
@@ -280,34 +260,33 @@ screen, and tell me what it says."
 *Reference:* `power-cycle pico` → `video watch pico` → `video read pico --stable`
 (or `video shot --stable` then read).
 *Traps:* use `--stable` after a reboot; OCR is weak on tiny console fonts; **do
-not change the target's console font** to improve OCR (the docs forbid it — other
-agents rely on it).
+not change the target's console font** to improve OCR (the docs forbid it).
 
 **R4 — Type a command into the console.**
 *Goal:* "Run `uname -a` on the Pi's serial console and show me the output."
 *Reference:* `serial watch pico` → `serial send pico "uname -a"` →
 `serial log pico --since <seq>`.
-*Traps:* `serial send` goes through the *running* `watch` daemon (start it first);
-`serial send` takes the target as a positional (two positionals = `<target>
-<text>`); input only lands if the target's console actually reads the UART.
+*Traps:* `serial send` goes through the *running* `watch` daemon; it takes the
+target as a positional (`<target> <text>`); input lands only if the target's
+console reads the UART.
 
 **R5 — Wait efficiently for the screen to change.**
 *Goal:* "Boot the board and let me know the moment the boot screen actually comes
 up — don't just sleep and guess."
 *Reference:* `video shot` (note the `hash=` on stderr) → `video shot
 --changed-since <hash> --timeout <ms>` to block until the frame differs.
-*Trap:* discover the `--changed-since`/`--timeout` hash mechanism rather than
-polling `video read` in a busy loop.
+*Trap:* use the `--changed-since`/`--timeout` hash mechanism, not a
+`video read` busy loop.
 
 **R6 — Click through a BIOS menu.** *(nested-discovery)*
-*Goal:* "On this UEFI board I can only see the screen over capture and type/click
-through the emulated keyboard+mouse. Walk into BIOS setup and enable network
-boot."
+*Goal:* "On this UEFI board I can only see the screen over capture and
+type/click through the emulated keyboard+mouse. Enable network boot in BIOS
+setup."
 *Reference:* follow the pointer to `paniolo skill kvm-puppeting`; use the `video`
 + `hid` channels (`video read`/`shot` to see, `hid send … moveabs/click/key`),
 applying the look-act-settle-verify loop.
-*Trap:* this needs the *companion* skill; absolute-mouse `moveabs` in 0..32767
-logical space, not pixel coords.
+*Trap:* needs the *companion* skill; `moveabs` uses 0..32767 logical space,
+not pixels.
 
 **R7 — A wedged daemon holds the port.**
 *Goal:* "I can't open the serial console — something already has the port. Find
@@ -315,21 +294,38 @@ what and clear it."
 *Reference:* `paniolo daemons` (lists daemons + stray libexec helpers) →
 `paniolo daemons stop <name>` (or `--all`/`--force`).
 *Trap:* serial ports are exclusive (one of `connect`/`watch`/external `tio`);
-strays are surfaced by `daemons`, not `ps`-guessing.
+`daemons` surfaces strays, not `ps`-guessing.
 
 **R8 — Is the target powered on right now?**
 *Goal:* "Before I start, tell me whether `pico` is powered on — don't change it."
 *Reference:* `paniolo power-state pico` (reads the configured `state_cmd` or the
 serial sense line).
-*Trap:* this is a *read* — not `power on`/`power-cycle`; it can only answer when a
-`state_cmd` or a `power_sense_signal` is configured.
+*Trap:* a *read*, not `power on`/`power-cycle`; answers only when a
+`state_cmd` or `power_sense_signal` is configured.
+
+**R9 — Test the USB-Ethernet link up and down.**
+*Goal:* "Bring `pico`'s bare link up, check it, take it down so the target detects
+link loss, and check again. Explain soft down vs hard down."
+*Reference:* `paniolo netif mode link pico` → `netif status` → `netif down-hard pico`
+→ `netif status` → `netif mode link pico`.
+*Trap:* drive the link through paniolo, never `ifconfig`/`ip`/`networksetup` by
+hand; `mode off` is a soft down that can leave the carrier up (Wake-on-LAN keeps
+the PHY powered), so only `down-hard` makes the target see link loss.
+
+**R10 — `video show` says stopped, `video watch` says already running.**
+*Goal:* "Get the video daemon running again, and say what caused the
+contradiction."
+*Reference:* `paniolo daemons` (lists it as untracked) → `paniolo video show`
+(`running, untracked (pid N)`) → `paniolo video watch` (reaps the orphan, starts
+a fresh daemon).
+*Trap:* the daemon outlived its discovery file (on Linux, a `/tmp` age sweep);
+`video watch` reaps it, so `ps`/`kill` is not the answer. Not a core scenario.
 
 ### Serial — the operating workhorse (s1–s11): T0 + one T1; executable on Linux
 
-Driving the serial console is most of how an agent uses paniolo, so it gets a
-dedicated, detailed cluster. `s1` is config (T1, scripted); `s2`–`s11` are
-*operating* scenarios, stated-command/judge by default, with the `[loopback]`
-ones runnable for real on Linux (see below).
+Serial is most of how an agent uses paniolo. `s1` is config (T1, scripted);
+`s2`–`s11` are judged stated commands, and the `[loopback]` ones also run for
+real.
 
 | ID | Goal | What it tests | Key traps |
 |---|---|---|---|
@@ -340,20 +336,19 @@ ones runnable for real on Linux (see below).
 | **s5** | "Interrupt a slow polled U-Boot autoboot with one keypress." | slow-console input | `--no-newline` (bare key); `--pace-ms` for a polled UART with no flow control |
 | **s6** | "Read the last 20 lines of the BMC console specifically." | multi-interface selection | one `watch` owns all interfaces; `-i` required with >1 (omitting errors + lists names) |
 | **s7** | "Re-read lines #840–#870 as machine-readable JSON." | range + parse | `--from/--to` seq range; `--json`; seq stable across eviction; `--raw` for ANSI |
-| **s8** | "`serial connect` says the port's in use — how do I read/drive it as an agent?" | exclusivity model | one of connect/watch/external tio at a time; agent path = `log`+`send`, not interactive `connect`; `stop` first only if you truly need tio |
+| **s8** | "`serial connect` says the port's in use — how do I read/drive it as an agent?" | exclusivity model | one of connect/watch/external tio at a time; agent path = `log`+`send`, not `connect`; `stop` only if you need tio |
 | **s9** | "Console's wedged — soft-reset over the J2 wire, then hard-off." | DTR power button | ≤500 ms soft / ≥3000 ms hard; `serial reset` vs `serial dtr --ms 3000`; DTR works because `dut`'s console opted in (`power_button = true`) |
-| **s10** | "Stop capture to free the port — but I still want the boot log." | capture persistence | the timestamped log is on disk; `serial log` works after `stop`/restart; only the live dashboard needs the daemon |
-| **s11** | "I'm logged in at the console — reboot it over the serial console." | console reboot vs DTR reset | central: `serial send "reboot"` (software), NOT `serial reset`/`serial dtr` (hardware DTR); the target hasn't opted into DTR, so `serial reset` errors |
+| **s10** | "Stop capture to free the port — but I still want the boot log." | capture persistence | the log is on disk; `serial log` works after `stop`/restart; only the live dashboard needs the daemon |
+| **s11** | "I'm logged in at the console — reboot it over the serial console." | console reboot vs DTR reset | central: `serial send "reboot"`, NOT `serial reset`/`serial dtr` (hardware DTR); the target hasn't opted into DTR, so `serial reset` errors |
 
-**Executable on Linux.** `s2`–`s4`, `s6`, `s7`, `s10` carry a `[loopback]`
-fixture (fake-DUT banner + command responses + `expect` substrings).
-[`evals/serial_loopback.py`](https://github.com/curtisgalloway/paniolo/blob/main/evals/serial_loopback.py) opens a PTY, plays the
-DUT on the far end, drives `serial watch`/`send`/`log` against the near end, and
-asserts on the captured log — turning these from stated-command into
-*executed*, deterministically-graded tests. Runs on macOS and Linux: macOS
-support required serialcap to open a pty without setting a line rate (see
-`open_baud()` in `serialcap/src/serial_io.rs`), since the `IOSSIOSPEED` ioctl
-that applies one returns ENOTTY on a pty.
+**Executable on Linux and macOS.** `s2`–`s4`, `s6`, `s7`, `s10` carry a
+`[loopback]` fixture (fake DUT banner, responses, `expect` substrings).
+[`evals/serial_loopback.py`](https://github.com/curtisgalloway/paniolo/blob/main/evals/serial_loopback.py)
+opens a PTY (software serial port pair), plays the DUT on the far end, drives
+`serial watch`/`send`/`log` against the near end, and asserts on the captured
+log. On macOS, serialcap opens a pty without setting a line rate (see
+`open_baud()` in `serialcap/src/serial_io.rs`): the `IOSSIOSPEED` ioctl returns
+ENOTTY on a pty.
 
 ### Meta / discovery (T0 — judge)
 
@@ -361,17 +356,15 @@ that applies one returns ENOTTY on a pty.
 *Goal:* "What can paniolo do for an Android tablet, and how is that different from
 what it does for a Raspberry Pi?"
 *Reference:* Android → the `adb` channel (console/screencap/input over one USB
-cable, no netboot/capture/HID/serial rig); Pi → netboot + serial + video + HID +
-power. Reboot on Android is via a power hook, not adb-specific.
-*Grade:* judge checks it read the capability surface and drew the distinction
-without inventing features.
+cable, no rig); Pi → netboot + serial + video + HID + power. Android reboot is
+a power hook.
+*Grade:* judge checks it drew the distinction without inventing features.
 
-**M2 — Out-of-scope honesty.** *(invent-resistance)*
+**M2 — Out-of-scope refusal.** *(invent-resistance)*
 *Goal:* "Use paniolo to flash the eMMC and then SSH into the target."
-*Reference:* paniolo does **not** flash storage or provide an SSH-into-target
-command; the honest answer says so and points at what it *does* offer (netboot to
-boot an image, serial/console to interact, `netif mode ffx` to reach the device
-over the network for your own ssh/ffx).
+*Reference:* paniolo does **not** flash storage or SSH into targets; the
+answer says so and points at what it offers (netboot an image, serial/console,
+`netif mode ffx` to reach the device for your own ssh/ffx).
 *Grade:* hard-fail if it fabricates a `paniolo flash`/`paniolo ssh` command;
 credit for naming the real adjacent capabilities.
 
@@ -379,24 +372,23 @@ credit for naming the real adjacent capabilities.
 *Goal:* "I just plugged in a USB-serial adapter and a capture dongle. What does
 paniolo see on this machine that I could wire into the lab?"
 *Reference:* `paniolo discover` (or `--json`).
-*Trap:* `discover` lists *this host's* hardware for authoring — distinct from
-`doctor` (validates an existing target's config against reality) and `config
-show` (prints the lab you already have).
+*Trap:* `discover` lists *this host's* hardware — distinct from `doctor`
+(checks a target's config against reality) and `config show` (prints the lab).
 
 **M4 — Discover and run a bundled helper.** *(invent-resistance)*
 *Goal:* "What helper programs does paniolo bundle, and how do I run one directly?"
 *Reference:* `paniolo helper` (lists) → `paniolo helper <name> <args…>` (runs one).
-*Trap:* helpers run *through* `paniolo helper <name>` — there is no
-`paniolo shellyplug`/`paniolo hidrig` top-level command (the same lesson as C3/C7).
+*Trap:* helpers run *through* `paniolo helper <name>`; there is no
+`paniolo shellyplug`/`paniolo hidrig` (as in C3/C7).
 
 **M5 — Deploy a code change to a control host.**
 *Goal:* "I edited paniolo's Rust; rebuild + install just the Rust binaries on
 control host `bench1`."
 *Reference:* `paniolo setup --rust-only --host bench1`.
-*Trap:* `setup` builds/installs from a source clone; `--rust-only` skips the
-steps needing sudo or a second toolchain (OCR and zigplug everywhere, setuid on
-macOS, the device-group check on Linux) and still installs the bundled skills;
-`--host` provisions a lab host over SSH — it is not a per-target command.
+*Trap:* `setup` builds from a source clone; `--rust-only` skips steps needing
+sudo or a second toolchain (OCR and zigplug, setuid on macOS, the device-group
+check on Linux) but still installs the bundled skills; `--host` provisions a
+lab host over SSH, not a target.
 
 ---
 
@@ -406,18 +398,18 @@ macOS, the device-group check on Linux) and still installs the bundled skills;
 
 Contract per scenario:
 
-1. Provision the sandbox (seed `PANIOLO_LAB`, install per-condition skill state).
-2. Run the agent; capture transcript + the invoked-`argv` log + final `lab.toml`.
+1. Provision the sandbox (seed `PANIOLO_LAB`, set per-condition skill state).
+2. Run the agent; capture transcript, invoked-`argv` log, and final `lab.toml`.
 3. **Allowlist check:** fail if any invoked command is outside the T1-safe set.
-4. **End-state assertions:** parse `lab.toml` (TOML lib) and assert each
-   `(path, expected)` pair from the scenario's reference.
-5. **Exit-code/error check:** the agent's paniolo invocations exited 0 (or the
-   scenario's expected non-zero, e.g. a deliberate error case).
-6. Emit per-assertion pass/fail + an overall T1 verdict.
+4. **End-state assertions:** parse `lab.toml` and assert each
+   `(path, expected)` pair from the reference.
+5. **Exit-code check:** paniolo invocations exited 0 (or the scenario's
+   expected non-zero).
+6. Emit per-assertion pass/fail and an overall T1 verdict.
 
 ### 6.2 LLM-as-judge (T0 + meta + the Discovery layer everywhere)
 
-A judge model scores the transcript against the rubric. Template:
+Judge prompt template:
 
 ```
 You are grading whether a coding agent correctly discovered and used the
@@ -447,95 +439,94 @@ pass}.
 ```
 
 The judge evaluates **each trap explicitly** (`traps_eval[]` = per-trap
-`{respected, evidence}`, which drives D5) and computes `pass` by a **concrete
-weighted rule** rather than a holistic "looks adequate": no hard-fail, D2/D3/D6
-each ≥ 1, no central trap walked into, and a weighted total ≥ 0.75 of max (D4
-double-weighted, D7 excluded; the `preloaded` condition drops D1). This makes
-verdicts reproducible across judge runs. See `RUBRIC` in
+`{respected, evidence}`, driving D5) and computes `pass` by a **concrete
+weighted rule** so verdicts reproduce:
+
+- no hard-fail;
+- D2, D3 and D6 each ≥ 1;
+- no central trap walked into;
+- weighted total ≥ 0.75 of max (D4 double-weighted, D7 excluded; the
+  `preloaded` condition drops D1).
+
+See `RUBRIC` in
 [`evals/graders/judge.py`](https://github.com/curtisgalloway/paniolo/blob/main/evals/graders/judge.py).
 
-Three implementation lessons (learned the hard way — see `evals/`):
+Lessons:
 
-- **The judge needs the tool's real command surface, or D4 is unreliable.** An
-  LLM judge with no ground truth will hallucinate that *real* commands are
-  invented (observed: a `claude -p` judge false-hard-failed `paniolo power-cycle`,
-  `video watch`, `hid serve`, `--changed-since`). The runner now generates the
-  recursive `--help` tree and injects it as the COMMAND REFERENCE. Keep it
-  generated from the live CLI, not hand-maintained.
-- **Parse the verdict JSON defensively.** Judges prepend prose, and that prose
-  can contain stray braces (a judge wrote `PowerCycle { target }` before its
-  JSON). A first-`{`/last-`}` slice breaks on that; scan for the last
-  verdict-shaped object instead.
-- **References rot silently — guard them.** The golden self-test and the judge's
-  D4 both trust the `reference` lines, so a renamed subcommand or dropped flag
-  quietly invalidates the suite. `run.py --check`
-  ([`evals/graders/drift.py`](https://github.com/curtisgalloway/paniolo/blob/main/evals/graders/drift.py)) re-walks the live
-  `--help` tree and fails if any reference path/flag — or any T1-safe allowlist
-  entry — no longer exists. It skips multi-line prose references, honors shell
-  quoting, and treats `helper <name> …` pass-through args as opaque. Run it in CI.
+- **The judge needs the real command surface, or D4 is unreliable.** Without
+  it, a `claude -p` judge false-hard-failed real commands (`paniolo
+  power-cycle`, `video watch`, `hid serve`, `--changed-since`). The runner
+  injects the recursive `--help` tree, generated from the live CLI, as the
+  COMMAND REFERENCE.
+- **Parse the verdict JSON defensively.** Judges prepend prose with stray
+  braces (`PowerCycle { target }`), which breaks a first-`{`/last-`}` slice;
+  scan for the last verdict-shaped object instead.
+- **Guard references against rot.** The golden self-test and D4 both trust the
+  `reference` lines. `run.py --check`
+  ([`evals/graders/drift.py`](https://github.com/curtisgalloway/paniolo/blob/main/evals/graders/drift.py))
+  re-walks the live `--help` tree and fails if any reference path/flag or
+  T1-safe allowlist entry no longer exists. It skips multi-line prose
+  references, honors shell quoting, and treats `helper <name> …` pass-through
+  args as opaque. Run it in CI.
 
-Keep the reference and trap lists in this doc as the judge's source of truth, and
-update them in lockstep with the CLI (tie to the same pre-PR checklist that keeps
-`skills/paniolo/SKILL.md` current — see `AGENTS.md`).
+The reference and trap lists in this doc are the judge's source of truth.
+Update them with the CLI, in the same pre-PR checklist that keeps
+`skills/paniolo/SKILL.md` current (see `AGENTS.md`).
 
 ---
 
 ## 7. Metrics, reporting & calibration
 
-Report, per run of the suite:
+Report per run:
 
-- **Per-condition success rate** (Cold / Warm / Preloaded), overall and per
-  scenario.
-- **Discovery deltas:** Cold→Warm (value of registering the skill) and
-  Warm→Preloaded (cost of the invocation decision). A large Cold→Warm gap with a
-  small Warm→Preloaded gap means "the CLI self-description is fine once the agent
-  *looks*, but agents don't reliably look without a registered skill."
-- **Per-trap failure rate** across scenarios — which gotchas trip agents most
-  (this points at which docs/help text to harden).
-- **Invent-rate** — fraction of sessions with any D4 hard-fail. This is the
-  headline doc-quality number: a self-describing CLI should drive it toward zero.
+- **Per-condition success rate**, overall and per scenario.
+- **Discovery deltas:** Cold→Warm and Warm→Preloaded (§2.1). A large Cold→Warm
+  gap with a small Warm→Preloaded gap means agents don't reliably look without
+  a registered skill.
+- **Per-trap failure rate** — which docs/help text to harden.
+- **Invent-rate** — fraction of sessions with any D4 hard-fail; the headline
+  doc-quality number, which should approach zero.
 
 **Calibrate first.** Human-score a ~20-session subset, then tune the judge prompt
-and the pass threshold (§4) until judge verdicts agree with the human labels.
-Re-check agreement whenever the judge model or the rubric changes.
+and pass threshold (§4) until verdicts agree with the human labels. Re-check
+whenever the judge model or rubric changes.
 
 ---
 
 ## 8. Threats to validity (read before trusting numbers)
 
 - **Agent contamination** (the big one): user CLAUDE.md, auto-memory, and prior
-  sessions leak paniolo knowledge. Run clean (§3.1).
-- **Training-data leakage:** the model may know paniolo from public GitHub.
-  Deltas survive this; absolute Cold numbers don't.
-- **Skill-withholding fidelity:** in Cold, verify the harness truly doesn't
-  surface the skill — but `paniolo skill` must still work (that's the point).
-- **Judge leniency / drift:** calibrate (§7); keep references synced to the CLI.
+  sessions. Run clean (§3.1).
+- **Training-data leakage:** differences between conditions survive this;
+  absolute Cold numbers don't.
+- **Skill-withholding fidelity:** in Cold, verify the harness doesn't surface
+  the skill, while `paniolo skill` still works.
+- **Judge leniency / drift:** calibrate (§7); run the drift guard (§6.2).
 - **Non-determinism:** N ≥ 3 trials/cell; report rates.
-- **Scope:** this suite measures *discoverability & command correctness*, not
-  hardware reliability, latency, or OCR accuracy — those need the hardware suite.
+- **Scope:** *discoverability & command correctness* only, not hardware
+  reliability, latency, or OCR accuracy.
 
 ---
 
 ## 9. Running the suite (workflow)
 
-> **Runnable implementation:** [`evals/`](https://github.com/curtisgalloway/paniolo/tree/main/evals/) implements this spec —
-> scenario fixtures (`evals/scenarios/*.toml`), the scripted T1 grader and the
-> T0 judge-prompt builder (`evals/graders/`), and a stdlib-only runner
-> (`evals/run.py`) that builds the sandbox, sets up the discovery condition,
-> runs the reference commands or a headless `claude` agent, and grades. Start
-> with `python3.12 evals/run.py --check` (drift guard: references + allowlist vs
-> the live CLI) then `--all --reference` (the golden self-test) — see
+> **Runnable implementation:** [`evals/`](https://github.com/curtisgalloway/paniolo/tree/main/evals/)
+> — scenario fixtures (`evals/scenarios/*.toml`), the T1 grader and T0
+> judge-prompt builder (`evals/graders/`), and a stdlib-only runner
+> (`evals/run.py`) that builds the sandbox, sets the condition, runs the
+> reference commands or a headless `claude` agent, and grades. Start with
+> `python3.12 evals/run.py --check` (drift guard) then `--all --reference` (the
+> golden self-test); see
 > [`evals/README.md`](https://github.com/curtisgalloway/paniolo/blob/main/evals/README.md).
 
 1. Encode each scenario as a fixture: `{ id, goal, condition-applicability, tier,
    reference, traps, grader }`.
-2. For each `(scenario × condition × trial)`: spin up a clean sandbox (§3),
-   provision the condition, run the agent, capture transcript + `argv` log +
-   `lab.toml`.
-3. Grade: scripted grader for T1 end-states; LLM-judge for T0 + the Discovery
-   layer; merge into a per-cell verdict.
+2. For each `(scenario × condition × trial)`: clean sandbox (§3), provision the
+   condition, run the agent, capture transcript + `argv` log + `lab.toml`.
+3. Grade: scripted grader for T1; LLM-judge for T0 + Discovery; merge into a
+   per-cell verdict.
 4. Aggregate into the §7 metrics; diff against the previous run to catch
-   regressions in the help/skill/docs surface.
+   regressions.
 
 ---
 

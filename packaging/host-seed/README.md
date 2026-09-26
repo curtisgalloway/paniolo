@@ -5,13 +5,13 @@ SPDX-License-Identifier: Apache-2.0
 
 # Control-host seed files
 
-Unattended-install files that take a blank Raspberry Pi to an
-**agent-reachable paniolo control host** with one human action: flash a card,
-plug it in, power on.
+cloud-init files that turn a blank Raspberry Pi into an **agent-reachable
+paniolo control host** with one human action: flash a card, plug it in, power
+on. Raspberry Pi OS reads `user-data`, `meta-data` and `network-config` from the
+boot partition on first boot.
 
-The user-facing walkthrough is [docs/control-host.md](../../docs/control-host.md).
-This directory holds the files themselves. The design rationale and the
-alternatives that were rejected are in
+The walkthrough is [docs/control-host.md](../../docs/control-host.md); design
+rationale is in
 [notes/control-host-provisioning.md](../../notes/control-host-provisioning.md).
 
 | Flavor | Directory | Status |
@@ -19,37 +19,33 @@ alternatives that were rejected are in
 | `pi-sd` — Raspberry Pi 4/5, Raspberry Pi OS Trixie Lite arm64 | [`pi-sd/`](pi-sd) | **Hardware-validated** (Pi 5 8 GB, 2026-08-20) |
 | `x86-usb` — UEFI mini-PC, Ubuntu Server autoinstall | — | Designed, not built |
 
-There is no generator. These are files you copy and edit; the argument-taking
-generator sketched in the design note has not earned its keep yet, and the
-edit is four placeholders.
+There is no generator: copy these files and fill in five placeholders.
 
 ## What the seed does, and where it stops
 
-It creates the operator account with the right groups, authorizes one SSH key,
-disables password login, installs the paniolo `.deb` and the packages it wants,
-and brings up the wired uplink on DHCP.
+The seed:
 
-It deliberately does **not** carry lab configuration, target wiring, daemon
-state, or any credential beyond that one public key. Those live in the lab
-file, and baking them into the image would fork the source of truth. The
-seed's job ends at first SSH.
+- creates the operator account with the right groups
+- authorizes one SSH key and disables password login
+- installs the paniolo `.deb` and the packages it wants
+- brings up the wired uplink on DHCP
+
+It carries no lab configuration, target wiring, daemon state, or credential
+beyond that one public key; those live in the lab file. Its job ends at first
+SSH.
 
 ## Using them
 
-**The executable procedure is `paniolo skill control-host`** — downloading
-the image, identifying the right removable device before writing to it,
-flashing, mounting, installing these files, rendering them, and enrolling the
-result. It has the exact commands for macOS and Linux, and it is the single
-source of truth for the steps. The rationale, host sizing, and troubleshooting
-are in [docs/control-host.md](../../docs/control-host.md).
+**Follow `paniolo skill control-host`** for the exact macOS and Linux commands:
+download the image, identify the right removable device before writing to it,
+flash, mount, install these files, render them, and enroll the result.
 
 In short: copy all three files to the FAT `bootfs` partition under exactly
 these names, `touch` an empty `ssh` file beside them, render the placeholders,
 and boot.
 
-Only `user-data` has placeholders. Replace all five, then confirm none
-survive. This check strips the file's own comments first, so a clean run means
-the payload really is rendered:
+Only `user-data` has placeholders. Replace all five (table below), then confirm
+none survive. This check strips the file's comments first:
 
 ```bash
 grep -v '^[[:space:]]*#' /Volumes/bootfs/user-data | grep '<[^>]*>' \
@@ -57,10 +53,9 @@ grep -v '^[[:space:]]*#' /Volumes/bootfs/user-data | grep '<[^>]*>' \
   || echo "OK: fully rendered"
 ```
 
-Do not simplify that to `grep '<[a-z-]*>' user-data`. It matches the
-explanatory comments in the template, so it can never report success, and its
-character class excludes spaces, so it silently misses a placeholder that
-contains one.
+Do not simplify it to `grep '<[a-z-]*>' user-data`: that matches the template's
+comments, so it never reports success, and it misses a placeholder containing a
+space.
 
 | Placeholder | Value |
 |---|---|
@@ -72,32 +67,26 @@ contains one.
 
 ## Gotchas these files encode
 
-Each of these cost a debug cycle on the first build. They are why the files
-look the way they do — do not "simplify" them back.
+Do not "simplify" these back.
 
 - **sshd is off by default on Pi OS, and `enable_ssh: true` does not turn it
-  on.** That key is a Pi OS downstream extension, absent from upstream
-  `cc_raspberry_pi`, and on the tested image it was a silent no-op. What works
-  is the classic empty **`ssh` flag file** on `bootfs`: `sshswitch.service`
-  survives in Trixie, enables sshd, and consumes the file. The seed ships that,
-  a `bootcmd` fallback, and `openssh-server` in `packages` — three mechanisms,
-  because losing SSH on a headless box means a trip to the bench.
-- **Never `systemctl enable --now ssh` in `bootcmd`.** `bootcmd` runs in the
-  pre-network local stage. `--now` waits for `ssh.service`, which waits for the
-  network, which waits for `cloud-init-local` — which is blocked in that very
-  command. The boot deadlocks and only a power-cut recovers it. Plain
-  `systemctl enable ssh` writes a symlink and returns instantly.
+  on** (it is a silent no-op; upstream `cc_raspberry_pi` lacks it). The empty
+  **`ssh` flag file** on `bootfs` works: `sshswitch.service` enables sshd and
+  consumes the file. The seed also has a `bootcmd` fallback and
+  `openssh-server` in `packages`, because losing SSH on a headless box means a
+  trip to the bench.
+- **Never `systemctl enable --now ssh` in `bootcmd`.** It deadlocks boot
+  (`--now` waits for `ssh.service`, which waits on the network, which waits on `cloud-init-local`, which is
+  running that command); only a power-cut recovers. Plain
+  `systemctl enable ssh` is safe.
 - **Re-seeding an already-booted card takes two edits**: change `user-data`
-  *and* bump `instance_id` in `meta-data`. cloud-init caches per-instance
-  state on the rootfs, so an unchanged id means the user, package, and runcmd
-  stages never re-run and your edit appears to do nothing.
-- **`optional: false` on the uplink** makes boot wait for the link. First boot
-  fetches packages and the `.deb` over the network; without the wait those
-  stages can run early and fail quietly.
+  *and* bump `instance_id` in `meta-data`. Otherwise cloud-init's cached
+  per-instance state means the user, package and runcmd stages never re-run.
+- **`optional: false` on the uplink** makes boot wait for the link, so package
+  and `.deb` downloads don't run early and fail quietly.
 
 ## Bench note, not a seed concern
 
-A board reused from netboot bring-up may have its EEPROM `BOOT_ORDER` set
-network-first (`0xf12`), which costs roughly 40 seconds per boot waiting for a
-PXE server that is not there. Set it SD-first (`0xf21`) with `rpi-eeprom-config
---edit` once the board becomes a control host.
+A board reused from netboot bring-up may have EEPROM `BOOT_ORDER` set
+network-first (`0xf12`), costing about 40 seconds per boot. Set it SD-first
+(`0xf21`) with `rpi-eeprom-config --edit`.

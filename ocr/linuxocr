@@ -19,7 +19,7 @@ Reads a PNG from stdin (pass '-') or a file path, applies 2x upscale and
 black padding (same preprocessing as visionocr for small console fonts),
 then pipes to tesseract and prints the recognized text.
 
-With --json, emits the v1 OCR envelope (see docs/ocr.md) instead: engine
+With --json, emits the v1 OCR envelope (see docs/dev/ocr.md) instead: engine
 identity, source dimensions, joined text, and per-line text + confidence +
 bbox. Bboxes are mapped back through the upscale and padding to SOURCE image
 coordinates — the preprocessed image is a different size, and a box in its
@@ -331,7 +331,7 @@ def main() -> None:
     ap.add_argument(
         "--json",
         action="store_true",
-        help="Emit the v1 OCR envelope (docs/ocr.md) instead of plain text",
+        help="Emit the v1 OCR envelope (docs/dev/ocr.md) instead of plain text",
     )
     args = ap.parse_args()
 
