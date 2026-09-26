@@ -645,20 +645,81 @@ mod linux {
         &buf[..(bytesused as usize).min(buf.len())]
     }
 
+    /// Buffers the stream is allocated with (`Stream::with_buffers`).
+    const BUFFERS: u32 = 4;
+
+    /// A dequeued buffer captured longer ago than this is skipped rather than
+    /// served (#221). V4L2 hands buffers back oldest first: after the capture
+    /// loop sleeps at its idle rate, every buffer in the queue holds a frame
+    /// from the start of that sleep, and the one a pull would get is up to a
+    /// second older than the screen.
+    const MAX_BUFFER_AGE: Duration = crate::demand::FRESH_ENOUGH;
+
+    /// Now on `CLOCK_MONOTONIC`, the clock V4L2 stamps buffers with when it
+    /// sets `V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC`.
+    fn monotonic_now() -> Option<Duration> {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid, writable timespec for the duration of the call.
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
+            return None;
+        }
+        Some(Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+    }
+
+    /// How long ago the driver captured this buffer, or `None` when that
+    /// cannot be trusted: a driver that does not stamp with the monotonic
+    /// clock, or a stamp in the future. `None` means "serve it", so a driver
+    /// with odd timestamps behaves exactly as before rather than having
+    /// every frame skipped.
+    fn buffer_age(meta: &v4l::buffer::Metadata, now: Duration) -> Option<Duration> {
+        use v4l::buffer::Flags;
+        if meta.flags & Flags::TIMESTAMP_MASK != Flags::TIMESTAMP_MONOTONIC {
+            return None;
+        }
+        let (sec, usec) = (meta.timestamp.sec, meta.timestamp.usec);
+        if sec < 0 || !(0..1_000_000).contains(&usec) {
+            return None;
+        }
+        let stamped = Duration::new(sec as u64, usec as u32 * 1000);
+        now.checked_sub(stamped)
+    }
+
     impl CaptureBackend for LinuxV4LBackend {
         fn frame(&mut self) -> Result<CapturedFrame> {
-            let (buf, meta) = self.stream.next().map_err(|e| {
-                if e.kind() == io::ErrorKind::TimedOut {
-                    anyhow!("frame timeout (device stalled)")
-                } else {
-                    anyhow!("VIDIOC_DQBUF: {e}")
+            // Skip buffers that are already too old (see `MAX_BUFFER_AGE`).
+            // Each skip returns a buffer the driver filled earlier, so the
+            // dequeue is immediate; after `BUFFERS` of them the queue holds
+            // only buffers handed back since, and the next is fresh. Bounded
+            // so a clock disagreement can cost at most one queue's worth.
+            let mut skipped = 0;
+            let buf: Vec<u8> = loop {
+                let (buf, meta) = self.stream.next().map_err(|e| {
+                    if e.kind() == io::ErrorKind::TimedOut {
+                        anyhow!("frame timeout (device stalled)")
+                    } else {
+                        anyhow!("VIDIOC_DQBUF: {e}")
+                    }
+                })?;
+                let stale = monotonic_now()
+                    .and_then(|now| buffer_age(meta, now))
+                    .is_some_and(|age| age > MAX_BUFFER_AGE);
+                if stale && skipped < BUFFERS {
+                    skipped += 1;
+                    continue;
                 }
-            })?;
-            let buf = frame_bytes(buf, meta.bytesused);
+                // Owned, so the stream's borrow ends with the loop.
+                break frame_bytes(buf, meta.bytesused).to_vec();
+            };
+            if skipped > 0 {
+                tracing::debug!("skipped {skipped} stale queued buffer(s)");
+            }
 
             if self.is_mjpeg {
-                // Keep a copy of the raw JPEG bytes for zero-cost preview serving.
-                let jpeg_bytes: Arc<[u8]> = Arc::from(buf.to_vec().into_boxed_slice());
+                // Keep the raw JPEG bytes for zero-cost preview serving.
+                let jpeg_bytes: Arc<[u8]> = Arc::from(buf.into_boxed_slice());
 
                 // Grayscale at half scale, for signal detection only. The
                 // capture thread discards `pixels` whenever raw JPEG bytes are
@@ -689,7 +750,7 @@ mod linux {
                     .map(|f| (f.width, f.height))
                     .unwrap_or(self.dims);
                 self.dims = (w, h);
-                let rgb = yuyv_to_rgb(buf, w, h);
+                let rgb = yuyv_to_rgb(&buf, w, h);
                 Ok(CapturedFrame {
                     jpeg: None,
                     pixels: PixelData::Rgb(Arc::from(rgb.into_raw().into_boxed_slice())),
@@ -704,6 +765,49 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn meta(flags: v4l::buffer::Flags, sec: i64, usec: i64) -> v4l::buffer::Metadata {
+            v4l::buffer::Metadata {
+                flags,
+                timestamp: v4l::timestamp::Timestamp { sec, usec },
+                ..Default::default()
+            }
+        }
+
+        /// The age of a monotonic-stamped buffer is now minus its stamp (#221).
+        #[test]
+        fn a_monotonic_buffer_reports_its_age() {
+            let m = meta(v4l::buffer::Flags::TIMESTAMP_MONOTONIC, 100, 250_000);
+            assert_eq!(
+                buffer_age(&m, Duration::from_millis(100_500)),
+                Some(Duration::from_millis(250))
+            );
+        }
+
+        /// A timestamp that cannot be compared with the monotonic clock is
+        /// never grounds to skip a frame: a driver stamping with another
+        /// clock, or a stamp from the future, must behave as before.
+        #[test]
+        fn an_untrustworthy_timestamp_has_no_age() {
+            use v4l::buffer::Flags;
+            let now = Duration::from_secs(100);
+            assert_eq!(buffer_age(&meta(Flags::TIMESTAMP_UNKNOWN, 1, 0), now), None);
+            assert_eq!(buffer_age(&meta(Flags::TIMESTAMP_COPY, 1, 0), now), None);
+            assert_eq!(
+                buffer_age(&meta(Flags::TIMESTAMP_MONOTONIC, 200, 0), now),
+                None,
+                "a stamp after now"
+            );
+            assert_eq!(
+                buffer_age(&meta(Flags::TIMESTAMP_MONOTONIC, -1, 0), now),
+                None
+            );
+            assert_eq!(
+                buffer_age(&meta(Flags::TIMESTAMP_MONOTONIC, 1, 1_000_000), now),
+                None,
+                "usec out of range"
+            );
+        }
 
         /// `VIDIOC_S_FMT` substitutes the driver's nearest match instead of
         /// failing, so asking for 1080p MJPG and then 1080p YUYV on a device

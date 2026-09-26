@@ -4,6 +4,10 @@ paniolo captures the target's screen through `hdmicap`, a daemon that keeps a
 USB HDMI capture device open and serves the current frame over HTTP, so there
 is no per-capture reopen delay.
 
+On Linux an unwatched daemon captures at 5 fps instead of 30, to save CPU on
+small control hosts. `shot`, `read` and `/snapshot` still get a current frame:
+a request for an old frame waits a moment for a fresh one.
+
 ---
 
 ## Hardware

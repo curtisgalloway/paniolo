@@ -26,6 +26,7 @@ mod auth;
 mod capture;
 mod capture_thread;
 mod daemon;
+mod demand;
 mod frame;
 // Pixel formats and conversions exist to serve a capture backend. On a
 // platform with none compiled in (Windows), nothing constructs them — that is

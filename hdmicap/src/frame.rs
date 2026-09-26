@@ -50,8 +50,10 @@ pub const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
 /// which is why the drift went unnoticed; sharing one is what stops it
 /// recurring.
 ///
-/// Not a floor on freshness for pull callers — `/snapshot` and `/ocr` read the
-/// warm buffer directly and see every captured frame.
+/// The Linux loop runs at this rate only while something wants it: an open
+/// `/preview`, a `/snapshot` waiting for a change, or a pull in the last
+/// 300 ms. Otherwise it idles at 5 fps (#221, `crate::demand`), and a pull
+/// that finds the warm frame too old waits for a fresh one.
 pub const TARGET_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
 
 /// How many consecutive same-resolution, non-black frames we require before

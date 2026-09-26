@@ -100,7 +100,8 @@ pub fn run(device: DeviceSpec, port: u16) -> Result<()> {
 
     // 2. Spawn the capture thread BEFORE the runtime. It owns the device and
     //    publishes into the watch channel.
-    let (frames, _capture_handle) = capture_thread::spawn(device);
+    let demand = crate::demand::Demand::new();
+    let (frames, _capture_handle) = capture_thread::spawn(device, demand.clone());
 
     // 3. Build a multi-thread runtime for axum and run the server.
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -133,7 +134,7 @@ pub fn run(device: DeviceSpec, port: u16) -> Result<()> {
         // process the kernel next gave that number to.
         let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
         let app = server::router(
-            AppState::new(frames),
+            AppState::new(frames).with_demand(demand),
             crate::auth::Auth::new(token, server::PUBLIC_ASSETS),
         )
         .layer(axum::Extension(shutdown.clone()));
