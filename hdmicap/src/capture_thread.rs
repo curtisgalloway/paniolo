@@ -29,18 +29,23 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::capture::{open_backend, CapturedFrame, DeviceSpec};
+use crate::demand::Demand;
 use crate::frame::{classify_gray, classify_nv12, classify_rgb, FrameState, Signal, STABLE_FRAMES};
 use crate::pixel::PixelData;
 
 pub type FrameRx = watch::Receiver<Arc<FrameState>>;
 
 /// Spawn the capture thread. Returns the receiver end and the JoinHandle.
-pub fn spawn(spec: DeviceSpec) -> (FrameRx, thread::JoinHandle<()>) {
+/// `demand` sets the Linux loop's pace (#221); see [`crate::demand`].
+pub fn spawn(spec: DeviceSpec, demand: Arc<Demand>) -> (FrameRx, thread::JoinHandle<()>) {
     let (tx, rx) = watch::channel(Arc::new(FrameState::no_device()));
 
     let handle = thread::Builder::new()
         .name("capture".into())
-        .spawn(move || capture_loop(spec, tx))
+        .spawn(move || {
+            demand.set_capture_thread(thread::current());
+            capture_loop(spec, tx, &demand)
+        })
         .expect("failed to spawn capture thread");
 
     (rx, handle)
@@ -82,7 +87,8 @@ impl StallTracker {
     }
 }
 
-fn capture_loop(spec: DeviceSpec, tx: watch::Sender<Arc<FrameState>>) {
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+fn capture_loop(spec: DeviceSpec, tx: watch::Sender<Arc<FrameState>>, demand: &Demand) {
     let mut stalls = StallTracker::new();
 
     // Reconnect loop: if the device is absent or vanishes mid-run, publish
@@ -271,21 +277,24 @@ fn capture_loop(spec: DeviceSpec, tx: watch::Sender<Arc<FrameState>>) {
                 captured_at: Instant::now(),
             }));
 
-            // Linux: cap the loop — the v4l device delivers as fast as we
-            // dequeue, and the per-frame turbojpeg decode has real cost
-            // (~16 ms at 1080p on a Pi 5, about half of one core at this rate).
-            // The dongle itself offers 50 fps at 1080p (measured on the MS2131
-            // in front of lab-optiplex-1), so this cap, not the hardware, sets
-            // the floor under how stale the newest frame can be: 33 ms rather
-            // than the 100 ms it was through v0.3.1. Raised once the preview
-            // stopped shipping the untrimmed arena buffer — at 19x
-            // amplification the wire, not the frame rate, was what bound.
+            // Linux: pace the loop — the v4l device delivers as fast as we
+            // dequeue, and every frame costs a decode. At most
+            // TARGET_FRAME_INTERVAL (33 ms) while something is watching; the
+            // dongle offers 50 fps at 1080p, so this cap, not the hardware,
+            // bounds how stale the newest frame can be. Slower when nothing
+            // is (#221): `demand` picks the interval and unparks this thread
+            // the moment a stream opens or a pull arrives, so the new interval
+            // takes effect mid-sleep. The interval is re-read on every wake.
             // macOS: no cap; the backend blocks until the next frame.
             #[cfg(target_os = "linux")]
             {
-                let elapsed = frame_start.elapsed();
-                if elapsed < crate::frame::TARGET_FRAME_INTERVAL {
-                    thread::sleep(crate::frame::TARGET_FRAME_INTERVAL - elapsed);
+                loop {
+                    let elapsed = frame_start.elapsed();
+                    let interval = demand.interval();
+                    if elapsed >= interval {
+                        break;
+                    }
+                    thread::park_timeout(interval - elapsed);
                 }
                 frame_start = Instant::now();
             }

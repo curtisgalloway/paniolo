@@ -274,6 +274,13 @@ the current frame as PNG/MJPEG plus the dashboard over HTTP. `paniolo video read
 (`linuxocr`) on Linux. Both are tuned for thin console fonts (2× upscale, black-pad,
 `.fast`/lowered min text height).
 
+On Linux the capture rate follows demand (`hdmicap/src/demand.rs`): 30 fps while a `/preview`
+is open, a `/snapshot` is waiting for a change or a stable signal, or a pull came in the last
+300 ms; 5 fps otherwise. A `/snapshot` or `/ocr` that finds the warm frame older than 66 ms
+wakes the loop and waits up to 250 ms for a new one, and the V4L2 backend skips queued buffers
+older than 66 ms, so a slow idle rate never serves a stale screen. macOS and Windows follow the
+device's own cadence.
+
 ### HID injection ([`hid.md`](../hid.md))
 The dual-board rig appears to the DUT as a USB keyboard + mouse. `hidrig` composes HID reports
 on the host and writes frames to the **control** board's USB-CDC port, which relays them over

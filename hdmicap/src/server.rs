@@ -40,6 +40,7 @@ use serde::Deserialize;
 use tokio::sync::{watch, Semaphore};
 
 use crate::capture_thread::FrameRx;
+use crate::demand::{Demand, FRESH_ENOUGH, FRESH_WAIT};
 use crate::frame::{FrameState, Signal, StatusDto};
 use crate::pixel::{nv12_to_rgb, nv12_to_rgb_half, PixelData};
 
@@ -71,6 +72,9 @@ pub struct AppState {
     /// N. Plain `std::sync::Mutex` is fine: it is only ever held for a
     /// synchronous lookup or store, never across an `.await`.
     preview_cache: PreviewCache,
+    /// What clients want from the capture loop right now (#221): streams
+    /// hold a guard, pulls record themselves. See [`crate::demand`].
+    demand: Arc<Demand>,
 }
 
 impl AppState {
@@ -79,8 +83,30 @@ impl AppState {
             frames,
             expensive: Arc::new(Semaphore::new(EXPENSIVE_PERMITS)),
             preview_cache: Arc::new(Mutex::new(None)),
+            demand: Demand::new(),
         }
     }
+
+    /// Share the capture thread's demand record, so requests pace it.
+    pub fn with_demand(mut self, demand: Arc<Demand>) -> Self {
+        self.demand = demand;
+        self
+    }
+}
+
+/// A pull's promise: the frame it serves was captured after the pull arrived,
+/// or at least within [`FRESH_ENOUGH`] of it (#221).
+///
+/// An idle capture loop runs slowly, so the warm frame can be most of a
+/// second old. Recording the pull wakes the loop at full rate; if the warm
+/// frame is too old, wait (up to [`FRESH_WAIT`]) for the next one. A capture
+/// thread that is gone or slow just means serving what there is, as before.
+async fn fresh_frame(rx: &mut FrameRx, demand: &Demand) {
+    demand.pulled();
+    if rx.borrow_and_update().captured_at.elapsed() <= FRESH_ENOUGH {
+        return;
+    }
+    let _ = tokio::time::timeout(FRESH_WAIT, rx.changed()).await;
 }
 
 /// Paths served without the daemon token: the vendored xterm.js library files
@@ -197,6 +223,7 @@ fn snapshot_ready(f: &FrameState, want_stable: bool, changed_since: Option<u64>)
 
 async fn snapshot(State(s): State<AppState>, Query(q): Query<SnapReq>) -> Response {
     let mut rx = s.frames.clone();
+    fresh_frame(&mut rx, &s.demand).await;
     let timeout_ms = q.timeout.unwrap_or(DEFAULT_TIMEOUT_MS);
     let deadline = Instant::now() + Duration::from_millis(timeout_ms).min(Duration::from_secs(60));
     let want_stable = q.wait.as_deref() == Some("stable");
@@ -204,6 +231,11 @@ async fn snapshot(State(s): State<AppState>, Query(q): Query<SnapReq>) -> Respon
         .changed_since
         .as_ref()
         .and_then(|h| u64::from_str_radix(h, 16).ok());
+
+    // A snapshot that waits for a change or a stable signal is watching the
+    // screen until it answers, so it holds the capture loop at full rate:
+    // at an idle rate it would notice the change up to a second late.
+    let _stream = (want_stable || changed_since.is_some()).then(|| s.demand.stream());
 
     loop {
         let ready = {
@@ -491,8 +523,12 @@ async fn preview(State(s): State<AppState>) -> Response {
     let mut frames = s.frames.clone();
     let expensive = s.expensive.clone();
     let preview_cache = s.preview_cache.clone();
+    // Held by the stream itself, so it drops when the client disconnects and
+    // the body stream is dropped: an open preview wants every frame (#221).
+    let demand = s.demand.clone();
 
     let stream = async_stream::stream! {
+        let _watching = demand.stream();
         let mut interval = tokio::time::interval(crate::frame::TARGET_FRAME_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_served: Option<Served> = None;
@@ -698,7 +734,9 @@ async fn wait_with_timeout(
 /// itself — it pipes a PNG to the tool located by [`visionocr_bin`] and returns
 /// the v1 envelope the helper emits under `--json` (see docs/dev/ocr.md).
 async fn ocr(State(s): State<AppState>) -> Response {
-    let f = s.frames.borrow().clone();
+    let mut rx = s.frames.clone();
+    fresh_frame(&mut rx, &s.demand).await;
+    let f = rx.borrow().clone();
     if f.effective_signal() == Signal::Stale {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1683,5 +1721,84 @@ mod tests {
                 assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
             }
         }
+    }
+
+    // ── #221: demand-paced capture ───────────────────────────────────────
+
+    /// A pull that finds the warm frame too old waits for the next one, so
+    /// an idle capture loop never hands an agent a screen from before its
+    /// last action.
+    #[tokio::test]
+    async fn a_pull_on_an_old_frame_waits_for_a_fresh_one() {
+        let old = Instant::now() - Duration::from_secs(1);
+        let (tx, mut rx) = watch::channel(Arc::new(nv12_frame(16, 8, Signal::Stable, old)));
+        let demand = Demand::new();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let _ = tx.send(Arc::new(nv12_frame(16, 8, Signal::Stable, Instant::now())));
+            // Keep the sender alive past the wait, as the capture thread would.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        fresh_frame(&mut rx, &demand).await;
+        assert!(
+            rx.borrow().captured_at.elapsed() < Duration::from_millis(500),
+            "the pull must come back with the new frame, not the one from a second ago"
+        );
+    }
+
+    /// A frame that is already fresh is served at once.
+    #[tokio::test]
+    async fn a_pull_on_a_fresh_frame_does_not_wait() {
+        let (_tx, mut rx) =
+            watch::channel(Arc::new(nv12_frame(16, 8, Signal::Stable, Instant::now())));
+        let start = Instant::now();
+        fresh_frame(&mut rx, &Demand::new()).await;
+        assert!(start.elapsed() < FRESH_WAIT / 2);
+    }
+
+    /// A snapshot waiting for a change holds the capture loop at full rate
+    /// until it answers; a plain snapshot does not.
+    #[tokio::test]
+    async fn a_waiting_snapshot_holds_a_stream_until_it_answers() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let (tx, rx) = watch::channel(Arc::new(stable_frame_with_hash(0x1)));
+        let demand = Demand::new();
+        let state = AppState::new(rx).with_demand(demand.clone());
+        let app = router(state, crate::auth::Auth::new("tok".into(), PUBLIC_ASSETS));
+
+        let req = HttpRequest::builder()
+            .uri("/snapshot?changed_since=1&timeout=2000")
+            .header(header::HOST, "127.0.0.1:1")
+            .header(header::AUTHORIZATION, "Bearer tok")
+            .body(Body::empty())
+            .unwrap();
+        let pending = tokio::spawn(app.oneshot(req));
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while demand.stream_count() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the waiting snapshot never held a stream"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        tx.send(Arc::new(stable_frame_with_hash(0x2))).unwrap();
+        let resp = tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .expect("snapshot did not answer after the change")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            demand.stream_count(),
+            0,
+            "the guard must drop with the answer"
+        );
     }
 }
