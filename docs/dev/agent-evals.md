@@ -303,6 +303,24 @@ serial sense line).
 *Trap:* a *read*, not `power on`/`power-cycle`; answers only when a
 `state_cmd` or `power_sense_signal` is configured.
 
+**R9 — Test the USB-Ethernet link up and down.**
+*Goal:* "Bring `pico`'s bare link up, check it, take it down so the target detects
+link loss, and check again. Explain soft down vs hard down."
+*Reference:* `paniolo netif mode link pico` → `netif status` → `netif down-hard pico`
+→ `netif status` → `netif mode link pico`.
+*Trap:* drive the link through paniolo, never `ifconfig`/`ip`/`networksetup` by
+hand; `mode off` is a soft down that can leave the carrier up (Wake-on-LAN keeps
+the PHY powered), so only `down-hard` makes the target see link loss.
+
+**R10 — `video show` says stopped, `video watch` says already running.**
+*Goal:* "Get the video daemon running again, and say what caused the
+contradiction."
+*Reference:* `paniolo daemons` (lists it as untracked) → `paniolo video show`
+(`running, untracked (pid N)`) → `paniolo video watch` (reaps the orphan, starts
+a fresh daemon).
+*Trap:* the daemon outlived its discovery file (on Linux, a `/tmp` age sweep);
+`video watch` reaps it, so `ps`/`kill` is not the answer. Not a core scenario.
+
 ### Serial — the operating workhorse (s1–s11): T0 + one T1; executable on Linux
 
 Serial is most of how an agent uses paniolo. `s1` is config (T1, scripted);

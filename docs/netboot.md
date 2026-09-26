@@ -269,11 +269,11 @@ The TFTP root must contain at least `config.txt`, `bcm2712-rpi-5-b.dtb`, and
 only configure the boot program (NBP, network boot program):
 
 ```bash
-paniolo netboot set -t nova \
+paniolo netboot set -t indiedroid \
     --interface en7 \
-    --tftp-root ~/nova/boot-root \
+    --tftp-root ~/indiedroid/boot-root \
     --boot-file grubaa64.efi      # any UEFI NBP: grubaa64.efi, ipxe.efi, a UKI…
-paniolo netboot start nova
+paniolo netboot start indiedroid
 ```
 
 **PXE (hardware-verified).** Pick **UEFI PXEv4** in the boot menu. A
@@ -285,7 +285,7 @@ returned"*). The log shows `RRQ <boot_file> … completed`.
 **HTTP Boot.** Pick **HTTP Boot (IPv4)**. An `HTTPClient` (arch 19 = ARM64
 UEFI HTTP) gets the `HTTPClient` echo and an
 `http://<host_ip>[:<http_port>]/<boot_file>` URL in option 67.
-`paniolo netboot logs -f nova` shows the `DISCOVER` (carrying
+`paniolo netboot logs -f indiedroid` shows the `DISCOVER` (carrying
 `HTTPClient:Arch:00019`), the offer, then `HEAD` + `GET /grubaa64.efi`. HTTP
 Boot uses ordinary kernel TCP: no `/dev/bpf`, setuid helper, or static ARP
 entry.

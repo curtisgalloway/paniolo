@@ -78,6 +78,7 @@ Source: [`docs/dev/`](https://github.com/curtisgalloway/paniolo/tree/main/docs/d
 | [HID serial protocol](dev/hid-serial-protocol.md) | Normative command vocabulary (v1) that `hidrig` and `ch9329` speak. |
 | [OCR helper protocol](dev/ocr.md) | The OCR helper contract and engines (Apple Vision, `Windows.Media.Ocr`, Tesseract). |
 | [HID dual-board design](dev/hid-dual-board-design.md) | The KB2040 rig's I2C1 wire format between control and target boards. |
+| [CLI error contract](dev/error-contract/design.md) | Design of the exit-code-by-kind and `--json-errors` contract; the user-facing reference is [errors.md](errors.md). |
 
 ### Extending paniolo
 
@@ -115,12 +116,16 @@ They are **not** kept current and not published.
 | [Openterface USB mux spec (clean-room)](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-usb-mux-spec.md) | The KVM-Go microSD serial command (shipped as the `usb` channel) and the Mini-KVM USB-A register write (untested). |
 | [Provisioning a Linux control host](https://github.com/curtisgalloway/paniolo/blob/main/notes/control-host-provisioning.md) | The design behind the cloud-init seed; the `pi-sd` flavor shipped (see [control-host.md](control-host.md)), the x86 flavor is unbuilt. |
 | [Pi 4 control host](https://github.com/curtisgalloway/paniolo/blob/main/notes/pi4-control-host.md) | Pi 4 control-host bring-up plan; the USB-HID-gadget backend is not implemented. |
+| [VM targets and RFB](https://github.com/curtisgalloway/paniolo/blob/main/notes/vm-targets-and-rfb.md) | **Design only.** VMs as targets, and RFB (the VNC protocol) as a second transport for video and HID. Only the pty serial console shipped. |
+| [Openterface Mini-KVM V2 on Linux](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-v2-linux-serial.md) | **Bench-measured.** Why the V2's control port is silent on Linux while the same unit works on macOS; root cause not yet established. Corrects two claims in other notes. |
+| [A desktop app for the lab](https://github.com/curtisgalloway/paniolo/blob/main/notes/desktop-app.md) | **Design only.** A Tauri desktop app as the lab's front door, building on [console front door](https://github.com/curtisgalloway/paniolo/blob/main/notes/console-front-door.md). |
 
 ## Elsewhere in the repo
 
 - **Agent skills** in [`skills/`](https://github.com/curtisgalloway/paniolo/tree/main/skills): `paniolo` (driving a target), `kvm-puppeting` (GUI puppeting), `control-host` (building a control host). `paniolo skill` lists them; `paniolo skill <name>` prints one's `SKILL.md`.
 - [`AGENTS.md`](https://github.com/curtisgalloway/paniolo/blob/main/AGENTS.md): internals, source constraints, adding a subsystem.
 - [`hidrig/README.md`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md): HID injector CLI and daemon; board and firmware are in [`paniolo-hardware`](https://github.com/curtisgalloway/paniolo-hardware) (`hidrig-kb2040/`).
+- [`docs/provenance/`](https://github.com/curtisgalloway/paniolo/tree/main/docs/provenance): the pinned source files read for each clean-room spec, for verifiers.
 
 ---
 

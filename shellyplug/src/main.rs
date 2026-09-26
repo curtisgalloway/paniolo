@@ -16,7 +16,7 @@
 //!
 //! A one-shot paniolo power helper: each invocation makes a single stateless
 //! HTTP RPC call to the device and exits. Hook-facing subcommands follow the
-//! paniolo helper conventions (docs/adding-power-helpers.md):
+//! paniolo helper conventions (docs/dev/adding-power-helpers.md):
 //!   state <id>    prints exactly `on` or `off`
 //!   on/off <id>   switch + read-back confirm
 //!   cycle <id>    off → confirm → delay → on → confirm

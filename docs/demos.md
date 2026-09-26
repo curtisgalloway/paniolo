@@ -163,7 +163,7 @@ Power ON  (lab-pi-1)
 
 # Cycle it, and catch the machine dying:
 $ paniolo power-cycle lab-pi-1
-Power cycling 'lab-pi-1' via python3 ~/src/usb-relay/host/usbrelay.py --port /dev/serial/by-id/usb-Raspberry_Pi_Pico_AA00BB11CC22DD33-if02 cycle 1
+Power cycling 'lab-pi-1' via python3 usbrelay.py --port /dev/serial/by-id/usb-Raspberry_Pi_Pico_AA00BB11CC22DD33-if02 cycle 1
 OK cycle 1 5.0
 Power cycle complete.
 $ paniolo power-state lab-pi-1
@@ -180,8 +180,8 @@ $ paniolo serial log lab-pi-1 --since 175 | grep -E 'BOOTSYS release|power-on-re
 [2026-08-28T00:56:45.351Z] #298       7.15 Read kernel_2712.img bytes 10172022 hnd 0x13b43
 [2026-08-28T00:56:46.267Z] #312     NOTICE:  BL31: v2.6(release):v2.6-240-gfc45bc492
 [2026-08-28T00:56:46.267Z] #313     NOTICE:  BL31: Built : 12:55:13, Dec  4 2024
-[2026-08-28T00:57:01.473Z] #315     Debian GNU/Linux 13 mablevale ttyAMA10
-[2026-08-28T00:57:01.473Z] #319*    mablevale login:
+[2026-08-28T00:57:01.473Z] #315     Debian GNU/Linux 13 lab-pi-1 ttyAMA10
+[2026-08-28T00:57:01.473Z] #319*    lab-pi-1 login:
 
 # power-on-reset 1 — a genuine cold boot, back to a login prompt in ~35 s.
 # serial + power + video + HID, one CLI:  github.com/curtisgalloway/paniolo

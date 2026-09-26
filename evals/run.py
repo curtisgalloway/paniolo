@@ -25,7 +25,7 @@ Examples:
   python3 run.py --scenario c1 --condition cold --agent claude
   python3 run.py --scenario r1 --condition warm --agent claude --judge-cmd "claude -p"
 
-See docs/agent-evals.md for the design.
+See docs/dev/agent-evals.md for the design.
 """
 
 from __future__ import annotations

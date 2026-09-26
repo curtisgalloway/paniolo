@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The HID serial protocol grammar (`docs/hid-serial-protocol.md` §3), executed
+//! The HID serial protocol grammar (`docs/dev/hid-serial-protocol.md` §3), executed
 //! against a CH9329 [`Session`] instead of forwarded to a microcontroller.
 //!
 //! [`execute_line`] is the single backend for both the CLI subcommands and

@@ -111,7 +111,7 @@ verbs, UPPERCASE keys). Arguments are separated by single spaces.
   keys.
 - `moveabs <x> <y>` positions the pointer in `0..32767` on each axis, which the
   host OS maps across the full screen; callers scale pixel coordinates against
-  the screen size (see §6).
+  the screen size: `logical = round(pixel * 32767 / screen_size)` on each axis.
   - It is **optional**, advertised by the `moveabs` capability in `version`. A
     device without it MUST reply `ERR`; callers fall back to relative `move`.
   - It requires an absolute-axis HID report descriptor on the device.

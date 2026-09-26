@@ -15,7 +15,7 @@ of a target board: **netboot it, watch its output, send it input, power-cycle it
 at the bench.
 
 It is a **device-control layer**, not a test orchestrator. It owns power, serial, deploy
-(netboot), video, HID (keyboard/mouse input), and adb. It does *not* choose tests or produce
+(netboot), video, HID (keyboard/mouse input), switchable USB media, and adb. It does *not* choose tests or produce
 verdicts; in hardware CI those sit *above* it (see
 [`ci-integration/`](../README.md#hardware-ci-integration-in-design)).
 
@@ -78,7 +78,7 @@ implemented. The only cross-subsystem coupling is the dashboard's hdmicap→seri
 
 **All configuration lives in one CLI-managed lab file**: `~/.config/paniolo/lab.toml`, or
 `--lab` / `PANIOLO_LAB` (e.g. a git-tracked file). It names **hosts** and **targets**; each
-target's hardware is a set of *channels* (`netboot`, `serial`, `power`, `video`, `hid`, `adb`),
+target's hardware is a set of *channels* (`netboot`, `serial`, `power`, `video`, `hid`, `usb`, `adb`),
 each bound to the host it is attached to. With exactly one target, the target argument may be
 omitted. Schema (`cli/src/model.rs`):
 
@@ -116,6 +116,9 @@ device = "USB Video"             # HDMI capture device for hdmicap
 
 [targets.target-machine.hid]
 cmd = "hidrig -d /dev/…"         # opaque helper prefix; `paniolo hid send` appends args
+
+[targets.target-machine.usb]
+cmd = "ch9329 -d /dev/…"         # helper prefix; paniolo appends only `usb host|target|state`
 
 [targets.target-machine.adb]     # an Android DUT reached over adb
 serial = "33271JEGR02033"        # `adb -s <serial>`; omit for the sole device

@@ -51,7 +51,7 @@ A typical hand-off:
 paniolo usb attach-host -t pi5
 # ... wait for the block device, write your image to it, unmount ...
 paniolo usb attach-target -t pi5
-paniolo power cycle -t pi5
+paniolo power-cycle -t pi5
 ```
 
 ---

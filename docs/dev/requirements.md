@@ -7,7 +7,7 @@
 > Design: [`docs/dev/ci-integration/`](ci-integration/gap-analysis.md); per-feature docs under
 > [`docs/`](../README.md). **Update the Status column as work lands.**
 >
-> Last updated: 2026-06-05.
+> Last updated: 2026-09-25.
 
 ## Status legend
 
@@ -109,7 +109,7 @@ bench checklist:
 
 | ID | Requirement | Pri | Status | Notes |
 |---|---|---|---|---|
-| OTF-1 | Bench-verify the control paths on our unit: PCB rev; MS2109 GPIO write for the A-port mux; DTR→`SW_GND` replug polarity + hold time; RTS→CH9329 reset; `DATAFLIP` semantics; serial-open DTR-pulse side effects; EEPROM backup dump | M | ☐ | **done**: v1.9; DTR asserted = disconnected; serial-open *does* replug the A-port; RTS resets the CH9329 (threshold 20–50 ms, ~700 ms boot, A-port undisturbed); `DATAFLIP` not observable (1,956 samples); EEPROM dumped (`sha256 9b46336d…`); switch is software-monitored. **blocked**: MS2109 GPIO write |
+| OTF-1 | Bench-verify the control paths on our unit: PCB rev; MS2109 GPIO write for the A-port mux; DTR→`SW_GND` replug polarity + hold time; RTS→CH9329 reset; `DATAFLIP` semantics; serial-open DTR-pulse side effects; EEPROM backup dump | M | ☑ | **done**: v1.9; DTR asserted = disconnected; serial-open *does* replug the A-port; RTS resets the CH9329 (threshold 20–50 ms, ~700 ms boot, A-port undisturbed); `DATAFLIP` not observable (1,956 samples); EEPROM dumped (`sha256 9b46336d…`); switch is software-monitored. **blocked**: MS2109 GPIO write |
 | OTF-2 | RTS hardware reset of the CH9329 (`HIDRESET` line) as a recovery verb in the shipped `ch9329` backend; guard against serial-open modem-line pulses disturbing the A-port (see OTF-1) | S | ☐ | **unblocked**: pulse RTS low ≥50 ms, wait ≥800 ms for boot. Route through the existing session (opening the tty asserts DTR+RTS, replugging the A-port). No status comes back (`DATAFLIP` unreadable). A reconnecting watchdog should force the baud, not autodetect (#81) |
 | OTF-3 | `usb attach-host` / `usb attach-target`: software flip of the A-port mux (MS2109 GPIO) — hands-free physical media (image stick host-side, boot it target-side, BIOS-visible) | S | ☐ | **unblocked 2026-08-30**: no 8051 patch needed. Read-modify-write XDATA `0xDF01` bit 0 (bit 4 on capture firmware < `24081309`) over the MS2109 HID config interface with XDATA opcodes `0xB5`/`0xB6` (already working in findings 7–9, which stopped one address past `0xDF00`). Protocol: [openterface-usb-mux-spec.md](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-usb-mux-spec.md). Untested on the Mini-KVM |
 | OTF-4 | `usb replug [--hold-ms]`: soft surprise-unplug/replug of the A-port device via CH340 DTR ground-float — scripted hot-plug exerciser for USB driver testing | S | ☐ | mechanism confirmed. Off the VM the blockers **did not reproduce** (28/28 cycles at 480 Mbps, finding 10); they look like USB-passthrough artifacts. Before shipping: repeat on bare-metal *Linux* (run was macOS) and re-check whether opening the tty alone unplugs the A-port (not on macOS `/dev/cu.*`) |
@@ -132,7 +132,7 @@ bench checklist:
 | NF-2 | Changes land as smallest reversible steps, each with tests | M | ◐ | |
 | NF-3 | Core power/serial path stays functional on both macOS and Linux | M | ☑ | CI-only features may be Linux-only (see §9) |
 | NF-4 | External contracts re-verified against upstream before relying on them | M | ◐ | re-check Fuchsia `device.go` (FX-4) |
-| NF-5 | Failures are machine-classifiable: exit code by kind, optional one-line JSON object on stderr | M | ◐ | [error contract](error-contract/design.md), [errors.md](../errors.md); on branch `error-contract`, releases as 0.5.0 |
+| NF-5 | Failures are machine-classifiable: exit code by kind, optional one-line JSON object on stderr | M | ☑ | [error contract](error-contract/design.md), [errors.md](../errors.md); shipped in 0.5.0 (#242) |
 
 ---
 
@@ -179,7 +179,7 @@ bench checklist:
 | SER-1 | serialcap exposes a **raw bidirectional TCP listener** (ser2net-equivalent) | LAVA | M | ☐ | backs `connection_command = telnet host port` |
 | SER-2 | serialcap exposes a **PTY** whose slave path is a real device file | FX | M | ☐ | handed to botanist as `DeviceConfig.serial` |
 | SER-3 | New endpoints **tee off the existing supervisor** (JSONL/WS/dashboard unaffected) | OWNER | M | ☐ | preserves NF-1 |
-| SER-4 | `paniolo serial send <bytes\|->` one-shot write (agent feature) | OWNER | M | ☐ | same `write_tx` channel; `--enter`/`--hex`/stdin |
+| SER-4 | `paniolo serial send <bytes\|->` one-shot write (agent feature) | OWNER | M | ☑ | same `write_tx` channel; shipped as `serial send [target] <text>` with `--pace-ms` and `--no-newline` (no `--hex` or stdin) |
 | SER-5 | Write arbitration per D-3 (lock, `/status` holder, `--exclusive`, auto-release) | OWNER | M | ☐ | |
 | SER-6 | Stable socket/PTY paths under `$XDG_RUNTIME_DIR/paniolo/<target>/` | BOTH | S | ☐ | predictable for adapters |
 | SER-7 | Existing JSONL log, `/stream`, `tio`, `serial log/dtr/reset` unchanged | OWNER | M | ☐ | regression guard / tests |
@@ -233,7 +233,7 @@ bench checklist:
 | RF-4 | `VirtualMedia` `InsertMedia`/`EjectMedia` → image deploy | OWNER | C | ⤵ | open: needed vs. Pxe-once sufficient? |
 | RF-5 | `SerialConsole` advertises out-of-band SSH/console endpoint pointing at paniolo raw-serial socket (metadata only) | OWNER | S | ⤵ | depends on SER-1; Redfish carries no serial bytes |
 | RF-6 | Accurate per-node `ResetType@Redfish.AllowableValues` / `ActionInfo` for the supported subset | OWNER | S | ⤵ | relay/DTR boards lack some `ResetType`s |
-| RF-7 | Implement via a sushy-tools-style emulator + paniolo backend driver (not a hand-rolled OData service) | OWNER | S | ⤵ | open: dependency footprint (core = `typer` only) |
+| RF-7 | Implement via a sushy-tools-style emulator + paniolo backend driver (not a hand-rolled OData service) | OWNER | S | ⤵ | open: dependency footprint (the core CLI is a single Rust binary) |
 | RF-8 | Document/decide whether Redfish provider replaces or complements LAVA/botanist adapters | OWNER | S | ⤵ | botanist PTY serial still needs the direct path → not a full replacement |
 
 ## 10. Security

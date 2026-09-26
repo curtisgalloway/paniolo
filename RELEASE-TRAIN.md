@@ -168,9 +168,9 @@ feeds needs re-reading before `--update` re-pins it.
 | `packaging/nfpm.yaml` | b348d64432f4 | Channels: deb |
 | `packaging/scripts/build-apt-repo.sh` | fb2205eeab8e | Channels: deb, install like a user |
 | `Makefile` | 0e29b48ae719 | Project: helpers; Channels: source |
-| `cli/src/setup.rs` | 2b42590a21fa | Channels: source |
+| `cli/src/setup.rs` | b14d2f93405a | Channels: source |
 | `cli/src/skills.rs` | eada6fa6ec0c | Smoke contract S2; Channels: homebrew, windows |
-| `cli/src/daemons.rs` | 7ac65873b125 | Smoke contract S3 |
+| `cli/src/daemons.rs` | f86e565cab42 | Smoke contract S3 |
 | `scripts/ci-coverage-check.sh` | 8d0d03ddf496 | Project: helpers |
 | `scripts/sync-brik.sh` | b8b5a15775a9 | Channels: windows |
 | `README.md` | ce98734c0b91 | Channels: source; Publish: re-verify apt |

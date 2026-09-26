@@ -343,7 +343,7 @@ fn trusted_runtime_base() -> std::result::Result<Option<PathBuf>, String> {
 //
 // Both directories exist by the time the helper runs. Helpers should prefer
 // these over hand-rolled paths, falling back to the same literal locations
-// when run standalone (documented in docs/adding-power-helpers.md).
+// when run standalone (documented in docs/dev/adding-power-helpers.md).
 
 /// Durable per-helper state base: `~/.config/paniolo/helpers`.
 pub fn state_base() -> Option<PathBuf> {
@@ -372,7 +372,7 @@ pub fn helper_env(name: &str, instance: Option<&str>) -> Vec<(&'static str, Path
 /// non-assignment shell token (`zigplug -d … on …` → `zigplug`,
 /// `/path/to/script.sh …` → `script.sh`, `AMT_PASSWORD=... amt-tool cycle` →
 /// `amt-tool`, skipping the assignment). Hooks are opaque strings, so this is
-/// a convention, not an inspection — documented in docs/adding-power-helpers.md.
+/// a convention, not an inspection — documented in docs/dev/adding-power-helpers.md.
 ///
 /// Sanitized before it comes back: the name becomes a path component
 /// (`daemons::helper_env` → [`runtime_rel`]), and a hook string is

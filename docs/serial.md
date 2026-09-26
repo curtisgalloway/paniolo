@@ -143,7 +143,7 @@ trip. The target may be positional or `-t`; omit the target and `-i` when
 there is only one.
 
 ```bash
-# Tail the last 50 lines from the default interface
+# Tail the last 50 lines from the `console` interface
 paniolo serial log target-machine -i console --tail 50
 
 # Only lines newer than a previously-seen sequence number (poll mode)

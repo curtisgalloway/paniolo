@@ -19,7 +19,7 @@
 //! is on, off, or has no OS installed at all, which is what makes AMT both a
 //! power switch and — unlike a smart plug driven blind — a power *sensor*.
 //! Hook-facing subcommands follow the paniolo helper conventions
-//! (docs/adding-power-helpers.md):
+//! (docs/dev/adding-power-helpers.md):
 //!   state         prints exactly `on` or `off` (errors on an unmapped state)
 //!   on/off        request the state + confirm by read-back
 //!   cycle         off → confirm → delay → on → confirm

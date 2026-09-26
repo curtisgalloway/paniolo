@@ -872,7 +872,7 @@ enum VideoCmd {
         #[arg(long, default_value_t = 2000)]
         timeout: u64,
         /// Emit the full OCR envelope (per-line text, confidence, bbox, and
-        /// which engine produced it) instead of just the text. See docs/ocr.md.
+        /// which engine produced it) instead of just the text. See docs/dev/ocr.md.
         #[arg(long)]
         json: bool,
     },

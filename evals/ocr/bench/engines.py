@@ -3,7 +3,7 @@
 
 """OCR engines, behind one adapter.
 
-**The adapter is paniolo's v1 OCR envelope** (`docs/ocr.md`), not a Python
+**The adapter is paniolo's v1 OCR envelope** (`docs/dev/ocr.md`), not a Python
 protocol invented here. That is a deliberate departure from the original
 benchmark plan, and the reason is that the envelope arrived in the meantime: it
 already carries text, per-line confidence, bounding boxes and engine identity in

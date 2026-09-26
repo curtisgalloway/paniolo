@@ -61,7 +61,7 @@ hidrig -d /dev/cu.usbmodemXXXX type "hello world"
 hidrig -d /dev/cu.usbmodemXXXX key ENTER
 hidrig -d /dev/cu.usbmodemXXXX combo LEFT_CONTROL C
 hidrig -d /dev/cu.usbmodemXXXX move 300 -50       # relative
-hidrig -d /dev/cu.usbmodemXXXX moveabs 16383 16383 # absolute (0..32767 logical; centre)
+hidrig -d /dev/cu.usbmodemXXXX moveabs 16383 16383 # absolute (0..32767 logical; center)
 hidrig -d /dev/cu.usbmodemXXXX click right
 hidrig -d /dev/cu.usbmodemXXXX scroll -3
 hidrig -d /dev/cu.usbmodemXXXX power cycle         # DUT power off/on via the relay
