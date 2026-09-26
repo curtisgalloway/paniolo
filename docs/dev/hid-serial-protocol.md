@@ -5,29 +5,32 @@ SPDX-License-Identifier: Apache-2.0
 
 # HID serial protocol, version 1
 
-A device-independent text protocol for USB HID input injectors: the command
-vocabulary (`type`, `key`, `combo`, `move`, `moveabs`, `click`, …) and the
-`OK`/`ERR` reply convention for driving a USB HID keyboard + mouse attached to
-a *target* machine from a *control host*.
+A device-independent text protocol for driving a USB HID (Human Interface
+Device: the USB class for keyboards and mice) keyboard + mouse plugged into a
+*target* machine from a *control host*. It defines the command vocabulary
+(`type`, `key`, `combo`, `move`, `moveabs`, `click`, …) and the `OK`/`ERR`
+reply convention.
 
-> **Where this protocol lives now (2026-06).** The default rig — the dual-board
-> KB2040 "dumb pipe" ([hid-dual-board-design.md](hid-dual-board-design.md)) —
-> keeps **this command vocabulary as its external interface** (the `hidrig` CLI,
-> `paniolo hid send`, the daemon's WebSocket §2 carrier), but `hidrig` now
-> **composes** the commands into HID report bytes host-side and sends **binary
-> frames** to the boards — the line protocol no longer travels on the device
-> wire. The §1 "line commands over a serial byte stream to the device" transport
-> below describes the **retired single-board** path; treat §1's device-side
-> framing as historical and the **command vocabulary (§3+) as still normative**.
+This document is **normative for the command vocabulary (§3 onward)**. §1's
+device-side framing is historical. Where the protocol lives (as of 2026-06):
 
-> The dual-board rig's `hidrig` also offers two **rig-specific** features that
-> are *not* part of this device-independent vocabulary: DUT **power** control
-> (`hidrig power off|on|cycle`) and a **serial-console** bridge. They surface
-> through paniolo's separate `power` and `serial` channels — not the `hid`
-> channel — so other HID backends need not implement them. See
-> [hid-dual-board-design.md](hid-dual-board-design.md) §6–§7.
+- **Default rig: the dual-board KB2040 "dumb pipe"**
+  ([hid-dual-board-design.md](hid-dual-board-design.md); the KB2040 is an
+  Adafruit RP2040 microcontroller board). This vocabulary is
+  the rig's external interface: the `hidrig` CLI, `paniolo hid send`, and the
+  daemon's WebSocket carrier (§1). `hidrig` **composes** the commands into HID
+  report bytes on the host and sends **binary frames** to the boards, so the
+  line protocol no longer travels on the device wire.
+- **Retired single-board rig.** §1's "line commands over a serial byte stream
+  to the device" transport describes this path.
 
-This document is **normative for the command vocabulary**. Consumers:
+The dual-board `hidrig` also has two **rig-specific** features outside this
+vocabulary: DUT (device under test) **power** control (`hidrig power off|on|cycle`) and a
+**serial-console** bridge. They surface through paniolo's separate `power` and
+`serial` channels, not the `hid` channel, so other HID backends need not
+implement them. See [hid-dual-board-design.md](hid-dual-board-design.md) §6–§7.
+
+Consumers:
 
 | Consumer | Status |
 |---|---|
@@ -36,35 +39,38 @@ This document is **normative for the command vocabulary**. Consumers:
 | [`hidrig-kb2040/firmware/single-board/`](https://github.com/curtisgalloway/paniolo-hardware/tree/main/hidrig-kb2040/firmware/single-board) (paniolo-hardware repo) — single-board KB2040 line-protocol firmware | **Retired** reference device implementation (spoke this over a UART) |
 | WCH CH9329 bridge (see [ch9329-spec.md](https://github.com/curtisgalloway/paniolo/blob/main/notes/ch9329-spec.md)) | Implemented — the host-side [`ch9329`](https://github.com/curtisgalloway/paniolo/blob/main/ch9329/README.md) crate speaks this protocol (one-shot CLI + `serve` daemon); a separate helper backend that drops into the same `hid` channel |
 
-The host-side client is the `hidrig` CLI (`hidrig/src/`); above it, paniolo and
-the dashboard speak only this vocabulary, so any injector behind the generic
-`hid` channel works unchanged.
+(The CH9329 is a WCH chip that turns serial commands into USB keyboard/mouse
+input.) Above `hidrig`, paniolo and the dashboard speak only this vocabulary,
+so any injector behind the generic `hid` channel works unchanged.
 
 ---
 
 ## 1. Transport
 
 - Any bidirectional byte stream. The reference implementation uses a UART:
-  **115200 baud, 8N1, no flow control, 3.3 V logic**. USB CDC or a TCP
-  socket are equally valid carriers.
+  **115200 baud, 8N1, no flow control, 3.3 V logic**. USB CDC (a virtual serial
+  port over USB) or a TCP socket are equally valid carriers.
 - Encoding is **UTF-8**.
 - No transport-level framing, checksums, or escaping: the stream is assumed
   reliable (it is a wire on a bench).
-- **WebSocket carrier (for the daemon / KVM path).** The `hidrig serve` daemon
-  owns the device's serial link and re-exposes the *same* line protocol over a
-  WebSocket (`GET /hid`): each client text frame is one command line (no
-  trailing `\n` needed). Results are **broadcast to all connected clients** as
-  transcript frames — `evt ok <line> :: <reply>` / `evt err <line> :: <reply>` —
-  so an issuer reads its own result off the shared stream (the daemon's
-  `POST /send` one-shot endpoint returns the raw `OK`/`ERR` reply directly).
-  The carrier is authenticated: the upgrade (or `/send`) must present the
-  token from the daemon's discovery file — `?token=` on the WebSocket URL,
+
+**WebSocket carrier (daemon / KVM path).** This is a carrier binding, not a
+different protocol: the command grammar below is identical on the UART and the
+WebSocket.
+
+- The `hidrig serve` daemon owns the device's serial link and re-exposes the
+  *same* line protocol over a WebSocket (`GET /hid`). Each client text frame is
+  one command line (no trailing `\n` needed).
+- Results are **broadcast to all connected clients** as transcript frames —
+  `evt ok <line> :: <reply>` / `evt err <line> :: <reply>` — so an issuer reads
+  its own result off the shared stream. The one-shot `POST /send` endpoint
+  instead returns the raw `OK`/`ERR` reply directly.
+- Authentication: the upgrade (or `/send`) must present the token from the
+  daemon's discovery file — `?token=` on the WebSocket URL,
   `Authorization: Bearer` on `/send` — from a loopback `Host`/`Origin`.
-  Many clients may connect at once — the daemon serializes their commands onto
-  the single device link, one in flight, which is exactly how CLI-injected and
-  browser-injected events intermix. This is a carrier binding, not a different
-  protocol: the command grammar below is identical on the UART and the
-  WebSocket.
+- Many clients may connect at once. The daemon serializes their commands onto
+  the single device link, one in flight; that is how CLI-injected and
+  browser-injected events intermix.
 
 ## 2. Framing and flow control
 
@@ -110,44 +116,50 @@ are separated by single spaces.
 
 - `<button>` is `left`, `right`, or `middle`.
 - `move` / `scroll` values may exceed one HID report's range (int8 for
-  boot-protocol relative mice); the device MUST split them into multiple
+  boot-protocol relative mice). The device MUST split them into multiple
   reports transparently (or, for an absolute-pointer device, accumulate the
   relative delta into its tracked cursor).
-- `combo` presses at most **6 keys** at once (the boot-protocol keyboard
-  report's key-slot count; modifiers don't count against it — they have their
-  own report byte). A chord that needs more — counting keys already held via
+- `combo` presses at most **6 keys** at once: the boot-protocol keyboard
+  report's key-slot count. Modifiers don't count against it; they have their
+  own report byte. A chord that needs more — counting keys already held via
   `down` — MUST reply `ERR` rather than silently drop the keys it can't fit.
 - `moveabs <x> <y>` positions the pointer at logical coordinates in `0..32767`
-  on each axis; the host OS maps that range across the full screen dimension,
-  so a caller scales pixel coordinates against the screen size (see §6). It is
-  **optional** — a device that implements it advertises the `moveabs`
-  capability in its `version` reply; one that does not MUST reply `ERR` (and
-  callers fall back to relative `move`). Implementing `moveabs` requires an
-  absolute-axis HID report descriptor on the device.
-- `type` text is the remainder of the line after `type ` — it may contain
-  spaces and `#`, and trailing spaces are part of the text (only the line's
-  own terminator is stripped, never trailing whitespace within it); no
-  quoting or escaping exists, and an embedded CR/LF is invalid (the command
-  line format has no way to carry one — see §2). A device MUST reply `ERR`
-  for a character outside its keyboard layout (reference: US) rather than
-  type it approximately or silently drop it — a partially-typed string is
-  worse than a refused one.
+  on each axis. The host OS maps that range across the full screen dimension,
+  so a caller scales pixel coordinates against the screen size (see §6).
+  - It is **optional**. A device that implements it advertises the `moveabs`
+    capability in its `version` reply; one that does not MUST reply `ERR`, and
+    callers fall back to relative `move`.
+  - It requires an absolute-axis HID report descriptor on the device.
+- `type` text is the remainder of the line after `type `, verbatim:
+  - It may contain spaces and `#`. Trailing spaces are part of the text: only
+    the line's own terminator is stripped, never trailing whitespace within it.
+  - No quoting or escaping exists. An embedded CR/LF is invalid, since the
+    command line format has no way to carry one (§2).
+  - A device MUST reply `ERR` for a character outside its keyboard layout
+    (reference: US) rather than type it approximately or silently drop it. A
+    partially-typed string is worse than a refused one.
 - `baud <rate>` renegotiates the serial link's speed mid-session (optional,
-  capability `baud`) — for a carrier where it makes sense (a UART; meaningless
-  on a TCP/WebSocket carrier). The **device boots at its default rate** —
-  115200 for the reference firmware (see §2) — so a naive connection always
-  works; a throughput-sensitive host then raises it. **Handshake:** the device replies `OK` **at the current rate**,
-  then switches to `<rate>`; the host, after reading that `OK`, switches its
-  port to `<rate>`, waits briefly for the device to switch, and confirms with a
-  `ping` (reverting on no reply). The device SHOULD return to its boot default
-  on power-cycle so a later naive connect re-syncs. A device that does not
-  implement it MUST reply `ERR` and stay at the current rate.
+  capability `baud`). It applies to a carrier where it makes sense (a UART); it
+  is meaningless on a TCP/WebSocket carrier.
+  - The **device boots at its default rate** — 115200 for the reference
+    firmware (see §1) — so a naive connection always works; a
+    throughput-sensitive host then raises it.
+  - **Handshake:** the device replies `OK` **at the current rate**, then
+    switches to `<rate>`. The host, after reading that `OK`, switches its port
+    to `<rate>`, waits briefly for the device to switch, and confirms with a
+    `ping` (reverting on no reply).
+  - The device SHOULD return to its boot default on power-cycle so a later
+    naive connect re-syncs.
+  - A device that does not implement it MUST reply `ERR` and stay at the
+    current rate.
 - `version` replies `OK <ver> <impl> [caps...]`, e.g.
-  `OK 1 kb2040-circuitpython/1.0 moveabs baud`. `<ver>` is the protocol version
-  (decimal integer) hosts use for compatibility; `<impl>` is an informational
-  free-form id; each remaining whitespace-separated token is an **optional
-  capability** the device supports (e.g. `moveabs`, `baud`). Absence of a token
-  means the corresponding command will `ERR`.
+  `OK 1 kb2040-circuitpython/1.0 moveabs baud`.
+  - `<ver>` is the protocol version (decimal integer) hosts use for
+    compatibility.
+  - `<impl>` is an informational free-form id.
+  - Each remaining whitespace-separated token is an **optional capability** the
+    device supports (e.g. `moveabs`, `baud`). A missing token means the
+    corresponding command will `ERR`.
 
 ### Key names
 
@@ -173,9 +185,9 @@ names to HID usage IDs themselves.)
 
 ## 4. Device behavior
 
-- **Boot:** the device begins serving the protocol as soon as it is ready;
-  there is no banner or greeting (the host would have no way to distinguish
-  it from a stale buffer anyway). Hosts should `ping` to detect liveness.
+- **Boot:** the device serves the protocol as soon as it is ready. There is no
+  banner or greeting, since the host could not tell one from a stale buffer.
+  Hosts should `ping` to detect liveness.
 - **Target not enumerated:** commands that need USB may block until
   enumeration or fail with `ERR`; the device MUST NOT crash. (The reference
   implementation blocks at startup until the target enumerates, and replies
@@ -191,7 +203,7 @@ names to HID usage IDs themselves.)
 ## 5. Reserved extensions
 
 Future capabilities follow the same pattern as `moveabs`: a new optional
-command advertised by a `version` token, `ERR` when unsupported, so adding one
+command advertised by a `version` token, `ERR` when unsupported. Adding one
 does not bump the protocol version. Reserved:
 
 - `consumer <NAME>` — consumer-control usages (volume, media keys).

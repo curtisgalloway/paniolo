@@ -1,17 +1,16 @@
 # Paniolo — Requirements & progress tracker
 
-> Project-wide requirements for **paniolo**, an agent-controlled target-machine wrangler for
-> low-level software development (bootloaders, firmware, OS bring-up). This is the single
-> source of truth for *what paniolo must do* and *how far along each capability is* — covering
-> both shipped capabilities and planned work.
+> The single source of truth for *what paniolo must do* and *how far along each capability is*,
+> shipped and planned. Paniolo is an agent-controlled target-machine wrangler for low-level
+> software development (bootloaders, firmware, OS bring-up).
 >
-> Scope note: paniolo is a **device-control / "wrangling" layer** (power, serial, deploy/netboot,
-> video, HID). It deliberately does **not** own test orchestration or result production — when
-> integrated with hardware-CI ecosystems, those stay above paniolo (see §9).
+> Scope: paniolo is a **device-control ("wrangling") layer** (power, serial, deploy/netboot,
+> video, HID). It does **not** own test orchestration or result production; in a hardware-CI
+> setup those stay above paniolo (see §9).
 >
-> Companion design docs live under [`docs/dev/ci-integration/`](ci-integration/gap-analysis.md) (gap analysis +
-> integration design) and per-feature docs under [`docs/`](../README.md). **Update the Status column as
-> work lands.**
+> Design docs: [`docs/dev/ci-integration/`](ci-integration/gap-analysis.md) (gap analysis +
+> integration design); per-feature docs under [`docs/`](../README.md). **Update the Status column
+> as work lands.**
 >
 > Last updated: 2026-06-05.
 
@@ -25,7 +24,9 @@
 | ⤵ | Deferred (planned, later) |
 | ⊘ | Out of scope (recorded, not planned) |
 
-**Pri** = M(ust) / S(hould) / C(ould). **Source/Notes** cites the driving need or contract.
+**Pri** = M(ust) / S(hould) / C(ould). **Source/Notes** cites the driving need or contract
+(in §9, Source is LAVA, FX = Fuchsia/botanist, BOTH = LAVA and FX, or OWNER = the project
+owner's own need).
 
 ---
 
@@ -44,7 +45,7 @@
 | CORE-9 | Tunnelled `console` for a remote target (dashboard reachable locally) | S | ☑ | `remote_console` in `cli/src/main.rs`; `?serialws=` stitch |
 | CORE-10 | Multi-host targets (one target spanning control hosts) | C | ◐ | per-channel dispatch routes each command to its channel's host (`dispatch.rs`); composite `console` still requires co-located channels |
 | CORE-11 | Remote `setup --host` + discovery-assisted `configure` | C | ☑ | `paniolo setup --host`, `discover`, `configure` (`cli/src/main.rs`) |
-| CORE-12 | Carry a helper's required secrets to its **remote** control host, without exposing them in the host's process list | S | ☑ | `AMT_PASSWORD` (`ssh::FORWARDED_ENV`) is auto-forwarded on every non-interactive dispatch (`power-*`, `power set` hooks) over the remote command's **stdin**, not its argv, so `ps` on the control host never sees it — `ssh::stdin_prelude`/`ssh::launch` in `cli/src/ssh.rs`, wired in `cli/src/dispatch.rs`. `run_interactive` (e.g. `serial connect`) forwards nothing, by construction — its stdin is the user's own terminal. See [distributed-control.md](../distributed-control.md#env-forwarding-to-a-control-host) and [power.md](../power.md#credentials) |
+| CORE-12 | Carry a helper's required secrets to its **remote** control host, without exposing them in the host's process list | S | ☑ | `AMT_PASSWORD` (`ssh::FORWARDED_ENV`) is auto-forwarded on every non-interactive dispatch (`power-*`, `power set` hooks) over the remote command's **stdin**, not its argv, so `ps` on the control host never sees it (`ssh::stdin_prelude`/`ssh::launch` in `cli/src/ssh.rs`, wired in `cli/src/dispatch.rs`). `run_interactive` (e.g. `serial connect`) forwards nothing by construction: its stdin is the user's own terminal. See [distributed-control.md](../distributed-control.md#env-forwarding-to-a-control-host) and [power.md](../power.md#credentials) |
 | CORE-13 | Re-image path for a control host: one human action from blank media to agent-reachable (the disposability principle, made real) | C | ◐ | `pi-sd` flavor shipped and hardware-validated — [`packaging/host-seed/`](https://github.com/curtisgalloway/paniolo/tree/main/packaging/host-seed), guide at [control-host.md](../control-host.md). `x86-usb` (Ubuntu autoinstall) and the argument-taking generator are unbuilt; design in [notes/control-host-provisioning.md](https://github.com/curtisgalloway/paniolo/blob/main/notes/control-host-provisioning.md) |
 
 ## 2. Netboot / deploy
@@ -84,7 +85,7 @@
 | VID-1 | HDMI/USB capture via warm-stream `hdmicap` daemon | M | ☑ | `hdmicap/`; Linux V4L2 + macOS |
 | VID-2 | `video watch/preview/shot/read/devices/show/stop`; stable & changed-since capture | M | ☑ | |
 | VID-3 | On-device OCR (`video read`): Apple Vision (macOS), Tesseract (Linux) | S | ☑ | `ocr/` helpers via hdmicap `GET /ocr` (the legacy `--json` flag was not carried into the Rust CLI) |
-| VID-4 | Change detection sensitive enough for small-region edits | C | ☐ | `--changed-since` compares a 64-bit aHash over an 8x8 cell grid, so a change smaller than a cell — a moved text cursor, a single toggled BIOS checkbox — averages away and reads as "unchanged". Fine for whole-screen transitions, wrong for waiting on a UI to acknowledge a keystroke. Wants an opt-in finer comparison (region-of-interest, or a second finer hash) rather than a bigger default hash. Distinct from the `signal` bugs fixed in #103 |
+| VID-4 | Change detection sensitive enough for small-region edits | C | ☐ | `--changed-since` compares a 64-bit aHash (average-brightness image hash) over an 8x8 cell grid, so a change smaller than a cell (a moved text cursor, one toggled BIOS checkbox) averages away and reads as "unchanged". Fine for whole-screen transitions; wrong for waiting on a UI to acknowledge a keystroke. Wants an opt-in finer comparison (region-of-interest, or a second finer hash), not a bigger default hash. Distinct from the `signal` bugs fixed in #103 |
 
 ## 6. HID injection
 
@@ -100,18 +101,21 @@
 
 ### 6.1 Openterface deep control (OTF)
 
-Findings from the Openterface Mini-KVM's open hardware design (v1.9
-schematic/BOM/datasheet): the switchable USB-A port and the CH340's modem
-lines make a stock unit a small programmable USB fixture. Details + bench
-test checklist: [`openterface-deep-control.md`](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-deep-control.md).
-**OTF-1 verified 2026-08-18** as far as this bench allows: DTR/`SW_GND` and
-RTS/`HIDRESET` are both characterized, `DATAFLIP` is not observable from the
-host, EEPROM dumped, switch semantics resolved from vendor docs. The MS2109
-GPIO write was the one item left; as of 2026-08-30 it is **unblocked** — the
-vendor never patched the firmware, and the mux is a register write over the HID
-config interface this bench already reads from. Note
-the lab host is a VM with USB passthrough — verify USB observations on the
-hypervisor, not in the guest.
+The Openterface Mini-KVM (a USB KVM dongle) has an open hardware design (v1.9
+schematic/BOM/datasheet). Its switchable USB-A port and the modem lines of its
+CH340 (USB-serial chip) make a stock unit a small programmable USB fixture.
+Details + bench test checklist:
+[`openterface-deep-control.md`](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-deep-control.md).
+
+- **OTF-1 verified 2026-08-18** as far as this bench allows: DTR/`SW_GND` and
+  RTS/`HIDRESET` are both characterized, `DATAFLIP` is not observable from the
+  host, EEPROM dumped, switch semantics resolved from vendor docs.
+- The MS2109 (the capture chip) GPIO write was the one item left. As of
+  2026-08-30 it is **unblocked**: the vendor never patched the firmware, and
+  the mux is a register write over the HID config interface this bench already
+  reads from.
+- The lab host is a VM with USB passthrough. Verify USB observations on the
+  hypervisor, not in the guest.
 
 | ID | Requirement | Pri | Status | Notes |
 |---|---|---|---|---|
@@ -119,7 +123,7 @@ hypervisor, not in the guest.
 | OTF-2 | RTS hardware reset of the CH9329 (`HIDRESET` line) as a recovery verb in the shipped `ch9329` backend; guard against serial-open modem-line pulses disturbing the A-port (see OTF-1) | S | ☐ | **unblocked**: reset characterized — pulse RTS low ≥50 ms, wait ≥800 ms for the ~700 ms boot. Route through the existing session (opening the tty asserts DTR+RTS, which also replugs the A-port). No status input comes back — `DATAFLIP` is not readable. a reconnecting watchdog should force the baud rather than rely on autodetect (#81) |
 | OTF-3 | `usb attach-host` / `usb attach-target`: software flip of the A-port mux (MS2109 GPIO) — hands-free physical media (image stick host-side, boot it target-side, BIOS-visible) | S | ☐ | **unblocked 2026-08-30** — the vendor never patches the 8051. It read-modify-writes XDATA `0xDF01` bit 0 (bit 4 on capture firmware < `24081309`) over the MS2109 HID config interface using XDATA opcodes `0xB5`/`0xB6` — the primitives findings 7–9 already had working; we stopped one address past `0xDF00`. Findings 7/8 remain right about what ms-tools cannot do, and wrong only in inferring the vendor needed it. Protocol: [openterface-usb-mux-spec.md](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-usb-mux-spec.md). Untested — the Mini-KVM was not on the bench |
 | OTF-4 | `usb replug [--hold-ms]`: soft surprise-unplug/replug of the A-port device via CH340 DTR ground-float — scripted hot-plug exerciser for USB driver testing | S | ☐ | mechanism confirmed on hardware. The blockers were re-tested off the VM and **did not reproduce**: 28/28 cycles returned at high-speed 480 Mbps with the CH340 and MS2109 healthy throughout (finding 10), so the degradation and hub instability look like USB-passthrough artifacts. Remaining gate before shipping: repeat on bare-metal *Linux* (this run was macOS), and re-check whether opening the tty alone unplugs the A-port device — it did not on macOS `/dev/cu.*` |
-| OTF-5 | EEPROM serial-stamping utility (AT24C16 via MS2109) → unique USB serials → stable by-id paths on multi-unit benches | C | ☐ | **premise corrected**: the `????????` serial is a RAM-resident string descriptor at XDATA `0xC676`, not an EEPROM field — needs a firmware patch. Still blocked on that wall, but no longer "blocked with OTF-3": OTF-3 turned out not to need patching at all (2026-08-30), so this is now an independent blocker. CH340 stays serial-less; by-path for that |
+| OTF-5 | EEPROM serial-stamping utility (AT24C16 via MS2109) → unique USB serials → stable by-id paths on multi-unit benches | C | ☐ | **premise corrected**: the `????????` serial is a RAM-resident string descriptor at XDATA `0xC676`, not an EEPROM field — needs a firmware patch. Still blocked on that, but no longer "blocked with OTF-3": OTF-3 turned out to need no patching (2026-08-30), so this blocker now stands alone. CH340 stays serial-less; by-path for that |
 | OTF-6 | Extension-pins target-side gadget slot (spare downstream port of each hub on pads): MCU mass-storage gadget (true virtual media) or analyzer tap | C | ⤵ | solder mod; revisit after OTF-3/4 prove out |
 | OTF-7 | KVM-Go microSD mux (`USB_SW` via the CH32V208): `usb attach-host` / `attach-target` / `state` over the existing CDC control port | S | ☑ | **done 2026-08-30, hardware-verified.** Shipped as the generic `usb` channel + the `ch9329` helper's `usb` verb. Serial opcode `0x17`, query + both directions exercised on our unit, media proven to move by a nonce round-trip across the mux with the filesystem intact. The reply reports the *resulting* position, not success — compare it against the request. An unimplemented opcode is **silent**, so gate "unsupported" on the port's VID/PID (`1A86:FE0C`) plus a query timeout, never on the chip-version table (it misclassifies our working unit). **RTS on this device is an MCU hardware reset — deassert RTS+DTR on open.** Protocol: [openterface-usb-mux-spec.md](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-usb-mux-spec.md) |
 
@@ -144,14 +148,15 @@ hypervisor, not in the guest.
 
 ## 9. Hardware-CI integration (KernelCI/LAVA + Fuchsia/botanist)
 
-> Goal: make paniolo's primitives **consumable by** LAVA (under KernelCI's Maestro) and
-> `botanist`+`testrunner` (under Fuchsia/LUCI) — *without* paniolo owning orchestration or
-> results. Full analysis: [`ci-integration/gap-analysis.md`](ci-integration/gap-analysis.md);
-> design: [`ci-integration/design.md`](ci-integration/design.md).
+> Goal: make paniolo's primitives **consumable by** LAVA (the board-test lab system under
+> KernelCI's Maestro) and `botanist`+`testrunner` (Fuchsia's device-test tools, under
+> Fuchsia/LUCI), *without* paniolo owning orchestration or results. Full analysis:
+> [`ci-integration/gap-analysis.md`](ci-integration/gap-analysis.md); design:
+> [`ci-integration/design.md`](ci-integration/design.md).
 >
-> **Current focus:** the owner is doing a **Fuchsia port** with an agent — single user, no
-> existing users, breaking changes are free. M1 leads with the Fuchsia-critical path (PTY +
-> power); the botanist adapter is sequenced before LAVA.
+> **Current focus:** the owner is doing a **Fuchsia port** with an agent. Single user, no
+> existing users, so breaking changes are free. M1 leads with the Fuchsia-critical path (PTY +
+> power); the botanist adapter comes before LAVA.
 
 ### 9.0 Decisions (locked 2026-05-29)
 
@@ -224,12 +229,14 @@ hypervisor, not in the guest.
 
 ### 9.6 Adapter C — Redfish provider
 
-> **Decision (D-9, 2026-05-29):** Redfish interop = **provider** direction (paniolo exposes a
-> Redfish API in front of BMC-less boards), **not client**. Higher-leverage than per-ecosystem
-> adapters because Redfish is the bare-metal lingua franca (Ironic/Metal3 primary control plane;
-> LAVA can `curl` it). Sequenced **after** M1 — consumes the power verbs (PWR-1..6) and the raw
-> serial socket (SER-1). Design sketch: [`ci-integration/redfish-provider.md`](ci-integration/redfish-provider.md).
-> Verified against DMTF canonical CSDL (DSP0266 v1.22.0, DSP8010 2025.2), OpenBMC, Ironic/sushy.
+> **Decision (D-9, 2026-05-29):** Redfish (the DMTF standard REST API for server management)
+> interop = **provider** direction: paniolo exposes a Redfish API in front of BMC-less boards
+> (boards without a server management controller). **Not client.** This has more leverage than
+> per-ecosystem adapters because Redfish is the common bare-metal control API (Ironic/Metal3's
+> primary control plane; LAVA can `curl` it). Sequenced **after** M1: it consumes the power verbs
+> (PWR-1..6) and the raw serial socket (SER-1). Design sketch:
+> [`ci-integration/redfish-provider.md`](ci-integration/redfish-provider.md). Verified against
+> DMTF canonical CSDL (DSP0266 v1.22.0, DSP8010 2025.2), OpenBMC, Ironic/sushy.
 
 | ID | Requirement | Source | Pri | Status | Notes |
 |---|---|---|---|---|---|
@@ -238,17 +245,17 @@ hypervisor, not in the guest.
 | RF-3 | `Boot.BootSourceOverrideTarget=Pxe` + `BootSourceOverrideEnabled=Once` → netboot | OWNER | S | ⤵ | maps to existing netboot |
 | RF-4 | `VirtualMedia` `InsertMedia`/`EjectMedia` → image deploy | OWNER | C | ⤵ | open: needed vs. Pxe-once sufficient? |
 | RF-5 | `SerialConsole` advertises out-of-band SSH/console endpoint pointing at paniolo raw-serial socket (metadata only) | OWNER | S | ⤵ | depends on SER-1; Redfish carries no serial bytes |
-| RF-6 | Honest per-node `ResetType@Redfish.AllowableValues` / `ActionInfo` for the supported subset | OWNER | S | ⤵ | relay/DTR boards can't do every `ResetType` |
+| RF-6 | Accurate per-node `ResetType@Redfish.AllowableValues` / `ActionInfo` for the supported subset | OWNER | S | ⤵ | relay/DTR boards can't do every `ResetType` |
 | RF-7 | Implement via a sushy-tools-style emulator + paniolo backend driver (not a hand-rolled OData service) | OWNER | S | ⤵ | open: dependency footprint (core = `typer` only) |
 | RF-8 | Document/decide whether Redfish provider replaces or complements LAVA/botanist adapters | OWNER | S | ⤵ | botanist PTY serial seam still needs the direct path → not a full replacement |
 
 ## 10. Security
 
-> **TODO — owner to populate.** This section needs dedicated attention and is intentionally
-> unfinished. Paniolo grants an agent physical-equivalent control of a target (power, raw
-> serial read/write, netboot/TFTP, HID injection) and, with the §9 work, opens **network-facing
-> serial endpoints** and is **SSH-driven from a dev machine into the control host** — so the
-> threat model and controls deserve first-class requirements, not afterthoughts.
+> **TODO — owner to populate.** Intentionally unfinished. Paniolo grants an agent
+> physical-equivalent control of a target (power, raw serial read/write, netboot/TFTP, HID
+> injection). With the §9 work it also opens **network-facing serial endpoints**, and it is
+> **SSH-driven from a dev machine into the control host**. The threat model and controls
+> therefore deserve first-class requirements, not afterthoughts.
 
 | ID | Requirement | Pri | Status | Notes |
 |---|---|---|---|---|

@@ -5,13 +5,15 @@ SPDX-License-Identifier: Apache-2.0
 
 # Control-host seed files
 
-Unattended-install files that take a blank Raspberry Pi to an
+Unattended-install files that turn a blank Raspberry Pi into an
 **agent-reachable paniolo control host** with one human action: flash a card,
-plug it in, power on.
+plug it in, power on. They are cloud-init files: cloud-init is the first-boot
+setup tool that Raspberry Pi OS runs, reading `user-data`, `meta-data` and
+`network-config` from the boot partition.
 
-The user-facing walkthrough is [docs/control-host.md](../../docs/control-host.md).
-This directory holds the files themselves. The design rationale and the
-alternatives that were rejected are in
+This directory holds only the files. The user-facing walkthrough is
+[docs/control-host.md](../../docs/control-host.md); the design rationale and
+rejected alternatives are in
 [notes/control-host-provisioning.md](../../notes/control-host-provisioning.md).
 
 | Flavor | Directory | Status |
@@ -19,36 +21,38 @@ alternatives that were rejected are in
 | `pi-sd` — Raspberry Pi 4/5, Raspberry Pi OS Trixie Lite arm64 | [`pi-sd/`](pi-sd) | **Hardware-validated** (Pi 5 8 GB, 2026-08-20) |
 | `x86-usb` — UEFI mini-PC, Ubuntu Server autoinstall | — | Designed, not built |
 
-There is no generator. These are files you copy and edit; the argument-taking
-generator sketched in the design note has not earned its keep yet, and the
-edit is four placeholders.
+There is no generator. You copy these files and edit them; the edit is four
+placeholders, so the generator sketched in the design note has not been worth
+building yet.
 
 ## What the seed does, and where it stops
 
-It creates the operator account with the right groups, authorizes one SSH key,
-disables password login, installs the paniolo `.deb` and the packages it wants,
-and brings up the wired uplink on DHCP.
+The seed:
+
+- creates the operator account with the right groups
+- authorizes one SSH key and disables password login
+- installs the paniolo `.deb` and the packages it wants
+- brings up the wired uplink on DHCP
 
 It deliberately does **not** carry lab configuration, target wiring, daemon
 state, or any credential beyond that one public key. Those live in the lab
-file, and baking them into the image would fork the source of truth. The
+file; baking them into the image would create a second source of truth. The
 seed's job ends at first SSH.
 
 ## Using them
 
-**The executable procedure is `paniolo skill control-host`** — downloading
-the image, identifying the right removable device before writing to it,
-flashing, mounting, installing these files, rendering them, and enrolling the
-result. It has the exact commands for macOS and Linux, and it is the single
-source of truth for the steps. The rationale, host sizing, and troubleshooting
-are in [docs/control-host.md](../../docs/control-host.md).
+**Follow `paniolo skill control-host`.** It is the single source of truth for
+the steps, with exact commands for macOS and Linux: download the image,
+identify the right removable device before writing to it, flash, mount, install
+these files, render them, and enroll the result. Rationale, host sizing, and
+troubleshooting are in [docs/control-host.md](../../docs/control-host.md).
 
 In short: copy all three files to the FAT `bootfs` partition under exactly
 these names, `touch` an empty `ssh` file beside them, render the placeholders,
 and boot.
 
-Only `user-data` has placeholders. Replace all five, then confirm none
-survive. This check strips the file's own comments first, so a clean run means
+Only `user-data` has placeholders. Replace all five (see the table below),
+then confirm none survive. This check strips the file's own comments first, so a clean run means
 the payload really is rendered:
 
 ```bash
@@ -58,9 +62,9 @@ grep -v '^[[:space:]]*#' /Volumes/bootfs/user-data | grep '<[^>]*>' \
 ```
 
 Do not simplify that to `grep '<[a-z-]*>' user-data`. It matches the
-explanatory comments in the template, so it can never report success, and its
-character class excludes spaces, so it silently misses a placeholder that
-contains one.
+template's explanatory comments, so it can never report success. Its character
+class also excludes spaces, so it silently misses a placeholder that contains
+one.
 
 | Placeholder | Value |
 |---|---|
@@ -72,16 +76,16 @@ contains one.
 
 ## Gotchas these files encode
 
-Each of these cost a debug cycle on the first build. They are why the files
-look the way they do — do not "simplify" them back.
+Each of these cost a debug cycle on the first build. They explain why the
+files look the way they do. Do not "simplify" them back.
 
 - **sshd is off by default on Pi OS, and `enable_ssh: true` does not turn it
   on.** That key is a Pi OS downstream extension, absent from upstream
   `cc_raspberry_pi`, and on the tested image it was a silent no-op. What works
   is the classic empty **`ssh` flag file** on `bootfs`: `sshswitch.service`
-  survives in Trixie, enables sshd, and consumes the file. The seed ships that,
-  a `bootcmd` fallback, and `openssh-server` in `packages` — three mechanisms,
-  because losing SSH on a headless box means a trip to the bench.
+  survives in Trixie, enables sshd, and consumes the file. The seed uses three
+  mechanisms (that file, a `bootcmd` fallback, and `openssh-server` in
+  `packages`), because losing SSH on a headless box means a trip to the bench.
 - **Never `systemctl enable --now ssh` in `bootcmd`.** `bootcmd` runs in the
   pre-network local stage. `--now` waits for `ssh.service`, which waits for the
   network, which waits for `cloud-init-local` — which is blocked in that very
@@ -98,6 +102,6 @@ look the way they do — do not "simplify" them back.
 ## Bench note, not a seed concern
 
 A board reused from netboot bring-up may have its EEPROM `BOOT_ORDER` set
-network-first (`0xf12`), which costs roughly 40 seconds per boot waiting for a
-PXE server that is not there. Set it SD-first (`0xf21`) with `rpi-eeprom-config
+network-first (`0xf12`). That costs roughly 40 seconds per boot waiting for a
+PXE (network boot) server that is not there. Set it SD-first (`0xf21`) with `rpi-eeprom-config
 --edit` once the board becomes a control host.

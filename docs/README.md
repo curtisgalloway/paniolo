@@ -2,18 +2,24 @@
 
 ![A robot paniolo on horseback surveys a herd of single-board computers grazing on the range](paniolo-and-herd.jpg)
 
-Paniolo is an **agent-controlled target-machine wrangler** for low-level software development —
-it gives an AI agent (or you) the controls to netboot a target, watch its output, send it input,
-and power-cycle it without a person at the bench each iteration. See the root
-[`README.md`](https://github.com/curtisgalloway/paniolo/blob/main/README.md) for install and the quick remote-control pattern —
-on Debian/Raspberry Pi OS the quickest route is the [apt repository](https://curtisgalloway.github.io/paniolo/apt/) served from this site.
+Paniolo is an **agent-controlled target-machine wrangler** for low-level software development.
+It gives an AI agent (or you) the controls to netboot a target, watch its output, send it input,
+and power-cycle it, with no person at the bench each iteration.
+
+- **Install:** see the root
+  [`README.md`](https://github.com/curtisgalloway/paniolo/blob/main/README.md), which also shows
+  the quick remote-control pattern. On Debian/Raspberry Pi OS the quickest route is the
+  [apt repository](https://curtisgalloway.github.io/paniolo/apt/) served from this site.
+- **Terms:** a *target* (or DUT, device under test) is the machine you are developing on; a
+  *control host* is the machine cabled to it; a *channel* is one kind of connection to a target
+  (power, serial, video, hid, …).
 
 ## Start here
 
 | Doc | What it covers |
 |---|---|
 | [Tested hardware](hardware.md) | The bench hardware each subsystem is verified with, by category, with purchase links. |
-| [Demos](demos.md) | Recorded runs from the CI rack — a NUC's BIOS puppeted through the KVM, a live desktop driven by emulated HID, out-of-band power over Intel AMT, a Pi cold-booted through a relay — each capture beside the transcript of what the agent typed. |
+| [Demos](demos.md) | Recorded runs from the CI rack, each capture beside the transcript of what the agent typed: a NUC's BIOS puppeted through the KVM, a live desktop driven by emulated HID (USB keyboard/mouse), out-of-band power over Intel AMT, a Pi cold-booted through a relay. |
 
 ## Naming the target
 
@@ -25,24 +31,27 @@ paniolo video stop target-machine        # positional
 paniolo video stop -t target-machine     # the same command
 ```
 
-Omit it entirely when the lab has exactly one target. The **config** verbs
-(`set`, `add`, `rm`) require `-t` and take no positional, because a command that
-creates or destroys configuration should not act on an implicit target.
-`paniolo doctor [target]` is the one positional-only runtime command: with no
-target it checks them all, so it is a filter rather than a subject.
+Omit it entirely when the lab has exactly one target.
+
+Two exceptions:
+
+- The **config** verbs (`set`, `add`, `rm`) require `-t` and take no positional. A command that
+  creates or destroys configuration should not act on an implicit target.
+- `paniolo doctor [target]` is positional-only. With no target it checks them all, so the
+  target is a filter rather than a subject.
 
 ## Exit status and errors
 
 Every failure exits with a code that names its kind (3 not configured, 4
-control host unreachable, 100 daemon not running, 101 hook failed, …), and
-`--json-errors` adds a one-line JSON object, so a script can branch without
-reading messages. See [Exit status and errors](errors.md).
+control host unreachable, 100 daemon not running, 101 hook failed, …).
+`--json-errors` adds a one-line JSON object. A script can branch on either
+without reading messages. See [Exit status and errors](errors.md).
 
 ## Subsystem guides
 
 | Guide | Commands | Summary |
 |---|---|---|
-| [Netboot](netboot.md) | `paniolo netboot` | DHCP + TFTP + HTTP over a direct USB-Ethernet link (single-binary Rust `netbootd`), incl. UEFI PXE / HTTP Boot. |
+| [Netboot](netboot.md) | `paniolo netboot` | DHCP + TFTP + HTTP over a direct USB-Ethernet link (single-binary Rust `netbootd`), incl. UEFI PXE / HTTP Boot (the firmware's network-boot protocols). |
 | [Link mode](netif.md) | `paniolo netif` | Atomically switch the link between `netboot`, bare-`link`, `ffx`-over-IPv6, and `off` modes (entering ffx stops netboot and sets up the host `fe80::1`); `down-hard` forces a real carrier drop. |
 | [Serial](serial.md) | `paniolo serial` | `serialcap` daemon (timestamped JSONL log + WebSocket terminal) and interactive `tio`. |
 | [Power](power.md) | `paniolo power on/off`, `power-cycle`, `power-state`, `serial dtr/reset` | DTR power-button wiring (J2; opt-in per serial interface) and generic shell-command hooks; `cambrionix` hub, `zigplug` Zigbee smart-plug, `shellyplug` Shelly Gen2+ plug/relay (local HTTP RPC), and `amt` Intel AMT/vPro (WS-Man, with true power-state readback) helpers. |
@@ -56,8 +65,8 @@ reading messages. See [Exit status and errors](errors.md).
 
 | Doc | What it covers |
 |---|---|
-| [Distributed control: one lab, one file](distributed-control.md) | Driving targets on remote control hosts: a single git-tracked lab file describing hosts + targets, SSH transport with the dev machine as the data-plane hub, per-channel host binding, and a discovery-proposes/human-approves config flow. Shipped: `--lab`, transparent re-exec, tunnelled `console`, remote `setup --host`, `discover`/`configure`. |
-| [Standing up a control host](control-host.md) | Blank Raspberry Pi to agent-reachable control host in one human action, using the hardware-validated cloud-init seed in [`packaging/host-seed/`](https://github.com/curtisgalloway/paniolo/tree/main/packaging/host-seed) — plus how to size the box, and the Pi OS first-boot gotchas worth recognizing on sight. |
+| [Distributed control: one lab, one file](distributed-control.md) | Driving targets on remote control hosts: one git-tracked lab file for hosts + targets, SSH transport with the dev machine as the data-plane hub, per-channel host binding, and a config flow where discovery proposes and a human approves. Shipped: `--lab`, transparent re-exec, tunnelled `console`, remote `setup --host`, `discover`/`configure`. |
+| [Standing up a control host](control-host.md) | Blank Raspberry Pi to agent-reachable control host in one human action, using the hardware-validated cloud-init seed in [`packaging/host-seed/`](https://github.com/curtisgalloway/paniolo/tree/main/packaging/host-seed). Also: sizing the box, and the Pi OS first-boot failures worth recognizing on sight. |
 
 ## Developer documentation
 
@@ -73,7 +82,7 @@ under [`docs/dev/`](https://github.com/curtisgalloway/paniolo/tree/main/docs/dev
 
 | Doc | What it covers |
 |---|---|
-| [HID serial protocol](dev/hid-serial-protocol.md) | Normative command vocabulary (v1) — the external interface `hidrig` composes from; the dual-board device wire is in [hid-dual-board-design.md](dev/hid-dual-board-design.md). |
+| [HID serial protocol](dev/hid-serial-protocol.md) | Normative command vocabulary (v1): the external interface `hidrig` composes from. The dual-board device wire format is in [hid-dual-board-design.md](dev/hid-dual-board-design.md). |
 | [OCR helper protocol](dev/ocr.md) | The contract an OCR helper implements, and which engine runs on which platform (Apple Vision on macOS, `Windows.Media.Ocr` on Windows, Tesseract on Linux). |
 | [HID dual-board design](dev/hid-dual-board-design.md) | The "dumb pipe" KB2040 rig: I2C1 wire format between the control and target boards, and why the host composes the reports. |
 
@@ -82,7 +91,7 @@ under [`docs/dev/`](https://github.com/curtisgalloway/paniolo/tree/main/docs/dev
 | Doc | What it covers |
 |---|---|
 | [Adding a power-control helper](dev/adding-power-helpers.md) | Recipe for supporting new power-switching hardware: the hook contract, helper CLI conventions, implementation skeletons (Rust/Python), verification ladder, and PR checklist. |
-| [Agent discoverability & usage evals](dev/agent-evals.md) | A no-hardware eval suite measuring how well a naive agent goes from a plain-language goal to the right paniolo command via the self-describing surface (`--help` → `paniolo skill` → docs). |
+| [Agent discoverability & usage evals](dev/agent-evals.md) | A no-hardware eval suite: how well does a naive agent get from a plain-language goal to the right paniolo command, using only the self-describing surface (`--help` → `paniolo skill` → docs)? |
 | [Serial agent benchmark](dev/serial-agent-benchmark.md) | A hardware-in-the-loop, head-to-head eval: does paniolo produce better serial-task outcomes than improvising ("YOLO") or the idiomatic `fx serial`? |
 
 ### Hardware-CI integration (in design)
@@ -99,29 +108,29 @@ orchestration or results.
 
 ## Notes: design records & bring-up findings
 
-Point-in-time documents — the design a feature was built from, a hardware
+Point-in-time documents: the design a feature was built from, a hardware
 bring-up's findings, a plan that has since shipped. They record *what was true
-when they were written*, so they are deliberately **not** documentation of the
+when they were written*. They are deliberately **not** documentation of the
 current state and are never published to this site. They live in
 [`notes/`](https://github.com/curtisgalloway/paniolo/tree/main/notes), outside
 the docs tree.
 
 | Doc | What it covers |
 |---|---|
-| [Config redesign: a CLI-managed lab](https://github.com/curtisgalloway/paniolo/blob/main/notes/config-redesign.md) | The lab data model (hosts/targets/per-channel hosts), the CRUD command surface, per-channel dispatch design, and the Python→Rust pivot + staged plan. The CLI + orchestration is rewritten Python→Rust (the `cli/` crate); the lab file is the single, CLI-managed source of truth. |
-| [CH9329 driver spec (clean-room)](https://github.com/curtisgalloway/paniolo/blob/main/notes/ch9329-spec.md) | **Implemented** (the [`ch9329`](https://github.com/curtisgalloway/paniolo/blob/main/ch9329/README.md) helper crate): WCH CH9329 serial protocol — frame format, GET_INFO, keyboard report, parameter-config/baud, reset, ACK codes. The helper speaks the [HID serial protocol](dev/hid-serial-protocol.md) surface and plugs into the same `hid` channel; the spec remains the clean-room reference it was built from. |
-| [Openterface deep control — findings & testing TODO](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-deep-control.md) | **Partially verified (tracker §6.1 OTF-1)**: DTR-driven unplug/replug of the A-port device is confirmed on hardware (asserted DTR = disconnected; opening the control tty replugs it) but is not production-ready — degraded link speed and hub-level instability. The USB-A switch turns out to be *software-monitored*, not switch-driven, and the MS2109 GPIO mux is blocked because ms-tools cannot patch this firmware. EEPROM dumped; the `????????` serial is a RAM descriptor, not an EEPROM field. RTS→CH9329 reset still untested. |
-| [Distributed-control implementation plan](https://github.com/curtisgalloway/paniolo/blob/main/notes/distributed-control-plan.md) | The original (Python-era) phased build sequence for [distributed control](distributed-control.md) — Phases 0–5 shipped; superseded by the Rust control plane for mechanism details. |
+| [Config redesign: a CLI-managed lab](https://github.com/curtisgalloway/paniolo/blob/main/notes/config-redesign.md) | The lab data model (hosts/targets/per-channel hosts), the CRUD command surface, per-channel dispatch design, and the staged plan for the Python→Rust rewrite of the CLI + orchestration (the `cli/` crate). The lab file is the single, CLI-managed source of truth. |
+| [CH9329 driver spec (clean-room)](https://github.com/curtisgalloway/paniolo/blob/main/notes/ch9329-spec.md) | **Implemented** as the [`ch9329`](https://github.com/curtisgalloway/paniolo/blob/main/ch9329/README.md) helper crate. The serial protocol of the WCH CH9329 (a UART-to-USB-keyboard/mouse chip): frame format, GET_INFO, keyboard report, parameter-config/baud, reset, ACK codes. The helper speaks the [HID serial protocol](dev/hid-serial-protocol.md) surface and plugs into the same `hid` channel; the spec is the clean-room reference it was built from. |
+| [Openterface deep control — findings & testing TODO](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-deep-control.md) | **Partially verified (tracker §6.1 OTF-1)**. DTR-driven unplug/replug of the A-port device works on hardware (asserted DTR = disconnected; opening the control tty replugs it) but is not production-ready: degraded link speed and hub-level instability. The USB-A switch is *software-monitored*, not switch-driven. The MS2109 GPIO mux is blocked because ms-tools cannot patch this firmware. EEPROM dumped; the `????????` serial is a RAM descriptor, not an EEPROM field. RTS→CH9329 reset still untested. |
+| [Distributed-control implementation plan](https://github.com/curtisgalloway/paniolo/blob/main/notes/distributed-control-plan.md) | The original (Python-era) phased build sequence for [distributed control](distributed-control.md). Phases 0–5 shipped; the Rust control plane supersedes it for mechanism details. |
 | [UEFI HTTP Boot design](https://github.com/curtisgalloway/paniolo/blob/main/notes/uefi-http-boot-design.md) | The design netbootd's UEFI PXE / HTTP Boot support was built from (vendor-class dispatch, HTTP serving); the shipped behavior is documented in [netboot.md](netboot.md). |
-| [Openterface KVM-Go — architecture and paniolo support](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-kvm-go.md) | **Bench-verified 2026-08-24**: the keychain-sized Mini-KVM successor (MS2130S capture + CH32V208 emulating the CH9329 protocol) — both paniolo channels work unmodified; hardware findings and deep-control notes. |
+| [Openterface KVM-Go — architecture and paniolo support](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-kvm-go.md) | **Bench-verified 2026-08-24**. The keychain-sized Mini-KVM successor (MS2130S capture + CH32V208 emulating the CH9329 protocol); both paniolo channels work unmodified. Hardware findings and deep-control notes. |
 | [Console front door](https://github.com/curtisgalloway/paniolo/blob/main/notes/console-front-door.md) | **Design only — parked**: one stable port with server-side fan-out for the remote dashboard, superseding `?serialws=` stitching. |
 | [Openterface USB mux spec (clean-room)](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-usb-mux-spec.md) | Clean-room protocol spec for switching the Openterface USB mux: the KVM-Go microSD serial command (hardware-verified 2026-08-30, shipped as the `usb` channel) and the Mini-KVM USB-A register write (unblocked, untested). |
-| [Provisioning a Linux control host](https://github.com/curtisgalloway/paniolo/blob/main/notes/control-host-provisioning.md) | The design the cloud-init seed was built from — one shared core, two wrappers (Pi NoCloud files / Ubuntu autoinstall USB), what the seed deliberately omits, host sizing, and the alternatives rejected. The `pi-sd` flavor shipped as [`packaging/host-seed/`](https://github.com/curtisgalloway/paniolo/tree/main/packaging/host-seed); the x86 flavor and the generator are still unbuilt. Current-state guide: [control-host.md](control-host.md). |
+| [Provisioning a Linux control host](https://github.com/curtisgalloway/paniolo/blob/main/notes/control-host-provisioning.md) | The design the cloud-init seed was built from: one shared core, two wrappers (Pi NoCloud files / Ubuntu autoinstall USB), what the seed deliberately omits, host sizing, and the alternatives rejected. The `pi-sd` flavor shipped as [`packaging/host-seed/`](https://github.com/curtisgalloway/paniolo/tree/main/packaging/host-seed); the x86 flavor and the generator are still unbuilt. Current-state guide: [control-host.md](control-host.md). |
 | [Pi 4 control host](https://github.com/curtisgalloway/paniolo/blob/main/notes/pi4-control-host.md) | Bring-up plan for a self-contained Pi 4 control host; everything works on Linux/ARM64 today except the net-new USB-HID-gadget backend (design sketch, not implemented). |
 
 ## Elsewhere in the repo
 
-- **Bundled agent skills** — paniolo ships agent guides under [`skills/`](https://github.com/curtisgalloway/paniolo/tree/main/skills) (`paniolo` for driving a target, `kvm-puppeting` for GUI puppeting, `control-host` for building a control host from blank media). They install alongside the CLI; `paniolo skill` lists them (with descriptions) and `paniolo skill <name>` prints one's `SKILL.md` — so an agent can discover and read them straight from the CLI, without the harness pre-loading them.
+- **Bundled agent skills** — agent guides under [`skills/`](https://github.com/curtisgalloway/paniolo/tree/main/skills): `paniolo` for driving a target, `kvm-puppeting` for GUI puppeting, `control-host` for building a control host from blank media. They install alongside the CLI. `paniolo skill` lists them (with descriptions) and `paniolo skill <name>` prints one's `SKILL.md`, so an agent can discover and read them straight from the CLI without the harness pre-loading them.
 - [`AGENTS.md`](https://github.com/curtisgalloway/paniolo/blob/main/AGENTS.md) — module-by-module internals, source constraints, and how to add a subsystem.
 - [`hidrig/README.md`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md) — HID injector host CLI and daemon; the board wiring and firmware are a custom-hardware design in the [`paniolo-hardware`](https://github.com/curtisgalloway/paniolo-hardware) repo (`hidrig-kb2040/`).
 
@@ -129,6 +138,6 @@ the docs tree.
 
 *These docs describe paniolo's **current, verified state** and are kept up to date as it changes.
 When you change a subsystem, update its guide here and the
-[architecture overview](dev/architecture.md); when you change requirements/scope, update the
+[architecture overview](dev/architecture.md). When you change requirements or scope, update the
 [tracker](dev/requirements.md). Work in progress, plans, and point-in-time findings belong in
 [`notes/`](https://github.com/curtisgalloway/paniolo/tree/main/notes), not here.*

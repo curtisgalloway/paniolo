@@ -1,13 +1,17 @@
 # Tested hardware
 
-The bench hardware paniolo has been verified with, grouped by subsystem. Links go to the
-exact items purchased (Amazon listings are just for reference and don't imply an
-endorsement). Equivalents that meet the same contract — UVC for video, FTDI for
-serial/DTR, CC2652 for Zigbee — should generally be expected to work; each subsystem
-guide states the actual compatibility requirement.
+The bench hardware paniolo is verified with, grouped by subsystem. Links go to the
+exact items purchased; Amazon listings are for reference, not an endorsement.
 
-Note that this is not any kind of guarantee that the hardware or implementation is
-bug-free. Use at your own risk; your mileage may vary. Testing is best-effort.
+Equivalents that meet the same contract should generally work. Each subsystem guide states
+the actual compatibility requirement. The common ones:
+
+- **UVC** (USB Video Class, the standard driverless webcam/capture protocol) for video.
+- **FTDI** (a USB-serial chip family that exposes the DTR control line) for serial and DTR.
+- **CC2652** (a TI Zigbee radio chip) for Zigbee.
+
+This is not a guarantee that the hardware or implementation is bug-free. Testing is
+best-effort; use at your own risk, and your mileage may vary.
 
 ## Power control
 
@@ -17,10 +21,10 @@ See the [power guide](power.md).
 |---|---|
 | [Sonoff Zigbee 3.0 USB Dongle Plus (ZBDongle-P, CC2652P)](https://www.amazon.com/dp/B09KXTCMSC) | Zigbee coordinator for the `zigplug` helper. |
 | [ThirdReality Zigbee Smart Plug (15 A, energy monitoring)](https://www.amazon.com/dp/B0BPY5D1KC) | Switched mains outlet for target power, driven by `zigplug` through the generic power hooks. |
-| [AINOPE USB 3.0 extension cable (6.6 ft)](https://www.amazon.com/dp/B07RQRMGKB) | Distances the Zigbee dongle from USB 3 devices. RF noise from USB 3 hardware (especially video capture) can break Zigbee network formation and joining; an extension cable is the fix. |
+| [AINOPE USB 3.0 extension cable (6.6 ft)](https://www.amazon.com/dp/B07RQRMGKB) | Moves the Zigbee dongle away from USB 3 devices. RF noise from USB 3 hardware (especially video capture) can break Zigbee network formation and joining; the extension cable fixes it. |
 | Cambrionix programmable USB hub | Per-port USB power switching via the [`cambrionix` helper](power.md#cambrionix-hub-control) (control UART, 115200 8N1). |
 | [Shelly Plug US Gen4 (S4PL-00116US, Wi-Fi, energy monitoring)](https://www.amazon.com/dp/B0G2YY8TCJ) | Wi-Fi switched mains outlet for target power, driven by the [`shellyplug` helper](power.md#shelly-smart-plug-control-shellyplug) over the device's local HTTP RPC API — no cloud, Home Assistant, or Matter. Any Shelly Gen2+ device works. |
-| Dell OptiPlex 7060 (Intel vPro) | Intel AMT machine driven over the network by the [`amt` helper](power.md#intel-amt-power-control-amt) (WS-Management, port 16992) — per-target power with true power-state readback from the Management Engine, no plug hardware. |
+| Dell OptiPlex 7060 (Intel vPro) | Intel AMT (out-of-band management built into the chipset) machine, driven over the network by the [`amt` helper](power.md#intel-amt-power-control-amt) (WS-Management, port 16992). Per-target power with true power-state readback from the Management Engine; no plug hardware. |
 
 ## Serial console
 
@@ -37,9 +41,9 @@ See the [HID guide](hid.md) and [`hidrig/README.md`](https://github.com/curtisga
 
 | Device | Role |
 |---|---|
-| 2× Adafruit KB2040 | Reference HID injector — the dual-board "dumb pipe": a **control** board (host USB-CDC, I2C1 controller) and a **target** board (DUT USB-HID, I2C1 peripheral), joined by I2C1 (GP10 SDA / GP19 SCL, 4.7 kΩ pull-ups). Any CircuitPython-capable RP2040 board with a free I2C1 works with minor pin edits. The host CLI is [`hidrig/`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md) in this repo; the CircuitPython firmware and build/flash runbook are in the [`paniolo-hardware`](https://github.com/curtisgalloway/paniolo-hardware) repo under [`hidrig-kb2040/`](https://github.com/curtisgalloway/paniolo-hardware/tree/main/hidrig-kb2040). |
-| 2× 4.7 kΩ resistors | I2C1 pull-ups (SDA→3.3 V, SCL→3.3 V) between the two KB2040 boards — required; the control board won't open the bus without them. No USB-serial adapter is needed (the control link is the control board's native USB-CDC). Wiring diagram: [`paniolo-hardware` `hidrig-kb2040/README.md`](https://github.com/curtisgalloway/paniolo-hardware/blob/main/hidrig-kb2040/README.md). |
-| [Openterface KVM-Go (HDMI)](https://openterface.com/product/kvm-go/) | CH32V208 emulating the CH9329 protocol — drives the target's keyboard/mouse over its host-side USB-CDC port. Works with the [`ch9329`](https://github.com/curtisgalloway/paniolo/blob/main/ch9329/README.md) helper unmodified; reports `chip_version=0x01` rather than a real CH9329's `0x38`. See [KVM-Go notes](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-kvm-go.md). |
+| 2× Adafruit KB2040 | Reference HID (USB keyboard/mouse) injector, the dual-board "dumb pipe": a **control** board (host USB-CDC, I2C1 controller) and a **target** board (DUT USB-HID, I2C1 peripheral), joined by I2C1 (GP10 SDA / GP19 SCL, 4.7 kΩ pull-ups). Any CircuitPython-capable RP2040 board with a free I2C1 works with minor pin edits. The host CLI is [`hidrig/`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md) in this repo; the CircuitPython firmware and build/flash runbook are in the [`paniolo-hardware`](https://github.com/curtisgalloway/paniolo-hardware) repo under [`hidrig-kb2040/`](https://github.com/curtisgalloway/paniolo-hardware/tree/main/hidrig-kb2040). |
+| 2× 4.7 kΩ resistors | I2C1 pull-ups (SDA→3.3 V, SCL→3.3 V) between the two KB2040 boards. Required: the control board won't open the bus without them. No USB-serial adapter is needed; the control link is the control board's native USB-CDC. Wiring diagram: [`paniolo-hardware` `hidrig-kb2040/README.md`](https://github.com/curtisgalloway/paniolo-hardware/blob/main/hidrig-kb2040/README.md). |
+| [Openterface KVM-Go (HDMI)](https://openterface.com/product/kvm-go/) | CH32V208 emulating the CH9329 (UART-to-USB-keyboard/mouse chip) protocol; drives the target's keyboard/mouse over its host-side USB-CDC port. Works with the [`ch9329`](https://github.com/curtisgalloway/paniolo/blob/main/ch9329/README.md) helper unmodified; reports `chip_version=0x01` rather than a real CH9329's `0x38`. See [KVM-Go notes](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-kvm-go.md). |
 | [Openterface Mini-KVM](https://openterface.com/) | Predecessor: a real CH9329 behind a CH340C USB-serial adapter. Same `ch9329` helper. Its extra modem-line control surface is documented in [deep-control notes](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-deep-control.md). |
 
 ## Video capture
@@ -50,7 +54,7 @@ See the [video guide](video.md).
 |---|---|
 | [Generic 4K HDMI capture dongle (MS2109-class, UVC)](https://www.amazon.com/dp/B09FLN63B3) | Target HDMI out → `hdmicap` warm stream + OCR. Any UVC capture card works; MS2109-class dongles are the tested baseline. |
 | [IPEVO V4K 8 MP USB document camera (UVC)](https://www.amazon.com/dp/B079DLTG9F) | UVC camera source used to verify `hdmicap` against non-capture-card devices; also handy for watching the physical bench. |
-| [Openterface KVM-Go (HDMI)](https://openterface.com/product/kvm-go/) | Combined capture + HID in one keychain-sized unit — MS2130S UVC capture (up to 4K; 1080p60 default) with a built-in male HDMI plug. Works with `hdmicap` unmodified. See [KVM-Go notes](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-kvm-go.md). |
+| [Openterface KVM-Go (HDMI)](https://openterface.com/product/kvm-go/) | Combined capture + HID in one keychain-sized unit: MS2130S UVC capture (up to 4K; 1080p60 default) with a built-in male HDMI plug. Works with `hdmicap` unmodified. See [KVM-Go notes](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-kvm-go.md). |
 
 ## Netboot link
 

@@ -1,8 +1,10 @@
 # Combined dashboard
 
-hdmicap's web UI serves a two-pane page: the HDMI video stream on top and an
-xterm.js terminal below. The terminal connects over WebSocket to serialcap,
-so the two daemons stay decoupled — hdmicap only references serialcap by URL.
+The dashboard is one web page for watching and driving a target: the HDMI
+video stream on top and a serial terminal below. hdmicap (the video capture
+daemon) serves the page. The terminal is xterm.js (a browser terminal
+emulator), connected over WebSocket to serialcap (the serial daemon). The two
+daemons stay decoupled: hdmicap only references serialcap by URL.
 
 ---
 
@@ -12,22 +14,28 @@ so the two daemons stay decoupled — hdmicap only references serialcap by URL.
 paniolo console                  # open in the default browser
 ```
 
-`paniolo console` starts any daemon that isn't already running — hdmicap,
-serialcap, and the hid daemon when the target has a `hid` channel — then opens
-the dashboard. The URL it opens carries each daemon's token — hdmicap's as
-`?token=`, the others' inside their `?serialws=`/`?hidws=` URLs — so open the
-URL the browser was handed, not a bare `http://127.0.0.1:<port>/`. What
-`console` *prints* is that bare address: the full URL carries three daemons'
-credentials in one line, and console output is transcribed and pasted far too
-often for that. If no browser could be launched, `console` writes the full URL to a `0600`
-`dashboard-url.txt` in the target's runtime dir and prints that path — on a
-headless host, or over SSH where the tunnels close with the command, an address
-you cannot open would leave you with no way in, and the token still never
-reaches the terminal. (`paniolo video watch` / `paniolo serial watch` still start them
-individually.) The page fetches the serialcap interface list and builds one
-terminal pane per interface, displayed side by side in the serial panel (or
-stacked in right-panel layout). With a single interface the panel looks the
-same as before, with connection status in the top bar.
+`paniolo console` starts any daemon that isn't already running (hdmicap,
+serialcap, and the hid daemon when the target has a `hid` channel), then opens
+the dashboard. (`paniolo video watch` / `paniolo serial watch` still start
+them individually.)
+
+**Use the URL the browser was handed**, not a bare `http://127.0.0.1:<port>/`.
+The opened URL carries each daemon's token: hdmicap's as `?token=`, the
+others' inside their `?serialws=`/`?hidws=` URLs.
+
+- What `console` *prints* is only the bare address. The full URL carries three
+  daemons' credentials in one line, and console output is transcribed and
+  pasted far too often for that.
+- If no browser could be launched, `console` writes the full URL to a `0600`
+  `dashboard-url.txt` in the target's runtime dir and prints that path. On a
+  headless host, or over SSH where the tunnels close with the command, an
+  address you cannot open would leave you with no way in; this way the token
+  still never reaches the terminal.
+
+The page fetches the serialcap interface list and builds one terminal pane per
+interface, side by side in the serial panel (or stacked in right-panel
+layout). With a single interface there is one pane, with connection status in
+the top bar.
 
 To open the dashboard pinned to a specific interface (single-pane mode):
 
@@ -39,12 +47,13 @@ paniolo console -i bmc
 
 ## Features
 
-**Live video** — MJPEG stream from the capture card, auto-refreshing.
+**Live video** — MJPEG (a stream of JPEG frames) from the capture card,
+auto-refreshing.
 
 **Serial terminal** — full xterm.js terminal connected to serialcap via
 WebSocket. Keystrokes go to the serial port; output appears in the terminal.
-xterm.js is vendored (not CDN) so the dashboard works on an isolated lab
-network.
+xterm.js is vendored (shipped with paniolo, not loaded from a CDN), so the
+dashboard works on an isolated lab network.
 
 **Multiple interfaces** — when serialcap is running multiple named interfaces,
 the page shows one terminal pane per interface side by side. The
@@ -61,20 +70,26 @@ current frame on-device (Apple Vision via `visionocr` on macOS, Tesseract via
 installed (`paniolo setup`).
 
 **Capture input (KVM)** — when the target has a `hid` channel, the **⌨ Capture
-input** button toggles KVM mode (it becomes **⌨ Capturing** while active; click
-again to release). Once engaged, your keyboard and mouse drive the target as USB
-HID events (the mouse is absolute — the target cursor follows where you point in
-the video). Your own cursor stays visible as a crosshair (no pointer lock), so
-there is a little feedback lag but you never lose your pointer; losing window
-focus also releases. The page streams commands to the hid daemon over a
-WebSocket, and `paniolo hid send` injections from the CLI intermix with them. See
-[HID injection › KVM mode](hid.md#kvm-mode-type-and-click-from-the-web-console).
+input** button toggles KVM mode, where your keyboard and mouse drive the
+target. The button reads **⌨ Capturing** while active; click it again, or move
+focus out of the window, to release.
 
-**Power** — when the target has a `power` channel, an on/off **toggle switch**
-(`Power [switch] ON/OFF`, reflecting live state, polled every few seconds) and a
-separate **⟳ Cycle** button appear in the overlay. Each asks for confirmation
-before acting. Availability and state come from `GET /power`, which performs **no**
-action — merely loading the dashboard never powers the target.
+- Input goes to the target as USB HID (keyboard/mouse) events.
+- The mouse is absolute: the target cursor follows where you point in the
+  video.
+- Your own cursor stays visible as a crosshair (no pointer lock). There is a
+  little feedback lag, but you never lose your pointer.
+- The page streams commands to the hid daemon over a WebSocket, and
+  `paniolo hid send` injections from the CLI intermix with them.
+
+See [HID injection › KVM mode](hid.md#kvm-mode-type-and-click-from-the-web-console).
+
+**Power** — when the target has a `power` channel, the overlay shows an on/off
+**toggle switch** (`Power [switch] ON/OFF`, reflecting live state, polled
+every few seconds) and a separate **⟳ Cycle** button. Each asks for
+confirmation before acting. Availability and state come from `GET /power`,
+which performs **no** action, so merely loading the dashboard never powers the
+target.
 
 ---
 
@@ -90,9 +105,9 @@ action — merely loading the dashboard never powers the target.
 | `?hidws=<url>` | Enable KVM input via this hid WebSocket URL, hid's `?token=` inside (what `paniolo console` passes) |
 | `?hid=<port>` | Enable KVM input via the hid daemon on this local port (no token, as for `?serial=`) |
 
-`serialws`/`hidws` (and the URLs built from `serial`/`hid`) must be loopback
-— `127.0.0.1`, `localhost` or `[::1]`; the page refuses anything else with an
-inline error and makes no connection, so a crafted link cannot point your
+`serialws`/`hidws` (and the URLs built from `serial`/`hid`) must be loopback:
+`127.0.0.1`, `localhost` or `[::1]`. The page refuses anything else with an
+inline error and makes no connection, so a crafted link cannot send your
 keystrokes, or the tokens in those URLs, somewhere else. The page also refuses
 to render inside another page's frame (`Content-Security-Policy:
 frame-ancestors 'none'`), so its power buttons cannot be clickjacked.
@@ -103,10 +118,13 @@ frame-ancestors 'none'`), so its power buttons cannot be clickjacked.
 
 `paniolo console` supplies every connection automatically. It reads each
 daemon's discovery file (port and token) and passes the page one complete
-loopback WebSocket URL per daemon — `?serialws=ws://127.0.0.1:<port>/stream?token=…`
-and `?hidws=…/hid?token=…` — on the local path as well as the remote/tunnel
-path, where `<port>` is the tunnel's local end. hdmicap's own token rides as
-`?token=`. The `?serial=` / `?hid=` port forms let you point a hand-opened page
-at a daemon yourself, but they cannot carry a token, so they work only against
-a daemon started by an older paniolo; without any of them the page falls back
-to `ws://<host>:8724/stream` (the standalone `serialcap --port` default).
+loopback WebSocket URL per daemon: `?serialws=ws://127.0.0.1:<port>/stream?token=…`
+and `?hidws=…/hid?token=…`. This is the same locally and over a remote tunnel,
+where `<port>` is the tunnel's local end. hdmicap's own token rides as
+`?token=`.
+
+The `?serial=` / `?hid=` port forms let you point a hand-opened page at a
+daemon yourself. They cannot carry a token, so they work only against a daemon
+started by an older paniolo. With none of these parameters, the page falls
+back to `ws://<host>:8724/stream` (the standalone `serialcap --port`
+default).

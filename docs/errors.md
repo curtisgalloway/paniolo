@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 # Exit status and errors
 
 A script or agent driving paniolo can tell *what kind* of failure happened from
-the exit status alone, and get the details as one line of JSON, without
+the exit status alone. It can get the details as one line of JSON, without
 matching any English message text.
 
 **Terms.**
@@ -45,9 +45,14 @@ and failed. So on Windows a missing hook reports 101 `helper_failed` with
 `child_exit` 1, not 3; the message above the JSON line carries `cmd.exe`'s own
 "is not recognized" or "cannot find the path" text.
 
-Codes follow the tens-digit bands: 2–9 will fail the same way again, 20s may
-succeed on a retry, 100 and up are specific to paniolo. Nothing exits 125 or
-above except a [passthrough](#passthrough-commands) reporting its child.
+Codes follow tens-digit bands:
+
+- 2–9 will fail the same way again.
+- 20s may succeed on a retry.
+- 100 and up are specific to paniolo.
+
+Nothing exits 125 or above except a [passthrough](#passthrough-commands)
+reporting its child.
 
 A command that re-runs on a control host exits with the **remote** paniolo's
 code, so a missing channel on `bench1` is 3 on your machine too. Only an SSH
@@ -56,11 +61,13 @@ failure is reported locally, as 4.
 ## The JSON error object
 
 Ask for it by setting `PANIOLO_JSON_ERRORS=1`, or with `--json-errors` placed
-**before** any trailing arguments: `paniolo --json-errors hid send …`. Commands
-that pass their remaining arguments on (`hid send`, `adb run`, `adb input`,
-`helper`) treat a `--json-errors` after those arguments as one of them, so
-the variable is the safer choice in scripts. On failure, paniolo then prints the usual message and,
-as the **last line of stderr**, exactly one JSON object:
+**before** any trailing arguments: `paniolo --json-errors hid send …`. In
+scripts the variable is safer: commands that pass their remaining arguments on
+(`hid send`, `adb run`, `adb input`, `helper`) treat a `--json-errors` after
+those arguments as one of them.
+
+On failure, paniolo prints the usual message and then, as the **last line of
+stderr**, exactly one JSON object:
 
 ```console
 $ paniolo --json-errors power-cycle nosuch
@@ -81,19 +88,18 @@ $ echo $?
 | `child_exit` | The hook's or helper's own exit code, for `helper_failed`; null when a signal killed it. |
 
 Every field is always present, `null` when it does not apply. Key order is not
-part of the contract. Stdout is never
-changed, so `--json` output from commands such as `discover` or `serial log
---json` stays parseable.
+part of the contract. Stdout is never changed, so `--json` output from
+commands such as `discover` or `serial log --json` stays parseable.
 
-Parse only the last line of stderr: anything a hook or helper prints comes
-before it. The variable is not passed on to hooks, helpers or daemons, so a hook
-that itself runs paniolo does not add a second object; a hook that wants one
-sets the variable itself.
+Parse only the last line of stderr; anything a hook or helper prints comes
+before it. The variable is not passed on to hooks, helpers or daemons, so a
+hook that itself runs paniolo does not add a second object. A hook that wants
+one sets the variable itself.
 
 **Version skew.** A control host running paniolo 0.4.x or older exits 1 for
-every error and does not know `--json-errors`. With the flag, such a host
-rejects the command with exit 2 (`unexpected argument '--json-errors'`) rather
-than running it. Upgrade the host (`apt upgrade`, then `paniolo daemons restart
+every error and does not know `--json-errors`. Given the flag, such a host
+rejects the command with exit 2 (`unexpected argument '--json-errors'`)
+instead of running it. Upgrade the host (`apt upgrade`, then `paniolo daemons restart
 --stale`).
 
 ## Passthrough commands
@@ -117,7 +123,7 @@ table above.
 ## A stopped serial daemon
 
 `paniolo serial log` reads the capture file from disk, so it still works when
-`serialcap` is stopped, but shows nothing captured since it stopped. In that
-case it prints a `warning:` line on stderr and exits 0. Pass `--require-live`
-to make it fail with 100 (`daemon_down`) instead, when a stale log would be a
-wrong answer.
+`serialcap` is stopped, but shows nothing captured since then. In that case it
+prints a `warning:` line on stderr and exits 0. When a stale log would be a
+wrong answer, pass `--require-live` to make it fail with 100 (`daemon_down`)
+instead.
