@@ -1,22 +1,16 @@
 # adb (Android targets)
 
-Use the **adb channel** when the target is a phone, tablet, or Android-based
-SBC (single-board computer) that the Android Debug Bridge (`adb`) can reach. It
-gives paniolo the target's console (`adb shell`), screen
-(`adb exec-out screencap`), and input injection (`adb shell input`). These are
-the same verbs the serial/video/hid channels provide for wired bring-up
-hardware, through one transport.
+The **adb channel** drives a phone, tablet, or Android board that `adb` can
+reach: console (`adb shell`), screen (`adb exec-out screencap`), and input
+(`adb shell input`), over one transport.
 
-`adb` is a *generic transport* like SSH, not a device-specific helper, so it
-lives in the core CLI (`cli/src/adb.rs`) rather than a libexec helper. paniolo
-shells out to the host's `adb` binary directly. The device is named by its
-`adb -s <serial>` id and bound to the control host it is physically plugged
-into. paniolo reaches that host (local, or over SSH) through the usual
-per-channel [dispatch](distributed-control.md).
+paniolo runs the host's `adb` binary itself (core CLI, `cli/src/adb.rs`; no
+helper). The device is named by its `adb -s <serial>` id and bound to the
+control host it is plugged into, reached locally or over SSH
+([dispatch](distributed-control.md)).
 
-> **Scope.** The channel covers console, screen, and input. Reboot/power
-> needs no adb-specific code. Wire `adb reboot` through the generic
-> [power hooks](power.md): `paniolo power set -t pixel --off-cmd "adb -s <id> reboot -p" --cycle-cmd "adb -s <id> reboot"`.
+> **Power:** use the [power hooks](power.md):
+> `paniolo power set -t pixel --off-cmd "adb -s <id> reboot -p" --cycle-cmd "adb -s <id> reboot"`.
 
 ---
 
@@ -50,23 +44,19 @@ paniolo adb set -t pixel --adb /opt/platform-tools/adb
 paniolo adb rm -t pixel
 ```
 
-**Prerequisite:** the device must already be authorized for adb (USB
-debugging on, host key accepted). paniolo does not manage pairing. `adb devices`
-must show the device as `device`, not `unauthorized`/`offline`.
+**Prerequisite:** authorize the device first (USB debugging on, host key
+accepted); paniolo does not pair. `adb devices` must show `device`, not
+`unauthorized`/`offline`.
 
-`paniolo doctor` checks the channel by running `adb get-state` on the channel's
-host. It reports:
+`paniolo doctor` runs `adb get-state` on the channel's host and reports:
 
 - `ok` when the device answers in the `device` state;
 - `MISSING` when it does not;
-- a distinct *"adb not installed"* note when the binary itself is absent (adb
-  is a system tool on `PATH`, not a paniolo libexec helper).
+- *"adb not installed"* when there is no `adb` on `PATH`.
 
 ---
 
 ## Commands
-
-With a single target in the lab, the target argument may be omitted.
 
 ```bash
 # Console
@@ -89,20 +79,13 @@ paniolo adb devices [-H <host>]
 paniolo adb show pixel                         # config + live device state
 ```
 
-- `shell` is the interactive console (like `serial connect`).
-- `run` is the agent-friendly one-shot: it captures output and propagates the
-  command's exit code.
-- `run` and `input` take a free-form tail, so they name the target with
-  `-t/--target` (like `hid send`), not a positional. Put `-t` first, and use
-  `--` before any argument that starts with a dash.
+- `run` is the one-shot: it captures output and returns the command's exit code.
+- `run` and `input` name the target with `-t/--target`, not a positional. Put
+  `-t` first, and `--` before any argument that starts with a dash.
 
-`screencap` uses `adb exec-out screencap -p`, which is binary-clean (no CRLF
-mangling). `-o <path>` always means **this machine's** filesystem, exactly
-like `video shot`. For a remote channel, `-o` streams the PNG over SSH into a
-local sibling temp file and renames it onto `-o`'s path only on success. A
-failed or interrupted capture therefore never truncates or half-writes what
-was already at that path. `-o -` (the default) streams the PNG to stdout
-instead.
+`screencap` uses `adb exec-out screencap -p`. `-o <path>` is always on
+**this machine**, even for a remote channel, and is replaced only when the
+capture succeeds. `-o -` (the default) writes to stdout.
 
 ---
 
@@ -127,8 +110,5 @@ serial = "33271JEGR02033"   # adb -s id; omit for the sole attached device
 | Input | `hid send` (USB HID rig) | `adb input` |
 | Reboot / power | `power` hooks, DTR | `power` hooks (`adb reboot`) |
 
-An adb target needs no capture card, HID rig, or serial adapter: one USB cable
-to the control host carries all of it. The trade-off is that adb sees only the
-running Android userspace, not the bootloader/firmware that a serial console
-and a capture card observe. For those, give the target *both* an `adb` channel
-and the wired channels.
+adb sees only running Android, not the bootloader or firmware. To watch those
+too, give the target both an `adb` channel and the wired channels.

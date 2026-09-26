@@ -1,11 +1,10 @@
 # KB2040 Dual-Board HID Injector
 
-A USB keyboard/mouse injector for automated testing of a target machine
-(SBC, e.g. a Raspberry Pi). HID (human interface device) is the USB class for
-keyboards and mice. Two **Adafruit KB2040** boards (small RP2040
-microcontroller boards) form a **"dumb pipe"**: the host-side `hidrig` tool
-composes the HID report bytes in Rust, and the boards relay those bytes to the
-target without interpreting any HID semantics.
+A USB keyboard/mouse (HID) injector for automated testing of a target machine
+(e.g. a Raspberry Pi). Two **Adafruit KB2040** boards (RP2040 microcontrollers)
+form a **"dumb pipe"**: the host-side `hidrig` tool composes the HID report
+bytes in Rust, and the boards relay them to the target without interpreting
+them.
 
 | Board | Faces | Link | I2C1 role |
 |---|---|---|---|
@@ -13,12 +12,11 @@ target without interpreting any HID semantics.
 | **target** | the device under test (DUT) | **USB-HID** | **peripheral** |
 
 The control board also bridges the DUT's **serial console** (its hardware UART)
-and switches **DUT power** through a relay. So one USB-attached device drives the
-target's HID, console, *and* power together (design §6–§7).
+and switches **DUT power** through a relay (design §6–§7).
 
-This is the **host-side** doc. The design and rationale are in
+This is the **host-side** doc. The design is in
 [`../docs/dev/hid-dual-board-design.md`](../docs/dev/hid-dual-board-design.md);
-the boards, BOM, wiring, and firmware bring-up runbook are in the
+boards, BOM, wiring and firmware are in the
 [`paniolo-hardware`](https://github.com/curtisgalloway/paniolo-hardware)
 repo (see [Hardware](#hardware) below).
 
@@ -37,29 +35,24 @@ repo (see [Hardware](#hardware) below).
 [Target / DUT]
 ```
 
-How a command flows: `hidrig` turns each command (`type`, `key`, `moveabs`, …)
-into HID report bytes, wraps them in binary frames, and writes them to the
-control board's data CDC endpoint. The control board relays HID frames verbatim
-over I2C1 to the target board, which calls `send_report`. Neither board parses
-keycodes or does mouse math.
+`hidrig` turns each command (`type`, `key`, `moveabs`, …) into HID report
+bytes in binary frames. The control board relays them over I2C1 to the target
+board, which calls `send_report`.
 
 The command vocabulary is the device-independent **HID serial protocol v1**
 ([`../docs/dev/hid-serial-protocol.md`](../docs/dev/hid-serial-protocol.md)).
-In this rig that protocol is the *external* interface only: `hidrig` (and the
-`serve` daemon) consume it and compose reports themselves, so the line protocol
-never travels on a wire. The boards see only binary frames.
+Here it is the *external* interface only; the boards see only binary frames.
 
 ## Host CLI (`hidrig`)
 
-`hidrig` composes HID and drives the rig. It installs into paniolo's private
-libexec dir (off PATH): `make install` does this, or manually
-`cargo install --path hidrig --root ~/.local/libexec/paniolo`. Run it directly
-via `paniolo helper hidrig …`, or bare inside a `paniolo hid set --cmd` hook
-string.
+`hidrig` installs into paniolo's private libexec dir (off PATH) with
+`make install`, or `cargo install --path hidrig --root ~/.local/libexec/paniolo`.
+Run it via `paniolo helper hidrig …`, or bare inside a `paniolo hid set --cmd`
+hook string.
 
-`-d` is the control board's **data CDC port**: the *second* `usbmodem` of the
-pair the control board exposes (the first is the REPL console). On Linux it is
-the higher-numbered `/dev/ttyACM*`.
+`-d` is the control board's **data CDC port**: the *second* `usbmodem` of its
+pair (the first is the REPL console). On Linux it is the higher-numbered
+`/dev/ttyACM*`.
 
 ```bash
 hidrig -d /dev/cu.usbmodemXXXX ping              # liveness (control frame)
@@ -76,22 +69,18 @@ hidrig -d /dev/cu.usbmodemXXXX power off           # off | on | cycle [secs]
 hidrig -d /dev/cu.usbmodemXXXX run boot-seq.txt   # command file; '-' = stdin
 ```
 
-- **`moveabs`** takes absolute coordinates in `0..32767`; the host OS maps that
-  range across the full screen, so `moveabs 16383 16383` parks the cursor dead
-  center.
+- **`moveabs`** takes `0..32767` across the full screen, so
+  `moveabs 16383 16383` is dead center.
 - **Key names** are `adafruit_hid` Keycode names (`A`–`Z`, `ENTER`, `TAB`,
   `ESCAPE`, `LEFT_CONTROL`, `LEFT_SHIFT`, `UP_ARROW`, `F1`–`F12`, …).
 - **Command files** take one command per line. Blank lines and `# comments` are
-  skipped; `delay <ms>` / `sleep <seconds>` pause between commands. Sequencing
-  lives on the host; the firmware stays dumb.
+  skipped; `delay <ms>` / `sleep <seconds>` pause between commands.
 
 ### Daemon mode (`serve`) — the KVM path
 
-The control link can have only one owner, so a streaming web console and CLI
-one-shots can't both open it. `hidrig serve` solves that. It owns the CDC link,
-holds the composition state (held keys, virtual cursor), and re-exposes the
-command vocabulary over a localhost WebSocket (`GET /hid`) plus `POST /send`,
-serializing every command onto the one wire.
+The control link has only one owner. `hidrig serve` owns it, holds the
+composition state (held keys, virtual cursor), and serves the command
+vocabulary on a localhost WebSocket (`GET /hid`) plus `POST /send`.
 
 ```bash
 hidrig -d /dev/cu.usbmodemXXXX serve             # owns the link, runs until stopped
@@ -99,10 +88,8 @@ hidrig -d /dev/cu.usbmodemXXXX type hi           # auto-routes through the daemo
 hidrig stop                                      # stop the daemon
 ```
 
-While a daemon for a device is running, every `hidrig -d <device> …` one-shot
-routes through it automatically (over `POST /send`), so the CLI and the web
-console never contend for the port. `paniolo console` starts this daemon on
-demand, and the dashboard streams keyboard + absolute-mouse events to it (see
+While a daemon runs, every `hidrig -d <device> …` one-shot routes through it
+(over `POST /send`). `paniolo console` starts the daemon on demand (see
 [`../docs/hid.md`](../docs/hid.md)).
 
 Every request needs the token the daemon publishes in its discovery file
@@ -110,49 +97,37 @@ Every request needs the token the daemon publishes in its discovery file
 `Host`/`Origin` only. One-shots and `paniolo console` supply it themselves.
 
 > The control board is a **USB-CDC** device, so there is **no baud
-> negotiation**: USB sets the real rate and the nominal "baud" is ignored.
-> (The retired single-board UART path's 115200→460800 negotiation is gone.)
+> negotiation**; the nominal "baud" is ignored.
 
-**Replies are demultiplexed.** A one-shot control command (`power cycle`,
-`ping`) draws its `0x02` reply from the *same* CDC stream that carries the DUT's
-`0x03` console output. So both the daemon and a direct one-shot demultiplex
-inbound bytes instead of assuming the next bytes read are the reply. A
-`power cycle` issued while the DUT is mid-boot still gets its answer, even with
-console frames interleaved ahead of it.
+**Replies are demultiplexed.** A control command's `0x02` reply (`power cycle`,
+`ping`) shares the CDC stream with the DUT's `0x03` console output, so replies
+arrive correctly even while the DUT is booting.
 
-**Every open resyncs.** Every open of the control link (daemon start, reopen, or
-a direct one-shot) first writes a 258-byte all-zero resync preamble. A parser
-already in sync ignores it. If a previous owner was killed mid-frame, the zeros
-complete that partial frame, instead of the next real bytes completing it wrong
-(design doc §5).
+**Every open resyncs.** Every open of the control link first writes a 258-byte
+all-zero resync preamble, which completes any frame a killed previous owner left
+half-written (design doc §5).
 
 **Shutdown releases everything.** Graceful shutdown (`SIGTERM`/Ctrl-C) releases
-every held key, modifier and mouse button before the daemon exits, bounded by a
-short timeout. A killed daemon does not leave the target with a key down that
-nothing remembers to release.
+every held key, modifier and mouse button, bounded by a short timeout.
 
 ### DUT power and serial console
 
 **Power.** `hidrig power off|on|cycle [secs]` switches the DUT through the
-control board's relay. It surfaces to paniolo as a normal power helper behind
-the `power` hook. A `cycle` acks immediately, then the board holds power off for
-the given seconds (firmware default 2 s).
+relay; use it as a normal paniolo `power` hook. A `cycle` acks immediately, then
+holds power off for the given seconds (firmware default 2 s).
 
 - The relay **state persists across a control-board reset** (stored in NVM;
-  default on if unset), so a replug or reload doesn't surprise-re-power the DUT.
-- The control board's I2C init is non-fatal, so power and console work even when
-  the target/HID side (and its pull-ups) isn't wired, which a `power off`/`cycle`
-  deliberately causes.
+  default on if unset).
+- Power and console work even when the target/HID side (and its pull-ups) isn't
+  wired or is powered off.
 
-**Console.** When the `serve` daemon runs, it also bridges the DUT's serial
-console (control board UART0) and **re-exports it as a PTY** (pseudo-terminal),
-so paniolo's existing `serial` channel attaches with no special handling. The
-console exists only while the daemon is serving, so bring the hid daemon up
-first (any `paniolo hid …` or `paniolo console` for the target starts it).
+**Console.** The `serve` daemon also bridges the DUT's serial console (control
+board UART0) and **re-exports it as a PTY**, so paniolo's `serial` channel
+attaches to it. The console exists only while the daemon runs; any
+`paniolo hid …` or `paniolo console` for the target starts it.
 
-The daemon publishes a stable symlink at `/tmp/paniolo-<uid>/hid/console` as a
-**convenience path** for a lab file's `serial` channel `device =`. Point the lab
-file at the symlink:
+Point the lab file's `serial` channel `device =` at the daemon's stable symlink,
+`/tmp/paniolo-<uid>/hid/console`:
 
 ```toml
 [[targets.pi5.serial]]
@@ -165,22 +140,19 @@ baud   = 115200                            # nominal; the UART rate is fixed in 
 Then `paniolo serial watch/connect/send/log` work as usual. A PTY has no
 DTR/CTS, so `serial dtr`/`reset` and `power_sense_signal` don't apply.
 
-The symlink can fail to create (e.g. a stale non-symlink left there). Then
-`console` in the discovery file falls back to the underlying device. `daemon.json`
-is the source of truth either way: it records `console` (whichever of the two is
-live) and `console_device` (always the real PTY slave path, e.g. `/dev/pts/7`).
-Anything reading discovery programmatically should prefer those fields over
-assuming the symlink exists.
+If the symlink can't be created (e.g. a stale non-symlink is there), `console`
+in `daemon.json` falls back to the underlying device. Programs should read
+`console` (whichever is live) and `console_device` (the real PTY slave, e.g.
+`/dev/pts/7`) from `daemon.json` instead of assuming the symlink.
 
-> **Status:** the **relay/power** path is hardware-verified (off/on/cycle actuate
-> the relay; the state persists across a control-board reset). The **console
-> bridge** is **not yet** verified. Confirm the PTY round trip through
-> `tio`/serialcap on the bench before relying on it (design §6).
+> **Status:** the **relay/power** path is hardware-verified. The **console
+> bridge** is **not yet** verified; confirm the PTY round trip through
+> `tio`/serialcap before relying on it (design §6).
 
 ## paniolo integration
 
-paniolo calls the tool through the generic per-target `hid` channel: an opaque
-command prefix, exactly like the power hooks.
+paniolo calls the tool through the per-target `hid` channel, a command prefix
+like the power hooks.
 
 ```bash
 paniolo hid set -t pi5 --cmd "hidrig -d /dev/cu.usbmodemXXXX"
@@ -188,15 +160,12 @@ paniolo hid send -t pi5 type hello
 paniolo hid send -t pi5 key ENTER
 ```
 
-`paniolo hid send` appends its arguments to the configured command and runs it
-on whichever control host owns the channel (transparently over SSH for remote
-hosts). See [`../docs/hid.md`](../docs/hid.md).
+`paniolo hid send` appends its arguments to the command and runs it on the
+control host that owns the channel. See [`../docs/hid.md`](../docs/hid.md).
 
 ## Wire protocol (host ↔ rig)
 
-`hidrig` writes length-prefixed binary frames to the control board's data CDC
-endpoint, and the control board relays HID frames over I2C1 to the target. Both
-legs use one frame format:
+Both legs (CDC to the control board, I2C1 to the target) use one frame format:
 
 ```
 [type][b1][len][payload .. len bytes]
@@ -211,29 +180,26 @@ legs use one frame format:
   `power` draw a `[0x02][cmd][len][payload]` reply. `version` returns the
   control board's implementation id (`dual-control/1`). `power` acks before
   acting (a `power cycle` blocks the board only for its off-time).
-- **Console frames (`0x03`) are a bidirectional byte pipe** to/from the DUT's
-  serial console on the control board's hardware UART. They are fire-and-forget;
-  the `serve` daemon demuxes inbound console output and re-exports it as a PTY
-  (see [DUT power and serial console](#dut-power-and-serial-console)).
+- **Console frames (`0x03`) are a fire-and-forget bidirectional byte pipe** to
+  the DUT's serial console (see
+  [DUT power and serial console](#dut-power-and-serial-console)).
 
-**The descriptor is the contract.** Because the host composes reports, its
-composer must match the target board's HID **descriptor** exactly (report IDs,
-field order, the 0..32767 absolute range). That descriptor lives in
+**The descriptor is the contract.** The host composer must match the target
+board's HID **descriptor** exactly (report IDs, field order, the 0..32767
+absolute range). That descriptor lives in
 [`hidrig-kb2040/firmware/target/boot.py`](https://github.com/curtisgalloway/paniolo-hardware/blob/main/hidrig-kb2040/firmware/target/boot.py)
 in the paniolo-hardware repo. A change to it there requires a matching change
 to `src/compose.rs` here, which holds the composition and framing.
 
 ## Hardware
 
-The boards, BOM, wiring diagrams, and firmware flash runbook are a
-custom-hardware design in a separate repo:
+The boards, BOM, wiring and firmware flash runbook are in
 [`paniolo-hardware`](https://github.com/curtisgalloway/paniolo-hardware), under
 [`hidrig-kb2040/`](https://github.com/curtisgalloway/paniolo-hardware/tree/main/hidrig-kb2040).
 See [`hidrig-kb2040/README.md`](https://github.com/curtisgalloway/paniolo-hardware/blob/main/hidrig-kb2040/README.md)
 for the full build and
 [`hidrig-kb2040/SETUP.md`](https://github.com/curtisgalloway/paniolo-hardware/blob/main/hidrig-kb2040/SETUP.md)
-for the CircuitPython flash runbook. This repo (`hidrig/`) is the host side
-only: the Rust CLI/daemon that talks to already-flashed boards.
+for the CircuitPython flash runbook. `hidrig/` here is the host side only.
 
 In brief: two **Adafruit KB2040** boards joined by **I2C1** (`GP10` = SDA,
 `GP19` = SCL, common GND, with required ~4.7 kΩ pull-ups), the target board at
@@ -245,43 +211,37 @@ two GPIOs surface through `hidrig`.
 
 ## Host testing tools (macOS)
 
-To verify the full pipeline end to end, plug the **target** board's USB into
-the same Mac that drives the control link, and capture its HID reports while you
-inject. Build with `cd hidrig/host && make`. Details are in `host/README.md`.
+To test end to end, plug the **target** board into the Mac that drives the
+control link and capture its HID reports while you inject. Build with
+`cd hidrig/host && make`; details in `host/README.md`.
 
 **`host/hid_capture_usb.m` — leak-safe capture (use this one).** It takes the
-target board away from the macOS HID stack entirely via IOUSBHost whole-device
-capture (`IOUSBHostObjectInitOptionsDeviceCapture`, root passes the gate), then
-prints each interrupt-IN report with timestamps. Injected keystrokes and mouse
-moves reach **only** this tool, never the focused app or the real cursor.
+board away from macOS via IOUSBHost whole-device capture
+(`IOUSBHostObjectInitOptionsDeviceCapture`, needs root) and prints each report
+with timestamps. Injected input reaches **only** this tool.
 
 ```bash
 sudo ./hid_capture_usb            # defaults to the injector serial
 sudo ./hid_capture_usb <serial>   # if more than one KB2040 is attached
 ```
 
-In another terminal: `hidrig -d /dev/cu.usbmodemXXXX moveabs 16383 16383`, and
-watch the report bytes. **Start the capture tool before injecting**, or the
-reports leak into your live session.
+Then run `hidrig -d /dev/cu.usbmodemXXXX moveabs 16383 16383` in another
+terminal. **Start the capture tool before injecting**, or the reports leak into
+your live session.
 
-> `host/hid_seize_reports.c` (the older `IOHIDDeviceOpen(..SeizeDevice)` tool)
-> is **non-exclusive** on modern macOS (Darwin 24/25): the seize succeeds and
-> reports arrive, but the system event path is not detached, so injected moves
-> still move the real cursor. Use it only as a passive raw-report tap.
+> `host/hid_seize_reports.c` (`IOHIDDeviceOpen(..SeizeDevice)`) is
+> **non-exclusive** on Darwin 24/25: injected moves still move the real cursor.
+> Use it only as a passive raw-report tap.
 
-`host/hid_bench.py` measures latency/throughput and `host/leak_check.py`
-asserts no cursor leak, both via `uv run --with pyserial …`. Both still speak
-the **retired single-board firmware's** line protocol; they don't drive the
-dual-board rig's binary-frame CDC link.
+`host/hid_bench.py` (latency/throughput) and `host/leak_check.py` (cursor leak)
+run via `uv run --with pyserial …`, but speak the **retired single-board
+firmware's** line protocol and don't drive the dual-board rig.
 
 ### macOS serial latency
 
-The host drops the macOS serial read-latency timer (`IOSSDATALAT`) to its floor
-when it opens the control CDC endpoint (`proto.rs`). The default timer adds
-~230 ms to a control-frame round trip (`ping`/`version`). HID frames are
-fire-and-forget so they don't pay it, but the floor keeps liveness checks
-prompt. A mouse move injects in ~8 ms (the target's USB interrupt endpoint's
-8 ms `bInterval` is then the floor).
+The host sets the macOS serial read-latency timer (`IOSSDATALAT`) to its floor
+on open (`proto.rs`); the default adds ~230 ms to a `ping`/`version` round trip.
+A mouse move injects in ~8 ms (the target's 8 ms `bInterval`).
 
 ## Files
 
@@ -304,20 +264,9 @@ hidrig/
 
 ## History
 
-1. **First dual-board version** (`hidrig/control/`, `hidrig/target/` in git
-   history): a role-based design where the boards parsed commands and held
-   duplicated opcode tables.
-2. **Single-board rig:** one KB2040 running "smart" CircuitPython firmware that
-   spoke the line-based HID serial protocol over a UART (via a USB-serial
-   adapter) and composed HID with `adafruit_hid`.
-3. **Current design:** two boards again, but as a **dumb pipe**. Composition
-   moved to the Rust host (`src/compose.rs`), the firmware relays raw report
-   bytes, and the host↔rig wire became the binary frame format above. No
-   duplicated opcode tables, no `adafruit_hid` on the target, and the external
-   command vocabulary is unchanged (design §7).
-
-The retired single-board firmware and the current dual-board firmware both live
-in the paniolo-hardware repo (see
-[`hidrig-kb2040/firmware/single-board/`](https://github.com/curtisgalloway/paniolo-hardware/tree/main/hidrig-kb2040/firmware/single-board)).
-The single board can later be rebuilt as a dumb device on the same Rust
-composition, with frames over its UART.
+The first dual-board version (`hidrig/control/`, `hidrig/target/` in git
+history) parsed commands on the boards; a later single-board rig composed HID
+with `adafruit_hid` in CircuitPython. The current design moved composition to
+`src/compose.rs` (design §7). The retired single-board firmware is in
+paniolo-hardware under
+[`hidrig-kb2040/firmware/single-board/`](https://github.com/curtisgalloway/paniolo-hardware/tree/main/hidrig-kb2040/firmware/single-board).

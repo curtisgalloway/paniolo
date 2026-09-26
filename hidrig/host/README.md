@@ -16,10 +16,9 @@ limitations under the License.
 
 # HID injector host tools (macOS)
 
-Tools for measuring and verifying the KB2040 injector (an Adafruit RP2040 board
-that acts as a USB keyboard and mouse, or HID device) with its USB plugged into
-the **same Mac** that drives the control link. This tests the HID path on its
-own, without the video feedback of the full KVM.
+Tools for testing the KB2040 injector (an RP2040 board acting as a USB keyboard
+and mouse) with its USB plugged into the **same Mac** that drives the control
+link.
 
 Build the C/Objective-C tools:
 
@@ -27,7 +26,7 @@ Build the C/Objective-C tools:
 make            # builds hid_capture_usb and hid_seize_reports
 ```
 
-The Python tools run under `uv` and need no build step.
+The Python tools run under `uv`; no build step.
 
 | Tool | Use it for | Works with |
 |---|---|---|
@@ -36,17 +35,18 @@ The Python tools run under `uv` and need no build step.
 | `hid_bench.py` | Latency and throughput | Retired single-board firmware only |
 | `leak_check.py` | Assert that injection does not move the real cursor | Retired single-board firmware only |
 
+The two C tools observe the DUT-facing HID board, which has the same VID/PID on
+both firmwares.
+
 ## hid_capture_usb — leak-safe HID capture
 
-**Always start this tool before injecting.** Otherwise the reports leak into
-your live session.
+**Always start this tool before injecting**, or the reports leak into your live
+session.
 
-It detaches the injector from the macOS HID stack entirely, using IOUSBHost
-whole-device capture (`IOUSBHostObjectInitOptionsDeviceCapture`; running as
-root passes the same gate as the `com.apple.vm.device-access` entitlement). It
-then reads the interrupt-IN endpoint and prints each report with timestamps.
-Because the device is detached, injected keystrokes and mouse moves reach
-**only** this tool, never the focused app or the real cursor.
+It detaches the injector from macOS with IOUSBHost whole-device capture
+(`IOUSBHostObjectInitOptionsDeviceCapture`; root passes the same gate as the
+`com.apple.vm.device-access` entitlement) and prints each interrupt-IN report
+with timestamps. Injected input reaches **only** this tool.
 
 ```bash
 sudo ./hid_capture_usb            # defaults to the injector serial
@@ -55,37 +55,27 @@ HID_CAPTURE_PROBE=1 sudo -E ./hid_capture_usb   # hold the capture and sleep, fo
 ```
 
 Each line is `report ts=<sec.usec> dt=<usec-since-prev> len=<n>: <hex>`. The
-first payload byte is the report ID (1 = keyboard, 2 = absolute mouse). To
-confirm the device is detached, run `hidutil list` while the tool runs: the
-injector disappears.
+first payload byte is the report ID (1 = keyboard, 2 = absolute mouse). While
+it runs, the injector is absent from `hidutil list`.
 
 ## hid_seize_reports — passive raw-report tap (NOT exclusive)
 
-The older approach: `IOHIDDeviceOpen(..., kIOHIDOptionsTypeSeizeDevice)`. On
-Darwin 24/25 the seize is **not** exclusive. The open succeeds and reports
-arrive here, but the system event path is not detached, so injected mouse moves
-still move the real cursor. Use it only as a passive timestamped tap; use
-`hid_capture_usb` when you need exclusivity. Requires `sudo` plus an Input
-Monitoring grant in System Settings.
-
-`hid_capture_usb` and `hid_seize_reports` observe the DUT-facing HID board
-(the board that plugs into the device under test). It has the same VID/PID on
-the retired single board and on the dual-board target board, so both tools work
-with either firmware when that board is plugged into this Mac.
+Uses `IOHIDDeviceOpen(..., kIOHIDOptionsTypeSeizeDevice)`, which on Darwin
+24/25 is **not** exclusive: injected mouse moves still move the real cursor.
+Use it only as a passive tap. Requires `sudo` plus an Input Monitoring grant in
+System Settings.
 
 ## hid_bench.py — latency / throughput (retired single-board path)
 
 > **Note:** `hid_bench.py` and `leak_check.py` speak only the retired
 > single-board firmware's line protocol over a USB-serial adapter (`OK`/`ERR`
-> replies, 115200→460800 baud negotiation). The current dual-board rig's
-> control link is a USB-CDC (USB virtual serial) port speaking binary frames
-> with **no baud and no text replies**, so these two tools cannot drive it.
-> They are kept for the retired firmware (paniolo-hardware `hidrig-kb2040/firmware/single-board/{boot,code,config}.py`,
-> https://github.com/curtisgalloway/paniolo-hardware) and as a reference for a
-> future bench port.
+> replies, 115200→460800 baud negotiation). They cannot drive the dual-board
+> rig's USB-CDC binary-frame link. The retired firmware is paniolo-hardware
+> `hidrig-kb2040/firmware/single-board/{boot,code,config}.py`
+> (https://github.com/curtisgalloway/paniolo-hardware).
 
-It drives the UART directly (setting `IOSSDATALAT` itself) and times command
-round trips. For a leak-safe run, start `hid_capture_usb` first.
+It times command round trips over the UART (setting `IOSSDATALAT` itself).
+Start `hid_capture_usb` first.
 
 ```bash
 uv run --with pyserial hid_bench.py --device /dev/cu.usbserial-XXXX \
@@ -99,15 +89,12 @@ uv run --with pyserial hid_bench.py --device /dev/cu.usbserial-XXXX \
 | `pipe` | windowed pipelining |
 
 `--latency-us` sets the macOS serial read-latency timer (1 ≈ floor; 0 leaves
-the default).
-
-Reference numbers (this bench, with the latency fix): `ping` ~3 ms, `moveabs`
-~8 ms (USB `bInterval` floor), moveabs throughput ~123/s (bInterval-capped).
+the default). Typical: `ping` ~3 ms, `moveabs` ~8 ms (USB `bInterval` floor),
+~123 moveabs/s.
 
 ## leak_check.py — assert no leak (retired single-board path)
 
-Injects one centered `moveabs` and checks whether the real cursor moved,
-restoring it if so. Expect `NO LEAK` while `hid_capture_usb` holds the device.
+Injects one centered `moveabs` and checks whether the real cursor moved. Expect `NO LEAK` while `hid_capture_usb` holds the device.
 
 ```bash
 uv run --with pyserial --with pyobjc-framework-Quartz leak_check.py \

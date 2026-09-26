@@ -1,17 +1,9 @@
 # Tested hardware
 
-The bench hardware paniolo is verified with, grouped by subsystem. Links go to the
-exact items purchased; Amazon listings are for reference, not an endorsement.
-
-Equivalents that meet the same contract should generally work. Each subsystem guide states
-the actual compatibility requirement. The common ones:
-
-- **UVC** (USB Video Class, the standard driverless webcam/capture protocol) for video.
-- **FTDI** (a USB-serial chip family that exposes the DTR control line) for serial and DTR.
-- **CC2652** (a TI Zigbee radio chip) for Zigbee.
-
-This is not a guarantee that the hardware or implementation is bug-free. Testing is
-best-effort; use at your own risk, and your mileage may vary.
+Links go to the exact items purchased (not an endorsement). Equivalents should work if they
+meet the requirement in each subsystem guide: usually **UVC** (driverless USB video) for video,
+**FTDI** (USB-serial with DTR) for serial and DTR, **CC2652** (TI Zigbee chip) for Zigbee.
+Testing is best-effort; no guarantee of bug-free behavior.
 
 ## Power control
 
@@ -20,11 +12,11 @@ See the [power guide](power.md).
 | Device | Role |
 |---|---|
 | [Sonoff Zigbee 3.0 USB Dongle Plus (ZBDongle-P, CC2652P)](https://www.amazon.com/dp/B09KXTCMSC) | Zigbee coordinator for the `zigplug` helper. |
-| [ThirdReality Zigbee Smart Plug (15 A, energy monitoring)](https://www.amazon.com/dp/B0BPY5D1KC) | Switched mains outlet for target power, driven by `zigplug` through the generic power hooks. |
-| [AINOPE USB 3.0 extension cable (6.6 ft)](https://www.amazon.com/dp/B07RQRMGKB) | Moves the Zigbee dongle away from USB 3 devices. RF noise from USB 3 hardware (especially video capture) can break Zigbee network formation and joining; the extension cable fixes it. |
+| [ThirdReality Zigbee Smart Plug (15 A, energy monitoring)](https://www.amazon.com/dp/B0BPY5D1KC) | Switched mains outlet driven by `zigplug`. |
+| [AINOPE USB 3.0 extension cable (6.6 ft)](https://www.amazon.com/dp/B07RQRMGKB) | Moves the Zigbee dongle away from USB 3 devices, whose RF noise (especially video capture) breaks Zigbee pairing. |
 | Cambrionix programmable USB hub | Per-port USB power switching via the [`cambrionix` helper](power.md#cambrionix-hub-control) (control UART, 115200 8N1). |
-| [Shelly Plug US Gen4 (S4PL-00116US, Wi-Fi, energy monitoring)](https://www.amazon.com/dp/B0G2YY8TCJ) | Wi-Fi switched mains outlet for target power, driven by the [`shellyplug` helper](power.md#shelly-smart-plug-control-shellyplug) over the device's local HTTP RPC API — no cloud, Home Assistant, or Matter. Any Shelly Gen2+ device works. |
-| Dell OptiPlex 7060 (Intel vPro) | Intel AMT (out-of-band management built into the chipset) machine, driven over the network by the [`amt` helper](power.md#intel-amt-power-control-amt) (WS-Management, port 16992). Per-target power with true power-state readback from the Management Engine; no plug hardware. |
+| [Shelly Plug US Gen4 (S4PL-00116US, Wi-Fi, energy monitoring)](https://www.amazon.com/dp/B0G2YY8TCJ) | Wi-Fi mains outlet driven by the [`shellyplug` helper](power.md#shelly-smart-plug-control-shellyplug) over local HTTP RPC (no cloud). Any Shelly Gen2+ device works. |
+| Dell OptiPlex 7060 (Intel vPro) | Intel AMT target driven by the [`amt` helper](power.md#intel-amt-power-control-amt) (WS-Management, port 16992), with true power-state readback; no plug hardware. |
 
 ## Serial console
 
@@ -32,8 +24,8 @@ See the [serial guide](serial.md).
 
 | Device | Role |
 |---|---|
-| [DSD TECH SH-U09C5 USB-to-TTL cable (FTDI, 1.8/2.5/3.3/5 V selectable)](https://www.amazon.com/dp/B07WX2DSVB) | TTL UART to a bare GPIO header. Being FTDI, its DTR line can also drive the Pi 5 J2 power button — see [DTR power control](power.md#dtr-power-control-ftdi-j2-wiring). |
-| [Waveshare Industrial USB-to-TTL (D), FT232RNL](https://www.amazon.com/dp/B0CX5C5KR4) | Pi 5 debug (UART) connector — ships with both an SH1.0 3-pin plug and a separate 4-pin header. |
+| [DSD TECH SH-U09C5 USB-to-TTL cable (FTDI, 1.8/2.5/3.3/5 V selectable)](https://www.amazon.com/dp/B07WX2DSVB) | TTL UART to a GPIO header; its DTR line can drive the Pi 5 J2 power button ([DTR power control](power.md#dtr-power-control-ftdi-j2-wiring)). |
+| [Waveshare Industrial USB-to-TTL (D), FT232RNL](https://www.amazon.com/dp/B0CX5C5KR4) | Pi 5 debug (UART) connector; ships with an SH1.0 3-pin plug and a 4-pin header. |
 
 ## HID injection
 
@@ -41,10 +33,10 @@ See the [HID guide](hid.md) and [`hidrig/README.md`](https://github.com/curtisga
 
 | Device | Role |
 |---|---|
-| 2× Adafruit KB2040 | Reference HID (USB keyboard/mouse) injector, the dual-board "dumb pipe": a **control** board (host USB-CDC, I2C1 controller) and a **target** board (DUT USB-HID, I2C1 peripheral), joined by I2C1 (GP10 SDA / GP19 SCL, 4.7 kΩ pull-ups). Any CircuitPython-capable RP2040 board with a free I2C1 works with minor pin edits. The host CLI is [`hidrig/`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md) in this repo; the CircuitPython firmware and build/flash runbook are in the [`paniolo-hardware`](https://github.com/curtisgalloway/paniolo-hardware) repo under [`hidrig-kb2040/`](https://github.com/curtisgalloway/paniolo-hardware/tree/main/hidrig-kb2040). |
-| 2× 4.7 kΩ resistors | I2C1 pull-ups (SDA→3.3 V, SCL→3.3 V) between the two KB2040 boards. Required: the control board won't open the bus without them. No USB-serial adapter is needed; the control link is the control board's native USB-CDC. Wiring diagram: [`paniolo-hardware` `hidrig-kb2040/README.md`](https://github.com/curtisgalloway/paniolo-hardware/blob/main/hidrig-kb2040/README.md). |
-| [Openterface KVM-Go (HDMI)](https://openterface.com/product/kvm-go/) | CH32V208 emulating the CH9329 (UART-to-USB-keyboard/mouse chip) protocol; drives the target's keyboard/mouse over its host-side USB-CDC port. Works with the [`ch9329`](https://github.com/curtisgalloway/paniolo/blob/main/ch9329/README.md) helper unmodified; reports `chip_version=0x01` rather than a real CH9329's `0x38`. See [KVM-Go notes](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-kvm-go.md). |
-| [Openterface Mini-KVM](https://openterface.com/) | Predecessor: a real CH9329 behind a CH340C USB-serial adapter. Same `ch9329` helper. Its extra modem-line control surface is documented in [deep-control notes](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-deep-control.md). |
+| 2× Adafruit KB2040 | Reference HID injector: a **control** board (host USB-CDC, I2C1 controller) and a **target** board (DUT USB-HID, I2C1 peripheral) joined by I2C1 (GP10 SDA / GP19 SCL). Any CircuitPython RP2040 board with a free I2C1 works with minor pin edits. Host CLI: [`hidrig/`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md); firmware: [`paniolo-hardware`](https://github.com/curtisgalloway/paniolo-hardware) under [`hidrig-kb2040/`](https://github.com/curtisgalloway/paniolo-hardware/tree/main/hidrig-kb2040). |
+| 2× 4.7 kΩ resistors | I2C1 pull-ups (SDA→3.3 V, SCL→3.3 V). Required: the control board won't open the bus without them. [Wiring diagram](https://github.com/curtisgalloway/paniolo-hardware/blob/main/hidrig-kb2040/README.md). |
+| [Openterface KVM-Go (HDMI)](https://openterface.com/product/kvm-go/) | CH32V208 emulating the CH9329 protocol over USB-CDC. Works with the [`ch9329`](https://github.com/curtisgalloway/paniolo/blob/main/ch9329/README.md) helper unmodified; reports `chip_version=0x01` (a real CH9329 reports `0x38`). [KVM-Go notes](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-kvm-go.md). |
+| [Openterface Mini-KVM](https://openterface.com/) | A real CH9329 behind a CH340C adapter; same `ch9329` helper. [Deep-control notes](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-deep-control.md). |
 
 ## Video capture
 
@@ -52,9 +44,9 @@ See the [video guide](video.md).
 
 | Device | Role |
 |---|---|
-| [Generic 4K HDMI capture dongle (MS2109-class, UVC)](https://www.amazon.com/dp/B09FLN63B3) | Target HDMI out → `hdmicap` warm stream + OCR. Any UVC capture card works; MS2109-class dongles are the tested baseline. |
-| [IPEVO V4K 8 MP USB document camera (UVC)](https://www.amazon.com/dp/B079DLTG9F) | UVC camera source used to verify `hdmicap` against non-capture-card devices; also handy for watching the physical bench. |
-| [Openterface KVM-Go (HDMI)](https://openterface.com/product/kvm-go/) | Combined capture + HID in one keychain-sized unit: MS2130S UVC capture (up to 4K; 1080p60 default) with a built-in male HDMI plug. Works with `hdmicap` unmodified. See [KVM-Go notes](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-kvm-go.md). |
+| [Generic 4K HDMI capture dongle (MS2109-class, UVC)](https://www.amazon.com/dp/B09FLN63B3) | Target HDMI → `hdmicap` + OCR. Any UVC capture card works. |
+| [IPEVO V4K 8 MP USB document camera (UVC)](https://www.amazon.com/dp/B079DLTG9F) | Non-capture-card UVC source for `hdmicap`; also watches the bench. |
+| [Openterface KVM-Go (HDMI)](https://openterface.com/product/kvm-go/) | Capture + HID in one unit: MS2130S UVC capture (up to 4K; 1080p60 default), male HDMI plug. Works with `hdmicap` unmodified. |
 
 ## Netboot link
 
@@ -62,10 +54,9 @@ See the [netboot](netboot.md) and [link mode](netif.md) guides.
 
 | Device | Role |
 |---|---|
-| [TP-Link UE330 — 3-port USB 3.0 hub + Gigabit Ethernet](https://www.amazon.com/dp/B01N9M32TA) | The direct host↔target Ethernet link, with spare USB ports for the rest of the rig. |
-| [Anker USB-C to Gigabit Ethernet adapter](https://www.amazon.com/dp/B08CK9X9Z8) | Dedicated USB-C network adapter for the direct link. |
+| [TP-Link UE330 — 3-port USB 3.0 hub + Gigabit Ethernet](https://www.amazon.com/dp/B01N9M32TA) | Direct host↔target Ethernet link plus spare USB ports. |
+| [Anker USB-C to Gigabit Ethernet adapter](https://www.amazon.com/dp/B08CK9X9Z8) | USB-C adapter for the direct link. |
 
 ______________________________________________________________________
 
-*When you verify paniolo against new hardware, add it here under the matching subsystem
-and note anything an equivalent device must provide.*
+*When you verify new hardware, add it here and note what an equivalent must provide.*

@@ -1,23 +1,21 @@
 # Recipe: adding a power-control helper for new hardware
 
-**How to add paniolo support for a new power-switching device**: a PDU (a
-network-controlled power strip), a relay board, a smart-plug family, a USB-PD
-(USB Power Delivery) hub, a BMC (a server's built-in management controller), or
-anything else that can turn a target's power on and off.
+Use this to support a new power-switching device: a PDU (networked power
+strip), relay board, smart-plug family, USB-PD hub, BMC, or anything else that
+switches a target's power.
 
-**The design principle** (from [power.md](../power.md)): device-specific
-control logic never goes in the core crates. It lives in a standalone helper
-binary, and paniolo drives it through four generic shell-command hooks on the
-target's power channel. So adding hardware means writing a helper and wiring
-it in. `cli/` needs no changes beyond, optionally, the install step.
+Device-specific logic never goes in the core crates ([power.md](../power.md)).
+It lives in a standalone helper binary that paniolo drives through four shell
+hooks on the target's power channel. `cli/` needs no changes beyond,
+optionally, the install step.
 
-Three shipped helpers serve as examples:
+Shipped examples:
 
 | Helper | Language | Controls |
 |---|---|---|
 | [`cambrionix/`](https://github.com/curtisgalloway/paniolo/tree/main/cambrionix) | Rust | Cambrionix USB hubs, over the hub's control UART (serial port) |
 | [`shellyplug/`](https://github.com/curtisgalloway/paniolo/tree/main/shellyplug) | Rust | Shelly Gen2+ plugs, over their local HTTP RPC |
-| [`zigplug/`](https://github.com/curtisgalloway/paniolo/tree/main/zigplug) | Python | Zigbee (a low-power mesh radio standard) smart plugs, via a CC2652 coordinator dongle |
+| [`zigplug/`](https://github.com/curtisgalloway/paniolo/tree/main/zigplug) | Python | Zigbee smart plugs, via a CC2652 coordinator dongle |
 
 ---
 
@@ -35,19 +33,17 @@ Paniolo runs each hook with `sh -c <cmd>` (`cli/src/main.rs`,
 
 The environment the helper must tolerate:
 
-- **`sh -c`, no shell profile.** `sh` evaluates the command string with the
-  paniolo process's PATH **plus the helper dirs prepended**: first the private
-  libexec dir (`~/.local/libexec/paniolo/bin`), then the system package dir
-  (`/usr/libexec/paniolo/bin`). So helpers installed by `paniolo setup` *or* by
-  the .deb resolve by bare name without being on the user's PATH. Absolute
-  paths also work. `paniolo doctor` checks both forms: `test -e` for absolute
-  paths, and `command -v` under the same helper-dirs-then-PATH resolution for
-  bare names.
+- **`sh -c`, no shell profile.** PATH is paniolo's PATH with the helper dirs
+  prepended: the private libexec dir (`~/.local/libexec/paniolo/bin`), then the
+  system package dir (`/usr/libexec/paniolo/bin`). Helpers installed by
+  `paniolo setup` or the .deb resolve by bare name; absolute paths also work.
+  `paniolo doctor` checks absolute paths with `test -e` and bare names with
+  `command -v` under the same resolution.
 - **Runs on the channel's control host.** Power commands re-exec over SSH on
-  the host that owns the power channel (`paniolo power set --host <labhost>`).
-  Install the helper on *that* host, not (only) where you type.
+  the host that owns the channel (`paniolo power set --host <labhost>`).
+  Install the helper on *that* host.
 - **State and temp data go where paniolo says.** Every invocation gets two env
-  vars, both naming directories that already exist:
+  vars naming existing directories:
     - `PANIOLO_STATE_DIR` (`~/.config/paniolo/helpers/<name>/`) for durable
       state (databases, pairing records).
     - `PANIOLO_RUNTIME_DIR` (`/tmp/paniolo-<uid>/<name>/`) for discovery files,
@@ -55,20 +51,18 @@ The environment the helper must tolerate:
 
     `<name>` is the basename of the hook command's program (`zigplug …` →
     `zigplug`); channel daemons get the channel name instead (hidrig → `hid`).
-    Prefer the env vars, and fall back to the same literal paths when run
-    standalone. **Never** write unnamespaced files into `~/.config/paniolo/`
-    itself: the lab file lives there.
-- **One-shot, stateless, exclusive.** Each invocation opens the device, acts,
-  and exits. If the transport is an exclusive-open serial port, two concurrent
-  invocations will collide, so keep long-lived helper modes (pairing windows,
-  monitors) off the hook paths.
-- **stdout/stderr pass through**, except for `state_cmd`, whose stdout is
-  captured and parsed. Print something useful on success; on failure, print
-  errors to stderr and exit non-zero.
+    Prefer the env vars; fall back to the same literal paths when run
+    standalone. **Never** write unnamespaced files into `~/.config/paniolo/`:
+    the lab file lives there.
+- **One-shot, stateless, exclusive.** Open the device, act, exit. Concurrent
+  invocations collide on an exclusive-open serial port, so keep long-lived
+  modes (pairing windows, monitors) off the hook paths.
+- **stdout/stderr pass through**, except `state_cmd` stdout, which is parsed.
+  On failure, print to stderr and exit non-zero.
 
 ## 2. Helper CLI conventions
 
-Mirror the existing helpers so hooks read the same across hardware:
+Mirror the existing helpers:
 
 ```
 <helper> -d <device> on <id>                  # switch on; confirm if the hw can report
@@ -78,37 +72,32 @@ Mirror the existing helpers so hooks read the same across hardware:
 <helper> -d <device> state                    # (optional) human-readable table of all ids
 ```
 
-- `-d/--device` is the transport (serial port path, IP, hub address). `<id>`
-  selects the outlet, port, or plug (hub port number, IEEE address, outlet
-  index). Both live in the hook string in the lab file, so the helper itself
-  needs no configuration.
-- **Confirm by read-back wherever the hardware can report state.** A
-  power-cycle that silently failed costs a whole debugging session.
-    - `on`/`off` verify the result and exit non-zero on mismatch (`zigplug`
-      reads the OnOff attribute back; `cambrionix` re-reads the port table after
-      every `mode` command).
-    - `cycle` confirms *both* phases: that power actually went off before the
-      hold, not just that it came back. Otherwise a relay that ignored the off
-      command produces a "cycle" that never removed power.
-    - `state` maps only the readings it understands. An unknown value is an
-      error carrying the raw reading, never a guessed `off`.
-- `cycle` defaults to a 3000 ms off-hold (both exemplars), long enough for the
-  target PSU's capacitors to drain.
-- Device lifecycle commands beyond the contract are fine (`zigplug form` /
-  `permit` / `list` / `remove`); keep them out of the four hook strings.
+- `-d/--device` is the transport (serial port path, IP, hub address); `<id>`
+  selects the outlet (hub port number, IEEE address, outlet index). Both live
+  in the hook string, so the helper needs no configuration.
+- **Confirm by read-back wherever the hardware reports state.** A silently
+  failed power-cycle costs a debugging session.
+    - `on`/`off` verify and exit non-zero on mismatch (`zigplug` reads the
+      OnOff attribute back; `cambrionix` re-reads the port table after every
+      `mode` command).
+    - `cycle` confirms *both* phases, so a relay that ignored `off` is not
+      reported as a successful cycle.
+    - `state` maps only readings it understands; an unknown value is an error
+      carrying the raw reading, never a guessed `off`.
+- `cycle` defaults to a 3000 ms off-hold, enough for PSU capacitors to drain.
+- Extra lifecycle commands are fine (`zigplug form` / `permit` / `list` /
+  `remove`); keep them out of the hook strings.
 
 ## 3. Implementation skeleton
 
-Pick the language by ecosystem fit: Rust if the device speaks a simple
-serial/HTTP protocol, Python if the driver library is Python (as with
-zigpy-znp). Any language works as long as it installs an executable into the
-libexec dir (`~/.local/libexec/paniolo/bin`). Helpers stay off the user's
-PATH; run one by hand with `paniolo helper <name> …`.
+Use Rust for a simple serial/HTTP protocol, Python when the driver library is
+Python (zigpy-znp). Any language works if it installs an executable into the
+libexec dir (`~/.local/libexec/paniolo/bin`). Helpers stay off PATH; run one
+by hand with `paniolo helper <name> …`.
 
-In any language, take state and temp paths from
-`PANIOLO_STATE_DIR`/`PANIOLO_RUNTIME_DIR` (see §1). zigplug's
-`default_db_path()` and `runtime_dir()` are the reference implementations,
-including lazy migration from a pre-API path.
+Take state and temp paths from `PANIOLO_STATE_DIR`/`PANIOLO_RUNTIME_DIR` (§1);
+zigplug's `default_db_path()` and `runtime_dir()` are the reference
+implementations, including lazy migration from a pre-API path.
 
 **Rust helper (the `cambrionix` pattern):**
 
@@ -127,39 +116,36 @@ including lazy migration from a pre-API path.
    of the root legacy package): `[tool.uv] package = true`,
    `[project.scripts] <helper> = "<pkg>._cli:app"`, src layout, typer CLI.
 2. Wrap async device libraries with one `asyncio.run()` per subcommand. Map
-   library exceptions to clean one-line errors: a traceback in hook output
-   reads as paniolo breakage.
+   library exceptions to one-line errors; a traceback in hook output looks
+   like paniolo breakage.
 3. Add an install block to `cli/src/setup.rs` following zigplug's: probe for
    `uv`, run `uv tool install --force <repo>/<helper>` with
-   `UV_TOOL_BIN_DIR` pointed at the libexec dir (the shim lands there, the
-   venv stays in uv's tool dir), and skip with a note when uv is missing.
+   `UV_TOOL_BIN_DIR` set to the libexec dir, and skip with a note when uv is
+   missing.
    Mention it in the Makefile header comment.
 
 Either way, **install the helper before testing hooks** (`paniolo setup`, or
 `cargo install --path <helper> --root ~/.local/libexec/paniolo` for a
-one-off). Paniolo runs installed binaries, not repo checkouts.
+one-off); paniolo runs installed binaries, not checkouts.
 
 ## 4. Hardware verification ladder
 
-Climb in this order. Each rung isolates one layer, and the destructive test
-comes last.
+Climb in order; each rung isolates one layer and the destructive test is last.
 
 1. **Identify the device node first.** `ioreg -p IOUSB -w0` (macOS) /
-   `lsusb` + `/dev/serial/by-id/` (Linux). Don't guess from `/dev` listings:
-   some USB-serial chips (e.g. CP2102N) have no serial number, so macOS names
-   them by USB topology (`/dev/cu.usbserial-8310` ↔ location `08310000`), and
-   the name changes if the dongle moves ports.
-2. **Run the helper's one-shots directly** (`paniolo helper <name> …`, since
-   helpers are not on PATH): any device-lifecycle setup (e.g. `paniolo helper
-   zigplug form` + `permit`), then `state <id>`, `on`, `off`, `cycle`. Confirm
-   each physically (relay click, LED, multimeter).
+   `lsusb` + `/dev/serial/by-id/` (Linux). Don't guess from `/dev`: chips
+   without a serial number (e.g. CP2102N) are named by USB topology on macOS
+   (`/dev/cu.usbserial-8310` ↔ location `08310000`) and rename when moved.
+2. **Run the helper directly** (`paniolo helper <name> …`): any lifecycle
+   setup (e.g. `paniolo helper zigplug form` + `permit`), then `state <id>`,
+   `on`, `off`, `cycle`. Confirm each physically (relay click, LED,
+   multimeter).
 3. **`paniolo power-state <target>`**: read-only. Proves the hook string, the
    `sh -c` environment, and the `on`/`off` token contract.
 4. **`paniolo power on/off <target>`**: switching through the full stack.
 5. **`paniolo power-cycle <target>`**: last, because it reboots the target.
-6. `paniolo doctor`: confirms which hooks are configured and checks that each
-   hook's program exists (absolute paths via `test -e`, bare names via
-   `command -v` under libexec-then-PATH).
+6. `paniolo doctor`: confirms which hooks are configured and that each hook's
+   program exists.
 
 ## 5. Wiring into a target
 
@@ -172,17 +158,14 @@ paniolo power set -t <target> \
     [--host <labhost>]        # the control host that owns the hardware
 ```
 
-All four hooks are optional and independent; wire what the hardware supports.
-Secrets (API tokens) come from the environment at call time and are never
-hardcoded in the hook string (see the Home Assistant example in
-[power.md](../power.md)).
+All four hooks are optional; wire what the hardware supports. Take secrets
+(API tokens) from the environment, never the hook string (see the Home
+Assistant example in [power.md](../power.md)).
 
 ## 6. Docs + PR checklist
 
-A helper PR touches more than the helper directory:
-
-- [ ] `docs/power.md` — a usage section: install, one-time setup, commands,
-      hook-wiring example, hardware gotchas you hit
+- [ ] `docs/power.md` — usage section: install, setup, commands, hook
+      wiring, hardware gotchas
 - [ ] `AGENTS.md` — directory-layout entry + the power bullet in
       "Current capabilities"
 - [ ] `README.md` — both helper lists (the power row in the subsystem table
@@ -191,44 +174,34 @@ A helper PR touches more than the helper directory:
 - [ ] `cli/src/setup.rs` — `HELPER_CRATES`, so `paniolo setup` installs the
       helper from a source clone
 - [ ] `.github/workflows/release.yml` — the `HELPERS` env list **and** the
-      rust-cache `workspaces` block, so the released `.deb`/tarball actually
-      ships the binary. Easy to forget, because nothing else fails without
-      it: v0.1.13 shipped without the `amt` helper this way.
+      rust-cache `workspaces` block, or the `.deb`/tarball silently omits the
+      binary (v0.1.13 shipped without `amt` this way).
 - [ ] `packaging/nfpm.yaml` — the helper list in the package description
 - [ ] `.github/workflows/ci.yml` — a job for the new crate
       (`working-directory: <crate>`; copy an existing crate job) **and** a
-      matching `crate_job` line in `scripts/ci-local.sh`. Every crate has a
-      CI job, no exceptions: the `coverage` job fails the build until both
-      exist. It also fails if the `Makefile`, release `HELPERS`, or
-      `HELPER_CRATES` lists above omit the crate
-      (`scripts/ci-coverage-check.sh`).
+      matching `crate_job` line in `scripts/ci-local.sh`. The `coverage` job
+      (`scripts/ci-coverage-check.sh`) fails until both exist, or if the
+      `Makefile`, release `HELPERS`, or `HELPER_CRATES` lists omit the crate.
 - [ ] `docs/README.md` — the Power row in the subsystem guide table
 - [ ] Apache 2.0 headers on all new source files
 
 ## 7. Field notes (earned the hard way)
 
-- **2.4 GHz radios hate USB 3.** zigplug's network formation failed
-  reproducibly, with zigpy-znp's literal "too much RF interference" error,
-  while the coordinator dongle sat on a hub next to a USB video-capture
-  device. Channel changes and NVRAM resets did nothing; a USB 2.0 extension
-  cable fixed it instantly. If a radio-based helper misbehaves near capture
-  hardware, move the dongle before debugging software.
-- **Verify the library API against the installed version**, not memory or
-  old examples. Device libraries (zigpy et al.) break their APIs across major
-  versions.
+- **2.4 GHz radios hate USB 3.** zigplug network formation failed with
+  zigpy-znp's "too much RF interference" error while the dongle sat next to a
+  USB video-capture device; a USB 2.0 extension cable fixed it. Move a radio
+  dongle before debugging software.
+- **Verify the library API against the installed version.** Device libraries
+  (zigpy et al.) break APIs across major versions.
 - **One-shot for stateless transports; a daemon for stateful ones.**
-    - When each invocation is a self-contained request/response over a simple
-      transport (the `cambrionix` UART), one-shot is right. A few seconds of
-      per-invocation cost saves a service to install, supervise, and debug.
+    - A self-contained request/response transport (the `cambrionix` UART) is
+      fine one-shot; it avoids a service to install and supervise.
     - A transport with *session state* needs a persistent owner. zigplug's
-      one-shot first version was unreliable by construction. Every serial open
-      toggled the CC2652's auto-bootloader lines and reset the radio
-      (occasionally *into* the bootloader, hanging the client). Two concurrent
-      hooks interleaving on one ZNP (the CC2652's serial protocol) session
-      wedged the coordinator for hours and cost it its NVRAM.
-    - The fix is the zigplug pattern: an auto-spawned daemon owns the port and
-      serializes operations with hard timeouts, while the CLI proxies to it
-      transparently. Hook strings stay one-shot-shaped either way (`hidrig
-      serve` uses the same pattern on the KVM path).
-- **Make `state` cheap and accurate.** It's the hook agents poll. Never cache
-  on the helper side, and fail loudly rather than report a guess.
+      one-shot version reset the CC2652 on every serial open (sometimes into
+      the bootloader, hanging the client), and two concurrent hooks on one ZNP
+      session wedged the coordinator for hours and lost its NVRAM.
+    - The zigplug fix: an auto-spawned daemon owns the port and serializes
+      operations with hard timeouts; the CLI proxies to it. Hook strings stay
+      one-shot-shaped (`hidrig serve` does the same on the KVM path).
+- **Make `state` cheap and accurate.** Agents poll it. Never cache on the
+  helper side; fail loudly rather than guess.
