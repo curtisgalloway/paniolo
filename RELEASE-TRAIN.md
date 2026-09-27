@@ -22,7 +22,8 @@ bench-host run and by CI's new smoke step.
 - ci workflow: `.github/workflows/ci.yml`; lint helpers `scripts/ci-actions-pinned.sh`, `scripts/ci-coverage-check.sh`
 - bump rules: conventional prefixes where present; this repo mostly writes `<crate>: <summary>`, so apply AGENTS.md: minor for a new command, channel, helper, verb, wire-protocol or daemon-lifecycle change, or a fix that changes what a target sees; patch for small fixes and docs; on the line, take the minor
 - releaser identity: tag with the author's GitHub noreply form already in the history (`git log --format=%ae | sort -u`), passed as `-c user.email` on the tag command, never edited into config
-- helpers: `hdmicap serialcap netbootd cambrionix hidrig ch9329 shellyplug amt` (the `HELPERS` line in the release workflow and `CRATES` in `Makefile` must agree; `scripts/ci-coverage-check.sh` enforces it)
+- helpers: `hdmicap serialcap netbootd cambrionix hidrig ch9329 shellyplug amt` (the `HELPERS` line in the release workflow, and `CRATES` in `Makefile` minus the library crates, must agree; `scripts/ci-coverage-check.sh` enforces it)
+- library crates: `secret` (no binary; in `Makefile` `CRATES` and CI, never in `HELPERS`; it ships compiled into `amt`, so no channel stages it and the smoke contract has nothing to check for it)
 - bundled skills: `skills/paniolo`, `skills/kvm-puppeting`, `skills/control-host` (shipped to `share/paniolo/skills` in every channel)
 - log dir: `logs/release-train/<run>/` (gitignored, persistent)
 
@@ -167,11 +168,11 @@ feeds needs re-reading before `--update` re-pins it.
 | `.github/workflows/docs.yml` | 0ffe09ec9fa4 | Publish: re-verify apt |
 | `packaging/nfpm.yaml` | b348d64432f4 | Channels: deb |
 | `packaging/scripts/build-apt-repo.sh` | fb2205eeab8e | Channels: deb, install like a user |
-| `Makefile` | 0e29b48ae719 | Project: helpers; Channels: source |
+| `Makefile` | 36543cf5ec97 | Project: helpers; Channels: source |
 | `cli/src/setup.rs` | b14d2f93405a | Channels: source |
 | `cli/src/skills.rs` | eada6fa6ec0c | Smoke contract S2; Channels: homebrew, windows |
 | `cli/src/daemons.rs` | f86e565cab42 | Smoke contract S3 |
-| `scripts/ci-coverage-check.sh` | 8d0d03ddf496 | Project: helpers |
+| `scripts/ci-coverage-check.sh` | d49ec54b9b17 | Project: helpers |
 | `scripts/sync-brik.sh` | b8b5a15775a9 | Channels: windows |
 | `README.md` | b2ae983f4654 | Channels: source; Publish: re-verify apt |
-| `AGENTS.md` | 1810f5594138 | Project: bump rules, tag format; Publish |
+| `AGENTS.md` | c291944d7cc2 | Project: bump rules, tag format; Publish |

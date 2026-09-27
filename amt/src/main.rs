@@ -26,11 +26,14 @@
 
 mod rpc;
 
+use std::path::PathBuf;
+use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use clap::{Parser, Subcommand};
+use secret::{Secret, Sources, Spec};
 
 use rpc::{
     is_transient, power_state_name, Client, CALL_TIMEOUT, KVM_DISABLED, KVM_ENABLED,
@@ -44,6 +47,26 @@ const CONFIRM_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Read-back polling interval while waiting for a transition.
 const POLL: Duration = Duration::from_millis(1000);
+
+/// The AMT Digest password's three sources.
+const PASSWORD: Spec = Spec {
+    what: "AMT password",
+    env: "AMT_PASSWORD",
+    file_flag: "--password-file",
+    command_flag: "--password-command",
+};
+
+/// The KVM (VNC) RFB password's three sources — a separate secret.
+const RFB_PASSWORD: Spec = Spec {
+    what: "RFB password",
+    env: "AMT_RFB_PASSWORD",
+    file_flag: "--rfb-password-file",
+    command_flag: "--rfb-password-command",
+};
+
+/// Exit status for a credential that could not be obtained: paniolo's
+/// `not_configured`, since retrying will not help.
+const EXIT_NOT_CONFIGURED: u8 = 3;
 
 #[derive(Parser)]
 #[command(
@@ -60,11 +83,15 @@ MENTAL MODEL
   - A machine is addressed by -d/--device (a hostname, IPv4 address, or
     bracketed IPv6 literal, optionally with :port; port 16992 by default)
     and -u/--user (default admin).
-  - The Digest password comes ONLY from the AMT_PASSWORD environment
-    variable — never from a flag or config file, so it cannot leak into a
-    lab file, shell history, or `ps` output. Inject it at call time, e.g.:
-      op run --env-file .env -- bash -c 'amt state -d 10.0.0.5'
-    (single quotes: the parent shell must not expand $AMT_PASSWORD itself).
+  - The Digest password is never a flag's value or a config-file entry, so it
+    cannot leak into a lab file, shell history, or `ps` output. It comes from
+    the first of these that is set:
+      1. the AMT_PASSWORD environment variable
+      2. --password-file <path>     (one trailing newline is dropped)
+      3. --password-command <cmd>   (run by sh -c / cmd /C; its stdout, 30 s limit)
+    e.g. a power hook that needs no environment:
+      amt -d 10.0.0.5 --password-command 'op read op://lab/amt/password' state
+    A missing file or failing command exits 3 (not configured).
   - on/off/cycle confirm by reading the power state back, so a request the
     firmware ignored surfaces as a non-zero exit.
   - `off` is an unconditional hardware power-off (CIM \"Off - Soft\", like
@@ -97,6 +124,18 @@ struct Cli {
         default_value = "admin"
     )]
     user: String,
+
+    /// Read the Digest password from this file (e.g. a systemd credential or
+    /// a secret mount). Used when AMT_PASSWORD is not set. The path is
+    /// resolved on the host where amt runs.
+    #[arg(long, value_name = "PATH", global = true)]
+    password_file: Option<PathBuf>,
+
+    /// Run this command (via sh -c, or cmd /C on Windows) and use its stdout
+    /// as the Digest password, e.g. 'op read op://vault/amt/password'. Used
+    /// when neither AMT_PASSWORD nor --password-file is set.
+    #[arg(long, value_name = "CMD", global = true)]
+    password_command: Option<String>,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -138,8 +177,9 @@ enum KvmCmd {
     Status,
     /// Open port 5900 to standard VNC clients and enable redirection.
     ///
-    /// The RFB password comes from AMT_RFB_PASSWORD in the environment, never
-    /// a flag: it must contain a special character, and a shell eats those.
+    /// The RFB password comes from AMT_RFB_PASSWORD, --rfb-password-file or
+    /// --rfb-password-command (first set wins), never a flag's value: it must
+    /// contain a special character, and a shell eats those.
     Enable {
         /// Require a person at the machine to consent to each session. Off by
         /// default — a headless bench target has nobody to click the prompt.
@@ -148,26 +188,49 @@ enum KvmCmd {
         /// Idle minutes before the ME drops a session; 0 disables the timeout.
         #[arg(long, default_value_t = 0)]
         session_timeout: u16,
+        /// Read the RFB password from this file. Used when AMT_RFB_PASSWORD
+        /// is not set.
+        #[arg(long, value_name = "PATH")]
+        rfb_password_file: Option<PathBuf>,
+        /// Run this command and use its stdout as the RFB password. Used when
+        /// neither AMT_RFB_PASSWORD nor --rfb-password-file is set.
+        #[arg(long, value_name = "CMD")]
+        rfb_password_command: Option<String>,
     },
     /// Close port 5900 and disable redirection. Leaves the stored RFB password
     /// alone, so re-enabling does not require setting it again.
     Disable,
 }
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            // The same rendering `fn main() -> Result<()>` gives an error.
+            eprintln!("Error: {e:?}");
+            if secret::is_not_configured(e.as_ref()) {
+                ExitCode::from(EXIT_NOT_CONFIGURED)
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     let device = cli
         .device
         .as_deref()
         .ok_or_else(|| anyhow!("required option '--device <HOST>' (-d) was not provided"))?;
-    let password = std::env::var("AMT_PASSWORD").map_err(|_| {
-        anyhow!(
-            "AMT_PASSWORD is not set — the AMT Digest password comes from the \
-             environment, never from a flag or config file. Inject it at call \
-             time, e.g.: op run --env-file .env -- bash -c 'amt state -d <host>'"
-        )
-    })?;
-    let client = Client::new(device, &cli.user, &password)?;
+    let password = secret::require(
+        &PASSWORD,
+        &Sources {
+            file: cli.password_file,
+            command: cli.password_command,
+        },
+    )?;
+    let client = Client::new(device, &cli.user, password.expose())?;
     match cli.cmd {
         Cmd::State => cmd_state(&client),
         Cmd::On => cmd_on(&client),
@@ -179,7 +242,18 @@ fn main() -> Result<()> {
             KvmCmd::Enable {
                 opt_in,
                 session_timeout,
-            } => cmd_kvm_enable(&client, opt_in, session_timeout),
+                rfb_password_file,
+                rfb_password_command,
+            } => {
+                let rfb = secret::resolve(
+                    &RFB_PASSWORD,
+                    &Sources {
+                        file: rfb_password_file,
+                        command: rfb_password_command,
+                    },
+                )?;
+                cmd_kvm_enable(&client, opt_in, session_timeout, rfb)
+            }
             KvmCmd::Disable => cmd_kvm_disable(&client),
         },
     }
@@ -274,11 +348,16 @@ fn check_rfb_password(pw: &str) -> Result<()> {
     if problems.is_empty() {
         Ok(())
     } else {
-        bail!("AMT_RFB_PASSWORD rejected: {}", problems.join("; "))
+        bail!("RFB password rejected: {}", problems.join("; "))
     }
 }
 
-fn cmd_kvm_enable(client: &Client, opt_in: bool, session_timeout: u16) -> Result<()> {
+fn cmd_kvm_enable(
+    client: &Client,
+    opt_in: bool,
+    session_timeout: u16,
+    rfb: Option<Secret>,
+) -> Result<()> {
     let before = client.kvm_settings()?;
     if !before.enabled_by_mebx {
         bail!(
@@ -286,30 +365,32 @@ fn cmd_kvm_enable(client: &Client, opt_in: bool, session_timeout: u16) -> Result
              turn it on — enable it in the firmware setup screen first"
         );
     }
-    let rfb = std::env::var("AMT_RFB_PASSWORD").ok();
-    if let Some(pw) = rfb.as_deref() {
-        check_rfb_password(pw)?;
+    if let Some(pw) = &rfb {
+        check_rfb_password(pw.expose())
+            .with_context(|| format!("RFB password from {}", pw.origin()))?;
     }
+    let rfb = rfb.as_ref().map(Secret::expose);
 
     // Port 5900 can be opened when a password "is already set or is set in the
     // same Put request" (Intel's IPS_KVMRedirectionSettingData reference), and
     // a Get never reveals whether one is stored — it always returns the field
-    // empty. So do not refuse up front for a missing AMT_RFB_PASSWORD: a
+    // empty. So do not refuse up front for a missing RFB password: a
     // previous `kvm enable` may have set one that `kvm disable` preserved.
     // Attempt the Put and explain only if the firmware actually objects. This
     // costs nothing: a Put authenticates with the AMT admin Digest credential,
     // so a rejection cannot contribute to the RFB password lockout.
     client
-        .set_kvm(rfb.as_deref(), true, opt_in, session_timeout)
+        .set_kvm(rfb, true, opt_in, session_timeout)
         .map_err(|e| {
             if rfb.is_none() {
                 e.context(
-                    "AMT_RFB_PASSWORD is not set, and the firmware refused to open port \
+                    "no RFB password was given, and the firmware refused to open port \
                      5900 — most likely no RFB password is stored. It is a separate \
-                     secret from AMT_PASSWORD: exactly 8 characters with a capital, a \
-                     lowercase, a digit and a special character, and not '\"' ',' or \
-                     ':'. Pass it in the environment, never on the command line, where \
-                     a shell will eat the special character.",
+                     secret from the AMT password: exactly 8 characters with a capital, \
+                     a lowercase, a digit and a special character, and not '\"' ',' or \
+                     ':'. Set AMT_RFB_PASSWORD, or pass --rfb-password-file <path> or \
+                     --rfb-password-command <cmd>; never the password itself on the \
+                     command line, where a shell will eat the special character.",
                 )
             } else {
                 e

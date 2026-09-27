@@ -26,6 +26,9 @@
 # .deb/tarball contents) and in HELPER_CRATES of cli/src/setup.rs (source
 # installs). A helper missing from either builds green in CI and then silently
 # never reaches users -- v0.1.13 shipped without the amt helper this way.
+# A library crate (no src/main.rs and no [[bin]], e.g. secret) is not a helper:
+# it ships inside the helpers that depend on it, so only the CI, ci-local and
+# Makefile checks apply to it.
 #
 # Run it anywhere: bash scripts/ci-local.sh needs a Linux box, this needs
 # nothing but a shell.
@@ -95,8 +98,13 @@ for manifest in "$ROOT"/*/Cargo.toml; do
   if [ -n "$make_covered" ] && ! printf '%s\n' "$make_covered" | grep -qx "$crate"; then
     missing_make="$missing_make $crate"
   fi
-  # Every crate except cli is a helper and must ship in packages + source installs.
-  if [ "$crate" != "cli" ]; then
+  # Every binary crate except cli is a helper and must ship in packages + source
+  # installs. A library crate ships inside the helpers that use it.
+  is_lib=0
+  if [ ! -f "$(dirname "$manifest")/src/main.rs" ] && ! grep -q '^\[\[bin\]\]' "$manifest"; then
+    is_lib=1
+  fi
+  if [ "$crate" != "cli" ] && [ "$is_lib" = 0 ]; then
     if [ -n "$release_helpers" ] && ! printf '%s\n' "$release_helpers" | grep -qx "$crate"; then
       missing_release="$missing_release $crate"
     fi

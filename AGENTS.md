@@ -138,7 +138,7 @@ follow-up. Run through this checklist before calling `gh pr create`:
    To catch the Linux-only failures without a round-trip, run
    `scripts/ci-local.sh` — it mirrors every GitHub Linux CI job (`cli`,
    `serialcap`, `netbootd`, `hdmicap`, `cambrionix`, `ch9329`, `hidrig`,
-   `shellyplug`, `amt`) in a Linux environment, e.g. a Lima VM:
+   `shellyplug`, `amt`, `secret`) in a Linux environment, e.g. a Lima VM:
    `limactl shell <instance> -- bash -l scripts/ci-local.sh`. It needs a Linux
    box or VM — it apt-installs and copies the tree — so treat it as the fuller
    check rather than the quick one; the three commands above are the minimum
@@ -332,7 +332,7 @@ Current capabilities:
 - On-device OCR of the captured screen (`paniolo video read [target] [--stable]`, which wraps hdmicap's `GET /ocr`; also the dashboard OCR button): Apple Vision on macOS, Tesseract on Linux
 - USB HID input (keyboard/mouse injection) via a generic helper hook (`paniolo hid send`); the `hidrig` helper drives the dual-board KB2040 injector — it composes HID reports in Rust and writes binary frames to the control board's USB-CDC endpoint, which relays them over I2C1 to the target board (the "dumb pipe", docs/dev/hid-dual-board-design.md; command vocabulary in docs/dev/hid-serial-protocol.md). `hidrig serve` runs a daemon that owns the control link and re-exposes the command vocabulary over a WebSocket, so `paniolo console` works as a **KVM** — stream the browser's keyboard + absolute mouse (`moveabs`) to the target, intermixed with CLI injection on the one wire. The same control board can also **bridge the DUT serial console** (its hardware UART, re-exported by the daemon as a PTY into the `serial` channel) and **switch DUT power** via a relay (`hidrig power off|on|cycle`), so one USB device backs the target's HID, console, and power (design §6–§7; the relay/power path is hardware-verified, incl. NVM state persistence across a control-board reset — the console bridge is not yet)
 - Switchable USB media via a generic per-target `usb` channel (`paniolo usb attach-host|attach-target|state`): one physical USB device routed to the control host or the target, never both. Supported today on the **Openterface KVM-Go**, whose onboard microSD reader sits behind an FSUSB42 mux driven by the same CH32V208 (and the same serial port) as its `hid` channel — so the `ch9329` helper backs both, and the two channels normally carry the same `--cmd`. The point is hands-free *physical* boot media, which firmware can see and streamed virtual media generally cannot. Like the power hooks the helper is opaque, but the vocabulary is **fixed** rather than passed through: paniolo appends `usb host`, `usb target`, or `usb state`, keeping the surface a constrained remote host must expose to three verbs. Guide: docs/usb.md; clean-room protocol: notes/openterface-usb-mux-spec.md. The Mini-KVM's switchable USB-A port uses a different mechanism (a register write over the capture chip's HID config interface) that is documented but not yet implemented by any helper
-- Power control via DTR (J2 wiring; **opt-in per serial interface** via `power_button = true` — `serial dtr`/`reset` refuse interfaces that haven't declared it) or generic shell-command hooks (`on_cmd`, `off_cmd`, `cycle_cmd`, `state_cmd`): `paniolo serial dtr`, `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`. Note: "reboot over the serial console" means `serial send <t> "reboot"` (software), *not* the DTR `serial reset` (hardware). Helpers that wire into the hooks: `cambrionix` (Cambrionix hub port power via control UART), `zigplug` (Zigbee smart plugs via a CC2652 coordinator dongle), `shellyplug` (Shelly Gen2+ smart plugs/relays over the device's local HTTP RPC API — no cloud/HA/Matter), and `amt` (Intel AMT/vPro machines over WS-Management on port 16992 with HTTP Digest auth — per-target power with no plug hardware, plus true power-state readback from the ME; password only via `AMT_PASSWORD` env). The dual-board `hidrig` control board can also drive a DUT power relay (`hidrig power off|on|cycle`) as a power-helper backend, consolidating HID + console + power on one USB device
+- Power control via DTR (J2 wiring; **opt-in per serial interface** via `power_button = true` — `serial dtr`/`reset` refuse interfaces that haven't declared it) or generic shell-command hooks (`on_cmd`, `off_cmd`, `cycle_cmd`, `state_cmd`): `paniolo serial dtr`, `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`. Note: "reboot over the serial console" means `serial send <t> "reboot"` (software), *not* the DTR `serial reset` (hardware). Helpers that wire into the hooks: `cambrionix` (Cambrionix hub port power via control UART), `zigplug` (Zigbee smart plugs via a CC2652 coordinator dongle), `shellyplug` (Shelly Gen2+ smart plugs/relays over the device's local HTTP RPC API — no cloud/HA/Matter), and `amt` (Intel AMT/vPro machines over WS-Management on port 16992 with HTTP Digest auth — per-target power with no plug hardware, plus true power-state readback from the ME; password via `AMT_PASSWORD`, `--password-file` or `--password-command`, never in the lab file). The dual-board `hidrig` control board can also drive a DUT power relay (`hidrig power off|on|cycle`) as a power-helper backend, consolidating HID + console + power on one USB device
 
 ## Architecture
 
@@ -675,8 +675,10 @@ amt/             Rust crate: standalone helper for Intel AMT (vPro) machine
                  RFC 2617) implemented in-crate — AMT 11+ is Digest-only.
                  Addressed by `-d <host|ipv4|[ipv6]>[:port]` (strictly parsed;
                  anything else URL-shaped is rejected) and `-u <user>` (default
-                 admin); password ONLY via the AMT_PASSWORD env var (never in
-                 the lab file). Commands: `status`, `state` (prints exactly
+                 admin); password from AMT_PASSWORD, --password-file or
+                 --password-command (first set wins; via the `secret` crate;
+                 never the password itself in a flag or the lab file; a
+                 credential failure exits 3). Commands: `status`, `state` (prints exactly
                  `on`/`off`; PowerState 2 = on, sleep/hibernate/off = off, any
                  other value is an error, never a guess), `on`, `off` (hard
                  power-off, confirmed as Off - Soft), `cycle [--delay-ms 3000]`
@@ -688,6 +690,18 @@ amt/             Rust crate: standalone helper for Intel AMT (vPro) machine
                  around host power transitions. TLS AMT (16993) is unsupported
                  (clear error). Hardware-verified against a Dell OptiPlex 7060
                  (AMT 12). See docs/power.md.
+
+secret/          Rust library crate (no binary), shared by path dependency —
+                 the one crate helpers share rather than copy. Resolves a
+                 helper's secret X from env X, then `--x-file <path>` (one
+                 trailing newline dropped; warns if group/other-readable),
+                 then `--x-command <cmd>` (`sh -c`/`cmd /C`, no stdin, stdout
+                 is the value, 30 s timeout) — the restic/borg pattern (#249).
+                 Every failure is `NotConfigured`; `is_not_configured` lets a
+                 helper's `main` exit 3. Used by amt (AMT_PASSWORD,
+                 AMT_RFB_PASSWORD). A new helper that needs a secret uses it
+                 with its own `Spec` and flags; see
+                 docs/dev/adding-power-helpers.md.
 
 zigplug/         Python (uv) helper: Zigbee smart plug control via a CC2652 (ZNP)
                  coordinator dongle, using zigpy-znp. CLI wired into paniolo

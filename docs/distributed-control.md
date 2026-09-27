@@ -173,6 +173,12 @@ process listing shows only the name.
   `setup --host`). Its stdin is your terminal; those commands don't need
   `AMT_PASSWORD`.
 
+Forwarding is one way to get the password there. A hook can instead name a
+`--password-file` or `--password-command` (see
+[power.md](power.md#setting-up-the-credential-source)), which is read on the
+control host where the hook runs, so a runner on the control host itself
+needs nothing forwarded. A forwarded `AMT_PASSWORD` wins over either.
+
 ### The dashboard, and why multi-host rules out a reverse-proxy
 
 hdmicap serves the dashboard page, and the page reaches serialcap by an

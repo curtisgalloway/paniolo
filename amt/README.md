@@ -28,15 +28,25 @@ Commands talk to the **Management Engine** (ME), which runs on standby power, so
 
 ## Credentials
 
-The Digest password comes **only** from the `AMT_PASSWORD` environment
-variable, never a flag or config file. Inject it at call time; with 1Password:
+The Digest password is never a flag's value or a config-file entry. It comes
+from the first of these that is set:
+
+1. the `AMT_PASSWORD` environment variable;
+2. `--password-file <path>` (one trailing newline dropped);
+3. `--password-command <cmd>`, run by `sh -c` (`cmd /C` on Windows), whose
+   stdout is the password; killed after 30 s.
 
 ```bash
+amt -d 192.168.99.50 --password-command 'op read op://lab/amt/password' state
+amt -d 192.168.99.50 --password-file ~/.config/paniolo/amt state
 op run --env-file .env -- bash -c 'amt state -d 192.168.99.50'
 ```
 
-Keep the single quotes, or the parent shell expands `$AMT_PASSWORD` before the
-wrapper sets it. Pass the username (default `admin`) with `-u`.
+In the `op run` form keep the single quotes, or the parent shell expands
+`$AMT_PASSWORD` before the wrapper sets it. When no source works, `amt` exits
+3 (not configured). Pass the username (default `admin`) with `-u`. `kvm enable`
+takes its RFB password the same way: `AMT_RFB_PASSWORD`,
+`--rfb-password-file`, or `--rfb-password-command`.
 
 ## Usage
 
@@ -72,5 +82,6 @@ paniolo power set -t <target> \
     --state-cmd "amt state -d <host>"
 ```
 
-See `docs/power.md` for the full recipe, including how to provide
-`AMT_PASSWORD` to `paniolo power …`.
+Add `--password-file` or `--password-command` to each hook, or run
+`paniolo power …` with `AMT_PASSWORD` set. See `docs/power.md` for the full
+recipe, with systemd, 1Password and macOS Keychain examples.

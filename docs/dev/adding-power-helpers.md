@@ -59,6 +59,15 @@ The environment the helper must tolerate:
   modes (pairing windows, monitors) off the hook paths.
 - **stdout/stderr pass through**, except `state_cmd` stdout, which is parsed.
   On failure, print to stderr and exit non-zero.
+- **Secrets come from the `secret` crate, never a flag's value or the lab
+  file.** A helper that needs a password or token `X` depends on
+  `secret = { path = "../secret" }`, declares a `secret::Spec` naming env `X`
+  and its flags `--x-file` / `--x-command`, and calls `secret::require` (or
+  `secret::resolve` for an optional one). The first source set wins, in the
+  order env, file, command; a hook can then carry its own source and needs
+  nothing in the environment. Map a `secret::NotConfigured` error to exit 3
+  (`secret::is_not_configured`), as `amt/src/main.rs` does: retrying will not
+  fix a missing file. See [power.md](../power.md#credentials).
 
 ## 2. Helper CLI conventions
 

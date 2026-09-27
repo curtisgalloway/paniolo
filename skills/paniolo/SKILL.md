@@ -525,21 +525,20 @@ paniolo power set -t optiplex \
     --state-cmd "amt state -d 10.0.0.5 -u admin"
 ```
 
-**The AMT password is not in the lab file** — the helper takes it from the
-`AMT_PASSWORD` environment variable, so `paniolo power …` / `power-cycle` /
-`power-state` against an AMT-backed target must run with it set, e.g.
+**The AMT password is not in the lab file.** The helper takes it from the
+first set of: the `AMT_PASSWORD` environment variable, `--password-file
+<path>`, or `--password-command <cmd>` (whose stdout is the password). A hook
+that carries its own source needs nothing in the environment, e.g.
+`--state-cmd "amt state -d 10.0.0.5 --password-command 'op read op://lab/amt/password'"`;
+look at the existing hooks before composing a fetch by hand. Otherwise run
+`paniolo power …` with `AMT_PASSWORD` set, e.g.
 `op run --env-file .env -- bash -c 'paniolo power-cycle optiplex'` (single
-quotes — the parent shell must not expand it). 1Password is only one option:
-any secret manager works, usually via a committed reference file or a small
-fetch-and-exec wrapper next to the automation that invokes paniolo — look
-for one there before composing the fetch by hand. Without the variable the
-hook fails with a message saying exactly this. Setting it only where *you*
-run the command is enough — if the target's power channel lives on a remote
-control host, paniolo's own dispatch carries `AMT_PASSWORD` the rest of the
-way (over the remote command's stdin, never its argv, so `ps` on the control
-host never shows it); there is nothing to install on the control host for
-this specific variable. See "Setting up the credential source" in
-`docs/power.md` for the patterns.
+quotes — the parent shell must not expand it). A file path or command in a
+hook is resolved on the host where the hook runs (the control host for a
+remote power channel); `AMT_PASSWORD` set where *you* run the command is
+carried to a remote control host by paniolo's own dispatch, over the remote
+command's stdin, never its argv, and wins over the hook's file or command.
+See "Setting up the credential source" in `docs/power.md` for the patterns.
 
 ## Switchable USB media — hand a card between host and target
 
@@ -817,9 +816,11 @@ the device is free just because a daemon is gone from the tracked list.
   set the host's `identity` (agent key-spray); if the remote can't find paniolo,
   set its `paniolo_cmd` to an absolute path.
 - OCR is strongest on large text; tiny console fonts may misread some characters.
-- AMT-backed power hooks need `AMT_PASSWORD` in the environment of the
-  `paniolo power …` invocation (see the Intel AMT power example) — a clean
-  "AMT_PASSWORD is not set" failure means inject the secret, not a bug.
+- AMT-backed power hooks need a password source: `AMT_PASSWORD` in the
+  environment of the `paniolo power …` invocation, or `--password-file` /
+  `--password-command` in the hook (see the Intel AMT power example). A hook
+  failing with `child_exit` 3 and "the AMT password is not set" (or a file or
+  command error) means configure the secret, not a bug.
 
 ---
 
