@@ -55,17 +55,25 @@ A **target** (DUT, device under test) is the machine being developed on; a
 
 ## Installation
 
-### macOS: Homebrew
+### Homebrew (macOS and Linux)
 
-The tap installs a prebuilt universal binary (Apple Silicon and Intel):
+The tap pours prebuilt binaries: universal on macOS (Apple Silicon and Intel),
+and x86-64 or arm64 on Linux. No Rust toolchain needed:
 
 ```bash
 brew tap curtisgalloway/tap
 brew install paniolo
 ```
 
-Upgrade with `brew upgrade`. Run `paniolo setup` once after installing: it
-setuid-installs `netbootd-bpf-helper` (one sudo) and the optional zigplug helper.
+Upgrade with `brew upgrade`. Run `paniolo setup` once after installing: on
+macOS it setuid-installs `netbootd-bpf-helper` (one sudo); on Linux it checks
+`dialout`/`video` group membership. Both install the optional zigplug helper.
+
+On a Linux host that runs capture daemons for days at a time (a control host),
+prefer the apt repository below. The `.deb` also installs a `tmpfiles.d` rule
+that keeps systemd from deleting the daemons' discovery files after ten days
+([#187](https://github.com/curtisgalloway/paniolo/issues/187)); Homebrew cannot
+install files outside its prefix.
 
 `brew install --HEAD paniolo` builds `main` from source, the same path as
 `make install` below.
@@ -110,7 +118,7 @@ sets group membership and installs the optional zigplug helper.
 Requirements:
 
 - macOS 10.14 (Mojave) or later, or Linux (x86-64 / arm64)
-- [Homebrew](https://brew.sh) (macOS only)
+- On macOS: [Homebrew](https://brew.sh)
 - Rust toolchain (`brew install rustup` on macOS, or `rustup.rs` on Linux)
 - On Linux: `sudo apt-get install pkg-config libudev-dev libclang-dev cmake nasm`
   (`make install` checks for these and tells you what's missing)
