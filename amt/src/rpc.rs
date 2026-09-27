@@ -553,7 +553,8 @@ fn auth_failed(rechallenge: Option<&str>) -> anyhow::Error {
     } else {
         anyhow!(
             "authentication failed (HTTP 401 after digest response) — \
-             check AMT_PASSWORD and the username"
+             check the AMT password (AMT_PASSWORD, --password-file or \
+             --password-command) and the username"
         )
     }
 }

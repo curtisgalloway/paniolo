@@ -15,6 +15,7 @@ dependencies = [
  "anyhow",
  "clap",
  "md-5",
+ "secret",
  "ureq",
 ]
 
@@ -484,6 +485,10 @@ dependencies = [
  "rustls-pki-types",
  "untrusted",
 ]
+
+[[package]]
+name = "secret"
+version = "0.1.0"
 
 [[package]]
 name = "serde"

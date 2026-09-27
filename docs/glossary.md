@@ -23,6 +23,7 @@ each term briefly on first use; this page is the longer reference.
 | **discovery file** | The small file a daemon writes in the runtime directory with its address, PID and token. paniolo's only record that the daemon is running. |
 | **stale / untracked daemon** | *Stale*: still running an old binary after an upgrade. *Untracked*: still running after its discovery file was deleted. |
 | **passthrough command** | A command that hands back another program's exit status unchanged, such as `paniolo helper <name>` or `paniolo adb run`. See [Exit status and errors](errors.md#passthrough-commands). |
+| **credential source** | Where a helper reads a secret such as the AMT password: an environment variable, a file (`--password-file`) or a command whose output is the secret (`--password-command`). The first one set wins. |
 | **link mode** | The host side of the direct USB-Ethernet link to a target. `paniolo netif` puts it in one of four modes: netboot, link, ffx or off. |
 
 ## Hardware
@@ -42,6 +43,7 @@ each term briefly on first use; this page is the longer reference.
 | **PDU** | Power distribution unit: a networked power strip with switchable outlets. |
 | **PHY** | The physical-layer chip behind an Ethernet port. |
 | **USB mux** | A switch that connects a USB device to one of two hosts. |
+| **systemd credential** | A secret systemd hands a service at start (`LoadCredential=`) as a file in a private directory named by `$CREDENTIALS_DIRECTORY`. |
 | **Zigbee** | A low-power wireless protocol used by smart plugs. |
 
 ## Protocols and interfaces
