@@ -154,7 +154,12 @@ paniolo power-state [target]      # state_cmd if set; else serial sense-line
 ```
 
 **`power-cycle`** runs `cycle_cmd` with no built-in timing; the script owns the
-sequence. A failing script makes paniolo exit 101 (`helper_failed`), with the
+sequence. A script may return before the cycle ends (a relay board that times
+the off period itself), so when `state_cmd` is set, `power-cycle` then reads it
+every 500 ms until it reports `on` and only then prints `Power cycle complete`.
+If it still reports `off` after 30 s, paniolo exits 22 (`timeout`, outcome
+unknown). Without `state_cmd` it cannot check, and prints `Power cycle
+requested` instead. A failing script makes paniolo exit 101 (`helper_failed`), with the
 script's code as `child_exit` in the `--json-errors` object. A missing or
 non-executable script (shell code 127/126) exits 3 (`not_configured`). See
 [Exit status and errors](errors.md).
