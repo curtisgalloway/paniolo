@@ -44,10 +44,18 @@
 
 name: CodeQL
 
+# Not on pull_request, on purpose. A Rust analysis takes about 7 minutes, and
+# a train of PRs merged one after another (main requires up-to-date branches)
+# paid for one run per PR, again per branch update, and again per merge.
+# CodeQL is not a required check, so PR runs never gated a merge anyway. On
+# main, the concurrency group below cancels a run that a newer push
+# supersedes, so a train costs about one full analysis of the final main.
+# Findings now arrive after merge instead of on the PR; run the workflow by
+# hand (workflow_dispatch) on a branch to scan it before merging.
 on:
   push:
     branches: [main]
-  pull_request:
+  workflow_dispatch:
   schedule:
     # Weekly, matching the cadence default setup used.
     - cron: "24 5 * * 1"
