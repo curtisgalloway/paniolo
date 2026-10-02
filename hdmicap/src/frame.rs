@@ -96,8 +96,8 @@ pub struct FrameState {
     pub pixels: PixelData,
     pub width: u32,
     pub height: u32,
-    /// Perceptual hash (8x8 aHash over strided luma samples). Powers
-    /// change-detection and a secondary torn-frame check. Cheap every frame.
+    /// Exact digest of the frame's pixels (see `digest`): changes when any
+    /// pixel does. Powers change-detection (`changed_since`).
     pub hash: u64,
     pub signal: Signal,
     /// Bumps every time the capture resolution changes. Lets a consumer notice
@@ -160,37 +160,33 @@ impl From<&FrameState> for StatusDto {
     }
 }
 
-/// Samples per hash cell edge: each of the 64 aHash cells averages an 8x8
-/// sample grid, 4096 luma reads total — resolution-independent cost.
+/// Edge of the luma sample lattice the no-signal test reads: 64x64, 4096
+/// reads total — resolution-independent cost.
 ///
-/// This was 4 (a 32x32 lattice, 1024 reads) and that was too coarse to *see*
-/// console text. On a 1280x720 Gigaboot screen — 1.35% of pixels at luma 255 —
-/// a 32x32 lattice landed on no glyph at all: max luma seen 20, so the frame
-/// classified as blank and hdmicap reported `no_signal` on a perfectly
-/// readable screen. At 64x64 the same frame yields max luma 255 across 42
-/// samples. See evals/ocr/dataset/README.md for the measurements.
-///
-/// The 8x8 cell grid, and therefore the 64-bit hash, is unchanged.
-const CELL_SAMPLES: u32 = 8;
-const GRID: u32 = 8 * CELL_SAMPLES; // 64x64 sample lattice
+/// This was 32 (1024 reads) and that was too coarse to *see* console text. On
+/// a 1280x720 Gigaboot screen — 1.35% of pixels at luma 255 — a 32x32 lattice
+/// landed on no glyph at all: max luma seen 20, so the frame classified as
+/// blank and hdmicap reported `no_signal` on a perfectly readable screen. At
+/// 64x64 the same frame yields max luma 255 across 42 samples. See
+/// evals/ocr/dataset/README.md for the measurements.
+const GRID: u32 = 64;
 
 /// A luma level that cannot come from an unlit panel. Well above the noise of a
 /// black frame from a capture dongle, well below any legible text.
 const BRIGHT: u32 = 64;
 
-/// One-pass strided classification: 8x8 aHash + (near-)black no-signal
-/// detection from the same 4096 luma samples. `luma_at(x, y)` must return
-/// FULL-RANGE luma (0-255); callers normalize video-range sources.
+/// (Near-)black no-signal detection from a strided 64x64 lattice of luma
+/// samples. `luma_at(x, y)` must return FULL-RANGE luma (0-255); callers
+/// normalize video-range sources.
 ///
-/// Replaces the old grayscale()+resize() aHash and full-image no-signal scan,
-/// whose cost scaled with resolution (~hundreds of ms at 8 MP — the capture
-/// loop ran at 1.4 fps against the IPEVO V4K before this).
-pub fn classify<F: FnMut(u32, u32) -> u8>(w: u32, h: u32, mut luma_at: F) -> (u64, bool) {
+/// Replaces the old full-image no-signal scan, whose cost scaled with
+/// resolution (~hundreds of ms at 8 MP — the capture loop ran at 1.4 fps
+/// against the IPEVO V4K before this).
+fn is_no_signal<F: FnMut(u32, u32) -> u8>(w: u32, h: u32, mut luma_at: F) -> bool {
     if w == 0 || h == 0 {
-        return (0, true);
+        return true;
     }
 
-    let mut cells = [0u32; 64];
     let mut sum = 0u64;
     let mut sum_sq = 0u64;
     let mut max = 0u32;
@@ -201,7 +197,6 @@ pub fn classify<F: FnMut(u32, u32) -> u8>(w: u32, h: u32, mut luma_at: F) -> (u6
         for gx in 0..GRID {
             let x = (gx * w + w / 2) / GRID;
             let l = luma_at(x.min(w - 1), y.min(h - 1)) as u32;
-            cells[((gy / CELL_SAMPLES) * 8 + gx / CELL_SAMPLES) as usize] += l;
             sum += l as u64;
             sum_sq += (l * l) as u64;
             max = max.max(l);
@@ -218,28 +213,59 @@ pub fn classify<F: FnMut(u32, u32) -> u8>(w: u32, h: u32, mut luma_at: F) -> (u6
     // BRIGHT is enough to prove something is lit, whatever the average says.
     // Conservative on purpose — this decides whether an agent is allowed to
     // read the screen at all.
-    let no_signal = mean < 10 && var < 64 && max < BRIGHT;
-
-    // Bit per cell: cell's sample sum vs the global mean of cell sums.
-    let cell_mean = (sum / 64) as u32;
-    let mut bits = 0u64;
-    for (i, &c) in cells.iter().enumerate() {
-        if c >= cell_mean {
-            bits |= 1 << i;
-        }
-    }
-    (bits, no_signal)
+    mean < 10 && var < 64 && max < BRIGHT
 }
 
-/// Classify an NV12 luma plane ('420v', video-range: black=16). Normalizes
-/// to full range so the no-signal thresholds keep their meaning.
+/// The frame hash: an exact 64-bit digest of every byte of the frame's pixel
+/// buffer (the first `len` bytes of `bytes`), plus its dimensions. It is only
+/// a "has the screen changed?" token — `/snapshot?changed_since=`, the
+/// `x-frame-hash` header, `/status` — so any pixel that changes changes it.
+///
+/// This was an 8x8 aHash (one bit per cell: above or below the mean), which
+/// could not see a few lines of console text on a 1080p screen: a command's
+/// output did not flip a single cell, so `changed_since` waited out its whole
+/// timeout (#258). The cost of exactness is that a blinking cursor or a
+/// ticking clock is a change too. Consecutive frames of a static screen were
+/// measured bit-identical on an MS2109-class MJPEG dongle, so capture noise
+/// does not trip it there.
+///
+/// Word-at-a-time multiply-rotate (the FxHash step) with a murmur3 finalizer:
+/// about a millisecond for an 8 MP luma plane. Not stable across hdmicap
+/// versions and not collision-resistant against an adversary; neither is
+/// needed for a token that lives as long as the daemon.
+fn digest(bytes: &[u8], len: usize, w: u32, h: u32) -> u64 {
+    const K: u64 = 0x9e37_79b9_7f4a_7c15;
+    let bytes = &bytes[..len.min(bytes.len())];
+    let mut acc = ((u64::from(w) << 32) | u64::from(h)).wrapping_mul(K);
+    let (words, rest) = bytes.as_chunks::<8>();
+    for &word in words {
+        acc = (acc.rotate_left(5) ^ u64::from_le_bytes(word)).wrapping_mul(K);
+    }
+    for &b in rest {
+        acc = (acc.rotate_left(5) ^ u64::from(b)).wrapping_mul(K);
+    }
+    acc = (acc.rotate_left(5) ^ bytes.len() as u64).wrapping_mul(K);
+    acc ^= acc >> 33;
+    acc = acc.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    acc ^= acc >> 33;
+    acc = acc.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    acc ^ (acc >> 33)
+}
+
+/// Classify an NV12 luma plane ('420v', video-range: black=16): the frame
+/// hash over the Y plane, and no-signal. Normalizes to full range so the
+/// no-signal thresholds keep their meaning.
 pub fn classify_nv12(y: &[u8], w: u32, h: u32) -> (u64, bool) {
-    classify(w, h, |x, yy| {
+    if w == 0 || h == 0 {
+        return (0, true);
+    }
+    let no_signal = is_no_signal(w, h, |x, yy| {
         let raw = *y
             .get((yy as usize) * (w as usize) + x as usize)
             .unwrap_or(&16);
         ((raw.saturating_sub(16) as u32 * 255) / 219).min(255) as u8
-    })
+    });
+    (digest(y, w as usize * h as usize, w, h), no_signal)
 }
 
 /// Classify a full-range luma plane, as JPEG grayscale decoding delivers it.
@@ -248,21 +274,30 @@ pub fn classify_nv12(y: &[u8], w: u32, h: u32) -> (u64, bool) {
 /// stretching it again would push a dim screen toward `Stable` and a black one
 /// toward lit.
 pub fn classify_gray(y: &[u8], w: u32, h: u32) -> (u64, bool) {
-    classify(w, h, |x, yy| {
+    if w == 0 || h == 0 {
+        return (0, true);
+    }
+    let no_signal = is_no_signal(w, h, |x, yy| {
         *y.get((yy as usize) * (w as usize) + x as usize)
             .unwrap_or(&0)
-    })
+    });
+    (digest(y, w as usize * h as usize, w, h), no_signal)
 }
 
-/// Classify a packed RGB8 buffer (Rec.601 luma, integer).
+/// Classify a packed RGB8 buffer (Rec.601 luma, integer). The hash covers
+/// all three channels, so a change of color alone counts.
 pub fn classify_rgb(rgb: &[u8], w: u32, h: u32) -> (u64, bool) {
-    classify(w, h, |x, y| {
+    if w == 0 || h == 0 {
+        return (0, true);
+    }
+    let no_signal = is_no_signal(w, h, |x, y| {
         let i = ((y as usize) * (w as usize) + x as usize) * 3;
         match rgb.get(i..i + 3) {
             Some(p) => ((p[0] as u32 * 77 + p[1] as u32 * 150 + p[2] as u32 * 29) >> 8) as u8,
             None => 0,
         }
-    })
+    });
+    (digest(rgb, w as usize * h as usize * 3, w, h), no_signal)
 }
 
 #[cfg(test)]
@@ -465,8 +500,7 @@ mod tests {
 
     #[test]
     fn hash_different_images_differ() {
-        // aHash measures structure (above/below mean): opposing horizontal
-        // gradients must produce different bit patterns.
+        // Opposing horizontal gradients: same histogram, different pixels.
         let w = 320u32;
         let h = 240u32;
         let gradient = |left_dark: bool| -> Vec<u8> {
@@ -481,6 +515,51 @@ mod tests {
         let a = classify_rgb(&gradient(true), w, h).0;
         let b = classify_rgb(&gradient(false), w, h).0;
         assert_ne!(a, b);
+    }
+
+    /// Two lines of console output change the hash (#258). The scene is the
+    /// one the bug was found on: a 1080p virtual console whose tab bar
+    /// already lights the top-left cells, then a command's output below it.
+    /// The old 8x8 aHash reported the same value with and without the
+    /// output — those cells were already "above the mean" — so
+    /// `changed_since` slept through it.
+    #[test]
+    fn hash_sees_a_few_lines_of_text() {
+        let (w, h) = (1920u32, 1080u32);
+        // 16-pixel-high "glyphs": 2-pixel strokes every 8 pixels.
+        let write_line = |buf: &mut [u8], top: u32, width: u32| {
+            for y in top + 2..top + 14 {
+                for x in (0..width).filter(|x| x % 8 < 2) {
+                    buf[(y * w + x) as usize] = 255;
+                }
+            }
+        };
+        let mut prompt = vec![0u8; (w * h) as usize];
+        write_line(&mut prompt, 0, 470); // tab bar
+        write_line(&mut prompt, 16, 8); // "$"
+        let mut output = prompt.clone();
+        write_line(&mut output, 16, 120); // "$ echo mcp-hid-ok"
+        write_line(&mut output, 32, 80); // "mcp-hid-ok"
+        write_line(&mut output, 48, 8); // "$"
+        assert_ne!(
+            classify_gray(&prompt, w, h).0,
+            classify_gray(&output, w, h).0
+        );
+    }
+
+    /// One changed pixel anywhere, including the very last byte, which the
+    /// word loop leaves to the remainder when the length is not a multiple
+    /// of 8.
+    #[test]
+    fn hash_sees_one_pixel() {
+        let (w, h) = (321u32, 3u32); // 963 bytes: a 3-byte remainder
+        let base = vec![40u8; (w * h) as usize];
+        let base_hash = classify_gray(&base, w, h).0;
+        for i in [0, 500, (w * h - 1) as usize] {
+            let mut changed = base.clone();
+            changed[i] = 41;
+            assert_ne!(classify_gray(&changed, w, h).0, base_hash, "pixel {i}");
+        }
     }
 
     #[test]
