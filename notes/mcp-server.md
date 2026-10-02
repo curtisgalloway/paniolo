@@ -187,11 +187,17 @@ The worker design above stays as the plan for that case. Reconnect still
 matters without it: per-call dispatch over a half-open ControlMaster hangs the
 same way, so step 2 is still worth doing first.
 
-### 2. SSH keepalive (independent, small)
+### 2. SSH keepalive (independent, small) — done
 
 Add `ServerAliveInterval=5` and `ServerAliveCountMax=3` to the options in
-`cli/src/ssh.rs`. Two lines. Helps every remote CLI call today, and the worker
-depends on it later.
+`cli/src/ssh.rs`. Helps every remote CLI call today, and the worker depends on
+it later.
+
+Done 2026-10-02: `ssh::liveness_args` now supplies `ConnectTimeout` and both
+`ServerAlive*` options to every ssh and sftp paniolo starts (`base_args` and
+`transfer_args`), so whichever invocation starts the ControlMaster carries
+them. A half-open link now fails as `unreachable` (exit 4) in ~15 s instead of
+hanging. Not yet exercised against a real sleeping laptop.
 
 ### 3. Spike `paniolo mcp`
 
