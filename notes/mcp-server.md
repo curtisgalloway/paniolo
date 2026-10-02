@@ -5,12 +5,13 @@ SPDX-License-Identifier: Apache-2.0
 
 # An MCP server for paniolo
 
-> **Status: spike built, not yet tried with a real harness.** Converged
+> **Status: spike built and passed a real-harness test (blank frame only).** Converged
 > 2026-10-02. Step 1 (measure per-call dispatch) is done: on a LAN it costs
 > ~17 ms per call, so the spike uses per-call dispatch and the persistent
 > worker is deferred (see *Step 1 result*). Step 2 (SSH keepalive) is done and
 > hardware-checked. Step 3's spike, `paniolo mcp` with `target_list` and
-> `video_shot`, is built; its try-it-with-a-harness stop point is open.
+> `video_shot`, is built and passed its stop point against a real target and
+> a real Claude Code client. Still untested: a target with a live picture.
 
 ## Goal
 
@@ -221,7 +222,7 @@ For whoever repeats it: `-o /dev/null` fails for `video shot` (it writes a
 temp file beside the output path), and unprivileged `ss -p` on the control host
 does not show sshd's pid, so the process has to be found by elimination.
 
-### 3. Spike `paniolo mcp` — built, not yet tried with a harness
+### 3. Spike `paniolo mcp` — built, stop point passed
 
 - New module `cli/src/mcp.rs`, one clap variant `Command::Mcp`.
 - Two tools only: `target_list` and `video_shot` (image + hash).
@@ -237,7 +238,42 @@ stdin/stdout, and `video_shot`'s tests execute a fake `paniolo` script to
 prove the argv, the closed stdin and the image read-back. An end-to-end run of
 the real binary over a pipe (handshake, `tools/list`, `target_list`, and a
 `video_shot` with no daemon returning a clean tool error) worked. User doc:
-`docs/mcp.md`. **Open:** the try-it step against a real target and harness.
+`docs/mcp.md`.
+
+#### Step 3 result (2026-10-02)
+
+Run on the dev machine against `target-machine`, whose video channel is on
+`bench1`, same LAN. Its daemon was the only one running in the lab, and the
+target had **no signal**, so every shot was a blank frame: this proves the
+plumbing, not reading a live screen.
+
+**Protocol over a pipe: pass on every check.**
+- stdout was exactly the 4 expected JSON lines and nothing else; stderr was
+  empty.
+- `video_shot` returned `isError: false`, a `image/png` item and
+  `signal=no_signal  hash=ffffffffffffffff`.
+- The decoded PNG was valid: 1920×1080, 33 KB, uniformly near-black.
+- A whole session (process start, `initialize`, one `video_shot`) took a
+  median of **52 ms** over 6 runs.
+- `changed_since` with that hash and `timeout_ms: 3000` returned after
+  3,056 ms with `(timeout)`, as expected on a static screen.
+
+**Real harness: pass.** A headless Claude Code run (`claude -p`, a throwaway
+`--mcp-config` with `--strict-mcp-config`):
+- found and called both tools: `target_list`, then `video_shot` with
+  `stable: true`, which it chose on its own;
+- took 4 turns and 22 s;
+- described the screenshot correctly: a solid near-black 1920×1080 frame with
+  `signal=no_signal`, so nothing was reaching the capture input;
+- listed all the lab's targets correctly.
+
+**Verdict:** the image reaches the model in one call of about 50 ms, with no
+file path and no second read step, and the model understood it unprompted.
+That clears the stop point, so step 4 can go ahead.
+
+**Still open:** a target with a live picture. Also, `target_list` returns the
+lab's real host and target names, so a transcript quoted from a real run must
+be scrubbed before it goes anywhere public.
 
 **Stop point:** if image-in-the-result is not clearly better than
 shot-then-read, stop here.
