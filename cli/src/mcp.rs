@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::Result;
+
+use crate::error::Kind;
 use serde_json::{json, Value};
 
 /// MCP revisions this server accepts. The tools-only subset is identical
@@ -127,7 +129,10 @@ impl Server {
                 let req = ShotRequest::from_args(&args)?;
                 Ok(self.video_shot(&req))
             }
-            other => Err(format!("unknown tool: {other}")),
+            other => {
+                let call = cli_call(other, &args)?;
+                Ok(self.run_cli_tool(&call))
+            }
         }
     }
 
@@ -195,6 +200,49 @@ impl Server {
         })
     }
 
+    /// Run a tool that maps onto one paniolo command and reports its output
+    /// as text. stderr rides along after stdout when there is any, because
+    /// it carries warnings an agent should see (a stale serial log, say).
+    fn run_cli_tool(&self, call: &CliCall) -> Value {
+        let out = match self.run_child(&call.argv) {
+            Ok(out) => out,
+            Err(e) => return tool_error(&format!("running paniolo: {e}")),
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let verb = call.verb();
+        if !out.status.success() {
+            let code = crate::error::shell_code(out.status);
+            let unknown = call.writes
+                && [Kind::Unreachable, Kind::Timeout]
+                    .iter()
+                    .any(|k| k.exit_code() == code);
+            let mut text = format!("paniolo {verb} exited {code}");
+            if unknown {
+                text.push_str(
+                    "\nOutcome unknown: the command may or may not have run. \
+                     Check the target's state before repeating it.",
+                );
+            }
+            for part in [stdout.trim_end(), stderr.trim_end()] {
+                if !part.is_empty() {
+                    text.push('\n');
+                    text.push_str(part);
+                }
+            }
+            return tool_error(&text);
+        }
+        let mut text = stdout.trim_end().to_string();
+        if text.is_empty() {
+            text = format!("paniolo {verb}: ok");
+        }
+        if !stderr.trim().is_empty() {
+            text.push_str("\nstderr:\n");
+            text.push_str(stderr.trim_end());
+        }
+        tool_text(&text)
+    }
+
     /// Run this binary with `args`, never letting it near the protocol
     /// stream: stdin closed (it must not read our requests), stdout and
     /// stderr captured.
@@ -209,6 +257,170 @@ impl Server {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
+    }
+}
+
+/// One tool call translated into a paniolo argv.
+#[derive(Debug, PartialEq)]
+struct CliCall {
+    argv: Vec<String>,
+    /// The command changes the target (input, power). A write whose outcome
+    /// is unknown must not be retried blindly, so its error says so.
+    writes: bool,
+}
+
+impl CliCall {
+    /// The command's words before its first flag, for messages.
+    fn verb(&self) -> String {
+        self.argv
+            .iter()
+            .take_while(|a| !a.starts_with('-'))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// Typed access to a tool's `arguments` object. Every error names the tool
+/// and the argument, and comes back to the agent as a JSON-RPC error.
+struct Args<'a> {
+    tool: &'a str,
+    v: &'a Value,
+}
+
+impl Args<'_> {
+    fn target(&self) -> Result<String, String> {
+        self.v
+            .get("target")
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .ok_or(format!("{} needs a target", self.tool))
+    }
+
+    fn opt_str(&self, name: &str) -> Result<Option<String>, String> {
+        match self.v.get(name) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.clone())),
+            Some(_) => Err(format!("{}: {name} must be a string", self.tool)),
+        }
+    }
+
+    fn opt_bool(&self, name: &str) -> Result<Option<bool>, String> {
+        match self.v.get(name) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Bool(b)) => Ok(Some(*b)),
+            Some(_) => Err(format!("{}: {name} must be a boolean", self.tool)),
+        }
+    }
+
+    fn opt_u64(&self, name: &str, max: u64) -> Result<Option<u64>, String> {
+        match self.v.get(name) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => v.as_u64().filter(|n| *n <= max).map(Some).ok_or(format!(
+                "{}: {name} must be an integer from 0 to {max}",
+                self.tool
+            )),
+        }
+    }
+}
+
+/// Longest serial log window one call may ask for.
+const MAX_LOG_LINES: u64 = 5_000;
+/// The CLI's own cap on `serial send --pace-ms`.
+const MAX_PACE_MS: u64 = 10_000;
+
+/// Translate a tool that maps onto one paniolo command. Every target is
+/// passed as `-t`, never positionally, so a name can't be read as an option.
+fn cli_call(tool: &str, args: &Value) -> Result<CliCall, String> {
+    let a = Args { tool, v: args };
+    let s = |x: &str| x.to_string();
+    let read = |argv: Vec<String>| {
+        Ok(CliCall {
+            argv,
+            writes: false,
+        })
+    };
+    let write = |argv: Vec<String>| Ok(CliCall { argv, writes: true });
+    match tool {
+        "video_read" => {
+            let mut argv = vec![s("video"), s("read"), s("-t"), a.target()?];
+            let timeout = a
+                .opt_u64("timeout_ms", MAX_SHOT_TIMEOUT_MS)?
+                .unwrap_or(DEFAULT_SHOT_TIMEOUT_MS);
+            argv.extend([s("--timeout"), timeout.to_string()]);
+            if a.opt_bool("stable")?.unwrap_or(false) {
+                argv.push(s("--stable"));
+            }
+            read(argv)
+        }
+        "serial_log" => {
+            let mut argv = vec![s("serial"), s("log"), s("-t"), a.target()?];
+            if let Some(i) = a.opt_str("interface")? {
+                argv.extend([s("-i"), i]);
+            }
+            for (name, flag) in [
+                ("tail", "-n"),
+                ("since", "--since"),
+                ("from", "--from"),
+                ("to", "--to"),
+            ] {
+                let max = if name == "tail" {
+                    MAX_LOG_LINES
+                } else {
+                    u64::MAX
+                };
+                if let Some(n) = a.opt_u64(name, max)? {
+                    argv.extend([s(flag), n.to_string()]);
+                }
+            }
+            read(argv)
+        }
+        "serial_send" => {
+            let target = a.target()?;
+            let text = a.opt_str("text")?.ok_or(format!(
+                "{tool} needs text (\"\" with newline sends just Enter)"
+            ))?;
+            let mut argv = vec![s("serial"), s("send"), s("-t"), target];
+            if let Some(i) = a.opt_str("interface")? {
+                argv.extend([s("-i"), i]);
+            }
+            if let Some(p) = a.opt_u64("pace_ms", MAX_PACE_MS)? {
+                argv.extend([s("--pace-ms"), p.to_string()]);
+            }
+            if !a.opt_bool("newline")?.unwrap_or(true) {
+                argv.push(s("--no-newline"));
+            }
+            // `--` so text that starts with `-` stays text.
+            argv.extend([s("--"), text]);
+            write(argv)
+        }
+        "hid_send" => {
+            let target = a.target()?;
+            let words: Vec<String> = match args.get("command") {
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .map(|w| w.as_str().map(str::to_string))
+                    .collect::<Option<_>>()
+                    .ok_or(format!("{tool}: command must be an array of strings"))?,
+                _ => return Err(format!("{tool} needs command, an array of strings")),
+            };
+            match words.first() {
+                None => return Err(format!("{tool}: command is empty")),
+                Some(w) if w.is_empty() || w.starts_with('-') => {
+                    return Err(format!("{tool}: command must start with a verb, got {w:?}"))
+                }
+                Some(_) => {}
+            }
+            let mut argv = vec![s("hid"), s("send"), s("-t"), target];
+            argv.extend(words);
+            write(argv)
+        }
+        "power_state" => read(vec![s("power-state"), s("-t"), a.target()?]),
+        "power_on" => write(vec![s("power"), s("on"), s("-t"), a.target()?]),
+        "power_off" => write(vec![s("power"), s("off"), s("-t"), a.target()?]),
+        "power_cycle" => write(vec![s("power-cycle"), s("-t"), a.target()?]),
+        other => Err(format!("unknown tool: {other}")),
     }
 }
 
@@ -292,8 +504,11 @@ fn initialize(params: &Value) -> Value {
         "serverInfo": { "name": "paniolo", "version": crate::VERSION },
         "instructions": "Drive embedded target machines managed by paniolo. \
             Call target_list first to see the targets and their channels. \
-            video_shot returns the target's screen as an image plus a hash; \
-            pass that hash back as changed_since to wait for the screen to change.",
+            To see the screen, video_shot returns it as an image plus a hash; after \
+            acting (hid_send, serial_send), pass that hash back as changed_since to \
+            wait for the screen to change. video_read returns the screen's text, and \
+            serial_log the console output. A write tool (hid_send, serial_send, \
+            power_*) whose outcome is unknown says so: check state before retrying it.",
     })
 }
 
@@ -333,7 +548,107 @@ fn tool_list() -> Value {
             },
             "annotations": { "readOnlyHint": true },
         },
+        {
+            "name": "video_read",
+            "description": "Read the text on the target's screen: OCR of the current \
+                video frame (BIOS menus, boot messages, console text). Cheaper than a \
+                screenshot when only the words matter. Small console fonts can confuse \
+                1/l/I; check a critical string with video_shot.",
+            "inputSchema": schema(&[
+                ("stable", json!({ "type": "boolean", "description": "Wait until the signal is stable before reading." })),
+                ("timeout_ms", json!({ "type": "integer", "minimum": 0, "maximum": MAX_SHOT_TIMEOUT_MS, "description": "Longest stable wait, in ms (default 2000)." })),
+            ]),
+            "annotations": { "readOnlyHint": true },
+        },
+        {
+            "name": "serial_log",
+            "description": "Read the target's serial console output (boot log, kernel \
+                messages, shell output) from the capture log. Each line is \
+                `[time] #<seq> <text>`; pass the last seq back as `since` to get only \
+                newer lines. With no window it returns the last 200 lines. The serial \
+                daemon must be running (`paniolo serial watch <target>`), or the log may \
+                be stale (a warning says so).",
+            "inputSchema": schema(&[
+                ("interface", json!({ "type": "string", "description": "Serial interface name, for a target with several (see target_list)." })),
+                ("tail", json!({ "type": "integer", "minimum": 0, "maximum": MAX_LOG_LINES, "description": "Only the most recent N lines." })),
+                ("since", json!({ "type": "integer", "minimum": 0, "description": "Only lines with a seq greater than this." })),
+                ("from", json!({ "type": "integer", "minimum": 0, "description": "Lowest seq to return (inclusive)." })),
+                ("to", json!({ "type": "integer", "minimum": 0, "description": "Highest seq to return (inclusive)." })),
+            ]),
+            "annotations": { "readOnlyHint": true },
+        },
+        {
+            "name": "serial_send",
+            "description": "Type text into the target's serial console, followed by Enter \
+                unless newline is false. Use serial_log afterwards to read the reply.",
+            "inputSchema": schema_requiring(&["text"], &[
+                ("text", json!({ "type": "string", "description": "Text to send. \"\" with newline true sends just Enter." })),
+                ("interface", json!({ "type": "string", "description": "Serial interface name, for a target with several." })),
+                ("newline", json!({ "type": "boolean", "description": "Append Enter (a carriage return). Default true." })),
+                ("pace_ms", json!({ "type": "integer", "minimum": 0, "maximum": MAX_PACE_MS, "description": "Delay between bytes, for slow polled consoles (default 0)." })),
+            ]),
+            "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false },
+        },
+        {
+            "name": "hid_send",
+            "description": "Send keyboard or mouse input to the target through its USB HID \
+                injector. command is one HID command as words, for example \
+                [\"type\", \"hello\"], [\"key\", \"ENTER\"], [\"combo\", \"CONTROL\", \"ALT\", \"DELETE\"], \
+                [\"moveabs\", \"16384\", \"16384\"] (0..32767 across the screen, not pixels), \
+                [\"click\", \"left\"], [\"scroll\", \"-3\"]. After acting, use video_shot with \
+                changed_since to see the result. The full vocabulary is in \
+                `paniolo skill kvm-puppeting`.",
+            "inputSchema": schema_requiring(&["command"], &[
+                ("command", json!({ "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "The verb, then its arguments, one string each." })),
+            ]),
+            "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false },
+        },
+        {
+            "name": "power_state",
+            "description": "Report whether the target is powered on: prints on or off.",
+            "inputSchema": schema(&[]),
+            "annotations": { "readOnlyHint": true },
+        },
+        {
+            "name": "power_on",
+            "description": "Switch the target's power on.",
+            "inputSchema": schema(&[]),
+            "annotations": { "readOnlyHint": false, "destructiveHint": true },
+        },
+        {
+            "name": "power_off",
+            "description": "Switch the target's power off (a hard power-off, not a shutdown).",
+            "inputSchema": schema(&[]),
+            "annotations": { "readOnlyHint": false, "destructiveHint": true },
+        },
+        {
+            "name": "power_cycle",
+            "description": "Power-cycle the target: off, then on (a hard reset). If the call \
+                fails with an unknown outcome, check power_state before trying again.",
+            "inputSchema": schema(&[]),
+            "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false },
+        },
     ])
+}
+
+/// An input schema with a required `target` plus `extra` optional properties.
+fn schema(extra: &[(&str, Value)]) -> Value {
+    schema_requiring(&[], extra)
+}
+
+/// [`schema`], with `required` listed as required alongside `target`.
+fn schema_requiring(required: &[&str], extra: &[(&str, Value)]) -> Value {
+    let mut props = serde_json::Map::new();
+    props.insert(
+        "target".into(),
+        json!({ "type": "string", "description": "Target name, as listed by target_list." }),
+    );
+    for (name, prop) in extra {
+        props.insert((*name).into(), prop.clone());
+    }
+    let mut req = vec!["target"];
+    req.extend(required);
+    json!({ "type": "object", "properties": props, "required": req, "additionalProperties": false })
 }
 
 fn result_reply(id: Value, result: Value) -> Value {
@@ -499,14 +814,157 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_names_both_tools_with_object_schemas() {
+    fn tools_list_names_every_tool_with_object_schemas() {
         let s = server(PathBuf::from("/nonexistent"), None);
         let r = exchange(&s, &[req(1, "tools/list", json!({}))]);
         let tools = r[0]["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["target_list", "video_shot"]);
+        assert_eq!(
+            names,
+            [
+                "target_list",
+                "video_shot",
+                "video_read",
+                "serial_log",
+                "serial_send",
+                "hid_send",
+                "power_state",
+                "power_on",
+                "power_off",
+                "power_cycle"
+            ]
+        );
         for t in tools {
-            assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
+            let name = t["name"].as_str().unwrap();
+            assert_eq!(t["inputSchema"]["type"], "object", "{name}");
+            if name != "target_list" {
+                assert!(
+                    t["inputSchema"]["required"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!("target")),
+                    "{name}"
+                );
+            }
+            // A tool that changes the target must not advertise itself as
+            // read-only, or a harness may run it without asking.
+            let writes = [
+                "serial_send",
+                "hid_send",
+                "power_on",
+                "power_off",
+                "power_cycle",
+            ]
+            .contains(&name);
+            assert_eq!(t["annotations"]["readOnlyHint"], !writes, "{name}");
+        }
+    }
+
+    /// One valid call per CLI-backed tool, with every optional argument set.
+    fn sample_calls() -> Vec<(&'static str, Value)> {
+        vec![
+            (
+                "video_read",
+                json!({ "target": "pi5", "stable": true, "timeout_ms": 500 }),
+            ),
+            (
+                "serial_log",
+                json!({ "target": "pi5", "interface": "uart0", "tail": 50, "since": 7, "from": 1, "to": 9 }),
+            ),
+            (
+                "serial_send",
+                json!({ "target": "pi5", "text": "-rf /", "interface": "uart0", "newline": false, "pace_ms": 5 }),
+            ),
+            ("serial_send", json!({ "target": "pi5", "text": "" })),
+            (
+                "hid_send",
+                json!({ "target": "pi5", "command": ["move", "50", "-30"] }),
+            ),
+            (
+                "hid_send",
+                json!({ "target": "pi5", "command": ["type", "--help"] }),
+            ),
+            ("power_state", json!({ "target": "pi5" })),
+            ("power_on", json!({ "target": "pi5" })),
+            ("power_off", json!({ "target": "pi5" })),
+            ("power_cycle", json!({ "target": "pi5" })),
+        ]
+    }
+
+    /// Every argv a tool builds must be one the real CLI parser accepts, with
+    /// the global flags the server adds in front. Text and HID words that look
+    /// like options (`-rf /`, `-30`, `--help`) are the cases that would break.
+    #[test]
+    fn every_tool_argv_parses_with_the_real_cli() {
+        use clap::Parser;
+        for (tool, args) in sample_calls() {
+            let call = cli_call(tool, &args).unwrap();
+            let mut argv = vec!["paniolo", "--lab", "/l.toml", "--json-errors"];
+            argv.extend(call.argv.iter().map(String::as_str));
+            if let Err(e) = crate::Cli::try_parse_from(&argv) {
+                panic!("{tool}: {argv:?} rejected:\n{e}");
+            }
+        }
+    }
+
+    #[test]
+    fn cli_calls_mark_writes_and_map_arguments() {
+        let send = cli_call(
+            "serial_send",
+            &json!({ "target": "pi5", "text": "ls", "newline": false }),
+        )
+        .unwrap();
+        assert!(send.writes);
+        assert_eq!(
+            send.argv,
+            ["serial", "send", "-t", "pi5", "--no-newline", "--", "ls"]
+        );
+        assert_eq!(send.verb(), "serial send");
+
+        let log = cli_call("serial_log", &json!({ "target": "pi5", "since": 42 })).unwrap();
+        assert!(!log.writes);
+        assert_eq!(log.argv, ["serial", "log", "-t", "pi5", "--since", "42"]);
+
+        let cycle = cli_call("power_cycle", &json!({ "target": "pi5" })).unwrap();
+        assert!(cycle.writes);
+        assert_eq!(cycle.argv, ["power-cycle", "-t", "pi5"]);
+        assert!(
+            !cli_call("power_state", &json!({ "target": "pi5" }))
+                .unwrap()
+                .writes
+        );
+    }
+
+    #[test]
+    fn cli_calls_reject_bad_arguments() {
+        for (tool, args) in [
+            ("power_on", json!({})),
+            ("serial_send", json!({ "target": "pi5" })),
+            ("serial_send", json!({ "target": "pi5", "text": 7 })),
+            (
+                "serial_send",
+                json!({ "target": "pi5", "text": "x", "pace_ms": MAX_PACE_MS + 1 }),
+            ),
+            (
+                "serial_log",
+                json!({ "target": "pi5", "tail": MAX_LOG_LINES + 1 }),
+            ),
+            ("serial_log", json!({ "target": "pi5", "since": -1 })),
+            ("hid_send", json!({ "target": "pi5" })),
+            ("hid_send", json!({ "target": "pi5", "command": [] })),
+            ("hid_send", json!({ "target": "pi5", "command": "type hi" })),
+            (
+                "hid_send",
+                json!({ "target": "pi5", "command": ["type", 1] }),
+            ),
+            (
+                "hid_send",
+                json!({ "target": "pi5", "command": ["-t", "other"] }),
+            ),
+            ("video_read", json!({ "target": "pi5", "stable": "yes" })),
+            ("no_such_tool", json!({ "target": "pi5" })),
+        ] {
+            assert!(cli_call(tool, &args).is_err(), "{tool} {args}");
         }
     }
 
@@ -622,6 +1080,93 @@ echo 'signal=ok  hash=00ff' >&2"#,
             args.starts_with("--lab /some/lab.toml --json-errors video shot -t pi5"),
             "{args}"
         );
+    }
+
+    #[cfg(unix)]
+    fn call(s: &Server, name: &str, arguments: Value) -> Value {
+        let r = exchange(
+            s,
+            &[req(
+                1,
+                "tools/call",
+                json!({ "name": name, "arguments": arguments }),
+            )],
+        );
+        r[0]["result"].clone()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_tool_returns_stdout_and_stderr_and_runs_the_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let args_log = dir.path().join("args");
+        let exe = fake_paniolo(
+            dir.path(),
+            &format!(
+                r#"echo "$@" > {log}
+read -r _ && exit 9
+echo '[2026-10-02T00:00:00.000Z] #12      login:'
+echo 'warning: serialcap is not running; the log may be stale' >&2"#,
+                log = args_log.display()
+            ),
+        );
+        let s = server(exe, None);
+        let result = call(&s, "serial_log", json!({ "target": "pi5", "tail": 5 }));
+        assert_eq!(result["isError"], false, "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("[2026-10-02T00:00:00.000Z] #12      login:"),
+            "{text}"
+        );
+        assert!(
+            text.contains("stderr:\nwarning: serialcap is not running"),
+            "{text}"
+        );
+        let args = std::fs::read_to_string(&args_log).unwrap();
+        assert_eq!(args.trim(), "--json-errors serial log -t pi5 -n 5");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_output_reports_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = server(fake_paniolo(dir.path(), "exit 0"), None);
+        let result = call(&s, "power_on", json!({ "target": "pi5" }));
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["content"][0]["text"], "paniolo power on: ok");
+    }
+
+    /// An unreachable host or a timeout leaves a write's outcome unknown, and
+    /// the error must say so; the same exit from a read needs no such warning,
+    /// and neither does a write that failed for a known reason.
+    #[cfg(unix)]
+    #[test]
+    fn unknown_outcome_is_flagged_only_for_writes_that_may_have_run() {
+        let dir = tempfile::tempdir().unwrap();
+        for (code, tool, flagged) in [
+            (4, "power_cycle", true),
+            (22, "hid_send", true),
+            (4, "power_state", false),
+            (3, "power_cycle", false),
+        ] {
+            let exe = fake_paniolo(dir.path(), &format!("echo 'ssh failed' >&2; exit {code}"));
+            let s = server(exe, None);
+            let args = if tool == "hid_send" {
+                json!({ "target": "pi5", "command": ["key", "ENTER"] })
+            } else {
+                json!({ "target": "pi5" })
+            };
+            let result = call(&s, tool, args);
+            assert_eq!(result["isError"], true, "{tool} {code}");
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(&format!("exited {code}")), "{text}");
+            assert!(text.contains("ssh failed"), "{text}");
+            assert_eq!(
+                text.contains("Outcome unknown"),
+                flagged,
+                "{tool} {code}: {text}"
+            );
+        }
     }
 
     #[cfg(unix)]

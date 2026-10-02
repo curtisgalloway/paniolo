@@ -207,7 +207,9 @@ enum Command {
     ///
     /// Speaks newline-delimited JSON-RPC on stdin/stdout until stdin closes;
     /// configure it in the harness as a stdio server whose command is
-    /// `paniolo mcp`. Tools: target_list, video_shot. Each tool runs the
+    /// `paniolo mcp`. Tools: target_list, video_shot, video_read, serial_log,
+    /// serial_send, hid_send, power_state, power_on, power_off, power_cycle.
+    /// Each tool runs the
     /// matching paniolo command, so remote targets dispatch over SSH as usual.
     Mcp,
     /// Run a helper binary from paniolo's private libexec dir (omit NAME to

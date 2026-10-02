@@ -5,13 +5,15 @@ SPDX-License-Identifier: Apache-2.0
 
 # An MCP server for paniolo
 
-> **Status: spike built and passed a real-harness test (blank frame only).** Converged
+> **Status: built (steps 1–4); hardware-tested for video only.** Converged
 > 2026-10-02. Step 1 (measure per-call dispatch) is done: on a LAN it costs
 > ~17 ms per call, so the spike uses per-call dispatch and the persistent
 > worker is deferred (see *Step 1 result*). Step 2 (SSH keepalive) is done and
 > hardware-checked. Step 3's spike, `paniolo mcp` with `target_list` and
 > `video_shot`, is built and passed its stop point against a real target and
-> a real Claude Code client. Still untested: a target with a live picture.
+> a real Claude Code client. Step 4 (the full tool set) is built and tested
+> without hardware. Still untested: a target with a live picture, and the new
+> tools against real serial and HID hardware.
 
 ## Goal
 
@@ -281,10 +283,31 @@ be scrubbed before it goes anywhere public.
 **Stop point:** if image-in-the-result is not clearly better than
 shot-then-read, stop here.
 
-### 4. Fill out the tool set
+### 4. Fill out the tool set — done
 
 The remaining tools from *First tool set*, with the retry rules from
 *Reconnect* if the worker exists.
+
+Done 2026-10-02: `video_read`, `serial_log`, `serial_send`, `hid_send`,
+`power_state`, `power_on`, `power_off`, `power_cycle`.
+- Each maps onto one paniolo command through `cli_call()`. A test parses
+  every resulting argv with the real clap `Cli`, so a tool can't build a
+  command line the CLI would reject; that includes text and HID words that
+  look like options (`-rf /`, `-30`, `--help`).
+- There is no worker, so there is nothing to retry. Instead, a write tool that
+  fails with `unreachable` (4) or `timeout` (22) says "Outcome unknown" in its
+  error, which is the *Reconnect* rule applied to per-call dispatch. A read
+  needs no such warning: running it again is harmless.
+- Write tools carry `readOnlyHint: false` and `destructiveHint: true`, so a
+  harness that asks before side effects asks.
+- `hid_send` takes `command` as an array of words (`["key", "ENTER"]`), the
+  helper's own vocabulary. Its description lists the common verbs and points
+  at `paniolo skill kvm-puppeting` for the rest.
+- Checked end to end with the real binary against a lab whose power hooks are
+  shell commands: `power_state` and `power_cycle` ran them. `serial_log`,
+  `serial_send` and `hid_send` each returned the expected classified error
+  (helper missing, daemon down, no channel). Not yet run against real serial
+  or HID hardware.
 
 ### 5. Measure against the skill
 

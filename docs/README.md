@@ -54,7 +54,7 @@ running, 101 hook failed, …); `--json-errors` adds a one-line JSON object. See
 | [Switchable USB media](usb.md) | `paniolo usb` | Switch a KVM-Go's microSD card between control host and target, as boot media. |
 | [HID injection](hid.md) | `paniolo hid` | USB keyboard/mouse injection via `hidrig` (KB2040) or `ch9329` (Openterface Mini-KVM / KVM-Go, Sipeed NanoKVM-USB). |
 | [adb (Android targets)](adb.md) | `paniolo adb` | Console (`adb shell`/`run`), screen (`screencap`), and input (`adb input`) over one USB cable. |
-| [MCP server (experimental)](mcp.md) | `paniolo mcp` | Runtime commands as MCP tools over stdio, for agent harnesses: `target_list`, `video_shot`. |
+| [MCP server (experimental)](mcp.md) | `paniolo mcp` | Runtime commands as MCP tools over stdio, for agent harnesses: screen (image and OCR), serial log and input, HID input, power. |
 
 ## Distributed control (Phases 0–5 shipped)
 

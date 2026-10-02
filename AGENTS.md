@@ -540,8 +540,11 @@ cli/src/
                 tools/list, tools/call). stdout is the protocol channel, so a
                 tool that drives a channel runs this binary as a child (stdin
                 null, stdout captured) instead of calling a handler that
-                prints; target_list reads the lab in-process. Design:
-                notes/mcp-server.md; user doc: docs/mcp.md
+                prints; target_list reads the lab in-process. Each
+                CLI-backed tool is one cli_call() → argv (a test parses every
+                one with the real clap Cli); writes flag an unknown outcome
+                on exit 4/22. Design: notes/mcp-server.md; user doc:
+                docs/mcp.md
 ```
 
 **Errors follow the exit-status contract** ([`docs/errors.md`](docs/errors.md);
