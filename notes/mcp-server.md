@@ -197,7 +197,26 @@ Done 2026-10-02: `ssh::liveness_args` now supplies `ConnectTimeout` and both
 `ServerAlive*` options to every ssh and sftp paniolo starts (`base_args` and
 `transfer_args`), so whichever invocation starts the ControlMaster carries
 them. A half-open link now fails as `unreachable` (exit 4) in ~15 s instead of
-hanging. Not yet exercised against a real sleeping laptop.
+hanging.
+
+Hardware check, 2026-10-02 (dev machine → `bench1`, same LAN, no keepalive in
+`~/.ssh/config`). Dead link simulated by `SIGSTOP` on the control host's
+`sshd-session` serving paniolo's ControlMaster, always resumed afterwards.
+Command: `video shot T --changed-since H --timeout 60000` under `timeout 100`.
+
+| Build | Result |
+|---|---|
+| This branch (fresh master) | exit 4 (`unreachable`), **16 s** from STOP to exit. A plain `video show T` straight afterwards succeeded. |
+| 0.6.0, run 1 | still blocked 78 s after STOP (past its own 60 s timeout), then interrupted by hand. |
+| 0.6.0, run 2 | exited 0 on its own 62 s after STOP, as if the link were fine. **Unexplained** — same method, same binary. |
+
+The new build behaves as designed. The baseline is inconsistent, so treat
+"0.6.0 hangs" as likely (run 1, and `ServerAliveInterval` 0 in its config)
+rather than shown. Not yet tried against a real sleeping laptop.
+
+For whoever repeats it: `-o /dev/null` fails for `video shot` (it writes a
+temp file beside the output path), and unprivileged `ss -p` on the control host
+does not show sshd's pid, so the process has to be found by elimination.
 
 ### 3. Spike `paniolo mcp`
 
