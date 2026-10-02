@@ -155,6 +155,10 @@ host, FTDI console · channels: power, serial.
 the boot. The log shows `power-on-reset 1` (a real cold start) and a login
 prompt about 35 seconds later.
 
+This transcript predates #259. Since then, a target with a `state_cmd` makes
+`power-cycle` wait until power is back on before it prints `Power cycle
+complete`, so the `Power OFF` reading below comes from the old behavior.
+
 ```console
 # lab-pi-1: a Raspberry Pi 5 on the CI rack, driven from another room.
 # Its USB-C power feeds through a relay board on the control host.

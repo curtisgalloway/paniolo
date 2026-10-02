@@ -2984,6 +2984,67 @@ fn run_power_hook(cmd: &str, label: &str, target: &str) -> Result<()> {
     }
 }
 
+/// Run a power channel's `state_cmd` and read its verdict: `true` for on,
+/// `false` for off, from the first whitespace-delimited token of its stdout
+/// (case-insensitive). A failing command is `hook_failed`; any other first
+/// token is an error naming what came back.
+fn read_state_cmd(cmd: &str, target: &str) -> Result<bool> {
+    let out = platform::shell_command(cmd)
+        .env("PATH", daemons::hook_path())
+        .envs(hook_envs(cmd))
+        .output()?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        return Err(error::hook_failed(
+            out.status,
+            format!(
+                "state_cmd '{cmd}' exited with code {} — stdout: {stdout} stderr: {stderr}",
+                error::shell_code(out.status)
+            ),
+        )
+        .target(target)
+        .channel("power")
+        .into());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let token = text
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match token.as_str() {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => bail!("state_cmd '{cmd}' output did not begin with 'on' or 'off' — got: {text}"),
+    }
+}
+
+/// How often `power-cycle` re-reads `state_cmd` while waiting for power to
+/// come back, and how long it waits in all.
+const POWER_CYCLE_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+const POWER_CYCLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Call `is_on` every `poll` until it returns true, for at most `deadline`
+/// (always at least once). Ok(true) when power came back, Ok(false) at the
+/// deadline; an error from `is_on` ends the wait at once.
+fn wait_for_power_on(
+    mut is_on: impl FnMut() -> Result<bool>,
+    poll: std::time::Duration,
+    deadline: std::time::Duration,
+) -> Result<bool> {
+    let start = std::time::Instant::now();
+    loop {
+        if is_on()? {
+            return Ok(true);
+        }
+        if start.elapsed() + poll > deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(poll);
+    }
+}
+
 fn cmd_power_cycle(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
     let lab = load_for_read(lab_flag)?;
     let target = resolve_single_target(&lab, target)?;
@@ -3008,8 +3069,40 @@ fn cmd_power_cycle(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
         )
     })?;
     run_power_hook(&cmd, "Power cycling", &target)?;
-    println!("Power cycle complete.");
+    // A cycle_cmd may return before the cycle ends: a relay board that
+    // accepts "cycle" and times the off period itself (#259). With a
+    // state_cmd, "complete" means power is back on; without one, paniolo
+    // cannot tell, so it says only that the hook finished.
+    let Some(state_cmd) = p.state_cmd else {
+        println!("Power cycle requested (cycle_cmd exited 0; no state_cmd to confirm power).");
+        return Ok(());
+    };
+    confirm_power_on(&state_cmd, &target, POWER_CYCLE_POLL, POWER_CYCLE_DEADLINE)?;
+    println!("Power cycle complete (power is back on).");
     Ok(())
+}
+
+/// Wait for `state_cmd` to report `target` on; `timeout` (exit 22, outcome
+/// unknown) when it still reports off at `deadline`.
+fn confirm_power_on(
+    state_cmd: &str,
+    target: &str,
+    poll: std::time::Duration,
+    deadline: std::time::Duration,
+) -> Result<()> {
+    if wait_for_power_on(|| read_state_cmd(state_cmd, target), poll, deadline)? {
+        return Ok(());
+    }
+    Err(error::PanioloError::new(
+        error::Kind::Timeout,
+        format!(
+            "cycle_cmd exited 0, but state_cmd still reports '{target}' off after {} ms",
+            deadline.as_millis()
+        ),
+    )
+    .target(target)
+    .channel("power")
+    .into())
 }
 
 fn cmd_power_on(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
@@ -3084,41 +3177,13 @@ fn cmd_power_state(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
 
     // Prefer state_cmd when configured; fall back to serial sense.
     if let Some(cmd) = p.state_cmd {
-        let out = platform::shell_command(&cmd)
-            .env("PATH", daemons::hook_path())
-            .envs(hook_envs(&cmd))
-            .output()?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            return Err(error::hook_failed(
-                out.status,
-                format!(
-                    "state_cmd '{cmd}' exited with code {} — stdout: {stdout} stderr: {stderr}",
-                    error::shell_code(out.status)
-                ),
-            )
-            .target(&target)
-            .channel("power")
-            .into());
-        }
-        let text = String::from_utf8_lossy(&out.stdout);
-        let token = text
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        match token.as_str() {
-            "on" => {
-                println!("Power ON  ({target})");
-                Ok(())
-            }
-            "off" => {
-                println!("Power OFF  ({target})");
-                Ok(())
-            }
-            _ => bail!("state_cmd '{cmd}' output did not begin with 'on' or 'off' — got: {text}"),
-        }
+        let state = if read_state_cmd(&cmd, &target)? {
+            "ON"
+        } else {
+            "OFF"
+        };
+        println!("Power {state}  ({target})");
+        Ok(())
     } else {
         let si = p.serial_interface.ok_or_else(|| {
             error::channel_missing(
@@ -4764,6 +4829,54 @@ fn print_resolved_target(rt: &ResolvedTarget) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `power-cycle` waits for power to come back (#259): the reader is
+    /// called until it says on, and not again after.
+    #[test]
+    fn wait_for_power_on_polls_until_on() {
+        let mut calls = 0;
+        let on = wait_for_power_on(
+            || {
+                calls += 1;
+                Ok(calls >= 3)
+            },
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(on);
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn wait_for_power_on_gives_up_at_the_deadline() {
+        let start = std::time::Instant::now();
+        let on = wait_for_power_on(
+            || Ok(false),
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(50),
+        )
+        .unwrap();
+        assert!(!on);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    /// A state_cmd that never reports on is `timeout` (exit 22): the cycle
+    /// may still finish, so the outcome is unknown.
+    #[cfg(unix)]
+    #[test]
+    fn confirm_power_on_times_out_as_timeout() {
+        let err = confirm_power_on(
+            "echo off",
+            "nuc",
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(50),
+        )
+        .unwrap_err();
+        let pe = error::classify(&err);
+        assert_eq!(pe.kind, error::Kind::Timeout, "{err:#}");
+        assert_eq!(pe.kind.exit_code(), 22);
+    }
 
     /// `--version` is the stamped release version when the build had one,
     /// and never the bare manifest placeholder when it did not.

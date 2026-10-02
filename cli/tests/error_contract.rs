@@ -393,6 +393,42 @@ fn a_hook_killed_by_a_signal_is_helper_failed_without_a_code() {
     assert!(error_object(&out)["child_exit"].is_null());
 }
 
+/// With a `state_cmd`, `power-cycle` reports success only once power is back
+/// on (#259): here the hook returns at once and the state reads off twice
+/// before it reads on, as with a relay board that times the off period itself.
+#[cfg(unix)]
+#[test]
+fn power_cycle_waits_for_state_cmd_to_report_on() {
+    let dir = scratch("cycle_waits", "");
+    let count = dir.join("state-calls");
+    let state_cmd = format!(
+        "n=$(cat '{c}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{c}'; \
+         [ $n -ge 3 ] && echo on || echo off",
+        c = count.display()
+    );
+    let lab = format!(
+        "[targets.nuc]\n[targets.nuc.power]\ncycle_cmd = \"true\"\nstate_cmd = {state_cmd:?}\n"
+    );
+    std::fs::write(dir.join("lab.toml"), lab).unwrap();
+    let out = paniolo(&dir, true, &["power-cycle", "nuc"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("back on"), "{stdout}");
+    assert_eq!(std::fs::read_to_string(&count).unwrap().trim(), "3");
+}
+
+/// Without a `state_cmd`, paniolo cannot confirm the cycle, and says so
+/// instead of claiming it is complete.
+#[test]
+fn power_cycle_without_state_cmd_does_not_claim_completion() {
+    let dir = scratch("cycle_no_state", &power_lab("exit 0"));
+    let out = paniolo(&dir, true, &["power-cycle", "nuc"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("requested"), "{stdout}");
+    assert!(!stdout.contains("complete"), "{stdout}");
+}
+
 /// A directory with fake `ssh` and `sftp` first on PATH. `sftp` logs its
 /// batch commands to `sftp.log` and succeeds (or fails with STUB_SFTP=fail);
 /// `ssh` records its argv in `ssh.args` and

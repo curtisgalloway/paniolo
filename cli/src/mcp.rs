@@ -623,8 +623,10 @@ fn tool_list() -> Value {
         },
         {
             "name": "power_cycle",
-            "description": "Power-cycle the target: off, then on (a hard reset). If the call \
-                fails with an unknown outcome, check power_state before trying again.",
+            "description": "Power-cycle the target: off, then on (a hard reset). When the \
+                target has a power state reader, the call returns once power is back on; \
+                otherwise only once the cycle was requested. If the call fails with an \
+                unknown outcome, check power_state before trying again.",
             "inputSchema": schema(&[]),
             "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false },
         },
