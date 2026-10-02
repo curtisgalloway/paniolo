@@ -605,7 +605,7 @@ hdmicap/         Rust crate: warm-stream HDMI capture daemon
                  later (backend.frame() itself never returned to let the main
                  thread see it), that IS the wedged case and it still exits
     frame.rs     FrameState, Signal enum, one-pass strided classification
-                 (aHash + no-signal from 4k luma samples, resolution-independent)
+                 (exact frame digest + no-signal from 4k luma samples)
     pixel.rs     PixelData (Rgb/Nv12/Empty) + NV12/YUYV -> RGB converters;
                  compact_nv12() re-packs a strided (row-padded) NV12 buffer
                  into tight Y/CbCr planes — needed by the Windows backend,
