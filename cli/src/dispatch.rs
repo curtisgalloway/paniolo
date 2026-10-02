@@ -315,6 +315,47 @@ pub fn run_subcommand(
     Ok(out)
 }
 
+const CAPTURE_TMP_PREFIX: &str = ".paniolo-capture-";
+const CAPTURE_TMP_SUFFIX: &str = ".tmp";
+
+/// How old a capture temp file must be before [`sweep_stale_captures`]
+/// deletes it. Far longer than any capture runs, so a concurrent capture into
+/// the same directory never loses its temp file mid-transfer; a leftover that
+/// survives an extra hour costs nothing.
+const STALE_CAPTURE_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Delete capture temp files in `dir` left by an earlier capture that was
+/// interrupted (#255). A SIGINT, SIGTERM or SIGKILL ends the process without
+/// running `NamedTempFile`'s destructor, so the next capture cleans up
+/// instead: only regular files with our prefix and suffix, owned by this
+/// user, and older than [`STALE_CAPTURE_AGE`]. Best effort — any error just
+/// leaves the file for a later sweep.
+fn sweep_stale_captures(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(CAPTURE_TMP_PREFIX) || !name.ends_with(CAPTURE_TMP_SUFFIX) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(md) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let stale = md
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age > STALE_CAPTURE_AGE);
+        if stale && crate::platform::is_own_file(&md) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// Run `write_body` with a writable sink prepared for `out_path` — a sibling
 /// temp file in the same directory, never `out_path` itself — and persist
 /// that sink onto `out_path` only when `write_body` returns exit code 0.
@@ -326,7 +367,8 @@ pub fn run_subcommand(
 /// instead of destroying it (the old code truncated `out_path` up front,
 /// before the transfer even started), and a reader of `out_path` never sees
 /// a partially-written file mid-transfer. On a non-zero exit the temp file
-/// is simply dropped, which removes it.
+/// is simply dropped, which removes it; one orphaned by a killed process is
+/// removed by a later capture's [`sweep_stale_captures`].
 ///
 /// The exception is an `out_path` that already exists and is not a regular
 /// file — `/dev/null`, a FIFO, `/dev/stdout` on a terminal. Rename cannot
@@ -347,9 +389,10 @@ fn capture_to_file(
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+    sweep_stale_captures(dir);
     let tmp = tempfile::Builder::new()
-        .prefix(".paniolo-capture-")
-        .suffix(".tmp")
+        .prefix(CAPTURE_TMP_PREFIX)
+        .suffix(CAPTURE_TMP_SUFFIX)
         .tempfile_in(dir)
         .map_err(|e| anyhow::anyhow!("creating a temp file next to {out_path}: {e}"))?;
     let sink = tmp
@@ -470,6 +513,46 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["shot.png"], "{names:?}");
+    }
+
+    /// A temp file orphaned by an interrupted capture (#255) is swept by the
+    /// next capture into that directory once it is older than
+    /// `STALE_CAPTURE_AGE`; a fresh one, which may belong to a capture still
+    /// running, is left alone, as is an unrelated file.
+    #[test]
+    fn capture_to_file_sweeps_stale_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join(".paniolo-capture-old.tmp");
+        let fresh = dir.path().join(".paniolo-capture-fresh.tmp");
+        let other = dir.path().join("notes.tmp");
+        for p in [&old, &fresh, &other] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        let backdated =
+            std::time::SystemTime::now() - STALE_CAPTURE_AGE - std::time::Duration::from_secs(60);
+        for p in [&old, &other] {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(backdated)
+                .unwrap();
+        }
+
+        let out = dir.path().join("shot.png");
+        let code = capture_to_file(out.to_str().unwrap(), |_| Ok(0)).unwrap();
+
+        assert_eq!(code, 0);
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![".paniolo-capture-fresh.tmp", "notes.tmp", "shot.png"],
+            "{names:?}"
+        );
     }
 
     /// A special file (here `/dev/null`) is written in place: no temp file in

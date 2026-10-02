@@ -144,6 +144,20 @@ pub fn is_private_dir(path: &Path) -> bool {
     }
 }
 
+/// True if `md` (from `symlink_metadata`) is a regular file owned by
+/// [`current_uid`] — the test for "a leftover of ours, safe to delete". On
+/// Windows there is no uid to compare, so it reduces to "a regular file".
+#[cfg(unix)]
+pub fn is_own_file(md: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    md.is_file() && md.uid() == current_uid()
+}
+
+#[cfg(windows)]
+pub fn is_own_file(md: &std::fs::Metadata) -> bool {
+    md.is_file()
+}
+
 #[cfg(windows)]
 pub fn is_private_dir(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
