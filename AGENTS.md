@@ -535,6 +535,13 @@ cli/src/
                 share → /usr/share/paniolo/skills, like daemons.rs helper_dirs
                 but under share/), list with frontmatter descriptions, print
                 one SKILL.md (or --path), install_bundled() for setup.rs
+  mcp.rs        `paniolo mcp` (experimental): hand-written MCP server,
+                newline-delimited JSON-RPC over stdio (initialize, ping,
+                tools/list, tools/call). stdout is the protocol channel, so a
+                tool that drives a channel runs this binary as a child (stdin
+                null, stdout captured) instead of calling a handler that
+                prints; target_list reads the lab in-process. Design:
+                notes/mcp-server.md; user doc: docs/mcp.md
 ```
 
 **Errors follow the exit-status contract** ([`docs/errors.md`](docs/errors.md);

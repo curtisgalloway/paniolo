@@ -648,6 +648,15 @@ paniolo skill kvm-puppeting    # print a skill's SKILL.md (e.g. GUI puppeting)
 paniolo skill paniolo --path   # the file path, to open or Read it
 ```
 
+## MCP tools (experimental)
+
+If your harness has a `paniolo` MCP server configured (`paniolo mcp`), it
+offers `target_list` and `video_shot`. `video_shot` returns the screen as an
+image plus `signal=…  hash=…`; pass the hash back as `changed_since` to wait
+for a change, as with `video shot --changed-since`. Everything else is still
+the CLI. A failed tool result carries paniolo's exit code and JSON error
+object (see *When a command fails* above). Setup: `docs/mcp.md`.
+
 ## Targets on a remote control host (a "lab")
 
 When the machine wired to the target isn't the one you're running paniolo on,

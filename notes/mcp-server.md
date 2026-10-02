@@ -5,10 +5,12 @@ SPDX-License-Identifier: Apache-2.0
 
 # An MCP server for paniolo
 
-> **Status: plan — nothing built.** Converged 2026-10-02. Step 1 (measure
-> per-call dispatch) is done: on a LAN it costs ~17 ms per call, so the spike
-> uses per-call dispatch and the persistent worker is deferred. See
-> *Step 1 result*.
+> **Status: spike built, not yet tried with a real harness.** Converged
+> 2026-10-02. Step 1 (measure per-call dispatch) is done: on a LAN it costs
+> ~17 ms per call, so the spike uses per-call dispatch and the persistent
+> worker is deferred (see *Step 1 result*). Step 2 (SSH keepalive) is done and
+> hardware-checked. Step 3's spike, `paniolo mcp` with `target_list` and
+> `video_shot`, is built; its try-it-with-a-harness stop point is open.
 
 ## Goal
 
@@ -37,7 +39,8 @@ server is a thin front end over the same command handlers.
 | Remote placement | `ssh <host> paniolo mcp` is a **fallback only** | When the harness runs on a machine with no paniolo install or lab file. The harness owns that pipe and generally will not relaunch a dead stdio server, so a drop loses every tool until restart. |
 | Reaching control hosts | **One persistent worker per host**, opened by `paniolo mcp` on first use (step 3) | Removes per-call setup cost; see *Cost of per-call dispatch*. |
 | Tool surface | **Runtime verbs only** | Configuration (`set`/`add`/`rm`) stays CLI-only, matching the rule that config commands never act on an implied target. |
-| Implementation | Tools call the existing handlers | No second implementation to drift. Investigate generating schemas from the clap tree so docs/help/skill/MCP stay one source. |
+| Implementation | Tools **run the CLI as a child process** (stdin null, stdout captured); pure lab reads run in-process | No second implementation to drift. Calling handlers in-process was the first idea, but handlers print to stdout, which is the protocol channel, and `video shot` exits the process. A child costs a few ms against an agent turn of seconds. Investigate generating schemas from the clap tree so docs/help/skill/MCP stay one source. |
+| Protocol library | **Hand-written** JSON-RPC over stdio, no new dependency | Decided 2026-10-02. `rmcp` (the official SDK) scored 8.5/10 on `dep-quality`, but at 0.35 confidence (GitHub data unavailable), and would add 35 crates to `cli` (102 → 137): tokio, futures and a second `syn` major in an otherwise synchronous CLI. It also shipped three major versions in about three months. A tools-only stdio server is five messages and a few hundred lines. Revisit `rmcp` for an HTTP transport, resources or notifications, or if tracking spec revisions by hand starts to hurt. |
 | Server state | **None of its own** | The daemons already hold the real state (capture, serial logs, held keys). Restarting `paniolo mcp` loses nothing. |
 
 ### First tool set
@@ -218,7 +221,7 @@ For whoever repeats it: `-o /dev/null` fails for `video shot` (it writes a
 temp file beside the output path), and unprivileged `ss -p` on the control host
 does not show sshd's pid, so the process has to be found by elimination.
 
-### 3. Spike `paniolo mcp`
+### 3. Spike `paniolo mcp` — built, not yet tried with a harness
 
 - New module `cli/src/mcp.rs`, one clap variant `Command::Mcp`.
 - Two tools only: `target_list` and `video_shot` (image + hash).
@@ -227,6 +230,14 @@ does not show sshd's pid, so the process has to be found by elimination.
   JSON-RPC over stdio. AGENTS.md requires discussion before a new dependency.
 - Try it: point Claude Code at `paniolo mcp`, run one look-act-verify cycle
   against a real target.
+
+Built 2026-10-02: hand-written (see *Decisions*), per-call dispatch, tools
+run the CLI as a child. Unit tests drive the server over in-memory
+stdin/stdout, and `video_shot`'s tests execute a fake `paniolo` script to
+prove the argv, the closed stdin and the image read-back. An end-to-end run of
+the real binary over a pipe (handshake, `tools/list`, `target_list`, and a
+`video_shot` with no daemon returning a clean tool error) worked. User doc:
+`docs/mcp.md`. **Open:** the try-it step against a real target and harness.
 
 **Stop point:** if image-in-the-result is not clearly better than
 shot-then-read, stop here.
