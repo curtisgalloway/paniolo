@@ -327,10 +327,22 @@ pub fn run_subcommand(
 /// before the transfer even started), and a reader of `out_path` never sees
 /// a partially-written file mid-transfer. On a non-zero exit the temp file
 /// is simply dropped, which removes it.
+///
+/// The exception is an `out_path` that already exists and is not a regular
+/// file — `/dev/null`, a FIFO, `/dev/stdout` on a terminal. Rename cannot
+/// replace those (and their parent, e.g. `/dev`, is usually not writable), and
+/// there is no earlier copy to protect, so the body streams straight into it.
 fn capture_to_file(
     out_path: &str,
     write_body: impl FnOnce(std::fs::File) -> anyhow::Result<i32>,
 ) -> anyhow::Result<i32> {
+    if std::fs::metadata(out_path).is_ok_and(|m| !m.is_file()) {
+        let sink = std::fs::OpenOptions::new()
+            .write(true)
+            .open(out_path)
+            .map_err(|e| anyhow::anyhow!("opening {out_path}: {e}"))?;
+        return write_body(sink);
+    }
     let dir = Path::new(out_path)
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -458,6 +470,22 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["shot.png"], "{names:?}");
+    }
+
+    /// A special file (here `/dev/null`) is written in place: no temp file in
+    /// its parent directory, which for `/dev` is not writable, and no rename.
+    /// Regressed as `creating a temp file next to /dev/null: Permission denied`.
+    #[cfg(unix)]
+    #[test]
+    fn capture_to_file_streams_into_a_special_file() {
+        let code = capture_to_file("/dev/null", |mut sink| {
+            use std::io::Write;
+            sink.write_all(b"discarded png bytes")?;
+            Ok(3)
+        })
+        .unwrap();
+
+        assert_eq!(code, 3);
     }
 
     /// A non-zero exit must not touch `out_path` at all — the old code
