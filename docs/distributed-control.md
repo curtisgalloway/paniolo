@@ -136,6 +136,13 @@ forwarded port. Only the browser dashboard uses tunnels.
 master connection), shared by every re-exec and `-L` forward. The host's
 `control_path` names the master socket.
 
+**Dead links fail, not hang.** Every ssh and sftp paniolo starts carries
+`ServerAliveInterval=5` and `ServerAliveCountMax=3`. A connection that goes
+silently half-open (laptop sleep, a Wi-Fi change) is noticed within about 15
+seconds, and the command fails with `unreachable` (exit 4; see
+[errors.md](errors.md)) instead of waiting forever. The next command opens a
+fresh master.
+
 **Operational notes:**
 
 - **`paniolo` must be reachable on the host.** Re-exec runs over a
