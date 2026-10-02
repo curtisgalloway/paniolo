@@ -150,7 +150,9 @@ paniolo video preview --open                     # open it in a browser instead 
 `--changed-since` to wait for the screen to change.
 
 - `--stable` waits for any steady frame.
-- `--changed-since` waits for any frame that differs from the hash.
+- `--changed-since` waits for any frame that differs from the hash. The hash
+  covers every pixel, so one new line of text counts, and so does a blinking
+  cursor or a clock ticking over.
 - **Both together** (`GET /snapshot?wait=stable&changed_since=<hash>`) wait
   for the next steady screen that differs.
 

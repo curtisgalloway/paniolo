@@ -623,8 +623,10 @@ fn tool_list() -> Value {
         },
         {
             "name": "power_cycle",
-            "description": "Power-cycle the target: off, then on (a hard reset). If the call \
-                fails with an unknown outcome, check power_state before trying again.",
+            "description": "Power-cycle the target: off, then on (a hard reset). When the \
+                target has a power state reader, the call returns once power is back on; \
+                otherwise only once the cycle was requested. If the call fails with an \
+                unknown outcome, check power_state before trying again.",
             "inputSchema": schema(&[]),
             "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false },
         },
@@ -1036,12 +1038,31 @@ mod tests {
     /// the `--out` path and the status line to stderr. Proves the child is
     /// really run with the global flags first, its file read back, and its
     /// stdin closed (the script would block on `read` otherwise).
+    ///
+    /// The script is written by a short-lived `sh` child, never by this
+    /// process. Tests run in parallel threads, and a thread that forks while
+    /// this one holds the file open for writing gives its child a copy of
+    /// that descriptor; exec'ing the script then fails with ETXTBSY ("Text
+    /// file busy") until the child execs. That failed CI on main after #253.
+    /// A pipe is the only thing this process holds, so no fork can inherit a
+    /// writer on the script itself.
     #[cfg(unix)]
     fn fake_paniolo(dir: &Path, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
+        use std::io::Write;
         let p = dir.join("paniolo");
-        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut writer = std::process::Command::new("sh")
+            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+            .arg(&p)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        writer
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+            .unwrap();
+        assert!(writer.wait().unwrap().success());
         p
     }
 
