@@ -79,6 +79,7 @@ nav:
       - Switchable USB media: usb.md
       - adb (Android targets): adb.md
   - Distributed control: distributed-control.md
+  - MCP server (experimental): mcp.md
   - Standing up a control host: control-host.md
   - Exit status and errors: errors.md
   - Glossary: glossary.md

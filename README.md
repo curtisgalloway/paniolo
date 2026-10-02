@@ -44,6 +44,7 @@ More on the [demos page](https://curtisgalloway.github.io/paniolo/demos/).
 | [Switchable USB media](https://curtisgalloway.github.io/paniolo/usb/) | `paniolo usb` | Switch a KVM-Go's microSD card between control host and target, as boot media |
 | [adb (Android targets)](https://curtisgalloway.github.io/paniolo/adb/) | `paniolo adb` | Drive an Android DUT over one USB cable: console (`shell`/`run`), screen (`screencap`), input |
 | [Dashboard](https://curtisgalloway.github.io/paniolo/dashboard/) | `paniolo console` | Video + serial web UI; auto-starts daemons; `-i <name>` preselects a serial interface |
+| [MCP server](https://curtisgalloway.github.io/paniolo/mcp/) (experimental) | `paniolo mcp` | Runtime commands as MCP tools over stdio for agent harnesses; screenshots come back as images |
 | Agent skills | `paniolo skill` | List the bundled agent guides, or print one's `SKILL.md` |
 | Lab config & diagnostics | `paniolo target`/`host`/`config`, `paniolo discover`, `paniolo configure`, `paniolo doctor`, `paniolo daemons` | Manage the lab file, discover hardware, check config against reality, list and restart daemons |
 | [Exit status and errors](https://curtisgalloway.github.io/paniolo/errors/) | `paniolo --json-errors …` | Exit codes name the failure kind; `--json-errors` adds a one-line JSON object |

@@ -31,6 +31,28 @@ use crate::model::{expand_tilde, Host, LOCAL};
 
 const CONTROL_PERSIST: &str = "300";
 const CONNECT_TIMEOUT: &str = "10";
+/// Probe an idle connection every this many seconds...
+const SERVER_ALIVE_INTERVAL: &str = "5";
+/// ...and give up after this many unanswered probes (~15 s in all).
+const SERVER_ALIVE_COUNT_MAX: &str = "3";
+
+/// Options that bound how long a dead link can hold a call: `ConnectTimeout`
+/// for the handshake, and `ServerAlive*` once connected. Without the latter, a
+/// connection that goes silently half-open (laptop sleep, a Wi-Fi change)
+/// never errors — TCP has nothing to send, so a read just waits — and the
+/// call hangs indefinitely instead of failing as an unreachable host. The
+/// ControlMaster takes these from the invocation that starts it, so every
+/// path that can start one must carry them.
+fn liveness_args() -> Vec<String> {
+    vec![
+        "-o".into(),
+        format!("ConnectTimeout={CONNECT_TIMEOUT}"),
+        "-o".into(),
+        format!("ServerAliveInterval={SERVER_ALIVE_INTERVAL}"),
+        "-o".into(),
+        format!("ServerAliveCountMax={SERVER_ALIVE_COUNT_MAX}"),
+    ]
+}
 
 fn uid() -> u32 {
     crate::platform::current_uid()
@@ -86,8 +108,7 @@ fn base_args(host: &Host, interactive: bool, multiplex: bool) -> std::io::Result
         a.push("-o".into());
         a.push("BatchMode=yes".into());
     }
-    a.push("-o".into());
-    a.push(format!("ConnectTimeout={CONNECT_TIMEOUT}"));
+    a.extend(liveness_args());
     if let Some(id) = &host.identity {
         a.push("-i".into());
         a.push(expand_tilde(id).to_string_lossy().into_owned());
@@ -286,12 +307,8 @@ fn launch(
 /// Same identity, timeout and multiplexing — an sftp that reuses the session's
 /// ControlMaster costs no extra handshake.
 fn transfer_args(host: &Host) -> std::io::Result<Vec<String>> {
-    let mut a = vec![
-        "-o".to_string(),
-        "BatchMode=yes".to_string(),
-        "-o".to_string(),
-        format!("ConnectTimeout={CONNECT_TIMEOUT}"),
-    ];
+    let mut a = vec!["-o".to_string(), "BatchMode=yes".to_string()];
+    a.extend(liveness_args());
     if let Some(id) = &host.identity {
         a.push("-i".into());
         a.push(expand_tilde(id).to_string_lossy().into_owned());
@@ -710,6 +727,14 @@ mod tests {
         assert!(a.contains("BatchMode=yes"), "{a}");
         assert!(a.contains("ControlMaster=auto"), "{a}");
         assert!(a.contains("IdentitiesOnly=yes"), "{a}");
+        assert!(a.contains("ServerAliveInterval=5"), "{a}");
+        assert!(a.contains("ServerAliveCountMax=3"), "{a}");
+        // A standalone connection (a port forward) needs them as much as a
+        // multiplexed one: a tunnel over a dead link should close, not hang.
+        assert!(base_args(&host, false, false)
+            .unwrap()
+            .join(" ")
+            .contains("ServerAliveInterval=5"));
         // Interactive variant drops BatchMode (so a PTY/password can work).
         assert!(!base_args(&host, true, true)
             .unwrap()
@@ -764,5 +789,9 @@ mod tests {
         assert!(a.contains("BatchMode=yes"), "{a}");
         assert!(a.contains("IdentitiesOnly=yes"), "{a}");
         assert!(a.contains("ControlMaster=auto"), "{a}");
+        // An sftp can be what starts the ControlMaster (dispatch ships the
+        // lab slice first), and the master keeps the options it started with.
+        assert!(a.contains("ServerAliveInterval=5"), "{a}");
+        assert!(a.contains("ServerAliveCountMax=3"), "{a}");
     }
 }

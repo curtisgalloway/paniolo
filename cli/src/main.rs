@@ -26,6 +26,7 @@ mod dispatch;
 mod doctor;
 mod error;
 mod labfile;
+mod mcp;
 mod model;
 mod netboot;
 mod netif;
@@ -201,6 +202,16 @@ enum Command {
         #[arg(long)]
         rust_only: bool,
     },
+    /// Serve runtime commands as MCP tools over stdio, for agent harnesses
+    /// (experimental).
+    ///
+    /// Speaks newline-delimited JSON-RPC on stdin/stdout until stdin closes;
+    /// configure it in the harness as a stdio server whose command is
+    /// `paniolo mcp`. Tools: target_list, video_shot, video_read, serial_log,
+    /// serial_send, hid_send, power_state, power_on, power_off, power_cycle.
+    /// Each tool runs the
+    /// matching paniolo command, so remote targets dispatch over SSH as usual.
+    Mcp,
     /// Run a helper binary from paniolo's private libexec dir (omit NAME to
     /// list the installed helpers).
     Helper {
@@ -946,6 +957,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Discover { json } => cmd_discover(json),
         Command::Configure { target, host } => cmd_configure(lab_flag, &target, &host),
         Command::Setup { host, rust_only } => cmd_setup(lab_flag, host.as_deref(), rust_only),
+        Command::Mcp => mcp::serve(lab_flag),
         Command::Helper { name, args } => cmd_helper(name.as_deref(), &args),
         Command::Skill { name, path } => skills::run(name.as_deref(), path),
         Command::Daemons { cmd } => match cmd.unwrap_or(DaemonsCmd::List) {
