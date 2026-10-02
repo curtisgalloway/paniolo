@@ -5,9 +5,10 @@ SPDX-License-Identifier: Apache-2.0
 
 # An MCP server for paniolo
 
-> **Status: plan — nothing built.** Converged 2026-10-02. The first step is a
-> measurement (step 1 below), and its result decides how much of step 3 is
-> built up front.
+> **Status: plan — nothing built.** Converged 2026-10-02. Step 1 (measure
+> per-call dispatch) is done: on a LAN it costs ~17 ms per call, so the spike
+> uses per-call dispatch and the persistent worker is deferred. See
+> *Step 1 result*.
 
 ## Goal
 
@@ -151,6 +152,40 @@ across a WAN/VPN.
   tool interface is the same either way.
 - **Shot time dominated by PNG transfer** → neither transport choice fixes
   that; look at JPEG or downscaled returns for `video_shot` instead.
+
+#### Step 1 result (2026-10-02)
+
+Measured from the dev machine against one target whose video channel is on a
+Pi 5 control host (`bench1`) on the same LAN (ping RTT 0.26 ms). paniolo 0.6.0
+on both ends. Six runs each, the first dropped; the remaining five were
+identical at the timer's resolution (10 ms for A/B/D, 1 ms for C).
+
+| | Measurement | Median |
+|---|---|---|
+| A | `paniolo video show T` — full per-call dispatch | 0.02 s |
+| B | `ssh bench1 true`, fresh connection | 0.12 s |
+| B′ | `ssh bench1 true` through paniolo's ControlMaster socket | < 0.01 s |
+| C | `paniolo video show T` run on `bench1` itself | 0.003 s |
+| D | `paniolo video shot T -o …` (daemon running) | 0.04 s |
+
+PNG size: 33 KB — but the target had no signal, so that is a blank frame. A
+real desktop frame will be larger and slower to encode.
+
+**Reading:** with the ControlMaster warm, dispatch adds about **17 ms per
+call** (A − C), well under the 100 ms threshold. A screenshot round trip is
+about 40 ms. An agent's own turn takes seconds, so a persistent worker would
+save a few percent at best on a LAN.
+
+**Decision:** spike with per-call dispatch; defer the worker. Revisit if:
+
+- a control host sits across a VPN or WAN, where each of dispatch's three SSH
+  operations pays a real round trip (re-run A and B′ there);
+- `video shot` on a live desktop frame turns out to be transfer-bound, which
+  the worker would not fix anyway (see the third bullet of the decision rule).
+
+The worker design above stays as the plan for that case. Reconnect still
+matters without it: per-call dispatch over a half-open ControlMaster hangs the
+same way, so step 2 is still worth doing first.
 
 ### 2. SSH keepalive (independent, small)
 
