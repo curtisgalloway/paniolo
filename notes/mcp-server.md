@@ -262,7 +262,10 @@ plumbing, not reading a live screen.
 `--mcp-config` with `--strict-mcp-config`):
 - found and called both tools: `target_list`, then `video_shot` with
   `stable: true`, which it chose on its own;
-- took 4 turns and 22 s;
+- took 4 turns and 22 s, one of them a `ToolSearch`: Claude Code loads MCP
+  tools as deferred, so the model finds them by searching. Tool names and
+  descriptions are what that search matches, so they need to say plainly what
+  each tool does (screenshot, serial log, …), not just name the paniolo verb;
 - described the screenshot correctly: a solid near-black 1920×1080 frame with
   `signal=no_signal`, so nothing was reaching the capture input;
 - listed all the lab's targets correctly.
