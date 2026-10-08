@@ -35,6 +35,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -75,7 +76,9 @@ commands:
   version                protocol version and capabilities
   info                   USB, video and keyboard-LED state
   run <file|-> [--delay-ms N]   run a command file
-  serve [--port N]       run the KVM daemon (holds the one session)
+  serve [--port N] [--ffmpeg PATH]
+                         run the KVM daemon (holds the one session; serves
+                         video as RFB on GET /rfb when ffmpeg is available)
   stop                   stop the running daemon
 
 JetKVM allows one session at a time: opening one (a one-shot, the daemon, or
@@ -175,6 +178,11 @@ func dispatchCommand(g globals, cmd string, args []string, stdin io.Reader, stdo
 		return err
 	}
 	if cmd == "info" {
+		if ds, ok := tx.(*daemonSender); ok {
+			if vs := ds.videoStream(); vs != "" {
+				data += " stream=" + vs
+			}
+		}
 		fmt.Fprintln(stdout, data)
 	} else {
 		fmt.Fprintln(stdout, "OK")
@@ -283,6 +291,30 @@ type daemonSender struct {
 }
 
 func (d *daemonSender) Close() {}
+
+// videoStream returns the daemon's /status "video" object as compact JSON, or
+// "" when the daemon cannot be asked.
+func (d *daemonSender) videoStream() string {
+	req, err := http.NewRequest(http.MethodGet, d.base+"/status", nil)
+	if err != nil {
+		return ""
+	}
+	if d.token != "" {
+		req.Header.Set("Authorization", "Bearer "+d.token)
+	}
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	var st struct {
+		Video json.RawMessage `json:"video"`
+	}
+	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&st) != nil {
+		return ""
+	}
+	return compactJSON(st.Video)
+}
 
 func (d *daemonSender) RunLine(line string) (string, error) {
 	req, err := http.NewRequest(http.MethodPost, d.base+"/send", strings.NewReader(line))
@@ -412,6 +444,7 @@ func cmdServe(g globals, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	port := fs.Int("port", 0, "")
+	ffmpegFlag := fs.String("ffmpeg", "", "")
 	if err := fs.Parse(args); err != nil {
 		return &usageError{err.Error()}
 	}
@@ -429,8 +462,24 @@ func cmdServe(g globals, args []string) error {
 		return err
 	}
 	host := g.device
+	var video *Video
+	ffmpeg, ferr := findFFmpeg(*ffmpegFlag)
+	if ferr != nil {
+		slog.Warn("video unavailable", "err", ferr)
+	}
 	owner := NewOwner(host, func(ctx context.Context) (rpcLink, error) {
-		return Dial(ctx, DialConfig{Host: host, Password: pw})
+		// The video track only rides the session when ffmpeg can decode it.
+		var vv *Video
+		if ok, _ := video.Available(); ok {
+			vv = video
+		}
+		return Dial(ctx, DialConfig{Host: host, Password: pw, Video: vv})
 	})
+	reason := ""
+	if ferr != nil {
+		reason = ferr.Error()
+	}
+	video = NewVideo(ffmpeg, reason, owner)
+	owner.SetVideo(video)
 	return serveDaemon(host, g.target, *port, owner)
 }

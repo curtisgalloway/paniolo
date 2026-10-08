@@ -23,12 +23,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 	"github.com/pion/ice/v4"
+	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -43,6 +45,10 @@ type fakeDevice struct {
 	calls    []string // "method {json params}", in arrival order
 	sessions []*fakeSession
 	logins   int
+
+	offers  []string // SDP of every offer received
+	videoAU [][]byte // when set, answer with an H.264 track playing these access units
+	plis    atomic.Int32
 }
 
 type fakeSession struct {
@@ -126,7 +132,19 @@ func (d *fakeDevice) signaling(w http.ResponseWriter, r *http.Request) {
 	}
 	d.mu.Unlock()
 
-	api := webrtc.NewAPI(webrtc.WithSettingEngine(*loopbackEngine()))
+	d.mu.Lock()
+	d.offers = append(d.offers, offer.SDP)
+	videoAU := d.videoAU
+	d.mu.Unlock()
+	opts := []func(*webrtc.API){webrtc.WithSettingEngine(*loopbackEngine())}
+	if videoAU != nil {
+		me := &webrtc.MediaEngine{}
+		for _, c := range h264Codecs() {
+			_ = me.RegisterCodec(c, webrtc.RTPCodecTypeVideo)
+		}
+		opts = append(opts, webrtc.WithMediaEngine(me))
+	}
+	api := webrtc.NewAPI(opts...)
 	pc, err := api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		return
@@ -147,6 +165,37 @@ func (d *fakeDevice) signaling(w http.ResponseWriter, r *http.Request) {
 	if pc.SetRemoteDescription(offer) != nil {
 		return
 	}
+	if videoAU != nil {
+		track, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{
+			MimeType: webrtc.MimeTypeH264, ClockRate: 90000,
+			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+		}, "video", "jetkvm")
+		if err != nil {
+			return
+		}
+		sender, err := pc.AddTrack(track)
+		if err != nil {
+			return
+		}
+		go func() { // count PLIs
+			for {
+				pkts, _, err := sender.ReadRTCP()
+				if err != nil {
+					return
+				}
+				for _, p := range pkts {
+					if _, ok := p.(*rtcp.PictureLossIndication); ok {
+						d.plis.Add(1)
+					}
+				}
+			}
+		}()
+		pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
+			if s == webrtc.PeerConnectionStateConnected {
+				go d.playVideo(pc, track, videoAU)
+			}
+		})
+	}
 	answer, err := pc.CreateAnswer(nil)
 	if err != nil {
 		return
@@ -162,6 +211,24 @@ func (d *fakeDevice) signaling(w http.ResponseWriter, r *http.Request) {
 	for {
 		if _, _, err := ws.Read(ctx); err != nil {
 			return
+		}
+	}
+}
+
+// playVideo loops the clip as one continuous RTP stream until the peer closes.
+func (d *fakeDevice) playVideo(pc *webrtc.PeerConnection, track *webrtc.TrackLocalStaticRTP, aus [][]byte) {
+	stream := newRTPStream()
+	for {
+		for _, frame := range stream.packetize(aus) {
+			for _, p := range frame {
+				if pc.ConnectionState() != webrtc.PeerConnectionStateConnected {
+					return
+				}
+				if track.WriteRTP(p) != nil {
+					return
+				}
+			}
+			time.Sleep(40 * time.Millisecond)
 		}
 	}
 }

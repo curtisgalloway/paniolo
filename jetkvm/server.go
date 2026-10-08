@@ -35,6 +35,7 @@ const maxSendBytes int64 = maxTypeChars + int64(len("type "))
 //	GET  /status   liveness and connection state
 //	GET  /version  forwards `version`
 //	POST /send     body = one command line; reply = OK data, or 503 + error
+//	GET  /rfb      WebSocket: RFB 3.8 video (see README)
 //	GET  /hid      WebSocket: command lines in, `evt ok|err ...` frames out
 //	POST /stop     authenticated shutdown (calls stop)
 func newHandler(owner *Owner, token string, stop func()) http.Handler {
@@ -48,6 +49,7 @@ func newHandler(owner *Owner, token string, stop func()) http.Handler {
 			"connected": connected,
 			"kicked":    kicked,
 			"last_err":  lastErr,
+			"video":     owner.Video().Status(),
 		})
 	})
 	mux.HandleFunc("GET /version", func(w http.ResponseWriter, r *http.Request) {
@@ -80,6 +82,9 @@ func newHandler(owner *Owner, token string, stop func()) http.Handler {
 	mux.HandleFunc("POST /stop", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "hid daemon stopping\n")
 		stop()
+	})
+	mux.HandleFunc("GET /rfb", func(w http.ResponseWriter, r *http.Request) {
+		serveRFB(owner.Video(), w, r)
 	})
 	mux.HandleFunc("GET /hid", func(w http.ResponseWriter, r *http.Request) {
 		serveHidWS(owner, w, r)
