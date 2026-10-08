@@ -14,6 +14,7 @@ Pick the helper that matches your injector hardware. There is no default.
 | Helper | Drives | Bind with |
 |---|---|---|
 | [`ch9329`](https://github.com/curtisgalloway/paniolo/blob/main/ch9329/README.md) | KVM-over-USB devices speaking the WCH CH9329 protocol (serial-to-HID chip): the **Openterface Mini-KVM**, the **Openterface KVM-Go** (see the [KVM-Go notes](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-kvm-go.md)), and the **Sipeed NanoKVM-USB**. | `--cmd "ch9329 -d <uart>"` |
+| [`jetkvm`](https://github.com/curtisgalloway/paniolo/blob/main/jetkvm/README.md) | The **JetKVM** network KVM (firmware 0.5.9), over the network instead of a serial port. Keyboard and mouse only; see [JetKVM](#jetkvm-network-kvm-jetkvm). | `--cmd "jetkvm -d <host>"` |
 | [`hidrig`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md) | The DIY dual-board KB2040 rig below. The only option that also bridges the DUT's serial console and switches its power. | `--cmd "hidrig -d <data-cdc>"` |
 
 Any other injector works if it implements the command vocabulary (`type`,
@@ -22,6 +23,46 @@ Any other injector works if it implements the command vocabulary (`type`,
 **Set the baud rate.** `ch9329` autodetects among 115200 (Openterface), 57600
 (Sipeed NanoKVM-USB) and 9600 (a factory CH9329), which costs a probe per
 session. `-b <rate>` skips it.
+
+---
+
+## JetKVM network KVM (`jetkvm`)
+
+The JetKVM is a KVM that sits on the network. Its firmware exposes the
+keyboard and mouse only over WebRTC (a browser-style peer connection), so the
+helper is a small Go program that logs in, negotiates one WebRTC session, and
+sends keyboard and mouse reports over it. It speaks the same command
+vocabulary as the other hid helpers.
+
+```bash
+# Bind it. -d is the JetKVM's address (host or host:port); there is no serial
+# port. Use a documentation address in examples, your own in the lab file.
+paniolo hid set -t target-machine --cmd "jetkvm -d 192.0.2.10"
+```
+
+**Password.** The device password never goes in a flag or the lab file. The
+helper reads, in order: the `JETKVM_PASSWORD` environment variable,
+`--password-file <path>`, then `--password-command '<cmd>'` (for example
+`'op read op://vault/jetkvm/password'`). A missing or rejected password exits
+3. A daemon needs it only at start; routed one-shots do not.
+
+**One session at a time.** The firmware keeps a single session. Opening the
+JetKVM web UI while the hid daemon runs kicks the daemon, and any command
+that has to open its own session kicks your browser tab. The daemon logs the
+takeover, does not fight for the session, and reconnects on the next command
+you send. Close the browser tab (or let the daemon own the session) while
+automating.
+
+**`OK` does not prove delivery.** The firmware reports success for HID calls
+even when the target has not enumerated the USB device. Run
+`paniolo hid send -t target-machine info` to read the USB state, video state
+and keyboard LEDs before trusting a silent run.
+
+Pointer clicks (`click`, `mdown`, `mup`) happen wherever the pointer already
+is, so follow a `moveabs` with the click. `paniolo console` works as a KVM
+through the helper's daemon exactly as it does for `ch9329`; the video comes
+from a separate `video` channel (milestone 1 does not stream the JetKVM's
+own video).
 
 ---
 
@@ -187,7 +228,7 @@ automatically.
 and `paniolo console` passes it in the `?hidws=` URL. A daemon from an older
 paniolo has no token; `paniolo daemons restart --stale` replaces it.
 
-**Stopping.** `hid stop` (and `ch9329 stop` / `hidrig stop`) uses the
+**Stopping.** `hid stop` (and `ch9329 stop` / `hidrig stop` / `jetkvm stop`) uses the
 authenticated `POST /stop` and never signals the discovery-file PID. Stop a
 daemon too old for the endpoint with `paniolo daemons stop hid`.
 

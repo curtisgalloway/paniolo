@@ -30,6 +30,12 @@
 # it ships inside the helpers that depend on it, so only the CI, ci-local and
 # Makefile checks apply to it.
 #
+# Go modules (a directory with a go.mod) are not Cargo crates, so they get their
+# own, equally strict, checks: a `working-directory:` job in ci.yml, a
+# `go_job` line in ci-local.sh, and a mention in GO_HELPERS of cli/src/setup.rs
+# (source installs). Release packaging is the one thing a Go module may defer,
+# and only through GO_RELEASE_EXEMPT below, with the reason written down.
+#
 # Run it anywhere: bash scripts/ci-local.sh needs a Linux box, this needs
 # nothing but a shell.
 set -uo pipefail
@@ -45,6 +51,12 @@ SETUP="$ROOT/cli/src/setup.rs"
 # Crates intentionally exempt from a CI job, one per line, with the reason
 # stated here. Keep this empty unless there is a real platform blocker.
 EXEMPT=""
+
+# Go modules whose release packaging (the .deb / tarball / zip / Homebrew
+# contents) is deliberately not wired up yet, one per line as "name: reason".
+# Keep this honest: a module listed here builds green in CI and never reaches
+# a release user until the reason is resolved.
+GO_RELEASE_EXEMPT="jetkvm: release packaging is milestone 1b (a Go cross-build step in release.yml, nfpm contents, the Homebrew keg); until then it ships only via 'paniolo setup' from a source clone"
 
 if [ ! -f "$CI" ]; then
   echo "FATAL: $CI not found" >&2
@@ -114,7 +126,61 @@ for manifest in "$ROOT"/*/Cargo.toml; do
   fi
 done
 
+missing_go_ci=""
+missing_go_local=""
+missing_go_setup=""
+go_setup_helpers=""
+if [ -f "$SETUP" ]; then
+  go_setup_helpers="$(sed -n '/GO_HELPERS/,/;/p' "$SETUP" \
+    | grep -oE '"[A-Za-z0-9_-]+"' | tr -d '"' | sort -u)"
+fi
+go_local_covered=""
+if [ -f "$LOCAL" ]; then
+  go_local_covered="$(grep -oE '^go_job[[:space:]]+"[A-Za-z0-9_-]+"' "$LOCAL" \
+    | tr -d '"' | awk '{print $NF}' | sort -u)"
+fi
+for gomod in "$ROOT"/*/go.mod; do
+  [ -f "$gomod" ] || continue
+  mod="$(basename "$(dirname "$gomod")")"
+  if printf '%s\n' "$covered" | grep -qx "$mod"; then
+    echo "  ok    $mod (go)"
+  else
+    echo "  MISS  $mod (go)"
+    missing_go_ci="$missing_go_ci $mod"
+  fi
+  if ! printf '%s\n' "$go_local_covered" | grep -qx "$mod"; then
+    missing_go_local="$missing_go_local $mod"
+  fi
+  if ! printf '%s\n' "$go_setup_helpers" | grep -qx "$mod"; then
+    missing_go_setup="$missing_go_setup $mod"
+  fi
+  if printf '%s\n' "$GO_RELEASE_EXEMPT" | grep -q "^$mod:"; then
+    echo "  skip  $mod release packaging (exempt: $(printf '%s\n' "$GO_RELEASE_EXEMPT" | grep "^$mod:" | cut -d: -f2- | sed 's/^ //'))"
+  elif [ -n "$release_helpers" ] && ! printf '%s\n' "$release_helpers" | grep -qx "$mod"; then
+    echo "  MISS  $mod is not in the release HELPERS list and not release-exempt" >&2
+    missing_release="$missing_release $mod"
+  fi
+done
+
 rc=0
+if [ -n "$missing_go_ci" ]; then
+  echo >&2
+  echo "FAIL: no CI job covers Go module(s):$missing_go_ci" >&2
+  echo "Add a job with 'working-directory: <module>' (gofmt, go vet, go test)." >&2
+  rc=1
+fi
+if [ -n "$missing_go_local" ]; then
+  echo >&2
+  echo "FAIL: scripts/ci-local.sh does not mirror Go module(s):$missing_go_local" >&2
+  echo "Add a matching 'go_job \"<module>\" \"<module>\"' line." >&2
+  rc=1
+fi
+if [ -n "$missing_go_setup" ]; then
+  echo >&2
+  echo "FAIL: cli/src/setup.rs GO_HELPERS omits Go module(s):$missing_go_setup" >&2
+  echo "Add it so 'paniolo setup' builds the helper from a source clone." >&2
+  rc=1
+fi
 if [ -n "$missing" ]; then
   echo >&2
   echo "FAIL: no CI job covers:$missing" >&2

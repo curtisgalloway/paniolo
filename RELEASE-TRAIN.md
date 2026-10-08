@@ -22,7 +22,7 @@ bench-host run and by CI's new smoke step.
 - ci workflow: `.github/workflows/ci.yml`; lint helpers `scripts/ci-actions-pinned.sh`, `scripts/ci-coverage-check.sh`
 - bump rules: conventional prefixes where present; this repo mostly writes `<crate>: <summary>`, so apply AGENTS.md: minor for a new command, channel, helper, verb, wire-protocol or daemon-lifecycle change, or a fix that changes what a target sees; patch for small fixes and docs; on the line, take the minor
 - releaser identity: tag with the author's GitHub noreply form already in the history (`git log --format=%ae | sort -u`), passed as `-c user.email` on the tag command, never edited into config
-- helpers: `hdmicap serialcap netbootd cambrionix hidrig ch9329 shellyplug amt` (the `HELPERS` line in the release workflow, and `CRATES` in `Makefile` minus the library crates, must agree; `scripts/ci-coverage-check.sh` enforces it)
+- helpers: `hdmicap serialcap netbootd cambrionix hidrig ch9329 shellyplug amt` (the `HELPERS` line in the release workflow, and `CRATES` in `Makefile` minus the library crates, must agree; `scripts/ci-coverage-check.sh` enforces it). The Go helper `jetkvm` is deliberately NOT in that list yet: release packaging for it is milestone 1b, and the coverage script carries the written exemption. Until then it reaches users only through the source channel (`paniolo setup` with Go installed)
 - library crates: `secret` (no binary; in `Makefile` `CRATES` and CI, never in `HELPERS`; it ships compiled into `amt`, so no channel stages it and the smoke contract has nothing to check for it)
 - bundled skills: `skills/paniolo`, `skills/kvm-puppeting`, `skills/control-host` (shipped to `share/paniolo/skills` in every channel)
 - log dir: `logs/release-train/<run>/` (gitignored, persistent)
@@ -131,7 +131,7 @@ enough.
 - workflow job: none
 - host: local
 - build: `PANIOLO_VERSION=X.Y.Z cargo install --path cli --root $S/.cargo` from the worktree with `HOME=$S`, `CARGO_HOME` **and `RUSTUP_HOME` exported explicitly at their real paths** (with `HOME` overridden rustup otherwise looks under `$S/.rustup`, finds no toolchain, and cargo fails with "could not choose a version of cargo"; the registry cache is the other reason), a persistent `CARGO_TARGET_DIR`, and **`CARGO_INSTALL_ROOT=$S/.cargo`**: `paniolo setup` reinstalls the CLI itself with `cargo install --path cli --force` and no `--root` (`cli/src/setup.rs`), which without that variable overwrites the developer's real CLI (it did, 2026-09-10)
-- install like a user: `HOME=$S paniolo setup --rust-only` from the worktree root (helpers land in `$S/.local/libexec/paniolo/bin`, and since #207 the bundled skills land in `$S/.local/share/paniolo/skills` on this path too); then by hand the OCR helper, which `--rust-only` skips because it needs a second toolchain: `swiftc -O -o $S/.local/libexec/paniolo/bin/visionocr ocr/visionocr.swift`; then zigplug, which `--rust-only` skips for the same reason (it needs uv) — `UV_TOOL_DIR=$S/uv UV_TOOL_BIN_DIR=$S/.local/libexec/paniolo/bin uv tool install ./zigplug` and `zigplug --help`. Both by-hand steps are load-bearing: until the v0.4.0 train the zigplug install ran on the fast path anyway (the block had no `will(...)` gate), so a recipe that omitted it still ended up with a working `zigplug` and nothing said otherwise
+- install like a user: `HOME=$S paniolo setup --rust-only` from the worktree root (helpers land in `$S/.local/libexec/paniolo/bin`, and since #207 the bundled skills land in `$S/.local/share/paniolo/skills` on this path too); then by hand the OCR helper, which `--rust-only` skips because it needs a second toolchain: `swiftc -O -o $S/.local/libexec/paniolo/bin/visionocr ocr/visionocr.swift`; then zigplug, which `--rust-only` skips for the same reason (it needs uv) — `UV_TOOL_DIR=$S/uv UV_TOOL_BIN_DIR=$S/.local/libexec/paniolo/bin uv tool install ./zigplug` and `zigplug --help`; then jetkvm, which `--rust-only` also skips because it needs Go (`SourceStep::JetKvm` in `cli/src/setup.rs`) — `(cd jetkvm && go build -trimpath -o $S/.local/libexec/paniolo/bin/jetkvm .)` and `jetkvm version`. All three by-hand steps are load-bearing: until the v0.4.0 train the zigplug install ran on the fast path anyway (the block had no `will(...)` gate), so a recipe that omitted it still ended up with a working `zigplug` and nothing said otherwise
 - smoke: S1..S7 against `$S/.cargo/bin/paniolo` with `HOME=$S`
 - cleanup: nothing outside `$S`
 - caveats: `paniolo setup` rebuilds the CLI with `cargo install --force` and inherits `PANIOLO_VERSION` from the environment, so keep it exported for that step too or S1 sees `0.1.0 (unversioned dev build)`
@@ -169,10 +169,10 @@ feeds needs re-reading before `--update` re-pins it.
 | `packaging/nfpm.yaml` | b348d64432f4 | Channels: deb |
 | `packaging/scripts/build-apt-repo.sh` | fb2205eeab8e | Channels: deb, install like a user |
 | `Makefile` | 36543cf5ec97 | Project: helpers; Channels: source |
-| `cli/src/setup.rs` | b14d2f93405a | Channels: source |
+| `cli/src/setup.rs` | ba262db163f0 | Channels: source |
 | `cli/src/skills.rs` | eada6fa6ec0c | Smoke contract S2; Channels: homebrew, windows |
 | `cli/src/daemons.rs` | f86e565cab42 | Smoke contract S3 |
-| `scripts/ci-coverage-check.sh` | d49ec54b9b17 | Project: helpers |
+| `scripts/ci-coverage-check.sh` | 84a938b2dbf0 | Project: helpers |
 | `scripts/sync-brik.sh` | b8b5a15775a9 | Channels: windows |
-| `README.md` | 983f8229cbac | Channels: source; Publish: re-verify apt |
-| `AGENTS.md` | 417fd01966bb | Project: bump rules, tag format; Publish |
+| `README.md` | 2402008706e1 | Channels: source; Publish: re-verify apt |
+| `AGENTS.md` | e65813e646e8 | Project: bump rules, tag format; Publish |

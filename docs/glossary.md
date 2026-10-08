@@ -36,9 +36,11 @@ each term briefly on first use; this page is the longer reference.
 | **CH340** | A common USB-to-serial chip. |
 | **CH9329** | A chip that turns serial commands into USB keyboard and mouse input. |
 | **FTDI** | A family of USB-to-serial chips. paniolo uses their DTR line to press a target's power button. |
+| **JetKVM** | A network KVM that connects to the target by USB and HDMI. Its keyboard and mouse are reachable only over WebRTC, and it allows one session at a time. |
 | **KB2040** | An Adafruit board built on the RP2040 microcontroller. The hidrig uses two of them. |
 | **KVM** | Keyboard, video and mouse: controlling a machine's screen and input from another machine. |
 | **MS2109** | A chip used in cheap USB HDMI capture dongles. |
+| **WebRTC** | The browser peer-to-peer protocol (used for video calls). The JetKVM's firmware uses a WebRTC data channel to carry keyboard and mouse commands. |
 | **Openterface Mini-KVM** | A USB dongle that combines HDMI capture with keyboard and mouse injection. |
 | **PDU** | Power distribution unit: a networked power strip with switchable outlets. |
 | **PHY** | The physical-layer chip behind an Ethernet port. |

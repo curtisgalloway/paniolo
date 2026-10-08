@@ -46,6 +46,12 @@ const HELPER_CRATES: [&str; 8] = [
     "amt",
 ];
 
+/// The Go helpers `setup` builds with `go build` into libexec when a Go
+/// toolchain is present. Not Cargo crates, so not in [`HELPER_CRATES`];
+/// `scripts/ci-coverage-check.sh` reads this list to check every Go module in
+/// the repo is installable from a source clone.
+const GO_HELPERS: [&str; 1] = ["jetkvm"];
+
 fn is_repo_root(d: &Path) -> bool {
     d.join("Makefile").is_file()
         && d.join("ocr").is_dir()
@@ -469,6 +475,8 @@ enum SourceStep {
     OcrHelper,
     /// Install the zigplug power helper (needs uv).
     Zigplug,
+    /// Build and install the jetkvm hid helper (Go; needs `go`).
+    JetKvm,
 }
 
 impl SourceStep {
@@ -481,6 +489,7 @@ impl SourceStep {
             Self::SetuidBpfHelper => "setuid",
             Self::OcrHelper => "OCR",
             Self::Zigplug => "zigplug",
+            Self::JetKvm => "jetkvm",
         }
     }
 
@@ -493,7 +502,11 @@ impl SourceStep {
     fn on_the_fast_path(self) -> bool {
         match self {
             Self::InstallSkills | Self::DropStaleCopies => true,
-            Self::LinuxGroups | Self::SetuidBpfHelper | Self::OcrHelper | Self::Zigplug => false,
+            Self::LinuxGroups
+            | Self::SetuidBpfHelper
+            | Self::OcrHelper
+            | Self::Zigplug
+            | Self::JetKvm => false,
         }
     }
 }
@@ -516,6 +529,7 @@ fn source_steps(os: &str, rust_only: bool) -> Vec<SourceStep> {
     }
     steps.push(SourceStep::OcrHelper);
     steps.push(SourceStep::Zigplug);
+    steps.push(SourceStep::JetKvm);
     if rust_only {
         steps.retain(|s| s.on_the_fast_path());
     }
@@ -614,6 +628,59 @@ fn zigplug_step(will: bool, repo: &Path, libexec: &Path) -> ZigplugOutcome {
         ZigplugOutcome::Installed
     } else {
         ZigplugOutcome::Failed
+    }
+}
+
+/// What [`jetkvm_step`] did, so the decision can be driven by a test without a
+/// Go toolchain standing by.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum JetKvmOutcome {
+    /// Off this run's step list — `run` never looked at the checkout or `go`.
+    Skipped,
+    /// No `jetkvm/go.mod` in the checkout.
+    SourceMissing,
+    /// `go` is not installed.
+    GoMissing,
+    Installed,
+    Failed,
+}
+
+/// jetkvm: the Go hid helper for JetKVM network KVMs, built from the checkout
+/// with `go build` straight into libexec (it has no uv-style shim to place).
+/// Not a Cargo crate, so it is not in [`HELPER_CRATES`]; a machine without a Go
+/// toolchain simply does not get it, and says so.
+///
+/// `will` is membership of [`source_steps`]; like [`zigplug_step`], the early
+/// return on `false` is what keeps `--rust-only` off a second toolchain.
+fn jetkvm_step(will: bool, repo: &Path, libexec: &Path) -> JetKvmOutcome {
+    if !will {
+        return JetKvmOutcome::Skipped;
+    }
+    let [name] = GO_HELPERS;
+    let dir = repo.join(name);
+    if !dir.join("go.mod").is_file() {
+        println!("  … jetkvm: source not found, skipped");
+        return JetKvmOutcome::SourceMissing;
+    }
+    let Some(go) = crate::daemons::find_binary("go") else {
+        println!("  … jetkvm: go not found (https://go.dev/dl), skipped");
+        return JetKvmOutcome::GoMissing;
+    };
+    let dest = libexec.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    let ok = Command::new(&go)
+        .current_dir(&dir)
+        .args(["build", "-trimpath", "-o"])
+        .arg(&dest)
+        .arg(".")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if ok {
+        println!("  ✓ {name:12} {}", dest.display());
+        JetKvmOutcome::Installed
+    } else {
+        eprintln!("  ! jetkvm: go build failed, skipped");
+        JetKvmOutcome::Failed
     }
 }
 
@@ -842,6 +909,7 @@ pub fn run(repo: &Path, rust_only: bool, lab_flag: Option<&str>) -> Result<()> {
     }
 
     zigplug_step(will(SourceStep::Zigplug), repo, &libexec);
+    jetkvm_step(will(SourceStep::JetKvm), repo, &libexec);
 
     if rust_only {
         println!(
@@ -959,6 +1027,60 @@ mod tests {
         }
     }
 
+    /// Same contract as zigplug: off the step list `jetkvm_step` must return
+    /// before it looks for the checkout or a Go toolchain, so `--rust-only`
+    /// never reaches `go`. On the list it reports what it found, and the
+    /// scratch repo here has no `jetkvm/`, which is what stops the test from
+    /// running a real build.
+    #[test]
+    fn rust_only_never_reaches_go_for_jetkvm() {
+        let repo = tempfile::tempdir().unwrap();
+        let libexec = tempfile::tempdir().unwrap();
+        assert_eq!(
+            jetkvm_step(false, repo.path(), libexec.path()),
+            JetKvmOutcome::Skipped
+        );
+        assert_eq!(
+            jetkvm_step(true, repo.path(), libexec.path()),
+            JetKvmOutcome::SourceMissing
+        );
+        for os in ["linux", "macos", "windows"] {
+            assert!(
+                !source_steps(os, true).contains(&SourceStep::JetKvm),
+                "{os}: jetkvm needs Go, so it is off the fast path"
+            );
+            assert!(source_steps(os, false).contains(&SourceStep::JetKvm));
+        }
+    }
+
+    /// The step builds the real helper from the real checkout when a Go
+    /// toolchain exists, and the binary it leaves in libexec runs. Skipped
+    /// (not failed) without `go`, which is the step's own documented outcome.
+    #[test]
+    fn jetkvm_step_builds_a_runnable_helper_from_the_checkout() {
+        if crate::daemons::find_binary("go").is_none() {
+            eprintln!("go not installed; skipping");
+            return;
+        }
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the cli crate always has a parent directory");
+        let libexec = tempfile::tempdir().unwrap();
+        assert_eq!(
+            jetkvm_step(true, repo, libexec.path()),
+            JetKvmOutcome::Installed
+        );
+        let bin = libexec
+            .path()
+            .join(format!("jetkvm{}", std::env::consts::EXE_SUFFIX));
+        let out = Command::new(&bin).arg("version").output().unwrap();
+        assert!(out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("jetkvm/"),
+            "version reply"
+        );
+    }
+
     /// The fast path is the full list minus what needs sudo or a second
     /// toolchain — nothing else. Stated per platform, because the answer
     /// differs and a list that ignored that would mis-report two of three.
@@ -973,7 +1095,8 @@ mod tests {
             vec![
                 SourceStep::LinuxGroups,
                 SourceStep::OcrHelper,
-                SourceStep::Zigplug
+                SourceStep::Zigplug,
+                SourceStep::JetKvm
             ],
             "Linux skips the group step (sudo), not the setuid one (macOS only)"
         );
@@ -982,12 +1105,17 @@ mod tests {
             vec![
                 SourceStep::SetuidBpfHelper,
                 SourceStep::OcrHelper,
-                SourceStep::Zigplug
+                SourceStep::Zigplug,
+                SourceStep::JetKvm
             ],
         );
         assert_eq!(
             rust_only_skips("windows"),
-            vec![SourceStep::OcrHelper, SourceStep::Zigplug],
+            vec![
+                SourceStep::OcrHelper,
+                SourceStep::Zigplug,
+                SourceStep::JetKvm
+            ],
             "there is no setuid bit and no dialout group on Windows"
         );
     }
