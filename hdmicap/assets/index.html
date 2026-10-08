@@ -13,6 +13,23 @@
     #video { flex: 1 1 auto; min-height: 0; position: relative;
              display: flex; align-items: center; justify-content: center; }
     #video img { max-width: 100%; max-height: 100%; object-fit: contain; }
+    /* Video mode: noVNC canvas (default) or the MJPEG <img> fallback. */
+    #vnc { position: absolute; inset: 0; background: #000; display: none; }
+    #video.mode-vnc #vnc { display: block; }
+    #video.mode-vnc #feed { display: none; }
+    #video.mode-mjpeg #vnc { display: none; }
+    /* noVNC drives the target with its own input; the hid-capture overlay is
+       for MJPEG mode only. */
+    #video.mode-vnc #kvmbtn, #video.mode-vnc #kvmhint,
+    #video.mode-vnc #kvmstatus { display: none !important; }
+    #vmode { display: inline-flex; align-items: center; gap: 4px; }
+    #vmode button { cursor: pointer; background: none; border: 1px solid #444;
+                    border-radius: 3px; color: #888; font: 11px ui-monospace, monospace;
+                    padding: 1px 6px; }
+    #vmode button:hover { color: #cdf; border-color: #46c; }
+    #vmode button.on { color: #000; background: #8ad; border-color: #8ad; }
+    #vncstat { color: #fa0; max-width: 40vw; overflow: hidden;
+               text-overflow: ellipsis; white-space: nowrap; }
     #vstatus { position: absolute; top: 8px; right: 12px; color: #0f0;
                background: rgba(0,0,0,.6); padding: 4px 8px; border-radius: 4px; }
     #sidebar { flex: 0 0 auto; display: flex; flex-direction: column; min-height: 0; }
@@ -114,6 +131,7 @@
 </head>
 <body>
   <div id="video">
+    <div id="vnc"></div>
     <img id="feed" alt="HDMI capture feed" draggable="false">
     <div id="kvmhint">⌨ Use “Capture input” to control the target</div>
     <div id="videobtns">
@@ -140,6 +158,12 @@
   </div>
   <div id="sidebar">
     <div id="bar">
+      <span class="label">video</span>
+      <span id="vmode">
+        <button data-mode="vnc" title="noVNC live view (native input)">VNC</button>
+        <button data-mode="mjpeg" title="MJPEG stream (use Capture input)">MJPEG</button>
+      </span>
+      <span id="vncstat"></span>
       <span class="label">serial</span>
       <span id="sstatus">disconnected</span>
       <button id="layoutbtn" title="Toggle serial panel position"></button>
@@ -149,6 +173,149 @@
 
   <script src="/xterm.js"></script>
   <script src="/xterm-addon-fit.js"></script>
+  <script type="module">
+    // ── video mode: noVNC canvas (default) or the MJPEG <img> ──
+    // noVNC connects to this daemon's /rfb WebSocket (same host:port as the
+    // page, same token) and sends its own keyboard/pointer events, which the
+    // daemon turns into hid commands. MJPEG mode is today's <img> plus the
+    // "Capture input" overlay. The bundle is vendored (no CDN), like xterm.js.
+    const MODE_KEY = 'paniolo-video-mode';
+    const videoEl = document.getElementById('video');
+    const vncEl = document.getElementById('vnc');
+    const feed = document.getElementById('feed');
+    const vstat = document.getElementById('vncstat');
+    const modeBtns = document.querySelectorAll('#vmode button');
+    const pageParams = new URLSearchParams(location.search);
+    const pageToken = pageParams.get('token') || '';
+
+    function storedMode() {
+      try {
+        const m = localStorage.getItem(MODE_KEY);
+        return m === 'mjpeg' ? 'mjpeg' : 'vnc';
+      } catch (e) { return 'vnc'; }
+    }
+    function storeMode(m) { try { localStorage.setItem(MODE_KEY, m); } catch (e) {} }
+    function setStat(txt, color) { vstat.textContent = txt; vstat.style.color = color || '#fa0'; }
+    function rfbUrl() {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const q = pageToken ? '?token=' + encodeURIComponent(pageToken) : '';
+      return proto + '//' + location.host + '/rfb' + q;
+    }
+
+    let RFB = null;          // the noVNC class, once imported
+    let rfb = null;          // the live connection, if any
+    let mode = null;         // what is showing: 'vnc' | 'mjpeg'
+    let everConnected = false;
+    let retry = 0, retryTimer = null;
+
+    function stopVnc() {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+      const r = rfb;
+      rfb = null; // detach first: the disconnect event must not schedule a retry
+      if (r) { try { r.disconnect(); } catch (e) {} }
+      vncEl.replaceChildren();
+    }
+
+    function startMjpeg() {
+      if (!feed.getAttribute('src')) feed.src = withToken('/preview');
+    }
+    function stopMjpeg() {
+      // Dropping src closes the multipart stream on the daemon side.
+      feed.removeAttribute('src');
+    }
+
+    function fallbackToMjpeg(why) {
+      showMode('mjpeg', false);
+      setStat('VNC unavailable (' + why + ') — showing MJPEG', '#fa0');
+    }
+
+    function vncConnect() {
+      if (mode !== 'vnc' || !RFB) return;
+      setStat(retry ? 'VNC reconnecting…' : 'VNC connecting…');
+      const r = new RFB(vncEl, rfbUrl(), { wsProtocols: ['binary'] });
+      rfb = r;
+      r.scaleViewport = true;
+      r.resizeSession = false;
+      r.viewOnly = false;
+      r.focusOnClick = true;
+      r.showDotCursor = true;
+      r.addEventListener('connect', () => {
+        if (rfb !== r) return;
+        everConnected = true;
+        retry = 0;
+        setStat('VNC connected', '#4d4');
+      });
+      r.addEventListener('securityfailure', ev => {
+        setStat('VNC security failure: ' + ((ev.detail && ev.detail.reason) || 'unknown'), '#f44');
+      });
+      r.addEventListener('disconnect', ev => {
+        if (rfb !== r) return; // we closed it ourselves
+        rfb = null;
+        vncEl.replaceChildren();
+        const clean = ev.detail && ev.detail.clean;
+        if (!everConnected && retry === 0) {
+          // First attempt never got going (older daemon with no /rfb -> 404,
+          // too many clients -> 503, ...): don't leave a dead pane.
+          fallbackToMjpeg('could not connect');
+          return;
+        }
+        const delay = Math.min(10000, 500 * Math.pow(2, retry));
+        retry++;
+        setStat('VNC disconnected' + (clean ? '' : ' (connection lost)') +
+                ' — retrying in ' + Math.ceil(delay / 1000) + ' s', '#f44');
+        retryTimer = setTimeout(vncConnect, delay);
+      });
+    }
+
+    function showMode(m, persist) {
+      if (persist) storeMode(m);
+      if (m !== mode) {
+        mode = m;
+        if (m === 'vnc') {
+          stopMjpeg();
+          everConnected = false;
+          retry = 0;
+          videoEl.classList.add('mode-vnc');
+          videoEl.classList.remove('mode-mjpeg');
+          vncConnect();
+        } else {
+          stopVnc();
+          videoEl.classList.add('mode-mjpeg');
+          videoEl.classList.remove('mode-vnc');
+          setStat('');
+          startMjpeg();
+        }
+        // Tell the hid-capture code to let go when leaving MJPEG mode.
+        window.dispatchEvent(new CustomEvent('paniolo-video-mode', { detail: m }));
+      }
+      modeBtns.forEach(b => b.classList.toggle('on', b.dataset.mode === m));
+    }
+    // Switching to VNC retries the import if it failed earlier.
+    modeBtns.forEach(b => {
+      b.onclick = async () => {
+        if (b.dataset.mode === 'vnc' && !RFB) {
+          try { RFB = (await import('/novnc.js')).default; }
+          catch (e) { setStat('VNC unavailable (noVNC failed to load)', '#f44'); return; }
+        }
+        showMode(b.dataset.mode, true);
+      };
+    });
+
+    const want = storedMode();
+    if (want === 'mjpeg') {
+      showMode('mjpeg', false);
+    } else {
+      // Show the VNC pane while the bundle loads; fall back if it cannot.
+      setStat('VNC loading…');
+      try {
+        RFB = (await import('/novnc.js')).default;
+        showMode('vnc', false);
+      } catch (e) {
+        fallbackToMjpeg('noVNC failed to load');
+      }
+    }
+  </script>
   <script>
     // ── auth ──
     // The daemon issues a per-start token (auth.rs); paniolo puts it in this
@@ -193,7 +360,8 @@
     // ── video: poll signal/resolution from this (hdmicap) daemon ──
     const vimg = document.getElementById('feed');
     const vst  = document.getElementById('vstatus');
-    vimg.src = withToken('/preview');
+    // The MJPEG stream is opened only while MJPEG mode is showing (see the
+    // video-mode block below); a stream nobody watches would cost an encode.
     function pollVideo() {
       fetch(withToken('/status')).then(r => {
         if (r.status === 401) {
@@ -209,7 +377,9 @@
     }
     pollVideo();
     setInterval(pollVideo, 2000);
-    vimg.onerror = () => { vst.textContent = 'stream error — reload'; vst.style.color = '#f44'; };
+    vimg.onerror = () => {
+      if (!vimg.getAttribute('src')) return; // we dropped it on purpose
+      vst.textContent = 'stream error — reload'; vst.style.color = '#f44'; };
 
     // ── OCR: run Apple Vision on the current frame via the /ocr endpoint ──
     const ocrPanel = document.getElementById('ocrpanel');
@@ -514,6 +684,10 @@
         send('releaseall'); // don't leave modifiers stuck on the target
       }
       btn.onclick = () => (captured ? disengage() : engage());
+      // Leaving MJPEG mode (to noVNC, which has its own input) drops capture.
+      window.addEventListener('paniolo-video-mode', ev => {
+        if (ev.detail === 'vnc' && captured) disengage();
+      });
       // Drop capture (and release held keys) if the window loses focus.
       window.addEventListener('blur', () => { if (captured) disengage(); });
 
