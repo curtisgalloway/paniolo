@@ -824,7 +824,11 @@ enum VideoCmd {
     Set {
         #[arg(long, short)]
         target: String,
-        /// Capture device: an hdmicap device name substring, index, or /dev path.
+        /// Capture device: an hdmicap device name substring, index, or /dev path;
+        /// or a network RFB source: `rfb+hid:` (the RFB feed of this target's
+        /// own hid daemon, e.g. a network KVM; needs a hid channel on the same
+        /// host, set first) or `rfb://HOST:PORT` (plain RFB over TCP, no
+        /// authentication).
         #[arg(long, short)]
         device: String,
         /// OCR engine selection: "gui" picks the GUI-tuned engine (only
@@ -1497,6 +1501,9 @@ fn restart_capture_daemon(lab: &Lab, name: &str, target: &str) -> Result<String>
 
     let replaced = stop_capture_daemon_and_wait(name, target)?;
 
+    if let Start::Video(device, _) = &start {
+        ensure_video_source(lab, target, device)?;
+    }
     let mut child = match start {
         Start::Serial(serials) => serial::start_daemon(&serials, 0, target)?,
         Start::Video(device, mode) => video::start_daemon(&device, 0, target, mode.as_deref())?,
@@ -2714,6 +2721,7 @@ fn cmd_console(
                 format!("video channel for '{target}' has no device set"),
             )
         })?;
+        ensure_video_source(&lab, &target, &device)?;
         eprintln!("Starting video daemon…");
         let mut child = video::start_daemon(&device, 0, &target, v.ocr_mode.as_deref())?;
         daemons::wait_for_daemon(
@@ -3654,6 +3662,9 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
             else if let Some(orphan) = video::untracked(&device) {
                 reap_untracked(&orphan)?;
             }
+            if model::is_network_device(&device) {
+                ensure_video_source(&load_for_read(lab_flag)?, &target, &device)?;
+            }
             eprintln!("Starting video daemon for '{target}' ('{device}')…");
             let mut child = video::start_daemon(&device, port, &target, v.ocr_mode.as_deref())?;
             let url =
@@ -4442,6 +4453,27 @@ fn ensure_hid_daemon_local(lab: &Lab, target: &str) -> Result<Option<daemons::En
                 )
             })?,
     ))
+}
+
+/// Before starting hdmicap for `device`, bring up whatever feeds it. For
+/// `rfb+hid:` that is the target's own hid daemon, started exactly as
+/// `console` starts it; every other device needs nothing.
+fn ensure_video_source(lab: &Lab, target: &str, device: &str) -> Result<()> {
+    if device != model::RFB_HID_DEVICE {
+        return Ok(());
+    }
+    match ensure_hid_daemon_local(lab, target)? {
+        Some(_) => Ok(()),
+        None => Err(error::channel_missing(
+            target,
+            "hid",
+            format!(
+                "video device '{device}' reads the hid daemon's RFB feed, but '{target}' has \
+                 no hid channel on this host"
+            ),
+        )
+        .into()),
+    }
 }
 
 fn cmd_hid_serve(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {

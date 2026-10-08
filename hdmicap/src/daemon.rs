@@ -92,6 +92,11 @@ pub fn discover() -> Result<Discovery> {
 /// Blocking entry point for `hdmicap daemon`. Builds the tokio runtime itself
 /// so the capture thread can stay a plain std::thread alongside it.
 pub fn run(device: DeviceSpec, port: u16) -> Result<()> {
+    // A malformed network source is an operator error: refuse now rather than
+    // retry it forever as an unplugged device.
+    if let DeviceSpec::Rfb(s) = &device {
+        crate::rfb::RfbTarget::parse(s)?;
+    }
     // 1. Acquire the advisory lock. Held for the lifetime of the process.
     let lock_file = File::create(lock_path()?)?;
     lock_file
