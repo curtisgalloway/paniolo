@@ -147,6 +147,19 @@ func dispatchCommand(g globals, cmd string, args []string, stdin io.Reader, stdo
 		fmt.Fprint(stdout, usageText)
 		return nil
 	case "stop":
+		// `stop --target T` must work as well as `--target T stop`: the global
+		// FlagSet stops at the first non-flag word, so a --target written
+		// after the verb was silently dropped and stop looked in the
+		// untargeted runtime dir.
+		sfs := flag.NewFlagSet("stop", flag.ContinueOnError)
+		sfs.SetOutput(io.Discard)
+		sfs.StringVar(&g.target, "target", g.target, "")
+		if err := sfs.Parse(args); err != nil {
+			return &usageError{fmt.Sprintf("stop: %v", err)}
+		}
+		if sfs.NArg() > 0 {
+			return &usageError{fmt.Sprintf("stop: unexpected argument %q", sfs.Arg(0))}
+		}
 		return cmdStop(g, stdout)
 	case "serve":
 		return cmdServe(g, args)

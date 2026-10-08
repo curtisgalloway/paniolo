@@ -1063,7 +1063,11 @@ fn escape_control_chars(s: &str) -> String {
 /// injector may serve (the mapping `cmd_helper` applies, in reverse).
 fn daemon_process_needles(name: &str) -> Vec<String> {
     match name {
-        HID_DAEMON => vec!["hidrig".to_string(), "ch9329".to_string()],
+        HID_DAEMON => vec![
+            "hidrig".to_string(),
+            "ch9329".to_string(),
+            "jetkvm".to_string(),
+        ],
         n => vec![n.to_string()],
     }
 }
@@ -1590,7 +1594,7 @@ fn cmd_helper(name: Option<&str>, args: &[String]) -> Result<()> {
     // whose discovery name is the channel (any conforming helper may serve
     // it): hidrig publishes under "hid".
     let env_name = match name {
-        "hidrig" | "ch9329" => HID_DAEMON.to_string(),
+        "hidrig" | "ch9329" | "jetkvm" => HID_DAEMON.to_string(),
         // Sanitized like every other name that becomes a path component
         // (Review low #10): `name` is a typed CLI argument, and with no
         // `instance` this host-singleton branch is the one place nothing
@@ -5451,7 +5455,10 @@ mod tests {
     #[test]
     fn daemon_process_needles_cover_the_hid_injectors() {
         assert_eq!(daemon_process_needles("serialcap"), vec!["serialcap"]);
-        assert_eq!(daemon_process_needles(HID_DAEMON), vec!["hidrig", "ch9329"]);
+        assert_eq!(
+            daemon_process_needles(HID_DAEMON),
+            vec!["hidrig", "ch9329", "jetkvm"]
+        );
     }
 
     /// `netboot logs --follow` must notice a daemon restart and reopen
@@ -5533,6 +5540,24 @@ mod tests {
             &["definitely-not-this".to_string(), exe_name]
         ));
         assert!(!pid_runs_one_of(me, &["netbootd".to_string()]));
+    }
+
+    /// `daemons stop 'hid[t]'` refused a live jetkvm daemon ("no longer
+    /// running hidrig/ch9329") because the hid needles named only the two
+    /// older helpers. Run a real process whose binary is called `jetkvm` and
+    /// check the gate lets the signal through.
+    #[cfg(unix)]
+    #[test]
+    fn hid_needles_match_a_running_jetkvm() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("jetkvm");
+        std::fs::copy("/bin/sleep", &fake).unwrap();
+        let mut child = std::process::Command::new(&fake).arg("30").spawn().unwrap();
+        let pid = child.id() as i32;
+        let ok = pid_runs_one_of(pid, &daemon_process_needles(HID_DAEMON));
+        child.kill().unwrap();
+        let _ = child.wait();
+        assert!(ok, "a running jetkvm must pass the hid identity check");
     }
 
     // Regression (#203): the config verbs took `-t/--target` and the runtime
