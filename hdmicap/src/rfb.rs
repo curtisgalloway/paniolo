@@ -173,18 +173,26 @@ impl RfbTarget {
         let RfbTarget::Discovery { path } = self else {
             return Ok(self.clone());
         };
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("hid daemon not running? cannot read {path:?}"))?;
-        let d: DiscoveryFile = serde_json::from_str(&text)
-            .with_context(|| format!("parsing discovery file {path:?}"))?;
-        if !crate::platform::pid_alive(d.pid as i32) {
-            bail!("hid daemon not running (stale discovery file {path:?})");
-        }
+        let (port, token) = read_discovery(path)?;
         Ok(RfbTarget::Ws {
-            url: format!("ws://127.0.0.1:{}/rfb", d.port),
-            token: d.token.filter(|t| !t.is_empty()),
+            url: format!("ws://127.0.0.1:{port}/rfb"),
+            token,
         })
     }
+}
+
+/// Read a hid daemon's discovery file: its port and token. Fails when the file
+/// is missing or names a process that is gone. Shared with the input link in
+/// `hid_link.rs`.
+pub(crate) fn read_discovery(path: &std::path::Path) -> Result<(u16, Option<String>)> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("hid daemon not running? cannot read {path:?}"))?;
+    let d: DiscoveryFile =
+        serde_json::from_str(&text).with_context(|| format!("parsing discovery file {path:?}"))?;
+    if !crate::platform::pid_alive(d.pid as i32) {
+        bail!("hid daemon not running (stale discovery file {path:?})");
+    }
+    Ok((d.port, d.token.filter(|t| !t.is_empty())))
 }
 
 fn split_host_port(authority: &str) -> Result<(&str, u16)> {

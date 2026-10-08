@@ -28,6 +28,8 @@ mod capture_thread;
 mod daemon;
 mod demand;
 mod frame;
+mod hid_link;
+mod keysym;
 // Pixel formats and conversions exist to serve a capture backend. On a
 // platform with none compiled in (Windows), nothing constructs them — that is
 // the design, not dead weight.
@@ -38,7 +40,9 @@ mod pixel;
 #[allow(dead_code)]
 mod platform;
 mod rfb;
+mod rfb_serve;
 mod server;
+mod zrle;
 
 use std::io::{Read, Write};
 

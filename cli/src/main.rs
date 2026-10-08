@@ -1514,14 +1514,20 @@ fn restart_capture_daemon(lab: &Lab, name: &str, target: &str) -> Result<String>
 
     let replaced = stop_capture_daemon_and_wait(name, target)?;
 
-    if let Start::Video(device, _, _) = &start {
-        ensure_video_source(lab, target, device)?;
-    }
+    let hid_input = match &start {
+        Start::Video(device, _, _) => ensure_video_source(lab, target, device)?,
+        Start::Serial(_) => None,
+    };
     let mut child = match start {
         Start::Serial(serials) => serial::start_daemon(&serials, 0, target)?,
-        Start::Video(device, mode, threshold) => {
-            video::start_daemon(&device, 0, target, mode.as_deref(), threshold)?
-        }
+        Start::Video(device, mode, threshold) => video::start_daemon(
+            &device,
+            0,
+            target,
+            mode.as_deref(),
+            threshold,
+            hid_input.as_deref(),
+        )?,
     };
     wait_for_started_daemon(name, Some(target), replaced, Some(&mut child))
 }
@@ -2736,7 +2742,7 @@ fn cmd_console(
                 format!("video channel for '{target}' has no device set"),
             )
         })?;
-        ensure_video_source(&lab, &target, &device)?;
+        let hid_input = ensure_video_source(&lab, &target, &device)?;
         eprintln!("Starting video daemon…");
         let mut child = video::start_daemon(
             &device,
@@ -2744,6 +2750,7 @@ fn cmd_console(
             &target,
             v.ocr_mode.as_deref(),
             v.change_threshold,
+            hid_input.as_deref(),
         )?;
         daemons::wait_for_daemon(
             video::DAEMON,
@@ -3690,9 +3697,7 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
             else if let Some(orphan) = video::untracked(&device) {
                 reap_untracked(&orphan)?;
             }
-            if model::is_network_device(&device) {
-                ensure_video_source(&load_for_read(lab_flag)?, &target, &device)?;
-            }
+            let hid_input = ensure_video_source(&load_for_read(lab_flag)?, &target, &device)?;
             eprintln!("Starting video daemon for '{target}' ('{device}')…");
             let mut child = video::start_daemon(
                 &device,
@@ -3700,6 +3705,7 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
                 &target,
                 v.ocr_mode.as_deref(),
                 v.change_threshold,
+                hid_input.as_deref(),
             )?;
             let url =
                 wait_for_started_daemon(video::DAEMON, Some(&target), replaced, Some(&mut child))?;
@@ -4493,16 +4499,31 @@ fn ensure_hid_daemon_local(lab: &Lab, target: &str) -> Result<Option<daemons::En
     ))
 }
 
-/// Before starting hdmicap for `device`, bring up whatever feeds it. For
-/// `rfb+hid:` that is the target's own hid daemon, started exactly as
-/// `console` starts it; every other device needs nothing.
-fn ensure_video_source(lab: &Lab, target: &str, device: &str) -> Result<()> {
-    if device != model::RFB_HID_DEVICE {
-        return Ok(());
-    }
-    match ensure_hid_daemon_local(lab, target)? {
-        Some(_) => Ok(()),
-        None => Err(error::channel_missing(
+/// Before starting hdmicap for `device`, bring up whatever feeds it and
+/// whatever it types through.
+///
+/// Returns the target's hid daemon discovery file when the target has a hid
+/// channel on this host (its daemon is started if it is not running), which
+/// hdmicap's noVNC view uses for keyboard and mouse; `None` leaves that view
+/// watch-only. For `rfb+hid:` the same daemon is also the video source, so a
+/// missing one is an error; for every other device a hid daemon that will not
+/// start only costs the view its input, and says so on stderr.
+fn ensure_video_source(
+    lab: &Lab,
+    target: &str,
+    device: &str,
+) -> Result<Option<std::path::PathBuf>> {
+    let hid = match ensure_hid_daemon_local(lab, target) {
+        Ok(hid) => hid,
+        Err(e) if device != model::RFB_HID_DEVICE => {
+            eprintln!("note: no keyboard/mouse in the browser view of '{target}': {e:#}");
+            None
+        }
+        Err(e) => return Err(e),
+    };
+    match hid {
+        Some(_) => Ok(Some(video::hid_discovery_file(target)?)),
+        None if device == model::RFB_HID_DEVICE => Err(error::channel_missing(
             target,
             "hid",
             format!(
@@ -4511,6 +4532,7 @@ fn ensure_video_source(lab: &Lab, target: &str, device: &str) -> Result<()> {
             ),
         )
         .into()),
+        None => Ok(None),
     }
 }
 

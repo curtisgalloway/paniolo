@@ -138,9 +138,19 @@ pub fn run(device: DeviceSpec, port: u16, change_threshold: u8) -> Result<()> {
         // the discovery file, which a crash can leave pointing at whatever
         // process the kernel next gave that number to.
         let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+        // The noVNC view types and points through the target's hid daemon
+        // when the CLI says where it keeps its discovery file.
+        let hid = std::env::var_os(crate::hid_link::ENV_HID_DISCOVERY)
+            .filter(|p| !p.is_empty())
+            .map(|p| crate::hid_link::HidLink::spawn(p.into()));
+        let name = std::env::var("PANIOLO_TARGET")
+            .ok()
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "hdmicap".into());
         let app = server::router(
             AppState::new(frames)
                 .with_demand(demand)
+                .with_rfb(&name, hid)
                 .with_change_threshold(change_threshold),
             crate::auth::Auth::new(token, server::PUBLIC_ASSETS),
         )

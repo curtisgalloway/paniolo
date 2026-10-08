@@ -12,13 +12,17 @@ path = "src/main.rs"
 [dependencies]
 # --- Async runtime + HTTP ------------------------------------------------
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "net", "process", "io-util"] }
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 
 # --- Imaging -------------------------------------------------------------
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # Fast pure-Rust JPEG encoder for the preview path (no system deps; the
 # image crate's encoder is several times slower at preview resolutions).
 jpeg-encoder = "0.6"
+
+# ZRLE (RFB) compression for the noVNC view; already in the build graph
+# transitively (image/png), now a direct dependency.
+flate2 = "1"
 
 # --- CLI -----------------------------------------------------------------
 clap = { version = "4", features = ["derive"] }

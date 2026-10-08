@@ -74,7 +74,10 @@ pub struct AppState {
     preview_cache: PreviewCache,
     /// What clients want from the capture loop right now (#221): streams
     /// hold a guard, pulls record themselves. See [`crate::demand`].
-    demand: Arc<Demand>,
+    pub(crate) demand: Arc<Demand>,
+    /// The noVNC view's shared state (`rfb_serve`): client count, decode
+    /// cache, optional hid link for input.
+    pub(crate) rfb: crate::rfb_serve::RfbShared,
     /// The daemon's `--change-threshold`, reported by `/status`.
     change_threshold: u8,
 }
@@ -86,6 +89,7 @@ impl AppState {
             expensive: Arc::new(Semaphore::new(EXPENSIVE_PERMITS)),
             preview_cache: Arc::new(Mutex::new(None)),
             demand: Demand::new(),
+            rfb: crate::rfb_serve::RfbShared::new(),
             change_threshold: crate::frame::DEFAULT_CHANGE_THRESHOLD,
         }
     }
@@ -93,6 +97,16 @@ impl AppState {
     /// Record the threshold the capture thread was started with.
     pub fn with_change_threshold(mut self, threshold: u8) -> Self {
         self.change_threshold = threshold;
+        self
+    }
+
+    /// Name the target in the RFB ServerInit, and give the noVNC view its
+    /// keyboard and mouse through `hid`, when there is one.
+    pub fn with_rfb(mut self, name: &str, hid: Option<Arc<crate::hid_link::HidLink>>) -> Self {
+        self.rfb = self.rfb.with_name(name);
+        if let Some(h) = hid {
+            self.rfb = self.rfb.with_hid(h);
+        }
         self
     }
 
@@ -130,6 +144,7 @@ pub fn router(state: AppState, auth: crate::auth::Auth) -> Router {
         .route("/status", get(status))
         .route("/snapshot", get(snapshot))
         .route("/preview", get(preview))
+        .route("/rfb", get(crate::rfb_serve::handler))
         .route("/ocr", get(ocr))
         .route("/power", get(power_state))
         .route("/power-on", post(power_on))
@@ -194,9 +209,24 @@ async fn xterm_fit_js() -> impl IntoResponse {
     )
 }
 
-async fn status(State(s): State<AppState>) -> Json<StatusDto> {
+/// `GET /status`: the frame's state plus what the noVNC view is doing.
+#[derive(serde::Serialize)]
+struct StatusOut {
+    #[serde(flatten)]
+    frame: StatusDto,
+    /// Open `/rfb` sessions.
+    rfb_clients: usize,
+    /// Whether the noVNC view can type and point (a hid daemon is configured).
+    rfb_input: bool,
+}
+
+async fn status(State(s): State<AppState>) -> Json<StatusOut> {
     let f = s.frames.borrow().clone();
-    Json(StatusDto::new(f.as_ref(), s.change_threshold))
+    Json(StatusOut {
+        frame: StatusDto::new(f.as_ref(), s.change_threshold),
+        rfb_clients: s.rfb.clients(),
+        rfb_input: s.rfb.input_enabled(),
+    })
 }
 
 #[derive(Deserialize)]
@@ -283,7 +313,7 @@ async fn snapshot(State(s): State<AppState>, Query(q): Query<SnapReq>) -> Respon
 
 /// Decode the frame to a full-resolution RGB image. NV12 (macOS) converts
 /// here, lazily; on the Linux MJPEG path we decode `jpeg` with turbojpeg.
-fn decode_rgb(f: &FrameState) -> Option<ImageBuffer<Rgb<u8>, Vec<u8>>> {
+pub(crate) fn decode_rgb(f: &FrameState) -> Option<ImageBuffer<Rgb<u8>, Vec<u8>>> {
     match &f.pixels {
         PixelData::Rgb(buf) => ImageBuffer::from_raw(f.width, f.height, buf.to_vec()),
         PixelData::Nv12 { y, cbcr } => Some(nv12_to_rgb(y, cbcr, f.width, f.height)),
