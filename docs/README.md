@@ -49,7 +49,7 @@ running, 101 hook failed, …); `--json-errors` adds a one-line JSON object. See
 | [Link mode](netif.md) | `paniolo netif` | Switch the link between `netboot`, `link`, `ffx`-over-IPv6 (host `fe80::1`), and `off`; `down-hard` forces a real carrier drop. |
 | [Serial](serial.md) | `paniolo serial` | `serialcap` daemon (JSONL log + WebSocket terminal) and interactive `tio`. |
 | [Power](power.md) | `paniolo power on/off`, `power-cycle`, `power-state`, `serial dtr/reset` | DTR power button (J2) and shell-command hooks; helpers `cambrionix`, `zigplug`, `shellyplug`, `amt`. |
-| [Video](video.md) | `paniolo video` | `hdmicap` HDMI capture + on-device OCR. |
+| [Video](video.md) | `paniolo video` | `hdmicap` HDMI capture, or a network RFB source (JetKVM); on-device OCR. |
 | [Dashboard](dashboard.md) | `paniolo console` | Combined video + serial web UI. |
 | [Switchable USB media](usb.md) | `paniolo usb` | Switch a KVM-Go's microSD card between control host and target, as boot media. |
 | [HID injection](hid.md) | `paniolo hid` | USB keyboard/mouse injection via `hidrig` (KB2040) or `ch9329` (Openterface Mini-KVM / KVM-Go, Sipeed NanoKVM-USB). |
@@ -118,6 +118,7 @@ They are **not** kept current and not published.
 | [Provisioning a Linux control host](https://github.com/curtisgalloway/paniolo/blob/main/notes/control-host-provisioning.md) | The design behind the cloud-init seed; the `pi-sd` flavor shipped (see [control-host.md](control-host.md)), the x86 flavor is unbuilt. |
 | [Pi 4 control host](https://github.com/curtisgalloway/paniolo/blob/main/notes/pi4-control-host.md) | Pi 4 control-host bring-up plan; the USB-HID-gadget backend is not implemented. |
 | [VM targets and RFB](https://github.com/curtisgalloway/paniolo/blob/main/notes/vm-targets-and-rfb.md) | **Design only.** VMs as targets, and RFB (the VNC protocol) as a second transport for video and HID. Only the pty serial console shipped. |
+| [Network video via RFB](https://github.com/curtisgalloway/paniolo/blob/main/notes/network-video-rfb.md) | Decision record for RFB network video sources (first consumer: JetKVM); user guide in [video.md](video.md#network-sources-rfb). |
 | [Openterface Mini-KVM V2 on Linux](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-v2-linux-serial.md) | **Bench-measured.** Why the V2's control port is silent on Linux while the same unit works on macOS; root cause not yet established. Corrects two claims in other notes. |
 | [A desktop app for the lab](https://github.com/curtisgalloway/paniolo/blob/main/notes/desktop-app.md) | **Design only.** A Tauri desktop app as the lab's front door, building on [console front door](https://github.com/curtisgalloway/paniolo/blob/main/notes/console-front-door.md). |
 

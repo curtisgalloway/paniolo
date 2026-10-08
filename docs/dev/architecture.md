@@ -64,6 +64,7 @@ invocations. State lives in plain files.
 | `amt` | Rust (ureq) | Standalone power helper: Intel AMT/vPro power over WS-Management (port 16992, HTTP Digest), with true power-state readback from the ME. |
 | `hidrig` | Rust | HID-injection helper: protocol client + `serve` daemon for the KB2040 injector, wired in via the generic `hid` channel. |
 | `ch9329` | Rust | HID-injection helper with the same CLI + `serve` daemon, speaking the CH9329 (serial-to-USB-HID chip) frame protocol for Openterface Mini-KVM / KVM-Go and Sipeed NanoKVM-USB. |
+| `jetkvm` | Go (pion/webrtc) | HID-injection helper for the JetKVM network KVM; its daemon also decodes the device's H.264 video (`ffmpeg` subprocess) and serves it as RFB for `hdmicap`'s `rfb+hid:` source. |
 | `visionocr` / `linuxocr` | Swift / shell+Tesseract | On-device OCR helpers invoked by `hdmicap` (`GET /ocr`, wrapped by `paniolo video read` and the dashboard OCR button). |
 | HID rig firmware (separate repo) | CircuitPython | Two KB2040 (RP2040 microcontroller) boards: a "dumb pipe" relaying host-composed HID reports to the DUT as USB keyboard + mouse. Not in this repo: see [`paniolo-hardware`](https://github.com/curtisgalloway/paniolo-hardware)'s [`hidrig-kb2040/`](https://github.com/curtisgalloway/paniolo-hardware/tree/main/hidrig-kb2040), driven by the `hidrig` row above. |
 
@@ -273,6 +274,13 @@ the current frame as PNG/MJPEG plus the dashboard over HTTP. `paniolo video read
 `GET /ocr`) and the dashboard OCR button run **on-device OCR** on the warm frame: Apple Vision (`visionocr`) on macOS, Tesseract
 (`linuxocr`) on Linux. Both are tuned for thin console fonts (2× upscale, black-pad,
 `.fast`/lowered min text height).
+
+A video channel can instead name a **network RFB source** (`rfb+hid:` or `rfb://HOST:PORT`).
+`hdmicap`'s RFB client (`hdmicap/src/rfb.rs`) then feeds the same warm-frame pipeline, so `/snapshot`,
+`/ocr` and the dashboard are unchanged. For `rfb+hid:` the source is the target's own hid daemon:
+`jetkvm serve` decodes the JetKVM's H.264 with an `ffmpeg` subprocess and serves RFB at its
+token-authenticated `GET /rfb`; `hdmicap` finds it through the daemon's discovery file. Agents only ever
+get decoded stills. Decisions: [`notes/network-video-rfb.md`](https://github.com/curtisgalloway/paniolo/blob/main/notes/network-video-rfb.md).
 
 On Linux the capture rate follows demand (`hdmicap/src/demand.rs`): 30 fps while a `/preview`
 is open, a `/snapshot` is waiting for a change or a stable signal, or a pull came in the last

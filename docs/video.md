@@ -48,6 +48,67 @@ and lists the ids when it finds several.
 
 ---
 
+## Network sources (RFB)
+
+A video channel can also read a screen over the network instead of from a
+capture device. The protocol is **RFB** (the one VNC uses; see the
+[glossary](glossary.md)), and `hdmicap` contains the client, so the same
+daemon, `shot`, `read` and dashboard work unchanged.
+
+| `--device` form | Meaning |
+|---|---|
+| `rfb+hid:` | The RFB feed of **this target's own `hid` daemon**. Needs a `hid` channel on the same host (set it first; `hid rm` is refused while the video channel uses it). `video watch`, `console` and `daemons restart` start the hid daemon, then `hdmicap`. |
+| `rfb://HOST:PORT` | A plain-TCP RFB server (a VM, an AMT machine), security type None only. |
+
+(`hdmicap` itself also accepts `rfb+ws://127.0.0.1:PORT/rfb` and
+`rfb+discovery:`, which is what `rfb+hid:` expands to. The token reaches it in
+the `HDMICAP_RFB_TOKEN` environment variable, or through the discovery file
+named by `HDMICAP_RFB_DISCOVERY`, never on a command line.)
+
+`hdmicap` speaks RFB 3.3, 3.7 and 3.8 with Raw, CopyRect and DesktopSize
+encodings. It sends a keepalive request every 5 s; after 15 s of silence it
+reports `no_device` and reconnects.
+
+### Example: a JetKVM
+
+```bash
+paniolo hid set   -t target-machine --cmd "jetkvm -d 192.0.2.10 --password-command 'op read op://vault/jetkvm/password'"
+paniolo video set -t target-machine --device rfb+hid:
+paniolo video watch target-machine     # starts the jetkvm daemon, then hdmicap
+paniolo video shot target-machine -o screen.png
+```
+
+The `jetkvm` daemon decodes the device's H.264 video with an **`ffmpeg`
+subprocess**, so `ffmpeg` must be installed on the control host (on `PATH`,
+in a common Homebrew or `/usr` location, or named with `serve --ffmpeg PATH`
+in the hid `--cmd`). Without it HID still works and video reports the reason.
+Decoding runs only while `hdmicap` is attached. Details:
+[jetkvm/README.md](https://github.com/curtisgalloway/paniolo/blob/main/jetkvm/README.md).
+
+### Caveats
+
+- **One session.** A JetKVM allows one session at a time, and the daemon holds
+  it for HID and video together. Opening the JetKVM's own web UI in a browser
+  evicts the daemon (video and HID stop until the next command), and a command
+  that opens its own session evicts your browser tab. Leave the web UI closed
+  while automating.
+- **Change detection is noisy on a lossy source.** On an unchanged JetKVM
+  screen the frame hash changed in 3 of 4 shots taken about a second apart. It
+  is not known whether a blinking text cursor or H.264 decode noise is the
+  cause. So `shot --changed-since` can report a change that is not one;
+  `--stable` worked in testing. Lossless RFB sources (AMT, VMs) have no codec
+  noise.
+- **Not supported yet:** VNC password authentication (so an AMT machine or VM
+  that requires a password does not work), dirty-rectangle updates (every
+  update is a whole frame), and a keyframe request after packet loss.
+- **Verified** on one JetKVM (firmware 0.5.9) in front of an x86 board, from a
+  macOS control host. Not verified: Windows, a Linux control host, `rfb://`
+  against AMT or a VM.
+
+Design record: [network-video-rfb.md](https://github.com/curtisgalloway/paniolo/blob/main/notes/network-video-rfb.md).
+
+---
+
 ## Starting and stopping the daemon
 
 ```bash
@@ -239,6 +300,13 @@ afterwards** instead of filtering on `signal`. A frame older than
 `/preview` refuse to treat it as live. Captures from older versions may show
 mostly-black firmware screens as `no_signal` and stalled captures as
 `stable`.
+
+### First OCR call on macOS is slow
+
+The first `video read` after Apple Vision has not run for a while can take
+about 15 s while the framework loads its model; later calls on a warm frame
+took about 0.3 s. This is a one-time cold start, not specific to any video
+source.
 
 ### Helper installation
 

@@ -56,15 +56,18 @@ each term briefly on first use; this page is the longer reference.
 | **ConIn** | UEFI console input: where firmware reads keystrokes from. |
 | **DTR** | Data Terminal Ready: a control output on a serial adapter. |
 | **HID** | Human Interface Device: the USB class for keyboards and mice. |
+| **H.264** | A lossy video codec. A JetKVM streams its screen as H.264; the `jetkvm` daemon decodes it with `ffmpeg`. |
 | **HTTP Boot** | UEFI's network boot over HTTP, an alternative to PXE. |
 | **IHDR** | The header chunk of a PNG file, which holds its dimensions. |
 | **LL address** | An IPv6 link-local address (`fe80::...`), valid only on one link. |
 | **mDNS** | Multicast DNS: name lookup on the local network without a DNS server. |
 | **MJPEG** | A video stream made of individual JPEG frames. |
 | **NBP** | Network boot program: the first file a PXE client downloads and runs. |
+| **noVNC** | A VNC client that runs in a browser (RFB over WebSocket). The chosen direction for a future live view; not built. |
 | **PTY** | Pseudo-terminal: a software serial port. A VM's serial console is one. |
 | **PXE** | Preboot Execution Environment: the standard way a machine boots from the network. |
-| **RFB** | Remote Framebuffer, the protocol VNC uses. |
+| **RFB** | Remote Framebuffer, the protocol VNC uses. A server sends rectangles of pixels; a client sends key and pointer events. `hdmicap` is an RFB client for network video sources. |
+| **VNC** | Virtual Network Computing: remote-desktop software built on RFB. |
 | **SOF** | A JPEG start-of-frame header, which holds the image size. |
 | **SLAAC** | Stateless address autoconfiguration: how IPv6 hosts pick their own addresses. |
 | **TFTP** | Trivial File Transfer Protocol: the simple file protocol boot ROMs use to download a boot image. |

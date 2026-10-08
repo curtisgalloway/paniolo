@@ -113,6 +113,11 @@ paniolo video shot <target> --changed-since H \
 
 (`H` is the `hash=` value the previous `shot` printed on stderr.)
 
+On a lossy video source (a JetKVM, `--device rfb+hid:`), the hash can differ
+between shots of an unchanged screen (a blinking cursor or H.264 decode noise;
+3 distinct hashes in 4 shots, measured), so `--changed-since` may return early.
+Treat it as a hint: use `--stable`, and still view the frame to verify.
+
 Rules that keep the loop honest:
 
 - **Never act on a stale screenshot.** If anything has happened since your last

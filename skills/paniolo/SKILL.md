@@ -272,6 +272,9 @@ paniolo video devices                 # list capture devices (with stable ids)
 paniolo video set -t <target> --device "<id-or-name>" [--ocr-mode text|gui]  # configure the video channel
                                            #   --ocr-mode gui is a Linux-only accuracy switch
                                            #   for GUI screens (unset = platform default)
+                                           #   --device rfb+hid: = the RFB video feed of this target's own
+                                           #   hid daemon (a JetKVM; set the hid channel first), or
+                                           #   rfb://HOST:PORT for a plain network RFB source (no password)
 paniolo video watch [target] [--restart]   # start the capture daemon (background);
                                            #   --restart force-restarts a stalled one
 paniolo video preview [--open]        # print the daemon's dashboard URL (--open: hand it to a browser instead)
@@ -592,7 +595,7 @@ arguments to it and runs it on the channel's host:
 - **`jetkvm`** — the JetKVM network KVM (Go helper): `paniolo hid set -t <name>
   --cmd "jetkvm -d <host>"`; the password comes from `JETKVM_PASSWORD`,
   `--password-file` or `--password-command`, never a flag. Same commands; its
-  `info` prints the device's USB, video and keyboard-LED state. **The JetKVM
+  `info` prints the device's USB, video and keyboard-LED state; its daemon also serves the screen (`video set --device rfb+hid:`). **The JetKVM
   allows ONE session**: the helper's session and a browser tab on the
   device's web UI kick each other, and `OK` does not prove delivery (the
   firmware says success even if the target's USB is not up — check `info`).
@@ -811,6 +814,13 @@ the device is free just because a daemon is gone from the tracked list.
 - `doctor` flags a channel that still works? Believe the working channel and
   report the discrepancy — never rewrite the lab config to silence `doctor`.
 - Serial port is exclusive: one of `connect` / `watch` / external `tio`/`screen`.
+- A JetKVM's screen arrives as `--device rfb+hid:` on the video channel; the
+  `jetkvm` daemon decodes it with `ffmpeg` (must be installed). Video and `hid`
+  share the daemon's one session, so they do not evict each other, but a
+  browser on the JetKVM web UI evicts both. Frame hashes there are noisy (an
+  unchanged screen gave 3 distinct hashes in 4 shots), so do not trust
+  `--changed-since` alone to mean "the screen changed"; use `--stable` or look
+  at the image.
 - JetKVM allows one session at a time: if a `jetkvm` hid command or daemon
   suddenly fails or reports "session taken over", someone opened the
   device's web UI. Don't open the UI to "check" while automating — it kicks

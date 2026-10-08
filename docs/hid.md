@@ -14,7 +14,7 @@ Pick the helper that matches your injector hardware. There is no default.
 | Helper | Drives | Bind with |
 |---|---|---|
 | [`ch9329`](https://github.com/curtisgalloway/paniolo/blob/main/ch9329/README.md) | KVM-over-USB devices speaking the WCH CH9329 protocol (serial-to-HID chip): the **Openterface Mini-KVM**, the **Openterface KVM-Go** (see the [KVM-Go notes](https://github.com/curtisgalloway/paniolo/blob/main/notes/openterface-kvm-go.md)), and the **Sipeed NanoKVM-USB**. | `--cmd "ch9329 -d <uart>"` |
-| [`jetkvm`](https://github.com/curtisgalloway/paniolo/blob/main/jetkvm/README.md) | The **JetKVM** network KVM (firmware 0.5.9), over the network instead of a serial port. Keyboard and mouse only; see [JetKVM](#jetkvm-network-kvm-jetkvm). | `--cmd "jetkvm -d <host>"` |
+| [`jetkvm`](https://github.com/curtisgalloway/paniolo/blob/main/jetkvm/README.md) | The **JetKVM** network KVM (firmware 0.5.9), over the network instead of a serial port. Keyboard and mouse, plus video via `rfb+hid:` (see [Video](video.md#network-sources-rfb)); see [JetKVM](#jetkvm-network-kvm-jetkvm). | `--cmd "jetkvm -d <host>"` |
 | [`hidrig`](https://github.com/curtisgalloway/paniolo/blob/main/hidrig/README.md) | The DIY dual-board KB2040 rig below. The only option that also bridges the DUT's serial console and switches its power. | `--cmd "hidrig -d <data-cdc>"` |
 
 Any other injector works if it implements the command vocabulary (`type`,
@@ -47,7 +47,7 @@ helper reads, in order: the `JETKVM_PASSWORD` environment variable,
 3. A daemon needs it only at start; routed one-shots do not.
 
 **One session at a time.** The firmware keeps a single session. Opening the
-JetKVM web UI while the hid daemon runs kicks the daemon, and any command
+JetKVM web UI while the hid daemon runs (and while it carries video) kicks the daemon, and any command
 that has to open its own session kicks your browser tab. The daemon logs the
 takeover, does not fight for the session, and reconnects on the next command
 you send. Close the browser tab (or let the daemon own the session) while
@@ -60,9 +60,16 @@ and keyboard LEDs before trusting a silent run.
 
 Pointer clicks (`click`, `mdown`, `mup`) happen wherever the pointer already
 is, so follow a `moveabs` with the click. `paniolo console` works as a KVM
-through the helper's daemon exactly as it does for `ch9329`; the video comes
-from a separate `video` channel (milestone 1 does not stream the JetKVM's
-own video).
+through the helper's daemon exactly as it does for `ch9329`.
+
+**The daemon also carries the screen.** `jetkvm serve` adds a receive-only
+H.264 video track to its one session, decodes it with an `ffmpeg` subprocess
+(`serve --ffmpeg PATH`, else `PATH`, else the usual Homebrew and `/usr`
+locations), and serves it as RFB at the token-authenticated `GET /rfb`. Point
+the target's video channel at it with `paniolo video set -t target-machine
+--device rfb+hid:`; see [Network sources (RFB)](video.md#network-sources-rfb).
+`ffmpeg` is needed only for video. Because the session is shared, video and
+HID run together without evicting each other.
 
 ---
 
