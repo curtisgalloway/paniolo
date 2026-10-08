@@ -96,8 +96,10 @@ pub struct FrameState {
     pub pixels: PixelData,
     pub width: u32,
     pub height: u32,
-    /// Exact digest of the frame's pixels (see `digest`): changes when any
-    /// pixel does. Powers change-detection (`changed_since`).
+    /// The settled hash (see [`Settler`]): the exact digest of the last
+    /// frame that differed from its predecessor by more than the change
+    /// threshold; frames within the threshold of that reference carry the
+    /// reference's hash. Powers change-detection (`changed_since`).
     pub hash: u64,
     pub signal: Signal,
     /// Bumps every time the capture resolution changes. Lets a consumer notice
@@ -140,6 +142,9 @@ impl FrameState {
 #[derive(Serialize)]
 pub struct StatusDto {
     pub signal: Signal,
+    /// The daemon's `--change-threshold`: how far a pixel's luma must move
+    /// from the reference frame before `hash` changes (0 = any change).
+    pub change_threshold: u8,
     pub width: u32,
     pub height: u32,
     pub hash: String, // hex, so it round-trips cleanly into ?changed_since=
@@ -147,9 +152,10 @@ pub struct StatusDto {
     pub captured_at_ms_ago: u128,
 }
 
-impl From<&FrameState> for StatusDto {
-    fn from(f: &FrameState) -> Self {
+impl StatusDto {
+    pub fn new(f: &FrameState, change_threshold: u8) -> Self {
         StatusDto {
+            change_threshold,
             signal: f.effective_signal(),
             width: f.width,
             height: f.height,
@@ -250,6 +256,155 @@ fn digest(bytes: &[u8], len: usize, w: u32, h: u32) -> u64 {
     acc ^= acc >> 33;
     acc = acc.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
     acc ^ (acc >> 33)
+}
+
+/// Default `--change-threshold`: a pixel's luma must move by more than this
+/// (0-255 scale) before the frame counts as changed. Measured on an H.264
+/// source (JetKVM) showing an unchanged screen: 316 of 2,073,600 pixels
+/// differed, by at most 8 levels and never above 16, while typed text and a
+/// clock tick moved over a thousand pixels by more than 16.
+pub const DEFAULT_CHANGE_THRESHOLD: u8 = 16;
+
+/// The pixels a frame offers for the threshold comparison.
+///
+/// Comparison is on luma everywhere: NV12 and grayscale-decoded MJPEG hand
+/// over their Y plane as is (NV12's is video-range, so a level there is 255/219
+/// of a full-range level; immaterial at this granularity), and RGB is reduced
+/// with the same integer Rec.601 weights `classify_rgb` uses. The buffers are
+/// `Arc`s so keeping one as the reference costs a refcount, not a copy.
+pub enum Samples {
+    Luma(Arc<[u8]>),
+    Rgb(Arc<[u8]>),
+}
+
+fn rgb_luma(p: &[u8]) -> u8 {
+    ((p[0] as u32 * 77 + p[1] as u32 * 150 + p[2] as u32 * 29) >> 8) as u8
+}
+
+impl Samples {
+    fn into_luma(self) -> Arc<[u8]> {
+        match self {
+            Samples::Luma(l) => l,
+            Samples::Rgb(rgb) => rgb.chunks_exact(3).map(rgb_luma).collect(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Samples::Luma(l) => l.len(),
+            Samples::Rgb(rgb) => rgb.len() / 3,
+        }
+    }
+
+    /// Does any pixel's luma differ from `reference` by more than `threshold`?
+    /// Early-exits at the first 64-pixel block holding one.
+    fn exceeds(&self, reference: &[u8], threshold: u8) -> bool {
+        const BLOCK: usize = 64;
+        match self {
+            Samples::Luma(l) => l.chunks(BLOCK).zip(reference.chunks(BLOCK)).any(|(a, b)| {
+                // No early exit inside the block, so the loop vectorizes.
+                a.iter()
+                    .zip(b)
+                    .map(|(x, y)| x.abs_diff(*y))
+                    .max()
+                    .unwrap_or(0)
+                    > threshold
+            }),
+            Samples::Rgb(rgb) => {
+                rgb.chunks(BLOCK * 3)
+                    .zip(reference.chunks(BLOCK))
+                    .any(|(a, b)| {
+                        a.chunks_exact(3)
+                            .zip(b)
+                            .map(|(p, y)| rgb_luma(p).abs_diff(*y))
+                            .max()
+                            .unwrap_or(0)
+                            > threshold
+                    })
+            }
+        }
+    }
+}
+
+struct Reference {
+    /// The exact digest of the accepted frame; also the hash published for it.
+    hash: u64,
+    width: u32,
+    height: u32,
+    luma: Arc<[u8]>,
+}
+
+/// Turns the per-frame exact digest into the published hash, ignoring noise.
+///
+/// A lossy source (H.264) re-renders an unchanged screen slightly differently
+/// each frame, so the exact digest flips on noise and `changed_since` /
+/// `--stable` callers see changes that are not there. The settler keeps the
+/// last *accepted* frame as a reference and publishes the reference's hash
+/// for every frame whose pixels all stay within `threshold` luma levels of it.
+/// Frames are compared to the REFERENCE, never to their predecessor, so slow
+/// drift accumulates and is eventually accepted. A frame that does move some
+/// pixel by more than `threshold` becomes the new reference and publishes its
+/// own exact digest. Any single pixel counts; there is no minimum area.
+///
+/// Cost: a frame whose exact digest equals the reference's, or the last
+/// noise frame's, is settled from the digest alone. Only a genuinely new
+/// digest runs the luma compare, which exits at the first block over the
+/// threshold. `threshold == 0` bypasses all of it: the exact digest is the hash.
+pub struct Settler {
+    threshold: u8,
+    reference: Option<Reference>,
+    /// Digest of the previous frame that was judged noise, so a source that
+    /// repeats one noisy frame is not compared again.
+    last_noise: Option<u64>,
+    /// Luma compares performed; lets a test prove a static source costs none.
+    compares: u64,
+}
+
+impl Settler {
+    pub fn new(threshold: u8) -> Self {
+        Settler {
+            threshold,
+            reference: None,
+            last_noise: None,
+            compares: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn compares(&self) -> u64 {
+        self.compares
+    }
+
+    /// The hash to publish for a frame with exact digest `digest` and
+    /// dimensions `w` x `h` (of the plane, for a scaled luma plane).
+    pub fn settle(&mut self, digest: u64, w: u32, h: u32, samples: Option<Samples>) -> u64 {
+        if self.threshold == 0 {
+            return digest;
+        }
+        let Some(samples) = samples else {
+            return digest;
+        };
+        if let Some(r) = &self.reference {
+            if r.hash == digest || self.last_noise == Some(digest) {
+                return r.hash;
+            }
+            if (r.width, r.height) == (w, h) && r.luma.len() == samples.len() {
+                self.compares += 1;
+                if !samples.exceeds(&r.luma, self.threshold) {
+                    self.last_noise = Some(digest);
+                    return r.hash;
+                }
+            }
+        }
+        self.reference = Some(Reference {
+            hash: digest,
+            width: w,
+            height: h,
+            luma: samples.into_luma(),
+        });
+        self.last_noise = None;
+        digest
+    }
 }
 
 /// Classify an NV12 luma plane ('420v', video-range: black=16): the frame
@@ -567,5 +722,179 @@ mod tests {
         let (hash, no_sig) = classify_rgb(&[], 0, 0);
         assert_eq!(hash, 0);
         assert!(no_sig);
+    }
+
+    // ── Settler (change threshold) ─────────────────────────────────────────
+
+    const SW: u32 = 64;
+    const SH: u32 = 48;
+
+    fn base_plane() -> Vec<u8> {
+        (0..SW * SH).map(|i| ((i * 7) % 200) as u8 + 20).collect()
+    }
+
+    /// Run one luma plane through the real digest + settler.
+    fn settle_luma(s: &mut Settler, plane: &[u8]) -> u64 {
+        let (d, _) = classify_gray(plane, SW, SH);
+        s.settle(d, SW, SH, Some(Samples::Luma(Arc::from(plane))))
+    }
+
+    fn to_rgb(plane: &[u8]) -> Vec<u8> {
+        plane.iter().flat_map(|&l| [l, l, l]).collect()
+    }
+
+    fn settle_rgb(s: &mut Settler, rgb: &[u8]) -> u64 {
+        let (d, _) = classify_rgb(rgb, SW, SH);
+        s.settle(d, SW, SH, Some(Samples::Rgb(Arc::from(rgb))))
+    }
+
+    /// Deterministic pseudo-random noise of at most +-`amp` on a few pixels.
+    fn noisy(plane: &[u8], amp: i16, seed: u32) -> Vec<u8> {
+        let mut out = plane.to_vec();
+        let mut x = seed.wrapping_mul(2_654_435_761).wrapping_add(12345);
+        for _ in 0..40 {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let i = (x >> 8) as usize % out.len();
+            let d = ((x >> 3) % (2 * amp as u32 + 1)) as i16 - amp;
+            out[i] = (out[i] as i16 + d).clamp(0, 255) as u8;
+        }
+        out
+    }
+
+    #[test]
+    fn noise_within_the_threshold_keeps_the_hash() {
+        let mut s = Settler::new(16);
+        let base = base_plane();
+        let h0 = settle_luma(&mut s, &base);
+        for seed in 0..50 {
+            let f = noisy(&base, 8, seed);
+            assert_eq!(settle_luma(&mut s, &f), h0, "noise frame {seed}");
+        }
+        assert!(s.compares() > 0, "the noise frames must have been compared");
+    }
+
+    #[test]
+    fn noise_within_the_threshold_keeps_the_hash_in_rgb() {
+        let mut s = Settler::new(16);
+        let base = base_plane();
+        let h0 = settle_rgb(&mut s, &to_rgb(&base));
+        for seed in 0..50 {
+            let f = to_rgb(&noisy(&base, 8, seed));
+            assert_eq!(settle_rgb(&mut s, &f), h0, "noise frame {seed}");
+        }
+    }
+
+    #[test]
+    fn one_pixel_beyond_the_threshold_is_a_change() {
+        let mut s = Settler::new(16);
+        let base = base_plane();
+        let h0 = settle_luma(&mut s, &base);
+        let mut f = base.clone();
+        f[500] = f[500].saturating_add(40);
+        let h1 = settle_luma(&mut s, &f);
+        assert_ne!(h1, h0);
+        assert_eq!(
+            h1,
+            classify_gray(&f, SW, SH).0,
+            "the accepted hash is exact"
+        );
+        // ...and it is the new reference.
+        assert_eq!(settle_luma(&mut s, &f), h1);
+        let mut g = to_rgb(&base);
+        let mut s2 = Settler::new(16);
+        let r0 = settle_rgb(&mut s2, &g);
+        g[500 * 3 + 1] = g[500 * 3 + 1].saturating_add(80);
+        assert_ne!(settle_rgb(&mut s2, &g), r0);
+    }
+
+    /// Exactly the threshold is noise; one level more is a change.
+    #[test]
+    fn the_threshold_itself_is_still_noise() {
+        let mut s = Settler::new(16);
+        let mut base = base_plane();
+        base[10] = 100;
+        let h0 = settle_luma(&mut s, &base);
+        base[10] = 116;
+        assert_eq!(settle_luma(&mut s, &base), h0);
+        base[10] = 117;
+        assert_ne!(settle_luma(&mut s, &base), h0);
+    }
+
+    /// Slow drift is measured against the reference, not the previous frame,
+    /// so it is caught once it adds up.
+    #[test]
+    fn slow_drift_is_caught_once_it_exceeds_the_threshold() {
+        let mut s = Settler::new(16);
+        let base = vec![100u8; (SW * SH) as usize];
+        let h0 = settle_luma(&mut s, &base);
+        let mut first_change = None;
+        for step in 1..=20u8 {
+            let f = vec![100 + step; (SW * SH) as usize];
+            if settle_luma(&mut s, &f) != h0 {
+                first_change = Some(step);
+                break;
+            }
+        }
+        assert_eq!(first_change, Some(17), "drift of 17 levels > 16");
+    }
+
+    /// Threshold 0 is the old behavior: the exact digest, every time.
+    #[test]
+    fn threshold_zero_is_the_exact_digest() {
+        let mut s = Settler::new(0);
+        let base = base_plane();
+        for seed in 0..10 {
+            let f = noisy(&base, 1, seed);
+            assert_eq!(settle_luma(&mut s, &f), classify_gray(&f, SW, SH).0);
+        }
+        let mut f = base.clone();
+        f[3] = f[3].wrapping_add(1);
+        assert_ne!(settle_luma(&mut s, &f), settle_luma(&mut s, &base));
+        assert_eq!(s.compares(), 0, "no luma compare at threshold 0");
+    }
+
+    #[test]
+    fn a_resolution_change_is_a_change() {
+        let mut s = Settler::new(16);
+        let a = vec![100u8; (SW * SH) as usize];
+        let ha = settle_luma(&mut s, &a);
+        let b = vec![100u8; (SW * SH / 2) as usize];
+        let (d, _) = classify_gray(&b, SW, SH / 2);
+        let hb = s.settle(d, SW, SH / 2, Some(Samples::Luma(Arc::from(b))));
+        assert_ne!(hb, ha);
+        assert_eq!(hb, d);
+    }
+
+    /// A bit-identical (deterministic) source costs no luma compares at all:
+    /// the digest equals the reference's.
+    #[test]
+    fn a_static_source_is_never_compared() {
+        let mut s = Settler::new(16);
+        let base = base_plane();
+        let h0 = settle_luma(&mut s, &base);
+        for _ in 0..100 {
+            assert_eq!(settle_luma(&mut s, &base), h0);
+        }
+        assert_eq!(s.compares(), 0);
+    }
+
+    /// A source that repeats one noisy frame is compared once.
+    #[test]
+    fn a_repeated_noise_frame_is_compared_once() {
+        let mut s = Settler::new(16);
+        let base = base_plane();
+        let h0 = settle_luma(&mut s, &base);
+        let n = noisy(&base, 8, 3);
+        for _ in 0..10 {
+            assert_eq!(settle_luma(&mut s, &n), h0);
+        }
+        assert_eq!(s.compares(), 1);
+    }
+
+    /// Frames without samples (nothing to compare) publish their digest.
+    #[test]
+    fn a_frame_without_samples_publishes_its_digest() {
+        let mut s = Settler::new(16);
+        assert_eq!(s.settle(42, SW, SH, None), 42);
     }
 }

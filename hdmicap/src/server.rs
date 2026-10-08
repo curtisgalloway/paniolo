@@ -75,6 +75,8 @@ pub struct AppState {
     /// What clients want from the capture loop right now (#221): streams
     /// hold a guard, pulls record themselves. See [`crate::demand`].
     demand: Arc<Demand>,
+    /// The daemon's `--change-threshold`, reported by `/status`.
+    change_threshold: u8,
 }
 
 impl AppState {
@@ -84,7 +86,14 @@ impl AppState {
             expensive: Arc::new(Semaphore::new(EXPENSIVE_PERMITS)),
             preview_cache: Arc::new(Mutex::new(None)),
             demand: Demand::new(),
+            change_threshold: crate::frame::DEFAULT_CHANGE_THRESHOLD,
         }
+    }
+
+    /// Record the threshold the capture thread was started with.
+    pub fn with_change_threshold(mut self, threshold: u8) -> Self {
+        self.change_threshold = threshold;
+        self
     }
 
     /// Share the capture thread's demand record, so requests pace it.
@@ -187,7 +196,7 @@ async fn xterm_fit_js() -> impl IntoResponse {
 
 async fn status(State(s): State<AppState>) -> Json<StatusDto> {
     let f = s.frames.borrow().clone();
-    Json(StatusDto::from(f.as_ref()))
+    Json(StatusDto::new(f.as_ref(), s.change_threshold))
 }
 
 #[derive(Deserialize)]
@@ -1800,5 +1809,86 @@ mod tests {
             0,
             "the guard must drop with the answer"
         );
+    }
+
+    /// End to end through the real router: a frame that is only noise
+    /// relative to the reference carries the reference's hash, so a
+    /// `changed_since=<reference hash>` caller keeps waiting; a real change
+    /// answers it.
+    #[tokio::test]
+    async fn changed_since_ignores_noise_and_sees_a_real_change() {
+        use crate::frame::{classify_nv12, Samples, Settler};
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let (w, h) = (16u32, 8u32);
+        let mut settler = Settler::new(16);
+        let mut settled = |y: Vec<u8>| -> FrameState {
+            let (digest, _) = classify_nv12(&y, w, h);
+            let hash = settler.settle(digest, w, h, Some(Samples::Luma(Arc::from(y.clone()))));
+            FrameState {
+                hash,
+                pixels: PixelData::Nv12 {
+                    y: Arc::from(y),
+                    cbcr: Arc::from(vec![128u8; (w * (h / 2)) as usize]),
+                },
+                ..nv12_frame(w, h, Signal::Stable, Instant::now())
+            }
+        };
+
+        let base = vec![100u8; (w * h) as usize];
+        let first = settled(base.clone());
+        let reference = first.hash;
+        let (tx, rx) = watch::channel(Arc::new(first));
+        let app = router(
+            AppState::new(rx),
+            crate::auth::Auth::new("tok".into(), PUBLIC_ASSETS),
+        );
+        let req = |q: &str| {
+            HttpRequest::builder()
+                .uri(q.to_string())
+                .header(header::HOST, "127.0.0.1:1")
+                .header(header::AUTHORIZATION, "Bearer tok")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let uri = format!("/snapshot?changed_since={reference:016x}&timeout=3000");
+        let pending = tokio::spawn(app.clone().oneshot(req(&uri)));
+
+        let mut noise = base.clone();
+        noise[5] = 108;
+        let noisy_frame = settled(noise);
+        assert_eq!(noisy_frame.hash, reference, "noise keeps the hash");
+        tx.send(Arc::new(noisy_frame)).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !pending.is_finished(),
+            "noise must not satisfy changed_since"
+        );
+
+        let mut real = base.clone();
+        real[5] = 200;
+        let real_frame = settled(real);
+        let new_hash = real_frame.hash;
+        assert_ne!(new_hash, reference);
+        tx.send(Arc::new(real_frame)).unwrap();
+        let resp = tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .expect("a real change must answer changed_since")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resp.headers()["x-timeout"], "0");
+        assert_eq!(
+            resp.headers()["x-frame-hash"],
+            format!("{new_hash:016x}").as_str()
+        );
+
+        let status = app.oneshot(req("/status")).await.unwrap();
+        let body = axum::body::to_bytes(status.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["change_threshold"], 16);
     }
 }

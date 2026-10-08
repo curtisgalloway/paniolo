@@ -191,6 +191,7 @@ pub fn start_daemon(
     port: u16,
     target: &str,
     ocr_mode: Option<&str>,
+    change_threshold: Option<u8>,
 ) -> Result<std::process::Child> {
     let binary = daemons::find_binary(DAEMON).ok_or_else(|| {
         crate::error::PanioloError::not_configured(
@@ -211,6 +212,7 @@ pub fn start_daemon(
         port,
         hid_discovery.as_deref(),
         ocr_helper(ocr_mode),
+        change_threshold,
     );
     cmd.envs(daemons::helper_env(DAEMON, Some(target)));
     cmd.env("PANIOLO_TARGET", target);
@@ -243,6 +245,7 @@ fn daemon_command(
     port: u16,
     hid_discovery: Option<&std::path::Path>,
     ocr: Option<std::path::PathBuf>,
+    change_threshold: Option<u8>,
 ) -> Command {
     let mut cmd = Command::new(binary);
     let device_arg = match (device == crate::model::RFB_HID_DEVICE, hid_discovery) {
@@ -257,6 +260,9 @@ fn daemon_command(
         .arg(device_arg)
         .arg("--port")
         .arg(port.to_string());
+    if let Some(n) = change_threshold {
+        cmd.arg("--change-threshold").arg(n.to_string());
+    }
     if let Some(ocr) = ocr {
         cmd.env("PANIOLO_VISIONOCR", ocr);
     }
@@ -317,6 +323,7 @@ mod tests {
             0,
             Some(file),
             None,
+            None,
         );
         assert_eq!(
             args_of(&cmd),
@@ -329,12 +336,35 @@ mod tests {
         assert_eq!(env_of(&cmd, "HDMICAP_RFB_TOKEN"), None);
     }
 
+    /// The channel's `change_threshold` reaches hdmicap as `--change-threshold`
+    /// (0 included: it means exact, not "unset"); unset adds no flag, so the
+    /// daemon's own default applies.
+    #[test]
+    fn change_threshold_is_passed_to_the_daemon_only_when_set() {
+        let bin = std::path::Path::new("hdmicap");
+        let cmd = daemon_command(bin, "x", 0, None, None, Some(0));
+        assert_eq!(
+            args_of(&cmd),
+            [
+                "daemon",
+                "--device",
+                "x",
+                "--port",
+                "0",
+                "--change-threshold",
+                "0"
+            ]
+        );
+        let cmd = daemon_command(bin, "x", 0, None, None, None);
+        assert!(!args_of(&cmd).iter().any(|a| a == "--change-threshold"));
+    }
+
     /// Every other device string reaches hdmicap untouched, with no RFB
     /// environment attached.
     #[test]
     fn other_devices_are_passed_through_unchanged() {
         for dev in ["USB Video", "/dev/video0", "rfb://192.0.2.10:5900"] {
-            let cmd = daemon_command(std::path::Path::new("hdmicap"), dev, 7, None, None);
+            let cmd = daemon_command(std::path::Path::new("hdmicap"), dev, 7, None, None, None);
             assert_eq!(args_of(&cmd), ["daemon", "--device", dev, "--port", "7"]);
             assert_eq!(env_of(&cmd, "HDMICAP_RFB_DISCOVERY"), None);
         }

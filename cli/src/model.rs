@@ -273,6 +273,13 @@ pub struct VideoChannel {
     /// Windows, `linuxocr` on Linux), which is right for everything except a
     /// Linux host looking at GUI screens.
     pub ocr_mode: Option<String>,
+    /// How far (0-255) any single pixel's luma must move from the last
+    /// accepted frame before hdmicap's frame hash changes, so smaller
+    /// movements (capture noise) do not look like a changed screen to
+    /// `video shot --changed-since` and friends. Unset means hdmicap's default
+    /// (16); 0 means exact: any differing pixel changes the hash. Measured
+    /// noise on an unchanged H.264 (network KVM) screen was at most 8 levels.
+    pub change_threshold: Option<u8>,
 }
 
 /// USB HID input injection: an opaque helper command (e.g. `hidrig -d <uart>`)
@@ -476,6 +483,11 @@ impl Lab {
             let mut f = Vec::new();
             push_opt(&mut f, "device", &v.device);
             push_opt(&mut f, "ocr_mode", &v.ocr_mode);
+            push_opt(
+                &mut f,
+                "change_threshold",
+                &v.change_threshold.map(|n| n.to_string()),
+            );
             channels.push(ResolvedChannel {
                 kind: ChannelKind::Video,
                 name: "video".into(),
