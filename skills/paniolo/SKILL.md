@@ -288,10 +288,11 @@ paniolo video stop [target]           # stop the daemon (on the target's host)
 
 - The **dashboard** (the video daemon's URL — ports are OS-assigned, and the
   URL `video watch` and `video preview` print carries the daemon's `?token=`;
-  open exactly that URL) shows live video on top, a
+  open exactly that URL) shows live video on top (a noVNC view
+  you can type and click in when the target has a `hid` channel; MJPEG toggle), a
   serial terminal below, an **OCR button** that reads the current screen, and —
-  when the target has a `hid` channel — a **⌨ Capture input** button that turns
-  the page into a KVM (see HID injection below).
+  when the target has a `hid` channel — keyboard and pointer input (click into the
+  video; the **⌨ Capture input** button exists only in MJPEG mode; see HID injection below).
 - **The token in that URL is a live credential — keep it out of your
   transcript.** Every command prints the token-free
   `http://127.0.0.1:<port>`; `paniolo video preview` is the only one that
@@ -631,11 +632,11 @@ host-powered and independent. Command vocabulary:
 `docs/dev/hid-serial-protocol.md`; dual-board design + frame format:
 `docs/dev/hid-dual-board-design.md`.
 
-**KVM in the console.** `paniolo console <name>` shows a **⌨ Capture input**
-toggle button over the video when the target has a `hid` channel: click it to
-drive the target with your own keyboard + mouse (absolute — the cursor follows
-where you point; your local cursor stays visible as a crosshair), click again to
-release. It auto-starts the hid daemon (`hidrig serve`), which owns the control
+**KVM in the console.** `paniolo console <name>` shows the video as a noVNC view; when the target
+has a `hid` channel, click into it to drive the target with your own keyboard + mouse (absolute —
+the cursor follows where you point; F13-F24 and exotic keysyms are dropped). In the MJPEG view
+(toggle) a **⌨ Capture input** button does the same. `video watch`/`console` start the hid daemon
+for any video device, so it owns the injector from then on. It auto-starts the hid daemon (`hidrig serve`), which owns the control
 link and re-exposes the command vocabulary over a WebSocket; `paniolo hid send` injections intermix
 with what you type in the browser. Manual daemon control: `paniolo hid
 serve [target]` / `paniolo hid stop [target]` (positional target — only

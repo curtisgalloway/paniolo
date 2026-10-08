@@ -59,11 +59,12 @@ each term briefly on first use; this page is the longer reference.
 | **H.264** | A lossy video codec. A JetKVM streams its screen as H.264; the `jetkvm` daemon decodes it with `ffmpeg`. |
 | **HTTP Boot** | UEFI's network boot over HTTP, an alternative to PXE. |
 | **IHDR** | The header chunk of a PNG file, which holds its dimensions. |
+| **keysym** | A key identifier in the X11/RFB scheme (`0x61` is `a`). noVNC sends keysyms; hdmicap maps them to hid key names. |
 | **LL address** | An IPv6 link-local address (`fe80::...`), valid only on one link. |
 | **mDNS** | Multicast DNS: name lookup on the local network without a DNS server. |
 | **MJPEG** | A video stream made of individual JPEG frames. |
 | **NBP** | Network boot program: the first file a PXE client downloads and runs. |
-| **noVNC** | A VNC client that runs in a browser (RFB over WebSocket). The chosen direction for a future live view; not built. |
+| **noVNC** | A VNC client that runs in a browser (RFB over WebSocket). The dashboard's video pane uses it, served by hdmicap's `GET /rfb`. |
 | **PTY** | Pseudo-terminal: a software serial port. A VM's serial console is one. |
 | **PXE** | Preboot Execution Environment: the standard way a machine boots from the network. |
 | **RFB** | Remote Framebuffer, the protocol VNC uses. A server sends rectangles of pixels; a client sends key and pointer events. `hdmicap` is an RFB client for network video sources. |
@@ -92,4 +93,5 @@ each term briefly on first use; this page is the longer reference.
 | **RCS** | Fuchsia's RemoteControlService; `ffx target list` shows `RCS:Y` when it is reachable. |
 | **Redfish** | A DMTF standard REST API for managing servers. |
 | **tio** | A terminal program for serial ports. |
+| **ZRLE** | Zlib Run-Length Encoding: the lossless RFB encoding hdmicap uses to send changed screen tiles compactly. |
 | **xterm.js** | The in-browser terminal the dashboard uses. |
