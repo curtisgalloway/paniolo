@@ -44,6 +44,10 @@ pub fn daemon(target: &str) -> Option<daemons::Endpoint> {
 /// daemons.rs). It still owns the capture device, so it has to be reaped
 /// before a replacement can start.
 pub fn untracked(device: &str) -> Option<daemons::Untracked> {
+    // A network source holds no local device, so no orphan can be holding it.
+    if crate::model::is_network_device(device) {
+        return None;
+    }
     daemons::untracked_on_devices(DAEMON, &[device.to_string()])
         .into_iter()
         .next()
@@ -196,16 +200,19 @@ pub fn start_daemon(
     // Record which binary this daemon runs, so a later upgrade/rebuild can be
     // detected as stale (see daemons::binary_is_stale).
     daemons::record_binmeta(&binary, DAEMON, Some(target));
-    let mut cmd = Command::new(binary);
-    cmd.arg("daemon")
-        .arg("--device")
-        .arg(device)
-        .arg("--port")
-        .arg(port.to_string());
+    let hid_discovery = if device == crate::model::RFB_HID_DEVICE {
+        Some(hid_discovery_file(target)?)
+    } else {
+        None
+    };
+    let mut cmd = daemon_command(
+        &binary,
+        device,
+        port,
+        hid_discovery.as_deref(),
+        ocr_helper(ocr_mode),
+    );
     cmd.envs(daemons::helper_env(DAEMON, Some(target)));
-    if let Some(ocr) = ocr_helper(ocr_mode) {
-        cmd.env("PANIOLO_VISIONOCR", ocr);
-    }
     cmd.env("PANIOLO_TARGET", target);
     // Capture stderr (tracing output) so a startup failure is diagnosable;
     // daemons::start_failure() reads the tail on timeout.
@@ -213,6 +220,47 @@ pub fn start_daemon(
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
     crate::platform::detach(&mut cmd);
     Ok(cmd.spawn()?)
+}
+
+/// The discovery file the target's hid daemon publishes (its channel name,
+/// `hid`, is the directory, whatever helper serves it).
+pub fn hid_discovery_file(target: &str) -> Result<std::path::PathBuf> {
+    Ok(daemons::ensure_runtime_dir(crate::HID_DAEMON, Some(target))?.join("daemon.json"))
+}
+
+/// The `hdmicap daemon` command line for `device`, without the per-target
+/// environment, stdio or detaching (see [`start_daemon`]).
+///
+/// The lab's `rfb+hid:` becomes hdmicap's `rfb+discovery:` plus
+/// `HDMICAP_RFB_DISCOVERY=<the hid daemon's discovery file>`. hdmicap re-reads
+/// that file on every reconnect, so a hid daemon restarted on a new port with
+/// a new token is found again. Neither the port nor the token ever appears on
+/// the command line (visible in `ps`) or in this process's output: the token
+/// stays in the owner-only file, and hdmicap reads it from there itself.
+fn daemon_command(
+    binary: &std::path::Path,
+    device: &str,
+    port: u16,
+    hid_discovery: Option<&std::path::Path>,
+    ocr: Option<std::path::PathBuf>,
+) -> Command {
+    let mut cmd = Command::new(binary);
+    let device_arg = match (device == crate::model::RFB_HID_DEVICE, hid_discovery) {
+        (true, Some(path)) => {
+            cmd.env("HDMICAP_RFB_DISCOVERY", path);
+            "rfb+discovery:"
+        }
+        _ => device,
+    };
+    cmd.arg("daemon")
+        .arg("--device")
+        .arg(device_arg)
+        .arg("--port")
+        .arg(port.to_string());
+    if let Some(ocr) = ocr {
+        cmd.env("PANIOLO_VISIONOCR", ocr);
+    }
+    cmd
 }
 
 /// Stop the target's running daemon via `hdmicap stop`. The per-target
@@ -243,6 +291,69 @@ pub fn passthrough(args: &[String], instance: Option<&str>) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env_of(cmd: &Command, key: &str) -> Option<String> {
+        cmd.get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new(key))
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned())
+    }
+
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// `rfb+hid:` reaches hdmicap as `rfb+discovery:` with the hid daemon's
+    /// discovery file in the environment; nothing secret or port-specific is
+    /// on the command line.
+    #[test]
+    fn rfb_hid_device_is_passed_as_discovery_through_the_environment() {
+        let file = std::path::Path::new("/run/example/hid/t/daemon.json");
+        let cmd = daemon_command(
+            std::path::Path::new("hdmicap"),
+            crate::model::RFB_HID_DEVICE,
+            0,
+            Some(file),
+            None,
+        );
+        assert_eq!(
+            args_of(&cmd),
+            ["daemon", "--device", "rfb+discovery:", "--port", "0"]
+        );
+        assert_eq!(
+            env_of(&cmd, "HDMICAP_RFB_DISCOVERY").as_deref(),
+            Some("/run/example/hid/t/daemon.json")
+        );
+        assert_eq!(env_of(&cmd, "HDMICAP_RFB_TOKEN"), None);
+    }
+
+    /// Every other device string reaches hdmicap untouched, with no RFB
+    /// environment attached.
+    #[test]
+    fn other_devices_are_passed_through_unchanged() {
+        for dev in ["USB Video", "/dev/video0", "rfb://192.0.2.10:5900"] {
+            let cmd = daemon_command(std::path::Path::new("hdmicap"), dev, 7, None, None);
+            assert_eq!(args_of(&cmd), ["daemon", "--device", dev, "--port", "7"]);
+            assert_eq!(env_of(&cmd, "HDMICAP_RFB_DISCOVERY"), None);
+        }
+    }
+
+    /// The new path must produce a discovery path that is the hid daemon's own
+    /// (`<runtime>/hid/<target>/daemon.json`), the file `ensure_hid_daemon_local`
+    /// waits for.
+    #[test]
+    fn hid_discovery_file_is_the_hid_daemons_file() {
+        let p = hid_discovery_file("bench-t").unwrap();
+        let tail: Vec<_> = p
+            .components()
+            .rev()
+            .take(3)
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(tail, ["daemon.json", "bench-t", "hid"]);
+    }
 
     /// The old `timeout_ms + 5_000` panics on overflow in a debug build (and
     /// wraps to a too-short timeout in release) for a `--timeout` near

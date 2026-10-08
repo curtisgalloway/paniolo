@@ -37,6 +37,7 @@ mod pixel;
 // may not use every primitive in it.
 #[allow(dead_code)]
 mod platform;
+mod rfb;
 mod server;
 
 use std::io::{Read, Write};
@@ -57,7 +58,13 @@ struct Cli {
 enum Cmd {
     /// Run the capture daemon (foreground; controller manages the process).
     Daemon {
-        /// Device: "auto" (default), an index, or a name substring.
+        /// Device: "auto" (default), an index, a name substring, or a network
+        /// RFB source: `rfb+ws://127.0.0.1:PORT/rfb` (RFB over WebSocket; the
+        /// bearer token comes from env HDMICAP_RFB_TOKEN, never argv),
+        /// `rfb://HOST:PORT` (plain TCP, security None only), or
+        /// `rfb+discovery:` (a hid daemon's /rfb, located through the
+        /// discovery file named by env HDMICAP_RFB_DISCOVERY and re-read on
+        /// every reconnect).
         #[arg(long, default_value = "auto")]
         device: String,
         /// Port to bind on localhost. 0 = OS-assigned.

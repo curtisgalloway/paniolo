@@ -419,6 +419,16 @@ fn check_channel(lab: &Lab, ch: &ResolvedChannel, rt: &ResolvedTarget) -> (Statu
         },
         ChannelKind::Video => match field(ch, "device") {
             None => (Status::Incomplete, "no device set".to_string()),
+            // A network source (RFB) is not an enumerable capture device:
+            // `hdmicap devices` would never list it, so only hdmicap itself
+            // can be missing.
+            Some(dev) if crate::model::is_network_device(dev) => {
+                match probe(lab, &ch.host, &Probe::OnHookPath("hdmicap".to_string())) {
+                    Some(0) => (Status::Ok, format!("{dev} (network source)")),
+                    None | Some(255) => (Status::Unreachable, "host unreachable".to_string()),
+                    Some(_) => (Status::Missing, format!("{dev} (hdmicap not installed)")),
+                }
+            }
             Some(dev) => match probe(lab, &ch.host, &Probe::Video(dev.to_string())) {
                 Some(3) => (Status::Missing, format!("{dev} (hdmicap not installed)")),
                 rc => interpret(rc, dev),
@@ -887,6 +897,32 @@ mod tests {
             assert_eq!(rc, Some(1), "hdmicap present: device simply not listed");
         } else {
             assert_eq!(rc, Some(3), "hdmicap absent: exit 3, not a device failure");
+        }
+    }
+
+    /// A network RFB device is never in `hdmicap devices`, so the capture-device
+    /// probe would always call it MISSING. It must be judged on hdmicap alone:
+    /// the detail names a network source (hdmicap present) or the missing
+    /// hdmicap, never the device as absent.
+    #[test]
+    fn network_video_devices_are_not_reported_as_missing_capture_devices() {
+        let lab = crate::model::parse(
+            "[targets.t]\n[targets.t.hid]\ncmd = \"x\"\n[targets.t.video]\ndevice = \"rfb+hid:\"\n",
+        )
+        .unwrap();
+        let rt = lab.resolved_target("t").unwrap();
+        let ch = rt
+            .channels
+            .iter()
+            .find(|c| c.kind == ChannelKind::Video)
+            .unwrap();
+        let (status, detail) = check_channel(&lab, ch, &rt);
+        if crate::daemons::find_binary("hdmicap").is_some() {
+            assert!(matches!(status, Status::Ok), "{detail}");
+            assert!(detail.contains("network source"), "{detail}");
+        } else {
+            assert!(matches!(status, Status::Missing), "{detail}");
+            assert!(detail.contains("hdmicap not installed"), "{detail}");
         }
     }
 
