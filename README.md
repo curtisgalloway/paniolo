@@ -1,6 +1,9 @@
 # paniolo
 
-<img src="docs/paniolo-on-horse.png" align="left" width="240" alt="A robot paniolo in a cowboy hat, on horseback, holding the reins">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/paniolo-on-horse-dark.png">
+  <img src="docs/paniolo-on-horse.png" align="left" width="240" alt="A robot paniolo in a cowboy hat, on horseback, holding the reins">
+</picture>
 
 Agent-controlled target machine wrangler for low-level software development.
 
