@@ -85,12 +85,20 @@ input goes through the `hid` path.
 
 ## Known limitations
 
-- **Frame hashes are noisy on a lossy source.** On an unchanged JetKVM screen
-  the hash changed across shots (3 distinct hashes in 4 shots about 1 s
-  apart). The causes were not separated: a blinking text cursor, or H.264
-  decode noise. So `changed_since` and other exact-digest change detection can
-  report a change on a lossy source. `--stable` still worked in testing.
-  Lossless RFB sources (AMT, VMs) are not affected by codec noise.
+- **Frame hashes were noisy on a lossy source; a change threshold fixed it.**
+  On an unchanged JetKVM screen the exact digest changed in 3 of 4 shots about
+  1 s apart. Diffing saved frames separated the two suspected causes: two
+  frames of a screen with nothing happening differed in 316 pixels, by at most
+  8 brightness levels and none above 16, which is H.264 decode noise; real
+  changes (typed text, a clock tick) differed by up to 255 levels in over a
+  thousand pixels. hdmicap now keeps a reference frame and gives a new frame a
+  new hash only when some pixel's luma differs from the reference by more than
+  a per-channel threshold (default 16; 0 = exact). Measured after the change:
+  the hash moved only with the text cursor's blink, a 10x18-pixel box at up to
+  250 levels, plus H.264 artifacts beside it at up to 45. A cursor blink is a
+  real change and moves the hash on a USB capture too; ignoring it would need
+  a minimum changed area, which was considered and not adopted, since a single
+  small glyph is about the same size.
 - **No VNC password authentication yet** (security None only). AMT or a VM
   that requires a password does not work yet.
 - **Whole-frame Raw updates** from the JetKVM (about 8 MB at 1080p); no dirty

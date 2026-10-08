@@ -619,6 +619,10 @@ hdmicap/         Rust crate: warm-stream HDMI capture daemon
                  notes/network-video-rfb.md
     frame.rs     FrameState, Signal enum, one-pass strided classification
                  (exact frame digest + no-signal from 4k luma samples)
+                 + Settler: the published hash only moves when some pixel's
+                 luma differs from the last accepted frame by more than
+                 --change-threshold (default 16, 0 = exact); compares run
+                 only when the exact digest changes
     pixel.rs     PixelData (Rgb/Nv12/Empty) + NV12/YUYV -> RGB converters;
                  compact_nv12() re-packs a strided (row-padded) NV12 buffer
                  into tight Y/CbCr planes — needed by the Windows backend,
@@ -1037,9 +1041,10 @@ jetkvm/          Go module (the one non-Rust helper besides zigplug): hid helper
                  `hid rm` is refused while used; `video watch`/`console`/
                  `daemons restart` start the hid daemon first, then hdmicap
                  with `rfb+discovery:`). cli/ knows only that a hid channel
-                 can host a feed. Known: frame hashes are noisy across shots
-                 of an unchanged screen on this H.264 source, so
-                 `changed_since` can report spurious changes.
+                 can host a feed. H.264 decode noise (measured: up to 8 luma
+                 levels on an unchanged screen) is absorbed by hdmicap's
+                 change threshold (frame.rs `Settler`, default 16), so the
+                 frame hash and `changed_since` stay put on it.
                  Tests run a fake JetKVM (httptest + a pion answerer) end to end.
                  CI: its own `jetkvm` job (gofmt, vet, `go test -race`) and
                  `go_job` in scripts/ci-local.sh; `ci-coverage-check.sh` checks

@@ -92,12 +92,14 @@ Decoding runs only while `hdmicap` is attached. Details:
   evicts the daemon (video and HID stop until the next command), and a command
   that opens its own session evicts your browser tab. Leave the web UI closed
   while automating.
-- **Change detection is noisy on a lossy source.** On an unchanged JetKVM
-  screen the frame hash changed in 3 of 4 shots taken about a second apart. It
-  is not known whether a blinking text cursor or H.264 decode noise is the
-  cause. So `shot --changed-since` can report a change that is not one;
-  `--stable` worked in testing. Lossless RFB sources (AMT, VMs) have no codec
-  noise.
+- **H.264 noise is absorbed by the change threshold.** A JetKVM's decoded
+  frames differ slightly even when the screen does not: measured, a few hundred
+  pixels per frame off by at most 8 brightness levels. The frame hash ignores
+  that because of the [change threshold](#change-threshold), which defaults to
+  16. With it on, the hash of an unchanged screen stays put; what still moves
+  it is real change, such as a blinking text cursor (up to 250 levels) and the
+  H.264 artifacts immediately around it (up to 45 levels, measured). A
+  blinking cursor counts as a change on any source, USB capture included.
 - **Not supported yet:** VNC password authentication (so an AMT machine or VM
   that requires a password does not work), dirty-rectangle updates (every
   update is a whole frame), and a keyframe request after packet loss.
@@ -213,9 +215,38 @@ paniolo video preview --open                     # open it in a browser instead 
 - `--stable` waits for any steady frame.
 - `--changed-since` waits for any frame that differs from the hash. The hash
   covers every pixel, so one new line of text counts, and so does a blinking
-  cursor or a clock ticking over.
+  cursor or a clock ticking over. Differences too faint to matter are ignored;
+  see [Change threshold](#change-threshold).
 - **Both together** (`GET /snapshot?wait=stable&changed_since=<hash>`) wait
   for the next steady screen that differs.
+
+### Change threshold
+
+The hash changes only when some pixel's brightness moves by **more than the
+threshold** (default 16 levels out of 255) from the last frame that changed
+it. Below that it is treated as noise: snapshots still show the newest
+pixels, but the hash, `--changed-since` and `--stable` do not move. Lossy
+sources need this; a JetKVM's H.264 video wobbles by up to 8 levels on a
+screen nothing is touching.
+
+```bash
+paniolo video set -t target-machine --change-threshold 16   # the default
+paniolo video set -t target-machine --change-threshold 0    # exact: any 1-level change counts
+```
+
+- The comparison is against the last *accepted* frame, not the previous one,
+  so a slow drift is still caught once it adds up past the threshold.
+- One pixel over the threshold is enough; there is no minimum area. A typed
+  character or a blinking cursor still registers.
+- It costs nothing on a screen that is bit-for-bit still, which is what a USB
+  capture of a static screen delivers. The brightness comparison runs only
+  when the exact digest changes.
+- On Linux MJPEG capture the comparison runs on the half-scale grayscale
+  image hdmicap already makes for each frame, so a lone single-pixel change
+  is averaged with its neighbors and can fall under the threshold.
+- A new value takes effect when the daemon next starts
+  (`paniolo video watch --restart`). `video show` prints it, and the daemon's
+  `/status` reports it as `change_threshold`.
 
 `-o <path>` always writes on the **invoking machine**, even when the video
 channel is on a remote control host. A failed capture removes the stub file.
