@@ -460,8 +460,10 @@ impl Fb {
             let d = ((y + row) * self.w + x) * 3;
             let s = row * w * 4;
             for (px, out) in src[s..s + w * 4]
-                .chunks_exact(4)
-                .zip(self.rgb[d..d + w * 3].chunks_exact_mut(3))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(self.rgb[d..d + w * 3].as_chunks_mut::<3>().0.iter_mut())
             {
                 out[0] = px[2];
                 out[1] = px[1];

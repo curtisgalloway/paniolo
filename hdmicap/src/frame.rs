@@ -277,7 +277,7 @@ pub enum Samples {
     Rgb(Arc<[u8]>),
 }
 
-fn rgb_luma(p: &[u8]) -> u8 {
+fn rgb_luma(p: &[u8; 3]) -> u8 {
     ((p[0] as u32 * 77 + p[1] as u32 * 150 + p[2] as u32 * 29) >> 8) as u8
 }
 
@@ -285,7 +285,7 @@ impl Samples {
     fn into_luma(self) -> Arc<[u8]> {
         match self {
             Samples::Luma(l) => l,
-            Samples::Rgb(rgb) => rgb.chunks_exact(3).map(rgb_luma).collect(),
+            Samples::Rgb(rgb) => rgb.as_chunks::<3>().0.iter().map(rgb_luma).collect(),
         }
     }
 
@@ -314,7 +314,9 @@ impl Samples {
                 rgb.chunks(BLOCK * 3)
                     .zip(reference.chunks(BLOCK))
                     .any(|(a, b)| {
-                        a.chunks_exact(3)
+                        a.as_chunks::<3>()
+                            .0
+                            .iter()
                             .zip(b)
                             .map(|(p, y)| rgb_luma(p).abs_diff(*y))
                             .max()

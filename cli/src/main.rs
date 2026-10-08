@@ -5544,17 +5544,28 @@ mod tests {
 
     /// `daemons stop 'hid[t]'` refused a live jetkvm daemon ("no longer
     /// running hidrig/ch9329") because the hid needles named only the two
-    /// older helpers. Run a real process whose binary is called `jetkvm` and
-    /// check the gate lets the signal through.
+    /// older helpers. Run a real process whose command line names `jetkvm`
+    /// and check the gate lets the signal through. A shell script, run as
+    /// `sh <dir>/jetkvm`, rather than a renamed copy of `sleep`: on hosts
+    /// where `sleep` is a multi-call coreutils binary it dispatches on its
+    /// own name, so a copy called `jetkvm` exits at once (CI, Linux).
     #[cfg(unix)]
     #[test]
     fn hid_needles_match_a_running_jetkvm() {
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("jetkvm");
-        std::fs::copy("/bin/sleep", &fake).unwrap();
-        let mut child = std::process::Command::new(&fake).arg("30").spawn().unwrap();
+        std::fs::write(&fake, "while :; do sleep 1; done\n").unwrap();
+        let mut child = std::process::Command::new("sh").arg(&fake).spawn().unwrap();
         let pid = child.id() as i32;
-        let ok = pid_runs_one_of(pid, &daemon_process_needles(HID_DAEMON));
+        let needles = daemon_process_needles(HID_DAEMON);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut ok = false;
+        while !ok && std::time::Instant::now() < deadline {
+            ok = pid_runs_one_of(pid, &needles);
+            if !ok {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
         child.kill().unwrap();
         let _ = child.wait();
         assert!(ok, "a running jetkvm must pass the hid identity check");
