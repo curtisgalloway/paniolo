@@ -203,6 +203,9 @@ func serveDaemon(device, target string, port int, owner *Owner) error {
 	_ = srv.Shutdown(sctx)
 	_ = srv.Close() // the /hid WebSocket is long-lived
 	cancel()
+	if v := owner.Video(); v != nil {
+		v.Close() // kills ffmpeg
+	}
 	slog.Info("jetkvm hid daemon shut down")
 	return nil
 }

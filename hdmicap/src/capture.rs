@@ -56,12 +56,17 @@ pub enum DeviceSpec {
     Auto,
     Index(u32),
     Name(String),
+    /// A network RFB source (`rfb+ws://…`, `rfb://…`, `rfb+discovery:`);
+    /// the raw string, parsed by [`crate::rfb::RfbTarget::parse`].
+    Rfb(String),
 }
 
 impl DeviceSpec {
     pub fn parse(s: &str) -> Self {
         let s = s.trim();
-        if s.is_empty() || s.eq_ignore_ascii_case("auto") {
+        if crate::rfb::is_rfb_spec(s) {
+            DeviceSpec::Rfb(s.to_string())
+        } else if s.is_empty() || s.eq_ignore_ascii_case("auto") {
             DeviceSpec::Auto
         } else if let Ok(i) = s.parse::<u32>() {
             DeviceSpec::Index(i)
@@ -295,6 +300,7 @@ fn resolve_in(devices: &[DeviceInfo], spec: &DeviceSpec) -> Result<u32> {
                 )),
             }
         }
+        DeviceSpec::Rfb(s) => Err(anyhow!("{s:?} is a network source, not a capture device")),
         DeviceSpec::Auto => {
             let external = devices.iter().find(|d| {
                 let n = d.name.to_lowercase();
@@ -306,6 +312,10 @@ fn resolve_in(devices: &[DeviceInfo], spec: &DeviceSpec) -> Result<u32> {
 }
 
 pub fn open_backend(spec: &DeviceSpec) -> Result<Box<dyn CaptureBackend>> {
+    // A network source needs no platform backend: it is the same on all three.
+    if let DeviceSpec::Rfb(s) = spec {
+        return crate::rfb::RfbBackend::open(s).map(|b| Box::new(b) as Box<dyn CaptureBackend>);
+    }
     #[cfg(target_os = "linux")]
     {
         linux::LinuxV4LBackend::open(spec).map(|b| Box::new(b) as Box<dyn CaptureBackend>)

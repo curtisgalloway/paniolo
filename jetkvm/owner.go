@@ -100,6 +100,24 @@ type Owner struct {
 
 	subMu sync.Mutex
 	subs  map[chan Event]struct{}
+
+	video *Video
+}
+
+// SetVideo attaches the video pipeline (nil disables /rfb).
+func (o *Owner) SetVideo(v *Video) { o.video = v }
+
+// Video returns the video pipeline, or nil.
+func (o *Owner) Video() *Video { return o.video }
+
+func (o *Owner) ensure() error {
+	_, err := o.ensureLink()
+	return err
+}
+
+func (o *Owner) linkState() (connected, kicked bool) {
+	c, k, _ := o.Status()
+	return c, k
 }
 
 // NewOwner returns an Owner for device (used only for status output).

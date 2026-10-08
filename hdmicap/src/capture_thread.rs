@@ -30,21 +30,27 @@ use tracing::{info, warn};
 
 use crate::capture::{open_backend, CapturedFrame, DeviceSpec};
 use crate::demand::Demand;
-use crate::frame::{classify_gray, classify_nv12, classify_rgb, FrameState, Signal, STABLE_FRAMES};
+use crate::frame::{
+    classify_gray, classify_nv12, classify_rgb, FrameState, Samples, Settler, Signal, STABLE_FRAMES,
+};
 use crate::pixel::PixelData;
 
 pub type FrameRx = watch::Receiver<Arc<FrameState>>;
 
 /// Spawn the capture thread. Returns the receiver end and the JoinHandle.
 /// `demand` sets the Linux loop's pace (#221); see [`crate::demand`].
-pub fn spawn(spec: DeviceSpec, demand: Arc<Demand>) -> (FrameRx, thread::JoinHandle<()>) {
+pub fn spawn(
+    spec: DeviceSpec,
+    demand: Arc<Demand>,
+    change_threshold: u8,
+) -> (FrameRx, thread::JoinHandle<()>) {
     let (tx, rx) = watch::channel(Arc::new(FrameState::no_device()));
 
     let handle = thread::Builder::new()
         .name("capture".into())
         .spawn(move || {
             demand.set_capture_thread(thread::current());
-            capture_loop(spec, tx, &demand)
+            capture_loop(spec, tx, &demand, change_threshold)
         })
         .expect("failed to spawn capture thread");
 
@@ -88,7 +94,12 @@ impl StallTracker {
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
-fn capture_loop(spec: DeviceSpec, tx: watch::Sender<Arc<FrameState>>, demand: &Demand) {
+fn capture_loop(
+    spec: DeviceSpec,
+    tx: watch::Sender<Arc<FrameState>>,
+    demand: &Demand,
+    change_threshold: u8,
+) {
     let mut stalls = StallTracker::new();
 
     // Reconnect loop: if the device is absent or vanishes mid-run, publish
@@ -174,6 +185,8 @@ fn capture_loop(spec: DeviceSpec, tx: watch::Sender<Arc<FrameState>>, demand: &D
                 .ok();
         }
 
+        // Fresh per backend open: a reopened device may show anything.
+        let mut settler = Settler::new(change_threshold);
         let mut last_dims = (0u32, 0u32);
         let mut epoch = 0u64;
         let mut stable_count = 0u32;
@@ -243,7 +256,9 @@ fn capture_loop(spec: DeviceSpec, tx: watch::Sender<Arc<FrameState>>, demand: &D
                 info!("resolution -> {w}x{h} (epoch {epoch})");
             }
 
-            let (hash, no_signal) = classify_captured(&captured);
+            let (digest, no_signal) = classify_captured(&captured);
+            let (pw, ph, samples) = settle_input(&captured);
+            let hash = settler.settle(digest, pw, ph, samples);
 
             let signal = if no_signal {
                 stable_count = 0;
@@ -327,6 +342,26 @@ fn classify_captured(captured: &CapturedFrame) -> (u64, bool) {
         (None, PixelData::Nv12 { y, .. }) => classify_nv12(y, w, h),
         (None, PixelData::Rgb(buf)) => classify_rgb(buf, w, h),
         (None, PixelData::Empty) => (0, true),
+    }
+}
+
+/// What the settler compares for a frame: the dimensions of the buffer it
+/// holds (the scaled plane's own, for MJPEG) and its luma samples. Cloning the
+/// `Arc`s is a refcount bump.
+fn settle_input(captured: &CapturedFrame) -> (u32, u32, Option<Samples>) {
+    match (&captured.luma, &captured.pixels) {
+        (Some(l), _) => (l.width, l.height, Some(Samples::Luma(l.data.clone()))),
+        (None, PixelData::Nv12 { y, .. }) => (
+            captured.width,
+            captured.height,
+            Some(Samples::Luma(y.clone())),
+        ),
+        (None, PixelData::Rgb(buf)) => (
+            captured.width,
+            captured.height,
+            Some(Samples::Rgb(buf.clone())),
+        ),
+        (None, PixelData::Empty) => (captured.width, captured.height, None),
     }
 }
 
@@ -460,5 +495,26 @@ mod tests {
             classify_captured(&frame(None, PixelData::Empty, 1920, 1080)),
             (0, true)
         );
+    }
+
+    /// The settler compares the scaled plane at the plane's own size, never the
+    /// frame's (the same trap as #211): its dimensions and length must agree.
+    #[test]
+    fn settle_input_for_a_scaled_plane_uses_the_planes_dimensions() {
+        let (pw, ph) = (960u32, 540u32);
+        let plane: Arc<[u8]> = vec![200u8; (pw * ph) as usize].into();
+        let captured = frame(
+            Some(LumaPlane {
+                data: plane,
+                width: pw,
+                height: ph,
+            }),
+            PixelData::Empty,
+            pw * 2,
+            ph * 2,
+        );
+        let (w, h, samples) = settle_input(&captured);
+        assert_eq!((w, h), (pw, ph));
+        assert!(matches!(samples, Some(Samples::Luma(l)) if l.len() == (pw * ph) as usize));
     }
 }

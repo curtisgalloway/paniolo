@@ -66,6 +66,23 @@ pub struct SubnetClash {
     pub other_interface: String,
 }
 pub const VALID_SENSE_SIGNALS: [&str; 4] = ["cts", "dsr", "dcd", "ri"];
+/// The `video.device` value meaning "the RFB feed served by this target's own
+/// hid-channel daemon" (any hid helper that serves `GET /rfb`). hdmicap is
+/// handed the daemon's discovery file, not a port, so a restarted hid daemon is
+/// found again. Needs a hid channel on the same host.
+pub const RFB_HID_DEVICE: &str = "rfb+hid:";
+
+/// Whether a `video.device` string names a network RFB source rather than a
+/// capture device. The same prefixes hdmicap's own device parser treats as
+/// network sources (hdmicap/src/rfb.rs `is_rfb_spec`, plus `rfb+hid:`, which
+/// only the CLI understands).
+pub fn is_network_device(device: &str) -> bool {
+    device == RFB_HID_DEVICE
+        || device == "rfb+discovery:"
+        || device.starts_with("rfb://")
+        || device.starts_with("rfb+ws://")
+}
+
 /// The `video.ocr_mode` values (see [`VideoChannel::ocr_mode`]).
 pub const VALID_OCR_MODES: [&str; 2] = ["text", "gui"];
 
@@ -256,6 +273,13 @@ pub struct VideoChannel {
     /// Windows, `linuxocr` on Linux), which is right for everything except a
     /// Linux host looking at GUI screens.
     pub ocr_mode: Option<String>,
+    /// How far (0-255) any single pixel's luma must move from the last
+    /// accepted frame before hdmicap's frame hash changes, so smaller
+    /// movements (capture noise) do not look like a changed screen to
+    /// `video shot --changed-since` and friends. Unset means hdmicap's default
+    /// (16); 0 means exact: any differing pixel changes the hash. Measured
+    /// noise on an unchanged H.264 (network KVM) screen was at most 8 levels.
+    pub change_threshold: Option<u8>,
 }
 
 /// USB HID input injection: an opaque helper command (e.g. `hidrig -d <uart>`)
@@ -459,6 +483,11 @@ impl Lab {
             let mut f = Vec::new();
             push_opt(&mut f, "device", &v.device);
             push_opt(&mut f, "ocr_mode", &v.ocr_mode);
+            push_opt(
+                &mut f,
+                "change_threshold",
+                &v.change_threshold.map(|n| n.to_string()),
+            );
             channels.push(ResolvedChannel {
                 kind: ChannelKind::Video,
                 name: "video".into(),
@@ -613,6 +642,14 @@ fn check_host_ref(host: &str, declared: &BTreeSet<&str>, ctx: &str) -> Result<()
 }
 
 /// Raise [`LabError`] if `lab` is not a structurally valid lab.
+/// `HOST:PORT` with a nonempty host and a nonzero numeric port.
+fn network_addr_ok(addr: &str) -> bool {
+    match addr.trim_end_matches('/').rsplit_once(':') {
+        Some((host, port)) => !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p != 0),
+        None => false,
+    }
+}
+
 pub fn validate(lab: &Lab) -> Result<(), LabError> {
     let mut declared: BTreeSet<&str> = lab.hosts.keys().map(String::as_str).collect();
     declared.insert(LOCAL);
@@ -679,6 +716,33 @@ pub fn validate(lab: &Lab) -> Result<(), LabError> {
         if let Some(v) = &t.video {
             let h = v.host.as_deref().unwrap_or(default_host);
             check_host_ref(h, &declared, &format!("target '{name}' video"))?;
+            if let Some(dev) = v.device.as_deref().filter(|d| is_network_device(d)) {
+                if dev == RFB_HID_DEVICE {
+                    let video_host = v.host.as_deref().unwrap_or(default_host);
+                    match &t.hid {
+                        None => {
+                            return lab_err(format!(
+                                "target '{name}' video: device '{RFB_HID_DEVICE}' reads the hid \
+                                 daemon's RFB feed, but the target has no hid channel \
+                                 (paniolo hid set -t {name} --cmd ...)"
+                            ))
+                        }
+                        Some(hid) if hid.host.as_deref().unwrap_or(default_host) != video_host => {
+                            return lab_err(format!(
+                                "target '{name}' video: device '{RFB_HID_DEVICE}' needs the video \
+                                 and hid channels on the same host (video on '{video_host}', hid on '{}')",
+                                hid.host.as_deref().unwrap_or(default_host)
+                            ))
+                        }
+                        Some(_) => {}
+                    }
+                } else if !dev.starts_with("rfb://") || !network_addr_ok(&dev["rfb://".len()..]) {
+                    return lab_err(format!(
+                        "target '{name}' video: unsupported network device '{dev}' \
+                         (valid: '{RFB_HID_DEVICE}' or 'rfb://HOST:PORT')"
+                    ));
+                }
+            }
             if let Some(mode) = &v.ocr_mode {
                 if !VALID_OCR_MODES.contains(&mode.as_str()) {
                     return lab_err(format!(
@@ -1114,6 +1178,40 @@ mod tests {
             "[targets.t]\n[targets.t.netboot]\nhost_ip = \"192.168.99.1\"\nhttp_port = \"8080\"\n"
         )
         .is_ok());
+    }
+
+    #[test]
+    fn rfb_hid_video_device_needs_a_colocated_hid_channel() {
+        let ok = "[targets.t]\n[targets.t.hid]\ncmd = \"jetkvm\"\n\
+                  [targets.t.video]\ndevice = \"rfb+hid:\"\n";
+        assert!(parse(ok).is_ok());
+        let e = parse("[targets.t]\n[targets.t.video]\ndevice = \"rfb+hid:\"\n").unwrap_err();
+        assert!(e.0.contains("no hid channel"), "{}", e.0);
+        let split =
+            "[hosts.a]\nssh = \"a.example\"\n[hosts.b]\nssh = \"b.example\"\n[targets.t]\n[targets.t.hid]\ncmd = \"jetkvm\"\nhost = \"a\"\n\
+                     [targets.t.video]\ndevice = \"rfb+hid:\"\nhost = \"b\"\n";
+        let e = parse(split).unwrap_err();
+        assert!(e.0.contains("same host"), "{}", e.0);
+    }
+
+    #[test]
+    fn network_video_devices_are_limited_to_the_supported_forms() {
+        for ok in ["rfb://192.0.2.10:5900", "rfb://vm.example:5901/"] {
+            let t = format!("[targets.t]\n[targets.t.video]\ndevice = \"{ok}\"\n");
+            assert!(parse(&t).is_ok(), "{ok}");
+        }
+        for bad in [
+            "rfb://host",
+            "rfb://:5900",
+            "rfb+ws://127.0.0.1:1/rfb",
+            "rfb+discovery:",
+        ] {
+            let t = format!("[targets.t]\n[targets.t.video]\ndevice = \"{bad}\"\n");
+            let e = parse(&t).unwrap_err();
+            assert!(e.0.contains("unsupported network device"), "{bad}: {}", e.0);
+        }
+        // A capture device that merely starts with the letters is still one.
+        assert!(parse("[targets.t]\n[targets.t.video]\ndevice = \"rfbcam\"\n").is_ok());
     }
 
     #[test]

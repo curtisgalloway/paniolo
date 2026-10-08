@@ -256,3 +256,9 @@ Two cautions for whoever picks this up:
   OCR'd; it is not a change of kind. The serial-pane tradeoff above is also
   softer than it looks — noVNC is a browser client, so video and serial can
   still share one page.
+
+Update (2026-10-07): the client half is now built. `hdmicap` has an RFB
+client backend and a video channel can use `rfb+hid:` (first consumer: the
+JetKVM). See [network-video-rfb.md](network-video-rfb.md) for the decisions
+and what is still missing (VNC password authentication, in particular, which
+AMT and most VMs need).

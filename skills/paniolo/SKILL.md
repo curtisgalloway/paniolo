@@ -109,7 +109,7 @@ paniolo target add <name> [--host <labhost>] [--description <text>]
 paniolo netboot set -t <name> --interface <iface> [--tftp-root <dir>] [--host-ip <ip>] [--boot-file grubaa64.efi] [--http-port 80] [--content-type <mime>]
 paniolo serial add console -t <name> --device <path> [--baud 115200] [--sense cts] [--power-button]
 paniolo power set -t <name> [--cycle-cmd C] [--on-cmd C] [--off-cmd C] [--state-cmd C] [--serial-interface console]
-paniolo video set -t <name> --device "<capture id or name>" [--ocr-mode text|gui]
+paniolo video set -t <name> --device "<capture id or name>" [--ocr-mode text|gui] [--change-threshold N]
 paniolo hid set -t <name> --cmd "hidrig -d <uart>"   # USB HID injection helper
 paniolo usb set -t <name> --cmd "ch9329 -d <uart>"   # switchable USB media (KVM-Go microSD)
 paniolo adb set -t <name> [--serial <adb-id>] [--adb <path>]  # an Android DUT over adb
@@ -269,9 +269,12 @@ passwordless `sudo` requirement as netboot (`ip` on Linux, `ifconfig` on macOS).
 
 ```
 paniolo video devices                 # list capture devices (with stable ids)
-paniolo video set -t <target> --device "<id-or-name>" [--ocr-mode text|gui]  # configure the video channel
+paniolo video set -t <target> --device "<id-or-name>" [--ocr-mode text|gui] [--change-threshold N]  # configure the video channel
                                            #   --ocr-mode gui is a Linux-only accuracy switch
                                            #   for GUI screens (unset = platform default)
+                                           #   --device rfb+hid: = the RFB video feed of this target's own
+                                           #   hid daemon (a JetKVM; set the hid channel first), or
+                                           #   rfb://HOST:PORT for a plain network RFB source (no password)
 paniolo video watch [target] [--restart]   # start the capture daemon (background);
                                            #   --restart force-restarts a stalled one
 paniolo video preview [--open]        # print the daemon's dashboard URL (--open: hand it to a browser instead)
@@ -592,7 +595,7 @@ arguments to it and runs it on the channel's host:
 - **`jetkvm`** — the JetKVM network KVM (Go helper): `paniolo hid set -t <name>
   --cmd "jetkvm -d <host>"`; the password comes from `JETKVM_PASSWORD`,
   `--password-file` or `--password-command`, never a flag. Same commands; its
-  `info` prints the device's USB, video and keyboard-LED state. **The JetKVM
+  `info` prints the device's USB, video and keyboard-LED state; its daemon also serves the screen (`video set --device rfb+hid:`). **The JetKVM
   allows ONE session**: the helper's session and a browser tab on the
   device's web UI kick each other, and `OK` does not prove delivery (the
   firmware says success even if the target's USB is not up — check `info`).
@@ -811,6 +814,14 @@ the device is free just because a daemon is gone from the tracked list.
 - `doctor` flags a channel that still works? Believe the working channel and
   report the discrepancy — never rewrite the lab config to silence `doctor`.
 - Serial port is exclusive: one of `connect` / `watch` / external `tio`/`screen`.
+- A JetKVM's screen arrives as `--device rfb+hid:` on the video channel; the
+  `jetkvm` daemon decodes it with `ffmpeg` (must be installed). Video and `hid`
+  share the daemon's one session, so they do not evict each other, but a
+  browser on the JetKVM web UI evicts both. Its H.264 noise is below the video
+  channel's change threshold (`video set --change-threshold`, default 16), so
+  the hash stays put on an unchanged screen; a blinking cursor still moves it,
+  on any source, so `--changed-since` alone does not mean the content you care
+  about changed. Use `--stable` or look at the image.
 - JetKVM allows one session at a time: if a `jetkvm` hid command or daemon
   suddenly fails or reports "session taken over", someone opened the
   device's web UI. Don't open the UI to "check" while automating — it kicks

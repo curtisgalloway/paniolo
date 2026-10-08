@@ -89,7 +89,13 @@ pub fn build_slice(lab: &Lab, target: &str, host: &str) -> Result<String, LabErr
     }
     if let Some(v) = &t.video {
         if on(&v.host) {
-            lf.set_video(target, v.device.as_deref(), v.ocr_mode.as_deref(), None)?;
+            lf.set_video(
+                target,
+                v.device.as_deref(),
+                v.ocr_mode.as_deref(),
+                v.change_threshold,
+                None,
+            )?;
         }
     }
     if let Some(h) = &t.hid {
@@ -617,6 +623,7 @@ mod tests {
             [targets.fortune.video]
             device = "/dev/video0"
             ocr_mode = "gui"
+            change_threshold = 4
             host = "bench2"
             [targets.fortune.usb]
             cmd = "ch9329 -d /dev/ttyUSB1"
@@ -671,6 +678,16 @@ mod tests {
         assert_eq!(v.device.as_deref(), Some("/dev/video0"));
         assert_eq!(v.ocr_mode.as_deref(), Some("gui"));
         assert!(v.host.is_none());
+    }
+
+    /// Same trap as `ocr_mode`: a field `build_slice` does not copy silently
+    /// reverts to the default on the control host.
+    #[test]
+    fn slice_carries_the_videos_change_threshold() {
+        let s = build_slice(&lab(), "fortune", "bench2").unwrap();
+        let reparsed = model::parse(&s).unwrap();
+        let v = reparsed.targets["fortune"].video.as_ref().unwrap();
+        assert_eq!(v.change_threshold, Some(4));
     }
 
     #[test]

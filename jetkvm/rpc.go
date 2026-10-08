@@ -33,6 +33,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -72,6 +73,9 @@ type DialConfig struct {
 	SettingEngine *webrtc.SettingEngine
 	// Timeout bounds login plus the WebRTC handshake (default 20 s).
 	Timeout time.Duration
+	// Video, when set, adds an H.264 receive-only video track to the session
+	// and feeds it to this pipeline.
+	Video *Video
 }
 
 // defaultSettingEngine applies to Dial calls that do not set their own. Nil in
@@ -134,6 +138,34 @@ type Link struct {
 	// OnEvent receives server-pushed notifications (usbState, ...). It is
 	// called from the data-channel goroutine and must not block.
 	OnEvent func(method string, params json.RawMessage)
+
+	video *Video
+}
+
+// h264Codecs are the only video codecs offered: H.265 is never negotiated.
+func h264Codecs() []webrtc.RTPCodecParameters {
+	var out []webrtc.RTPCodecParameters
+	for i, profile := range []string{"42e01f", "42001f", "4d001f", "640c1f"} {
+		out = append(out, webrtc.RTPCodecParameters{
+			RTPCodecCapability: webrtc.RTPCodecCapability{
+				MimeType:  webrtc.MimeTypeH264,
+				ClockRate: 90000,
+				SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;" +
+					"profile-level-id=" + profile,
+				RTCPFeedback: []webrtc.RTCPFeedback{{Type: "nack"}, {Type: "nack", Parameter: "pli"}},
+			},
+			PayloadType: webrtc.PayloadType(102 + 2*i),
+		})
+	}
+	return out
+}
+
+// RequestKeyframe sends an RTCP Picture Loss Indication for the video track.
+func (l *Link) requestKeyframe(ssrc uint32) {
+	if l.pc == nil {
+		return
+	}
+	_ = l.pc.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: ssrc}})
 }
 
 // Done is closed when the session ends for any reason.
@@ -230,6 +262,9 @@ func (l *Link) onMessage(data []byte) {
 			l.Close()
 			return
 		}
+		if m.Method == "videoInputState" && l.video != nil {
+			l.video.InputState(m.Params)
+		}
 		if l.OnEvent != nil {
 			l.OnEvent(m.Method, m.Params)
 		}
@@ -310,12 +345,21 @@ func Dial(parent context.Context, cfg DialConfig) (*Link, error) {
 	if se == nil {
 		se = defaultSettingEngine
 	}
-	var api *webrtc.API
+	opts := []func(*webrtc.API){}
 	if se != nil {
-		api = webrtc.NewAPI(webrtc.WithSettingEngine(*se))
-	} else {
-		api = webrtc.NewAPI()
+		opts = append(opts, webrtc.WithSettingEngine(*se))
 	}
+	if cfg.Video != nil {
+		me := &webrtc.MediaEngine{}
+		for _, c := range h264Codecs() {
+			if err := me.RegisterCodec(c, webrtc.RTPCodecTypeVideo); err != nil {
+				_ = ws.CloseNow()
+				return nil, err
+			}
+		}
+		opts = append(opts, webrtc.WithMediaEngine(me))
+	}
+	api := webrtc.NewAPI(opts...)
 	pc, err := api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		_ = ws.CloseNow()
@@ -325,12 +369,34 @@ func Dial(parent context.Context, cfg DialConfig) (*Link, error) {
 	l := &Link{
 		pc: pc, ws: ws, ctx: lctx, cancel: lcancel,
 		waiters: map[int]chan rpcMessage{}, done: make(chan struct{}),
+		video: cfg.Video,
 	}
 	fail := func(err error) (*Link, error) {
 		l.Close()
 		return nil, err
 	}
 
+	if cfg.Video != nil {
+		if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo,
+			webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly}); err != nil {
+			return fail(err)
+		}
+		pc.OnTrack(func(tr *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+			if tr.Kind() != webrtc.RTPCodecTypeVideo {
+				return
+			}
+			slog.Info("JetKVM video track", "codec", tr.Codec().MimeType)
+			ssrc := uint32(tr.SSRC())
+			cfg.Video.Attach(func() { l.requestKeyframe(ssrc) })
+			for {
+				pkt, _, err := tr.ReadRTP()
+				if err != nil {
+					return
+				}
+				cfg.Video.Packet(pkt)
+			}
+		})
+	}
 	dc, err := pc.CreateDataChannel("rpc", nil)
 	if err != nil {
 		return fail(err)

@@ -17,9 +17,11 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -121,6 +123,34 @@ func TestShutdownCleanupLeavesLockFileLocked(t *testing.T) {
 		t.Fatalf("the next daemon can lock once the first is gone: %v", err)
 	}
 	third.Close()
+}
+
+// `jetkvm stop --target T` (flag after the verb) must find T's daemon. It used
+// to drop the flag and report "no hid daemon running" for a live daemon. A
+// token-less record makes stop fail at the request, which proves it was found.
+func TestStopTargetAfterTheVerbFindsTheDaemon(t *testing.T) {
+	t.Setenv("PANIOLO_RUNTIME_DIR", "")
+	t.Setenv("PANIOLO_RUNTIME_BASE", t.TempDir())
+	dir, err := runtimeDir("target-machine", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(dir, "daemon.json"),
+		[]byte(`{"pid":`+strconv.Itoa(os.Getpid())+`,"port":7}`), 0o600)
+	for _, args := range [][]string{
+		{"stop", "--target", "target-machine"},
+		{"--target", "target-machine", "stop"},
+	} {
+		var out, errb bytes.Buffer
+		code := run(args, strings.NewReader(""), &out, &errb)
+		if code != exitFailure || !strings.Contains(errb.String(), "no token") {
+			t.Fatalf("%v: code %d stdout %q stderr %q", args, code, out.String(), errb.String())
+		}
+	}
+	var out, errb bytes.Buffer
+	if code := run([]string{"stop", "extra"}, strings.NewReader(""), &out, &errb); code != exitUsage {
+		t.Fatalf("stray argument: code %d", code)
+	}
 }
 
 func TestDiscoverIgnoresDeadPidAndGarbage(t *testing.T) {

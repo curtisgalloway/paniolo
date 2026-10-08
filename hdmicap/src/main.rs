@@ -37,6 +37,7 @@ mod pixel;
 // may not use every primitive in it.
 #[allow(dead_code)]
 mod platform;
+mod rfb;
 mod server;
 
 use std::io::{Read, Write};
@@ -57,12 +58,26 @@ struct Cli {
 enum Cmd {
     /// Run the capture daemon (foreground; controller manages the process).
     Daemon {
-        /// Device: "auto" (default), an index, or a name substring.
+        /// Device: "auto" (default), an index, a name substring, or a network
+        /// RFB source: `rfb+ws://127.0.0.1:PORT/rfb` (RFB over WebSocket; the
+        /// bearer token comes from env HDMICAP_RFB_TOKEN, never argv),
+        /// `rfb://HOST:PORT` (plain TCP, security None only), or
+        /// `rfb+discovery:` (a hid daemon's /rfb, located through the
+        /// discovery file named by env HDMICAP_RFB_DISCOVERY and re-read on
+        /// every reconnect).
         #[arg(long, default_value = "auto")]
         device: String,
         /// Port to bind on localhost. 0 = OS-assigned.
         #[arg(long, default_value_t = 8723)]
         port: u16,
+        /// How far (0-255) any one pixel's luma must move from the last
+        /// accepted frame before the frame hash changes. Smaller movements
+        /// are treated as capture noise (lossy H.264 sources re-render an
+        /// unchanged screen slightly differently each frame; measured noise
+        /// was at most 8 levels). 0 = exact: any differing pixel changes
+        /// the hash.
+        #[arg(long, default_value_t = frame::DEFAULT_CHANGE_THRESHOLD)]
+        change_threshold: u8,
     },
     /// List available capture devices and exit (no daemon needed).
     Devices {
@@ -117,7 +132,11 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Daemon { device, port } => daemon::run(DeviceSpec::parse(&device), port),
+        Cmd::Daemon {
+            device,
+            port,
+            change_threshold,
+        } => daemon::run(DeviceSpec::parse(&device), port, change_threshold),
         Cmd::Devices { json, all } => cmd_devices(json, all),
         Cmd::Shot {
             stable,

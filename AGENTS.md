@@ -329,6 +329,7 @@ Current capabilities:
   one daemon **per target** owns that target's several named interfaces, each with a
   timestamped rolling capture log queryable by line range (`paniolo serial log -i <name>`)
 - Combined video+serial web dashboard (hdmicap's `GET /`: video on top, xterm.js terminal below)
+- Network video sources via RFB (`paniolo video set --device rfb+hid:` for a JetKVM, or `rfb://HOST:PORT`): hdmicap is the RFB client; the first consumer is the JetKVM, whose daemon decodes H.264 with `ffmpeg` and serves RFB (docs/video.md, notes/network-video-rfb.md)
 - On-device OCR of the captured screen (`paniolo video read [target] [--stable]`, which wraps hdmicap's `GET /ocr`; also the dashboard OCR button): Apple Vision on macOS, Tesseract on Linux
 - USB HID input (keyboard/mouse injection) via a generic helper hook (`paniolo hid send`); the `hidrig` helper drives the dual-board KB2040 injector — it composes HID reports in Rust and writes binary frames to the control board's USB-CDC endpoint, which relays them over I2C1 to the target board (the "dumb pipe", docs/dev/hid-dual-board-design.md; command vocabulary in docs/dev/hid-serial-protocol.md). `hidrig serve` runs a daemon that owns the control link and re-exposes the command vocabulary over a WebSocket, so `paniolo console` works as a **KVM** — stream the browser's keyboard + absolute mouse (`moveabs`) to the target, intermixed with CLI injection on the one wire. The same control board can also **bridge the DUT serial console** (its hardware UART, re-exported by the daemon as a PTY into the `serial` channel) and **switch DUT power** via a relay (`hidrig power off|on|cycle`), so one USB device backs the target's HID, console, and power (design §6–§7; the relay/power path is hardware-verified, incl. NVM state persistence across a control-board reset — the console bridge is not yet)
 - Switchable USB media via a generic per-target `usb` channel (`paniolo usb attach-host|attach-target|state`): one physical USB device routed to the control host or the target, never both. Supported today on the **Openterface KVM-Go**, whose onboard microSD reader sits behind an FSUSB42 mux driven by the same CH32V208 (and the same serial port) as its `hid` channel — so the `ch9329` helper backs both, and the two channels normally carry the same `--cmd`. The point is hands-free *physical* boot media, which firmware can see and streamed virtual media generally cannot. Like the power hooks the helper is opaque, but the vocabulary is **fixed** rather than passed through: paniolo appends `usb host`, `usb target`, or `usb state`, keeping the surface a constrained remote host must expose to three verbs. Guide: docs/usb.md; clean-room protocol: notes/openterface-usb-mux-spec.md. The Mini-KVM's switchable USB-A port uses a different mechanism (a register write over the capture chip's HID config interface) that is documented but not yet implemented by any helper
@@ -604,8 +605,24 @@ hdmicap/         Rust crate: warm-stream HDMI capture daemon
                  frame in between. If the flag is still set a full watchdog poll
                  later (backend.frame() itself never returned to let the main
                  thread see it), that IS the wedged case and it still exits
+    rfb.rs       platform-independent RFB client capture backend for network
+                 video sources (device strings `rfb://HOST:PORT` plain TCP,
+                 security None only; `rfb+ws://127.0.0.1:PORT/rfb` with the
+                 bearer token in env `HDMICAP_RFB_TOKEN`, never argv;
+                 `rfb+discovery:`, which re-reads the discovery file named by
+                 env `HDMICAP_RFB_DISCOVERY` on every reconnect so a restarted
+                 daemon's port and token are picked up). RFB 3.3/3.7/3.8; Raw,
+                 CopyRect, DesktopSize. Keepalive: a non-incremental update
+                 request every 5 s; no bytes for 15 s = link dead, publish
+                 no_device and reopen. Deps: tokio-tungstenite (no TLS),
+                 futures-util. No VNC password auth yet. Design:
+                 notes/network-video-rfb.md
     frame.rs     FrameState, Signal enum, one-pass strided classification
                  (exact frame digest + no-signal from 4k luma samples)
+                 + Settler: the published hash only moves when some pixel's
+                 luma differs from the last accepted frame by more than
+                 --change-threshold (default 16, 0 = exact); compares run
+                 only when the exact digest changes
     pixel.rs     PixelData (Rgb/Nv12/Empty) + NV12/YUYV -> RGB converters;
                  compact_nv12() re-packs a strided (row-padded) NV12 buffer
                  into tight Y/CbCr planes — needed by the Windows backend,
@@ -1008,6 +1025,26 @@ jetkvm/          Go module (the one non-Rust helper besides zigplug): hid helper
                  the background (the next command reconnects); only a plain
                  drop is retried, with 1-30 s backoff. HID RPCs succeed even
                  when the target's USB is down, so `ok` is not delivery (`info`).
+                 **Video (milestone 2)**: the daemon adds a receive-only H.264
+                 track to its ONE session (video.go: RTP -> Annex-B -> an
+                 `ffmpeg` subprocess, `serve --ffmpeg PATH`, else PATH, else
+                 Homebrew/usr paths; ffmpeg is a runtime requirement for
+                 JetKVM video only, HID works without it) and serves RFB 3.8
+                 over WebSocket at the token-authenticated `GET /rfb`
+                 (rfb.go; subprotocol `binary` accepted, so noVNC works;
+                 security None; Raw full frames; DesktopSize; input messages
+                 ignored, input goes through the hid path). Decoding runs only
+                 while an /rfb client is attached. `/status` and `info` gain a
+                 `video`/`stream` object. A lab video channel reaches it with
+                 `device = "rfb+hid:"` (the RFB feed of this target's own hid
+                 daemon; needs a hid channel on the same host, validated, and
+                 `hid rm` is refused while used; `video watch`/`console`/
+                 `daemons restart` start the hid daemon first, then hdmicap
+                 with `rfb+discovery:`). cli/ knows only that a hid channel
+                 can host a feed. H.264 decode noise (measured: up to 8 luma
+                 levels on an unchanged screen) is absorbed by hdmicap's
+                 change threshold (frame.rs `Settler`, default 16), so the
+                 frame hash and `changed_since` stay put on it.
                  Tests run a fake JetKVM (httptest + a pion answerer) end to end.
                  CI: its own `jetkvm` job (gofmt, vet, `go test -race`) and
                  `go_job` in scripts/ci-local.sh; `ci-coverage-check.sh` checks
@@ -1503,7 +1540,9 @@ every `HELPERS` binary landed in the installed `.deb`.
 
 ## Platform support
 
-Paniolo runs on three host platforms:
+Paniolo runs on three host platforms. (Network RFB video sources are
+platform-independent Rust and build and test on all three in CI; the
+JetKVM-through-RFB path was hardware-verified from a macOS control host only.)
 
 | Platform | Status | CI | Release artifacts |
 | --- | --- | --- | --- |

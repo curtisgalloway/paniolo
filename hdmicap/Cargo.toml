@@ -42,6 +42,8 @@ bytes = "1"
 
 # --- daemon auth: OS entropy for the per-start bearer token (src/auth.rs) ---
 getrandom = "0.2"
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
+futures-util = { version = "0.3", default-features = false, features = ["alloc", "sink"] }
 
 # Linux capture: the v4l crate directly, so we can call stream.set_timeout()
 # and avoid an indefinite VIDIOC_DQBUF block, plus keep the raw MJPEG tee.

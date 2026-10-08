@@ -22,7 +22,7 @@ bench-host run and by CI's new smoke step.
 - ci workflow: `.github/workflows/ci.yml`; lint helpers `scripts/ci-actions-pinned.sh`, `scripts/ci-coverage-check.sh`
 - bump rules: conventional prefixes where present; this repo mostly writes `<crate>: <summary>`, so apply AGENTS.md: minor for a new command, channel, helper, verb, wire-protocol or daemon-lifecycle change, or a fix that changes what a target sees; patch for small fixes and docs; on the line, take the minor
 - releaser identity: tag with the author's GitHub noreply form already in the history (`git log --format=%ae | sort -u`), passed as `-c user.email` on the tag command, never edited into config
-- helpers: `hdmicap serialcap netbootd cambrionix hidrig ch9329 shellyplug amt` (the `HELPERS` line in the release workflow, and `CRATES` in `Makefile` minus the library crates, must agree; `scripts/ci-coverage-check.sh` enforces it). The Go helper `jetkvm` is deliberately NOT in that list yet: release packaging for it is milestone 1b, and the coverage script carries the written exemption. Until then it reaches users only through the source channel (`paniolo setup` with Go installed)
+- helpers: `hdmicap serialcap netbootd cambrionix hidrig ch9329 shellyplug amt` (the `HELPERS` line in the release workflow, and `CRATES` in `Makefile` minus the library crates, must agree; `scripts/ci-coverage-check.sh` enforces it). The Go helper `jetkvm` is deliberately NOT in that list yet: release packaging for it is milestone 1b, and the coverage script carries the written exemption. Until then it reaches users only through the source channel (`paniolo setup` with Go installed). Its video path needs `ffmpeg` at runtime (JetKVM video only; HID does not), and `hdmicap` gained the `tokio-tungstenite` and `futures-util` dependencies for its RFB client, so a channel smoke that builds `hdmicap` offline needs them vendored or fetchable
 - library crates: `secret` (no binary; in `Makefile` `CRATES` and CI, never in `HELPERS`; it ships compiled into `amt`, so no channel stages it and the smoke contract has nothing to check for it)
 - bundled skills: `skills/paniolo`, `skills/kvm-puppeting`, `skills/control-host` (shipped to `share/paniolo/skills` in every channel)
 - log dir: `logs/release-train/<run>/` (gitignored, persistent)
@@ -174,5 +174,5 @@ feeds needs re-reading before `--update` re-pins it.
 | `cli/src/daemons.rs` | f86e565cab42 | Smoke contract S3 |
 | `scripts/ci-coverage-check.sh` | 84a938b2dbf0 | Project: helpers |
 | `scripts/sync-brik.sh` | b8b5a15775a9 | Channels: windows |
-| `README.md` | 2402008706e1 | Channels: source; Publish: re-verify apt |
-| `AGENTS.md` | e65813e646e8 | Project: bump rules, tag format; Publish |
+| `README.md` | 0ee53d4a0269 | Channels: source; Publish: re-verify apt |
+| `AGENTS.md` | 1d7f7a7e8e6d | Project: bump rules, tag format; Publish |

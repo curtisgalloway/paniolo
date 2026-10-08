@@ -824,7 +824,11 @@ enum VideoCmd {
     Set {
         #[arg(long, short)]
         target: String,
-        /// Capture device: an hdmicap device name substring, index, or /dev path.
+        /// Capture device: an hdmicap device name substring, index, or /dev path;
+        /// or a network RFB source: `rfb+hid:` (the RFB feed of this target's
+        /// own hid daemon, e.g. a network KVM; needs a hid channel on the same
+        /// host, set first) or `rfb://HOST:PORT` (plain RFB over TCP, no
+        /// authentication).
         #[arg(long, short)]
         device: String,
         /// OCR engine selection: "gui" picks the GUI-tuned engine (only
@@ -832,6 +836,15 @@ enum VideoCmd {
         /// platform default. Leave unset for the default on every platform.
         #[arg(long, value_parser = model::VALID_OCR_MODES)]
         ocr_mode: Option<String>,
+        /// Frame-change sensitivity, 0-255: how far any single pixel's luma
+        /// must move from the last accepted frame before the frame hash
+        /// changes (`video shot --changed-since`, `--stable`). Smaller moves
+        /// are capture noise. Default 16 when unset; 0 = exact (any differing
+        /// pixel counts). A lossy H.264 source (network KVM) was measured at
+        /// noise of at most 8 levels on an unchanged screen. Takes effect when
+        /// the daemon next starts (`video watch --restart`).
+        #[arg(long, value_parser = clap::value_parser!(u8))]
+        change_threshold: Option<u8>,
         #[arg(long)]
         host: Option<String>,
     },
@@ -1050,7 +1063,11 @@ fn escape_control_chars(s: &str) -> String {
 /// injector may serve (the mapping `cmd_helper` applies, in reverse).
 fn daemon_process_needles(name: &str) -> Vec<String> {
     match name {
-        HID_DAEMON => vec!["hidrig".to_string(), "ch9329".to_string()],
+        HID_DAEMON => vec![
+            "hidrig".to_string(),
+            "ch9329".to_string(),
+            "jetkvm".to_string(),
+        ],
         n => vec![n.to_string()],
     }
 }
@@ -1468,7 +1485,7 @@ fn restart_capture_daemon(lab: &Lab, name: &str, target: &str) -> Result<String>
         Serial(Vec<model::SerialChannel>),
         // Device plus the channel's OCR mode: the daemon is handed its OCR
         // helper at spawn, so the mode has to travel with the device.
-        Video(String, Option<String>),
+        Video(String, Option<String>, Option<u8>),
     }
     let start = if name == serial::DAEMON {
         let serials = local_serials(lab, target)?;
@@ -1490,16 +1507,21 @@ fn restart_capture_daemon(lab: &Lab, name: &str, target: &str) -> Result<String>
                 format!("video channel for '{target}' has no device set"),
             )
         })?;
-        Start::Video(device, v.ocr_mode.clone())
+        Start::Video(device, v.ocr_mode.clone(), v.change_threshold)
     } else {
         bail!("'{name}' is not a restartable capture daemon");
     };
 
     let replaced = stop_capture_daemon_and_wait(name, target)?;
 
+    if let Start::Video(device, _, _) = &start {
+        ensure_video_source(lab, target, device)?;
+    }
     let mut child = match start {
         Start::Serial(serials) => serial::start_daemon(&serials, 0, target)?,
-        Start::Video(device, mode) => video::start_daemon(&device, 0, target, mode.as_deref())?,
+        Start::Video(device, mode, threshold) => {
+            video::start_daemon(&device, 0, target, mode.as_deref(), threshold)?
+        }
     };
     wait_for_started_daemon(name, Some(target), replaced, Some(&mut child))
 }
@@ -1572,7 +1594,7 @@ fn cmd_helper(name: Option<&str>, args: &[String]) -> Result<()> {
     // whose discovery name is the channel (any conforming helper may serve
     // it): hidrig publishes under "hid".
     let env_name = match name {
-        "hidrig" | "ch9329" => HID_DAEMON.to_string(),
+        "hidrig" | "ch9329" | "jetkvm" => HID_DAEMON.to_string(),
         // Sanitized like every other name that becomes a path component
         // (Review low #10): `name` is a typed CLI argument, and with no
         // `instance` this host-singleton branch is the one place nothing
@@ -2714,8 +2736,15 @@ fn cmd_console(
                 format!("video channel for '{target}' has no device set"),
             )
         })?;
+        ensure_video_source(&lab, &target, &device)?;
         eprintln!("Starting video daemon…");
-        let mut child = video::start_daemon(&device, 0, &target, v.ocr_mode.as_deref())?;
+        let mut child = video::start_daemon(
+            &device,
+            0,
+            &target,
+            v.ocr_mode.as_deref(),
+            v.change_threshold,
+        )?;
         daemons::wait_for_daemon(
             video::DAEMON,
             Some(&target),
@@ -3595,10 +3624,17 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
             target,
             device,
             ocr_mode,
+            change_threshold,
             host,
         } => {
             edit_lab(lab_flag, |lf| {
-                lf.set_video(&target, Some(&device), ocr_mode.as_deref(), host.as_deref())
+                lf.set_video(
+                    &target,
+                    Some(&device),
+                    ocr_mode.as_deref(),
+                    change_threshold,
+                    host.as_deref(),
+                )
             })?;
             println!("video channel set for '{target}'.");
             Ok(())
@@ -3654,8 +3690,17 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
             else if let Some(orphan) = video::untracked(&device) {
                 reap_untracked(&orphan)?;
             }
+            if model::is_network_device(&device) {
+                ensure_video_source(&load_for_read(lab_flag)?, &target, &device)?;
+            }
             eprintln!("Starting video daemon for '{target}' ('{device}')…");
-            let mut child = video::start_daemon(&device, port, &target, v.ocr_mode.as_deref())?;
+            let mut child = video::start_daemon(
+                &device,
+                port,
+                &target,
+                v.ocr_mode.as_deref(),
+                v.change_threshold,
+            )?;
             let url =
                 wait_for_started_daemon(video::DAEMON, Some(&target), replaced, Some(&mut child))?;
             // Token-free, like every other line paniolo prints: the openable
@@ -3820,6 +3865,10 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
         VideoCmd::Show { target } => {
             let (target, v) = video_runtime(lab_flag, target.name())?;
             println!("device\t{}", v.device.as_deref().unwrap_or("(not set)"));
+            match v.change_threshold {
+                Some(n) => println!("change_threshold\t{n}"),
+                None => println!("change_threshold\t(default)"),
+            }
             match video::daemon_url(&target) {
                 Some(url) => {
                     println!(
@@ -4442,6 +4491,27 @@ fn ensure_hid_daemon_local(lab: &Lab, target: &str) -> Result<Option<daemons::En
                 )
             })?,
     ))
+}
+
+/// Before starting hdmicap for `device`, bring up whatever feeds it. For
+/// `rfb+hid:` that is the target's own hid daemon, started exactly as
+/// `console` starts it; every other device needs nothing.
+fn ensure_video_source(lab: &Lab, target: &str, device: &str) -> Result<()> {
+    if device != model::RFB_HID_DEVICE {
+        return Ok(());
+    }
+    match ensure_hid_daemon_local(lab, target)? {
+        Some(_) => Ok(()),
+        None => Err(error::channel_missing(
+            target,
+            "hid",
+            format!(
+                "video device '{device}' reads the hid daemon's RFB feed, but '{target}' has \
+                 no hid channel on this host"
+            ),
+        )
+        .into()),
+    }
 }
 
 fn cmd_hid_serve(lab_flag: Option<&str>, target: Option<&str>) -> Result<()> {
@@ -5385,7 +5455,10 @@ mod tests {
     #[test]
     fn daemon_process_needles_cover_the_hid_injectors() {
         assert_eq!(daemon_process_needles("serialcap"), vec!["serialcap"]);
-        assert_eq!(daemon_process_needles(HID_DAEMON), vec!["hidrig", "ch9329"]);
+        assert_eq!(
+            daemon_process_needles(HID_DAEMON),
+            vec!["hidrig", "ch9329", "jetkvm"]
+        );
     }
 
     /// `netboot logs --follow` must notice a daemon restart and reopen
@@ -5467,6 +5540,35 @@ mod tests {
             &["definitely-not-this".to_string(), exe_name]
         ));
         assert!(!pid_runs_one_of(me, &["netbootd".to_string()]));
+    }
+
+    /// `daemons stop 'hid[t]'` refused a live jetkvm daemon ("no longer
+    /// running hidrig/ch9329") because the hid needles named only the two
+    /// older helpers. Run a real process whose command line names `jetkvm`
+    /// and check the gate lets the signal through. A shell script, run as
+    /// `sh <dir>/jetkvm`, rather than a renamed copy of `sleep`: on hosts
+    /// where `sleep` is a multi-call coreutils binary it dispatches on its
+    /// own name, so a copy called `jetkvm` exits at once (CI, Linux).
+    #[cfg(unix)]
+    #[test]
+    fn hid_needles_match_a_running_jetkvm() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("jetkvm");
+        std::fs::write(&fake, "while :; do sleep 1; done\n").unwrap();
+        let mut child = std::process::Command::new("sh").arg(&fake).spawn().unwrap();
+        let pid = child.id() as i32;
+        let needles = daemon_process_needles(HID_DAEMON);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut ok = false;
+        while !ok && std::time::Instant::now() < deadline {
+            ok = pid_runs_one_of(pid, &needles);
+            if !ok {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        child.kill().unwrap();
+        let _ = child.wait();
+        assert!(ok, "a running jetkvm must pass the hid identity check");
     }
 
     // Regression (#203): the config verbs took `-t/--target` and the runtime
@@ -5684,6 +5786,30 @@ mod tests {
                 "{pos:?} must not take the target positionally"
             );
             assert!(parse(&verb).is_err(), "{verb:?} must require --target");
+        }
+    }
+
+    /// `video set --change-threshold` takes a byte: 0 and 255 parse, 256 and
+    /// a negative number are refused by clap before any lab edit happens.
+    #[test]
+    fn video_set_change_threshold_must_fit_a_byte() {
+        fn argv(n: &str) -> Vec<&str> {
+            vec![
+                "video",
+                "set",
+                "-t",
+                "t",
+                "-d",
+                "x",
+                "--change-threshold",
+                n,
+            ]
+        }
+        for ok in ["0", "16", "255"] {
+            assert!(parse(&argv(ok)).is_ok(), "{ok} should parse");
+        }
+        for bad in ["256", "-1", "abc"] {
+            assert!(parse(&argv(bad)).is_err(), "{bad} should be refused");
         }
     }
 }
