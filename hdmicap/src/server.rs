@@ -132,10 +132,15 @@ async fn fresh_frame(rx: &mut FrameRx, demand: &Demand) {
     let _ = tokio::time::timeout(FRESH_WAIT, rx.changed()).await;
 }
 
-/// Paths served without the daemon token: the vendored xterm.js library files
-/// the dashboard page loads by bare `<script>`/`<link>` path. They are public
-/// code, not data, and a bare asset tag cannot carry a header.
-pub const PUBLIC_ASSETS: &[&str] = &["/xterm.js", "/xterm.css", "/xterm-addon-fit.js"];
+/// Paths served without the daemon token: the vendored xterm.js and noVNC
+/// library files the dashboard page loads by bare `<script>`/`<link>` path.
+/// They are public code, not data, and a bare asset tag cannot carry a header.
+pub const PUBLIC_ASSETS: &[&str] = &[
+    "/xterm.js",
+    "/xterm.css",
+    "/xterm-addon-fit.js",
+    "/novnc.js",
+];
 
 pub fn router(state: AppState, auth: crate::auth::Auth) -> Router {
     Router::new()
@@ -155,6 +160,8 @@ pub fn router(state: AppState, auth: crate::auth::Auth) -> Router {
         .route("/xterm.js", get(xterm_js))
         .route("/xterm.css", get(xterm_css))
         .route("/xterm-addon-fit.js", get(xterm_fit_js))
+        // Vendored noVNC (one bundled ES module) for the video pane.
+        .route("/novnc.js", get(novnc_js))
         .layer(middleware::from_fn_with_state(auth, crate::auth::require))
         .with_state(state)
 }
@@ -206,6 +213,13 @@ async fn xterm_fit_js() -> impl IntoResponse {
             "application/javascript; charset=utf-8",
         )],
         include_str!("../assets/xterm-addon-fit.js"),
+    )
+}
+
+async fn novnc_js() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../assets/novnc.js"),
     )
 }
 
@@ -1920,5 +1934,43 @@ mod tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["change_threshold"], 16);
+    }
+
+    /// The vendored noVNC bundle is public code: served without a token, as
+    /// JavaScript, so the dashboard's `<script type="module">` can import it.
+    #[tokio::test]
+    async fn novnc_bundle_is_a_public_javascript_asset() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let (_tx, rx) = watch::channel(Arc::new(FrameState::no_device()));
+        let app = router(
+            AppState::new(rx),
+            crate::auth::Auth::new("tok".into(), PUBLIC_ASSETS),
+        );
+        let req = HttpRequest::builder()
+            .uri("/novnc.js")
+            .header(header::HOST, "127.0.0.1:1")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ctype = resp.headers()[header::CONTENT_TYPE].to_str().unwrap();
+        assert!(ctype.starts_with("text/javascript"), "{ctype}");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.len() > 100_000, "bundle looks truncated");
+    }
+
+    /// Cheap guard that the dashboard still wires up the noVNC video pane:
+    /// it must import the vendored bundle and dial the `/rfb` endpoint.
+    #[test]
+    fn dashboard_references_novnc_and_rfb() {
+        let html = include_str!("../assets/index.html");
+        assert!(html.contains("/novnc.js"));
+        assert!(html.contains("/rfb"));
+        assert!(html.contains("paniolo-video-mode"));
     }
 }
