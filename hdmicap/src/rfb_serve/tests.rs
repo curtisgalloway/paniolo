@@ -159,7 +159,9 @@ async fn within<T>(f: impl std::future::Future<Output = T>) -> T {
 }
 
 impl Client {
-    async fn connect(port: u16, token: Option<&str>) -> Result<Client, tungstenite::Error> {
+    // Boxed: tungstenite::Error is large enough that clippy's result_large_err
+    // fires on CI's newer toolchain. `?` boxes it via From<T> for Box<T>.
+    async fn connect(port: u16, token: Option<&str>) -> Result<Client, Box<tungstenite::Error>> {
         let q = token.map(|t| format!("?token={t}")).unwrap_or_default();
         let mut req = format!("ws://127.0.0.1:{port}/rfb{q}").into_client_request()?;
         req.headers_mut()
@@ -394,11 +396,11 @@ async fn a_text_frame_is_refused() {
 #[tokio::test]
 async fn the_endpoint_needs_the_daemon_token() {
     let h = harness(64, 64, &pattern(64, 64), None).await;
-    match Client::connect(h.port, None).await {
+    match Client::connect(h.port, None).await.map_err(|e| *e) {
         Err(tungstenite::Error::Http(resp)) => assert_eq!(resp.status(), 401),
         other => panic!("expected 401, got {:?}", other.map(|_| ())),
     }
-    match Client::connect(h.port, Some("wrong")).await {
+    match Client::connect(h.port, Some("wrong")).await.map_err(|e| *e) {
         Err(tungstenite::Error::Http(resp)) => assert_eq!(resp.status(), 401),
         other => panic!("expected 401, got {:?}", other.map(|_| ())),
     }
@@ -645,7 +647,7 @@ async fn clients_are_capped_and_counted() {
         held.push(c);
     }
     assert_eq!(h.status().await["rfb_clients"], MAX_CLIENTS);
-    match Client::connect(h.port, Some(TOKEN)).await {
+    match Client::connect(h.port, Some(TOKEN)).await.map_err(|e| *e) {
         Err(tungstenite::Error::Http(resp)) => assert_eq!(resp.status(), 503),
         other => panic!("expected 503, got {:?}", other.map(|_| ())),
     }
