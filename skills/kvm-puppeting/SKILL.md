@@ -79,7 +79,7 @@ all).
 
    ```sh
    paniolo video watch <target>      # start the HDMI capture daemon
-   paniolo hid serve   <target>      # warm the hid daemon (idempotent)
+   paniolo hid serve   <target>      # warm the hid daemon (idempotent; video watch also starts it)
    paniolo hid send -t <target> ping # confirm the injector answers
    ```
 
@@ -135,8 +135,9 @@ Rules that keep the loop honest:
 ## Warm the daemon for multi-step work
 
 Each bare `paniolo hid send` is a fresh process. With the **hid daemon** running
-(`paniolo hid serve <target>`, or `paniolo console <target>`, which auto-starts
-it), every injection flows through one long-lived connection that owns the
+(`paniolo hid serve <target>`, or `paniolo video watch`/`paniolo console <target>`, which
+start it for any target with a `hid` channel; the browser's noVNC view types through the
+same daemon), every injection flows through one long-lived connection that owns the
 injector. This matters because the daemon is what makes **held state survive
 across commands**:
 

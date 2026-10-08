@@ -123,12 +123,32 @@ JetKVM firmware 0.5.9 in front of an x86 board, macOS control host:
 Not verified: a Windows control host (CI covers build and test), a Linux
 control host, `rfb://` against AMT or a VM, and recovery from packet loss.
 
-## Egress (live view), not built
+## Egress (live view): built
 
-Direction: **noVNC** as the browser client. It already speaks RFB over
-WebSocket with the `binary` subprotocol, which the `/rfb` route accepts, and it
-would let video and serial share one page (as noted in the vm-targets
-postscript).
+**noVNC** is the browser client, and it is built (2026-10). Decisions:
+
+- **All targets, served by hdmicap.** hdmicap serves its warm frame as RFB at
+  `GET /rfb` (WebSocket, token auth, subprotocol `binary`) for every video
+  source, USB capture included, not only the JetKVM's own `/rfb`. One viewer
+  path, one place for tokens.
+- **Input is server-side and native.** noVNC key and pointer events are mapped
+  to the hid vocabulary in hdmicap (`keysym.rs`) and sent to the target's hid
+  daemon over its `/hid` WebSocket (`hid_link.rs`, found through
+  `HDMICAP_HID_DISCOVERY`). No hid channel means a watch-only view.
+- **It replaces the MJPEG pane**, which stays behind a video VNC | MJPEG toggle
+  and as the automatic fallback when `/rfb` cannot connect. The Capture-input
+  overlay exists only in MJPEG mode.
+- **Lossless ZRLE** (one zlib stream per connection) over changed 64x64 tiles,
+  with Raw as the fallback. No lossy encoding, so what the viewer sees is what
+  OCR and `shot` see.
+
+Measured: a synthetic mostly-text 1920x1080 frame is 81,417 bytes as ZRLE against
+8,294,400 bytes Raw, about 100 times smaller. Hardware-verified on a JetKVM
+target from a macOS control host in Chrome: connect, scaled render, click to
+position the remote cursor, typing including capitals and a shifted `!`, the
+MJPEG toggle both ways, and reconnect on reload. Not verified: a USB-capture
+target, a remote control host through the `console` tunnel, Windows or Linux
+browsers, and the scroll wheel on hardware.
 
 **H.264 egress** (stream the encoded video to a browser) is kept as a later
 option, with this reference cost: Raspberry Pi's published tests put

@@ -1,6 +1,6 @@
 # Combined dashboard
 
-One web page to watch and drive a target: HDMI video on top, a serial
+One web page to watch and drive a target: live video on top, a serial
 terminal below. hdmicap (video daemon) serves the page; the terminal connects
 to serialcap (serial daemon) over WebSocket.
 
@@ -33,7 +33,39 @@ paniolo console -i bmc
 
 ## Features
 
-**Live video:** MJPEG from the capture card.
+**Live video (noVNC):** the video pane is a vendored
+[noVNC](https://github.com/novnc/noVNC) viewer on hdmicap's `GET /rfb`, so it
+works for every video source, a USB capture device or a network one. Only the
+screen tiles that changed are sent (lossless ZRLE; a mostly-text 1080p frame
+measured 81,417 bytes against 8,294,400 raw), and the view scales to the pane.
+A **video: VNC | MJPEG** toggle switches to the older MJPEG stream (the choice
+is remembered in `localStorage` under `paniolo-video-mode`). If `/rfb` cannot
+connect, for instance to a daemon from an older paniolo, the page falls back to
+MJPEG on its own.
+
+**Typing and pointing in the VNC view:** click into the video and type. When
+the target has a `hid` channel on the control host, key and pointer events go to
+the target's hid daemon, intermixed with CLI `paniolo hid send` input. Details:
+
+- Keys: printable ASCII, editing and navigation keys, F1 to F12, modifiers
+  (Meta maps to Alt, AltGr to Right Alt), and the keypad (mapped to the
+  main-block keys). F13 to F24 and keysyms outside that set are dropped, since
+  the hid vocabulary has no F13 and up.
+- The pointer is absolute (scaled to 0..32767); the wheel scrolls. Held keys
+  and buttons are released when the page disconnects.
+- With no `hid` channel the view is watch-only.
+- `video watch`, `console` and `daemons restart` start the target's local hid
+  daemon for every video device, not just `rfb+hid:`. On a USB-capture target
+  with a `hid` channel, starting video therefore also starts the hid daemon,
+  which then owns the injector. If the hid daemon fails to start, the view
+  stays watch-only and the command prints a note; only `rfb+hid:` treats that
+  as an error.
+- `GET /status` reports `rfb_clients` and `rfb_input` (up to 8 viewers at once).
+
+**`/rfb` is not a general VNC server.** It is a WebSocket endpoint (RFB 3.8,
+3.7 and 3.3, security None, subprotocol `binary`) that needs hdmicap's token, as
+`Authorization: Bearer` or `?token=`. There is no plain TCP RFB listener, so a
+desktop VNC client cannot connect; use noVNC-style clients.
 
 **Serial terminal:** xterm.js, vendored, so it works on an isolated lab
 network. The `?interface=<name>` URL parameter (or `console -i <name>`) pins
@@ -46,7 +78,8 @@ right-panel (380 px) layouts; saved in `localStorage`.
 (`visionocr` on macOS, `linuxocr` on Linux). Needs the OCR helper
 (`paniolo setup`).
 
-**Capture input (KVM):** with a `hid` channel, **⌨ Capture input** sends your
+**Capture input (KVM, MJPEG mode only):** in the MJPEG view, with a `hid`
+channel, **⌨ Capture input** sends your
 keyboard and absolute mouse to the target; it reads **⌨ Capturing** while
 active. Click again or leave the window to release. Your cursor stays visible
 (no pointer lock), and CLI `paniolo hid send` input intermixes. See
@@ -74,6 +107,16 @@ acts. Loading the page never powers the target (`GET /power` only reads).
 (`127.0.0.1`, `localhost` or `[::1]`); the page refuses anything else. It also
 refuses to render in a frame (`Content-Security-Policy:
 frame-ancestors 'none'`).
+
+---
+
+## Third-party code
+
+The page vendors xterm.js and noVNC v1.7.0 so it works on an isolated network.
+noVNC is one esbuild bundle (`hdmicap/assets/novnc.js`) under MPL-2.0, with its
+pako dependency under MIT; both notices are in
+`hdmicap/assets/novnc-LICENSE.txt`. `scripts/vendor-novnc.sh` rebuilds it
+reproducibly from a pinned, checksummed release.
 
 ---
 

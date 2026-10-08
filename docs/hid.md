@@ -196,7 +196,9 @@ hidrig -d /dev/cu.usbmodemXXXX run - < boot-sequence.txt   # via stdin
 
 ## KVM mode: type and click from the web console
 
-With a `hid` channel, `paniolo console` turns the dashboard into a KVM:
+With a `hid` channel, `paniolo console` turns the dashboard into a KVM. In the
+default noVNC view, click into the video and type; there is no capture button
+(see [Dashboard](dashboard.md)). In the MJPEG view:
 
 1. Click **⌨ Capture input** in the video overlay. It becomes **⌨ Capturing**.
 2. Your keyboard and mouse drive the target. The mouse is **absolute**: the

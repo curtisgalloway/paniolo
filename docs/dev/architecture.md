@@ -310,7 +310,7 @@ host's `adb` and routed like every other channel. For reboot/power, wire `adb re
 power hooks.
 
 ### Dashboard ([`dashboard.md`](../dashboard.md))
-`paniolo console` opens hdmicap's `GET /`: live video on top, xterm.js terminal(s) below (§7).
+`paniolo console` opens hdmicap's `GET /`: live video (a noVNC view of hdmicap's `GET /rfb`, with MJPEG as a toggle and fallback) on top, xterm.js terminal(s) below (§7).
 
 ### Distributed control ([`distributed-control.md`](../distributed-control.md))
 Drives targets on **remote control hosts** over SSH only, with no coordinator daemon.
@@ -349,7 +349,14 @@ hdmicap **serves the page** but references serialcap **only by URL**:
   only when the page is opened by hand.
 - The page fetches serialcap's `/interfaces` and builds one xterm.js terminal per interface.
 
-No daemon learns another's token. xterm.js is **vendored**, so the dashboard works on an
+The video pane is noVNC dialing hdmicap's own `GET /rfb`. hdmicap diffs the warm frame into
+changed 64x64 tiles and sends them as ZRLE; key and pointer events come back over the same
+socket and hdmicap forwards them to the target's hid daemon (`/hid`), found through the
+`HDMICAP_HID_DISCOVERY` discovery file the CLI sets when the target has a local `hid` channel.
+That is the one place hdmicap holds another daemon's token, read from the file, never the
+environment or a URL.
+
+No daemon learns another's token through the browser. xterm.js and noVNC are **vendored**, so the dashboard works on an
 isolated network. Power controls appear only when hdmicap was started with a target; their
 probe (`GET /power`) performs no power action.
 

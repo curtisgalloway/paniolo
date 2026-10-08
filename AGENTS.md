@@ -328,7 +328,7 @@ Current capabilities:
 - Serial console — interactive (tio) or daemon-backed for the web dashboard (`paniolo serial`);
   one daemon **per target** owns that target's several named interfaces, each with a
   timestamped rolling capture log queryable by line range (`paniolo serial log -i <name>`)
-- Combined video+serial web dashboard (hdmicap's `GET /`: video on top, xterm.js terminal below)
+- Combined video+serial web dashboard (hdmicap's `GET /`: a noVNC view of hdmicap's own `GET /rfb` on top, with keyboard/mouse through the hid daemon, and an xterm.js terminal below)
 - Network video sources via RFB (`paniolo video set --device rfb+hid:` for a JetKVM, or `rfb://HOST:PORT`): hdmicap is the RFB client; the first consumer is the JetKVM, whose daemon decodes H.264 with `ffmpeg` and serves RFB (docs/video.md, notes/network-video-rfb.md)
 - On-device OCR of the captured screen (`paniolo video read [target] [--stable]`, which wraps hdmicap's `GET /ocr`; also the dashboard OCR button): Apple Vision on macOS, Tesseract on Linux
 - USB HID input (keyboard/mouse injection) via a generic helper hook (`paniolo hid send`); the `hidrig` helper drives the dual-board KB2040 injector — it composes HID reports in Rust and writes binary frames to the control board's USB-CDC endpoint, which relays them over I2C1 to the target board (the "dumb pipe", docs/dev/hid-dual-board-design.md; command vocabulary in docs/dev/hid-serial-protocol.md). `hidrig serve` runs a daemon that owns the control link and re-exposes the command vocabulary over a WebSocket, so `paniolo console` works as a **KVM** — stream the browser's keyboard + absolute mouse (`moveabs`) to the target, intermixed with CLI injection on the one wire. The same control board can also **bridge the DUT serial console** (its hardware UART, re-exported by the daemon as a PTY into the `serial` channel) and **switch DUT power** via a relay (`hidrig power off|on|cycle`), so one USB device backs the target's HID, console, and power (design §6–§7; the relay/power path is hardware-verified, incl. NVM state persistence across a control-board reset — the console bridge is not yet)
@@ -605,6 +605,24 @@ hdmicap/         Rust crate: warm-stream HDMI capture daemon
                  frame in between. If the flag is still set a full watchdog poll
                  later (backend.frame() itself never returned to let the main
                  thread see it), that IS the wedged case and it still exits
+    rfb_serve.rs RFB server at `GET /rfb` for every video source: WebSocket
+                 (subprotocol `binary`, token via header or `?token=`), RFB
+                 3.8/3.7/3.3, security None, at most MAX_CLIENTS (8) sessions.
+                 Sends only changed 64x64 tiles; ZRLE, Raw fallback,
+                 DesktopSize; honors 32bpp true-color SetPixelFormat. Key and
+                 pointer events go to hid_link.rs; held keys/buttons are
+                 released on disconnect. No plain TCP listener. Tests in
+                 rfb_serve/tests.rs
+    zrle.rs      ZRLE encoder (one zlib stream per connection, lossless)
+    keysym.rs    X11 keysym -> hid key name: printable ASCII, editing and
+                 navigation, F1-F12, modifiers (Meta -> Alt, AltGr -> RIGHT_ALT),
+                 keypad -> main-block keys; F13-F24 and unmapped keysyms are
+                 dropped (the hid vocabulary has no F13+)
+    hid_link.rs  client of the target's hid daemon `/hid` WebSocket, found via
+                 the discovery file named by env `HDMICAP_HID_DISCOVERY` (set
+                 by the CLI whenever the target has a local hid channel,
+                 whatever the video device); reconnects, re-reading port and
+                 token; absent = the noVNC view is watch-only
     rfb.rs       platform-independent RFB client capture backend for network
                  video sources (device strings `rfb://HOST:PORT` plain TCP,
                  security None only; `rfb+ws://127.0.0.1:PORT/rfb` with the
@@ -628,8 +646,10 @@ hdmicap/         Rust crate: warm-stream HDMI capture daemon
                  into tight Y/CbCr planes — needed by the Windows backend,
                  whose samples may pad rows past the visible width
     server.rs    axum HTTP API: GET / (dashboard; CSP frame-ancestors 'none'),
-                 /status, /snapshot, /preview, /ocr, /devices, POST /power-cycle,
-                 and /xterm.* static assets (the only token-exempt routes).
+                 /status (adds `rfb_clients`, `rfb_input`), /snapshot, /preview,
+                 /ocr, /devices, POST /power-cycle, GET /rfb (the RFB server,
+                 below), GET /novnc.js, and the /xterm.* and /novnc.js static
+                 assets (the only token-exempt routes; `PUBLIC_ASSETS`).
                  /snapshot matches the inner Result of `rx.changed()`, not just
                  the outer timeout — otherwise a dropped capture-thread Sender
                  makes it spin at 100% CPU until the deadline instead of
@@ -673,6 +693,9 @@ hdmicap/         Rust crate: warm-stream HDMI capture daemon
                  next daemon lock a fresh inode at the same path while this
                  process (and its lock on the old inode) is still alive
   assets/        index.html (combined dashboard) + vendored xterm.js/css/fit addon
+                 + novnc.js (noVNC v1.7.0 as one esbuild ESM bundle, MPL-2.0 plus
+                 pako MIT, notices in novnc-LICENSE.txt; rebuild reproducibly with
+                 scripts/vendor-novnc.sh, pinned sha512 and esbuild)
 
 cambrionix/      Rust crate: standalone helper binary for Cambrionix USB hub control
                  (control UART, 115200 8N1); wired into paniolo via generic power hooks.
@@ -1063,7 +1086,12 @@ browser, from `paniolo hid send`, from another script — flows through one
 `mpsc` queue in `uart.rs`, one in flight, request/reply; that single queue is
 what makes events intermix correctly. `paniolo console` starts the daemon when
 the target has a `hid` channel (local: `?hid=PORT`; remote: an SSH-tunnelled
-`?hidws=` URL). The **`⌨ Capture input`** overlay button toggles capture (no click-to-grab, no
+`?hidws=` URL). In the default noVNC view the browser's key and pointer events reach
+this daemon through hdmicap (`/rfb` -> hid_link.rs), not from the page; `video watch`,
+`console` and `daemons restart` start the local hid daemon for every video device (only
+`rfb+hid:` errors if it will not start), so on a USB-capture target with a hid channel
+starting video also makes the hid daemon own the injector. In MJPEG mode the
+**`⌨ Capture input`** overlay button toggles capture (no click-to-grab, no
 host-key release): engaged, the page streams `down`/`up`/`moveabs`/`scroll` to
 the daemon; click the button again to release. The mouse is absolute (the
 firmware's custom HID descriptor), so the cursor follows where you point in the
@@ -1085,8 +1113,10 @@ timer on open to keep those round trips prompt.
 
 ## Combined dashboard (video + serial)
 
-hdmicap's `GET /` serves a two-pane page: the MJPEG video on top, an xterm.js
-terminal below. The terminal opens a WebSocket to **serialcap** (a separate
+hdmicap's `GET /` serves a two-pane page: a noVNC view of `GET /rfb` on top (a
+**video VNC | MJPEG** toggle, stored in `localStorage` as `paniolo-video-mode`; MJPEG
+also the automatic fallback when `/rfb` cannot connect; the Capture-input overlay
+exists only in MJPEG mode), an xterm.js terminal below. The terminal opens a WebSocket to **serialcap** (a separate
 daemon/port), so the two subsystems stay decoupled — hdmicap only references
 serialcap by URL. Defaults to `ws://<host>:8724/stream`; override with
 `?serialws=<url>` (or `?serial=<port>`, which cannot carry a token). `paniolo
@@ -1094,7 +1124,7 @@ console` passes `?serialws=` — serialcap's `/stream` with serialcap's own
 `?token=` inside, percent-encoded — on both the local and the remote/tunnel
 path, plus hdmicap's token as `?token=`; the page refuses a non-loopback URL.
 serialcap sends serial bytes as binary
-frames and accepts keystrokes back over the same socket. xterm.js is vendored
+frames and accepts keystrokes back over the same socket. xterm.js and noVNC are vendored
 (not CDN) so the dashboard works on an isolated lab network. This is the first
 concrete instance of the "Option B" inter-subsystem coordination described above.
 

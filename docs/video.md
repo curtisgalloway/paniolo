@@ -268,6 +268,17 @@ no browser launches, it writes the URL to the same `0600` file `console` uses.
 `--open` is refused when the video channel is on another host. Use
 `paniolo console <target>`, which forwards ports and opens a local browser.
 
+`GET /rfb` serves the warm frame as RFB over a WebSocket (token required, as
+`Authorization: Bearer` or `?token=`; subprotocol `binary`; security None; up to
+8 clients) for **every** video source. It is what the [dashboard](dashboard.md)'s
+noVNC view connects to. Only changed 64x64 tiles are sent, as ZRLE (lossless)
+with a Raw fallback, plus DesktopSize. There is no plain TCP RFB listener, so
+only noVNC-style clients connect. Key and pointer events are forwarded to the
+target's hid daemon when `video watch`/`console` found a local `hid` channel
+(the `HDMICAP_HID_DISCOVERY` environment variable names its discovery file);
+otherwise the view is watch-only. `GET /status` shows `rfb_clients` and
+`rfb_input`.
+
 `GET /preview` is the MJPEG stream behind `paniolo video preview` and the
 [dashboard](dashboard.md):
 

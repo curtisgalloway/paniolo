@@ -192,6 +192,7 @@ pub fn start_daemon(
     target: &str,
     ocr_mode: Option<&str>,
     change_threshold: Option<u8>,
+    hid_input: Option<&std::path::Path>,
 ) -> Result<std::process::Child> {
     let binary = daemons::find_binary(DAEMON).ok_or_else(|| {
         crate::error::PanioloError::not_configured(
@@ -213,6 +214,7 @@ pub fn start_daemon(
         hid_discovery.as_deref(),
         ocr_helper(ocr_mode),
         change_threshold,
+        hid_input,
     );
     cmd.envs(daemons::helper_env(DAEMON, Some(target)));
     cmd.env("PANIOLO_TARGET", target);
@@ -239,6 +241,11 @@ pub fn hid_discovery_file(target: &str) -> Result<std::path::PathBuf> {
 /// a new token is found again. Neither the port nor the token ever appears on
 /// the command line (visible in `ps`) or in this process's output: the token
 /// stays in the owner-only file, and hdmicap reads it from there itself.
+///
+/// `hid_input` is the same kind of file for the browser view's keyboard and
+/// mouse: `HDMICAP_HID_DISCOVERY=<the target's hid daemon discovery file>`,
+/// set whenever the target has a hid channel on this host, whatever the video
+/// device is. Absent, the view is watch-only.
 fn daemon_command(
     binary: &std::path::Path,
     device: &str,
@@ -246,6 +253,7 @@ fn daemon_command(
     hid_discovery: Option<&std::path::Path>,
     ocr: Option<std::path::PathBuf>,
     change_threshold: Option<u8>,
+    hid_input: Option<&std::path::Path>,
 ) -> Command {
     let mut cmd = Command::new(binary);
     let device_arg = match (device == crate::model::RFB_HID_DEVICE, hid_discovery) {
@@ -255,6 +263,9 @@ fn daemon_command(
         }
         _ => device,
     };
+    if let Some(path) = hid_input {
+        cmd.env("HDMICAP_HID_DISCOVERY", path);
+    }
     cmd.arg("daemon")
         .arg("--device")
         .arg(device_arg)
@@ -324,6 +335,7 @@ mod tests {
             Some(file),
             None,
             None,
+            None,
         );
         assert_eq!(
             args_of(&cmd),
@@ -342,7 +354,7 @@ mod tests {
     #[test]
     fn change_threshold_is_passed_to_the_daemon_only_when_set() {
         let bin = std::path::Path::new("hdmicap");
-        let cmd = daemon_command(bin, "x", 0, None, None, Some(0));
+        let cmd = daemon_command(bin, "x", 0, None, None, Some(0), None);
         assert_eq!(
             args_of(&cmd),
             [
@@ -355,7 +367,7 @@ mod tests {
                 "0"
             ]
         );
-        let cmd = daemon_command(bin, "x", 0, None, None, None);
+        let cmd = daemon_command(bin, "x", 0, None, None, None, None);
         assert!(!args_of(&cmd).iter().any(|a| a == "--change-threshold"));
     }
 
@@ -364,9 +376,45 @@ mod tests {
     #[test]
     fn other_devices_are_passed_through_unchanged() {
         for dev in ["USB Video", "/dev/video0", "rfb://192.0.2.10:5900"] {
-            let cmd = daemon_command(std::path::Path::new("hdmicap"), dev, 7, None, None, None);
+            let cmd = daemon_command(
+                std::path::Path::new("hdmicap"),
+                dev,
+                7,
+                None,
+                None,
+                None,
+                None,
+            );
             assert_eq!(args_of(&cmd), ["daemon", "--device", dev, "--port", "7"]);
             assert_eq!(env_of(&cmd, "HDMICAP_RFB_DISCOVERY"), None);
+            assert_eq!(env_of(&cmd, "HDMICAP_HID_DISCOVERY"), None);
+        }
+    }
+
+    /// A target with a local hid channel hands hdmicap the hid daemon's
+    /// discovery file for the browser view's input, for a USB capture device
+    /// as much as a network one; the token is never in the environment.
+    #[test]
+    fn hid_input_is_passed_as_a_discovery_file_for_any_device() {
+        let file = std::path::Path::new("/run/example/hid/t/daemon.json");
+        for dev in ["USB Video", crate::model::RFB_HID_DEVICE] {
+            let cmd = daemon_command(
+                std::path::Path::new("hdmicap"),
+                dev,
+                0,
+                Some(file),
+                None,
+                None,
+                Some(file),
+            );
+            assert_eq!(
+                env_of(&cmd, "HDMICAP_HID_DISCOVERY").as_deref(),
+                Some("/run/example/hid/t/daemon.json"),
+                "{dev}"
+            );
+            assert!(!cmd
+                .get_envs()
+                .any(|(k, _)| k.to_string_lossy().contains("TOKEN")));
         }
     }
 
