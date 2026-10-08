@@ -452,13 +452,23 @@ impl LabFile {
         target: &str,
         device: Option<&str>,
         ocr_mode: Option<&str>,
+        change_threshold: Option<u8>,
         host: Option<&str>,
     ) -> Result<(), LabError> {
         self.set_singleton(
             target,
             "video",
             &[("device", device), ("ocr_mode", ocr_mode), ("host", host)],
-        )
+        )?;
+        if let Some(n) = change_threshold {
+            let c = self
+                .target_mut(target)?
+                .get_mut("video")
+                .and_then(|i| i.as_table_mut())
+                .ok_or_else(|| LabError(format!("target '{target}': video is not a table")))?;
+            c.insert("change_threshold", value(i64::from(n)));
+        }
+        Ok(())
     }
 
     pub fn remove_video(&mut self, target: &str) -> Result<(), LabError> {
@@ -845,7 +855,7 @@ mod tests {
         let (_d, path) = tmp();
         let mut lf = LabFile::create(&path);
         lf.add_target("t", None, None).unwrap();
-        lf.set_video("t", Some("/dev/video0"), Some("gui"), None)
+        lf.set_video("t", Some("/dev/video0"), Some("gui"), None, None)
             .unwrap();
         lf.save().unwrap();
         let v = model::load(&path).unwrap().targets["t"]
@@ -855,7 +865,8 @@ mod tests {
         assert_eq!(v.device.as_deref(), Some("/dev/video0"));
         assert_eq!(v.ocr_mode.as_deref(), Some("gui"));
         // Changing only the device leaves the mode alone.
-        lf.set_video("t", Some("/dev/video1"), None, None).unwrap();
+        lf.set_video("t", Some("/dev/video1"), None, None, None)
+            .unwrap();
         lf.save().unwrap();
         let v = model::load(&path).unwrap().targets["t"]
             .video
@@ -864,7 +875,7 @@ mod tests {
         assert_eq!(v.device.as_deref(), Some("/dev/video1"));
         assert_eq!(v.ocr_mode.as_deref(), Some("gui"));
         // An unknown mode is refused at save, like any other bad field.
-        lf.set_video("t", None, Some("fast"), None).unwrap();
+        lf.set_video("t", None, Some("fast"), None, None).unwrap();
         assert!(lf.save().unwrap_err().0.contains("invalid ocr_mode 'fast'"));
     }
 
@@ -954,7 +965,7 @@ mod tests {
         .unwrap();
         let mut lf = LabFile::load(&path).unwrap();
         let e = lf
-            .set_video("t", Some("/dev/video0"), None, None)
+            .set_video("t", Some("/dev/video0"), None, None, None)
             .unwrap_err();
         assert!(
             e.0.contains("`targets.t` is not a standard table"),
@@ -963,7 +974,7 @@ mod tests {
         );
         assert!(e.0.contains("[targets.t]"), "{}", e.0);
         // A sibling written the standard way is still editable.
-        lf.set_video("plain", Some("/dev/video0"), None, None)
+        lf.set_video("plain", Some("/dev/video0"), None, None, None)
             .unwrap();
         // And a whole inline `targets` is reported at that level.
         std::fs::write(&path, "targets = { t = { } }\n").unwrap();
@@ -1116,5 +1127,44 @@ mod tests {
         )
         .unwrap();
         lf.save().unwrap();
+    }
+
+    #[test]
+    fn set_video_round_trips_change_threshold_and_keeps_comments() {
+        let (_d, path) = tmp();
+        std::fs::write(
+            &path,
+            "# lab\n[targets.t]\n[targets.t.video]\n# the capture dongle\ndevice = \"/dev/video0\"\n",
+        )
+        .unwrap();
+        let mut lf = LabFile::load(&path).unwrap();
+        lf.set_video("t", None, None, Some(0), None).unwrap();
+        lf.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# the capture dongle"), "{text}");
+        assert!(text.contains("# lab"), "{text}");
+        assert!(text.contains("change_threshold = 0"), "{text}");
+        let v = model::load(&path).unwrap().targets["t"]
+            .video
+            .clone()
+            .unwrap();
+        assert_eq!(v.change_threshold, Some(0));
+        assert_eq!(v.device.as_deref(), Some("/dev/video0"));
+        // Leaving it out of a later edit keeps it.
+        lf.set_video("t", Some("/dev/video1"), None, None, None)
+            .unwrap();
+        lf.save().unwrap();
+        let v = model::load(&path).unwrap().targets["t"]
+            .video
+            .clone()
+            .unwrap();
+        assert_eq!(v.change_threshold, Some(0));
+        // A hand-written out-of-range value is refused on load.
+        std::fs::write(
+            &path,
+            "[targets.t]\n[targets.t.video]\nchange_threshold = 256\n",
+        )
+        .unwrap();
+        assert!(model::load(&path).is_err());
     }
 }

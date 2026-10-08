@@ -836,6 +836,15 @@ enum VideoCmd {
         /// platform default. Leave unset for the default on every platform.
         #[arg(long, value_parser = model::VALID_OCR_MODES)]
         ocr_mode: Option<String>,
+        /// Frame-change sensitivity, 0-255: how far any single pixel's luma
+        /// must move from the last accepted frame before the frame hash
+        /// changes (`video shot --changed-since`, `--stable`). Smaller moves
+        /// are capture noise. Default 16 when unset; 0 = exact (any differing
+        /// pixel counts). A lossy H.264 source (network KVM) was measured at
+        /// noise of at most 8 levels on an unchanged screen. Takes effect when
+        /// the daemon next starts (`video watch --restart`).
+        #[arg(long, value_parser = clap::value_parser!(u8))]
+        change_threshold: Option<u8>,
         #[arg(long)]
         host: Option<String>,
     },
@@ -1472,7 +1481,7 @@ fn restart_capture_daemon(lab: &Lab, name: &str, target: &str) -> Result<String>
         Serial(Vec<model::SerialChannel>),
         // Device plus the channel's OCR mode: the daemon is handed its OCR
         // helper at spawn, so the mode has to travel with the device.
-        Video(String, Option<String>),
+        Video(String, Option<String>, Option<u8>),
     }
     let start = if name == serial::DAEMON {
         let serials = local_serials(lab, target)?;
@@ -1494,19 +1503,21 @@ fn restart_capture_daemon(lab: &Lab, name: &str, target: &str) -> Result<String>
                 format!("video channel for '{target}' has no device set"),
             )
         })?;
-        Start::Video(device, v.ocr_mode.clone())
+        Start::Video(device, v.ocr_mode.clone(), v.change_threshold)
     } else {
         bail!("'{name}' is not a restartable capture daemon");
     };
 
     let replaced = stop_capture_daemon_and_wait(name, target)?;
 
-    if let Start::Video(device, _) = &start {
+    if let Start::Video(device, _, _) = &start {
         ensure_video_source(lab, target, device)?;
     }
     let mut child = match start {
         Start::Serial(serials) => serial::start_daemon(&serials, 0, target)?,
-        Start::Video(device, mode) => video::start_daemon(&device, 0, target, mode.as_deref())?,
+        Start::Video(device, mode, threshold) => {
+            video::start_daemon(&device, 0, target, mode.as_deref(), threshold)?
+        }
     };
     wait_for_started_daemon(name, Some(target), replaced, Some(&mut child))
 }
@@ -2723,7 +2734,13 @@ fn cmd_console(
         })?;
         ensure_video_source(&lab, &target, &device)?;
         eprintln!("Starting video daemon…");
-        let mut child = video::start_daemon(&device, 0, &target, v.ocr_mode.as_deref())?;
+        let mut child = video::start_daemon(
+            &device,
+            0,
+            &target,
+            v.ocr_mode.as_deref(),
+            v.change_threshold,
+        )?;
         daemons::wait_for_daemon(
             video::DAEMON,
             Some(&target),
@@ -3603,10 +3620,17 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
             target,
             device,
             ocr_mode,
+            change_threshold,
             host,
         } => {
             edit_lab(lab_flag, |lf| {
-                lf.set_video(&target, Some(&device), ocr_mode.as_deref(), host.as_deref())
+                lf.set_video(
+                    &target,
+                    Some(&device),
+                    ocr_mode.as_deref(),
+                    change_threshold,
+                    host.as_deref(),
+                )
             })?;
             println!("video channel set for '{target}'.");
             Ok(())
@@ -3666,7 +3690,13 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
                 ensure_video_source(&load_for_read(lab_flag)?, &target, &device)?;
             }
             eprintln!("Starting video daemon for '{target}' ('{device}')…");
-            let mut child = video::start_daemon(&device, port, &target, v.ocr_mode.as_deref())?;
+            let mut child = video::start_daemon(
+                &device,
+                port,
+                &target,
+                v.ocr_mode.as_deref(),
+                v.change_threshold,
+            )?;
             let url =
                 wait_for_started_daemon(video::DAEMON, Some(&target), replaced, Some(&mut child))?;
             // Token-free, like every other line paniolo prints: the openable
@@ -3831,6 +3861,10 @@ fn video_cmd(lab_flag: Option<&str>, cmd: VideoCmd) -> Result<()> {
         VideoCmd::Show { target } => {
             let (target, v) = video_runtime(lab_flag, target.name())?;
             println!("device\t{}", v.device.as_deref().unwrap_or("(not set)"));
+            match v.change_threshold {
+                Some(n) => println!("change_threshold\t{n}"),
+                None => println!("change_threshold\t(default)"),
+            }
             match video::daemon_url(&target) {
                 Some(url) => {
                     println!(
@@ -5716,6 +5750,30 @@ mod tests {
                 "{pos:?} must not take the target positionally"
             );
             assert!(parse(&verb).is_err(), "{verb:?} must require --target");
+        }
+    }
+
+    /// `video set --change-threshold` takes a byte: 0 and 255 parse, 256 and
+    /// a negative number are refused by clap before any lab edit happens.
+    #[test]
+    fn video_set_change_threshold_must_fit_a_byte() {
+        fn argv(n: &str) -> Vec<&str> {
+            vec![
+                "video",
+                "set",
+                "-t",
+                "t",
+                "-d",
+                "x",
+                "--change-threshold",
+                n,
+            ]
+        }
+        for ok in ["0", "16", "255"] {
+            assert!(parse(&argv(ok)).is_ok(), "{ok} should parse");
+        }
+        for bad in ["256", "-1", "abc"] {
+            assert!(parse(&argv(bad)).is_err(), "{bad} should be refused");
         }
     }
 }

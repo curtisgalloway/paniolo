@@ -617,7 +617,11 @@ async fn snapshot_serves_the_rfb_framebuffer_as_png() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let spec = DeviceSpec::parse(&format!("rfb://{}", fake.addr));
     assert!(matches!(spec, DeviceSpec::Rfb(_)));
-    let (rx, _h) = crate::capture_thread::spawn(spec, crate::demand::Demand::new());
+    let (rx, _h) = crate::capture_thread::spawn(
+        spec,
+        crate::demand::Demand::new(),
+        crate::frame::DEFAULT_CHANGE_THRESHOLD,
+    );
     let app = crate::server::router(
         crate::server::AppState::new(rx),
         crate::auth::Auth::new("tok".into(), crate::server::PUBLIC_ASSETS),

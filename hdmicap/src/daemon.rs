@@ -91,7 +91,7 @@ pub fn discover() -> Result<Discovery> {
 
 /// Blocking entry point for `hdmicap daemon`. Builds the tokio runtime itself
 /// so the capture thread can stay a plain std::thread alongside it.
-pub fn run(device: DeviceSpec, port: u16) -> Result<()> {
+pub fn run(device: DeviceSpec, port: u16, change_threshold: u8) -> Result<()> {
     // A malformed network source is an operator error: refuse now rather than
     // retry it forever as an unplugged device.
     if let DeviceSpec::Rfb(s) = &device {
@@ -106,7 +106,7 @@ pub fn run(device: DeviceSpec, port: u16) -> Result<()> {
     // 2. Spawn the capture thread BEFORE the runtime. It owns the device and
     //    publishes into the watch channel.
     let demand = crate::demand::Demand::new();
-    let (frames, _capture_handle) = capture_thread::spawn(device, demand.clone());
+    let (frames, _capture_handle) = capture_thread::spawn(device, demand.clone(), change_threshold);
 
     // 3. Build a multi-thread runtime for axum and run the server.
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -139,7 +139,9 @@ pub fn run(device: DeviceSpec, port: u16) -> Result<()> {
         // process the kernel next gave that number to.
         let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
         let app = server::router(
-            AppState::new(frames).with_demand(demand),
+            AppState::new(frames)
+                .with_demand(demand)
+                .with_change_threshold(change_threshold),
             crate::auth::Auth::new(token, server::PUBLIC_ASSETS),
         )
         .layer(axum::Extension(shutdown.clone()));
