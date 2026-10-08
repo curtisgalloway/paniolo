@@ -91,7 +91,7 @@ make install               # cargo-installs the `paniolo` CLI, then `paniolo set
 Run once per machine; re-run after pulling or editing (it's a full rebuild).
 Only the `paniolo` CLI lands in `~/.cargo/bin` — make sure that's on `PATH`.
 The helpers (hdmicap, serialcap, netbootd, cambrionix, hidrig, ch9329,
-shellyplug, amt, zigplug, the
+shellyplug, amt, jetkvm (needs Go), zigplug, the
 OCR tool) live in the private libexec dir `~/.local/libexec/paniolo/bin`,
 off PATH; paniolo resolves them itself, and `paniolo helper [NAME] [ARGS…]`
 lists or runs one directly. If a different `paniolo` shadows the CLI on PATH
@@ -577,7 +577,7 @@ Full guide: `docs/usb.md`. Protocol: `notes/openterface-usb-mux-spec.md`.
 
 ## HID injection — type and click into the target
 
-Two bundled injector helpers speak the same command vocabulary; the `hid`
+Three bundled injector helpers speak the same command vocabulary; the `hid`
 channel stores an opaque helper command and `paniolo hid send` appends its
 arguments to it and runs it on the channel's host:
 
@@ -589,6 +589,13 @@ arguments to it and runs it on the channel's host:
   Mini-KVM and KVM-Go, Sipeed NanoKVM-USB): `paniolo hid set -t <name> --cmd
   "ch9329 -d <uart>"`. Same commands; it autodetects the link baud (115200 /
   57600 / 9600) and adds `info` (target USB enumeration + lock LEDs).
+- **`jetkvm`** — the JetKVM network KVM (Go helper): `paniolo hid set -t <name>
+  --cmd "jetkvm -d <host>"`; the password comes from `JETKVM_PASSWORD`,
+  `--password-file` or `--password-command`, never a flag. Same commands; its
+  `info` prints the device's USB, video and keyboard-LED state. **The JetKVM
+  allows ONE session**: the helper's session and a browser tab on the
+  device's web UI kick each other, and `OK` does not prove delivery (the
+  firmware says success even if the target's USB is not up — check `info`).
 
 ```
 paniolo hid set -t <name> --cmd "hidrig -d /dev/cu.usbmodemXXXX" [--host <labhost>]
@@ -804,6 +811,11 @@ the device is free just because a daemon is gone from the tracked list.
 - `doctor` flags a channel that still works? Believe the working channel and
   report the discrepancy — never rewrite the lab config to silence `doctor`.
 - Serial port is exclusive: one of `connect` / `watch` / external `tio`/`screen`.
+- JetKVM allows one session at a time: if a `jetkvm` hid command or daemon
+  suddenly fails or reports "session taken over", someone opened the
+  device's web UI. Don't open the UI to "check" while automating — it kicks
+  the helper (and the helper kicks the browser). `jetkvm info` shows whether
+  the target's USB is actually up; HID `OK` alone does not.
 - `~/.cargo/bin` (the CLI) must be on `PATH`, ahead of any other `paniolo`
   (e.g. a Homebrew keg from the tap can shadow it). The helper binaries are
   *not* on PATH — they live in `~/.local/libexec/paniolo/bin`

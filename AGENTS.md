@@ -982,6 +982,40 @@ ch9329/          Rust crate: the *other* hid helper — a WCH CH9329 UART->USB-H
                    and the hardware-verified status notes
 ```
 
+jetkvm/          Go module (the one non-Rust helper besides zigplug): hid helper
+                 for the JetKVM network KVM (firmware 0.5.9), whose keyboard and
+                 mouse exist ONLY over WebRTC -- hence Go and pion/webrtc. Same
+                 CLI/daemon surface as ch9329 (`-d <host[:port]>`, `serve`,
+                 `stop`, `run`, plus `info`), so it is a drop-in `hid` channel
+                 (`--cmd "jetkvm -d 192.0.2.10"`); paniolo starts it as
+                 `<cmd> serve --port 0` like the others, no jetkvm code in cli/.
+                 One flat `package main`: rpc.go (login -> signaling WebSocket ->
+                 "rpc" data channel, JSON-RPC, `Link`), hid.go (`Session`
+                 composing keyboardReport/absMouseReport/relMouseReport/
+                 wheelReport, `executeLine`, `parseSequence`; the vocabulary and
+                 bounds are ported from ch9329), keys.go (US layout), owner.go
+                 (`Owner`: the ONE session, lazy connect, a single serializing
+                 queue, transcript broadcast, background reconnect), server.go
+                 (/status /version /send /hid /stop), auth.go (token +
+                 loopback Host/Origin, the Go twin of auth.rs), daemon.go
+                 (discovery file 0600 temp+rename, daemon.lock never unlinked,
+                 runtime dir rules of platform::ensure_private_dir),
+                 secret.go (JETKVM_PASSWORD -> --password-file ->
+                 --password-command, the `secret` crate's order; exit 3).
+                 **The firmware allows one session**: a new offer kicks the old
+                 one with an `otherSessionConnected` event. The daemon treats
+                 that as "a person's browser took it" and does NOT redial in
+                 the background (the next command reconnects); only a plain
+                 drop is retried, with 1-30 s backoff. HID RPCs succeed even
+                 when the target's USB is down, so `ok` is not delivery (`info`).
+                 Tests run a fake JetKVM (httptest + a pion answerer) end to end.
+                 CI: its own `jetkvm` job (gofmt, vet, `go test -race`) and
+                 `go_job` in scripts/ci-local.sh; `ci-coverage-check.sh` checks
+                 Go modules too. `paniolo setup` builds it with `go build` into
+                 libexec when `go` is present (`SourceStep::JetKvm`,
+                 `GO_HELPERS` in setup.rs). Release packaging is NOT done yet
+                 (milestone 1b; the exemption is written in the coverage script).
+
 ### hid daemon + KVM (`hidrig serve`)
 
 The control link can have only one owner, so KVM streaming and CLI injection

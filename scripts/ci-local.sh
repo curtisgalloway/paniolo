@@ -120,6 +120,47 @@ touch "$DST/$MARKER"
 
 declare -A RES
 
+# Go: the jetkvm helper is not a Cargo crate. Needs Go >= the version in
+# jetkvm/go.mod; a distro golang-go is usually too old, so install the
+# official tarball under $HOME when `go` is missing.
+ensure_go () {
+  if command -v go >/dev/null 2>&1; then return 0; fi
+  if [ -x "$HOME/.cache/paniolo-go/go/bin/go" ]; then
+    export PATH="$HOME/.cache/paniolo-go/go/bin:$PATH"
+    return 0
+  fi
+  echo "### [setup] go"
+  local arch
+  case "$(uname -m)" in
+    x86_64) arch=amd64 ;;
+    aarch64|arm64) arch=arm64 ;;
+    *) echo "unsupported architecture for the Go install" >&2; return 1 ;;
+  esac
+  fetch_installer "https://go.dev/dl/go1.24.7.linux-$arch.tar.gz" go.tar.gz || return 1
+  mkdir -p "$HOME/.cache/paniolo-go" \
+    && tar -C "$HOME/.cache/paniolo-go" -xzf "$INSTALLERS/go.tar.gz" || return 1
+  export PATH="$HOME/.cache/paniolo-go/go/bin:$PATH"
+}
+
+go_job () {
+  local name="$1" dir="$2"
+  echo
+  echo "===== $name ====="
+  (
+    ensure_go || exit 91
+    cd "$DST/$dir" || exit 90
+    unformatted="$(gofmt -l .)"
+    if [ -n "$unformatted" ]; then
+      echo "gofmt would change:" >&2
+      echo "$unformatted" >&2
+      exit 1
+    fi
+    go vet ./... && go test -race ./...
+  )
+  RES["$name"]=$?
+  echo "----- $name exit ${RES[$name]} -----"
+}
+
 # fmt + clippy (-D warnings) + a final build/test, mirroring each crate's CI job.
 crate_job () {
   local name="$1" dir="$2" lastcmd="$3"
@@ -145,12 +186,13 @@ crate_job "hidrig"     "hidrig"     "cargo test"
 crate_job "shellyplug" "shellyplug" "cargo test"
 crate_job "amt"        "amt"        "cargo test"
 crate_job "secret"     "secret"     "cargo test"
+go_job    "jetkvm"     "jetkvm"
 
 echo
 echo "########## LOCAL CI SUMMARY ##########"
 fail=0
 for k in "cli" "serialcap" "netbootd" "hdmicap" "cambrionix" "ch9329" \
-         "hidrig" "shellyplug" "amt" "secret"; do
+         "hidrig" "shellyplug" "amt" "secret" "jetkvm"; do
   c="${RES[$k]:-NA}"
   if [ "$c" = "0" ]; then printf 'PASS       %s\n' "$k"; else printf 'FAIL(%s)  %s\n' "$c" "$k"; fail=1; fi
 done

@@ -40,7 +40,7 @@ More on the [demos page](https://curtisgalloway.github.io/paniolo/demos/).
 | [Video](https://curtisgalloway.github.io/paniolo/video/) | `paniolo video` | HDMI capture daemon; on-device OCR |
 | [Serial](https://curtisgalloway.github.io/paniolo/serial/) | `paniolo serial` | Serial console: interactive (tio) or a daemon with a timestamped log |
 | [Power control](https://curtisgalloway.github.io/paniolo/power/) | `paniolo power on/off`, `paniolo power-cycle`, `paniolo power-state`, `paniolo serial dtr/reset` | DTR power button (J2 header) and shell-command hooks; helpers `cambrionix` (hub ports), `zigplug` (Zigbee plugs), `shellyplug` (Shelly Gen2+), `amt` (Intel AMT/vPro) |
-| [HID injection](https://curtisgalloway.github.io/paniolo/hid/) | `paniolo hid` | USB keyboard/mouse injection via a helper (`hidrig` KB2040 injector, or `ch9329` for Openterface Mini-KVM / KVM-Go and Sipeed NanoKVM-USB) |
+| [HID injection](https://curtisgalloway.github.io/paniolo/hid/) | `paniolo hid` | USB keyboard/mouse injection via a helper (`hidrig` KB2040 injector, `ch9329` for Openterface Mini-KVM / KVM-Go and Sipeed NanoKVM-USB, or `jetkvm` for the JetKVM network KVM) |
 | [Switchable USB media](https://curtisgalloway.github.io/paniolo/usb/) | `paniolo usb` | Switch a KVM-Go's microSD card between control host and target, as boot media |
 | [adb (Android targets)](https://curtisgalloway.github.io/paniolo/adb/) | `paniolo adb` | Drive an Android DUT over one USB cable: console (`shell`/`run`), screen (`screencap`), input |
 | [Dashboard](https://curtisgalloway.github.io/paniolo/dashboard/) | `paniolo console` | Video + serial web UI; auto-starts daemons; `-i <name>` preselects a serial interface |

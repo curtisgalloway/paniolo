@@ -293,6 +293,35 @@ jobs:
       - name: Test
         run: cargo test
 
+  jetkvm:
+    # The Go hid helper for JetKVM network KVMs. Not a Cargo crate, so it gets
+    # its own job: gofmt (fails on any unformatted file), vet, and the tests,
+    # which include a fake JetKVM (login, signaling, WebRTC answerer) run
+    # end to end under the race detector.
+    name: jetkvm (gofmt, vet, test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: jetkvm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: jetkvm/go.mod
+          cache-dependency-path: jetkvm/go.sum
+      - name: Format check
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt would change:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -race ./...
+
   hidrig:
     name: hidrig (fmt, clippy, test)
     runs-on: ubuntu-latest
